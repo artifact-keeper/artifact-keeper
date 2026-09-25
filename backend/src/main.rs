@@ -689,14 +689,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
-    // #3647: enabling quarantine on a Remote/Virtual repository is refused at
-    // the API now, but rows written before that gate still block every uncached
-    // fetch with no release path. Warn about them once per boot; the stored
-    // config is left untouched (see `warn_unsupported_proxy_quarantine`).
+    // #3647 / #3912: enabling quarantine on a Virtual repository is refused
+    // at the API (a virtual has no cache of its own; the policy belongs on
+    // its member remotes), but rows written before that gate are dead state.
+    // Warn about them once per boot; the stored config is left untouched
+    // (see `warn_unsupported_virtual_quarantine`).
     {
         let db_pool = db_pool.clone();
         tokio::spawn(async move {
-            artifact_keeper_backend::services::quarantine_service::warn_unsupported_proxy_quarantine(
+            artifact_keeper_backend::services::quarantine_service::warn_unsupported_virtual_quarantine(
                 &db_pool,
             )
             .await;

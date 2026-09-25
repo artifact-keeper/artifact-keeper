@@ -1193,10 +1193,11 @@ async fn with_quarantine_settings(
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
     let (enabled, duration) = quarantine_service::repo_settings(db, repo_id).await;
-    // #3647: a row written before the enable-time gate existed still blocks
-    // every uncached fetch on a proxying repository with no release path. The
-    // stored value is left exactly as the operator set it; reading the repo
-    // just says so out loud, the same audit the startup scan emits.
+    // #3647 / #3912: a row written before the enable-time gate existed is dead
+    // state on a virtual repository (the only type still unsupported — the
+    // policy belongs on its member remotes). The stored value is left exactly
+    // as the operator set it; reading the repo just says so out loud, the
+    // same audit the startup scan emits.
     if enabled == Some(true)
         && !RepositoryType::from_db_str(&response.repo_type)
             .as_ref()
@@ -1205,9 +1206,10 @@ async fn with_quarantine_settings(
         tracing::warn!(
             repository = %response.key,
             repo_type = %response.repo_type,
-            "repository has quarantine enabled but is a {} repository; the hold blocks all \
-             uncached content and has no release path (#3647). Set \
-             `quarantine_enabled: false` on this repository.",
+            "repository has quarantine enabled but is a {} repository; a virtual has no \
+             cache of its own, so the setting is never consulted (#3647, #3912). Enable the \
+             Package Age Policy on the member remote repositories and set \
+             `quarantine_enabled: false` here.",
             response.repo_type
         );
     }
@@ -1606,13 +1608,16 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 }
 
 /// Reject `quarantine_enabled = true` on repositories that serve proxied
-/// content (#3647).
+/// content without a quarantine identity of their own (#3647, #3912).
 ///
-/// Quarantine state is keyed on `artifacts`; a Remote or Virtual repository
-/// records what it serves in `proxy_cache_artifacts`, which has no quarantine
-/// columns, so the hold has no release path and degrades into a total block on
-/// all uncached content. Refusing the write surfaces that at configuration time
-/// instead of at first pull. The explicit
+/// Hosted and Remote repositories qualify: hosted content carries
+/// `artifacts.quarantine_*`, and remote (proxy) content got its quarantine
+/// identity in #3912 (`proxy_cache_artifacts.quarantine_until`, the
+/// release-date window on both fetch paths, and the
+/// `POST /api/v1/quarantine/proxy-cache/{key}/release` endpoint). A Virtual
+/// repository caches nothing itself — its members' Remote legs do — so
+/// enabling the policy on it would be dead state. Refusing the write surfaces
+/// that at configuration time instead of at first pull. The explicit
 /// `quarantine_service::supports_quarantine` call is what the structural
 /// regression test below greps for.
 ///
@@ -1621,7 +1626,7 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
     if !quarantine_service::supports_quarantine(repo_type) {
         return Err(AppError::Validation(
-            quarantine_service::PROXY_QUARANTINE_UNSUPPORTED.to_string(),
+            quarantine_service::VIRTUAL_QUARANTINE_UNSUPPORTED.to_string(),
         ));
     }
     Ok(())
@@ -15467,6 +15472,7 @@ mod tests {
                 Some("f00d"),
                 Some("application/x-test"),
                 None,
+                None,
             )
             .await
             .expect("seed catalog row");
@@ -23115,21 +23121,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // quarantine_enabled is refused on proxying repository types (#3647)
+    // quarantine_enabled is refused on virtual repositories only (#3647, #3912)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_quarantine_enableable_rejects_proxy_types() {
+    fn test_is_quarantine_enableable_rejects_only_virtual() {
         assert!(is_quarantine_enableable(&RepositoryType::Local).is_ok());
         assert!(is_quarantine_enableable(&RepositoryType::Staging).is_ok());
-        for proxying in [RepositoryType::Remote, RepositoryType::Virtual] {
-            let err = is_quarantine_enableable(&proxying)
-                .expect_err("quarantine must be refused on a proxying repository");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")),
-                "expected a Validation error naming the reason, got {err:?}",
-            );
-        }
+        // #3912: Remote repositories got a releasable quarantine identity
+        // (proxy_cache_artifacts columns + the proxy-cache release endpoint),
+        // so enabling the policy there is allowed.
+        assert!(is_quarantine_enableable(&RepositoryType::Remote).is_ok());
+        let err = is_quarantine_enableable(&RepositoryType::Virtual)
+            .expect_err("quarantine must still be refused on a virtual repository");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("member remote")),
+            "expected a Validation error naming the alternative, got {err:?}",
+        );
     }
 
     /// Structural regression guard: the update path must keep routing
@@ -23148,11 +23156,13 @@ mod tests {
         );
     }
 
-    /// DB-backed: PATCH `{"quarantine_enabled": true}` is refused with a 400 on
-    /// a Remote and on a Virtual repository, nothing is written, and disabling
-    /// stays allowed so an existing enabled row can still be turned off.
+    /// DB-backed: since #3912, PATCH `{"quarantine_enabled": true}` SUCCEEDS on
+    /// a Remote repository (proxied content carries a releasable quarantine
+    /// identity now) and is still refused with a 400 on a Virtual repository
+    /// (no cache of its own), writing nothing. Disabling stays allowed on both
+    /// so an existing enabled row can always be turned off.
     #[tokio::test]
-    async fn test_quarantine_enable_refused_on_proxy_repositories_db() {
+    async fn test_quarantine_enable_remote_allowed_virtual_refused_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::extract::{Extension, Path, State};
 
@@ -23182,31 +23192,42 @@ mod tests {
             }
         };
 
-        for (repo_id, repo_key) in [(remote_id, &remote_key), (virtual_id, &virtual_key)] {
-            let err = update_repository(
-                State(state.clone()),
-                Extension(Some(admin_auth(user_id, &username))),
-                Path(repo_key.clone()),
-                Json(update(r#"{"quarantine_enabled":true}"#)),
-            )
-            .await
-            .expect_err("enabling quarantine on a proxying repo must be refused");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")
-                    && msg.contains("release")),
-                "the refusal must say why there is no release path, got {err:?}",
-            );
-            assert_eq!(
-                err.into_response().status(),
-                StatusCode::BAD_REQUEST,
-                "the refusal must surface as a 400"
-            );
-            assert_eq!(
-                stored(repo_id).await,
-                None,
-                "a refused enable must not write the config row"
-            );
-        }
+        // Remote: allowed since #3912 and persisted.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(remote_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect("enabling quarantine on a remote repo must succeed since #3912");
+        assert_eq!(resp.quarantine_enabled, Some(true));
+        assert_eq!(stored(remote_id).await.as_deref(), Some("true"));
+
+        // Virtual: still refused, with a 400 naming the alternative, and
+        // nothing is written.
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(virtual_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect_err("enabling quarantine on a virtual repo must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("release")),
+            "the refusal must say where the release path lives, got {err:?}",
+        );
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "the refusal must surface as a 400"
+        );
+        assert_eq!(
+            stored(virtual_id).await,
+            None,
+            "a refused enable must not write the config row"
+        );
 
         // Disabling remains allowed on a proxying repo: that is the escape
         // hatch for a row written before this gate existed.

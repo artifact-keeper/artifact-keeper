@@ -239,6 +239,10 @@ struct UpstreamStream {
     /// (a future enhancement; currently informational only).
     #[allow(dead_code)]
     content_length: Option<u64>,
+    /// `Last-Modified` from upstream (#3912): the release date the Package Age
+    /// Policy window is measured from on the streaming path, and the value the
+    /// cache sidecar records for later conditional revalidation (#1611).
+    last_modified: Option<String>,
 }
 
 /// Output of [`ProxyService::fetch_artifact_streaming`]. Carries the
@@ -403,9 +407,15 @@ struct CacheMetadataTemplate {
     /// Upstream `X-Repo-Commit` for the bytes being persisted — see
     /// [`UpstreamResponse::commit_sha`].
     commit_sha: Option<String>,
-    /// `Last-Modified` from upstream (#1611). `None` on the streaming path,
-    /// which does not currently surface the header into the tee template.
+    /// `Last-Modified` from upstream (#1611). Surfaced into the tee template
+    /// by the streaming leader since #3912 so the sidecar records it exactly
+    /// as the buffered path does.
     last_modified: Option<String>,
+    /// Package Age Policy hold computed by the streaming leader from the
+    /// upstream `Last-Modified` (#3912). Recorded on the committed sidecar so
+    /// the hit paths gate the entry until the window elapses; `None` when the
+    /// repository's quarantine policy is disabled.
+    quarantine_until: Option<DateTime<Utc>>,
     ttl_secs: i64,
     /// Optional content digest the cache commit is gated on (#2274, widened
     /// past SHA-256 by GHSA-qxv7-p3mq-88fv). When `Some`,
@@ -419,7 +429,6 @@ struct CacheMetadataTemplate {
     expected_checksum: Option<CacheCommitDigest>,
     /// Owning repository id for the persisted proxy-cache catalog row
     /// (#2218/#2270). Threaded so the streaming Commit arm can upsert
-    /// `proxy_cache_artifacts` with the TRUE `bytes_written`/checksum.
     repository_id: Uuid,
     /// Logical cache path (e.g. `simple/click/click-8.0.0-...whl`) — the
     /// catalog's `(repository_id, path)` identity.
@@ -786,6 +795,10 @@ pub(crate) struct UpstreamHeaders {
     pub(crate) content_encoding: Option<String>,
     /// See [`UpstreamResponse::commit_sha`].
     pub(crate) commit_sha: Option<String>,
+    /// Upstream `Last-Modified` (#3912): the streaming path's only release-date
+    /// signal for the Package Age Policy window, recorded on the cache sidecar
+    /// exactly as the buffered path's `last_modified` is.
+    pub(crate) last_modified: Option<String>,
 }
 
 /// Extract the forwardable headers from an upstream response. Extracted from
@@ -813,12 +826,17 @@ fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHe
         .get(UPSTREAM_COMMIT_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let last_modified = headers
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     UpstreamHeaders {
         content_type,
         etag,
         content_length,
         content_encoding,
         commit_sha,
+        last_modified,
     }
 }
 
@@ -1758,6 +1776,9 @@ impl CachePersister {
             Some(metadata.checksum_sha256.as_str()),
             metadata.content_type.as_deref(),
             None,
+            // #3912: mirror the sidecar hold onto the catalog row so a held
+            // buffered entry is releasable via the quarantine API too.
+            metadata.quarantine_until,
         )
         .await
         {
@@ -1982,10 +2003,13 @@ impl CachePersister {
                             content_encoding: template.content_encoding,
                             upstream_commit_sha: template.commit_sha,
                             negative_cached_until: None,
-                            // The streaming leader refuses to open upstream at all
-                            // while the repo's Package Age Policy is enabled
-                            // (#1770), so a tee'd entry is never under a hold.
-                            quarantine_until: None,
+                            // Package Age Policy (#3912): the streaming leader
+                            // computed the hold from the upstream
+                            // `Last-Modified` before deciding to serve; the
+                            // sidecar records it so every read path gates on
+                            // it until the window elapses (or an admin
+                            // releases the entry).
+                            quarantine_until: template.quarantine_until,
                             expires_at: now + chrono::Duration::seconds(template.ttl_secs),
                             content_type: template.content_type,
                             size_bytes: result.bytes_written as i64,
@@ -2024,6 +2048,10 @@ impl CachePersister {
                                         Some(metadata.checksum_sha256.as_str()),
                                         metadata.content_type.as_deref(),
                                         template.upstream_url.as_deref(),
+                                        // #3912: mirror the sidecar hold onto
+                                        // the catalog row so the entry is
+                                        // releasable via the quarantine API.
+                                        metadata.quarantine_until,
                                     )
                                     .await
                                     {
@@ -2876,6 +2904,7 @@ impl UpstreamClient {
             content_encoding: headers.content_encoding,
             commit_sha: headers.commit_sha,
             content_length: headers.content_length,
+            last_modified: headers.last_modified,
         })
     }
 
@@ -3682,6 +3711,79 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Release a held proxy-cache entry (#3912): clear the sidecar's Package
+    /// Age Policy hold and stamp the catalog row's release, so reads of this
+    /// cached object stop answering 409 before the window elapses.
+    ///
+    /// Keyed on `(repository_id, path)` — the catalog's uniqueness key, and
+    /// the identity an operator sees on the Packages page / cache listing.
+    /// Returns 404 when no catalog row exists and 409 when the entry is not
+    /// currently held (never held, window already elapsed, or already
+    /// released), mirroring the hosted release endpoint's
+    /// [`quarantine_service::transition`] contract.
+    pub async fn release_quarantined_cache_entry(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+    ) -> Result<()> {
+        let row = proxy_catalog::find_quarantine_row(&self.db, repository_id, path)
+            .await?
+            .ok_or_else(|| AppError::NotFound("No cached artifact at that path".to_string()))?;
+
+        let still_held = row.quarantine_released_at.is_none()
+            && row.quarantine_until.is_some_and(|until| until > Utc::now());
+        if !still_held {
+            return Err(AppError::Conflict(
+                "Cached artifact is not in quarantined state; release not allowed".to_string(),
+            ));
+        }
+
+        // Clear the hold at the read-path authority FIRST: the sidecar. The
+        // catalog row is only stamped after, so a sidecar write failure leaves
+        // the release fully retryable (the row still reads as held).
+        match self.load_cache_metadata(&row.metadata_key).await {
+            Ok(Some(mut metadata)) => {
+                metadata.quarantine_until = None;
+                let json = serde_json::to_vec(&metadata).map_err(|e| {
+                    AppError::Internal(format!("Proxy cache metadata serialization failed: {e}"))
+                })?;
+                self.storage
+                    .put(&row.metadata_key, Bytes::from(json))
+                    .await?;
+                invalidate_proxy_metadata_lru(&row.metadata_key).await;
+            }
+            // A missing or unreadable sidecar cannot hold a read (the read
+            // paths treat both as a cache miss / refetch), so there is nothing
+            // to clear; the catalog row is still stamped below.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    metadata_key = %row.metadata_key,
+                    error = %e,
+                    "proxy-cache sidecar unreadable at quarantine release; stamping the \
+                     catalog row only (the unreadable sidecar never holds a read)"
+                );
+            }
+        }
+
+        let released = proxy_catalog::mark_quarantine_released(&self.db, row.id).await?;
+        if released == 0 {
+            // Lost a race: the window elapsed or a concurrent release landed
+            // between our read and the guarded update. The sidecar is already
+            // cleared either way, so this only changes the reported status.
+            return Err(AppError::Conflict(
+                "Cached artifact is not in quarantined state; release not allowed".to_string(),
+            ));
+        }
+
+        tracing::info!(
+            repository_id = %repository_id,
+            path = %path,
+            "Proxy-cache entry released from quarantine"
+        );
+        Ok(())
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
@@ -4343,6 +4445,10 @@ impl ProxyService {
                 metadata.size_bytes,
                 Some(metadata.checksum_sha256.as_str()),
                 metadata.content_type.as_deref(),
+                // #3912: a pre-existing held entry backfills its hold too, so
+                // it is releasable via the quarantine API (placeholder rows
+                // only; authoritative rows keep what their commit wrote).
+                metadata.quarantine_until,
             )
             .await
             {
@@ -4480,18 +4586,14 @@ impl ProxyService {
         metadata_key: String,
         expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamHandle> {
-        // Package Age Policy (#1770): the streaming path has no buffered
-        // upstream `Last-Modified` to base a release-date hold on (#1771), so
-        // a repo with the policy enabled conservatively refuses to open a new
-        // streaming fetch outright. Entries cached while the policy was off
-        // are unaffected (gated by their sidecar on the hit path above), and
-        // the error propagates as 409 rather than degrading to a fall-back.
-        let quarantine_config = quarantine_service::resolve_config(&self.db, repo.id).await;
-        if quarantine_service::should_quarantine(&quarantine_config) {
-            return Err(AppError::Conflict(
-                "Artifact is quarantined and pending security review".to_string(),
-            ));
-        }
+        // Package Age Policy (#3912): the hold decision needs the upstream
+        // release date, which only exists once the streaming response headers
+        // arrive, so it is made AFTER the upstream open below — a package
+        // older than the configured window is served on first fetch, a fresh
+        // one is cached under its hold and refused with 409 until the window
+        // elapses or an admin releases the cache entry. (Before #3912 this
+        // path refused outright here, before the fetch, so the release-date
+        // window was never honoured on the streaming path.)
 
         let upstream_url = Self::remote_target(repo)?;
         let full_url = Self::build_upstream_url(upstream_url, fetch_path);
@@ -4508,6 +4610,18 @@ impl ProxyService {
                     .await;
             }
         };
+
+        // Package Age Policy (#3912): resolve the hold from the upstream
+        // `Last-Modified` now that the streaming response headers exist. A
+        // release older than the configured window yields an already-elapsed
+        // expiry, so old packages are served on first fetch; only a hold in
+        // the future actually blocks this request (after the cache tee below,
+        // so the entry is cached under its hold and later requests are gated
+        // by the sidecar until the window elapses or an admin releases it).
+        let quarantine_until = self
+            .quarantine_until_for_new_entry(repo.id, upstream.last_modified.as_deref())
+            .await;
+        let hold_active = quarantine_until.is_some_and(|until| until > Utc::now());
 
         // #1611: classify the path. Immutable paths (versioned artifacts, OCI
         // blobs) cache effectively forever; mutable indexes get the short
@@ -4558,7 +4672,10 @@ impl ProxyService {
         //     advertises a length.
         //
         // Either way the client is still served in full, matching the buffered
-        // path's over-quota behaviour.
+        // path's over-quota behaviour — EXCEPT under an active Package Age
+        // Policy hold (#3912): the bypass serves the raw upstream body with no
+        // cache write, which would hand out a held artifact with no releasable
+        // record. Under a hold the answer is the same 409 the tee path gives.
         let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
         if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
             if advertised > limit {
@@ -4572,6 +4689,11 @@ impl ProxyService {
                      streaming it to the client without any proxy-cache write"
                 );
                 crate::services::metrics_service::record_proxy_cache_quota_exceeded(&repo.key);
+                if hold_active {
+                    return Err(AppError::Conflict(
+                        "Artifact is quarantined and pending security review".to_string(),
+                    ));
+                }
                 return Ok(StreamHandle {
                     body: upstream.body,
                     headers,
@@ -4588,7 +4710,8 @@ impl ProxyService {
                 etag: upstream.etag,
                 content_encoding: upstream.content_encoding,
                 commit_sha: upstream.commit_sha,
-                last_modified: None,
+                last_modified: upstream.last_modified,
+                quarantine_until,
                 ttl_secs: cache_ttl,
                 expected_checksum,
                 // #2218/#2270: identity for the persisted catalog row, written
@@ -4600,6 +4723,39 @@ impl ProxyService {
             upstream.content_length,
             max_cache_bytes,
         );
+
+        if hold_active {
+            // Cache-but-hold (#3912): drive the tee to completion in a
+            // detached task so the entry IS committed under its hold (the
+            // sidecar's `quarantine_until` gates every later read until the
+            // window elapses, and the catalog row gives the entry its
+            // releasable identity), then refuse THIS request with the same
+            // 409 the hit path answers. Without the drain the tee's writer
+            // task would never see a byte — the returned stream is what feeds
+            // it — and every poll during the window would re-fetch upstream.
+            tracing::info!(
+                repository = %repo.key,
+                path = %cache_path,
+                quarantine_until = %quarantine_until.expect("hold_active implies Some"),
+                "caching proxied artifact under a Package Age Policy hold; \
+                 refusing this download until the window elapses"
+            );
+            tokio::spawn(async move {
+                let mut drain = body;
+                while let Some(item) = drain.next().await {
+                    if let Err(e) = item {
+                        tracing::debug!(
+                            error = %e,
+                            "quarantine hold drain: upstream stream error (cache write abandoned)"
+                        );
+                        break;
+                    }
+                }
+            });
+            return Err(AppError::Conflict(
+                "Artifact is quarantined and pending security review".to_string(),
+            ));
+        }
 
         Ok(StreamHandle { body, headers })
     }
@@ -10506,6 +10662,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             etag: None,
             last_modified: None,
+            quarantine_until: None,
             ttl_secs: 60,
             expected_checksum: None,
             repository_id: Uuid::nil(),
@@ -12386,6 +12543,7 @@ mod tests {
             content_type: Some("application/x-deb".to_string()),
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
+            quarantine_until: None,
             ttl_secs: 7200,
             expected_checksum: None,
             repository_id: Uuid::nil(),
@@ -13675,6 +13833,26 @@ mod tests {
         let empty = extract_streaming_headers(&HeaderMap::new());
         assert!(empty.content_encoding.is_none());
         assert!(empty.commit_sha.is_none());
+    }
+
+    /// #3912: the streaming path's release-date signal. `Last-Modified` must
+    /// survive header capture verbatim (the Package Age Policy window parses
+    /// it later) and stay absent when upstream sends none.
+    #[test]
+    fn test_extract_streaming_headers_captures_last_modified() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let got = extract_streaming_headers(&h);
+        assert_eq!(
+            got.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+
+        let empty = extract_streaming_headers(&HeaderMap::new());
+        assert!(empty.last_modified.is_none());
     }
 
     #[test]
@@ -16556,6 +16734,256 @@ mod tests {
             .expect_err("a 5xx upstream must fail the streaming fetch");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3912: Package Age Policy on the streaming path — the release-date
+    // window must be honoured against the streaming response's own
+    // `Last-Modified`, and a held entry must be cached under its hold (not
+    // re-fetched per poll) with a releasable catalog identity.
+    // -----------------------------------------------------------------------
+
+    /// A remote Repository backed by a REAL DB row (so the quarantine config
+    /// lookups in `repository_config` resolve), with `upstream_url` pointed at
+    /// the wiremock server. Returns the model value the proxy calls take.
+    async fn quarantined_remote_repo(
+        pool: &PgPool,
+        upstream: &str,
+        storage_path: &str,
+        duration_minutes: i64,
+    ) -> Repository {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(pool, "remote", "generic").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point upstream_url at wiremock");
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), \
+                    ($1, 'quarantine_duration_minutes', $2)",
+        )
+        .bind(repo_id)
+        .bind(duration_minutes.to_string())
+        .execute(pool)
+        .await
+        .expect("enable quarantine config");
+        crate::services::quarantine_service::invalidate_config_cache(repo_id);
+        let mut repo = wiremock_remote_repo(&repo_key, upstream, storage_path);
+        repo.id = repo_id;
+        repo
+    }
+
+    /// Read the committed cache sidecar from the filesystem backend, polling
+    /// briefly: the streaming tee commits it from a background writer task.
+    async fn read_sidecar(
+        tmp: &std::path::Path,
+        repo_key: &str,
+        path: &str,
+    ) -> Option<CacheMetadata> {
+        let sidecar = tmp.join(format!("proxy-cache/{repo_key}/{path}/__cache_meta__.json"));
+        for _ in 0..100 {
+            if let Ok(json) = std::fs::read(&sidecar) {
+                if let Ok(meta) = serde_json::from_slice::<CacheMetadata>(&json) {
+                    return Some(meta);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A catalog row's quarantine columns as observed by [`read_catalog_hold`]
+    /// (a named pair, not a nested `Option` tuple).
+    struct CatalogHold {
+        quarantine_until: Option<DateTime<Utc>>,
+        quarantine_released_at: Option<DateTime<Utc>>,
+    }
+
+    /// Raw `proxy_cache_artifacts` hold columns as read by [`read_catalog_hold`].
+    type HoldRow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+    /// Poll for the catalog row's quarantine columns. The tee's writer task
+    /// commits the catalog upsert AFTER the sidecar put, so a read right after
+    /// the sidecar appears can still miss the row.
+    async fn read_catalog_hold(pool: &PgPool, repo_id: Uuid, path: &str) -> Option<CatalogHold> {
+        for _ in 0..100 {
+            let row: Option<HoldRow> = sqlx::query_as(
+                "SELECT quarantine_until, quarantine_released_at FROM proxy_cache_artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .expect("catalog hold query");
+            if let Some((quarantine_until, quarantine_released_at)) = row {
+                return Some(CatalogHold {
+                    quarantine_until,
+                    quarantine_released_at,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A package released upstream LONG before the hold window must be served
+    /// on first fetch even with the policy on — before #3912 the streaming
+    /// path refused it outright (the release date never reached the hold
+    /// computation).
+    #[tokio::test]
+    async fn test_streaming_quarantine_serves_package_older_than_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/old.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .set_body_bytes(b"old-package-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-qold-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let repo = quarantined_remote_repo(&pool, &server.uri(), tmp.to_str().unwrap(), 60).await;
+
+        let result = proxy.fetch_artifact_streaming(&repo, "pkg/old.bin").await;
+        let served = result.expect(
+            "a package released years before the 60-minute window must be served on first fetch",
+        );
+        assert_eq!(drain_stream(served.body).await, b"old-package-body");
+
+        // The cache entry records the (already-elapsed) hold for audit parity
+        // with the buffered path, and the catalog row mirrors it.
+        let meta = read_sidecar(&tmp, &repo.key, "pkg/old.bin")
+            .await
+            .expect("the streamed body must be cached with its sidecar");
+        let until = meta
+            .quarantine_until
+            .expect("an enabled policy records the hold timestamp");
+        assert!(
+            until <= Utc::now(),
+            "a 2015 release date yields an elapsed hold, not a future one: {until}"
+        );
+        let hold = read_catalog_hold(&pool, repo.id, "pkg/old.bin")
+            .await
+            .expect("catalog row for the cached object");
+        let db_until = hold.quarantine_until;
+        // Postgres `timestamptz` stores microseconds while the sidecar JSON
+        // keeps nanoseconds, so compare at second precision.
+        assert_eq!(
+            db_until.map(|d| d.timestamp()),
+            Some(until.timestamp()),
+            "the catalog row mirrors the sidecar hold (#3912)"
+        );
+
+        tdh::cleanup(&pool, repo.id, repo.id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A package released upstream INSIDE the hold window is refused with 409
+    /// — but the body is still cached under its hold, so the polling client
+    /// never re-fetches upstream, and the catalog row carries the releasable
+    /// hold (#3912).
+    #[tokio::test]
+    async fn test_streaming_quarantine_holds_fresh_package_and_caches_it() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Released "now": comfortably inside a 60-minute window.
+        let released_now = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        Mock::given(method("GET"))
+            .and(path("/pkg/fresh.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_bytes(b"fresh-package-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-qfresh-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let repo = quarantined_remote_repo(&pool, &server.uri(), tmp.to_str().unwrap(), 60).await;
+
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "pkg/fresh.bin")
+            .await
+            .expect_err("a package inside the hold window must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "the hold refusal is a 409, got {err:?}"
+        );
+
+        // Cache-but-hold: the background drain commits the body + sidecar
+        // under the hold.
+        let meta = read_sidecar(&tmp, &repo.key, "pkg/fresh.bin")
+            .await
+            .expect("the held entry must still be cached (cache-but-hold)");
+        let until = meta
+            .quarantine_until
+            .expect("the hold is recorded on the sidecar");
+        assert!(until > Utc::now(), "the hold is in the future: {until}");
+        let cached_body = std::fs::read(tmp.join(format!(
+            "proxy-cache/{}/pkg/fresh.bin/__content__",
+            repo.key
+        )))
+        .expect("the held body is cached");
+        assert_eq!(cached_body, b"fresh-package-body");
+
+        // The catalog row carries the same hold — the releasable identity.
+        let hold = read_catalog_hold(&pool, repo.id, "pkg/fresh.bin")
+            .await
+            .expect("catalog row for the held object");
+        let db_until = hold.quarantine_until;
+        let db_released = hold.quarantine_released_at;
+        assert_eq!(
+            db_until.map(|d| d.timestamp()),
+            Some(until.timestamp()),
+            "the catalog row mirrors the sidecar hold (second precision; \
+             timestamptz truncates the nanoseconds the sidecar keeps)"
+        );
+        assert!(db_released.is_none());
+
+        // A poll during the window is refused by the SIDECAR, without any
+        // second upstream fetch.
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "pkg/fresh.bin")
+            .await
+            .expect_err("a held entry keeps refusing until the window elapses");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+        let upstream_hits = server
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .len();
+        assert_eq!(
+            upstream_hits, 1,
+            "the second refusal must come from the cached hold, not a re-fetch"
+        );
+
+        tdh::cleanup(&pool, repo.id, repo.id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// PyPI-shaped split (#895 follow-up): the upstream download URL
