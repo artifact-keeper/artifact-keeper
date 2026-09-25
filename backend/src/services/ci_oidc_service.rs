@@ -2720,6 +2720,59 @@ mod tests {
         drop_groups(&pool, &[group_a, group_b, group_c]).await;
     }
 
+    /// A mapping created before mappings provisioned their own account has no
+    /// attributed account until its first exchange. Binding it still saves:
+    /// there is nothing to reconcile yet, and the first exchange applies the
+    /// binding (design D3).
+    #[tokio::test]
+    async fn binding_a_mapping_without_an_account_saves_and_reconciles_nothing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let group_id = seed_group(&pool).await;
+        let mapping_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ci_oidc_identity_mappings (id, provider_id, name) \
+             VALUES ($1, $2, 'legacy')",
+        )
+        .bind(mapping_id)
+        .bind(provider_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy mapping");
+
+        let updated = svc
+            .update_mapping(
+                provider_id,
+                mapping_id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(Some(vec![group_id])),
+                },
+            )
+            .await
+            .expect("binding a mapping with no account yet still saves");
+
+        assert_eq!(updated.group_binding_ids, Some(vec![group_id]));
+        assert_eq!(updated.service_account_id, None);
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE group_id = $1")
+                .bind(group_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, 0, "no account exists to reconcile");
+
+        svc.delete(provider_id).await.expect("delete provider");
+        drop_groups(&pool, &[group_id]).await;
+    }
+
     // -----------------------------------------------------------------------
     // Migration 232: re-keying pre-upgrade CI accounts
     //

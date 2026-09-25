@@ -1444,7 +1444,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod group_bindings {
-        use super::super::exchange_validated_claims;
+        use super::super::{exchange_validated_claims, mint_ci_session};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::models::access_scope::AccessScope;
@@ -2041,6 +2041,70 @@ mod tests {
                 .await
                 .expect_err("a deleted mapping must not match");
             assert!(matches!(err, crate::error::AppError::Authentication(_)));
+            fx.cleanup().await;
+        }
+
+        /// Design D3: reconciliation on the exchange is best-effort. When it
+        /// fails the credential is still minted, and the account keeps the
+        /// memberships from its last successful reconcile — here the one the
+        /// mapping write performed — rather than losing them.
+        #[tokio::test]
+        async fn a_failed_reconcile_does_not_fail_the_exchange() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (_mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+            let claims = gitlab("group/app", "main");
+            let provider = fx.svc.get(fx.provider_id).await.unwrap();
+            let mapping = fx
+                .svc
+                .resolve_mapping(fx.provider_id, &claims)
+                .await
+                .unwrap();
+            let credentials = fx
+                .svc
+                .resolve_service_account(
+                    &mapping,
+                    CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims),
+                )
+                .await
+                .unwrap();
+
+            // A service whose every query fails: nothing listens on port 1.
+            let unreachable = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(200))
+                .connect_lazy("postgresql://nobody:nobody@127.0.0.1:1/none")
+                .expect("lazy pool");
+            let broken_svc = CiOidcService::new(unreachable);
+            let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+
+            let (user, tokens) = mint_ci_session(
+                &fx.pool,
+                &broken_svc,
+                &auth_service,
+                credentials,
+                None,
+                // A binding the reconcile would have to act on: dropping the
+                // group the account holds.
+                Some(vec![]),
+                None,
+            )
+            .await
+            .expect("the exchange succeeds although the reconcile failed");
+
+            assert_eq!(user.id, account_id);
+            assert!(
+                fx.can(&tokens, repo_id, RepoAccess::READ).await,
+                "the membership from the last successful reconcile is kept"
+            );
             fx.cleanup().await;
         }
     }
