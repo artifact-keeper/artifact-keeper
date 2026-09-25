@@ -162,7 +162,7 @@ async fn test_oci_chunked_upload_cross_repo_session_rejected() {
     let state = build_state(pool.clone(), storage_path.to_str().unwrap());
     let auth = basic_auth_header(&username, "pushpass");
 
-    let make_app = || oci_v2::router().with_state(state.clone());
+    let make_app = || oci_v2::router(None).with_state(state.clone());
 
     // POST start under repo A.
     let req = Request::builder()

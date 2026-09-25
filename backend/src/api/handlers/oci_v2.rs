@@ -38,6 +38,7 @@ use crate::api::handlers::proxy_helpers;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
+use crate::api::middleware::rate_limit::LoginRateLimitState;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -12304,19 +12305,32 @@ async fn catch_all(
 /// caller POST arbitrarily large bodies and exhaust worker memory.
 const TOKEN_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024;
 
-pub fn router() -> Router<SharedState> {
+pub fn router(token_rate_limit: Option<LoginRateLimitState>) -> Router<SharedState> {
+    // #4020: /v2/token is unauthenticated by design (it is where OCI clients
+    // exchange credentials) and is mounted outside `api_v1_routes`, so none of
+    // the API rate-limit layers apply to it. Gate its password-verification
+    // exits (Basic header, OAuth2 password-grant form) behind the login
+    // limiter's per-(username, IP) budget; the refresh-grant and bearer-swap
+    // exits present an already-issued credential and stay unlimited.
+    let token_route = get(token)
+        .post(token)
+        .layer(DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES));
+    let token_route = match token_rate_limit {
+        Some(limit_state) => token_route.layer(axum::middleware::from_fn_with_state(
+            limit_state,
+            crate::api::middleware::rate_limit::token_rate_limit_middleware,
+        )),
+        // Tests build the router without the limiter; production
+        // (`routes::create_router`) always passes `Some`.
+        None => token_route,
+    };
     Router::new()
         .route("/", get(version_check))
         // Apply a tight per-route body limit on the token endpoint, BEFORE
         // the router-level `DefaultBodyLimit::disable()` layer below. axum
         // resolves the most-specific limit, so this caps the bytes the
         // form-credential extractor will buffer (#894 review HIGH).
-        .route(
-            "/token",
-            get(token)
-                .post(token)
-                .layer(DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES)),
-        )
+        .route("/token", token_route)
         .route("/_catalog", get(handle_catalog))
         .fallback(catch_all)
         .layer(DefaultBodyLimit::disable())
@@ -16972,7 +16986,7 @@ mod token_claims_isactive_regression_tests {
             .header("Authorization", format!("Bearer {}", tokens.access_token))
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
 
@@ -17044,7 +17058,7 @@ mod blob_pull_streaming_tests {
         .await
         .expect("insert oci_blobs row");
 
-        let app = fx.router_anon(router());
+        let app = fx.router_anon(router(None));
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{}/myimage/blobs/{}", fx.repo_key, digest))
@@ -17982,7 +17996,7 @@ mod token_lockout_regression_tests {
             .header("Authorization", basic)
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
@@ -18063,7 +18077,7 @@ mod token_lockout_regression_tests {
             .header("Authorization", basic)
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
@@ -19038,7 +19052,7 @@ mod manifest_digest_db_tests {
         let auth = bearer(&fx).await;
 
         let (status, _, body) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/keycloak/manifests/26.7.0", fx.repo_key),
@@ -19076,7 +19090,7 @@ mod manifest_digest_db_tests {
         let ok_auth = bearer(&ok).await;
 
         let (status, _, body) = send(
-            router().with_state(ok.state.clone()),
+            router(None).with_state(ok.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/keycloak/manifests/26.7.0", ok.repo_key),
@@ -19143,7 +19157,7 @@ mod manifest_digest_db_tests {
 
         // 1. Push body A under tag v1, then overwrite v1 with body B.
         let (st, h, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 manifest_uri("v1"),
@@ -19161,7 +19175,7 @@ mod manifest_digest_db_tests {
             .to_string();
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 manifest_uri("v1"),
@@ -19176,7 +19190,7 @@ mod manifest_digest_db_tests {
         // 1a. Tagged pull still works through the refactored resolver: the tag
         //     now serves B with its stored content type.
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(Method::GET, manifest_uri("v1"), &auth, None, Bytes::new()),
         )
         .await;
@@ -19187,7 +19201,7 @@ mod manifest_digest_db_tests {
         // 2. The tag now resolves to B, but A must still be pullable by digest
         //    (previously 404 MANIFEST_UNKNOWN — the bug).
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 manifest_uri(&digest_a),
@@ -19204,7 +19218,7 @@ mod manifest_digest_db_tests {
 
         // 3. HEAD mirrors GET: same Content-Length, no body.
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::HEAD,
                 manifest_uri(&digest_a),
@@ -19224,7 +19238,7 @@ mod manifest_digest_db_tests {
         // 4. A genuinely-absent digest is still 404.
         let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(Method::GET, manifest_uri(absent), &auth, None, Bytes::new()),
         )
         .await;
@@ -19232,7 +19246,7 @@ mod manifest_digest_db_tests {
 
         // 5. DELETE by digest removes the object; the digest then 404s.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::DELETE,
                 manifest_uri(&digest_a),
@@ -19245,7 +19259,7 @@ mod manifest_digest_db_tests {
         assert_eq!(st, StatusCode::ACCEPTED, "DELETE A by digest");
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 manifest_uri(&digest_a),
@@ -19307,7 +19321,7 @@ mod manifest_digest_db_tests {
             br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:abababababababababababababababababababababababababababababababab","size":1},"layers":[]}"#,
         );
         let (st, h, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/image/manifests/v1", fx.repo_key),
@@ -19328,7 +19342,7 @@ mod manifest_digest_db_tests {
         // committed metadata for the digest: pulling through repo B must 404
         // rather than leak repo A's manifest.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", other_key, digest),
@@ -19353,7 +19367,7 @@ mod manifest_digest_db_tests {
             r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{digest}","size":1}}]}}"#
         ));
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/image/manifests/latest", other_key),
@@ -19366,7 +19380,7 @@ mod manifest_digest_db_tests {
         assert_eq!(st, StatusCode::CREATED, "PUT index into repo B");
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", other_key, digest),
@@ -19384,7 +19398,7 @@ mod manifest_digest_db_tests {
 
         // Sanity: repo A still serves its own digest.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", fx.repo_key, digest),
@@ -19491,7 +19505,7 @@ mod manifest_digest_db_tests {
         .expect("create failure trigger");
 
         let (status, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::DELETE,
                 format!("/{}/image/manifests/v1", fx.repo_key),
@@ -19635,13 +19649,13 @@ mod oci_blob_upload_streaming_tests {
         }
 
         fn app(&self) -> Router {
-            router().with_state(self.inner.state.clone())
+            router(None).with_state(self.inner.state.clone())
         }
 
         fn app_with_max_upload_size(&self, max_upload_size_bytes: u64) -> Router {
             let mut state = (*self.inner.state).clone();
             state.config.max_upload_size_bytes = max_upload_size_bytes;
-            router().with_state(Arc::new(state))
+            router(None).with_state(Arc::new(state))
         }
 
         fn storage(&self) -> Arc<dyn crate::storage::StorageBackend> {
@@ -21411,7 +21425,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "first-patch-race".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -21539,7 +21553,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -21606,7 +21620,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"copy without row lock");
         let digest = compute_sha256(&content);
 
@@ -21701,7 +21715,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "delete-repo-on-copy".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"monolithic db failure");
         let digest = compute_sha256(&content);
 
@@ -21772,7 +21786,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "reject-blob-insert".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, _headers, body) = send(
             app,
@@ -21935,7 +21949,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-ambiguous-start".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, _headers, body) = send(
             app,
@@ -21990,7 +22004,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-ambiguous-patch".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -22400,7 +22414,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "session-aware".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"commit-before-cleanup");
         let digest = compute_sha256(&content);
 
@@ -22877,7 +22891,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -22966,7 +22980,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let content = Bytes::from_static(b"A");
         let digest = compute_sha256(&content);
@@ -23335,7 +23349,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let digest = compute_sha256(b"hello world");
 
         let (status, headers, body) = send(
@@ -23799,7 +23813,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-cancel-faildelete".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -24076,7 +24090,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let wrong_digest = compute_sha256(b"hello WORLD");
 
         let (status, headers, body) = send(
@@ -24192,7 +24206,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends.clone(), "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let wrong_digest = compute_sha256(b"hello WORLD");
 
         let (status, headers, body) = send(
@@ -24548,7 +24562,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let content = Bytes::from_static(b"A");
         let digest = compute_sha256(&content);
@@ -24974,7 +24988,7 @@ mod token_service_query_validation_tests {
             .uri("/token?service=victim.example.com")
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -25000,7 +25014,7 @@ mod token_service_query_validation_tests {
             .uri(format!("/token?service={OCI_TOKEN_SERVICE}"))
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -25026,7 +25040,7 @@ mod token_service_query_validation_tests {
             .uri("/token")
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -26449,7 +26463,7 @@ mod cross_repo_session_regression_tests {
         let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
         let auth = basic_auth(&username, &password);
 
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start under repo A.
         let req = Request::builder()
@@ -26525,7 +26539,7 @@ mod cross_repo_session_regression_tests {
         let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
         let auth = basic_auth(&username, &password);
 
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26625,7 +26639,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mm").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26722,7 +26736,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "nd").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26775,7 +26789,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mono").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let body = b"monolithic-blob-payload".to_vec();
         let digest = format!("sha256:{}", sha256_hex(&body));
@@ -26824,7 +26838,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "monomm").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let body = b"monolithic-bytes-A".to_vec();
         // Digest of a DIFFERENT payload so verification must fail.
@@ -26901,7 +26915,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/octet-stream")
             .body(Body::from(body.to_vec()))
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -26938,7 +26952,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -27004,7 +27018,7 @@ mod cross_repo_session_regression_tests {
                 .header("Authorization", &auth)
                 .body(Body::empty())
                 .unwrap();
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -27088,7 +27102,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/octet-stream")
             .body(Body::from(body))
             .unwrap();
-        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::METHOD_NOT_ALLOWED,
@@ -27118,7 +27132,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
             .body(Body::from(manifest))
             .unwrap();
-        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::METHOD_NOT_ALLOWED,
@@ -27188,7 +27202,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
             .body(Body::from(body.clone()))
             .unwrap();
-        let status = router()
+        let status = router(None)
             .with_state(state)
             .oneshot(req)
             .await
@@ -27261,7 +27275,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", "Bearer anonymous")
             .body(Body::empty())
             .unwrap();
-        let (status, body) = tdh::send(router().with_state(state), req).await;
+        let (status, body) = tdh::send(router(None).with_state(state), req).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -27295,7 +27309,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "upstat").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // Seed an OPEN session with a real offset, as two prior PATCHes
         // totalling 12 bytes would have left it.
@@ -27387,7 +27401,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "refapi").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let subject_digest = format!("sha256:{}", "5".repeat(64));
         let referrer = serde_json::json!({
@@ -27609,7 +27623,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mc").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -27745,7 +27759,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state_post_patch.clone())
             .oneshot(req)
             .await
@@ -27773,7 +27787,7 @@ mod cross_repo_session_regression_tests {
                 .header("Authorization", &auth)
                 .body(Body::from((*chunk).clone()))
                 .unwrap();
-            let resp = router()
+            let resp = router(None)
                 .with_state(state_post_patch.clone())
                 .oneshot(req)
                 .await
@@ -27799,7 +27813,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state_complete.clone())
             .oneshot(req)
             .await
@@ -27928,7 +27942,7 @@ mod oci_write_authz_and_size_tests {
             .header("Authorization", bearer)
             .body(Body::empty())
             .unwrap();
-        router()
+        router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -28150,7 +28164,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -28178,7 +28192,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(form_post("/token", String::new()))
             .await
@@ -28203,7 +28217,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let anonymous = router()
+        let anonymous = router(None)
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
@@ -28213,7 +28227,7 @@ mod token_refresh_grant_tests {
             )
             .await
             .unwrap();
-        let bad_bearer = router()
+        let bad_bearer = router(None)
             .with_state(state)
             .oneshot(
                 Request::builder()
@@ -28243,7 +28257,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(true).await else {
             return;
         };
-        let get = router()
+        let get = router(None)
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
@@ -28253,7 +28267,7 @@ mod token_refresh_grant_tests {
             )
             .await
             .unwrap();
-        let post = router()
+        let post = router(None)
             .with_state(state)
             .oneshot(form_post("/token", String::new()))
             .await
@@ -28281,7 +28295,7 @@ mod token_refresh_grant_tests {
         };
 
         // `docker login`: password grant with access_type=offline.
-        let login = router()
+        let login = router(None)
             .with_state(state.clone())
             .oneshot(form_post(
                 "/token",
@@ -28299,7 +28313,7 @@ mod token_refresh_grant_tests {
         // `docker pull`: the refresh grant, carrying no Authorization header.
         let pull_token = match refresh.as_deref() {
             Some(rt) => Some(
-                router()
+                router(None)
                     .with_state(state)
                     .oneshot(form_post(
                         "/token",
@@ -28343,7 +28357,7 @@ mod token_refresh_grant_tests {
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
         );
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let body = read_body(resp).await;
@@ -28365,7 +28379,7 @@ mod token_refresh_grant_tests {
             return;
         };
         let body = format!("grant_type=password&username={username}&password=real-test-password");
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let bytes = read_body_bytes(resp).await;
@@ -28395,7 +28409,7 @@ mod token_refresh_grant_tests {
         let body = format!(
             "grant_type=password&username={username}&password={api_token}&access_type=offline"
         );
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let bytes = read_body_bytes(resp).await;
@@ -28421,7 +28435,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28464,7 +28478,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28529,7 +28543,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28568,7 +28582,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, auth_service)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28620,7 +28634,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(form_post(
                 "/token",
@@ -28638,7 +28652,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         for body in [
             "grant_type=refresh_token".to_string(),
             "grant_type=refresh_token&refresh_token=".to_string(),
@@ -28666,7 +28680,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper&offline_token=true",
@@ -28692,7 +28706,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper",
@@ -28725,7 +28739,7 @@ mod token_refresh_grant_tests {
             .generate_api_token(user_id, "get-offline-test", vec!["*".to_string()], None)
             .await
             .expect("generate API token");
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper&offline_token=true",
@@ -28761,7 +28775,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28802,7 +28816,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28846,7 +28860,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, auth_service)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         // Interactive login mints a web-session refresh token.
         let (_user, web) = auth_service
@@ -29032,7 +29046,7 @@ mod proxy_scan_block_tests {
 
     /// Anonymous manifest GET through the real router.
     async fn pull_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{repo_key}/app/manifests/{reference}"))
@@ -30369,7 +30383,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30489,7 +30503,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method(method)
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30622,7 +30636,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30770,7 +30784,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -31455,7 +31469,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -31579,7 +31593,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -32110,7 +32124,7 @@ mod proxy_scan_block_tests {
     /// `pull_manifest`). HEAD is deliberately ungated, which is exactly why it
     /// must not publish catalog rows.
     async fn head_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("HEAD")
             .uri(format!("/{repo_key}/app/manifests/{reference}"))
@@ -33772,7 +33786,7 @@ mod virtual_scan_gate_tests {
     }
 
     async fn pull(state: &SharedState, image_name: &str, kind: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{image_name}/{kind}/{reference}"))
@@ -35758,7 +35772,7 @@ mod oci_read_authz_tests {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            tdh::send(router().with_state(self.state.clone()), req).await
+            tdh::send(router(None).with_state(self.state.clone()), req).await
         }
 
         /// Like [`Self::call`], but also returns the response headers, for the
@@ -35775,7 +35789,7 @@ mod oci_read_authz_tests {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+            tdh::send_with_headers(router(None).with_state(self.state.clone()), req).await
         }
 
         async fn teardown(&self) {
@@ -36518,7 +36532,7 @@ mod oci_read_authz_tests {
             .body(Body::empty())
             .expect("build request");
         let (version_anon, _, version_headers) =
-            tdh::send_with_headers(router().with_state(f.state.clone()), anon_req).await;
+            tdh::send_with_headers(router(None).with_state(f.state.clone()), anon_req).await;
         let (version_member, _) = f.call("GET", "/".to_string(), &member_bearer).await;
         let (token_status, token_body) = f.call("GET", "/token".to_string(), &member_bearer).await;
         let token: serde_json::Value = serde_json::from_slice(&token_body).unwrap_or_default();
@@ -37277,12 +37291,12 @@ mod oci_error_envelope_db_tests {
                 .expect("build request")
         };
         let (rejected_status, rejected_json, rejected_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             get("/token?service=a&service=b"),
         )
         .await;
         let (ok_status, ok_json, ok_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             get("/token?service=artifact-keeper"),
         )
         .await;
@@ -37360,13 +37374,13 @@ mod oci_error_envelope_db_tests {
         };
 
         let (denied_status, denied_json, denied_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             put(read_token, uri.clone()),
         )
         .await;
 
         let (allowed_status, _allowed_json, allowed_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             put(full_token, uri.clone()),
         )
         .await;
@@ -37462,9 +37476,9 @@ mod oci_error_envelope_db_tests {
         };
 
         let (blocked_status, blocked_json, blocked_raw) =
-            send(router().with_state(fx.state.clone()), get("blockedimg")).await;
+            send(router(None).with_state(fx.state.clone()), get("blockedimg")).await;
         let (allowed_status, allowed_json, allowed_raw) =
-            send(router().with_state(fx.state.clone()), get("goodimg")).await;
+            send(router(None).with_state(fx.state.clone()), get("goodimg")).await;
 
         let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
             .bind(fx.repo_id)
@@ -37967,7 +37981,7 @@ mod oci_catalog_read_scope_tests {
                 builder = builder.header(AUTHORIZATION, auth);
             }
             let req = builder.body(Body::empty()).expect("build request");
-            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+            tdh::send_with_headers(router(None).with_state(self.state.clone()), req).await
         }
 
         async fn teardown(&self) {
@@ -38472,7 +38486,7 @@ mod read_scope_db_tests {
             .header(AUTHORIZATION, auth)
             .body(Body::empty())
             .expect("build request");
-        let resp = router()
+        let resp = router(None)
             .with_state(fx.state.clone())
             .oneshot(req)
             .await
@@ -38553,7 +38567,7 @@ mod read_scope_db_tests {
                 .header(AUTHORIZATION, &auth)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(fx.state.clone())
                 .oneshot(req)
                 .await
@@ -38821,7 +38835,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39006,7 +39020,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39178,7 +39192,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39226,7 +39240,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, &scoped)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39458,7 +39472,7 @@ mod oci_v2_resolution_db_error_leak_3761 {
             .header(AUTHORIZATION, authorization)
             .body(Body::empty())
             .expect("build request");
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
