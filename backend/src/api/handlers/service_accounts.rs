@@ -596,6 +596,15 @@ pub async fn create_token(
         crate::services::repo_selector_service::store_token_selector(&state.db, token_id, selector)
             .await?;
     } else if let Some(repo_ids) = &payload.repository_ids {
+        // Mark restricted BEFORE pinning (#4228, #4265 follow-up): a crash
+        // between the mint and the first pin row must leave a deny-all
+        // token, not an unrestricted one the backfill cannot tell apart from
+        // a never-restricted token. See `repo_tokens::create_repo_token`.
+        sqlx::query("UPDATE api_tokens SET repository_restricted = true WHERE id = $1")
+            .bind(token_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         for repo_id in repo_ids {
             sqlx::query!(
                 "INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)",
