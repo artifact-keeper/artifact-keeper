@@ -243,12 +243,18 @@ pub async fn stream_copy_artifact(
 /// folding the raw `QualityGateEvaluation` into this three-state outcome up
 /// front, then matching on it.
 ///
-/// `NotEvaluated` covers two non-fatal cases that the previous code already
-/// treated as "skip the gate, continue":
-///   * `skip_policy_check = true` in the request
+/// `NotEvaluated` covers the non-fatal cases where skipping the gate is the
+/// documented behaviour:
+///   * `skip_policy_check = true` in the request (the admin break-glass
+///     override, #4203)
 ///   * `quality_check_service` is not wired into application state
-///   * the underlying evaluation returned `Err` (missing gate / missing health
-///     score), which has always been logged-and-continued rather than 5xx'd.
+///   * the repository has no enabled gate, or the artifact has no health
+///     score yet (the `AppError::NotFound` defaults, #4156)
+///
+/// A GENUINE evaluation failure (a database error, say) is none of those:
+/// downgrading it to `NotEvaluated` promoted the artifact without the gate
+/// having run — a fail-open (#4204). `evaluate_gate_once` now returns it as
+/// `Err` and both promote routes refuse the promotion for that artifact.
 #[derive(Debug, Clone)]
 pub enum GateOutcome {
     /// Gate evaluation says this promotion must be rejected. The handler
@@ -259,9 +265,9 @@ pub enum GateOutcome {
     /// `warn` (or anything other than `block`). The promotion proceeds and
     /// the violations are attached to the response payload.
     Warn(Vec<QualityGateViolation>),
-    /// No actionable gate state: either the gate passed, the evaluation was
-    /// skipped (caller opt-out, service not wired, or recoverable error
-    /// inside `evaluate_quality_gate`).
+    /// No actionable gate state: either the gate passed, or the evaluation
+    /// was legitimately skipped (caller opt-out, service not wired, or one
+    /// of the `AppError::NotFound` "nothing to evaluate" defaults).
     NotEvaluated,
 }
 
@@ -269,10 +275,16 @@ pub enum GateOutcome {
 /// per promotion request and reduce the result to a `GateOutcome`.
 ///
 /// Skips evaluation when the caller passed `skip_policy_check = true` or when
-/// `quality_check_service` is not wired into application state. Errors from
-/// the underlying evaluation (e.g. missing gate, missing health score) are
-/// logged and downgraded to `NotEvaluated`; they are not fatal because the
-/// promotion path historically allowed promotions without a configured gate.
+/// `quality_check_service` is not wired into application state. The two
+/// `AppError::NotFound` defaults (no enabled gate for the repository, no
+/// health score for the artifact) are logged at debug and downgraded to
+/// `NotEvaluated`: promotions on an ungated repository are the common case,
+/// not an error (#4156).
+///
+/// Any OTHER evaluation error is returned as `Err` and fails the promotion
+/// closed (#4204): a gate that could not be evaluated must not silently
+/// promote. The single route maps the error to a retryable 503; the bulk
+/// route fails just that item.
 ///
 /// Returning a single owned outcome here is what lets the handler avoid the
 /// double-evaluation pattern that existed before (#1382 review): the same
@@ -282,22 +294,22 @@ pub async fn evaluate_gate_once(
     artifact_id: Uuid,
     repository_id: Uuid,
     skip_policy_check: bool,
-) -> GateOutcome {
+) -> Result<GateOutcome> {
     if skip_policy_check {
-        return GateOutcome::NotEvaluated;
+        return Ok(GateOutcome::NotEvaluated);
     }
     let Some(qc) = quality_check_service else {
-        return GateOutcome::NotEvaluated;
+        return Ok(GateOutcome::NotEvaluated);
     };
     match qc.evaluate_quality_gate(artifact_id, repository_id).await {
-        Ok(eval) => classify_gate_evaluation(eval),
+        Ok(eval) => Ok(classify_gate_evaluation(eval)),
         Err(e) if gate_error_is_no_op(&e) => {
             tracing::debug!(
                 "Quality gate not evaluated for artifact {}: {}",
                 artifact_id,
                 e
             );
-            GateOutcome::NotEvaluated
+            Ok(GateOutcome::NotEvaluated)
         }
         Err(e) => {
             tracing::warn!(
@@ -305,7 +317,7 @@ pub async fn evaluate_gate_once(
                 artifact_id,
                 e
             );
-            GateOutcome::NotEvaluated
+            Err(e)
         }
     }
 }
@@ -319,7 +331,8 @@ pub async fn evaluate_gate_once(
 /// successful promotion on an ungated repository look like a failure to
 /// log-based alerting (#4156). Matching on the variant rather than on the
 /// message keeps the classification stable if the wording changes. Anything
-/// else (a database error, say) is a real evaluation failure and stays at WARN.
+/// else (a database error, say) is a real evaluation failure and propagates
+/// out of [`evaluate_gate_once`] as `Err` (#4204).
 fn gate_error_is_no_op(err: &AppError) -> bool {
     matches!(err, AppError::NotFound(_))
 }
@@ -952,13 +965,25 @@ pub async fn promote_artifact(
     // violations take precedence in the error response. A gate-blocked
     // promotion returns HTTP 409 Conflict, which is the documented rejection
     // code for promotions blocked by gate policy (#1376).
+    //
+    // Fail closed on a genuine evaluation error (#4204): the raw error is
+    // already logged inside `evaluate_gate_once`; the caller gets a retryable
+    // 503 with a sanitised, actionable message rather than a promotion that
+    // never ran the gate.
     let gate_outcome = evaluate_gate_once(
         state.quality_check_service.as_deref(),
         artifact_id,
         source_repo.id,
         req.skip_policy_check,
     )
-    .await;
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(
+            "Quality gate could not be evaluated; promotion refused for safety. \
+             Retry shortly, or ask an administrator to skip the policy check."
+                .to_string(),
+        )
+    })?;
 
     if let GateOutcome::Block(ref eval) = gate_outcome {
         return Err(gate_block_error(eval));
@@ -1299,13 +1324,34 @@ pub async fn promote_artifacts_bulk(
         // single path returns 409 for the whole request. That difference is
         // deliberate: a bulk promotion reports per-artifact outcomes so a
         // partial result stays distinguishable from a wholesale refusal.
-        let gate_outcome = evaluate_gate_once(
+        //
+        // A genuine evaluation error fails the item closed (#4204) — the
+        // promotion must not proceed with the gate unevaluated. The raw
+        // error was logged inside `evaluate_gate_once`; the per-item message
+        // is the same sanitised wording other DB failures use here.
+        let gate_outcome = match evaluate_gate_once(
             state.quality_check_service.as_deref(),
             *artifact_id,
             source_repo.id,
             req.skip_policy_check,
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    crate::api::handlers::internal_err_message(
+                        "Quality gate evaluation failed; item not promoted",
+                        &e,
+                    )
+                    .to_string(),
+                ));
+                continue;
+            }
+        };
 
         // CVE / licence policy, per item. Not queried for a gate-blocked item:
         // the gate refusal wins, so the evaluation would be discarded.
@@ -4450,6 +4496,123 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], sa).await;
+        }
+
+        /// #4204: a quality-gate evaluation that fails with a genuine error
+        /// (here: the gate service's database is unreachable) must FAIL CLOSED.
+        /// Before the fix the error was logged and downgraded to NotEvaluated,
+        /// so the artifact was promoted with the gate never having run.
+        ///
+        /// The harness wires a `QualityCheckService` backed by a dead pool
+        /// (connection refused) into the otherwise-real state: every gate
+        /// query errors, which is exactly the "the gate could not be
+        /// evaluated" case the issue calls out.
+        fn state_with_broken_gate_service(state: &SharedState) -> SharedState {
+            let broken = sqlx::PgPool::connect_lazy("postgresql://127.0.0.1:1/ak_gate_eval_broken")
+                .expect("connect_lazy never fails");
+            let mut app = (**state).clone();
+            app.quality_check_service = Some(std::sync::Arc::new(QualityCheckService::new(broken)));
+            std::sync::Arc::new(app)
+        }
+
+        #[tokio::test]
+        async fn test_single_promote_gate_evaluation_error_fails_closed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4204-gate-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4204-gate-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "gf-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "gf-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "gf").await;
+            let state = state_with_broken_gate_service(&tdh::build_state(
+                pool.clone(),
+                sdir.to_str().unwrap(),
+            ));
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "gfclosed").await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("a gate evaluation error must refuse the promotion");
+            assert!(
+                matches!(err, AppError::ServiceUnavailable(_)),
+                "the fail-closed refusal is a retryable 503; got {err:?}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "gfclosed").await,
+                "the artifact must NOT be promoted when the gate cannot run"
+            );
+            let (history_rows,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM promotion_history WHERE artifact_id = $1")
+                    .bind(artifact)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count history rows");
+            assert_eq!(
+                history_rows, 0,
+                "a refused promotion leaves no audit-trail success row"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        #[tokio::test]
+        async fn test_bulk_promote_gate_evaluation_error_fails_item_closed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4204b-gate-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4204b-gate-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "gbf-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "gbf-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "gbf").await;
+            let state = state_with_broken_gate_service(&tdh::build_state(
+                pool.clone(),
+                sdir.to_str().unwrap(),
+            ));
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "gbfclosed").await;
+
+            let res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk reports per-item outcomes rather than failing the batch");
+            assert_eq!(res.0.promoted, 0, "nothing may be promoted");
+            assert_eq!(res.0.failed, 1);
+            let message = res.0.results[0].message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("Quality gate evaluation failed"),
+                "the item failure must name the gate evaluation; got {message:?}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "gbfclosed").await,
+                "the artifact must NOT be promoted when the gate cannot run"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
         }
 
         /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.
