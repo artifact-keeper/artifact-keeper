@@ -911,6 +911,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
             .nest("/smtp", handlers::smtp::router())
             .nest("/age-gate", handlers::age_gate::admin_router())
+            .nest("/holds", handlers::download_holds::admin_router())
             // Admin quality-checks list-all (#2419). Kept inside the `/admin`
             // block so `admin_middleware` gates it; the artifact-scoped
             // `/quality/checks` (auth-only, 400s without artifact_id) is the

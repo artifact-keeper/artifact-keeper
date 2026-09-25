@@ -8771,10 +8771,10 @@ impl ScannerService {
         tracing::info!(
             artifact_id = %artifact_id,
             violations = %reason,
-            "Quarantining artifact after failed scan due to scan policy violation"
+            "Blocking artifact after failed scan due to scan policy violation"
         );
         if let Err(e) = sqlx::query(
-            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+            "UPDATE artifacts SET quarantine_status = 'policy_blocked', quarantine_until = NULL, \
              quarantine_reason = $2 \
              WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
         )
@@ -8860,7 +8860,7 @@ impl ScannerService {
             tracing::info!(
                 artifact_id = %artifact_id,
                 violations = %reason,
-                "Quarantining artifact due to scan policy violation"
+                "Recording scan-policy block (not quarantine) due to scan policy violation"
             );
         }
 
@@ -8899,7 +8899,7 @@ impl ScannerService {
             // quarantine, nor a terminal admin rejection.
             sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, \
-                       quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
+                       quarantine_until = CASE WHEN $2 IN ('quarantined', 'policy_blocked') THEN NULL ELSE quarantine_until END, \
                        quarantine_reason = $3 \
                  WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
                        AND quarantine_status IS DISTINCT FROM 'rejected'",
@@ -8946,7 +8946,7 @@ pub(crate) fn post_scan_status_decision(
             // Convert the expiring hold into a permanent policy quarantine:
             // `clear_until` drops the expiry so the block does not lapse.
             return PostScanDecision {
-                status: "quarantined".to_string(),
+                status: "policy_blocked".to_string(),
                 clear_until: true,
                 reason: Some(p.violations.join("; ")),
             };
@@ -8960,7 +8960,7 @@ pub(crate) fn post_scan_status_decision(
     }
     if let Some(p) = violation {
         return PostScanDecision {
-            status: "quarantined".to_string(),
+            status: "policy_blocked".to_string(),
             clear_until: false,
             reason: Some(p.violations.join("; ")),
         };
