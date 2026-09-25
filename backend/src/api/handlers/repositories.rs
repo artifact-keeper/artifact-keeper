@@ -957,7 +957,10 @@ pub struct UpdateRepositoryRequest {
     /// "unverified upstream"); send an ASCII-armored PUBLIC key block to set
     /// it. A private-key block or malformed armor is rejected (400). The
     /// response never echoes the key — only `has_trusted_gpg_key`.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<String>)]
     pub trusted_gpg_key: Option<Option<String>>,
     /// Update the keyless-sync unverified-ingest opt-in (#2569). When provided,
@@ -995,7 +998,10 @@ pub struct UpdateRepositoryRequest {
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
     /// update onto the stored config. Only valid for Debian Remote repos.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<DebianConfigPatch>)]
     pub debian: Option<Option<DebianConfigPatch>>,
     /// Enable curation-rule enforcement on this repository's proxy paths.
@@ -1008,21 +1014,6 @@ pub struct UpdateRepositoryRequest {
     /// rather than an unconstrained string.
     #[schema(value_type = String, example = "allow")]
     pub curation_default_action: Option<String>,
-}
-
-/// Deserialize a nullable optional field into `Option<Option<T>>` so a handler
-/// can distinguish three states: the key absent (`None`), the key present and
-/// `null` (`Some(None)`), and the key present with a value (`Some(Some(v))`).
-/// Serde maps a bare `Option<T>` null to `None`, collapsing the first two —
-/// this preserves the distinction needed for partial-update-vs-clear.
-fn deserialize_double_option<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 impl UpdateRepositoryRequest {
