@@ -425,8 +425,19 @@ impl PackageService {
         // guard rejected the update (in which case that row is unchanged and
         // still the representative).
         if should_update_package_row {
-            sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                r#"
+            // #3931: two concurrent publishes of the same (package, version)
+            // race this statement — the loser's ON CONFLICT guard returns no
+            // `upserted` row and the fallback subquery still reads the
+            // statement-start snapshot, which predates the winner's
+            // just-committed `package_versions` row, so `COALESCE(NULL, NULL)`
+            // lands in `packages.size_bytes NOT NULL` (23502). A retry gets a
+            // fresh snapshot where the winner's row is visible. Bounded; any
+            // other error propagates immediately.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let result = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    r#"
                 {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET version = $2,
@@ -444,15 +455,23 @@ impl PackageService {
                     updated_at = NOW()
                 WHERE id = $1
                 "#
-            )))
-            .bind(package_id)
-            .bind(version)
-            .bind(size_bytes)
-            .bind(checksum_sha256)
-            .bind(description)
-            .bind(&metadata)
-            .execute(&self.db)
-            .await?;
+                )))
+                .bind(package_id)
+                .bind(version)
+                .bind(size_bytes)
+                .bind(checksum_sha256)
+                .bind(description)
+                .bind(&metadata)
+                .execute(&self.db)
+                .await;
+                const MAX_UPSERT_ATTEMPTS: u32 = 3;
+                let retryable = matches!(&result, Err(e)
+                    if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23502"));
+                if !retryable || attempt >= MAX_UPSERT_ATTEMPTS {
+                    result?;
+                    break;
+                }
+            }
         } else {
             // Data-modifying CTEs execute exactly once even when
             // unreferenced, so the version upsert still runs.
@@ -1933,5 +1952,51 @@ mod catalog_maintenance_tests {
         fx.teardown().await;
 
         assert_eq!(size, 100_000, "the catalog reports the archive's size");
+    }
+
+    /// #3931: two concurrent publishers of the same (name, version) raced the
+    /// upsert CTE into writing `COALESCE(NULL, NULL)` into
+    /// `packages.size_bytes NOT NULL` (23502). This loop made that crash
+    /// likely within a handful of iterations pre-fix; with the retry both
+    /// tasks run clean.
+    #[tokio::test]
+    async fn concurrent_publish_same_version_never_violates_size_not_null_3931() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut handles = Vec::new();
+        for tag in ["a", "b"] {
+            let svc = PackageService::new(fx.pool.clone());
+            let repo_id = fx.repo_id;
+            handles.push(tokio::spawn(async move {
+                for i in 0..60_i64 {
+                    svc.create_or_update_from_artifact(
+                        repo_id,
+                        "race-pkg",
+                        "1.0.0",
+                        if tag == "a" { 100 + i } else { 200 + i },
+                        &format!("{}{:0>63}", tag, i),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("upsert must not fail with 23502 (#3931)");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("publisher task panicked");
+        }
+
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'race-pkg'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("packages row exists");
+        assert!(size > 0, "size_bytes must be a real size, got {size}");
+
+        fx.teardown().await;
     }
 }
