@@ -119,29 +119,31 @@ pub fn webhook_within_token_scope(token_scope: &AccessScope, repository_id: Opti
 /// webhook takes that same exit, so a repository-scoped token cannot read the
 /// status code as an existence oracle either.
 ///
-/// # What this gate fronts (#3715)
+/// # What this gate fronts (#3715, #3901)
 ///
-/// The `TENANT-GATE-ONLY` justification inside argued in MANAGEMENT terms,
-/// but no management verb reaches here any more: `create_webhook` goes
-/// through `enforce_admin_audited`, and delete / enable / disable / test /
-/// rotate-secret / redeliver each call `auth.require_admin()` first. The only
-/// two callers left are pure READS -- [`get_webhook`] and [`list_deliveries`]
-/// -- which return a private repository's webhook `url`, `headers`,
-/// `secret_digest` and delivery history. (The raw secret is not among them:
-/// it is returned once at create and is unrecoverable afterwards, so what a
-/// bad decision here leaks is secret METADATA, not the signing key.)
+/// The `TENANT-GATE-ONLY` justification this gate used to carry argued in
+/// MANAGEMENT terms, but no management verb reaches here any more:
+/// `create_webhook` goes through `enforce_admin_audited`, and delete /
+/// enable / disable / test / rotate-secret / redeliver each call
+/// `auth.require_admin()` first. The only two callers left are pure READS --
+/// [`get_webhook`] and [`list_deliveries`] -- which return a private
+/// repository's webhook `url`, `headers`, `secret_digest` and delivery
+/// history. (The raw secret is not among them: it is returned once at create
+/// and is unrecoverable afterwards, so what a bad decision here leaks is
+/// secret METADATA, not the signing key.)
 ///
-/// The action-blind tenant term is nonetheless kept deliberately rather than
-/// by omission: it is what makes a repository role holder see the same
-/// webhook on fetch that `list_webhooks` shows them, whose `role_assignments`
-/// arm is likewise action-blind. It is knowingly WIDER than that listing in
-/// exactly one case -- #3708 narrowed the listing's fine-grained
-/// `permissions` arm to `read`-carrying grants, while `RepoAccess::TenantOnly`
-/// still admits any non-empty `actions`, so a `{write}`-only grantee is
-/// refused the webhook in the list but served it by id. Aligning the two
-/// means `RepoAccess::READ` here, which also narrows the role-assignment arm:
-/// a behaviour change for existing members, and the policy question #3708
-/// left open rather than something a confinement fix settles in passing.
+/// #3901 settled the policy question #3708 left open: the by-id read must
+/// require the same READ-carrying access as [`list_webhooks`], so this gate
+/// asks [`RepoAccess::READ`], not the action-blind tenant term. That fails
+/// closed in exactly two places the tenant term fell open:
+///
+/// * a `{write}`-only fine-grained `permissions` grantee was refused the
+///   webhook in the listing but served it -- with its URL and secret
+///   metadata -- by id;
+/// * a role assignment whose role carries no `read`/`admin` capability
+///   (a custom publish-only role) admitted the same read. Built-in roles
+///   all carry `read` (admin/developer/reader/repository-owner), so
+///   existing members with stock roles are unaffected.
 async fn authorize_webhook_access(
     state: &SharedState,
     auth: &AuthExtension,
@@ -177,17 +179,17 @@ async fn authorize_webhook_access(
     let repo_accessible = if auth.is_admin || created_by == Some(auth.user_id) {
         false
     } else if let Some(repo_id) = repository_id {
-        // TENANT-GATE-ONLY (#3331, justification restated in #3715). This
-        // helper fronts two pure READS, not management -- see the "What this
-        // gate fronts" section on the function's doc comment for why the
-        // action-blind tenant term is still the intended question here, and
-        // for the one case in which it is knowingly wider than the listing.
+        // #3901: the by-id read requires the same READ-carrying access the
+        // listing's grant arm carries -- the action-blind `TenantOnly` term
+        // used to serve this repository's webhook URL and secret metadata to
+        // a `{write}`-only grantee the listing refused. See the function's
+        // doc comment for the two fail-closed consequences.
         let repo_service = state.create_repository_service();
         repo_service
             .user_can_access_repo(
                 repo_id,
                 auth.user_id,
-                crate::services::repository_service::RepoAccess::TenantOnly,
+                crate::services::repository_service::RepoAccess::READ,
             )
             .await?
     } else {
@@ -3737,6 +3739,127 @@ mod tests {
             ));
 
             cleanup(&pool, &[repo], &[owner, stranger, admin, outsider]).await;
+        }
+
+        // ===================================================================
+        // #3901: get_webhook / list_deliveries require a READ-carrying
+        // grant, exactly as list_webhooks does. The pre-fix gate was the
+        // action-blind `RepoAccess::TenantOnly`, which served the webhook
+        // (URL, headers, secret metadata) to a `{write}`-only grantee the
+        // listing refused.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn get_webhook_by_id_requires_read_carrying_grant() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let owner = create_user(&pool, false).await;
+            let writer = create_user(&pool, false).await;
+            let reader = create_user(&pool, false).await;
+            let publisher = create_user(&pool, false).await;
+            let repo = create_repo(&pool).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let wh = insert_webhook(&pool, Some(owner), Some(repo)).await;
+
+            // Fine-grained grants: {write} and {read} on the repository.
+            tdh::grant_permission(&pool, "user", writer, "repository", repo, &["write"]).await;
+            tdh::grant_permission(&pool, "user", reader, "repository", repo, &["read"]).await;
+
+            // A custom publish-only role (no `read` capability) for the
+            // role-assignment arm: the tenant gate admitted it, READ must not.
+            let role_name = format!("wh3901-pub-{}", &Uuid::new_v4().to_string()[..8]);
+            let role_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO roles (name, description, permissions, is_system) \
+                 VALUES ($1, 'publish-only test role', ARRAY['write']::TEXT[], false) RETURNING id",
+            )
+            .bind(&role_name)
+            .fetch_one(&pool)
+            .await
+            .expect("insert publish-only role");
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(publisher)
+            .bind(role_id)
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("assign publish-only role");
+
+            let deliveries_query = || ListDeliveriesQuery {
+                status: None,
+                page: None,
+                per_page: None,
+            };
+
+            // The {write}-only grantee: 404 by id and on deliveries, matching
+            // the listing (pre-fix: 200 by id -- the bug).
+            for caller in [writer, publisher] {
+                assert!(
+                    is_not_found(
+                        &get_webhook(
+                            axum::extract::State(state.clone()),
+                            axum::Extension(auth_for(caller, false)),
+                            axum::extract::Path(wh),
+                        )
+                        .await
+                    ),
+                    "#3901: a non-read grantee must get 404 on get_webhook"
+                );
+                assert!(
+                    is_not_found(
+                        &list_deliveries(
+                            axum::extract::State(state.clone()),
+                            axum::Extension(auth_for(caller, false)),
+                            axum::extract::Path(wh),
+                            axum::extract::Query(deliveries_query()),
+                        )
+                        .await
+                    ),
+                    "#3901: a non-read grantee must get 404 on list_deliveries"
+                );
+            }
+
+            // Positive controls: the read grantee and the owner still read.
+            assert!(
+                get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(reader, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+                .is_ok(),
+                "a read grantee must keep reading the webhook by id"
+            );
+            assert!(
+                get_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+                .is_ok(),
+                "the owner must keep reading their own webhook"
+            );
+
+            sqlx::query("DELETE FROM role_assignments WHERE role_id = $1")
+                .bind(role_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM roles WHERE id = $1")
+                .bind(role_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await
+                .ok();
+            cleanup(&pool, &[repo], &[owner, writer, reader, publisher]).await;
         }
 
         // ===================================================================

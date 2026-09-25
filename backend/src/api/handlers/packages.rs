@@ -26,17 +26,24 @@ use crate::services::repository_service::{
 /// packages endpoints enforce the same per-user authorization model
 /// (public repos plus any repo the user holds a role assignment for) instead
 /// of treating every authenticated caller as entitled to all packages.
+///
+/// #3901: a repository-scoped token binds AHEAD of `is_admin`, matching
+/// `search::intersect_token_scope` and the webhook reads (#1803, #3715): an
+/// admin holding a token minted for repository A must not enumerate other
+/// repositories' packages with it. Token scope is confinement, not a
+/// privilege boundary, so it narrows admins too.
 fn repo_visibility_for(auth: Option<&AuthExtension>) -> RepoVisibility {
     match auth {
         None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
-        // Repo-scoped token: restrict strictly to the token's allowed set.
+        // Repo-scoped token: restrict strictly to the token's allowed set,
+        // whether its owner is an admin or not (#3901).
         Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
             a.allowed_repo_ids
                 .as_allowed_repo_ids()
                 .unwrap_or_default()
                 .to_vec(),
         ),
+        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -707,10 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn test_visibility_admin_scoped_token_still_all() {
-        // Admin bypasses scope restrictions, matching list_repositories.
-        let auth = make_auth(Uuid::new_v4(), true, Some(vec![Uuid::new_v4()]));
-        assert_eq!(repo_visibility_for(Some(&auth)), RepoVisibility::All);
+    fn test_visibility_admin_scoped_token_is_confined() {
+        // #3901: token scope binds ahead of is_admin -- an admin holding a
+        // repository-scoped token is confined to the token's set, matching
+        // search::intersect_token_scope and the webhook reads.
+        let repo = Uuid::new_v4();
+        let auth = make_auth(Uuid::new_v4(), true, Some(vec![repo]));
+        assert_eq!(
+            repo_visibility_for(Some(&auth)),
+            RepoVisibility::Ids(vec![repo])
+        );
     }
 
     #[test]

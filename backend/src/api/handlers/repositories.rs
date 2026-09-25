@@ -246,20 +246,24 @@ pub(crate) async fn require_repo_admin(
 /// own ACLs — must use [`member_read_visibility`] instead.
 ///
 /// * anonymous              -> public repositories only
+/// * repo-scoped API token  -> exactly the token's allowed set. This arm is
+///   checked BEFORE the admin arm (#3901): token scope is confinement, not
+///   a privilege boundary, so an admin holding a repository-scoped token is
+///   narrowed to the token's set exactly as
+///   `search::intersect_token_scope` and the webhook reads already do
+///   (#1803, #3715)
 /// * global admin           -> everything
-/// * repo-scoped API token  -> exactly the token's allowed set (checked before
-///   the general user arm; admin tokens are handled above and bypass scope)
 /// * any other principal    -> public repositories plus their own grants
 pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibility {
     match auth {
         None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
             a.allowed_repo_ids
                 .as_allowed_repo_ids()
                 .unwrap_or_default()
                 .to_vec(),
         ),
+        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -26021,18 +26025,20 @@ mod apt_validation_tests {
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped)),
-            RepoVisibility::Ids(scoped_to)
+            RepoVisibility::Ids(scoped_to.clone())
         );
 
-        // An ADMIN repo-scoped token still resolves to `All`: the admin arm is
-        // matched first, mirroring the listing.
+        // #3901: an ADMIN repo-scoped token is confined to the token's set --
+        // the scope arm is matched ahead of the admin arm, exactly as
+        // `search::intersect_token_scope` and the webhook reads already
+        // narrow an admin's scoped credential.
         let scoped_admin = AuthExtension {
             is_admin: true,
             ..scoped
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped_admin)),
-            RepoVisibility::All
+            RepoVisibility::Ids(scoped_to)
         );
     }
 
