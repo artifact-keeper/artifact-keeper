@@ -18001,6 +18001,8 @@ mod tests {
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
             project_id: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
