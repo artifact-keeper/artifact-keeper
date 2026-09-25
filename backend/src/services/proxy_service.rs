@@ -358,6 +358,54 @@ impl CacheCommitDigest {
             Self::Sha256Hex(h) | Self::Sha512Hex(h) | Self::Sha1Hex(h) => h,
         }
     }
+
+    /// The algorithm half of this digest.
+    pub fn algorithm(&self) -> CommitDigestAlgorithm {
+        match self {
+            Self::Sha256Hex(_) => CommitDigestAlgorithm::Sha256,
+            Self::Sha512Hex(_) => CommitDigestAlgorithm::Sha512,
+            Self::Sha1Hex(_) => CommitDigestAlgorithm::Sha1,
+        }
+    }
+}
+
+/// The algorithm of a [`CacheCommitDigest`], without the value.
+///
+/// Declared up front on the deferred-digest streaming path (#3982) so the tee
+/// can hash the forwarded bytes from the first chunk; the digest VALUE is only
+/// needed at cache-commit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDigestAlgorithm {
+    Sha256,
+    Sha512,
+    Sha1,
+}
+
+/// A commit-gate digest that resolves concurrently with the body stream
+/// (#3982). The shared future is driven by the tee itself once a cold-cache
+/// leader actually tees (so the digest fetch overlaps the body stream), and a
+/// warm cache hit never polls it at all — a hit pays for the digest
+/// resolution neither on the response path nor in the background. `None` from
+/// the future means "no authoritative digest": the commit proceeds
+/// unverified, exactly like a caller that passed `None` up front.
+pub type DeferredCommitDigest =
+    futures::future::Shared<futures::future::BoxFuture<'static, Option<CacheCommitDigest>>>;
+
+/// How the streaming cache commit learns the digest it is gated on (#2274,
+/// GHSA-qxv7-p3mq-88fv).
+#[derive(Clone)]
+pub enum ExpectedCommitDigest {
+    /// Known before the fetch starts — the original gate.
+    Resolved(CacheCommitDigest),
+    /// Resolves concurrently with the body stream (#3982): the content fetch
+    /// no longer waits on the digest (e.g. Maven's `.sha1` sidecar) round-trip
+    /// before starting, cutting a warm Maven proxy GET from two sequential
+    /// proxy-cache round-trips to one. Only the final verify-and-commit step
+    /// needs both results, so the security posture is unchanged.
+    Deferred {
+        algorithm: CommitDigestAlgorithm,
+        digest: DeferredCommitDigest,
+    },
 }
 
 /// Running hasher for the non-SHA-256 commit gates (GHSA-qxv7-p3mq-88fv):
@@ -372,10 +420,16 @@ enum TeeDigestHasher {
 
 impl TeeDigestHasher {
     fn for_expected(expected: &CacheCommitDigest) -> Option<Self> {
-        match expected {
-            CacheCommitDigest::Sha1Hex(_) => Some(Self::Sha1(sha1::Sha1::default())),
-            CacheCommitDigest::Sha512Hex(_) => Some(Self::Sha512(sha2::Sha512::default())),
-            CacheCommitDigest::Sha256Hex(_) => None,
+        Self::for_algorithm(expected.algorithm())
+    }
+
+    fn for_algorithm(algorithm: CommitDigestAlgorithm) -> Option<Self> {
+        match algorithm {
+            CommitDigestAlgorithm::Sha1 => Some(Self::Sha1(sha1::Sha1::default())),
+            CommitDigestAlgorithm::Sha512 => Some(Self::Sha512(sha2::Sha512::default())),
+            // SHA-256 expectations never get one — the storage layer's
+            // observed checksum covers those.
+            CommitDigestAlgorithm::Sha256 => None,
         }
     }
 
@@ -425,8 +479,11 @@ struct CacheMetadataTemplate {
     /// that returns wrong bytes cannot poison the proxy cache. `None`
     /// preserves the pre-existing behaviour for every other streaming
     /// caller (deb/pypi/plain-Remote), which gate only on the upstream
-    /// Content-Length.
-    expected_checksum: Option<CacheCommitDigest>,
+    /// Content-Length. The digest may be [`ExpectedCommitDigest::Resolved`]
+    /// up front or [`ExpectedCommitDigest::Deferred`] — resolving
+    /// concurrently with the body stream and awaited only at commit time
+    /// (#3982).
+    expected_checksum: Option<ExpectedCommitDigest>,
     /// Owning repository id for the persisted proxy-cache catalog row
     /// (#2218/#2270). Threaded so the streaming Commit arm can upsert
     repository_id: Uuid,
@@ -1880,10 +1937,29 @@ impl CachePersister {
         // reads the completed digest or finds `None` (client disconnect
         // mid-stream, or a cache write abandoned under the #2928 ceiling),
         // which fails the gate closed and skips the cache commit.
-        let tee_hasher = template
-            .expected_checksum
-            .as_ref()
-            .and_then(TeeDigestHasher::for_expected);
+        let tee_hasher = match template.expected_checksum.as_ref() {
+            Some(ExpectedCommitDigest::Resolved(expected)) => {
+                TeeDigestHasher::for_expected(expected)
+            }
+            Some(ExpectedCommitDigest::Deferred { algorithm, .. }) => {
+                TeeDigestHasher::for_algorithm(*algorithm)
+            }
+            None => None,
+        };
+        // #3982: a deferred digest (Maven's `.sha1` sidecar) is only needed at
+        // commit time, but it must RESOLVE concurrently with the body stream
+        // rather than after it — drive the shared future now so the sidecar
+        // fetch overlaps the upstream body. Reaching `tee_stream` at all means
+        // the cache MISSED (a hit never tees), so a warm hit never pays for
+        // the sidecar: neither on the response path nor in the background.
+        if let Some(ExpectedCommitDigest::Deferred { digest, .. }) =
+            template.expected_checksum.as_ref()
+        {
+            let digest = digest.clone();
+            tokio::spawn(async move {
+                let _ = digest.await;
+            });
+        }
         let tee_digest_slot = Arc::new(std::sync::Mutex::new(None::<String>));
         let tee_digest_slot_writer = Arc::clone(&tee_digest_slot);
 
@@ -1944,7 +2020,19 @@ impl CachePersister {
                         // SHA-1/SHA-512. A missing tee digest — the client
                         // disconnected mid-stream, or the cache write was
                         // abandoned — cannot match, so the gate fails closed.
-                        if let Some(expected) = template.expected_checksum.as_ref() {
+                        // #3982: a Deferred digest resolves concurrently with
+                        // the body stream (driven by the tee at setup) and is
+                        // only awaited here, at commit time — in practice it
+                        // has long resolved, so this costs nothing. `None`
+                        // (sidecar absent / unparseable / upstream error)
+                        // commits unverified, exactly like a caller that
+                        // passed `None` up front.
+                        let expected: Option<CacheCommitDigest> = match template.expected_checksum {
+                            Some(ExpectedCommitDigest::Resolved(expected)) => Some(expected),
+                            Some(ExpectedCommitDigest::Deferred { digest, .. }) => digest.await,
+                            None => None,
+                        };
+                        if let Some(expected) = expected.as_ref() {
                             let observed_hex = match expected {
                                 CacheCommitDigest::Sha256Hex(_) => {
                                     Some(result.checksum_sha256.clone())
@@ -4242,6 +4330,55 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamingFetchResult> {
+        self.streaming_gated_fetch(
+            repo,
+            fetch_path,
+            cache_path,
+            expected_checksum.map(ExpectedCommitDigest::Resolved),
+        )
+        .await
+    }
+
+    /// Deferred-digest sibling of
+    /// [`Self::fetch_artifact_streaming_with_cache_path_gated_digest`]
+    /// (#3982): the digest resolves CONCURRENTLY with the fetch instead of
+    /// gating whether it starts. Maven's `.sha1` sidecar rides the same
+    /// proxy-cache/storage path the content fetch does, so awaiting it first
+    /// cost every artifact GET two sequential round-trips; with the digest
+    /// deferred, a warm hit never resolves it at all (one round-trip total)
+    /// and a cold miss overlaps the sidecar with the body stream, deciding
+    /// the cache commit on both results exactly as the up-front gate did.
+    ///
+    /// `algorithm` is declared up front so the tee can hash the forwarded
+    /// bytes from the first chunk. The future resolving to `None` means "no
+    /// authoritative digest" — the commit proceeds unverified, identical to
+    /// passing `None` to the up-front variant.
+    pub async fn fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        algorithm: CommitDigestAlgorithm,
+        digest: DeferredCommitDigest,
+    ) -> Result<StreamingFetchResult> {
+        self.streaming_gated_fetch(
+            repo,
+            fetch_path,
+            cache_path,
+            Some(ExpectedCommitDigest::Deferred { algorithm, digest }),
+        )
+        .await
+    }
+
+    /// The single-flight streaming body shared by every digest-gated public
+    /// variant.
+    async fn streaming_gated_fetch(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        expected_checksum: Option<ExpectedCommitDigest>,
+    ) -> Result<StreamingFetchResult> {
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -4251,6 +4388,10 @@ impl ProxyService {
         // usually done and the cache is warm. We loop a bounded number of times
         // to avoid an unbounded re-enter storm; in practice one re-enter hits the
         // warm cache or wins the election outright.
+        //
+        // A Deferred digest survives the re-enters as a cheap
+        // [`DeferredCommitDigest`] clone — every clone shares the ONE
+        // underlying resolution, so a re-enter never re-fetches the sidecar.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
@@ -4306,7 +4447,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -4584,7 +4725,7 @@ impl ProxyService {
         cache_path: &str,
         cache_key: String,
         metadata_key: String,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamHandle> {
         // Package Age Policy (#3912): the hold decision needs the upstream
         // release date, which only exists once the streaming response headers
@@ -4875,7 +5016,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamingFetchResult> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -12044,8 +12185,10 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(
-            "0000000000000000000000000000000000000000000000000000000000000".to_string(),
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha256Hex(
+                "0000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
         ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
@@ -12092,9 +12235,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"some other body"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -12131,9 +12274,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"some other body"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -12168,9 +12311,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -12200,6 +12343,207 @@ mod tests {
             "a matching SHA-512 gate must publish onto the live key"
         );
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #3982: a DEFERRED commit digest — one resolving concurrently with the
+    /// body stream — still gates the cache commit. The digest future here is
+    /// completed only AFTER the client has drained the body, proving the
+    /// commit arm truly awaits the late-resolving value instead of deciding
+    /// without it: a late MISMATCH degrades exactly like the up-front gate's
+    /// reject (served to the client, never cached).
+    #[tokio::test]
+    async fn test_tee_deferred_digest_late_mismatch_is_not_cached() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        // The client receives the full body while the digest is still
+        // unresolved — serving never waits on it (serve-but-don't-cache).
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.expect("client chunk"));
+        }
+        assert_eq!(received, b"first-chunk");
+
+        // The sidecar resolves only now — after streaming — with a MISMATCH.
+        let _ = tx.send(Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"some other body"),
+        ))));
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a late-resolving digest mismatch must not write a metadata sidecar (#3982)"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a late-resolving digest mismatch must never publish onto the live key (#3982)"
+        );
+    }
+
+    /// #3982: a deferred digest that resolves to the body's true SHA-1 —
+    /// again only after streaming has finished — commits exactly like the
+    /// up-front gate: good bytes must never become a permanent cache miss.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_late_match_commits() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+        let _ = tx.send(Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        ))));
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a late-resolving digest match must commit the metadata sidecar (#3982)"
+        );
+        assert_eq!(writes[0].0, "meta-key");
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "a late-resolving digest match must publish onto the live key (#3982)"
+        );
+        assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #3982: the deferred future resolving to `None` — the sender dropped
+    /// without a digest, i.e. sidecar absent / unparseable / upstream error —
+    /// commits UNVERIFIED, identical to the up-front `None` posture: the
+    /// download proceeds unverified exactly as before, GHSA-qxv7-p3mq-88fv
+    /// only gates when a digest actually exists.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_none_commits_unverified() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+        // No digest ever arrives: the sidecar resolution failed.
+        drop(tx);
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "no authoritative digest must commit unverified, like the up-front None (#3982)"
+        );
+    }
+
+    /// #3982: the tee must DRIVE the deferred digest future from setup, so the
+    /// sidecar resolution overlaps the body stream instead of starting at
+    /// commit time. Proof: with an upstream stream that never ends, the
+    /// commit arm can never run — so the digest future being polled at all is
+    /// only possible through the tee's own driver.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_is_driven_before_stream_end() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_in_future = Arc::clone(&polled);
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move {
+                polled_in_future.store(true, Ordering::SeqCst);
+                Some(CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(
+                    b"first-chunk",
+                ))))
+            }
+            .boxed()
+            .shared(),
+        });
+
+        // One chunk, then pend forever: the writer can never reach its commit
+        // arm, so a "commit arm polls the digest" implementation would leave
+        // the flag clear forever.
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(
+            futures::stream::once(async { Ok(Bytes::from_static(b"first-chunk")) })
+                .chain(futures::stream::pending()),
+        );
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            None,
+            None,
+        );
+        let first = client.next().await.expect("first chunk").expect("chunk ok");
+        assert_eq!(first.as_ref(), b"first-chunk");
+
+        for _ in 0..200 {
+            if polled.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the deferred digest future was never polled with the stream still open: \
+             the tee is not driving it, so the sidecar fetch would start only at \
+             commit time instead of overlapping the body stream (#3982)"
+        );
     }
 
     /// #3487: drive `client` until exactly `len` bytes have arrived, then drop
@@ -12258,9 +12602,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"first-chunk"))),
+        ));
 
         // Unique metadata key: the #3335 publish registry is process-global
         // and the entry is looked up by key below.
@@ -12334,9 +12678,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12362,9 +12706,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"some other body"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12397,9 +12741,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"first-chunk"))),
+        ));
 
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12433,9 +12777,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(hex::encode(
-            sha2::Sha256::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha256Hex(hex::encode(sha2::Sha256::digest(b"first-chunk"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
