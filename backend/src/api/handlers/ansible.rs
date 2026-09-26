@@ -79,9 +79,10 @@
 //! any non-2xx.
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, OriginalUri, Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -149,6 +150,62 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/api/v3/imports/collections/:task_id",
             get(import_status),
         )
+}
+
+/// Answer a Galaxy v3 read request that arrived on the generic repository
+/// download route (`/api/v1/repositories/{key}/download/{path}`) with the same
+/// document the `/ansible/{key}/...` route would serve (#3873).
+///
+/// Operators point `ansible-galaxy` at the generic download URL of a Galaxy
+/// repository, and for a Remote one that route used to stream the upstream's
+/// JSON verbatim. That document is not usable as this repository's: its
+/// `links` are root-relative to the UPSTREAM origin
+/// (`/api/v3/plugin/ansible/...`), so following `next` left the repository; its
+/// `download_url`s point at the upstream directly; and the byte proxy drops the
+/// query string and caches by path, so even a re-prefixed `next` would have
+/// re-served page one forever. Serving the Galaxy handler's own documents fixes
+/// all three at the source: the list is built here, paged here, and its links
+/// are spelled from the path the client actually requested.
+///
+/// Returns `None` for any path that is not one of the Galaxy read endpoints, so
+/// the caller keeps its ordinary artifact / proxy handling (tarballs included).
+pub(crate) async fn serve_galaxy_api_path(
+    state: &SharedState,
+    repo_key: &str,
+    path: &str,
+    uri: &Uri,
+) -> Option<Response> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let st = State(state.clone());
+    let key = repo_key.to_string();
+    let own = |s: &&str| s.to_string();
+    let result = match segments.as_slice() {
+        ["api"] | ["api", ""] => api_root(st, Path(key)).await,
+        ["api", "v3", ""] => api_v3_root(st, Path(key)).await,
+        ["api", "v3", "collections", ""] => {
+            list_collections(st, Path(key), OriginalUri(uri.clone())).await
+        }
+        ["api", "v3", "collections", ns, name, ""] if !ns.is_empty() && !name.is_empty() => {
+            collection_info(st, Path((key, own(ns), own(name)))).await
+        }
+        ["api", "v3", "collections", ns, name, "versions", ""]
+            if !ns.is_empty() && !name.is_empty() =>
+        {
+            version_list(
+                st,
+                Path((key, own(ns), own(name))),
+                OriginalUri(uri.clone()),
+            )
+            .await
+        }
+        ["api", "v3", "collections", ns, name, "versions", version, ""]
+            if !ns.is_empty() && !name.is_empty() && !version.is_empty() =>
+        {
+            version_info(st, Path((key, own(ns), own(name), own(version)))).await
+        }
+        _ => return None,
+    };
+    Some(result.unwrap_or_else(|err| err))
 }
 
 /// The `task` value returned by `upload_collection` and the `href` echoed back
@@ -308,6 +365,78 @@ fn version_href(repo_key: &str, namespace: &str, name: &str, version: &str) -> S
         "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
         repo_key, namespace, name, version
     )
+}
+
+/// Galaxy v3 list envelope (`meta` / `links` / `data`) with DRF limit/offset
+/// paging applied to `items` (#3873).
+///
+/// `uri` is the request exactly as the client addressed it (`OriginalUri`), and
+/// every link is that request's own PATH with fresh `limit`/`offset` params.
+/// That is what keeps a `next` inside the repository whichever mount served the
+/// list -- `/ansible/{key}/api/v3/...` or the generic
+/// `/api/v1/repositories/{key}/download/api/v3/...` -- where a link spelled
+/// from a fixed prefix (or, worse, forwarded from an upstream Galaxy, whose
+/// links are root-relative to ITS origin) sends `ansible-galaxy` out of the
+/// repository. The client resolves a link by substituting it for the path of
+/// the URL it just fetched (`versions_url.replace(path, next_link)` in
+/// `GalaxyAPI.get_collection_versions`), so a root-absolute path is the shape
+/// it needs, and the one galaxy.ansible.com itself emits.
+///
+/// A request that names neither `limit` nor `offset` keeps the historical
+/// answer: the whole list as a single page with every link null. A `limit` of
+/// zero or one that does not parse is treated as absent, as DRF does.
+fn galaxy_paginated_list(uri: &Uri, items: Vec<serde_json::Value>) -> serde_json::Value {
+    let count = items.len();
+    let (limit, offset) = galaxy_page_params(uri.query());
+
+    let (data, links) = match (limit, offset) {
+        (None, 0) => (items, [None, None, None, None]),
+        (limit, offset) => {
+            let limit = limit.unwrap_or(count).max(1);
+            let link = |o: usize| Some(format!("{}?limit={}&offset={}", uri.path(), limit, o));
+            let last = count.saturating_sub(1) / limit * limit;
+            let next = offset.saturating_add(limit);
+            let next = (next < count).then_some(next);
+            let previous = (offset > 0).then_some(offset.saturating_sub(limit).min(last));
+            let data = items.into_iter().skip(offset).take(limit).collect();
+            (
+                data,
+                [
+                    link(0),
+                    previous.and_then(link),
+                    next.and_then(link),
+                    link(last),
+                ],
+            )
+        }
+    };
+    let [first, previous, next, last] = links;
+
+    serde_json::json!({
+        "meta": { "count": count },
+        "links": {
+            "first": first,
+            "previous": previous,
+            "next": next,
+            "last": last,
+        },
+        "data": data,
+    })
+}
+
+/// The `limit` / `offset` a Galaxy list request asked for. Unparseable values
+/// and a zero `limit` read as absent rather than failing the request.
+fn galaxy_page_params(query: Option<&str>) -> (Option<usize>, usize) {
+    let mut limit = None;
+    let mut offset = 0;
+    for (k, v) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        match k.as_ref() {
+            "limit" => limit = v.parse::<usize>().ok().filter(|l| *l > 0),
+            "offset" => offset = v.parse::<usize>().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (limit, offset)
 }
 
 /// Fetch every version an upstream Galaxy server publishes for one collection.
@@ -791,6 +920,7 @@ fn rewrite_upstream_version_info(
 async fn list_collections(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
 
@@ -836,20 +966,7 @@ async fn list_collections(
         })
         .collect();
 
-    let json = serde_json::json!({
-        "meta": {
-            "count": data.len(),
-        },
-        "links": {
-            "first": null,
-            "previous": null,
-            "next": null,
-            "last": null,
-        },
-        "data": data,
-    });
-
-    Ok(super::json_response(&json))
+    Ok(super::json_response(&galaxy_paginated_list(&uri, data)))
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1077,7 @@ async fn collection_info(
 async fn version_list(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
 
@@ -1045,20 +1163,7 @@ async fn version_list(
         }
     }
 
-    let json = serde_json::json!({
-        "meta": {
-            "count": versions.len(),
-        },
-        "links": {
-            "first": null,
-            "previous": null,
-            "next": null,
-            "last": null,
-        },
-        "data": versions,
-    });
-
-    Ok(super::json_response(&json))
+    Ok(super::json_response(&galaxy_paginated_list(&uri, versions)))
 }
 
 // ---------------------------------------------------------------------------
@@ -3817,5 +3922,247 @@ mod tests {
                 .contains(".."),
             "and must not reach the href either: {doc}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3873: pagination links stay inside the repository
+    // -----------------------------------------------------------------------
+
+    fn page_of(uri: &str, n: usize) -> serde_json::Value {
+        let items = (0..n).map(|i| serde_json::json!({ "i": i })).collect();
+        galaxy_paginated_list(&uri.parse::<Uri>().unwrap(), items)
+    }
+
+    /// Every link is the requested path with fresh `limit`/`offset`, walked
+    /// across a five-item list in pages of two, including the short last page
+    /// that must carry no `next`.
+    #[test]
+    fn test_galaxy_paginated_list_links_walk_every_page_3873() {
+        let base = "/api/v1/repositories/galaxy.ansible.com/download/api/v3/collections/community/docker/versions/";
+        let link = |o: usize| format!("{base}?limit=2&offset={o}");
+
+        let p0 = page_of(&format!("{base}?limit=2"), 5);
+        assert_eq!(p0["meta"]["count"], 5);
+        assert_eq!(p0["data"], serde_json::json!([{ "i": 0 }, { "i": 1 }]));
+        assert_eq!(p0["links"]["first"], link(0));
+        assert_eq!(p0["links"]["previous"], serde_json::Value::Null);
+        assert_eq!(p0["links"]["next"], link(2));
+        assert_eq!(p0["links"]["last"], link(4));
+
+        let p1 = page_of(&link(2), 5);
+        assert_eq!(p1["data"], serde_json::json!([{ "i": 2 }, { "i": 3 }]));
+        assert_eq!(p1["links"]["previous"], link(0));
+        assert_eq!(p1["links"]["next"], link(4));
+
+        let p2 = page_of(&link(4), 5);
+        assert_eq!(p2["data"], serde_json::json!([{ "i": 4 }]));
+        assert_eq!(p2["links"]["previous"], link(2));
+        assert_eq!(
+            p2["links"]["next"],
+            serde_json::Value::Null,
+            "the last page must end the client's walk"
+        );
+        assert_eq!(p2["links"]["last"], link(4));
+    }
+
+    #[test]
+    fn test_galaxy_paginated_list_without_paging_params_is_one_page_3873() {
+        let doc = page_of("/ansible/r/api/v3/collections/?format=json", 3);
+        assert_eq!(doc["meta"]["count"], 3);
+        assert_eq!(doc["data"].as_array().unwrap().len(), 3);
+        for k in ["first", "previous", "next", "last"] {
+            assert_eq!(doc["links"][k], serde_json::Value::Null, "{k}");
+        }
+    }
+
+    #[test]
+    fn test_galaxy_paginated_list_tolerates_odd_params_3873() {
+        // Zero / junk limit reads as absent; an offset past the end yields an
+        // empty page whose `previous` points at the real last page.
+        assert_eq!(galaxy_page_params(Some("limit=0&offset=x")), (None, 0));
+        assert_eq!(galaxy_page_params(Some("limit=abc")), (None, 0));
+        let doc = page_of("/p/?limit=2&offset=40", 5);
+        assert_eq!(doc["data"], serde_json::json!([]));
+        assert_eq!(doc["links"]["next"], serde_json::Value::Null);
+        assert_eq!(doc["links"]["previous"], "/p/?limit=2&offset=4");
+        let huge = page_of(
+            &format!("/p/?limit={}&offset={}", usize::MAX, usize::MAX),
+            1,
+        );
+        assert_eq!(huge["links"]["next"], serde_json::Value::Null);
+    }
+
+    /// The generic download route enforces `require_visible`; the fixture
+    /// repository is private, so it is published for the anonymous probe.
+    async fn generic_download_app_for(f: &tdh::Fixture, state: SharedState) -> axum::Router {
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+        generic_download_app(state)
+    }
+
+    fn generic_download_app(state: SharedState) -> axum::Router {
+        tdh::router_anon(
+            axum::Router::new().nest(
+                "/api/v1/repositories",
+                crate::api::handlers::repositories::download_router(),
+            ),
+            state,
+        )
+    }
+
+    async fn get_json(app: axum::Router, uri: String) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+        let doc = serde_json::from_slice(&body).unwrap_or_else(|_| {
+            panic!("{uri}: non-JSON body {:?}", String::from_utf8_lossy(&body))
+        });
+        (status, doc)
+    }
+
+    /// #3873 end to end on a hosted repository: the version list is paged and
+    /// its links are spelled from the mount the client used, so walking `next`
+    /// through the generic download URL stays under that URL -- and the
+    /// `/ansible` mount gets `/ansible` links.
+    #[tokio::test]
+    async fn test_version_list_pagination_links_keep_the_mount_prefix_3873() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for v in ["1.0.0", "1.1.0", "2.0.0"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("key-3873-{v}"),
+                &format!("testns-testcoll-{v}.tar.gz"),
+                "testns-testcoll",
+                v,
+                "application/gzip",
+                bytes::Bytes::from_static(b"collection-bytes"),
+                f.user_id,
+            )
+            .await;
+        }
+
+        let generic = format!(
+            "/api/v1/repositories/{}/download/api/v3/collections/testns/testcoll/versions/",
+            f.repo_key
+        );
+        let (s1, p1) = get_json(
+            generic_download_app_for(&f, f.state.clone()).await,
+            format!("{generic}?limit=2"),
+        )
+        .await;
+        let next = p1["links"]["next"].as_str().map(str::to_string);
+        let (s2, p2) = match &next {
+            Some(n) => get_json(generic_download_app(f.state.clone()), n.clone()).await,
+            None => (StatusCode::OK, serde_json::Value::Null),
+        };
+        let ansible = format!(
+            "/ansible/{}/api/v3/collections/testns/testcoll/versions/",
+            f.repo_key
+        );
+        let (s3, p3) = get_json(nested_app_with_auth(&f), format!("{ansible}?limit=2")).await;
+        let (s4, all) = get_json(generic_download_app(f.state.clone()), generic.clone()).await;
+
+        f.teardown().await;
+
+        assert_eq!(s1, StatusCode::OK, "{p1}");
+        assert_eq!(p1["meta"]["count"], 3);
+        assert_eq!(p1["data"].as_array().unwrap().len(), 2);
+        assert_eq!(p1["links"]["first"], format!("{generic}?limit=2&offset=0"));
+        assert_eq!(p1["links"]["previous"], serde_json::Value::Null);
+        assert_eq!(
+            next.as_deref(),
+            Some(format!("{generic}?limit=2&offset=2").as_str()),
+            "`next` must stay under the repository URL the client configured"
+        );
+        assert_eq!(p1["links"]["last"], format!("{generic}?limit=2&offset=2"));
+
+        assert_eq!(s2, StatusCode::OK, "{p2}");
+        assert_eq!(p2["data"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            p2["links"]["previous"],
+            format!("{generic}?limit=2&offset=0")
+        );
+        assert_eq!(p2["links"]["next"], serde_json::Value::Null);
+        let mut seen: Vec<String> = p1["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(p2["data"].as_array().unwrap())
+            .map(|v| v["version"].as_str().unwrap().to_string())
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["1.0.0", "1.1.0", "2.0.0"],
+            "pages must not overlap or gap"
+        );
+
+        assert_eq!(s3, StatusCode::OK, "{p3}");
+        assert_eq!(p3["links"]["next"], format!("{ansible}?limit=2&offset=2"));
+
+        assert_eq!(s4, StatusCode::OK, "{all}");
+        assert_eq!(all["data"].as_array().unwrap().len(), 3);
+        assert_eq!(all["links"]["next"], serde_json::Value::Null);
+    }
+
+    /// #3873 as reported: a Remote Galaxy repository addressed through the
+    /// generic download URL used to stream the upstream's JSON verbatim, whose
+    /// `links.next` is root-relative to the UPSTREAM origin
+    /// (`/api/v3/plugin/...`). The list must be this repository's own, with a
+    /// `next` under the configured URL.
+    #[tokio::test]
+    async fn test_remote_version_list_via_generic_download_url_keeps_prefix_3873() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_versions_page(
+                &["2.0.0", "1.5.1"],
+                2,
+                Some("/api/v3/plugin/ansible/content/published/collections/index/testns/testcoll/versions/?limit=10&offset=10"),
+            )))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let generic = format!(
+            "/api/v1/repositories/{}/download/api/v3/collections/testns/testcoll/versions/",
+            f.repo_key
+        );
+        let (status, doc) = get_json(
+            generic_download_app_for(&f, state.clone()).await,
+            format!("{generic}?limit=1"),
+        )
+        .await;
+        let (disc_status, disc) = get_json(
+            generic_download_app(state),
+            format!("/api/v1/repositories/{}/download/api", f.repo_key),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        assert_eq!(doc["meta"]["count"], 2);
+        assert_eq!(doc["links"]["next"], format!("{generic}?limit=1&offset=1"));
+        assert_eq!(doc["links"]["last"], format!("{generic}?limit=1&offset=1"));
+        assert_eq!(doc["data"][0]["version"], "2.0.0");
+        assert_eq!(
+            doc["data"][0]["href"],
+            format!(
+                "/ansible/{}/api/v3/collections/testns/testcoll/versions/2.0.0/",
+                f.repo_key
+            ),
+            "hrefs are this repository's, not the upstream's"
+        );
+        assert_eq!(disc_status, StatusCode::OK);
+        assert_eq!(disc["available_versions"]["v3"], "v3/");
     }
 }

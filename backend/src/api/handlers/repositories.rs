@@ -8823,6 +8823,23 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
 
+    // #3873: a Galaxy API read addressed through this route is answered by the
+    // Galaxy handler, not by streaming the upstream's JSON -- whose pagination
+    // links are root-relative to the upstream origin and leave the repository.
+    // Virtual repositories keep the member walk below: the Galaxy handler has
+    // no virtual resolution to delegate to.
+    if repo.format == RepositoryFormat::Ansible && repo.repo_type != RepositoryType::Virtual {
+        let uri = request
+            .extensions()
+            .get::<axum::extract::OriginalUri>()
+            .map_or_else(|| request.uri().clone(), |o| o.0.clone());
+        if let Some(response) =
+            super::ansible::serve_galaxy_api_path(&state, &key, &path, &uri).await
+        {
+            return Ok(response);
+        }
+    }
+
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
     // mirroring `get_artifact_metadata`. No-op for non-npm formats and for
