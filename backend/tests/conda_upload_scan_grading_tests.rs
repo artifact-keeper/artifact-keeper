@@ -121,18 +121,29 @@ async fn put_package(app: axum::Router, repo_key: &str, name: &str, auth: &str) 
 
 /// Poll for the scan the upload spawned to land a completed row. Returns the
 /// row's `(status, scan_completeness)` when one appears inside the budget.
+///
+/// `scan_type` scopes the read to one scanner's row. One upload writes a row
+/// PER SCANNER (dependency, grype, ...), each on its own `created_at`, so a
+/// "newest row of any type" read reports whichever scanner happened to finish
+/// last — on a host without the `grype` binary that is grype's `failed` row,
+/// written ~10 ms after the dependency row completes, and the poll almost
+/// never lands inside that window. `None` reads every scanner's rows (the
+/// negative control, where no row of any type may appear).
 async fn wait_for_scan(
     pool: &PgPool,
     repo_id: Uuid,
+    scan_type: Option<&str>,
     budget: std::time::Duration,
 ) -> Option<(String, Option<String>)> {
     let deadline = std::time::Instant::now() + budget;
     loop {
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT status, scan_completeness FROM scan_results \
-             WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+             WHERE repository_id = $1 AND ($2::text IS NULL OR scan_type = $2) \
+             ORDER BY created_at DESC LIMIT 1",
         )
         .bind(repo_id)
+        .bind(scan_type)
         .fetch_optional(pool)
         .await
         .expect("read scan_results");
@@ -197,7 +208,15 @@ async fn native_put_upload_is_scanned_and_graded() {
         "conda PUT upload must succeed before scanning is even possible, got {status}"
     );
 
-    let scan = wait_for_scan(&pool, repo_id, std::time::Duration::from_secs(30)).await;
+    // The assertion is about the dependency scanner's verdict (the #4042
+    // `partial` for an unaliased conda name), so read that scanner's row.
+    let scan = wait_for_scan(
+        &pool,
+        repo_id,
+        Some("dependency"),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
     // The scan writes the grade row as its final step, so once the completed
     // scan row exists the grade read is racy-free within the same budget.
     let mut grade = None;
@@ -219,7 +238,7 @@ async fn native_put_upload_is_scanned_and_graded() {
     let (scan_status, completeness) = scan.unwrap_or_else(|| {
         panic!(
             "a native conda upload into a scan_on_upload repository must \
-             enqueue a scan, but no completed scan_results row ever appeared"
+             enqueue a scan, but no completed dependency scan_results row ever appeared"
         )
     });
     assert_eq!(scan_status, "completed");
@@ -272,7 +291,16 @@ async fn native_put_upload_enqueues_nothing_when_scan_on_upload_is_disabled() {
 
     // Two seconds is generous for a spawn that would fire immediately; the
     // positive test proves a scan WOULD land well inside this window.
-    let scan = wait_for_scan(&pool, repo_id, std::time::Duration::from_secs(2)).await;
+    let scan = wait_for_scan(&pool, repo_id, None, std::time::Duration::from_secs(2)).await;
+    // `wait_for_scan` only reports a COMPLETED newest row; a spawned scan
+    // whose last scanner failed (grype absent) would slip past it, so also
+    // require that no scanner wrote any row at all.
+    let any_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count scan_results");
     let grade = repo_grade(&pool, repo_id).await;
 
     cs::cleanup_repo(&pool, repo_id).await;
@@ -281,8 +309,9 @@ async fn native_put_upload_enqueues_nothing_when_scan_on_upload_is_disabled() {
     cs::cleanup_storage(&scan_workspace);
 
     assert!(
-        scan.is_none(),
-        "scan_on_upload is disabled, so the upload must not enqueue a scan, got {scan:?}"
+        scan.is_none() && any_rows == 0,
+        "scan_on_upload is disabled, so the upload must not enqueue a scan, \
+         got {scan:?} ({any_rows} scan_results rows)"
     );
     assert!(
         grade.is_none(),
