@@ -949,13 +949,16 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     }
 
     for i in 0..archive.len() {
+        // Match on the central-directory name BEFORE opening the entry, so an
+        // unmatched entry costs one string comparison rather than a local-
+        // header read; large archives (a 12k-entry wheel, #3886) walk cheaply.
+        if !archive.name_for_index(i).is_some_and(&matches) {
+            continue;
+        }
         let mut file = archive
             .by_index(i)
             .map_err(|e| AppError::Validation(format!("Cannot read ZIP entry: {}", e)))?;
         if !file.is_file() {
-            continue;
-        }
-        if !matches(file.name()) {
             continue;
         }
         // Header size is a hint (the central directory may lie); reject an
