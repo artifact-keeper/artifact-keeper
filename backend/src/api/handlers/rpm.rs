@@ -957,6 +957,17 @@ async fn read_rpm_header_prefix(
     size_bytes: i64,
 ) -> Option<Bytes> {
     let storage = state.storage_for_repo(location).ok()?;
+    read_rpm_header_prefix_from(storage.as_ref(), key, size_bytes).await
+}
+
+/// [`read_rpm_header_prefix`] against an already-resolved backend. A header
+/// that would need more than the stored size or [`RPM_HEAL_HEADER_LIMIT`]
+/// stops the growth; the short prefix is returned and fails to parse.
+async fn read_rpm_header_prefix_from(
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+    size_bytes: i64,
+) -> Option<Bytes> {
     let size = usize::try_from(size_bytes).ok()?;
     let mut want = size.min(64 * 1024);
     for _ in 0..4 {
@@ -5738,5 +5749,114 @@ mod repodata_deps_tests {
             "the healed block must be persisted so it is derived once: {stored}"
         );
         assert_eq!(stored["summary"], legacy["summary"], "existing fields kept");
+    }
+
+    // -----------------------------------------------------------------------
+    // read_rpm_header_prefix: the ranged-read grow loop and its bounds.
+    // -----------------------------------------------------------------------
+
+    /// Lead + empty signature header + a main header holding NAME and a BIN
+    /// blob of `blob_len` bytes; `declared_hsize` overrides the store size
+    /// the header CLAIMS (the bytes written are always the real store).
+    fn synthetic_rpm(blob_len: usize, declared_hsize: Option<u32>) -> Vec<u8> {
+        let mut store = b"bigheader\0".to_vec();
+        let blob_off = store.len() as u32;
+        store.resize(store.len() + blob_len, 0xab);
+        let entries: [(u32, u32, u32, u32); 2] =
+            [(1000, 6, 0, 1), (1012, 7, blob_off, blob_len as u32)];
+        let mut p = vec![0u8; 96];
+        p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        p[4] = 3;
+        p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+        p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        p.extend_from_slice(&declared_hsize.unwrap_or(store.len() as u32).to_be_bytes());
+        for (tag, ty, off, count) in entries {
+            for v in [tag, ty, off, count] {
+                p.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        p.extend_from_slice(&store);
+        p
+    }
+
+    async fn stored(
+        bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        crate::storage::filesystem::FilesystemStorage,
+    ) {
+        use crate::storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::filesystem::FilesystemStorage::new(dir.path());
+        fs.put("pkg.rpm", Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        (dir, fs)
+    }
+
+    /// A header larger than the first 64 KiB read (big file lists do this)
+    /// must be healed: the loop grows the read to exactly the header end.
+    #[tokio::test]
+    async fn header_prefix_grows_past_first_64k_read() {
+        // Header ends ~100 KiB in; 50 KiB of payload follows it.
+        let mut pkg = synthetic_rpm(100 * 1024, None);
+        let header_end = pkg.len();
+        pkg.extend_from_slice(&vec![0u8; 50 * 1024]);
+        let (_dir, fs) = stored(&pkg).await;
+
+        let prefix = read_rpm_header_prefix_from(&fs, "pkg.rpm", pkg.len() as i64)
+            .await
+            .expect("prefix");
+        assert!(header_end > 64 * 1024);
+        assert_eq!(
+            prefix.len(),
+            header_end,
+            "grown to the header end, not the payload"
+        );
+        let info = RpmHandler::parse_rpm_repodata_info(&prefix).expect("grown prefix parses");
+        assert_eq!(info.header_end as usize, header_end);
+    }
+
+    /// A header claiming more bytes than the object holds is not chased: the
+    /// first read comes back unparsed-but-bounded (`needed <= size` guard).
+    #[tokio::test]
+    async fn header_prefix_does_not_grow_past_stored_size() {
+        let pkg = synthetic_rpm(70 * 1024, Some(10 * 1024 * 1024));
+        let (_dir, fs) = stored(&pkg).await;
+        let prefix = read_rpm_header_prefix_from(&fs, "pkg.rpm", pkg.len() as i64)
+            .await
+            .expect("prefix");
+        assert_eq!(prefix.len(), 64 * 1024);
+        assert!(RpmHandler::parse_rpm_repodata_info(&prefix).is_err());
+    }
+
+    /// A header claiming more than [`RPM_HEAL_HEADER_LIMIT`] is not chased
+    /// even when the recorded object size would allow it.
+    #[tokio::test]
+    async fn header_prefix_does_not_grow_past_heal_limit() {
+        let claimed = RPM_HEAL_HEADER_LIMIT as u32 + 1;
+        let pkg = synthetic_rpm(70 * 1024, Some(claimed));
+        let (_dir, fs) = stored(&pkg).await;
+        // The artifact row says the object is big enough to hold the header,
+        // so only the cap stops the read.
+        let recorded_size = 2 * RPM_HEAL_HEADER_LIMIT as i64;
+        assert!(
+            RpmHandler::header_bytes_needed(&pkg[..64 * 1024]).unwrap() > RPM_HEAL_HEADER_LIMIT
+        );
+        let prefix = read_rpm_header_prefix_from(&fs, "pkg.rpm", recorded_size)
+            .await
+            .expect("prefix");
+        assert_eq!(prefix.len(), 64 * 1024);
+    }
+
+    /// A negative recorded size (corrupt row) is rejected, not cast.
+    #[tokio::test]
+    async fn header_prefix_rejects_negative_size() {
+        let pkg = synthetic_rpm(16, None);
+        let (_dir, fs) = stored(&pkg).await;
+        assert!(read_rpm_header_prefix_from(&fs, "pkg.rpm", -1)
+            .await
+            .is_none());
     }
 }

@@ -1703,4 +1703,128 @@ mod tests {
         let _ = RpmHandler::parse_rpm_header(&data);
         let _ = RpmHandler::header_bytes_needed(&data);
     }
+
+    // ========================================================================
+    // Hostile headers: every bounds/type guard must yield a clean "absent"
+    // value or Err, never a panic or an out-of-bounds read (#3801).
+    // ========================================================================
+
+    /// One header structure: intro (magic, version, nindex, hsize), index
+    /// entries `(tag, type, offset, count)`, then `store` verbatim.
+    fn hostile_header(entries: &[(u32, u32, u32, u32)], store: &[u8]) -> Vec<u8> {
+        let mut h = vec![0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0];
+        h.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        h.extend_from_slice(&(store.len() as u32).to_be_bytes());
+        for &(tag, ty, off, count) in entries {
+            for v in [tag, ty, off, count] {
+                h.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        h.extend_from_slice(store);
+        h
+    }
+
+    /// Lead + empty signature header + `main` (which lands at offset 112).
+    fn hostile_package(main: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 96];
+        p[..4].copy_from_slice(&RPM_MAGIC);
+        p[4] = 3;
+        p.extend_from_slice(&hostile_header(&[], &[]));
+        p.extend_from_slice(main);
+        p
+    }
+
+    #[test]
+    fn test_hostile_entry_offset_past_store_is_skipped() {
+        // NAME points exactly at the end of the store (offset == hsize) and
+        // VERSION far past it: `strings_at` would slice out of bounds.
+        let store = b"pkg\0";
+        let main = hostile_header(
+            &[
+                (RPMTAG_NAME, 6, store.len() as u32, 1),
+                (RPMTAG_VERSION, 6, u32::MAX, 1),
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 1_000, 3),
+            ],
+            store,
+        );
+        let h = HeaderIndex::parse(&main).unwrap();
+        assert!(h.entries.is_empty(), "out-of-store entries are dropped");
+        assert_eq!(h.string(RPMTAG_NAME), None);
+        assert!(h.string_array(RPMTAG_REQUIRENAME).is_empty());
+
+        let pkg = hostile_package(&main);
+        let meta = RpmHandler::parse_rpm_header(&pkg).unwrap();
+        assert_eq!(meta.name, "");
+        assert!(meta.requires.is_empty());
+        let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
+        assert!(info.requires.is_empty());
+    }
+
+    #[test]
+    fn test_hostile_int_array_past_store_yields_nothing() {
+        // 8 bytes of store; INT32 arrays claiming 3 values (12 bytes) and
+        // u32::MAX values from inside the store, INT64 straddling the end.
+        let store = [0u8, 0, 0, 7, 0, 0, 0, 9];
+        let main = hostile_header(
+            &[
+                (RPMTAG_EPOCH, RPM_INT32_TYPE, 0, 3),
+                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 4, u32::MAX),
+                (RPMTAG_LONGSIZE, RPM_INT64_TYPE, 4, 1),
+                (RPMTAG_BUILDTIME, RPM_INT32_TYPE, 4, 1),
+            ],
+            &store,
+        );
+        let h = HeaderIndex::parse(&main).unwrap();
+        assert!(h.ints(RPMTAG_EPOCH).is_empty());
+        assert!(h.ints(RPMTAG_REQUIREFLAGS).is_empty());
+        assert_eq!(h.int(RPMTAG_LONGSIZE), None);
+        // The in-bounds control entry still reads.
+        assert_eq!(h.int(RPMTAG_BUILDTIME), Some(9));
+
+        let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)).unwrap();
+        assert_eq!(info.epoch, None);
+        assert_eq!(info.installed_size, None);
+        assert_eq!(info.build_time, Some(9));
+    }
+
+    #[test]
+    fn test_hostile_type_mismatch_yields_nothing() {
+        // EPOCH/SIZE declared as strings, a flags array declared as BIN, and
+        // a provides list declared INT32 (read as one string, not `count`).
+        let store = b"12\0abc\0";
+        let main = hostile_header(
+            &[
+                (RPMTAG_EPOCH, 6, 0, 1),
+                (RPMTAG_SIZE, RPM_STRING_ARRAY_TYPE, 0, 2),
+                (RPMTAG_PROVIDEFLAGS, 7, 0, 2),
+                (RPMTAG_PROVIDENAME, RPM_INT32_TYPE, 3, 50),
+            ],
+            store,
+        );
+        let h = HeaderIndex::parse(&main).unwrap();
+        assert!(h.ints(RPMTAG_EPOCH).is_empty());
+        assert!(h.ints(RPMTAG_SIZE).is_empty());
+        assert!(h.ints(RPMTAG_PROVIDEFLAGS).is_empty());
+        assert_eq!(h.string_array(RPMTAG_PROVIDENAME), vec!["abc".to_string()]);
+
+        let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)).unwrap();
+        assert_eq!(info.epoch, None);
+        assert_eq!(info.installed_size, None);
+        assert_eq!(info.provides, vec![entry("abc")]);
+    }
+
+    #[test]
+    fn test_header_bytes_needed_stops_on_corrupt_main_magic() {
+        // Valid lead + signature, then 16 bytes that are not a header: no
+        // amount of extra bytes can help, so report what we already have.
+        let mut pkg = hostile_package(&[]);
+        pkg.extend_from_slice(&[
+            0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff,
+        ]);
+        pkg.extend_from_slice(&[0u8; 32]);
+        assert_eq!(RpmHandler::header_bytes_needed(&pkg), Some(pkg.len()));
+        assert!(RpmHandler::parse_rpm_repodata_info(&pkg).is_err());
+        let meta = RpmHandler::parse_rpm_header(&pkg).unwrap();
+        assert_eq!(meta.name, "", "falls back to the (empty) lead name");
+    }
 }
