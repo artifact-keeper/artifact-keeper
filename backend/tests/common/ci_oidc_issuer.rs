@@ -41,8 +41,7 @@ const KID: &str = "ak-ci-e2e-kid";
 
 /// The process-wide throwaway CA, installed as `CUSTOM_CA_CERT_PATH` once.
 struct TestCa {
-    cert: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 static TEST_CA: OnceLock<TestCa> = OnceLock::new();
@@ -66,7 +65,9 @@ fn test_ca() -> &'static TestCa {
             std::env::temp_dir().join(format!("ak-ci-oidc-e2e-ca-{}.pem", uuid::Uuid::new_v4()));
         std::fs::write(&path, cert.pem()).expect("write CA PEM");
         std::env::set_var("CUSTOM_CA_CERT_PATH", &path);
-        TestCa { cert, key }
+        TestCa {
+            issuer: rcgen::Issuer::new(params, key),
+        }
     })
 }
 
@@ -79,9 +80,7 @@ fn server_tls_config(ip: IpAddr) -> Arc<tokio_rustls::rustls::ServerConfig> {
     params.subject_alt_names = vec![rcgen::SanType::IpAddress(ip)];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("leaf key");
-    let leaf = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf");
+    let leaf = params.signed_by(&key, &ca.issuer).expect("sign leaf");
 
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
