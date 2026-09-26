@@ -1024,6 +1024,145 @@ fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream tarball URL layouts (#3785)
+// ---------------------------------------------------------------------------
+
+/// Whether `url` shares scheme, host and port with `upstream_url`.
+///
+/// This is the trust boundary for non-standard tarball layouts: a tarball
+/// URL on the configured upstream's origin may be fetched with the
+/// repository's upstream credentials, anything else may not.
+fn npm_same_origin(url: &str, upstream_url: &str) -> bool {
+    match (reqwest::Url::parse(url), reqwest::Url::parse(upstream_url)) {
+        (Ok(a), Ok(b)) => {
+            matches!(a.scheme(), "http" | "https")
+                && a.scheme() == b.scheme()
+                && a.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// A version string safe to embed as a tarball filename path segment.
+fn npm_version_is_path_safe(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 256
+        && !version.starts_with('.')
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'))
+}
+
+/// The tarball filename this repository advertises (and serves under
+/// `/npm/{repo}/{package}/-/{filename}`) for one packument version entry.
+///
+/// * A registry-standard URL (`…/{package}/-/{filename}`, registry.npmjs.org
+///   and most mirrors) keeps the filename after its `/-/` marker, whatever
+///   host it names — the pre-#3785 behavior.
+/// * A URL without the `/-/` marker (GitHub Packages serves
+///   `https://npm.pkg.github.com/download/@scope/pkg/<version>/<hash>`) is
+///   rewritten ONLY when it lives on the configured upstream's origin: the
+///   advertised filename is then the canonical `{basename}-{version}.tgz`,
+///   and the tarball route maps it back to the upstream URL through the
+///   packument (`npm_tarball_source_for_filename`).
+/// * Anything else (a foreign host, a malformed URL, an unsafe version) is
+///   left alone: `None`.
+fn npm_advertised_tarball_filename(
+    tarball: &str,
+    package_name: &str,
+    version: &str,
+    upstream_url: Option<&str>,
+) -> Option<String> {
+    if let Some((_, filename)) = tarball.rsplit_once("/-/") {
+        return Some(filename.to_string());
+    }
+    let upstream_url = upstream_url?;
+    if !npm_same_origin(tarball, upstream_url)
+        || !npm_version_is_path_safe(version)
+        || !crate::formats::npm::is_valid_npm_name(package_name)
+    {
+        return None;
+    }
+    Some(build_npm_tarball_filename(package_name, version))
+}
+
+/// Package name and version of one packument version entry: the entry's own
+/// `name` / `version`, falling back to the document name and the map key.
+fn npm_version_identity<'a>(
+    packument: &'a serde_json::Value,
+    version_key: &'a str,
+    version_data: &'a serde_json::Value,
+) -> (&'a str, &'a str) {
+    let name = version_data
+        .get("name")
+        .and_then(|n| n.as_str())
+        .or_else(|| packument.get("name").and_then(|n| n.as_str()))
+        .unwrap_or("_unknown");
+    let version = version_data
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or(version_key);
+    (name, version)
+}
+
+/// The packument `dist` object whose advertised tarball filename is
+/// `filename`, plus its raw upstream tarball URL.
+///
+/// Registry-standard URLs match on the URL's basename, exactly as before
+/// #3785 (never by parsing a version out of the requested filename). URLs in
+/// a non-standard layout on the upstream's origin match on the canonical
+/// filename `npm_advertised_tarball_filename` rewrote them to.
+fn npm_dist_for_filename<'a>(
+    packument: &'a serde_json::Value,
+    filename: &str,
+    upstream_url: Option<&str>,
+) -> Option<(&'a serde_json::Value, &'a str)> {
+    let versions = packument.get("versions")?.as_object()?;
+    for (version_key, version_data) in versions {
+        let Some(dist) = version_data.get("dist") else {
+            continue;
+        };
+        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
+        let tarball_name = if tarball.contains("/-/") {
+            tarball
+                .split(['#', '?'])
+                .next()
+                .unwrap_or(tarball)
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        } else {
+            let (name, version) = npm_version_identity(packument, version_key, version_data);
+            npm_advertised_tarball_filename(tarball, name, version, upstream_url)
+        };
+        match tarball_name {
+            Some(n) if !n.is_empty() && n == filename => return Some((dist, tarball)),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Where to fetch `filename` from upstream, when that is NOT the canonical
+/// `{package}/-/{filename}` path: the packument's own tarball URL, returned
+/// only when it is in a non-standard layout on the upstream's origin (so the
+/// repository's upstream credentials may accompany it). `None` means "use the
+/// canonical path".
+fn npm_tarball_source_for_filename(
+    packument: &serde_json::Value,
+    filename: &str,
+    upstream_url: &str,
+) -> Option<String> {
+    let (_, tarball) = npm_dist_for_filename(packument, filename, Some(upstream_url))?;
+    if tarball.contains("/-/") || !npm_same_origin(tarball, upstream_url) {
+        return None;
+    }
+    Some(tarball.split('#').next().unwrap_or(tarball).to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tarball integrity gating (GHSA-qxv7-p3mq-88fv)
 // ---------------------------------------------------------------------------
 
@@ -1090,44 +1229,49 @@ fn normalize_npm_shasum(raw: &str) -> Option<String> {
 /// filename (hyphenated names and prerelease tags make that ambiguous; the
 /// curation gate refuses to for the same reason, #2930). `dist.integrity`
 /// (SRI) is preferred over the legacy `dist.shasum` (SHA-1 hex).
+#[cfg(test)]
 fn npm_integrity_for_filename(
     packument: &serde_json::Value,
     filename: &str,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    npm_integrity_for_filename_on_upstream(packument, filename, None)
+}
+
+/// [`npm_integrity_for_filename`], additionally matching tarball URLs in a
+/// non-standard layout on `upstream_url`'s origin by the canonical filename
+/// they are advertised under (#3785).
+fn npm_integrity_for_filename_on_upstream(
+    packument: &serde_json::Value,
+    filename: &str,
+    upstream_url: Option<&str>,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
     use crate::services::proxy_service::CacheCommitDigest;
 
-    let versions = packument.get("versions")?.as_object()?;
-    for version in versions.values() {
-        let Some(dist) = version.get("dist") else {
-            continue;
-        };
-        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
-        let tarball_name = tarball
-            .split(['#', '?'])
-            .next()
-            .unwrap_or(tarball)
-            .rsplit('/')
-            .next()
-            .unwrap_or("");
-        if tarball_name.is_empty() || tarball_name != filename {
-            continue;
-        }
-        if let Some(digest) = dist
-            .get("integrity")
-            .and_then(|i| i.as_str())
-            .and_then(parse_npm_sri)
-        {
-            return Some(digest);
-        }
-        if let Some(digest) = dist
-            .get("shasum")
-            .and_then(|s| s.as_str())
-            .and_then(normalize_npm_shasum)
-        {
-            return Some(CacheCommitDigest::Sha1Hex(digest));
-        }
+    let (dist, _) = npm_dist_for_filename(packument, filename, upstream_url)?;
+    if let Some(digest) = dist
+        .get("integrity")
+        .and_then(|i| i.as_str())
+        .and_then(parse_npm_sri)
+    {
+        return Some(digest);
     }
-    None
+    dist.get("shasum")
+        .and_then(|s| s.as_str())
+        .and_then(normalize_npm_shasum)
+        .map(CacheCommitDigest::Sha1Hex)
+}
+
+/// Upstream facts about one tarball, read from the packument.
+#[derive(Debug, Default)]
+struct NpmTarballUpstream {
+    /// Registry-published digest the proxy-cache commit is gated on.
+    integrity: Option<crate::services::proxy_service::CacheCommitDigest>,
+    /// Absolute upstream URL to fetch the tarball from when the upstream
+    /// does not serve it at the canonical `{package}/-/{filename}` path
+    /// (GitHub Packages' `/download/…` layout, #3785). `None` = canonical.
+    source: Option<String>,
+    /// Whether the packument advertises `filename` at all.
+    advertised: bool,
 }
 
 /// Resolve the registry-published integrity for the tarball `filename` of
@@ -1139,27 +1283,32 @@ fn npm_integrity_for_filename(
 /// a tarball whose bytes disagreed with it was committed to the cache and
 /// served warm from then on.
 ///
+/// The same lookup yields the tarball's upstream source (#3785): an upstream
+/// that publishes tarballs outside the registry-standard `/-/` layout
+/// (GitHub Packages) is fetched from the URL its packument advertises, on the
+/// upstream's own origin, rather than from a canonical path it does not serve.
+///
 /// The packument is re-read through the same cache-keyed metadata helper the
 /// metadata handler uses, so an npm client — which always fetches the
 /// packument immediately before the tarball — finds it warm. The cached copy
 /// is the RAW upstream document (tarball-URL rewriting happens after the
 /// cache read), so the digests are the upstream's own values. Best-effort by
 /// construction: any failure (fetch/parse error, version entry missing, no
-/// usable digest) returns `None` and the download proceeds unverified,
-/// exactly as before.
-async fn resolve_npm_tarball_integrity(
+/// usable digest) yields no gate and the canonical source, and the download
+/// proceeds exactly as before.
+async fn resolve_npm_tarball_upstream(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
     package_name: &str,
     filename: &str,
-) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+) -> NpmTarballUpstream {
     // Fetch/cache split (#3297): `%2F`-encoded name upstream, decoded
     // `@scope/name` as the local cache key — identical to the metadata
     // handler, so this rides the same cache entry.
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct, _budget_permit) =
+    let Ok((content, _ct, _budget_permit)) =
         proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
             proxy,
             repo_id,
@@ -1171,9 +1320,17 @@ async fn resolve_npm_tarball_integrity(
             proxy_helpers::LARGE_METADATA_MAX_BYTES,
         )
         .await
-        .ok()?;
-    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
-    npm_integrity_for_filename(&packument, filename)
+    else {
+        return NpmTarballUpstream::default();
+    };
+    let Ok(packument) = serde_json::from_slice::<serde_json::Value>(&content) else {
+        return NpmTarballUpstream::default();
+    };
+    NpmTarballUpstream {
+        advertised: npm_dist_for_filename(&packument, filename, Some(upstream_url)).is_some(),
+        integrity: npm_integrity_for_filename_on_upstream(&packument, filename, Some(upstream_url)),
+        source: npm_tarball_source_for_filename(&packument, filename, upstream_url),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2947,6 +3104,7 @@ async fn get_package_metadata(
                     package_name,
                     content,
                     content_type,
+                    Some(upstream_url.as_str()),
                     base_url,
                     repo_key,
                     want_abbreviated,
@@ -3121,7 +3279,7 @@ async fn fetch_remote_packument(
     let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
         AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
     })?;
-    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key, Some(upstream_url));
     Ok(json)
 }
 
@@ -3144,11 +3302,13 @@ async fn fetch_virtual_packument(
 /// that member's age-gate filter, then rewrite tarball URLs to the virtual
 /// repo key. Returns `Ok(None)` for an unparseable body — the member is
 /// treated as a miss rather than failing the whole merge.
+#[allow(clippy::too_many_arguments)]
 async fn remote_member_packument_value(
     state: &SharedState,
     member_id: uuid::Uuid,
     package_name: &str,
     content: &Bytes,
+    upstream_url: &str,
     base_url: &str,
     repo_key: &str,
     apply_age_gate: bool,
@@ -3172,7 +3332,7 @@ async fn remote_member_packument_value(
             }
         }
     }
-    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key, Some(upstream_url));
     Ok(Some(json))
 }
 
@@ -3533,6 +3693,7 @@ async fn virtual_member_packument_contribution(
                 member.id,
                 package_name,
                 &content,
+                upstream_url,
                 base_url,
                 repo_key,
                 apply_age_gate,
@@ -3762,6 +3923,7 @@ async fn rewrite_and_respond_with_age_gate(
     package_name: &str,
     content: Bytes,
     content_type: Option<String>,
+    upstream_url: Option<&str>,
     base_url: &str,
     repo_key: &str,
     want_abbreviated: bool,
@@ -3782,6 +3944,7 @@ async fn rewrite_and_respond_with_age_gate(
         package_name,
         content,
         content_type,
+        upstream_url,
         base_url,
         repo_key,
         want_abbreviated,
@@ -3796,6 +3959,7 @@ async fn rewrite_and_respond_with_age_gate_params(
     package_name: &str,
     content: Bytes,
     content_type: Option<String>,
+    upstream_url: Option<&str>,
     base_url: &str,
     repo_key: &str,
     want_abbreviated: bool,
@@ -3815,6 +3979,7 @@ async fn rewrite_and_respond_with_age_gate_params(
     Ok(rewrite_and_respond_inner(
         filtered,
         content_type,
+        upstream_url,
         base_url,
         repo_key,
         want_abbreviated,
@@ -3824,6 +3989,7 @@ async fn rewrite_and_respond_with_age_gate_params(
 fn rewrite_and_respond_inner(
     content: Bytes,
     content_type: Option<String>,
+    upstream_url: Option<&str>,
     base_url: &str,
     repo_key: &str,
     want_abbreviated: bool,
@@ -3831,7 +3997,7 @@ fn rewrite_and_respond_inner(
     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
         // Abbreviate after the tarball rewrite so abbreviated `dist.tarball`
         // URLs point at this proxy.
-        rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+        rewrite_npm_tarball_urls(&mut json, base_url, repo_key, upstream_url);
         return respond_with_packument(json, want_abbreviated);
     }
     // Not valid JSON: pass through with the original content type (never abbreviate).
@@ -4094,6 +4260,26 @@ async fn serve_tarball(
                 response_filename = lkg_filename;
             }
 
+            // Packument facts for the tarball actually served (after the age
+            // gate, so a last-known-good substitution resolves its OWN
+            // entry): the integrity the cache commit is gated on, and — for
+            // an upstream outside the registry-standard `/-/` layout (GitHub
+            // Packages, #3785) — the URL the upstream really serves it at.
+            // The proxy cache key stays the canonical `fetch_path` either way.
+            let tarball_upstream = resolve_npm_tarball_upstream(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                package_name,
+                &response_filename,
+            )
+            .await;
+            let source_path = tarball_upstream
+                .source
+                .clone()
+                .unwrap_or_else(|| fetch_path.clone());
+
             // #3003: when scan-on-proxy is enabled, route through the inline
             // scan-and-block path (buffered capped fetch + digest-keyed
             // verdict gate shared with proxy-PyPI, #2954/#2970/#2976). Taken
@@ -4116,6 +4302,7 @@ async fn serve_tarball(
                     repo_key,
                     upstream_url,
                     package_name,
+                    &source_path,
                     &fetch_path,
                     &response_filename,
                     action,
@@ -4141,15 +4328,7 @@ async fn serve_tarball(
             // variant rather than the SHA-256-only proxy_helpers wrapper; a
             // mismatch is served to the client (npm verifies the SRI itself)
             // but never cached.
-            let expected_integrity = resolve_npm_tarball_integrity(
-                proxy,
-                repo.id,
-                repo_key,
-                upstream_url,
-                package_name,
-                &response_filename,
-            )
-            .await;
+            let expected_integrity = tarball_upstream.integrity;
             let gated_repo = proxy_helpers::build_remote_repo_with_format(
                 repo.id,
                 repo_key,
@@ -4159,7 +4338,7 @@ async fn serve_tarball(
             let result = proxy
                 .fetch_artifact_streaming_with_cache_path_gated_digest(
                     &gated_repo,
-                    &fetch_path,
+                    &source_path,
                     &fetch_path,
                     expected_integrity,
                 )
@@ -4373,6 +4552,19 @@ async fn serve_tarball(
                 if !enabled {
                     continue;
                 }
+                // #3785: a member upstream outside the `/-/` layout (GitHub
+                // Packages) is fetched from the URL its packument advertises.
+                let source_path = resolve_npm_tarball_upstream(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    member_upstream,
+                    package_name,
+                    filename,
+                )
+                .await
+                .source
+                .unwrap_or_else(|| upstream_path.clone());
                 match serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4380,6 +4572,7 @@ async fn serve_tarball(
                     &member.key,
                     member_upstream,
                     package_name,
+                    &source_path,
                     &upstream_path,
                     filename,
                     action,
@@ -4402,6 +4595,27 @@ async fn serve_tarball(
                         continue;
                     }
                 }
+            }
+        }
+
+        // #3785: a Remote member whose upstream publishes tarballs outside the
+        // registry-standard `/-/` layout (GitHub Packages' `/download/…`)
+        // cannot be served by the shared resolver below, which fetches every
+        // member at the canonical `upstream_path`. Serve it here, from the
+        // URL its packument advertises, under the same canonical cache key.
+        if let Some(proxy) = proxy_for_virtual {
+            if let Some(resp) = serve_npm_virtual_relocated_tarball(
+                state,
+                proxy,
+                &members,
+                package_name,
+                &upstream_path,
+                filename,
+                ctx,
+            )
+            .await?
+            {
+                return Ok(resp);
             }
         }
 
@@ -4659,6 +4873,92 @@ fn build_scanned_tarball_response(
     builder.body(Body::from(bytes)).unwrap()
 }
 
+/// Virtual-over-Remote leg of #3785: serve `filename` from the first Remote
+/// member (in the resolver's priority order) whose packument advertises it,
+/// when that member's upstream serves it outside the canonical `/-/` path.
+///
+/// `members` is the already authorized, scope-filtered and #3955
+/// priority-guarded list the shared resolver would walk, so this never
+/// reaches a member the resolver could not. The walk stops at the first
+/// Remote member that advertises the tarball: if its upstream uses the
+/// canonical layout this returns `Ok(None)` and the shared resolver serves it
+/// exactly as before, so a registry-standard member is never overtaken. A
+/// member whose upstream 404s the advertised URL falls through to the next.
+async fn serve_npm_virtual_relocated_tarball(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    members: &[crate::models::repository::Repository],
+    package_name: &str,
+    upstream_path: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Response>, Response> {
+    for member in members {
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(ref member_upstream) = member.upstream_url else {
+            continue;
+        };
+        let upstream = resolve_npm_tarball_upstream(
+            proxy,
+            member.id,
+            &member.key,
+            member_upstream,
+            package_name,
+            filename,
+        )
+        .await;
+        let Some(source) = upstream.source else {
+            if upstream.advertised {
+                // Advertised in the canonical layout: the shared resolver's
+                // walk serves it.
+                return Ok(None);
+            }
+            continue;
+        };
+        match proxy_helpers::proxy_fetch_streaming_with_cache_key(
+            proxy,
+            member.id,
+            &member.key,
+            member_upstream,
+            &source,
+            upstream_path,
+            member.format.clone(),
+        )
+        .await
+        {
+            Ok(result) => {
+                correct_cached_tarball_content_type(&state.db, member.id, upstream_path).await;
+                proxy_helpers::record_proxy_download(
+                    state,
+                    member.id,
+                    &member.key,
+                    upstream_path,
+                    ctx,
+                )
+                .await;
+                return Ok(Some(build_tarball_response_stream(
+                    result.body,
+                    filename,
+                    npm_virtual_tarball_content_type(result.content_type),
+                    result.content_length,
+                    result.content_encoding,
+                )));
+            }
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                debug!(
+                    member_key = %member.key,
+                    "npm virtual member's relocated tarball 404'd upstream; trying next member"
+                );
+                continue;
+            }
+            Err(resp) => return Err(resp),
+        }
+    }
+    Ok(None)
+}
+
 /// Inline scan-and-block for an npm proxy tarball download (#3003).
 ///
 /// Runs ONLY when scan-on-proxy is enabled for the repo; the caller keeps the
@@ -4678,6 +4978,7 @@ async fn serve_scanned_npm_tarball(
     repo_key: &str,
     upstream_url: &str,
     package_name: &str,
+    source_path: &str,
     fetch_path: &str,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
@@ -4700,7 +5001,7 @@ async fn serve_scanned_npm_tarball(
     let (bytes, content_encoding) = match proxy
         .fetch_artifact_with_cache_path_capped(
             &remote_repo,
-            fetch_path,
+            source_path,
             fetch_path,
             crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
         )
@@ -4729,7 +5030,7 @@ async fn serve_scanned_npm_tarball(
                         repo_id,
                         repo_key,
                         upstream_url,
-                        fetch_path,
+                        source_path,
                         fetch_path,
                         RepositoryFormat::Npm,
                     )
@@ -5465,18 +5766,39 @@ async fn dist_tags_delete(
 /// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
 /// npm metadata contains `versions.{ver}.dist.tarball` pointing to the upstream registry.
 /// We rewrite those to point to `{base_url}/npm/{repo_key}/{package}/-/{filename}`.
-fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_key: &str) {
+///
+/// `upstream_url` is the upstream the document came from, when it came from
+/// one: tarball URLs on that origin are rewritten even when they do not use
+/// the registry-standard `/-/` layout (GitHub Packages' `/download/…`, #3785),
+/// so the client never needs to reach the upstream directly. See
+/// [`npm_advertised_tarball_filename`] for the exact rule.
+fn rewrite_npm_tarball_urls(
+    json: &mut serde_json::Value,
+    base_url: &str,
+    repo_key: &str,
+    upstream_url: Option<&str>,
+) {
+    let doc_name = json
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
     let versions = match json.get_mut("versions").and_then(|v| v.as_object_mut()) {
         Some(v) => v,
         None => return,
     };
 
-    for (_version, version_data) in versions.iter_mut() {
+    for (version_key, version_data) in versions.iter_mut() {
         // Extract package name before taking mutable borrow on dist
         let pkg_name = version_data
             .get("name")
             .and_then(|n| n.as_str())
-            .unwrap_or("_unknown")
+            .map(str::to_string)
+            .or_else(|| doc_name.clone())
+            .unwrap_or_else(|| "_unknown".to_string());
+        let version = version_data
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or(version_key)
             .to_string();
 
         if let Some(dist) = version_data.get_mut("dist") {
@@ -5486,10 +5808,10 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
                 .and_then(|t| t.as_str())
                 .and_then(|tarball| {
                     // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
-                    tarball.rsplit_once("/-/").map(|(_, filename)| {
-                        build_npm_tarball_url(base_url, repo_key, &pkg_name, filename)
-                    })
-                });
+                    // or https://npm.pkg.github.com/download/@o/p/1.0.0/<hash>
+                    npm_advertised_tarball_filename(tarball, &pkg_name, &version, upstream_url)
+                })
+                .map(|filename| build_npm_tarball_url(base_url, repo_key, &pkg_name, &filename));
 
             if let Some(url) = new_url {
                 if let Some(d) = dist.as_object_mut() {
@@ -8069,7 +8391,7 @@ mod tests {
             }
         });
 
-        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-remote");
+        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-remote", None);
 
         let tarball = json["versions"]["4.18.2"]["dist"]["tarball"]
             .as_str()
@@ -8095,7 +8417,7 @@ mod tests {
             }
         });
 
-        rewrite_npm_tarball_urls(&mut json, "https://my.registry.com", "npm-main");
+        rewrite_npm_tarball_urls(&mut json, "https://my.registry.com", "npm-main", None);
 
         let tarball = json["versions"]["17.0.0"]["dist"]["tarball"]
             .as_str()
@@ -8112,7 +8434,7 @@ mod tests {
             "name": "empty-pkg"
         });
         // Should not panic
-        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo", None);
         // JSON unchanged
         assert!(json.get("versions").is_none());
     }
@@ -8128,7 +8450,7 @@ mod tests {
             }
         });
         // Should not panic
-        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo", None);
     }
 
     #[test]
@@ -8145,7 +8467,7 @@ mod tests {
             }
         });
         // Should not panic or modify anything
-        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo", None);
     }
 
     #[test]
@@ -8168,7 +8490,7 @@ mod tests {
             }
         });
 
-        rewrite_npm_tarball_urls(&mut json, "http://local:8080", "npm");
+        rewrite_npm_tarball_urls(&mut json, "http://local:8080", "npm", None);
 
         let t1 = json["versions"]["4.17.20"]["dist"]["tarball"]
             .as_str()
@@ -9565,7 +9887,7 @@ mod tests {
             }
         });
 
-        rewrite_npm_tarball_urls(&mut json, "https://registry.example.dev", "npm");
+        rewrite_npm_tarball_urls(&mut json, "https://registry.example.dev", "npm", None);
 
         let dist = &json["versions"]["2.0.0"]["dist"];
 
@@ -9618,7 +9940,7 @@ mod tests {
             }
         });
 
-        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-cache");
+        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-cache", None);
 
         // Both versions should have rewritten tarball URLs
         assert!(json["versions"]["1.0.1"]["dist"]["tarball"]
@@ -10047,6 +10369,387 @@ mod tests {
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
         cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3785: GitHub Packages (`/download/…`) tarball URL layout
+    // -----------------------------------------------------------------------
+
+    const GHP_SCOPED: &str = "@example-org/example-package";
+
+    /// A GitHub-Packages-shaped packument: tarball URLs live under
+    /// `{origin}/download/@scope/pkg/<version>/<hash>`, with no `/-/` segment
+    /// and no filename. Version 9.9.9 points at a foreign host and must never
+    /// be rewritten or fetched.
+    fn ghp_packument(origin: &str, integrity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": GHP_SCOPED,
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {
+                "1.2.3": {
+                    "name": GHP_SCOPED,
+                    "version": "1.2.3",
+                    "dist": {
+                        "tarball": format!(
+                            "{origin}/download/{GHP_SCOPED}/1.2.3/0123456789abcdef"
+                        ),
+                        "integrity": integrity
+                    }
+                },
+                "9.9.9": {
+                    "name": GHP_SCOPED,
+                    "version": "9.9.9",
+                    "dist": {"tarball": "https://elsewhere.example/blob/9.9.9"}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_advertised_tarball_filename_3785() {
+        let up = Some("https://npm.pkg.github.com");
+        // Registry-standard layout: unchanged, whatever host it names.
+        assert_eq!(
+            npm_advertised_tarball_filename(
+                "https://registry.npmjs.org/express/-/express-4.18.2.tgz",
+                "express",
+                "4.18.2",
+                None
+            )
+            .as_deref(),
+            Some("express-4.18.2.tgz")
+        );
+        // GitHub Packages layout on the upstream's origin: canonical filename.
+        assert_eq!(
+            npm_advertised_tarball_filename(
+                "https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/abc",
+                GHP_SCOPED,
+                "1.2.3",
+                up
+            )
+            .as_deref(),
+            Some("example-package-1.2.3.tgz")
+        );
+        // Same layout with an owner path prefix on the configured upstream.
+        assert!(npm_advertised_tarball_filename(
+            "https://NPM.pkg.github.com:443/download/@example-org/example-package/1.2.3/abc",
+            GHP_SCOPED,
+            "1.2.3",
+            Some("https://npm.pkg.github.com/example-org")
+        )
+        .is_some());
+        // Unknown upstream, foreign host, other scheme, malformed URL,
+        // unsafe version or invalid name: left alone.
+        for (url, name, version, upstream) in [
+            (
+                "https://npm.pkg.github.com/download/x/1/h",
+                "x",
+                "1.0.0",
+                None,
+            ),
+            ("https://evil.example/download/x/1/h", "x", "1.0.0", up),
+            ("http://npm.pkg.github.com/download/x/1/h", "x", "1.0.0", up),
+            ("not a url", "x", "1.0.0", up),
+            ("https://npm.pkg.github.com/d/x", "x", "../1", up),
+            ("https://npm.pkg.github.com/d/x", "x", "", up),
+            ("https://npm.pkg.github.com/d/x", "Bad Name", "1.0.0", up),
+        ] {
+            assert_eq!(
+                npm_advertised_tarball_filename(url, name, version, upstream),
+                None,
+                "{url} / {name} / {version:?} must not be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_github_packages_3785() {
+        let origin = "https://npm.pkg.github.com";
+        let mut json = ghp_packument(origin, "sha512-x");
+        // Without the upstream the `/download/` URL is not recognised.
+        let mut unmatched = json.clone();
+        rewrite_npm_tarball_urls(&mut unmatched, "http://ak", "gh", None);
+        assert_eq!(unmatched, json);
+
+        rewrite_npm_tarball_urls(&mut json, "http://ak", "gh", Some(origin));
+        assert_eq!(
+            json["versions"]["1.2.3"]["dist"]["tarball"],
+            "http://ak/npm/gh/@example-org/example-package/-/example-package-1.2.3.tgz"
+        );
+        // Foreign-host tarball URL is left untouched.
+        assert_eq!(
+            json["versions"]["9.9.9"]["dist"]["tarball"],
+            "https://elsewhere.example/blob/9.9.9"
+        );
+        // The abbreviated document carries the rewritten URL too.
+        let abbreviated = abbreviate_packument(&json);
+        assert_eq!(
+            abbreviated["versions"]["1.2.3"]["dist"]["tarball"],
+            json["versions"]["1.2.3"]["dist"]["tarball"]
+        );
+    }
+
+    #[test]
+    fn test_npm_tarball_source_and_integrity_for_relocated_layout_3785() {
+        use crate::services::proxy_service::CacheCommitDigest;
+        use base64::Engine as _;
+
+        let origin = "https://npm.pkg.github.com";
+        let sha512_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"ghp"));
+        let packument = ghp_packument(origin, &format!("sha512-{sha512_b64}"));
+        let file = "example-package-1.2.3.tgz";
+        assert_eq!(
+            npm_tarball_source_for_filename(&packument, file, origin).as_deref(),
+            Some("https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/0123456789abcdef")
+        );
+        assert_eq!(
+            npm_integrity_for_filename_on_upstream(&packument, file, Some(origin)),
+            Some(CacheCommitDigest::Sha512Hex(hex::encode(
+                sha2::Sha512::digest(b"ghp")
+            )))
+        );
+        // A different upstream origin neither relocates nor matches.
+        assert_eq!(
+            npm_tarball_source_for_filename(&packument, file, "https://other.example"),
+            None
+        );
+        assert!(npm_dist_for_filename(&packument, file, Some("https://other.example")).is_none());
+        // A registry-standard layout keeps the canonical fetch path.
+        let standard = serde_json::json!({"versions": {"1.0.0": {"name": "p", "version": "1.0.0",
+            "dist": {"tarball": format!("{origin}/p/-/p-1.0.0.tgz")}}}});
+        assert!(npm_dist_for_filename(&standard, "p-1.0.0.tgz", Some(origin)).is_some());
+        assert_eq!(
+            npm_tarball_source_for_filename(&standard, "p-1.0.0.tgz", origin),
+            None
+        );
+    }
+
+    /// Mount the GitHub-Packages-shaped packument and its `/download/`
+    /// tarball on `upstream`, requiring `bearer` on the tarball fetch when
+    /// given. Returns the tarball bytes.
+    async fn mount_ghp_upstream(
+        upstream: &wiremock::MockServer,
+        bearer: Option<&str>,
+    ) -> &'static [u8] {
+        use base64::Engine as _;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const BYTES: &[u8] = b"\x1f\x8b\x08github-packages-tarball-bytes";
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(BYTES))
+        );
+        Mock::given(method("GET"))
+            .and(path("/@example-org%2Fexample-package"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(ghp_packument(&upstream.uri(), &integrity)),
+            )
+            .mount(upstream)
+            .await;
+        let download = Mock::given(method("GET")).and(path(format!(
+            "/download/{GHP_SCOPED}/1.2.3/0123456789abcdef"
+        )));
+        let download = match bearer {
+            Some(token) => download.and(header("authorization", format!("Bearer {token}"))),
+            None => download,
+        };
+        download
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(BYTES),
+            )
+            // At least one relocated fetch; a repeat pull is normally a cache
+            // hit, but the streamed cache commit may land after it starts.
+            .expect(1..=2)
+            .mount(upstream)
+            .await;
+        BYTES
+    }
+
+    /// Fetch `@example-org/example-package` metadata through `repo_key`
+    /// (full or abbreviated) and return the served 1.2.3 tarball URL.
+    async fn ghp_served_tarball_url(
+        state: &SharedState,
+        repo_key: &str,
+        abbreviated: bool,
+    ) -> String {
+        let resp = super::get_package_metadata(
+            state,
+            None,
+            repo_key,
+            GHP_SCOPED,
+            "http://localhost",
+            abbreviated,
+        )
+        .await
+        .unwrap_or_else(|r| panic!("packument must resolve: HTTP {}", r.status()));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read packument");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("packument JSON");
+        json["versions"]["1.2.3"]["dist"]["tarball"]
+            .as_str()
+            .expect("tarball url")
+            .to_string()
+    }
+
+    async fn ghp_download(state: &SharedState, repo_key: &str) -> Result<Response, Response> {
+        super::download_scoped_tarball(
+            axum::extract::State(state.clone()),
+            axum::Extension(tdh_admin()),
+            axum::extract::Path((
+                repo_key.to_string(),
+                "example-org".to_string(),
+                "example-package".to_string(),
+                "example-package-1.2.3.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await
+    }
+
+    fn tdh_admin() -> Option<AuthExtension> {
+        crate::api::handlers::test_db_helpers::admin_auth_ext()
+    }
+
+    /// #3785: a Remote npm repo whose upstream is GitHub Packages serves a
+    /// packument whose `/download/…` tarball URLs point at THIS repository
+    /// (full and abbreviated), and the rewritten URL fetches the upstream
+    /// bytes from the `/download/…` URL with the repo's bearer credentials.
+    #[tokio::test]
+    async fn test_remote_github_packages_tarball_rewritten_and_proxied_3785_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        // `save_upstream_auth` needs an encryption key; with one configured the
+        // tarball mock only answers a request carrying the bearer token.
+        let bearer =
+            if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+                let creds = crate::services::upstream_auth::build_credentials_json(
+                    &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                        token: "ghp-token".to_string(),
+                    },
+                );
+                crate::services::upstream_auth::save_upstream_auth(
+                    &fx.pool, fx.repo_id, "bearer", &creds,
+                )
+                .await
+                .expect("save upstream auth");
+                Some("ghp-token")
+            } else {
+                None
+            };
+        let bytes = mount_ghp_upstream(&upstream, bearer).await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+
+        let full = ghp_served_tarball_url(&state, &fx.repo_key, false).await;
+        let abbreviated = ghp_served_tarball_url(&state, &fx.repo_key, true).await;
+        // Drain each body before the next pull: the proxy cache commits when
+        // the streamed body completes, so the second pull is normally served
+        // from the cache.
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            bodies.push(match ghp_download(&state, &fx.repo_key).await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    Ok((status, body))
+                }
+                Err(resp) => Err(resp.status()),
+            });
+        }
+
+        let key = fx.repo_key.clone();
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let expected = format!(
+            "http://localhost/npm/{key}/@example-org/example-package/-/example-package-1.2.3.tgz"
+        );
+        assert_eq!(full, expected);
+        assert_eq!(abbreviated, expected);
+        for served in bodies {
+            let (status, body) =
+                served.unwrap_or_else(|status| panic!("tarball must be served: {status}"));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], bytes);
+        }
+    }
+
+    /// #3785, Virtual-over-Remote: a virtual repo whose Remote member is
+    /// GitHub Packages advertises the tarball under the VIRTUAL key and
+    /// serves it from the member's `/download/…` URL.
+    #[tokio::test]
+    async fn test_virtual_over_github_packages_remote_tarball_3785_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let bytes = mount_ghp_upstream(&upstream, None).await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+        tdh::publish_repo(&fx.pool, remote_id).await;
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+
+        let served = ghp_served_tarball_url(&state, &fx.repo_key, false).await;
+        let download = ghp_download(&state, &fx.repo_key).await;
+
+        let key = fx.repo_key.clone();
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            served,
+            format!(
+                "http://localhost/npm/{key}/@example-org/example-package/-/example-package-1.2.3.tgz"
+            )
+        );
+        let resp = download.unwrap_or_else(|r| panic!("tarball must be served: {}", r.status()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], bytes);
     }
 
     /// #3297: a Remote npm proxy must request a scoped packument from
@@ -15565,17 +16268,17 @@ mod content_encoding_forwarding_tests {
             .unwrap_or(src);
 
         let call_sites = body.matches("build_tarball_response_stream(").count();
-        // 5 serves + the `fn` definition itself.
+        // 6 serves + the `fn` definition itself.
         assert_eq!(
-            call_sites, 6,
+            call_sites, 7,
             "npm tarball call-site count changed; re-check each new arm \
              forwards content_encoding (#3149)",
         );
         let forwarding = body.matches(".content_encoding,").count();
         assert_eq!(
-            forwarding, 4,
+            forwarding, 5,
             "every proxied npm tarball arm (remote, virtual, virtual-LKG, \
-             scan-pending) must pass the fetch result's content_encoding; \
+             virtual-relocated #3785, scan-pending) must pass the fetch result's content_encoding; \
              only the hosted arm passes None (#3149)",
         );
     }
