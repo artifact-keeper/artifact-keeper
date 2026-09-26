@@ -65,8 +65,17 @@ pub struct ApprovalResponse {
     pub target_repository: String,
     pub status: String,
     pub requested_by: Uuid,
+    /// Usernames of the principals on either side of the request (#4238).
+    /// `requested_by` / `reviewed_by` alone are bare ids, so a promotion
+    /// approval could not say who asked for it or who granted it without a
+    /// lookup per row — and a service account, which is what a CI-driven
+    /// promotion uses, was indistinguishable from a person. `promotion_history`
+    /// already hydrates `promoted_by_username` the same way. Both are `None`
+    /// when the account has since been deleted; the audit log keeps the record.
+    pub requested_by_username: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub reviewed_by: Option<Uuid>,
+    pub reviewed_by_username: Option<String>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub review_notes: Option<String>,
     #[schema(value_type = Option<Object>)]
@@ -128,6 +137,8 @@ struct ApprovalRow {
     // Joined columns
     source_repo_key: Option<String>,
     target_repo_key: Option<String>,
+    requested_by_username: Option<String>,
+    reviewed_by_username: Option<String>,
 }
 
 impl ApprovalRow {
@@ -139,8 +150,10 @@ impl ApprovalRow {
             target_repository: self.target_repo_key.unwrap_or_default(),
             status: self.status,
             requested_by: self.requested_by,
+            requested_by_username: self.requested_by_username,
             requested_at: self.requested_at,
             reviewed_by: self.reviewed_by,
+            reviewed_by_username: self.reviewed_by_username,
             reviewed_at: self.reviewed_at,
             review_notes: self.review_notes,
             policy_result: self.policy_result,
@@ -353,10 +366,14 @@ const SELECT_APPROVAL: &str = r#"
         pa.policy_result,
         pa.notes,
         sr.key AS source_repo_key,
-        tr.key AS target_repo_key
+        tr.key AS target_repo_key,
+        requester.username AS requested_by_username,
+        reviewer.username AS reviewed_by_username
     FROM promotion_approvals pa
     LEFT JOIN repositories sr ON sr.id = pa.source_repo_id
     LEFT JOIN repositories tr ON tr.id = pa.target_repo_id
+    LEFT JOIN users requester ON requester.id = pa.requested_by
+    LEFT JOIN users reviewer ON reviewer.id = pa.reviewed_by
 "#;
 
 // ---------------------------------------------------------------------------
@@ -504,8 +521,10 @@ pub async fn request_approval(
             target_repository: req.target_repository,
             status: "pending".to_string(),
             requested_by: auth.user_id,
+            requested_by_username: Some(auth.username.clone()),
             requested_at: now,
             reviewed_by: None,
+            reviewed_by_username: None,
             reviewed_at: None,
             review_notes: None,
             policy_result,
@@ -1494,8 +1513,10 @@ mod tests {
             target_repository: "release-npm".to_string(),
             status: "pending".to_string(),
             requested_by: Uuid::nil(),
+            requested_by_username: Some("ci-promoter".to_string()),
             requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
             reviewed_by: None,
+            reviewed_by_username: None,
             reviewed_at: None,
             review_notes: None,
             policy_result: None,
@@ -1517,8 +1538,10 @@ mod tests {
             target_repository: "release".to_string(),
             status: "approved".to_string(),
             requested_by: Uuid::nil(),
+            requested_by_username: Some("ci-promoter".to_string()),
             requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
             reviewed_by: Some(reviewer),
+            reviewed_by_username: Some("release-captain".to_string()),
             reviewed_at: Some(DateTime::from_timestamp(1700001000, 0).unwrap()),
             review_notes: Some("LGTM".to_string()),
             policy_result: Some(serde_json::json!({"passed": true})),
@@ -1598,12 +1621,17 @@ mod tests {
             notes: Some("test notes".to_string()),
             source_repo_key: Some("staging-maven".to_string()),
             target_repo_key: Some("release-maven".to_string()),
+            requested_by_username: Some("ci-promoter".to_string()),
+            reviewed_by_username: None,
         };
         let resp = row.into_response();
         assert_eq!(resp.source_repository, "staging-maven");
         assert_eq!(resp.target_repository, "release-maven");
         assert_eq!(resp.status, "pending");
         assert_eq!(resp.notes.as_deref(), Some("test notes"));
+        // #4238: the joined actor names survive the row -> response mapping.
+        assert_eq!(resp.requested_by_username.as_deref(), Some("ci-promoter"));
+        assert!(resp.reviewed_by_username.is_none());
     }
 
     #[test]
@@ -1623,12 +1651,20 @@ mod tests {
             notes: None,
             source_repo_key: None,
             target_repo_key: None,
+            requested_by_username: None,
+            reviewed_by_username: Some("release-captain".to_string()),
         };
         let resp = row.into_response();
         assert_eq!(resp.source_repository, "");
         assert_eq!(resp.target_repository, "");
         assert_eq!(resp.status, "rejected");
         assert_eq!(resp.review_notes.as_deref(), Some("Not ready"));
+        // A deleted requester leaves the id but no name; the reviewer is named.
+        assert!(resp.requested_by_username.is_none());
+        assert_eq!(
+            resp.reviewed_by_username.as_deref(),
+            Some("release-captain")
+        );
     }
 
     #[test]
