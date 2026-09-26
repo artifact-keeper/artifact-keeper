@@ -4873,45 +4873,78 @@ fn build_scanned_tarball_response(
     builder.body(Body::from(bytes)).unwrap()
 }
 
+/// Upper bound on one virtual member's relocation lookup (#3785). The lookup
+/// is a cache read; a storage backend slower than this yields no relocation
+/// (canonical path) rather than holding the tarball request.
+const NPM_RELOCATION_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Per-member absolute upstream fetch URLs for a virtual npm tarball (#3785),
 /// for [`proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls`].
 ///
 /// Only Remote members whose own packument advertises `filename` at a
 /// non-standard, same-origin URL (GitHub Packages) get an entry; every other
-/// member — and any member whose packument cannot be read — fetches the
-/// canonical path, so a lookup failure is never worse than no lookup. The
-/// lookups run concurrently (they are warm packument cache reads in the
-/// common case, #4241's rationale for the member walk).
+/// member fetches the canonical path, so a failed lookup is never worse than
+/// no lookup. The lookup never contacts upstream: it reads the member's
+/// proxy-CACHED packument — warm in the normal flow, where the client fetched
+/// the virtual packument (which walks every member) just before the tarball.
+/// A cache miss, a parse failure or a lookup exceeding
+/// [`NPM_RELOCATION_LOOKUP_TIMEOUT`] all mean "canonical path", so a dead or
+/// slow member cannot delay the request. Lookups run in batches of at most
+/// [`proxy_helpers::MAX_VIRTUAL_FANOUT`], like #4241's member walk.
 async fn npm_virtual_member_fetch_urls(
     proxy: Option<&crate::services::proxy_service::ProxyService>,
     members: &[crate::models::repository::Repository],
     package_name: &str,
     filename: &str,
 ) -> std::collections::HashMap<uuid::Uuid, String> {
+    let mut urls = std::collections::HashMap::new();
     let Some(proxy) = proxy else {
-        return std::collections::HashMap::new();
+        return urls;
     };
-    let lookups = members.iter().filter_map(|member| {
-        let upstream_url = member.upstream_url.as_deref()?;
-        (member.repo_type == RepositoryType::Remote).then_some(async move {
-            let source = resolve_npm_tarball_upstream(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                package_name,
-                filename,
+    let remotes: Vec<_> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some())
+        .collect();
+    for batch in remotes.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+        let lookups = batch.iter().map(|member| async move {
+            let upstream_url = member.upstream_url.as_deref()?;
+            let source = tokio::time::timeout(
+                NPM_RELOCATION_LOOKUP_TIMEOUT,
+                npm_cached_tarball_source(proxy, &member.key, upstream_url, package_name, filename),
             )
             .await
-            .source;
-            source.map(|url| (member.id, url))
-        })
-    });
-    futures::future::join_all(lookups)
+            .ok()
+            .flatten()?;
+            Some((member.id, source))
+        });
+        urls.extend(
+            futures::future::join_all(lookups)
+                .await
+                .into_iter()
+                .flatten(),
+        );
+    }
+    urls
+}
+
+/// Cache-only sibling of [`resolve_npm_tarball_upstream`]'s source lookup:
+/// the relocated upstream URL for `filename` from the member's proxy-cached
+/// packument (cached under the decoded package name, #3297), or `None` on a
+/// cache miss / unparseable body / canonical layout. Never contacts upstream.
+async fn npm_cached_tarball_source(
+    proxy: &crate::services::proxy_service::ProxyService,
+    member_key: &str,
+    upstream_url: &str,
+    package_name: &str,
+    filename: &str,
+) -> Option<String> {
+    let (content, _ct, _encoding) = proxy
+        .get_cached_artifact_by_path(member_key, package_name)
         .await
-        .into_iter()
-        .flatten()
-        .collect()
+        .ok()
+        .flatten()?;
+    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    npm_tarball_source_for_filename(&packument, filename, upstream_url)
 }
 
 /// Inline scan-and-block for an npm proxy tarball download (#3003).
@@ -10720,41 +10753,41 @@ mod tests {
         assert_eq!(&body[..], bytes);
     }
 
-    /// #3785 review B1: the relocated fetch URL must not reorder the virtual
-    /// member walk. Priority 1 is a registry-standard Remote whose packument
-    /// read FAILS (5xx) but which serves the tarball at the canonical path;
-    /// priority 2 is a GitHub-Packages Remote advertising the same filename
-    /// with different bytes. The served bytes must be priority 1's: a failed
-    /// packument lookup falls back to the canonical path and the resolver's
-    /// priority order decides, never the lower-priority relocated member.
-    #[tokio::test]
-    async fn test_virtual_relocated_member_never_outranks_higher_priority_3785_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    const P1_BYTES: &[u8] = b"\x1f\x8b\x08priority-one-registry-bytes";
 
-        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
-            return;
-        };
-        const P1_BYTES: &[u8] = b"\x1f\x8b\x08priority-one-registry-bytes";
-        let p1 = MockServer::start().await;
+    /// Mount priority 1's registry-standard tarball (and the given packument
+    /// response) on `p1`.
+    async fn mount_priority_one(p1: &wiremock::MockServer, packument: wiremock::ResponseTemplate) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
         Mock::given(method("GET"))
             .and(path("/@example-org%2Fexample-package"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&p1)
+            .respond_with(packument)
+            .mount(p1)
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/{GHP_SCOPED}/-/example-package-1.2.3.tgz")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(P1_BYTES))
-            .mount(&p1)
+            .mount(p1)
             .await;
-        // Priority 2 may or may not be fanned out to; it must never win.
-        let p2 = MockServer::start().await;
-        let p2_bytes = mount_ghp_upstream(&p2, None, 0..=1).await;
-        assert_ne!(P1_BYTES, p2_bytes);
+    }
 
+    /// Virtual repo over two Remote members (`p1` at priority 1, `p2` at
+    /// priority 2). Optionally fetches the merged packument first (which
+    /// warms each member's cached packument, as a real `npm install` does),
+    /// then downloads the 1.2.3 tarball. Returns the served status/bytes and
+    /// how long the download took.
+    async fn virtual_two_remote_download(
+        p1: &wiremock::MockServer,
+        p2: &wiremock::MockServer,
+        warm_packuments: bool,
+    ) -> Option<(Result<(StatusCode, Bytes), StatusCode>, std::time::Duration)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let fx = tdh::Fixture::setup("virtual", "npm").await?;
         let mut members = Vec::new();
-        for (priority, upstream) in [(1, &p1), (2, &p2)] {
+        for (priority, upstream) in [(1, p1), (2, p2)] {
             let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
             sqlx::query(
                 "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
@@ -10782,6 +10815,20 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
         let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
 
+        if warm_packuments {
+            // Result ignored: a failing member may fail or thin the merge;
+            // the point is the members' packument cache writes.
+            let _ = super::get_package_metadata(
+                &state,
+                None,
+                &fx.repo_key,
+                GHP_SCOPED,
+                "http://localhost",
+                false,
+            )
+            .await;
+        }
+        let started = std::time::Instant::now();
         let served = match ghp_download(&state, &fx.repo_key).await {
             Ok(resp) => {
                 let status = resp.status();
@@ -10792,12 +10839,16 @@ mod tests {
             }
             Err(resp) => Err(resp.status()),
         };
+        let elapsed = started.elapsed();
 
         for (id, dir) in &members {
             tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
         }
         fx.teardown().await;
+        Some((served, elapsed))
+    }
 
+    fn assert_priority_one_served(served: Result<(StatusCode, Bytes), StatusCode>) {
         let (status, body) =
             served.unwrap_or_else(|status| panic!("priority 1 must serve: {status}"));
         assert_eq!(status, StatusCode::OK);
@@ -10805,6 +10856,77 @@ mod tests {
             &body[..],
             P1_BYTES,
             "a lower-priority relocated member must never outrank priority 1"
+        );
+    }
+
+    /// #3785 review B1: the relocated fetch URL must not reorder the virtual
+    /// member walk. Priority 1 is a registry-standard Remote whose packument
+    /// read FAILS (5xx) but which serves the tarball at the canonical path;
+    /// priority 2 is a GitHub-Packages Remote advertising the same filename
+    /// (its packument warm in the cache, so it HAS a relocation URL) with
+    /// different bytes. The served bytes must be priority 1's.
+    #[tokio::test]
+    async fn test_virtual_relocated_member_never_outranks_higher_priority_3785_db() {
+        let p1 = wiremock::MockServer::start().await;
+        mount_priority_one(&p1, wiremock::ResponseTemplate::new(503)).await;
+        let p2 = wiremock::MockServer::start().await;
+        // Priority 2 may or may not be fanned out to; it must never win.
+        let p2_bytes = mount_ghp_upstream(&p2, None, 0..=1).await;
+        assert_ne!(P1_BYTES, p2_bytes);
+        let Some((served, _)) = virtual_two_remote_download(&p1, &p2, true).await else {
+            return;
+        };
+        assert_priority_one_served(served);
+    }
+
+    /// #3785 review-2 N2: same as above, but priority 1's packument is a 200
+    /// that lists the package WITHOUT version 1.2.3 (stale or partial): the
+    /// canonical path still resolves and priority 1 still wins.
+    #[tokio::test]
+    async fn test_virtual_relocated_member_loses_to_priority_one_missing_version_3785_db() {
+        let p1 = wiremock::MockServer::start().await;
+        let partial = serde_json::json!({
+            "name": GHP_SCOPED,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": GHP_SCOPED, "version": "1.0.0",
+                "dist": {"tarball": format!(
+                    "{}/{GHP_SCOPED}/-/example-package-1.0.0.tgz", p1.uri())}}}
+        });
+        mount_priority_one(
+            &p1,
+            wiremock::ResponseTemplate::new(200).set_body_json(partial),
+        )
+        .await;
+        let p2 = wiremock::MockServer::start().await;
+        mount_ghp_upstream(&p2, None, 0..=1).await;
+        let Some((served, _)) = virtual_two_remote_download(&p1, &p2, true).await else {
+            return;
+        };
+        assert_priority_one_served(served);
+    }
+
+    /// #3785 review-2 N1: the relocation lookup reads only CACHED packuments,
+    /// so a dead/slow lower-priority member (every request stalls 30 s) does
+    /// not delay a tarball priority 1 serves.
+    #[tokio::test]
+    async fn test_virtual_relocation_lookup_not_delayed_by_slow_member_3785_db() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let p1 = wiremock::MockServer::start().await;
+        mount_priority_one(&p1, ResponseTemplate::new(503)).await;
+        let p2 = wiremock::MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .mount(&p2)
+            .await;
+        let Some((served, elapsed)) = virtual_two_remote_download(&p1, &p2, false).await else {
+            return;
+        };
+        assert_priority_one_served(served);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a slow lower-priority member must not delay the download: took {elapsed:?}"
         );
     }
 
