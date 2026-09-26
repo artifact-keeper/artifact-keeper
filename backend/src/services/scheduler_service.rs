@@ -881,6 +881,16 @@ pub fn spawn_all(
                     _ => {}
                 }
 
+                let scratch = std::path::Path::new(&storage_path).join(".uploads");
+                let stale_scratch =
+                    crate::services::upload_service::sweep_stale_assembly_scratch(&scratch).await;
+                if stale_scratch > 0 {
+                    tracing::info!(
+                        "Removed {} stale chunked-upload scratch file(s)",
+                        stale_scratch
+                    );
+                }
+
                 let swept =
                     crate::api::handlers::incus::sweep_orphan_staging_files(&storage_path, 24)
                         .await;

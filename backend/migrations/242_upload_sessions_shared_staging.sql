@@ -19,10 +19,55 @@
 -- deleted. A terminal session (completed/failed/cancelled) with
 -- `staged_in_storage` and no purge timestamp still owns staged bytes; the
 -- hourly upload reaper claims and deletes those, on any replica.
+--
+-- `staging_storage_backend` / `staging_storage_path`: the repository's
+-- storage location captured when the session is created, so the staged
+-- chunks stay findable after the repository row is gone.
+--
+-- `upload_staging_orphans`: when a session row that still owns staged chunks
+-- is deleted — a repository or user deletion cascades `upload_sessions`
+-- (migrations 125, 200), or a replication retry removes a stale session — a
+-- trigger records what to delete, and the reaper purges it. Without it those
+-- rows were the only record of the objects.
+
+-- Fail fast instead of queueing every upload behind a long transaction while
+-- waiting for the ACCESS EXCLUSIVE lock (precedent: 232, 237).
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE upload_sessions
     ADD COLUMN IF NOT EXISTS staged_in_storage BOOLEAN NOT NULL DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS staging_purged_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS staging_purged_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS staging_storage_backend TEXT,
+    ADD COLUMN IF NOT EXISTS staging_storage_path TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_upload_sessions_unpurged_staging
     ON upload_sessions (updated_at)
     WHERE staged_in_storage AND staging_purged_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS upload_staging_orphans (
+    session_id UUID PRIMARY KEY,
+    total_chunks INT NOT NULL,
+    storage_backend TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION ak_upload_session_staging_orphan() RETURNS trigger AS $$
+BEGIN
+    IF OLD.staged_in_storage
+       AND OLD.staging_purged_at IS NULL
+       AND OLD.staging_storage_backend IS NOT NULL THEN
+        INSERT INTO upload_staging_orphans
+            (session_id, total_chunks, storage_backend, storage_path)
+        VALUES (OLD.id, OLD.total_chunks, OLD.staging_storage_backend,
+                COALESCE(OLD.staging_storage_path, ''))
+        ON CONFLICT (session_id) DO NOTHING;
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS ak_upload_session_staging_orphan ON upload_sessions;
+CREATE TRIGGER ak_upload_session_staging_orphan
+    AFTER DELETE ON upload_sessions
+    FOR EACH ROW EXECUTE FUNCTION ak_upload_session_staging_orphan();

@@ -142,6 +142,11 @@ pub enum UploadError {
     #[error("artifact_path is too long: {len} characters (maximum {max})")]
     PathTooLong { len: usize, max: usize },
 
+    /// The session was created by an earlier server version whose staged
+    /// bytes live on one replica's local disk (#3918). Restart the upload.
+    #[error("{}", LEGACY_SESSION_MESSAGE)]
+    LegacySession,
+
     /// The storage backend holding staged chunks failed (#3918). Retryable.
     #[error("staging storage error: {0}")]
     Storage(String),
@@ -359,9 +364,13 @@ impl UploadService {
                  artifact_name, artifact_version, artifact_metadata_format,
                  artifact_metadata, artifact_metadata_properties, package_description,
                  package_metadata, is_replication, content_type, total_size, chunk_size,
-                 total_chunks, checksum_sha256, temp_file_path, staged_in_storage)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18, $19, TRUE)
+                 total_chunks, checksum_sha256, temp_file_path, staged_in_storage,
+                 staging_storage_backend, staging_storage_path)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                   $14, $15, $16, $17, $18, $19, TRUE,
+                   r.storage_backend, r.storage_path
+            FROM repositories r
+            WHERE r.id = $3
             RETURNING *
             "#,
         )
@@ -457,7 +466,7 @@ impl UploadService {
             return Err(UploadError::InvalidStatus(session.status));
         }
         if !session.staged_in_storage {
-            return Err(UploadError::InvalidStatus(LEGACY_SESSION_MESSAGE.into()));
+            return Err(UploadError::LegacySession);
         }
 
         // C6/#2316: Serialize concurrent uploads of the SAME chunk with a
@@ -603,6 +612,15 @@ impl UploadService {
         // Because the chunk-row lock is held for the whole claim→complete
         // window, exactly one request completes each chunk, so `+ 1` counts
         // every completed chunk once.
+        //
+        // The status guard is the fence against a concurrent cancel or reaper
+        // (#3922 review S1): the status check at the top ran without a lock,
+        // so the session may have been cancelled — and its staged chunks
+        // purged — while this chunk was being stored. This UPDATE takes the
+        // session row lock: if it wins, a later cancel waits for this commit
+        // and its purge covers the new chunk; if the cancel won, the guard
+        // matches nothing and the chunk just stored is deleted here, since no
+        // purge will ever look for it again.
         let updated = sqlx::query_as::<_, (i32, i64)>(
             r#"
             UPDATE upload_sessions
@@ -611,17 +629,32 @@ impl UploadService {
                 status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END,
                 updated_at = NOW()
             WHERE id = $1
+              AND status IN ('pending', 'in_progress')
             RETURNING completed_chunks, bytes_received
             "#,
         )
         .bind(session_id)
         .bind(data_len)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        tx.commit().await?;
+        let Some((completed_chunks, bytes_received)) = updated else {
+            let _ = tx.rollback().await;
+            let _ = storage
+                .delete(&staged_chunk_key(session_id, chunk_index))
+                .await;
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                    .bind(session_id)
+                    .fetch_optional(db)
+                    .await?;
+            return Err(match status {
+                Some(status) => UploadError::InvalidStatus(status),
+                None => UploadError::NotFound,
+            });
+        };
 
-        let (completed_chunks, bytes_received) = updated;
+        tx.commit().await?;
 
         Ok(ChunkResult {
             chunk_index,
@@ -694,7 +727,7 @@ impl UploadService {
             return Err(UploadError::InvalidStatus("cancelled".into()));
         }
         if !session.staged_in_storage {
-            return Err(UploadError::InvalidStatus(LEGACY_SESSION_MESSAGE.into()));
+            return Err(UploadError::LegacySession);
         }
 
         // Take the completion lease.
@@ -1080,66 +1113,115 @@ impl UploadService {
         Ok(count)
     }
 
-    /// Purge pass of [`Self::cleanup_expired`]. Claims a bounded batch by
-    /// stamping `staging_purged_at` under FOR UPDATE SKIP LOCKED (so replicas
-    /// drain disjoint sessions), deletes the chunk objects, and un-stamps any
-    /// session whose delete failed so a later pass retries it.
+    /// Purge pass of [`Self::cleanup_expired`] (#3922).
+    ///
+    /// Works one session at a time: it locks the session row
+    /// (FOR UPDATE SKIP LOCKED, so replicas take disjoint sessions), deletes
+    /// the chunk objects, and only then stamps `staging_purged_at` and
+    /// commits. A crash or storage error mid-delete rolls the claim back, so
+    /// the next pass retries it. Then it drains `upload_staging_orphans`
+    /// (sessions deleted by a repository/user cascade) the same way. The pass
+    /// stops after [`STAGING_PURGE_OBJECT_BUDGET`] chunk objects so one tick
+    /// cannot run unbounded.
     async fn purge_unreclaimed_staging(
         db: &PgPool,
         registry: &crate::storage::StorageRegistry,
     ) -> Result<i64, UploadError> {
-        let claimed = sqlx::query_as::<_, (Uuid, i32, String, String)>(
-            r#"
-            WITH candidate AS (
-                SELECT id
-                FROM upload_sessions
-                WHERE staged_in_storage
-                  AND staging_purged_at IS NULL
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY updated_at
-                LIMIT $1
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE upload_sessions s
-            SET staging_purged_at = NOW()
-            FROM candidate, repositories r
-            WHERE s.id = candidate.id
-              AND r.id = s.repository_id
-            RETURNING s.id, s.total_chunks, r.storage_backend, r.storage_path
-            "#,
-        )
-        .bind(STAGING_PURGE_BATCH)
-        .fetch_all(db)
-        .await?;
-
+        let mut budget = STAGING_PURGE_OBJECT_BUDGET;
         let mut purged = 0_i64;
-        for (id, total_chunks, backend, path) in claimed {
-            let location = crate::storage::StorageLocation { backend, path };
-            let result = match registry.backend_for(&location) {
-                Ok(storage) => {
-                    delete_staged_chunk_objects(storage.as_ref(), id, total_chunks).await
+        let mut failed: Vec<Uuid> = Vec::new();
+        for orphans in [false, true] {
+            while budget > 0 {
+                let mut tx = db.begin().await?;
+                let sql = if orphans {
+                    "SELECT session_id, total_chunks, storage_backend, storage_path \
+                     FROM upload_staging_orphans \
+                     WHERE NOT (session_id = ANY($1)) \
+                     ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                } else {
+                    "SELECT id, total_chunks, staging_storage_backend, \
+                            COALESCE(staging_storage_path, '') \
+                     FROM upload_sessions \
+                     WHERE staged_in_storage AND staging_purged_at IS NULL \
+                       AND staging_storage_backend IS NOT NULL \
+                       AND status IN ('completed', 'failed', 'cancelled') \
+                       AND NOT (id = ANY($1)) \
+                     ORDER BY updated_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                };
+                let Some((id, total_chunks, backend, path)) =
+                    sqlx::query_as::<_, (Uuid, i32, String, String)>(sql)
+                        .bind(&failed)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                else {
+                    break;
+                };
+                budget -= i64::from(total_chunks.max(1));
+
+                let location = crate::storage::StorageLocation { backend, path };
+                let deleted = match registry.backend_for(&location) {
+                    Ok(storage) => {
+                        delete_staged_chunk_objects(storage.as_ref(), id, total_chunks).await
+                    }
+                    Err(e) => Err(storage_err(e)),
+                };
+                if let Err(e) = deleted {
+                    tracing::warn!(
+                        session = %id,
+                        error = %e,
+                        "failed to purge staged upload chunks; will retry next pass"
+                    );
+                    failed.push(id);
+                    let _ = tx.rollback().await;
+                    continue;
                 }
-                Err(e) => Err(storage_err(e)),
-            };
-            match result {
-                Ok(()) => purged += 1,
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "failed to purge staged upload chunks; will retry");
-                    let _ = sqlx::query(
-                        "UPDATE upload_sessions SET staging_purged_at = NULL WHERE id = $1",
-                    )
-                    .bind(id)
-                    .execute(db)
-                    .await;
-                }
+                let done = if orphans {
+                    "DELETE FROM upload_staging_orphans WHERE session_id = $1"
+                } else {
+                    "UPDATE upload_sessions SET staging_purged_at = NOW() WHERE id = $1"
+                };
+                sqlx::query(done).bind(id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                purged += 1;
             }
         }
         Ok(purged)
     }
 }
 
-/// Upper bound on sessions purged per reaper pass.
-const STAGING_PURGE_BATCH: i64 = 200;
+/// Remove completion scratch files (`<scratch_dir>/assemble-*`) left behind
+/// when a replica died mid-completion (#3922 review N4). A live completion
+/// renews its lease for at most [`COMMIT_LEASE_TTL_SECS`], so a scratch file
+/// older than that plus a margin has no owner. Returns how many were removed.
+pub async fn sweep_stale_assembly_scratch(scratch_dir: &Path) -> usize {
+    let max_age = std::time::Duration::from_secs_f64(COMMIT_LEASE_TTL_SECS + 3600.0);
+    let Ok(mut entries) = tokio::fs::read_dir(scratch_dir).await else {
+        return 0;
+    };
+    let mut removed = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_name().to_string_lossy().starts_with("assemble-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale && tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Chunk objects one reaper pass may delete before yielding to the next tick.
+const STAGING_PURGE_OBJECT_BUDGET: i64 = 50_000;
+
+/// Concurrent deletes per session purge.
+const STAGING_PURGE_CONCURRENCY: usize = 16;
 
 /// A verified, reassembled upload on this replica's local disk. The file is
 /// removed when this is dropped, so no path (success, error, panic) can leave
@@ -1215,8 +1297,11 @@ async fn delete_staged_chunk_objects(
     session_id: Uuid,
     total_chunks: i32,
 ) -> Result<(), UploadError> {
-    for index in 0..total_chunks {
-        match storage.delete(&staged_chunk_key(session_id, index)).await {
+    let mut deletes = futures::stream::iter(0..total_chunks)
+        .map(|index| async move { storage.delete(&staged_chunk_key(session_id, index)).await })
+        .buffer_unordered(STAGING_PURGE_CONCURRENCY);
+    while let Some(result) = deletes.next().await {
+        match result {
             Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
             Err(e) => return Err(storage_err(e)),
         }
@@ -1778,6 +1863,32 @@ mod tests {
     // -----------------------------------------------------------------------
     // Temp file path construction
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stale_assembly_scratch_is_swept_and_fresh_is_kept() {
+        let dir = std::env::temp_dir().join(format!("ak-scratch-sweep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("assemble-stale");
+        let fresh = dir.join("assemble-fresh");
+        let other = dir.join("not-a-scratch-file");
+        for p in [&stale, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 3600);
+        for p in [&stale, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        assert_eq!(sweep_stale_assembly_scratch(&dir).await, 1);
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "an in-flight completion's file is kept");
+        assert!(other.exists(), "only assembly scratch files are touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_staged_chunk_key_is_derived_from_session_and_index() {
@@ -2580,9 +2691,11 @@ mod tests {
                 (id, user_id, repository_id, repository_key, artifact_path,
                  total_size, chunk_size, total_chunks, completed_chunks,
                  bytes_received, checksum_sha256, temp_file_path, status,
-                 staged_in_storage)
-            VALUES ($1, $2, $3, $4, 'lease-test/file.bin',
-                    $5, 1048576, 1, 1, $5, $6, $7, 'in_progress', TRUE)
+                 staged_in_storage, staging_storage_backend, staging_storage_path)
+            SELECT $1, $2, $3, $4, 'lease-test/file.bin',
+                   $5, 1048576, 1, 1, $5, $6, $7, 'in_progress', TRUE,
+                   r.storage_backend, r.storage_path
+            FROM repositories r WHERE r.id = $3
             "#,
         )
         .bind(session_id)
@@ -2827,10 +2940,6 @@ mod tests {
             scratch_files(&f.scratch_dir).await,
             0,
             "the assembled scratch file must not outlive a failed completion"
-        );
-        assert!(
-            f.chunk_staged().await,
-            "staged chunk still present before the reaper"
         );
 
         UploadService::cleanup_expired(&f.pool, &f.registry())
@@ -3363,15 +3472,201 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(chunk, Err(UploadError::InvalidStatus(ref m)) if m == LEGACY_SESSION_MESSAGE),
+            matches!(chunk, Err(UploadError::LegacySession)),
             "got {chunk:?}"
         );
         let complete = UploadService::complete_session(&f.pool, f.session_id, f.user_id).await;
         assert!(
-            matches!(complete, Err(UploadError::InvalidStatus(ref m)) if m == LEGACY_SESSION_MESSAGE),
+            matches!(complete, Err(UploadError::LegacySession)),
             "got {complete:?}"
         );
         assert_eq!(session_status(&f.pool, f.session_id).await, "in_progress");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Review follow-ups (S1-S3)
+    // -----------------------------------------------------------------------
+
+    /// Filesystem-backed storage with scripted interference: on `put` it can
+    /// cancel the session (a cancel landing mid-PATCH), and `delete` can be
+    /// made to fail (a storage outage during the reaper's purge).
+    struct ScriptedStorage {
+        inner: crate::storage::filesystem::FilesystemStorage,
+        cancel_on_put: Option<(PgPool, Uuid)>,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for ScriptedStorage {
+        async fn put(&self, key: &str, content: bytes::Bytes) -> crate::error::Result<()> {
+            self.inner.put(key, content).await?;
+            if let Some((pool, id)) = &self.cancel_on_put {
+                sqlx::query("UPDATE upload_sessions SET status = 'cancelled' WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .expect("cancel mid-put");
+            }
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<bytes::Bytes> {
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage("scripted outage".into()));
+            }
+            self.inner.delete(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    /// S1: a cancel that lands while a PATCH is storing its chunk must not
+    /// leave that chunk behind (the cancel's purge has already run or will
+    /// never see it) nor bump the cancelled session's counters.
+    #[tokio::test]
+    async fn chunk_stored_while_the_session_is_cancelled_is_removed() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_chunks SET status = 'pending' WHERE session_id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reopen chunk");
+        sqlx::query("UPDATE upload_sessions SET completed_chunks = 0 WHERE id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reset counter");
+        f.storage.delete(&f.chunk_key()).await.expect("unstage");
+
+        let storage = ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: Some((f.pool.clone(), f.session_id)),
+            fail_delete: Default::default(),
+        };
+        let result = UploadService::upload_chunk(
+            &f.pool,
+            &storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(LEASE_PAYLOAD),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UploadError::InvalidStatus(ref s)) if s == "cancelled"),
+            "got {result:?}"
+        );
+        assert!(
+            !f.chunk_staged().await,
+            "the orphaned chunk must be deleted"
+        );
+        let completed: i32 =
+            sqlx::query_scalar("SELECT completed_chunks FROM upload_sessions WHERE id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("counter");
+        assert_eq!(completed, 0, "a cancelled session's counters stay put");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// S2: the reaper stamps `staging_purged_at` only after the deletes
+    /// succeeded, so a storage failure leaves the session to be retried.
+    #[tokio::test]
+    async fn reaper_does_not_mark_purged_when_the_delete_fails() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        const FLAKY: &str = "flaky-staging-test";
+        let flaky = std::sync::Arc::new(ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: None,
+            fail_delete: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut backends: std::collections::HashMap<String, std::sync::Arc<dyn StorageBackend>> =
+            std::collections::HashMap::new();
+        backends.insert(FLAKY.to_string(), flaky.clone());
+        let registry = crate::storage::StorageRegistry::new(backends, FLAKY.to_string());
+        sqlx::query(
+            "UPDATE upload_sessions SET status = 'failed', staging_storage_backend = $2 \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .bind(FLAKY)
+        .execute(&f.pool)
+        .await
+        .expect("fail session on the flaky backend");
+
+        UploadService::cleanup_expired(&f.pool, &registry)
+            .await
+            .expect("reaper ok");
+        let purged: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT staging_purged_at FROM upload_sessions WHERE id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("marker");
+        assert!(purged.is_none(), "a failed purge must stay retryable");
+        assert!(f.chunk_staged().await);
+
+        flaky
+            .fail_delete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        UploadService::cleanup_expired(&f.pool, &registry)
+            .await
+            .expect("reaper ok");
+        assert!(!f.chunk_staged().await, "the retry purges the chunks");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// S3: a repository delete cascades the session row away; the trigger
+    /// records its staged chunks and the reaper still purges them.
+    #[tokio::test]
+    async fn staged_chunks_are_purged_after_a_repository_delete_cascade() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete repository (cascades upload_sessions)");
+        let orphaned: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(orphaned, 1, "the cascade must record the staged chunks");
+
+        UploadService::cleanup_expired(&f.pool, &f.registry())
+            .await
+            .expect("reaper ok");
+        assert!(!f.chunk_staged().await, "orphaned staged chunks are purged");
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(left, 0);
 
         teardown_lease_fixture(&f).await;
     }

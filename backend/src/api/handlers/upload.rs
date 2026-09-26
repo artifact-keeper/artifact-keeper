@@ -731,19 +731,17 @@ async fn complete_session_commit(
     // that legitimately predate a quota change must still replicate; the
     // background reconciler folds their bytes into the ledger).
     //
-    // Every failure from here on is terminal for the commit lease: the temp
-    // file was already removed after the storage copy, so a retry could not
-    // re-verify the payload. Fail the session under its token rather than
-    // leaving it wedged in `committing` for the whole staleness window.
+    // The staged chunks outlive this request (#3918), so a failure BEFORE the
+    // artifact transaction commits (opening it, a quota-ledger error, the
+    // upsert) is retryable: release the lease and let the client re-issue the
+    // completion instead of re-uploading every chunk. A quota denial is a
+    // decision, not a fault, and stays terminal, as does anything after the
+    // commit (or an ambiguous commit error): a retry would then hit the
+    // immutability gate on the path this session already wrote.
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("could not open the artifact transaction: {e}"),
-            )
-            .await;
+            UploadService::release_commit_lease(&state.db, &session).await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
@@ -761,12 +759,7 @@ async fn complete_session_commit(
                 Ok(admission) => admission,
                 Err(e) => {
                     drop(tx);
-                    UploadService::fail_committing(
-                        &state.db,
-                        &session,
-                        &format!("quota admission failed: {e}"),
-                    )
-                    .await;
+                    UploadService::release_commit_lease(&state.db, &session).await;
                     return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
                 }
             };
@@ -813,12 +806,7 @@ async fn complete_session_commit(
         Ok(id) => id,
         Err(e) => {
             drop(tx);
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("artifact upsert failed: {e}"),
-            )
-            .await;
+            UploadService::release_commit_lease(&state.db, &session).await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
@@ -1035,6 +1023,9 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "I/O error".into()),
         // Staged chunks live in the repository's storage backend (#3918); a
         // failure reaching it is transient from the client's point of view.
+        // A pre-upgrade session cannot be continued; the client must start a
+        // new one.
+        UploadError::LegacySession => (StatusCode::CONFLICT, e.to_string()),
         UploadError::Storage(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Storage backend error; retry the request".into(),
@@ -3815,9 +3806,11 @@ mod tests {
                  (id, user_id, repository_id, repository_key, artifact_path, \
                   total_size, chunk_size, total_chunks, completed_chunks, \
                   bytes_received, checksum_sha256, temp_file_path, status, \
-                  staged_in_storage) \
-             VALUES ($1, $2, $3, $4, $7, $5, 1048576, 1, 1, $5, $6, \
-                     'upload-staging', 'in_progress', TRUE)",
+                  staged_in_storage, staging_storage_backend, staging_storage_path) \
+             SELECT $1, $2, $3, $4, $7, $5, 1048576, 1, 1, $5, $6, \
+                    'upload-staging', 'in_progress', TRUE, \
+                    r.storage_backend, r.storage_path \
+             FROM repositories r WHERE r.id = $3",
         )
         .bind(session_id)
         .bind(f.user_id)
