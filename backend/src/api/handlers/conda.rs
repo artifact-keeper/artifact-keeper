@@ -4457,8 +4457,8 @@ async fn store_attestation(
     let record = cep27::verification_record(&verdict, chrono::Utc::now());
     sqlx::query(
         r#"
-        INSERT INTO artifact_metadata (artifact_id, metadata)
-        VALUES ($1, jsonb_build_object('attestation', $2::jsonb, $3::text, $4::jsonb))
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'conda', jsonb_build_object('attestation', $2::jsonb, $3::text, $4::jsonb))
         ON CONFLICT (artifact_id) DO UPDATE
         SET metadata = artifact_metadata.metadata || jsonb_build_object('attestation', $2::jsonb, $3::text, $4::jsonb)
         "#,
