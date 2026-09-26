@@ -1,0 +1,35 @@
+-- CI OIDC: give an identity mapping a group binding, the floor to its
+-- `allowed_repo_ids` ceiling.
+--
+-- Today `allowed_repo_ids` reads like a grant but is only ever intersected
+-- with the service account's RBAC (`AccessScope::Restricted`), and a CI
+-- service account starts with no RBAC of its own. Making a pipeline work has
+-- required a second, disconnected act: create a group, grant it repository
+-- actions, add the service account to it by hand. This column lets the
+-- mapping say that itself.
+--
+-- Three states, deliberately (design D2):
+--   NULL         — the mapping makes no claim about memberships; nothing
+--                   reconciles, so every mapping created before this column
+--                   existed keeps behaving exactly as it does today.
+--   '{}'         — the mapping asserts "no memberships"; reconciles, strips
+--                   every membership the account holds.
+--   '{id, ...}'  — the mapping asserts exactly these groups; reconciles to
+--                   that set.
+--
+-- No FK, deliberately (design D5). A cascading FK would silently shrink a
+-- binding the moment a referenced group is deleted: safe (access only
+-- narrows) but invisible — the mapping would misrepresent itself with no
+-- signal, and an FK-driven RESTRICT would instead block a group deletion
+-- behind an unrelated hunt through CI mappings. Referenced groups are
+-- validated at write time by the application (mapping create/update refuses
+-- an unknown group id) and re-checked at reconcile time (a group deleted
+-- after validation is skipped and reported, never silently dropped from the
+-- mapping's own declared value). The array is application-owned, not
+-- database-enforced, on purpose.
+--
+-- No backfill: every existing mapping gets NULL (the column's default),
+-- which is the "absent" state above.
+
+ALTER TABLE ci_oidc_identity_mappings
+    ADD COLUMN IF NOT EXISTS group_binding_ids UUID[];
