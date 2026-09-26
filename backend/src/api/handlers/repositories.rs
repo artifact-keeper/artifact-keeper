@@ -4287,6 +4287,26 @@ async fn collect_repo_oci_upload_temp_keys(state: &SharedState, repo_id: Uuid) -
     keys
 }
 
+/// Filter the journaled keys of a deleted repository down to objects it owned
+/// exclusively (#3851 review B1).
+///
+/// Temp, part and completion keys embed an upload UUID and are always the
+/// repository's own. A final `oci-blobs/<digest>` key is content-addressed:
+/// on a backend whose repositories share one object namespace (S3/GCS/Azure)
+/// another repository may have committed the very same object while this
+/// repository's journal row for it lingered (cleanup-journal rows are per
+/// repository), so deleting it would destroy that repository's blob. Leave
+/// those to the blob GC, as the artifact purge already does for OCI objects.
+/// A repo-isolated backend (filesystem) gives the repository its own copy.
+fn oci_upload_keys_owned_by_deleted_repo(backend: &str, keys: Vec<String>) -> Vec<String> {
+    if crate::storage::backend_is_repo_isolated(backend) {
+        return keys;
+    }
+    keys.into_iter()
+        .filter(|key| !key.starts_with(crate::api::handlers::oci_v2::OCI_BLOB_KEY_PREFIX))
+        .collect()
+}
+
 /// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
 /// objects from storage, given the keys previously gathered by
 /// [`collect_repo_oci_upload_temp_keys`].
@@ -4302,6 +4322,7 @@ async fn purge_oci_upload_temp_objects(
     location: &crate::storage::StorageLocation,
     keys: Vec<String>,
 ) {
+    let keys = oci_upload_keys_owned_by_deleted_repo(&location.backend, keys);
     if keys.is_empty() {
         return;
     }
@@ -21588,6 +21609,119 @@ mod tests {
             .expect("drop blocking trigger function");
         let _ = storage.delete(&temp_key).await;
         fx.teardown().await;
+    }
+
+    #[test]
+    fn deleted_repo_keeps_shared_namespace_blob_keys_for_gc() {
+        let keys = vec![
+            "oci-uploads/abc".to_string(),
+            "oci-blobs/sha256:dead".to_string(),
+        ];
+        assert_eq!(
+            oci_upload_keys_owned_by_deleted_repo("s3", keys.clone()),
+            vec!["oci-uploads/abc".to_string()],
+            "a shared-namespace backend must not purge a content-addressed blob key"
+        );
+        assert_eq!(
+            oci_upload_keys_owned_by_deleted_repo("filesystem", keys.clone()),
+            keys,
+            "a repo-isolated backend owns its copy outright"
+        );
+    }
+
+    /// #3851 review B1: repositories A and B share one object namespace. A's
+    /// push of blob D left its (per-repository) cleanup-journal row behind; B
+    /// then pushed and committed D. Deleting A must not delete `oci-blobs/D`
+    /// out from under B.
+    #[tokio::test]
+    async fn repo_delete_does_not_purge_a_blob_another_repo_committed_on_a_shared_backend() {
+        let Some(fa) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let Some(fb) = tdh::Fixture::setup("local", "docker").await else {
+            fa.teardown().await;
+            return;
+        };
+        const SHARED: &str = "shared-namespace-test";
+        let shared_dir = std::env::temp_dir().join(format!("ak-shared-ns-{}", Uuid::new_v4()));
+        let shared: std::sync::Arc<dyn crate::storage::StorageBackend> = std::sync::Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&shared_dir),
+        );
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(SHARED.to_string(), shared.clone());
+        let mut state = (*fa.state).clone();
+        state.storage_registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            SHARED.to_string(),
+        ));
+        let state: SharedState = std::sync::Arc::new(state);
+        for repo in [fa.repo_id, fb.repo_id] {
+            sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+                .bind(SHARED)
+                .bind(repo)
+                .execute(&fa.pool)
+                .await
+                .expect("point repo at the shared backend");
+        }
+
+        let digest = format!("sha256:{}", Uuid::new_v4().simple());
+        let blob_key = crate::api::handlers::oci_v2::blob_storage_key(&digest);
+        shared
+            .put(&blob_key, bytes::Bytes::from_static(b"shared blob"))
+            .await
+            .expect("write blob");
+        // A's abandoned push left its journal row; B committed the same blob.
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) VALUES ($1, $2)",
+        )
+        .bind(fa.repo_id)
+        .bind(&blob_key)
+        .execute(&fa.pool)
+        .await
+        .expect("A's lingering journal row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, 11, $3)",
+        )
+        .bind(fb.repo_id)
+        .bind(&digest)
+        .bind(&blob_key)
+        .execute(&fa.pool)
+        .await
+        .expect("B's committed blob");
+
+        // The repository-delete flow: collect, delete the row, purge.
+        let keys = collect_repo_oci_upload_temp_keys(&state, fa.repo_id).await;
+        assert!(
+            keys.contains(&blob_key),
+            "precondition: A journals the blob key"
+        );
+        let location = crate::storage::StorageLocation {
+            backend: SHARED.to_string(),
+            path: fa.storage_dir.to_string_lossy().into_owned(),
+        };
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(fa.repo_id)
+            .execute(&fa.pool)
+            .await
+            .expect("delete repo A");
+        purge_oci_upload_temp_objects(&state, fa.repo_id, &location, keys).await;
+
+        assert!(
+            shared.exists(&blob_key).await.expect("exists"),
+            "deleting repository A must not destroy the blob repository B committed"
+        );
+        let b_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(fb.repo_id)
+                .fetch_one(&fa.pool)
+                .await
+                .expect("count");
+        assert_eq!(b_rows, 1);
+
+        fb.teardown().await;
+        fa.teardown().await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
     }
 
     /// F2 (batching): a cleanup-key backlog larger than one batch must be fully

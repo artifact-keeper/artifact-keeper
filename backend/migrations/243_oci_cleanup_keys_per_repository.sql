@@ -22,6 +22,12 @@
 -- object while another repository holds a fresh, non-tombstoned row for it,
 -- and registration and the sweep's tombstone serialize per key on a
 -- transaction-scoped advisory lock (see `storage_gc_service`).
+-- Rollback note: once two repositories hold rows for one key, the old
+-- UNIQUE(storage_key) can no longer be re-added; a rollback must first delete
+-- all but one row per storage_key (keeping any row with a live claim).
+
+SET LOCAL lock_timeout = '5s';
+
 -- Drop the single-column UNIQUE(storage_key) whatever it is named (the
 -- Postgres default is `oci_upload_cleanup_keys_storage_key_key`).
 DO $$
@@ -41,6 +47,11 @@ BEGIN
         EXECUTE format('ALTER TABLE oci_upload_cleanup_keys DROP CONSTRAINT %I', con.conname);
     END LOOP;
 END $$;
+
+-- Re-registering a key (a new push over a lingering row) refreshes this, so
+-- the sweep's "fresh sibling = live push" guard sees the new push.
+ALTER TABLE oci_upload_cleanup_keys
+    ADD COLUMN IF NOT EXISTS last_registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_oci_upload_cleanup_keys_repo_key
     ON oci_upload_cleanup_keys (repository_id, storage_key);

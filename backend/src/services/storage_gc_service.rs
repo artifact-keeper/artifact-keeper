@@ -570,7 +570,8 @@ const CLEANUP_KEY_SHARED_LIVENESS_SQL: &str = r#"
                 WHERE sibling.storage_key = oci_upload_cleanup_keys.storage_key
                   AND sibling.id <> oci_upload_cleanup_keys.id
                   AND sibling.pending_delete_at IS NULL
-                  AND COALESCE(sibling.storage_write_completed_at, sibling.created_at)
+                  AND GREATEST(sibling.last_registered_at,
+                               COALESCE(sibling.storage_write_completed_at, sibling.created_at))
                       >= NOW() - INTERVAL '24 hours'
               )"#;
 
@@ -3812,6 +3813,36 @@ pub(crate) async fn claim_cleanup_journal_row_for_blob_commit(
     repository_id: Uuid,
     storage_key: &str,
 ) -> sqlx::Result<CleanupJournalClaim> {
+    // Step 0 (#3851): take the per-key lock shared with registration and the
+    // sweep's phase-1 tombstone, for the rest of the caller's transaction, and
+    // refuse if ANY repository's row for this key is tombstoned under a live
+    // claim. Journal rows are per repository, so on a shared-namespace backend
+    // another repository's sweep can be deleting this very object while our
+    // own row is untouched. (A filesystem repository has its own copy of
+    // every object, so another repository's sweep cannot touch it.) Holding
+    // the lock until the `oci_blobs` INSERT
+    // commits also means a sweep's tombstone that runs after us sees that row
+    // and skips the delete.
+    lock_cleanup_journal_key(&mut *conn, storage_key).await?;
+    let foreign_sweep = sqlx::query(
+        "SELECT 1 AS present FROM oci_upload_cleanup_keys \
+         WHERE storage_key = $1 AND id <> $2 \
+           AND pending_delete_at IS NOT NULL \
+           AND (claim_expires_at IS NULL OR claim_expires_at > NOW()) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM repositories r \
+             WHERE r.id = $3 AND r.storage_backend = 'filesystem') \
+         LIMIT 1",
+    )
+    .bind(storage_key)
+    .bind(journal_id)
+    .bind(repository_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if foreign_sweep.is_some() {
+        return Ok(CleanupJournalClaim::Doomed);
+    }
+
     // Step 1: take the row lock. `FOR UPDATE` conflicts with the sweep's
     // phase-1 `UPDATE`, so from here on exactly one of the two proceeds.
     //
