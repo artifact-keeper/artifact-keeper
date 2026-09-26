@@ -45,6 +45,7 @@ use crate::services::repository_service::{
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::rpm_layout;
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 
@@ -700,6 +701,7 @@ pub fn router() -> Router<SharedState> {
     use axum::routing::{delete, post, put};
 
     Router::new()
+        .route("/_/capabilities", get(repository_capabilities))
         .route("/", get(list_repositories).post(create_repository))
         .route(
             "/:key",
@@ -793,6 +795,10 @@ pub struct ListRepositoriesQuery {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepositoryRequest {
+    /// Metadata root directory depth for local RPM repositories. Omit for 0.
+    #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
+    #[schema(minimum = 0, maximum = 1023, nullable = false)]
+    pub repodata_depth: Option<u32>,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
@@ -925,6 +931,10 @@ fn default_priority() -> i32 {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepositoryRequest {
+    /// Omit to retain the RPM metadata root depth. Changes require an empty repository.
+    #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
+    #[schema(minimum = 0, maximum = 1023, nullable = false)]
+    pub repodata_depth: Option<u32>,
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -1047,6 +1057,11 @@ impl UpdateRepositoryRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryResponse {
+    /// Always present; 0 preserves the legacy repository-root metadata layout.
+    #[schema(minimum = 0, maximum = 1023)]
+    pub repodata_depth: u32,
+    /// Structural eligibility and emptiness only, not an authorization grant.
+    pub repodata_depth_editable: bool,
     pub id: Uuid,
     pub key: String,
     pub name: String,
@@ -1148,12 +1163,57 @@ pub struct RepositoryListResponse {
     pub pagination: Pagination,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RpmRepodataDepthCapability {
+    pub supported: bool,
+    pub min: u32,
+    pub max: u32,
+    pub default: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryCapabilities {
+    pub rpm_repodata_depth: RpmRepodataDepthCapability,
+}
+
+/// Non-mutating feature detection, including on an installation with no repositories.
+#[utoipa::path(
+    get, path = "/_/capabilities", context_path = "/api/v1/repositories",
+    tag = "repositories",
+    responses((status = 200, description = "Repository capabilities", body = RepositoryCapabilities))
+)]
+pub async fn repository_capabilities() -> Json<RepositoryCapabilities> {
+    Json(RepositoryCapabilities {
+        rpm_repodata_depth: RpmRepodataDepthCapability {
+            supported: true,
+            min: 0,
+            max: rpm_layout::MAX_REPODATA_DEPTH,
+            default: 0,
+        },
+    })
+}
+
+async fn with_repodata_depth(
+    db: &sqlx::PgPool,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    let (depth, editable) = rpm_layout::settings(db, &[response.id])
+        .await?
+        .remove(&response.id)
+        .ok_or_else(|| AppError::NotFound("Repository not found".into()))?;
+    response.repodata_depth = depth;
+    response.repodata_depth_editable = editable;
+    Ok(response)
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
     storage_used_bytes: i64,
 ) -> RepositoryResponse {
     RepositoryResponse {
+        repodata_depth: 0,
+        repodata_depth_editable: false,
         id: repo.id,
         key: repo.key,
         name: repo.name,
@@ -2714,6 +2774,7 @@ pub async fn list_repositories(
         std::collections::HashSet::new()
     };
 
+    let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -2721,6 +2782,10 @@ pub async fn list_repositories(
             let has_gpg = gpg_key_ids.contains(&r.id);
             let mut resp = repo_to_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
+            if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
+                resp.repodata_depth = depth;
+                resp.repodata_depth_editable = editable;
+            }
             resp
         })
         .collect();
@@ -2746,9 +2811,11 @@ pub async fn list_repositories(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
+        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 409, description = "Repository key already exists"),
+        (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
 pub async fn create_repository(
@@ -2944,34 +3011,37 @@ pub async fn create_repository(
     let is_public = payload.effective_is_public();
 
     let repo = service
-        .create(ServiceCreateRepoReq {
-            key: payload.key,
-            name: payload.name,
-            description: payload.description,
-            format,
-            repo_type: repo_type.clone(),
-            storage_backend,
-            storage_path,
-            upstream_url: payload.upstream_url,
-            is_public,
-            quota_bytes: payload.quota_bytes,
-            promotion_only: payload.promotion_only.unwrap_or(false),
-            versioning_enabled: payload.versioning_enabled.unwrap_or(false),
-            // Plugin format key takes precedence over any explicit format_key
-            // in the payload: when a WASM plugin format was resolved above,
-            // `plugin_format_key` carries the canonical handler name.
-            format_key: plugin_format_key.or(payload.format_key),
-            project_id: payload.project_id,
-            // Trusted upstream GPG key for RPM curation (#2568). Already
-            // validated up-front; the service persists it in the create tx.
-            trusted_gpg_key: payload.trusted_gpg_key,
-            // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
-            // default; only an explicit `true` opts into unverified ingest.
-            curation_allow_unverified: payload.curation_allow_unverified,
-            // Owner auto-grant: record the creator and grant them per-repo
-            // access so they retain access under per-repo authorization.
-            created_by: Some(auth.user_id),
-        })
+        .create_with_repodata_depth(
+            ServiceCreateRepoReq {
+                key: payload.key,
+                name: payload.name,
+                description: payload.description,
+                format,
+                repo_type: repo_type.clone(),
+                storage_backend,
+                storage_path,
+                upstream_url: payload.upstream_url,
+                is_public,
+                quota_bytes: payload.quota_bytes,
+                promotion_only: payload.promotion_only.unwrap_or(false),
+                versioning_enabled: payload.versioning_enabled.unwrap_or(false),
+                // Plugin format key takes precedence over any explicit format_key
+                // in the payload: when a WASM plugin format was resolved above,
+                // `plugin_format_key` carries the canonical handler name.
+                format_key: plugin_format_key.or(payload.format_key),
+                project_id: payload.project_id,
+                // Trusted upstream GPG key for RPM curation (#2568). Already
+                // validated up-front; the service persists it in the create tx.
+                trusted_gpg_key: payload.trusted_gpg_key,
+                // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
+                // default; only an explicit `true` opts into unverified ingest.
+                curation_allow_unverified: payload.curation_allow_unverified,
+                // Owner auto-grant: record the creator and grant them per-repo
+                // access so they retain access under per-repo authorization.
+                created_by: Some(auth.user_id),
+            },
+            payload.repodata_depth.unwrap_or(0),
+        )
         .await?;
 
     // Provision the hex registry signing key (#2641). A hosted hex repository is
@@ -3216,6 +3286,7 @@ pub async fn create_repository(
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -3279,6 +3350,7 @@ pub async fn get_repository(
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -3742,10 +3814,12 @@ pub async fn get_repository_storage_tree(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
+        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
-        (status = 409, description = "Repository key already exists"),
+        (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
 pub async fn update_repository(
@@ -3829,7 +3903,7 @@ pub async fn update_repository(
     let effective_is_public = payload.effective_is_public();
 
     let repo = service
-        .update(
+        .update_with_repodata_depth(
             existing.id,
             ServiceUpdateRepoReq {
                 key: payload.key,
@@ -3853,6 +3927,7 @@ pub async fn update_repository(
                 curation_enabled: payload.curation_enabled,
                 curation_default_action: payload.curation_default_action,
             },
+            payload.repodata_depth,
         )
         .await?;
 
@@ -4161,6 +4236,7 @@ pub async fn update_repository(
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -10552,6 +10628,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        repository_capabilities,
         list_repositories,
         create_repository,
         get_repository,
@@ -10590,6 +10667,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         CreateRepositoryRequest,
         UpdateRepositoryRequest,
         RepositoryResponse,
+        RepositoryCapabilities,
+        RpmRepodataDepthCapability,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
         StorageTreeQuery,
@@ -13499,6 +13578,8 @@ mod tests {
     #[test]
     fn test_repository_response_serialization() {
         let resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -14804,6 +14885,8 @@ mod tests {
         // #1770 B: when the handler populates the quarantine settings from
         // `repository_config`, they appear in the serialized detail response.
         let resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
@@ -23972,6 +24055,8 @@ mod tests {
     #[test]
     fn test_repository_response_serializes_custom_user_agent() {
         let mut resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             id: Uuid::new_v4(),
             has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),

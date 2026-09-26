@@ -203,6 +203,9 @@ async fn create_session(
     require_repo_write_access(&auth, &repo_record, &repo_service)
         .await
         .map_err(IntoResponse::into_response)?;
+    crate::services::rpm_layout::validate_upload(&state.db, repo_id, &req.artifact_path)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     // Promotion-only gate (#817 parity with the direct upload path).
     //
@@ -1022,6 +1025,9 @@ async fn settle_completed_session(
 
 /// Map any displayable error to an HTTP error response.
 fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
+    if let Some(error) = crate::services::rpm_layout::database_error(&e.to_string()) {
+        return error.into_response();
+    }
     (
         status,
         axum::Json(serde_json::json!({"error": e.to_string()})),

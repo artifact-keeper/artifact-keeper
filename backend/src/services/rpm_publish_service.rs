@@ -111,6 +111,7 @@ pub async fn create_version(
     repo_id: Uuid,
     actor: Uuid,
 ) -> Result<VersionSummary, AppError> {
+    crate::services::rpm_layout::reject_unsupported(db, repo_id).await?;
     let mut attempt = 0;
     loop {
         attempt += 1;

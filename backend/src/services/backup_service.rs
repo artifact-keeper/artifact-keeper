@@ -794,6 +794,114 @@ fn ensure_backup_not_cancelled(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+fn backup_table<'a>(entries: &'a [(std::path::PathBuf, Vec<u8>)], table: &str) -> Option<&'a [u8]> {
+    entries
+        .iter()
+        .find(|(path, _)| {
+            path.starts_with("database/")
+                && path.file_stem().and_then(|s| s.to_str()) == Some(table)
+        })
+        .map(|(_, bytes)| bytes.as_slice())
+}
+
+fn archive_repository_layouts(
+    entries: &[(std::path::PathBuf, Vec<u8>)],
+) -> Result<std::collections::BTreeMap<Uuid, u32>> {
+    let mut layouts = std::collections::BTreeMap::new();
+    if let Some(bytes) = backup_table(entries, "repositories") {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)?;
+        for row in rows {
+            let id: Uuid = serde_json::from_value(row["id"].clone())?;
+            let depth = match row.get("repodata_depth") {
+                None => 0,
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        AppError::Validation(
+                            "Invalid repodata_depth in backup repository record".into(),
+                        )
+                    })?,
+            };
+            crate::services::rpm_layout::validate_depth(depth)?;
+            if depth > 0
+                && (row["format"] != "rpm"
+                    || row["repo_type"] != "local"
+                    || (!row["format_key"].is_null() && row["format_key"] != "rpm")
+                    || row["curation_enabled"] != false
+                    || !row["curation_source_repo_id"].is_null()
+                    || !row["curation_target_repo_id"].is_null()
+                    || !row["active_publication_id"].is_null())
+            {
+                return Err(AppError::UnprocessableEntity(
+                    crate::services::rpm_layout::UNSUPPORTED.into(),
+                ));
+            }
+            if layouts.insert(id, depth).is_some() {
+                return Err(AppError::Validation(
+                    "Duplicate repository layout in backup".into(),
+                ));
+            }
+        }
+    }
+    if let Some(bytes) = backup_table(entries, "artifacts") {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)?;
+        for row in rows {
+            let id: Uuid = serde_json::from_value(row["repository_id"].clone())?;
+            // A legacy/partial archive with no repository record implies depth zero.
+            layouts.entry(id).or_insert(0);
+        }
+    }
+    Ok(layouts)
+}
+
+async fn validate_restore_layouts(
+    conn: &mut sqlx::PgConnection,
+    layouts: &std::collections::BTreeMap<Uuid, u32>,
+    lock: bool,
+) -> Result<()> {
+    if lock {
+        for id in layouts.keys() {
+            let acquired: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended('rpm-depth:' || $1::text, 0))",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if !acquired {
+                return Err(AppError::Conflict(
+                    "Repository layout is being changed; retry the operation".into(),
+                ));
+            }
+        }
+    }
+    let ids: Vec<Uuid> = layouts.keys().copied().collect();
+    let existing: Vec<(Uuid, i32)> =
+        sqlx::query_as("SELECT id, ak_rpm_repodata_depth(id) FROM repositories WHERE id=ANY($1)")
+            .bind(ids)
+            .fetch_all(conn)
+            .await?;
+    for (id, current) in existing {
+        if i64::from(current) != i64::from(layouts[&id]) {
+            return Err(AppError::Conflict(format!(
+                "Cannot restore repository {id}: archive repodata_depth {} differs from existing {current}",
+                layouts[&id],
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validated_restore_rows(table: &str, content: &[u8]) -> Result<Vec<serde_json::Value>> {
+    // The table name is interpolated into SQL; the fixed allowlist is mandatory.
+    if !ALLOWED_EXPORT_TABLES.contains(&table) {
+        return Err(AppError::Validation(format!(
+            "Invalid restore table: {table}"
+        )));
+    }
+    Ok(serde_json::from_slice(content)?)
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         // Default: backup archives live in the same bucket as artifacts, so
@@ -1131,6 +1239,11 @@ impl BackupService {
         // keeps every artifact, preserving the historical behavior.
         let since_filter = parse_since_filter(backup.metadata.as_ref());
 
+        // Layout and artifact rows must describe the same database snapshot.
+        let mut snapshot = self.db.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *snapshot)
+            .await?;
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
             ensure_backup_not_cancelled(cancel)?;
@@ -1138,10 +1251,10 @@ impl BackupService {
             // so when a repository filter is in effect an excluded repository's
             // artifact rows are kept out of the dump too (not just its bytes).
             let json_data = if *table == "artifacts" {
-                self.export_artifacts(repository_filter.as_deref(), since_filter)
+                Self::export_artifacts(&mut snapshot, repository_filter.as_deref(), since_filter)
                     .await?
             } else {
-                self.export_table(table).await?
+                Self::export_table(&mut snapshot, table).await?
             };
             let json_bytes = serde_json::to_vec_pretty(&json_data)?;
             table_data.push((table.to_string(), json_bytes));
@@ -1152,11 +1265,12 @@ impl BackupService {
         // types, so it must be honored rather than silently producing a full
         // archive (#3011).
         let storage_keys = if backup_includes_artifact_bytes(backup.backup_type) {
-            self.artifact_storage_keys(repository_filter.as_deref(), since_filter)
+            Self::artifact_storage_keys(&mut snapshot, repository_filter.as_deref(), since_filter)
                 .await?
         } else {
             Vec::new()
         };
+        snapshot.commit().await?;
         // Read each artifact's bytes, tracking failures rather than discarding
         // them (#3170). A read that fails means the archive will not contain
         // that artifact's content; that must never be invisible.
@@ -1276,13 +1390,22 @@ impl BackupService {
         self.get_by_id(backup_id).await
     }
 
-    async fn export_table(&self, table: &str) -> Result<serde_json::Value> {
+    async fn export_table(conn: &mut sqlx::PgConnection, table: &str) -> Result<serde_json::Value> {
         validate_export_table(table)?;
 
         // Export table data as JSON array
-        let query = format!("SELECT row_to_json(t) FROM {} t", table);
+        let query = if table == "repositories" {
+            // Only this non-secret key is exported, and only when positive.
+            // It lives in a checksum-covered payload, not the mutable manifest.
+            "SELECT to_jsonb(t) || CASE WHEN ak_rpm_repodata_depth(id) > 0 \
+             THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
+             ELSE '{}'::jsonb END FROM repositories t"
+                .to_string()
+        } else {
+            format!("SELECT row_to_json(t) FROM {} t", table)
+        };
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
-            .fetch_all(&self.db)
+            .fetch_all(conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1335,7 +1458,7 @@ impl BackupService {
     /// predicates are null-guarded so passing `None`/`None` returns every
     /// artifact exactly as before.
     async fn artifact_storage_keys(
-        &self,
+        conn: &mut sqlx::PgConnection,
         repository_filter: Option<&[Uuid]>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<String>> {
@@ -1351,7 +1474,7 @@ impl BackupService {
         )
         .bind(repo_ids)
         .bind(since)
-        .fetch_all(&self.db)
+        .fetch_all(conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1367,7 +1490,7 @@ impl BackupService {
     /// cutoff keeps only rows with `updated_at >= since`, so an incremental
     /// backup dumps just the metadata changed after the given timestamp.
     async fn export_artifacts(
-        &self,
+        conn: &mut sqlx::PgConnection,
         repository_filter: Option<&[Uuid]>,
         since: Option<DateTime<Utc>>,
     ) -> Result<serde_json::Value> {
@@ -1383,7 +1506,7 @@ impl BackupService {
         )
         .bind(repo_ids)
         .bind(since)
-        .fetch_all(&self.db)
+        .fetch_all(conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1550,6 +1673,12 @@ impl BackupService {
             options.allow_unverified_archive,
         )
         .map_err(AppError::Validation)?;
+        let layouts = archive_repository_layouts(&entries)?;
+        let strict_layout_restore = layouts.values().any(|depth| *depth > 0);
+        {
+            let mut conn = self.db.acquire().await?;
+            validate_restore_layouts(&mut conn, &layouts, false).await?;
+        }
 
         // Phase 2: Async restore from extracted data
         let mut result = RestoreResult {
@@ -1623,22 +1752,44 @@ impl BackupService {
         // the allowlist (GHSA-95fx-g94v-8jqg), so unknown entries are ignored
         // rather than inserted into attacker-chosen tables.
         if options.restore_database {
+            let mut tx = self.db.begin().await?;
+            validate_restore_layouts(&mut tx, &layouts, true).await?;
             for table_name in RESTORE_TABLE_ORDER {
-                if let Some(content) = entries.iter().find(|(p, _)| {
-                    p.starts_with("database/")
-                        && p.file_stem().and_then(|s| s.to_str()) == Some(table_name)
-                }) {
-                    match self.restore_table(table_name, &content.1).await {
+                if let Some(content) = backup_table(&entries, table_name) {
+                    match Self::restore_table_in(
+                        &mut tx,
+                        table_name,
+                        content,
+                        strict_layout_restore,
+                    )
+                    .await
+                    {
                         Ok(rows) => {
                             tracing::info!("Restored {} rows into table '{}'", rows, table_name);
                             result.tables_restored.push(table_name.to_string());
                         }
-                        Err(e) => result
-                            .errors
-                            .push(format!("Failed to restore {}: {}", table_name, e)),
+                        Err(e) => {
+                            if strict_layout_restore
+                                || crate::services::rpm_layout::database_error(&e.to_string())
+                                    .is_some()
+                            {
+                                return Err(e);
+                            }
+                            result
+                                .errors
+                                .push(format!("Failed to restore {}: {}", table_name, e));
+                        }
+                    }
+                    if *table_name == "repositories" {
+                        for (&id, &depth) in &layouts {
+                            if depth > 0 {
+                                crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
+                            }
+                        }
                     }
                 }
             }
+            tx.commit().await?;
         }
 
         // Restore artifact files
@@ -1778,29 +1929,25 @@ impl BackupService {
 
     /// Restore a single database table from JSON data.
     /// Uses jsonb_populate_record for proper type coercion.
+    #[cfg(test)]
     async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
-        let rows: Vec<serde_json::Value> = serde_json::from_slice(content)?;
+        if validated_restore_rows(table, content)?.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.db.begin().await?;
+        let restored = Self::restore_table_in(&mut tx, table, content, false).await?;
+        tx.commit().await?;
+        Ok(restored)
+    }
+
+    async fn restore_table_in(
+        conn: &mut sqlx::PgConnection,
+        table: &str,
+        content: &[u8],
+        strict: bool,
+    ) -> Result<usize> {
+        let rows = validated_restore_rows(table, content)?;
         let mut restored = 0usize;
-
-        // GHSA-95fx-g94v-8jqg: enforce the export allowlist on the restore
-        // path too. The table name is interpolated into the INSERT below, so
-        // without this check a crafted backup archive could insert
-        // attacker-controlled rows into any alphanumeric-named table
-        // (`signing_keys`, `role_assignments`, ...).
-        if !ALLOWED_EXPORT_TABLES.contains(&table) {
-            return Err(AppError::Validation(format!(
-                "Invalid restore table: {}",
-                table
-            )));
-        }
-
-        // Validate table name to prevent SQL injection (only allow alphanumeric + underscore)
-        if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Err(AppError::Validation(format!(
-                "Invalid table name: {}",
-                table
-            )));
-        }
 
         for row in &rows {
             // Use jsonb_populate_record to let Postgres handle type coercion
@@ -1808,15 +1955,23 @@ impl BackupService {
                 "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
             );
 
+            let mut row_tx = sqlx::Connection::begin(&mut *conn).await?;
             match sqlx::query(sqlx::AssertSqlSafe(&*query))
                 .bind(row)
-                .execute(&self.db)
+                .execute(&mut *row_tx)
                 .await
             {
                 Ok(result) => {
                     restored += result.rows_affected() as usize;
+                    row_tx.commit().await?;
                 }
                 Err(e) => {
+                    row_tx.rollback().await?;
+                    if strict
+                        || crate::services::rpm_layout::database_error(&e.to_string()).is_some()
+                    {
+                        return Err(e.into());
+                    }
                     tracing::warn!(
                         "Failed to restore row in '{}': {} (row: {})",
                         table,
@@ -1979,6 +2134,9 @@ pub struct RestoreResult {
 }
 
 #[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod rpm_depth_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3151,13 +3309,14 @@ mod tests {
         let new_key = insert_artifact_at(&pool, repo_id, "new", new_at).await;
 
         let service = service_for(pool.clone());
+        let mut conn = service.db.acquire().await.unwrap();
         let repo_filter = [repo_id];
 
         // With a `since` cutoff only the artifact modified after it is included.
-        let keys = service
-            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
-            .await
-            .expect("storage keys with since");
+        let keys =
+            BackupService::artifact_storage_keys(&mut conn, Some(&repo_filter), Some(cutoff))
+                .await
+                .expect("storage keys with since");
         assert_eq!(
             keys,
             vec![new_key.clone()],
@@ -3166,8 +3325,7 @@ mod tests {
         assert!(!keys.contains(&old_key), "older artifact is excluded");
 
         // The exported metadata rows honor the same cutoff.
-        let exported = service
-            .export_artifacts(Some(&repo_filter), Some(cutoff))
+        let exported = BackupService::export_artifacts(&mut conn, Some(&repo_filter), Some(cutoff))
             .await
             .expect("export with since");
         let rows = exported.as_array().expect("array");
@@ -3177,18 +3335,17 @@ mod tests {
         // Boundary: an artifact modified exactly at the cutoff is included
         // (predicate is `updated_at >= since`).
         let edge_key = insert_artifact_at(&pool, repo_id, "edge", cutoff).await;
-        let keys_edge = service
-            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
-            .await
-            .expect("storage keys with since (edge)");
+        let keys_edge =
+            BackupService::artifact_storage_keys(&mut conn, Some(&repo_filter), Some(cutoff))
+                .await
+                .expect("storage keys with since (edge)");
         assert!(
             keys_edge.contains(&edge_key),
             "artifact at exactly the cutoff is included"
         );
 
         // No cutoff (`None`) => every artifact in the repo, unchanged behavior.
-        let keys_all = service
-            .artifact_storage_keys(Some(&repo_filter), None)
+        let keys_all = BackupService::artifact_storage_keys(&mut conn, Some(&repo_filter), None)
             .await
             .expect("storage keys without since");
         assert_eq!(keys_all.len(), 3, "unset since includes every artifact");

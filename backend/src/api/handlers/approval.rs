@@ -823,6 +823,15 @@ pub async fn approve_promotion(
         }
     }
 
+    crate::services::rpm_layout::validate_copy(
+        &state.db,
+        target_repo.id,
+        &artifact.path,
+        &artifact.checksum_sha256,
+        &artifact.storage_key,
+    )
+    .await?;
+
     // Cross-repository write guard (#2511): the approval-execute copy re-uses the
     // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
     // shared-namespace cloud backend that key may already be owned by a third

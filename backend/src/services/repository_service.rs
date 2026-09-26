@@ -1041,6 +1041,22 @@ impl RepositoryService {
 
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
+        self.create_with_repodata_depth(req, 0).await
+    }
+
+    pub async fn create_with_repodata_depth(
+        &self,
+        req: CreateRepositoryRequest,
+        repodata_depth: u32,
+    ) -> Result<Repository> {
+        crate::services::rpm_layout::validate_depth(repodata_depth)?;
+        if repodata_depth > 0
+            && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
+        {
+            return Err(AppError::UnprocessableEntity(
+                crate::services::rpm_layout::UNSUPPORTED.into(),
+            ));
+        }
         // Validate remote repository has upstream URL and it is safe to contact
         validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
@@ -1194,6 +1210,10 @@ impl RepositoryService {
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                if repodata_depth > 0 {
+                    crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)
+                        .await?;
                 }
                 tx.commit()
                     .await
@@ -1546,6 +1566,15 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
+        self.update_with_repodata_depth(id, req, None).await
+    }
+
+    pub async fn update_with_repodata_depth(
+        &self,
+        id: Uuid,
+        req: UpdateRepositoryRequest,
+        repodata_depth: Option<u32>,
+    ) -> Result<Repository> {
         // Validate upstream_url is safe to contact if it is being updated.
         // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
         // (both are immutable after creation), so load the existing row to
@@ -1555,6 +1584,10 @@ impl RepositoryService {
             validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
         }
 
+        let mut tx = self.db.begin().await?;
+        if let Some(depth) = repodata_depth {
+            crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
+        }
         let repo = sqlx::query_as!(
             Repository,
             r#"
@@ -1598,7 +1631,7 @@ impl RepositoryService {
             req.curation_enabled,
             req.curation_default_action,
         )
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
             if is_duplicate_key_error(&e.to_string()) {
@@ -1621,7 +1654,7 @@ impl RepositoryService {
             )
             .bind(gpg_key.as_deref())
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
@@ -1635,10 +1668,12 @@ impl RepositoryService {
             )
             .bind(allow_unverified)
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
+
+        tx.commit().await?;
 
         // #2516 S2: quota admission trusts the usage-ledger counters. While a
         // repository sits at unlimited quota the admission fast path never
