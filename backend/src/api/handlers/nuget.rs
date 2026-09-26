@@ -344,6 +344,54 @@ fn parse_upstream_resources(index: &serde_json::Value) -> NugetUpstreamResources
     }
 }
 
+/// Record which step of a remote NuGet resolution failed, and against what
+/// (#3899). A proxied failure otherwise reached the log only as the request's
+/// final status, so a client-side "NotFound" on a registration page could not
+/// be told apart from an unreachable upstream, an unadvertised resource or an
+/// undecodable document. Both URLs are redacted (userinfo, query, fragment)
+/// before they are logged. An upstream 404 is an ordinary answer (the package
+/// or version does not exist) and logs at INFO; anything else at WARN.
+fn log_upstream_failure(
+    step: &'static str,
+    repo_key: &str,
+    upstream_url: &str,
+    target: &str,
+    response: &Response,
+) {
+    let upstream = crate::services::proxy_service::redact_url_for_diagnostics(upstream_url);
+    let target = crate::services::proxy_service::redact_url_for_diagnostics(target);
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        info!(
+            step,
+            repo_key = %repo_key,
+            upstream = %upstream,
+            target = %target,
+            status = status.as_u16(),
+            "NuGet upstream resolution step answered not found"
+        );
+    } else {
+        warn!(
+            step,
+            repo_key = %repo_key,
+            upstream = %upstream,
+            target = %target,
+            status = status.as_u16(),
+            "NuGet upstream resolution step failed"
+        );
+    }
+}
+
+/// [`log_upstream_failure`] as an `inspect_err` callback.
+fn upstream_failure<'a>(
+    step: &'static str,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    target: &'a str,
+) -> impl Fn(&Response) + Copy + 'a {
+    move |response| log_upstream_failure(step, repo_key, upstream_url, target, response)
+}
+
 /// Resolve what protocol `upstream_url` speaks, memoized through the same
 /// proxy-cache entry discovery already uses (`v3/index.json`), so a request
 /// pays at most one probe per member.
@@ -373,7 +421,10 @@ async fn discover_upstream_protocol(
         Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(UpstreamProtocol::V2 {
             base: v2_feed_base(upstream_url),
         }),
-        Err(resp) => Err(resp),
+        Err(resp) => {
+            log_upstream_failure("service_index", repo_key, upstream_url, &index_url, &resp);
+            Err(resp)
+        }
     }
 }
 
@@ -394,14 +445,27 @@ async fn discover_upstream_resources(
         "v3/index.json", // clean, stable proxy-cache key
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
-    let index: serde_json::Value = serde_json::from_slice(&content).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet service index was not valid JSON",
-        )
-            .into_response()
-    })?;
+    .await
+    .inspect_err(upstream_failure(
+        "service_index",
+        repo_key,
+        upstream_url,
+        &index_url,
+    ))?;
+    let index: serde_json::Value = serde_json::from_slice(&content)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet service index was not valid JSON",
+            )
+                .into_response()
+        })
+        .inspect_err(upstream_failure(
+            "service_index_decode",
+            repo_key,
+            upstream_url,
+            &index_url,
+        ))?;
     Ok(parse_upstream_resources(&index))
 }
 
@@ -639,7 +703,13 @@ async fn fetch_v3_registration(
         resources.registration_base.as_ref(),
         upstream_url,
         "RegistrationsBaseUrl",
-    )?;
+    )
+    .inspect_err(upstream_failure(
+        "registration_base",
+        fetch_repo_key,
+        upstream_url,
+        upstream_url,
+    ))?;
     let fetch_url = registration_fetch_url(&reg_base, package_id_lower, &["index.json"])?;
     let cache_path = format!("v3/registration/{}/index.json", package_id_lower);
     let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
@@ -651,7 +721,13 @@ async fn fetch_v3_registration(
         &cache_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
+    .await
+    .inspect_err(upstream_failure(
+        "registration_index",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    ))?;
     let body = String::from_utf8_lossy(&content);
     Ok((
         rewrite_v3_registration(&body, &resources, ak_base, client_repo_key),
@@ -741,17 +817,31 @@ async fn proxy_v3_registration_subresource(
     let UpstreamProtocol::V3(resources) =
         discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?
     else {
-        return Err((
+        let response = (
             StatusCode::NOT_FOUND,
             "NuGet registration resource not found",
         )
-            .into_response());
+            .into_response();
+        log_upstream_failure(
+            "registration_page_v2_upstream",
+            fetch_repo_key,
+            upstream_url,
+            &subpath_segments.join("/"),
+            &response,
+        );
+        return Err(response);
     };
     let reg_base = guard_upstream_base(
         resources.registration_base.as_ref(),
         upstream_url,
         "RegistrationsBaseUrl",
-    )?;
+    )
+    .inspect_err(upstream_failure(
+        "registration_base",
+        fetch_repo_key,
+        upstream_url,
+        upstream_url,
+    ))?;
     let fetch_url = registration_fetch_url(&reg_base, package_id_lower, subpath_segments)?;
     let cache_path = format!(
         "v3/registration/{}/{}",
@@ -767,21 +857,37 @@ async fn proxy_v3_registration_subresource(
         &cache_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
-    let body = std::str::from_utf8(&content).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet registration response was not valid UTF-8",
-        )
-            .into_response()
-    })?;
-    serde_json::from_str::<serde_json::Value>(body).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet registration response was not valid JSON",
-        )
-            .into_response()
-    })?;
+    .await
+    .inspect_err(upstream_failure(
+        "registration_page",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    ))?;
+    let log_decode = upstream_failure(
+        "registration_page_decode",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    );
+    let body = std::str::from_utf8(&content)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration response was not valid UTF-8",
+            )
+                .into_response()
+        })
+        .inspect_err(log_decode)?;
+    serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration response was not valid JSON",
+            )
+                .into_response()
+        })
+        .inspect_err(log_decode)?;
     let rewritten = rewrite_v3_registration(body, &resources, ak_base, client_repo_key);
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1752,7 +1858,9 @@ async fn flatcontainer_fetch_target(
 ) -> Result<(String, String), Response> {
     match discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await? {
         UpstreamProtocol::V3(resources) => {
-            v3_flatcontainer_target(&resources, upstream_url, sub_path)
+            v3_flatcontainer_target(&resources, upstream_url, sub_path).inspect_err(
+                upstream_failure("flatcontainer_base", fetch_repo_key, upstream_url, sub_path),
+            )
         }
         // A V2 feed serves package content from `package/{id}/{version}`
         // (#4122). Cached under the key `v2_download` already uses, so a V2 and
@@ -1926,7 +2034,13 @@ async fn proxy_v3_flatcontainer(
             "application/octet-stream",
             RepositoryFormat::Nuget,
         )
-        .await?;
+        .await
+        .inspect_err(upstream_failure(
+            "flatcontainer_package",
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+        ))?;
         // #3446: `streaming` is exactly the `.nupkg` arm — the non-streaming
         // sibling below serves a version LIST, which is metadata and must not
         // count. `ctx` is therefore `Some` only where a real download context
@@ -1963,7 +2077,13 @@ async fn proxy_v3_flatcontainer(
                 &cache_path,
                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
             )
-            .await?;
+            .await
+            .inspect_err(upstream_failure(
+                "flatcontainer_versions",
+                fetch_repo_key,
+                upstream_url,
+                &fetch_url,
+            ))?;
         let mut builder = Response::builder().status(StatusCode::OK).header(
             CONTENT_TYPE,
             content_type.unwrap_or_else(|| "application/json".to_string()),
@@ -9791,6 +9911,81 @@ mod remote_discovery_tests {
         assert!(!body.contains(&uri), "upstream URL leaked: {body}");
         assert!(body.contains(&format!("/{}/v3/registration/serilog/", fx.repo_key)));
         assert!(body.contains(&format!("/{}/v3/flatcontainer/serilog/", fx.repo_key)));
+    }
+
+    /// Collects `tracing` output emitted on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #3899: a registration page the upstream does not serve reached the log
+    /// only as the request's final 404. The failing step, the upstream it was
+    /// resolved against and the redacted fetch target are now recorded.
+    #[tokio::test]
+    async fn registration_page_failure_logs_the_step_upstream_and_status() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = v3_upstream(&[("RegistrationsBaseUrl/3.6.0", "/v3-registration/")]).await;
+        Mock::given(method("GET"))
+            .and(path("/v3-registration/serilog/page/0.1.6/1.2.47.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        set_upstream(&fx.pool, fx.repo_id, &upstream).await;
+        let app = app(&fx);
+
+        let capture = LogCapture::default();
+        let status = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{}/v3/registration/serilog/page/0.1.6/1.2.47.json",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            status
+        };
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("step=\"registration_page\""))
+            .unwrap_or_else(|| panic!("no registration_page failure logged: {logs}"));
+        assert!(line.contains("status=404"), "{line}");
+        assert!(line.contains(&upstream.uri()), "upstream missing: {line}");
+        assert!(
+            line.contains("/v3-registration/serilog/page/0.1.6/1.2.47.json"),
+            "target missing: {line}"
+        );
     }
 
     #[tokio::test]
