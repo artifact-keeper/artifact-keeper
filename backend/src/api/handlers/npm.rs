@@ -1114,6 +1114,56 @@ async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
         .await
 }
 
+/// Resolve the repository an npm WRITE (publish / dist-tag change) addressed
+/// at `repo_key` actually lands in (#968).
+///
+/// Hosted repos answer themselves (after the usual not-hosted rejection). A
+/// VIRTUAL repo answers its deployment target — the first writable hosted
+/// member in the virtual's flattened resolution order — so a client can
+/// publish through the single virtual entry point exactly as if it had
+/// published to that member directly. The caller must be authenticated (the
+/// #508 middleware guarantees it for any write that reached the handler);
+/// `resolve_virtual_deploy_target` re-checks the caller's write action and
+/// token scope against the MEMBER, so aggregation never publishes where a
+/// direct publish would have been refused.
+async fn resolve_npm_write_target(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+) -> Result<RepoInfo, Response> {
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    if repo.repo_type != RepositoryType::Virtual {
+        proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+        return Ok(repo);
+    }
+    // Unreachable on the mounted route — `repo_visibility_middleware` resolves
+    // every credential shape (including npm's base64 `user:pass` Bearer) into
+    // the extension and 401s a write without one before the handler runs —
+    // but the member write check below needs a principal, so a direct call
+    // without one (tests, a future route without the layer) fails closed
+    // here rather than skipping the check.
+    let auth = auth.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required for publishing",
+        )
+            .into_response()
+    })?;
+    let target = proxy_helpers::resolve_virtual_deploy_target(
+        &state.db,
+        &state.permission_service,
+        auth,
+        repo.id,
+    )
+    .await?;
+    tracing::info!(
+        virtual_repo = %repo_key,
+        deploy_target = %target.key,
+        "routing npm write through virtual repository to its deployment target"
+    );
+    Ok(proxy_helpers::repo_info_from_member(&target))
+}
+
 // ---------------------------------------------------------------------------
 // npm security advisories (npm audit) -- issue #1400
 // ---------------------------------------------------------------------------
@@ -3055,6 +3105,125 @@ async fn remote_member_packument_value(
     Ok(Some(json))
 }
 
+// ---------------------------------------------------------------------------
+// #3951: in-process negative cache for the virtual member walk.
+//
+// A virtual whose members are not all public bypasses the #2162 computed-
+// packument cache by design (#3323), so EVERY packument request re-walks
+// every member. The merge is a union, so a member that lacks the package is
+// consulted on every walk — and the proxy layer's per-member negative entry
+// (`NEGATIVE_CACHE_TTL_SECS`, 45 s) lapses six to seven times inside the
+// 300 s positive window the other member serves from, forcing a fresh
+// upstream 404 round trip each time. The short-lived in-process cache below
+// absorbs those repeats: #3527's OCI virtual-resolution negative cache,
+// extended to npm's member walk at the same clamp
+// (`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`).
+//
+// The key is per (MEMBER, package), not per virtual: "member M's upstream
+// definitively 404'd package P" is a property of the member, principal-
+// independent (the fetch uses the member's own upstream credentials), so —
+// unlike the OCI whole-walk cache — no caller-visibility gate is needed: a
+// caller the member is hidden from never walks it (#3323), and every caller
+// who does walk it sees the same upstream answer. Only a definitive 404 is
+// recorded; a 429/5xx/timeout says nothing about presence and is never
+// cached (#3836's rule).
+// ---------------------------------------------------------------------------
+
+/// One member's definitive "this package is absent" record.
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+struct NpmVirtualMemberMissKey {
+    member_repo_id: uuid::Uuid,
+    package_name: String,
+}
+
+impl NpmVirtualMemberMissKey {
+    /// Pure constructor, centralised so call sites do not need to know the
+    /// field layout (and so unit tests can pin the construction without
+    /// touching the global cache).
+    fn new(member_repo_id: uuid::Uuid, package_name: &str) -> Self {
+        Self {
+            member_repo_id,
+            package_name: package_name.to_string(),
+        }
+    }
+}
+
+/// Process-global store for the #3951 member-miss entries. `LazyLock` keeps
+/// the initializer with the declaration.
+static NPM_VIRTUAL_MEMBER_MISS_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+fn npm_virtual_member_miss_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>,
+> {
+    &NPM_VIRTUAL_MEMBER_MISS_CACHE
+}
+
+/// Pure decision: given the duration since an entry was inserted and the
+/// configured TTL, is the entry still a "hit"? Extracted so the freshness
+/// window is unit-testable without depending on `Instant::now()`.
+fn npm_negative_entry_is_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
+}
+
+/// Pure cap policy: attempt eviction of expired entries only once the map
+/// reaches the configured maximum.
+fn npm_negative_should_evict_before_insert(current_len: usize, max_entries: usize) -> bool {
+    current_len >= max_entries
+}
+
+/// Pure cap-and-evict step on a negative-cache map. Returns `true` iff there
+/// is room to record a new entry after evicting expired ones; the caller
+/// refuses the insert when this returns `false`.
+fn npm_negative_evict_and_has_room(
+    map: &mut std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    max_entries: usize,
+) -> bool {
+    if !npm_negative_should_evict_before_insert(map.len(), max_entries) {
+        return true;
+    }
+    map.retain(|_, at| npm_negative_entry_is_fresh(now.duration_since(*at), ttl));
+    !npm_negative_should_evict_before_insert(map.len(), max_entries)
+}
+
+/// True when this member was recently seen definitively NOT serving
+/// `package_name` and the entry has not expired. Lock poisoning degrades to
+/// "miss" — correct, just slower.
+fn npm_virtual_member_miss_hit(key: &NpmVirtualMemberMissKey, ttl: std::time::Duration) -> bool {
+    let now = std::time::Instant::now();
+    let cache = npm_virtual_member_miss_cache();
+    let read = match cache.read() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    match read.get(key) {
+        Some(at) => npm_negative_entry_is_fresh(now.duration_since(*at), ttl),
+        None => false,
+    }
+}
+
+/// Record a member's definitive 404. Best-effort: lock poisoning or a full
+/// cache silently degrades to "no caching", which is still correct.
+fn npm_virtual_member_miss_insert(
+    key: NpmVirtualMemberMissKey,
+    ttl: std::time::Duration,
+    max_entries: usize,
+) {
+    let cache = npm_virtual_member_miss_cache();
+    let mut write = match cache.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let now = std::time::Instant::now();
+    if !npm_negative_evict_and_has_room(&mut write, ttl, now, max_entries) {
+        return;
+    }
+    write.insert(key, now);
+}
+
 /// Collect every virtual member's contribution for `package_name` and merge
 /// them in priority order (#2844).
 ///
@@ -3165,6 +3334,23 @@ async fn virtual_member_packument_contribution(
         return Ok(None);
     };
 
+    // #3951: a member whose upstream definitively 404'd this package a
+    // moment ago is not re-asked on every walk — the in-process negative
+    // cache absorbs the repeats the 45 s disk negative entry cannot (it
+    // expires six to seven times inside the other member's 300 s positive
+    // window, and every lapse costs an upstream round trip).
+    let negative_ttl =
+        std::time::Duration::from_millis(state.config.npm_virtual_negative_cache_ttl_ms);
+    let miss_key = NpmVirtualMemberMissKey::new(member.id, package_name);
+    if npm_virtual_member_miss_hit(&miss_key, negative_ttl) {
+        debug!(
+            member_key = %member.key,
+            package = %package_name,
+            "npm virtual member walk: in-process negative-cache hit"
+        );
+        return Ok(None);
+    }
+
     let encoded_name = encode_package_name_for_upstream(package_name);
     // Fetch/cache split (#3297): encoded name upstream, decoded
     // `@scope/name` as the member's local cache key.
@@ -3193,7 +3379,17 @@ async fn virtual_member_packument_contribution(
             )
             .await
         }
-        Err(_e) => {
+        Err(e) => {
+            // Only a definitive 404 is negative evidence: a 429/5xx/timeout
+            // says nothing about presence and must not pin a miss for the
+            // TTL (#3836's rule for the OCI cache applies here too).
+            if e.status() == StatusCode::NOT_FOUND {
+                npm_virtual_member_miss_insert(
+                    miss_key,
+                    negative_ttl,
+                    state.config.npm_virtual_negative_cache_max_entries,
+                );
+            }
             debug!(
                 member_key = %member.key,
                 "npm metadata proxy fetch missed for virtual member"
@@ -3543,10 +3739,17 @@ async fn npm_local_fetch(
     // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
     // separator stays un-encoded for tarballs; see
     // `build_tarball_upstream_path`).
-    if let Ok(result) =
-        proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
-    {
-        return Ok(result);
+    //
+    // #4286: only a genuine miss (404) may fall through to the pattern
+    // lookup. `local_fetch_by_path` enforces quarantine AND the member's scan
+    // policy; a 403/409 refusal (or a 5xx) is the answer for this member and
+    // must reach `resolve_virtual_download_from_members`, which treats a
+    // policy block as terminal. Swallowing it with `if let Ok(..)` let the
+    // fallback below serve the bytes the gate had just refused.
+    match proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await {
+        Ok(result) => return Ok(result),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+        Err(resp) => return Err(resp),
     }
 
     // Fall back to a pattern that anchors the match on the decoded package
@@ -3554,13 +3757,13 @@ async fn npm_local_fetch(
     // layout "{package_name}/{version}/{filename}".
     //
     // Escape `%` and `_` from user-supplied package_name and filename so
-    // they're treated as literals; the literal `/%/` separator below
-    // remains a wildcard. ESCAPE '\' on the SQL side selects backslash as
-    // the escape character. See `super::escape_like_literal`.
+    // they're treated as literals; the literal `/%/` separator remains a
+    // wildcard. ESCAPE '\' on the SQL side selects backslash as the escape
+    // character. See `super::escape_like_literal`.
     let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
     let filename_escaped = super::escape_like_literal(filename);
-    let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+    let path: String = sqlx::query_scalar(
+        "SELECT path \
          FROM artifacts \
          WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
@@ -3578,41 +3781,107 @@ async fn npm_local_fetch(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    proxy_helpers::check_quarantine_row(&artifact)?;
+    // #4286: serve the resolved row through the same gated helper as the
+    // exact-path lookup, so it passes quarantine AND `enforce_scan_policy_gate`
+    // (and keeps the streaming / hydration-retry / #2260 artifact_id contract)
+    // rather than a hand-rolled quarantine-only copy.
+    proxy_helpers::local_fetch_by_path(db, state, repo_id, location, &path).await
+}
 
-    let storage = state
-        .storage_for_repo(location)
-        .map_err(|e| e.into_response())?;
-    // Stream the body for the common case, but preserve the #1016 / hydration
-    // contract: a storage miss falls back to the coordinated buffered retry and
-    // is re-wrapped as a one-shot stream so the caller sees a uniform result.
-    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
-        match storage.get_stream(&artifact.storage_key).await {
-            Ok(stream) => stream,
-            Err(crate::error::AppError::NotFound(_)) => {
-                let bytes = proxy_helpers::coordinated_retry_get(
-                    db,
-                    artifact.id,
-                    &artifact.storage_key,
-                    &*storage,
-                )
-                .await?;
-                Box::pin(futures::stream::once(async move { Ok(bytes) }))
-            }
-            Err(e) => return Err(map_storage_err(e)),
-        };
+/// Outcome of the npm virtual shadowing-guard ownership check
+/// (#1217 / #3646 / #3955) for the requested `name@version`.
+#[derive(Clone, Copy, Debug)]
+enum NpmVirtualOwnership {
+    /// No non-Remote member owns the coordinate: Remote members serve
+    /// normally.
+    NotOwned,
+    /// A non-Remote member owns the NAME but the filename carried no
+    /// parseable version for it, so the guard cannot prove which versions
+    /// are owned. Fail-safe (#3646): suppress every Remote member rather
+    /// than fan out on a shape we cannot read.
+    OwnedNameOnly,
+    /// A non-Remote member owns this exact `name@version`; carries the
+    /// smallest `virtual_repo_members.priority` among the owning members
+    /// (lower value = higher priority). Suppression is then decided PER
+    /// REMOTE MEMBER — see [`remote_member_outranked_by_owner`].
+    OwnedAtPriority(i32),
+}
 
-    Ok(proxy_helpers::StreamingFetchResult {
-        commit_sha: None,
-        content_encoding: None,
-        body,
-        content_type: Some(artifact.content_type.clone()),
-        content_length: Some(artifact.size_bytes as u64),
-        // Local artifact resolved: surface its id so a virtual npm-member
-        // download is recorded exactly once at the streaming resolver (#2260).
-        artifact_id: Some(artifact.id),
-        etag: None,
+/// Resolve the npm virtual shadowing-guard ownership (#1217 / #3646 /
+/// #3955) of the tarball `filename` requested under `package_name` in the
+/// Virtual repo `virtual_repo_id`. See the guard comment in `serve_tarball`
+/// for the rules; the three arms are:
+///
+/// - the filename carries this package's version: version-aware and
+///   priority-aware (`OwnedAtPriority` / `NotOwned`);
+/// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
+/// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+async fn resolve_npm_virtual_ownership(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+    filename: &str,
+) -> Result<NpmVirtualOwnership, Response> {
+    if !crate::formats::npm::is_valid_npm_name(package_name) {
+        return Ok(NpmVirtualOwnership::NotOwned);
+    }
+    let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
+        // Fail-safe (#3646): no readable version, so fall back to the
+        // name-only guard rather than fan out on a shape we cannot read.
+        let owns_name =
+            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name).await?;
+        return Ok(if owns_name {
+            NpmVirtualOwnership::OwnedNameOnly
+        } else {
+            NpmVirtualOwnership::NotOwned
+        });
+    };
+    let owner_min_priority =
+        proxy_helpers::npm_virtual_owner_min_priority(db, virtual_repo_id, package_name, &version)
+            .await?;
+    Ok(match owner_min_priority {
+        Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
+        None => NpmVirtualOwnership::NotOwned,
     })
+}
+
+/// The proxy service handed to the virtual tarball resolver for a given
+/// ownership outcome, over the member list the guard already filtered.
+/// `None` is the load-bearing security primitive: it withholds every
+/// Remote member from the resolver (the name-only fail-safe, and an owner
+/// that outranks every Remote member).
+fn npm_virtual_resolver_proxy<'a>(
+    ownership: NpmVirtualOwnership,
+    members: &[crate::models::repository::Repository],
+    proxy: Option<&'a crate::services::proxy_service::ProxyService>,
+) -> Option<&'a crate::services::proxy_service::ProxyService> {
+    match ownership {
+        NpmVirtualOwnership::NotOwned => proxy,
+        NpmVirtualOwnership::OwnedNameOnly => None,
+        NpmVirtualOwnership::OwnedAtPriority(_) => {
+            if members
+                .iter()
+                .any(|m| m.repo_type == RepositoryType::Remote)
+            {
+                proxy
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The npm shadowing-guard suppression rule (#3955), the #2311 PyPI rule
+/// ported to npm: an owning non-Remote member suppresses a Remote member
+/// only when it OUTRANKS it (strictly lower priority value). A Remote
+/// member at equal or higher priority still surfaces — the operator
+/// explicitly ranked the upstream at or above the local owner, and the
+/// priority-aware packument merge (#2844) advertises that same winner's
+/// `dist.integrity` for the version, so the two legs of the virtual agree
+/// and npm's SRI check passes. A Remote member with no priority row fails
+/// safe: treated as outranked (suppressed), the pre-#3955 posture.
+fn remote_member_outranked_by_owner(owner_min_priority: i32, remote_priority: Option<i32>) -> bool {
+    owner_min_priority < remote_priority.unwrap_or(i32::MAX)
 }
 
 async fn serve_tarball(
@@ -3766,16 +4035,13 @@ async fn serve_tarball(
         let fname = filename.to_string();
 
         // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-        // If a non-Remote member of this Virtual repo owns the npm
-        // package at the requested version, block Remote members from
-        // satisfying the download. The `package_name` parameter is the
-        // npm-canonical name (eg. `@types/node` or `lodash`) extracted by
-        // the router; `artifacts.name` stores the same shape, so a direct
-        // case-insensitive comparison is what the guard performs. Passing
-        // `None` to `resolve_virtual_download` is the load-bearing
-        // security primitive: see hex.rs's
-        // `serve_virtual_tarball_local_only` for the rationale on why
-        // any refactor here must keep this `None`.
+        // When a non-Remote member of this Virtual repo owns the npm
+        // package at the requested version, Remote members it OUTRANKS are
+        // blocked from satisfying the download. The `package_name`
+        // parameter is the npm-canonical name (eg. `@types/node` or
+        // `lodash`) extracted by the router; `artifacts.name` stores the
+        // same shape, so a direct case-insensitive comparison is what the
+        // guard performs.
         //
         // #3646: the guard is version-aware. The virtual packument merge
         // (#2844) advertises every member's versions, so a hosted member
@@ -3787,35 +4053,23 @@ async fn serve_tarball(
         // does not carry this package's version keeps the name-only guard
         // (fail-safe: never fan out on a shape we cannot read).
         //
+        // #3955: the guard is priority-aware. The merge keeps the FIRST —
+        // highest-priority — member's entry per version
+        // (`merge_packument_into`), so the tarball leg must serve that
+        // same member's bytes or the advertised `dist.integrity` does not
+        // match and npm fails with EINTEGRITY. An owning non-Remote member
+        // therefore suppresses only the Remote members it outranks
+        // (applied below, after the member list is fetched); a Remote
+        // member ranked at or above every owner still surfaces, the #2311
+        // PyPI rule ported to npm.
+        //
         // Fail-closed: skip the guard for names that fail
         // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
         // Such names cannot reach `artifacts.name` so the guard would
-        // always return false; skipping it spares the DB an existence
+        // always return `NotOwned`; skipping it spares the DB an existence
         // check on every malformed request.
-        let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
-            match npm_version_from_tarball_filename(package_name, filename) {
-                Some(version) => {
-                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
-                        &state.db,
-                        repo.id,
-                        package_name,
-                        &version,
-                    )
-                    .await?
-                }
-                None => {
-                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name)
-                        .await?
-                }
-            }
-        } else {
-            false
-        };
-        let proxy_for_virtual = if local_owns {
-            None
-        } else {
-            state.proxy_service.as_deref()
-        };
+        let ownership =
+            resolve_npm_virtual_ownership(&state.db, repo.id, package_name, filename).await?;
 
         // #2424: apply the per-member npm scope policy to the direct-tarball
         // path, exactly as the metadata/packument loops already do. Metadata
@@ -3844,16 +4098,53 @@ async fn serve_tarball(
             .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
             .collect();
 
+        // #3955: apply the priority-aware half of the shadowing guard. An
+        // owning non-Remote member suppresses only the Remote members it
+        // outranks, so the tarball route serves the same member the
+        // priority-ordered packument merge drew the version's
+        // `dist.integrity` from. The priorities map is fetched only when an
+        // owner exists — one indexed query on exactly the requests the guard
+        // engages on.
+        let members: Vec<_> = match ownership {
+            NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
+                let member_priorities =
+                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?;
+                members
+                    .into_iter()
+                    .filter(|m| {
+                        m.repo_type != RepositoryType::Remote
+                            || !remote_member_outranked_by_owner(
+                                owner_min_priority,
+                                member_priorities.get(&m.id).copied(),
+                            )
+                    })
+                    .collect()
+            }
+            _ => members,
+        };
+
+        // Passing `None` to the resolver when the guard suppresses every
+        // Remote member is the load-bearing security primitive: see
+        // hex.rs's `serve_virtual_tarball_local_only` for the rationale on
+        // why any refactor here must keep this `None`. With #3955 the
+        // member-list filter above is what removes the suppressed Remote
+        // members; the `None` below covers the two cases where none may
+        // remain — the name-only fail-safe, and an owner that outranks
+        // every Remote member (the pre-#3955 posture for that case).
+        let proxy_for_virtual =
+            npm_virtual_resolver_proxy(ownership, &members, state.proxy_service.as_deref());
+
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
         // per-member (see the metadata branch), so an ordinary `npm install`
         // cannot resolve a young version — but a client that already knows the
         // exact young tarball URL (a pinned lockfile) would otherwise stream it
-        // straight through `resolve_virtual_download`. Only runs when the name
-        // is not locally owned (`proxy_for_virtual` is `Some`); a locally-owned
-        // name is served from the local member and is never age-gated. The
-        // shared `resolve_virtual_download` helper is left untouched so no
-        // other format (maven/hex/...) is affected.
+        // straight through `resolve_virtual_download`. Runs whenever a Remote
+        // member survived the shadowing guard (`proxy_for_virtual` is `Some`);
+        // the loop skips non-Remote members, so a fully suppressed walk (a
+        // locally-owned name served from the local member) is never
+        // age-gated. The shared `resolve_virtual_download` helper is left
+        // untouched so no other format (maven/hex/...) is affected.
         if let Some(proxy) = proxy_for_virtual {
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
@@ -4751,9 +5042,12 @@ async fn publish_package(
     // Bearer-fallback helper.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
-        require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+        require_auth_with_bearer_fallback(auth.clone(), headers, &state.db, &state.config, "npm")
+            .await?;
+    // #968: a publish addressed at a virtual repo lands in its deployment
+    // target (first writable hosted member); for hosted repos this is the
+    // repo itself, so nothing changes outside the virtual case.
+    let repo = resolve_npm_write_target(state, auth.as_ref(), repo_key).await?;
     repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
@@ -4762,7 +5056,7 @@ async fn publish_package(
         store_npm_version(
             state,
             repo.id,
-            repo_key,
+            &repo.key,
             &repo.storage_location(),
             package_name,
             user_id,
@@ -4805,7 +5099,7 @@ async fn publish_package(
     .execute(&state.db)
     .await;
 
-    invalidate_packument_caches(state, repo.id, repo_key, package_name).await;
+    invalidate_packument_caches(state, repo.id, &repo.key, package_name).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -4876,9 +5170,11 @@ async fn dist_tags_put(
     validate_package_name(&package)?;
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
-        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+        require_auth_with_bearer_fallback(auth.clone(), &headers, &state.db, &state.config, "npm")
+            .await?;
+    // #968: through a virtual repo the tag is written to its deployment
+    // target, the same member a publish would have landed in.
+    let repo = resolve_npm_write_target(&state, auth.as_ref(), &repo_key).await?;
     repo.reject_if_promotion_only(false)?;
 
     if tag.is_empty() {
@@ -4932,7 +5228,7 @@ async fn dist_tags_put(
     .await
     .map_err(map_db_err)?;
 
-    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
+    invalidate_packument_caches(&state, repo.id, &repo.key, &package).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -4951,9 +5247,11 @@ async fn dist_tags_delete(
     validate_package_name(&package)?;
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
-        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+        require_auth_with_bearer_fallback(auth.clone(), &headers, &state.db, &state.config, "npm")
+            .await?;
+    // #968: through a virtual repo the tag is removed from its deployment
+    // target, the same member a publish would have landed in.
+    let repo = resolve_npm_write_target(&state, auth.as_ref(), &repo_key).await?;
     repo.reject_if_promotion_only(false)?;
 
     if tag == "latest" {
@@ -4963,18 +5261,33 @@ async fn dist_tags_delete(
         );
     }
 
-    let _ = sqlx::query(
+    // Only a tag that exists on THIS repository's row is removed, and a miss
+    // is a 404 — symmetric with `dist_tags_put`'s version-existence check.
+    // This matters for the #968 virtual route: the deployment target is the
+    // first WRITABLE member, not necessarily the member that owns the
+    // package, so an unconditional UPDATE could match zero rows and still
+    // answer `ok` while the tag stayed on a lower-priority member and kept
+    // showing in the packument served through the virtual.
+    let removed = sqlx::query(
         "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
-         WHERE repository_id = $2 AND name = $3",
+         WHERE repository_id = $2 AND name = $3 AND tags ? $1",
     )
     .bind(&tag)
     .bind(repo.id)
     .bind(&package)
     .execute(&state.db)
     .await
-    .map_err(map_db_err)?;
+    .map_err(map_db_err)?
+    .rows_affected();
+    if removed == 0 {
+        return Err(AppError::NotFound(format!(
+            "dist-tag {} of {} not found in repository {}",
+            tag, package, repo.key
+        ))
+        .into_response());
+    }
 
-    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
+    invalidate_packument_caches(&state, repo.id, &repo.key, &package).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -6764,6 +7077,814 @@ mod tests {
              virtual repo (#3646):\n{}",
             failures.join("\n")
         );
+    }
+
+    /// #4286: a Virtual must apply its hosted member's scan policy to the
+    /// tarballs it serves on that member's behalf, exactly as the direct hosted
+    /// route does.
+    ///
+    /// `npm_local_fetch` discarded every `Err` from the gated exact-path lookup
+    /// (`if let Ok(..)`), including the scan-policy 403, then served whatever its
+    /// `{pkg}/%/{file}` pattern lookup found after a quarantine-only check. For a
+    /// hosted member the pattern lookup is the normal path (hosted tarballs live
+    /// at `{pkg}/{ver}/{file}`, which the exact lookup misses), and it also
+    /// re-finds a row stored at the upstream path (`{pkg}/-/{file}`), so a
+    /// `block_unscanned` / `block_on_fail` / `max_severity` block was lost on
+    /// both layouts.
+    ///
+    /// POSITIVE CONTROL in the same fixture: every request serves 200 with the
+    /// real bytes before the policy exists and again after it is removed, so the
+    /// 403 is attributable to the policy and not to a resolver that stopped
+    /// resolving.
+    #[tokio::test]
+    async fn test_virtual_hosted_member_tarball_applies_scan_policy_4286_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach hosted member");
+        // Anonymous probes below; publish both so the subject stays the gate
+        // rather than the #3323 authorization filter.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        tdh::publish_repo(&fx.pool, local_id).await;
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        // (npm name, tarball basename, stored path). The first is the hosted
+        // publish layout; the second is the upstream-path layout the exact
+        // lookup hits, whose refusal the old code swallowed before re-finding
+        // the same row through the pattern lookup.
+        let tarballs = [
+            (
+                "gate4286-pkg",
+                "gate4286-pkg-1.0.0.tgz",
+                "gate4286-pkg/1.0.0/gate4286-pkg-1.0.0.tgz",
+            ),
+            (
+                "@gate4286/scoped",
+                "scoped-1.0.0.tgz",
+                "@gate4286/scoped/-/scoped-1.0.0.tgz",
+            ),
+        ];
+        let body = |name: &str| Bytes::from(format!("tgz:{name}@1.0.0"));
+        for (name, _, stored_path) in tarballs {
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &local_repo,
+                &format!("npm/{stored_path}"),
+                stored_path,
+                name,
+                "1.0.0",
+                "application/gzip",
+                body(name),
+                fx.user_id,
+            )
+            .await;
+        }
+        let app = tdh::router_anon(super::router(), state);
+
+        // Probe every tarball through the virtual AND directly on the hosted
+        // member, returning (label, status, bytes-matched).
+        let keys = [fx.repo_key.clone(), local_key.clone()];
+        let probe = |app: axum::Router| {
+            let keys = keys.clone();
+            async move {
+                let mut out = Vec::new();
+                for (name, file, _) in tarballs {
+                    for key in &keys {
+                        let route = format!("/{key}/{name}/-/{file}");
+                        let (status, bytes) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                        out.push((route, status, bytes == body(name)));
+                    }
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4286-npm-{local_id}"))
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await;
+        let after = probe(app).await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for sql in [
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(local_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        fx.teardown().await;
+
+        for (route, status, matched) in before.iter().chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must serve the tarball with no scan policy \
+                 (HTTP {status}, bytes matched: {matched})"
+            );
+        }
+        for (route, status, _) in &blocked {
+            assert_eq!(
+                *status,
+                StatusCode::FORBIDDEN,
+                "#4286: GET {route} must be refused while the hosted member's scan policy \
+                 blocks the tarball, through the virtual exactly as on the direct route"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_member_outranked_by_owner (#3955)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shadowing_guard_suppresses_only_outranked_remotes() {
+        // Owner at priority 1: a Remote at priority 2 is outranked and
+        // suppressed (the pre-#3955 posture, kept for this order).
+        assert!(remote_member_outranked_by_owner(1, Some(2)));
+        // A Remote at priority 1 OUTRANKS an owner at priority 2: it still
+        // surfaces, so the packument's advertised integrity and the served
+        // bytes both come from the Remote member.
+        assert!(!remote_member_outranked_by_owner(2, Some(1)));
+        // Equal priority: the Remote still surfaces (#2311's rule — the
+        // operator ranked the upstream level with the owner, and the merge's
+        // tie-order cannot be overridden coherently here).
+        assert!(!remote_member_outranked_by_owner(1, Some(1)));
+        // A Remote with no priority row fails safe: suppressed whenever an
+        // owner exists, matching the pre-#3955 suppress-everything posture.
+        assert!(remote_member_outranked_by_owner(5, None));
+    }
+
+    /// Virtual npm repo for the #3955 ownership-arm tests: a hosted member
+    /// at priority 1 owning `fail-safe-pkg@1.0.0` and a Remote member at
+    /// priority 2. Returns the fixture and the virtual's member list.
+    async fn setup_3955_ownership_rig() -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        Vec<crate::models::repository::Repository>,
+    )> {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let fx = tdh::Fixture::setup("virtual", "npm").await?;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, _rdir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        for (member_id, priority) in [(local_id, 1), (remote_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+        }
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let artifact_path = "fail-safe-pkg/1.0.0/fail-safe-pkg-1.0.0.tgz";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &local_repo,
+            &format!("npm/{artifact_path}"),
+            artifact_path,
+            "fail-safe-pkg",
+            "1.0.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz:fail-safe-pkg-1.0.0"),
+            fx.user_id,
+        )
+        .await;
+        // The proxy mapping sees the caller-AUTHORIZED member set in
+        // `serve_tarball` (#3323), so the rig builds the same set for an
+        // anonymous caller; publish the repos so the Remote member survives.
+        for repo_id in [fx.repo_id, local_id, remote_id] {
+            tdh::publish_repo(&fx.pool, repo_id).await;
+        }
+        let members = proxy_helpers::authorized_virtual_members(&fx.pool, None, fx.repo_id)
+            .await
+            .expect("authorized virtual members");
+        assert!(
+            members
+                .iter()
+                .any(|m| m.repo_type == RepositoryType::Remote),
+            "rig must carry a Remote member for the proxy assertions to mean anything"
+        );
+        Some((fx, members))
+    }
+
+    /// #3955 / #3646: a tarball filename that does not carry this package's
+    /// version falls back to the NAME-only guard, and a hosted owner of the
+    /// name then withholds the proxy from the resolver, so no Remote member
+    /// may serve the bytes (fail-safe: never fan out on a shape we cannot
+    /// read). Pins the name-only arm of `resolve_npm_virtual_ownership` and
+    /// the `OwnedNameOnly => None` arm of `npm_virtual_resolver_proxy`.
+    #[tokio::test]
+    async fn test_tarball_ownership_name_only_fail_safe_withholds_proxy_3955() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some((fx, members)) = setup_3955_ownership_rig().await else {
+            return;
+        };
+
+        // Control: a versioned filename takes the priority-aware arm.
+        let versioned = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg-1.0.0.tgz",
+        )
+        .await
+        .expect("versioned ownership");
+        assert!(
+            matches!(versioned, NpmVirtualOwnership::OwnedAtPriority(1)),
+            "versioned filename must resolve the owner's priority, got {versioned:?}"
+        );
+
+        // No readable version: the name-only fail-safe engages.
+        let name_only = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg.tgz",
+        )
+        .await
+        .expect("name-only ownership");
+        assert!(
+            matches!(name_only, NpmVirtualOwnership::OwnedNameOnly),
+            "an unreadable filename for an owned name must fail safe, got {name_only:?}"
+        );
+
+        // The fail-safe only engages on an OWNED name.
+        let unowned = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "nobody-owns-this-pkg",
+            "nobody-owns-this-pkg.tgz",
+        )
+        .await
+        .expect("unowned ownership");
+        assert!(
+            matches!(unowned, NpmVirtualOwnership::NotOwned),
+            "an unowned name must not engage the fail-safe, got {unowned:?}"
+        );
+
+        // And the fail-safe withholds the proxy even though a Remote member
+        // is present, while an unowned name still hands it to the resolver.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        assert!(
+            npm_virtual_resolver_proxy(name_only, &members, Some(proxy.as_ref())).is_none(),
+            "OwnedNameOnly must withhold the proxy: no Remote member may serve the tarball"
+        );
+        assert!(
+            npm_virtual_resolver_proxy(unowned, &members, Some(proxy.as_ref())).is_some(),
+            "NotOwned must hand the proxy to the resolver"
+        );
+    }
+
+    /// #3955: a name failing `is_valid_npm_name` (here: uppercase) skips the
+    /// ownership check entirely and yields `NotOwned`. The owner queries
+    /// compare `LOWER(name)`, so without the skip the uppercase spelling of
+    /// an owned name WOULD resolve as owned; the skip is what keeps the DB
+    /// out of malformed requests. Pins the `else` (invalid-name) arm.
+    #[tokio::test]
+    async fn test_tarball_ownership_invalid_name_skips_check_3955() {
+        let Some((fx, _members)) = setup_3955_ownership_rig().await else {
+            return;
+        };
+        assert!(!crate::formats::npm::is_valid_npm_name("Fail-Safe-Pkg"));
+
+        // Control: the lowercase spelling is owned.
+        let valid = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg-1.0.0.tgz",
+        )
+        .await
+        .expect("valid-name ownership");
+        assert!(
+            matches!(valid, NpmVirtualOwnership::OwnedAtPriority(1)),
+            "control: the valid spelling must be owned, got {valid:?}"
+        );
+
+        for filename in ["Fail-Safe-Pkg-1.0.0.tgz", "Fail-Safe-Pkg.tgz"] {
+            let invalid =
+                resolve_npm_virtual_ownership(&fx.pool, fx.repo_id, "Fail-Safe-Pkg", filename)
+                    .await
+                    .expect("invalid-name ownership");
+            assert!(
+                matches!(invalid, NpmVirtualOwnership::NotOwned),
+                "an invalid npm name must skip the ownership check ({filename}), got {invalid:?}"
+            );
+        }
+    }
+
+    /// #3955: the packument merge honours member priority but the tarball
+    /// route's ownership guard used to ignore it. With a Remote member at
+    /// priority 1 and a hosted member at priority 2 BOTH holding
+    /// `pkg@1.2.3` (different bytes — the whole point of a same-version
+    /// rebuild), the merge advertises the REMOTE's `dist.integrity` while
+    /// the guard suppressed every Remote member and served the HOSTED
+    /// bytes, so npm's subresource-integrity check fails with EINTEGRITY.
+    /// The guard must suppress a Remote member only when an owning
+    /// non-Remote member OUTRANKS it (the #2311 PyPI rule), so the
+    /// advertised integrity and the served bytes always come from the same
+    /// member.
+    #[tokio::test]
+    async fn test_virtual_tarball_integrity_matches_served_member_3955_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+
+        let package = "priority-shadow-pkg";
+        let version = "1.2.3";
+        let filename = format!("{package}-{version}.tgz");
+        let upstream_bytes = Bytes::from_static(b"tgz:upstream-1.2.3");
+        let local_bytes = Bytes::from_static(b"tgz:local-1.2.3-rebuild");
+        let upstream_integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&upstream_bytes))
+        );
+        let local_integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&local_bytes))
+        );
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": version},
+                "versions": {version: {"name": package, "version": version, "dist": {
+                    "tarball": format!("{}/{package}/-/{filename}", upstream.uri()),
+                    "integrity": upstream_integrity,
+                }}},
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_bytes.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for member_id in [local_id, remote_id] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            // Anonymous probes below; publish so the subject stays the
+            // priority rule rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // The #2162 computed-packument cache is caller-independent and would
+        // serve the first order's merge again after the reorder; the behaviour
+        // under test is the per-request merge, so the cache is disabled (the
+        // private-member uncacheable shape is covered by the #3951 test).
+        let state = tdh::build_state_with_proxy_with(
+            fx.pool.clone(),
+            storage_path.as_str(),
+            proxy,
+            |config| config.npm_packument_cache_enabled = false,
+        );
+        // Hosted member: the same name@version with different bytes. The seed
+        // helper writes a placeholder checksum, so set the real SHA-256 —
+        // otherwise the hosted entry's advertised `dist.integrity` is
+        // meaningless and the SRI comparison below proves nothing.
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let artifact_path = format!("{package}/{version}/{filename}");
+        let artifact_id = tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &local_repo,
+            &format!("npm/{artifact_path}"),
+            &artifact_path,
+            package,
+            version,
+            "application/gzip",
+            local_bytes.clone(),
+            fx.user_id,
+        )
+        .await;
+        let local_sha256_hex = format!("{:x}", sha2::Sha256::digest(&local_bytes));
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind(&local_sha256_hex)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("real checksum for the hosted rebuild");
+
+        let app = tdh::router_anon(super::router(), state);
+
+        let mut failures: Vec<String> = Vec::new();
+        for (order, local_priority, remote_priority, expect_local) in [
+            ("local p1 / remote p2", 1, 2, true),
+            ("remote p1 / local p2", 2, 1, false),
+        ] {
+            for (member_id, priority) in [(local_id, local_priority), (remote_id, remote_priority)]
+            {
+                sqlx::query(
+                    "UPDATE virtual_repo_members SET priority = $1 \
+                     WHERE virtual_repo_id = $2 AND member_repo_id = $3",
+                )
+                .bind(priority)
+                .bind(fx.repo_id)
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await
+                .expect("reorder members");
+            }
+
+            let (status, body) =
+                tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
+            if status != StatusCode::OK {
+                failures.push(format!("[{order}] packument {package}: HTTP {status}"));
+                continue;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("packument");
+            let advertised = json["versions"][version]["dist"]["integrity"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let tarball = json["versions"][version]["dist"]["tarball"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            // The merge is priority-aware: the contested version's entry must
+            // be the highest-priority holder's.
+            let expected_integrity = if expect_local {
+                &local_integrity
+            } else {
+                &upstream_integrity
+            };
+            if &advertised != expected_integrity {
+                failures.push(format!(
+                    "[{order}] packument advertises {advertised}, expected {expected_integrity}"
+                ));
+            }
+            let route = match tarball.find(&format!("/npm/{}/", fx.repo_key)) {
+                Some(idx) => tarball[idx + "/npm".len()..].to_string(),
+                None => {
+                    failures.push(format!(
+                        "[{order}] {package}@{version}: tarball not rewritten to the virtual \
+                         repo: {tarball}"
+                    ));
+                    continue;
+                }
+            };
+            let (status, bytes) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+            if status != StatusCode::OK {
+                failures.push(format!("[{order}] GET {route}: HTTP {status}"));
+                continue;
+            }
+            let expected_bytes = if expect_local {
+                &local_bytes
+            } else {
+                &upstream_bytes
+            };
+            if bytes != expected_bytes {
+                failures.push(format!(
+                    "[{order}] GET {route}: the lower-priority member's bytes were served"
+                ));
+            }
+            // The npm SRI check: the advertised integrity must verify against
+            // the served bytes. Before the fix the remote-p1 order advertised
+            // upstream's sha512 while serving the hosted rebuild — the
+            // EINTEGRITY failure from the issue.
+            let verified = match advertised.split_once('-') {
+                Some(("sha512", digest)) => base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .map(|d| d == sha2::Sha512::digest(&bytes).as_slice())
+                    .unwrap_or(false),
+                Some(("sha256", digest)) => base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .map(|d| d == sha2::Sha256::digest(&bytes).as_slice())
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !verified {
+                failures.push(format!(
+                    "[{order}] advertised integrity {advertised} does not match the served \
+                     bytes (npm would fail with EINTEGRITY)"
+                ));
+            }
+        }
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            for sql in [
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "the advertised dist.integrity and the served tarball bytes must come from the \
+             same member — the one member priority selects (#3955):\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // npm virtual member-miss negative cache (#3951)
+    //
+    // The cache is process-global and shared across tests, so each test uses
+    // a fresh random member id (or unique package name) rather than clearing
+    // the map — clearing would race parallel tests under nextest's default
+    // runner.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn npm_negative_entry_freshness_boundary() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(npm_negative_entry_is_fresh(std::time::Duration::ZERO, ttl));
+        assert!(npm_negative_entry_is_fresh(
+            std::time::Duration::from_secs(4),
+            ttl
+        ));
+        assert!(!npm_negative_entry_is_fresh(ttl, ttl));
+        assert!(!npm_negative_entry_is_fresh(
+            std::time::Duration::from_secs(6),
+            ttl
+        ));
+        // TTL of zero disables every hit, even for a just-written entry.
+        assert!(!npm_negative_entry_is_fresh(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn npm_negative_eviction_policy_boundaries() {
+        // Under the cap: never evict-on-insert.
+        assert!(!npm_negative_should_evict_before_insert(4095, 4096));
+        // At or over the cap: eviction is attempted before recording.
+        assert!(npm_negative_should_evict_before_insert(4096, 4096));
+        assert!(npm_negative_should_evict_before_insert(10_000, 4096));
+
+        // A full map of EXPIRED entries makes room; a full map of FRESH
+        // entries refuses the insert (the cap is the memory bound).
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        let mut expired: std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant> =
+            (0..4)
+                .map(|i| {
+                    (
+                        NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), &format!("pkg-{i}")),
+                        now - std::time::Duration::from_secs(60),
+                    )
+                })
+                .collect();
+        assert!(npm_negative_evict_and_has_room(&mut expired, ttl, now, 4));
+        assert!(expired.is_empty(), "expired entries were evicted");
+
+        let mut fresh: std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant> = (0
+            ..4)
+            .map(|i| {
+                (
+                    NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), &format!("pkg-{i}")),
+                    now,
+                )
+            })
+            .collect();
+        assert!(!npm_negative_evict_and_has_room(&mut fresh, ttl, now, 4));
+        assert_eq!(fresh.len(), 4, "fresh entries survive a refused insert");
+
+        // max_entries = 0 refuses every insert (the operator "off" switch).
+        let mut empty = std::collections::HashMap::new();
+        assert!(!npm_negative_evict_and_has_room(&mut empty, ttl, now, 0));
+    }
+
+    #[test]
+    fn npm_virtual_member_miss_cache_roundtrip_and_isolation() {
+        let ttl = std::time::Duration::from_secs(5);
+        let member_a = uuid::Uuid::new_v4();
+        let member_b = uuid::Uuid::new_v4();
+        let key_a = NpmVirtualMemberMissKey::new(member_a, "absent-pkg");
+
+        // Unseen key: no hit.
+        assert!(!npm_virtual_member_miss_hit(&key_a, ttl));
+        npm_virtual_member_miss_insert(key_a.clone(), ttl, 4096);
+        assert!(npm_virtual_member_miss_hit(&key_a, ttl));
+
+        // The same package on ANOTHER member is not absorbed: the entry
+        // records one member's upstream answer, never a virtual-wide one.
+        let key_b = NpmVirtualMemberMissKey::new(member_b, "absent-pkg");
+        assert!(!npm_virtual_member_miss_hit(&key_b, ttl));
+
+        // A different package on the SAME member is not absorbed either.
+        let key_other_pkg = NpmVirtualMemberMissKey::new(member_a, "other-pkg");
+        assert!(!npm_virtual_member_miss_hit(&key_other_pkg, ttl));
+
+        // A zero TTL makes the just-written entry stale (operator "off").
+        assert!(!npm_virtual_member_miss_hit(
+            &key_a,
+            std::time::Duration::ZERO
+        ));
+
+        // max_entries = 0 refuses the insert entirely.
+        let key_never = NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), "never-cached");
+        npm_virtual_member_miss_insert(key_never.clone(), ttl, 0);
+        assert!(!npm_virtual_member_miss_hit(&key_never, ttl));
+    }
+
+    /// #3951 (item 1): a virtual with a private member bypasses the #2162
+    /// computed-packument cache by design (#3323), so every request re-walks
+    /// the members — and before this fix each re-walk re-fetched a member's
+    /// definitive upstream 404 as soon as the proxy layer's 45 s disk
+    /// negative entry expired (the asymmetric TTL: a member's 200 is cached
+    /// for 300 s). The member walk now keeps a short-lived in-process
+    /// negative cache per (member, package) — #3527's OCI mechanism extended
+    /// to npm — so a member that just 404'd is not re-asked within the TTL.
+    ///
+    /// B's disk negative-cache sidecar is deleted between the two requests,
+    /// so the second request's absorption can come ONLY from the in-process
+    /// entry.
+    #[tokio::test]
+    async fn test_virtual_member_404_absorbed_by_inprocess_negative_cache_3951_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "inprocess-neg-dep";
+
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0", "dist": {
+                    "tarball": format!("{}/{package}/-/{package}-1.0.0.tgz", upstream_a.uri()),
+                }}},
+            })))
+            // A's positive entry is cached for 300 s: exactly one upstream
+            // fetch across both requests, before and after the fix.
+            .expect(1)
+            .mount(&upstream_a)
+            .await;
+        let upstream_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(404))
+            // The whole assertion: without the in-process negative cache the
+            // second request re-asks B (its disk negative entry was deleted
+            // below); with it, B is asked once.
+            .expect(1)
+            .mount(&upstream_b)
+            .await;
+
+        // Two remote members; B is PRIVATE, which is what makes this
+        // virtual's merged packument uncacheable (#3323) so every request
+        // re-walks the members — the reproduction surface of #3951. The
+        // fixture user holds a read grant on B so the walk still includes it.
+        let (a_id, _akey, a_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        let (b_id, b_key, b_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_a.uri())
+            .bind(a_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member A");
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_b.uri())
+            .bind(b_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member B");
+        for (member_id, priority) in [(a_id, 1), (b_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+        }
+        tdh::publish_repo(&fx.pool, a_id).await;
+        tdh::grant_repo_actions(&fx.pool, b_id, fx.user_id, &["read"]).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let uri = format!("/{}/{package}", fx.repo_key);
+        let (status, body) = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+        let first_ok = status == StatusCode::OK
+            && serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|json| json["versions"].get("1.0.0").cloned())
+                .is_some();
+
+        // Remove B's disk negative-cache sidecar so the second request's
+        // absorption can come only from the in-process entry under test.
+        let disk_negative = fx
+            .storage_dir
+            .join(format!("proxy-cache/{b_key}/{package}/__cache_meta__.json"));
+        let disk_negative_existed = std::fs::remove_file(&disk_negative).is_ok();
+
+        let (status2, _) = tdh::send(app.clone(), tdh::get(uri)).await;
+
+        // Cleanup before verifying so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(a_id, &a_dir), (b_id, &b_dir)] {
+            for sql in [
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(
+            first_ok,
+            "first packument GET must federate member A's 1.0.0"
+        );
+        assert!(
+            disk_negative_existed,
+            "B's upstream 404 must have written the disk negative-cache sidecar \
+             (missing: {disk_negative:?})"
+        );
+        assert_eq!(status2, StatusCode::OK, "second packument GET");
+        upstream_a.verify().await;
+        upstream_b.verify().await;
     }
 
     // -----------------------------------------------------------------------
@@ -10043,6 +11164,254 @@ mod tests {
              Accept variants within seconds of the publish (would take up to \
              the fresh TTL + per-variant SWR reads without the fanout, #2490)"
         );
+    }
+
+    /// #968: a publish addressed at a VIRTUAL repository lands in its first
+    /// writable hosted member — the single-entry-point layout from the
+    /// issue (one virtual in front of a local + a remote; users publish to
+    /// the virtual). Pre-fix the publish was rejected with 400 "Cannot
+    /// publish to a virtual repository". Also covers dist-tag writes through
+    /// the virtual, which must land on the same member.
+    #[tokio::test]
+    async fn test_publish_through_virtual_lands_in_hosted_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&fx.pool, "virtual", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+        // The through-virtual write composes write on BOTH the virtual (the
+        // middleware's gate on the URL repo) and the member (the handler's
+        // deploy-target gate) — grant both.
+        tdh::grant_repo_actions(&fx.pool, virtual_id, fx.user_id, &["write"]).await;
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
+
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
+            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
+        });
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &virtual_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+        assert!(
+            published.is_ok(),
+            "publish through the virtual must succeed: {:?}",
+            published.err().map(|r| r.status())
+        );
+
+        // The artifact row landed in the MEMBER, and nowhere else.
+        let in_member: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND name = 'widget' AND version = '1.0.0' AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count member artifacts");
+        assert_eq!(
+            in_member, 1,
+            "the version must be stored in the hosted member"
+        );
+        let in_virtual: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(virtual_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count virtual artifacts");
+        assert_eq!(in_virtual, 0, "a virtual owns no artifact rows");
+
+        // ...and the version is listed through the virtual's packument.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let meta = super::get_package_metadata(
+            &fx.state,
+            Some(&auth),
+            &virtual_key,
+            "widget",
+            "http://localhost",
+            false,
+        )
+        .await
+        .expect("packument through virtual");
+        let body = axum::body::to_bytes(meta.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
+        assert!(
+            json["versions"]["1.0.0"].is_object(),
+            "the through-virtual publish must be visible through the virtual: {json:?}"
+        );
+
+        // A dist-tag write through the virtual lands on the same member.
+        let tagged = super::dist_tags_put(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(auth.clone())),
+            axum::extract::Path((
+                virtual_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&serde_json::json!("1.0.0")).expect("serialize tag")),
+        )
+        .await;
+        assert!(
+            tagged.is_ok(),
+            "dist-tag through the virtual must succeed: {:?}",
+            tagged.err().map(|r| r.status())
+        );
+        let member_tags = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        assert_eq!(
+            member_tags.get("next").and_then(|v| v.as_str()),
+            Some("1.0.0"),
+            "the tag must be written to the member's dist-tags row: {member_tags:?}"
+        );
+
+        // Removing a tag the deployment target does not carry is a 404, not a
+        // silent `ok` — the target is the first WRITABLE member, which need
+        // not be the member that owns the package.
+        let del_missing = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(auth.clone())),
+            axum::extract::Path((
+                virtual_key.clone(),
+                "widget".to_string(),
+                "nope".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(
+            del_missing
+                .expect_err("a tag absent from the target must not report success")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let del_next = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(auth.clone())),
+            axum::extract::Path((
+                virtual_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_next.is_ok(),
+            "removing the tag through the virtual must succeed: {:?}",
+            del_next.err().map(|r| r.status())
+        );
+        let member_tags = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        assert!(
+            member_tags.get("next").is_none(),
+            "the tag must be gone from the member's row: {member_tags:?}"
+        );
+
+        // `permissions` has no FK to `repositories`: drop the virtual's grant
+        // explicitly (the fixture teardown covers `fx.repo_id`).
+        let _ = sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+        )
+        .bind(virtual_id)
+        .execute(&fx.pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(virtual_dir);
+        fx.teardown().await;
+    }
+
+    /// #968 authz: routing a publish through a virtual must NOT become a
+    /// confused deputy — a caller with write on the virtual but no write on
+    /// any hosted member gets 400 and no artifact row. The member is a
+    /// SEPARATE local repo (not the fixture's): `Fixture::setup` grants the
+    /// fixture user the developer role on `fx.repo_id`, which would
+    /// legitimately satisfy the member write gate and defeat the premise.
+    #[tokio::test]
+    async fn test_publish_through_virtual_requires_member_write() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&fx.pool, "virtual", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+        // Write on the virtual ONLY: the member must stay out of reach.
+        tdh::grant_repo_actions(&fx.pool, virtual_id, fx.user_id, &["write"]).await;
+
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
+            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
+        });
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &virtual_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+
+        let in_member: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(member_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count member artifacts");
+
+        for id in [member_id, virtual_id] {
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(id)
+            .execute(&fx.pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(member_dir);
+        let _ = std::fs::remove_dir_all(virtual_dir);
+        fx.teardown().await;
+
+        let err = published.expect_err("publish without member write must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(in_member, 0, "nothing may land in the member");
     }
 
     /// #2022: a direct `npm publish` to a `promotion_only` repository must be

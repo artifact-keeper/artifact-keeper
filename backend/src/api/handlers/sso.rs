@@ -70,7 +70,8 @@ async fn audit_federated_login(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let mut entry = AuditEntry::new(action, ResourceType::User)
-        .details(federated_login_details(provider, extra));
+        .details(federated_login_details(provider, extra))
+        .with_request_client_ip();
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
     }

@@ -26,17 +26,24 @@ use crate::services::repository_service::{
 /// packages endpoints enforce the same per-user authorization model
 /// (public repos plus any repo the user holds a role assignment for) instead
 /// of treating every authenticated caller as entitled to all packages.
+///
+/// #3901: a repository-scoped token binds AHEAD of `is_admin`, matching
+/// `search::intersect_token_scope` and the webhook reads (#1803, #3715): an
+/// admin holding a token minted for repository A must not enumerate other
+/// repositories' packages with it. Token scope is confinement, not a
+/// privilege boundary, so it narrows admins too.
 fn repo_visibility_for(auth: Option<&AuthExtension>) -> RepoVisibility {
     match auth {
         None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
-        // Repo-scoped token: restrict strictly to the token's allowed set.
+        // Repo-scoped token: restrict strictly to the token's allowed set,
+        // whether its owner is an admin or not (#3901).
         Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
             a.allowed_repo_ids
                 .as_allowed_repo_ids()
                 .unwrap_or_default()
                 .to_vec(),
         ),
+        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -126,23 +133,16 @@ async fn resolve_package_filter(
         });
     }
 
-    // Expand the virtual repo to its members (all types, matching
-    // `fetch_virtual_members`): remote members contribute their proxy-cached
-    // catalog rows, hosted members their pushed artifacts. Order by priority
-    // for a stable, deterministic listing.
-    let member_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        SELECT r.id
-        FROM repositories r
-        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-        WHERE vrm.virtual_repo_id = $1
-        ORDER BY vrm.priority
-        "#,
-    )
-    .bind(id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Expand the virtual repo to its leaf members through the same recursive
+    // walk as `fetch_virtual_members` (#3840): nested virtuals contribute
+    // their own members, remote members their proxy-cached catalog rows,
+    // hosted members their pushed artifacts. The walk's resolution order
+    // (depth-first pre-order priority) keeps the listing stable and
+    // deterministic.
+    let member_ids: Vec<Uuid> =
+        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, id)
+            .await
+            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
 
     // Aggregated rows are reported under the virtual repo's key, not the
     // member's, so the whole page reads as the virtual repo.
@@ -161,19 +161,26 @@ async fn package_in_virtual_repo(
     package_id: Uuid,
     virtual_key: &str,
 ) -> Result<bool> {
+    let virtual_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'")
+            .bind(virtual_key)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some(virtual_id) = virtual_id else {
+        return Ok(false);
+    };
+    // Same recursive member walk as the listing paths (#3840): a package
+    // owned by a leaf of a NESTED virtual still reports the top virtual's key.
+    let member_ids =
+        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
+            .await
+            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
     sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM repositories vr
-            JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = vr.id
-            JOIN packages p ON p.repository_id = vrm.member_repo_id
-            WHERE vr.key = $1 AND p.id = $2
-        )
-        "#,
+        "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
     )
-    .bind(virtual_key)
     .bind(package_id)
+    .bind(&member_ids)
     .fetch_one(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))
@@ -707,10 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn test_visibility_admin_scoped_token_still_all() {
-        // Admin bypasses scope restrictions, matching list_repositories.
-        let auth = make_auth(Uuid::new_v4(), true, Some(vec![Uuid::new_v4()]));
-        assert_eq!(repo_visibility_for(Some(&auth)), RepoVisibility::All);
+    fn test_visibility_admin_scoped_token_is_confined() {
+        // #3901: token scope binds ahead of is_admin -- an admin holding a
+        // repository-scoped token is confined to the token's set, matching
+        // search::intersect_token_scope and the webhook reads.
+        let repo = Uuid::new_v4();
+        let auth = make_auth(Uuid::new_v4(), true, Some(vec![repo]));
+        assert_eq!(
+            repo_visibility_for(Some(&auth)),
+            RepoVisibility::Ids(vec![repo])
+        );
     }
 
     #[test]

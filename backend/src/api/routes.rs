@@ -20,11 +20,12 @@ use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
     repo_visibility_middleware, RepoVisibilityState,
 };
+use super::middleware::client_ip::client_ip_context_middleware;
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
-    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
+    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware, CidrRange,
     LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
@@ -158,9 +159,34 @@ pub fn create_router(state: SharedState) -> Router {
         router = router.merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
     }
 
+    // Rate-limit policy pieces hoisted above the route assembly so the login
+    // limiter state can be shared with the OCI `/v2/token` credential
+    // exchange (#4020), which is mounted outside `api_v1_routes`: both
+    // surfaces verify user passwords, so they draw from the SAME limiter
+    // instances — a guess against one endpoint spends the other's budget too.
+    let rate_limit_exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+        state.config.rate_limit_exempt_usernames.clone(),
+        state.config.rate_limit_exempt_service_accounts,
+        state.config.rate_limit_trusted_cidrs.clone(),
+    ));
+    let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+    let login_rate_limit_state = build_login_rate_limit_state(
+        &state.config,
+        &rate_limit_exemptions,
+        &rate_limit_trusted_proxies,
+    );
+
     let mut router = router
         // API v1 routes
-        .nest("/api/v1", api_v1_routes(state.clone()))
+        .nest(
+            "/api/v1",
+            api_v1_routes(
+                state.clone(),
+                rate_limit_exemptions,
+                rate_limit_trusted_proxies.clone(),
+                login_rate_limit_state.clone(),
+            ),
+        )
         // Device Authorization Grant (#3461): the browser approval page. 404
         // unless DEVICE_AUTH_ENABLED=true.
         .merge(
@@ -171,7 +197,12 @@ pub fn create_router(state: SharedState) -> Router {
         )
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
-        .nest("/v2", handlers::oci_v2::router())
+        // `/v2/token` shares the login limiter (#4020): the same per-(username,
+        // IP) password-guessing budget and global backstop as /api/v1/auth/login.
+        .nest(
+            "/v2",
+            handlers::oci_v2::router(Some(login_rate_limit_state)),
+        )
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
 
@@ -233,6 +264,17 @@ pub fn create_router(state: SharedState) -> Router {
     // backstop below). Extracts or generates a correlation ID and sets the
     // X-Correlation-ID response header.
     router = router.layer(middleware::from_fn(correlation_id_middleware));
+
+    // Client-IP context (#3888/#1849). Resolves the request's client address
+    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
+    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
+    // the rate limiter keys on) — and scopes it as a request task-local so
+    // audit emission and IP-conditioned permission gates observe the same
+    // address without signature threading. Runs on every route.
+    router = router.layer(middleware::from_fn_with_state(
+        rate_limit_trusted_proxies,
+        client_ip_context_middleware,
+    ));
 
     // Defense-in-depth backstop (outermost layer). A router-wide load-shed +
     // concurrency limit (+ optional request timeout) so that NO request path —
@@ -387,8 +429,76 @@ fn apply_global_backstop(
     )
 }
 
-/// API v1 routes
-fn api_v1_routes(state: SharedState) -> Router<SharedState> {
+/// Construct the login rate-limit state shared by `/api/v1/auth/login` and
+/// the OCI `/v2/token` credential exchange (#4020).
+///
+/// Both surfaces verify user passwords, so they draw from the SAME limiter
+/// instances: the per-(username, IP) budget, the global shedding backstop,
+/// and the per-IP failed-login pad budget (#3504). A password guess against
+/// one endpoint spends the other's budget too. Called once by
+/// [`create_router`], which clones the result into `api_v1_routes` and into
+/// `oci_v2::router`.
+fn build_login_rate_limit_state(
+    config: &crate::config::Config,
+    exemptions: &Arc<RateLimitExemptions>,
+    trusted_proxies: &Arc<Vec<CidrRange>>,
+) -> LoginRateLimitState {
+    // Global shedding backstop for the login path. The login limiter keys
+    // per-(username, IP); this single-bucket backstop bounds the total login
+    // volume per window (and therefore the size of the per-key map) so a
+    // username-cycling attacker cannot exhaust memory via unbounded distinct
+    // keys. Sized far above any legitimate concurrent-login volume so real
+    // users never reach it; it sheds rather than starves.
+    let backstop = Arc::new(RateLimiter::new(
+        config.rate_limit_login_global_per_window,
+        config.rate_limit_window_secs,
+    ));
+    // Dedicated tight per-(username, IP) bucket for the login endpoint. The
+    // login handler bcrypt-verifies the submitted password (and does so even
+    // for locked accounts), so borrowing the loose general-auth budget lets a
+    // single client drive a burst of verifies that saturates CPU. This budget
+    // sheds excess login attempts as 429 in the middleware layer, before the
+    // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
+    let limiter = Arc::new(RateLimiter::new(
+        config.rate_limit_login_per_window,
+        config.rate_limit_login_window_secs,
+    ));
+    // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
+    // above is keyed per-(username, IP), so cycling usernames gets a fresh one
+    // every request; this one accrues against the source IP. It gates the pad,
+    // never the request — an exhausted budget makes logins run unpadded, it
+    // does not refuse them — and it is not reset by a success, so the bound is
+    // exactly N padded verifies per IP per window. Default: 30 failures /
+    // 5 minutes per IP; 0 disables it.
+    let failed_by_ip = Arc::new(RateLimiter::new(
+        config.rate_limit_login_failed_per_ip_per_window,
+        config.rate_limit_login_failed_per_ip_window_secs,
+    ));
+    LoginRateLimitState {
+        inner: RateLimitState {
+            limiter,
+            exemptions: Arc::clone(exemptions),
+            enabled: config.rate_limit_enabled,
+            trusted_proxies: Arc::clone(trusted_proxies),
+        },
+        backstop,
+        failed_by_ip,
+    }
+}
+
+/// API v1 routes.
+///
+/// `exemptions`, `trusted_proxies`, and `login_rate_limit_state` are built by
+/// [`create_router`] and passed in so the login limiter state can ALSO gate
+/// the OCI `/v2/token` exchange (#4020), which is mounted outside this
+/// router: both password-verification surfaces share the same limiter
+/// instances, so a guess against one spends the other's budget.
+fn api_v1_routes(
+    state: SharedState,
+    exemptions: Arc<RateLimitExemptions>,
+    trusted_proxies: Arc<Vec<CidrRange>>,
+    login_rate_limit_state: LoginRateLimitState,
+) -> Router<SharedState> {
     // Create an AuthService for middleware use
     let auth_service = Arc::new(AuthService::new(
         state.db.clone(),
@@ -400,19 +510,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
 
     let upload_limit = state.config.max_upload_size_bytes;
 
-    // Rate limiters and exemptions, driven by Config fields.
-    let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
-        state.config.rate_limit_exempt_usernames.clone(),
-        state.config.rate_limit_exempt_service_accounts,
-        state.config.rate_limit_trusted_cidrs.clone(),
-    ));
-
-    // Trusted reverse-proxy CIDRs (#2023). `X-Forwarded-For` is believed for
-    // client-IP resolution only when the immediate TCP peer falls within one
-    // of these ranges; empty (the default) means XFF is never trusted and the
-    // real TCP peer is always the rate-limit key. Shared by every limiter
-    // state so the policy is uniform across endpoints.
-    let trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+    // Rate limiters, driven by Config fields. The exemption set and trusted
+    // reverse-proxy policy arrive from `create_router` (see the doc comment
+    // above) so they stay identical to the policy `/v2/token` sees; only the
+    // endpoint limiters are built here.
 
     let auth_rate_limiter = Arc::new(RateLimiter::new(
         state.config.rate_limit_auth_per_window,
@@ -431,37 +532,6 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     let presign_rate_limiter = Arc::new(RateLimiter::new(
         state.config.rate_limit_presign_per_window,
         state.config.rate_limit_window_secs,
-    ));
-    // Global shedding backstop for the login path. The login limiter keys
-    // per-(username, IP); this single-bucket backstop bounds the total login
-    // volume per window (and therefore the size of the per-key map) so a
-    // username-cycling attacker cannot exhaust memory via unbounded distinct
-    // keys. Sized far above any legitimate concurrent-login volume so real
-    // users never reach it; it sheds rather than starves.
-    let login_global_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_login_global_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    // Dedicated tight per-(username, IP) bucket for the login endpoint. The
-    // login handler bcrypt-verifies the submitted password (and does so even
-    // for locked accounts), so borrowing the loose general-auth budget lets a
-    // single client drive a burst of verifies that saturates CPU. This budget
-    // sheds excess login attempts as 429 in the middleware layer, before the
-    // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
-    let login_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_login_per_window,
-        state.config.rate_limit_login_window_secs,
-    ));
-    // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
-    // above is keyed per-(username, IP), so cycling usernames gets a fresh one
-    // every request; this one accrues against the source IP. It gates the pad,
-    // never the request — an exhausted budget makes logins run unpadded, it
-    // does not refuse them — and it is not reset by a success, so the bound is
-    // exactly N padded verifies per IP per window. Default: 30 failures /
-    // 5 minutes per IP; 0 disables it.
-    let login_failed_ip_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_login_failed_per_ip_per_window,
-        state.config.rate_limit_login_failed_per_ip_window_secs,
     ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
@@ -507,19 +577,6 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
-    };
-    // Login-only state: keys the dedicated tight login limiter per-(username,
-    // IP) and gates it behind the global shedding backstop. Applied only to
-    // /login so /logout and /refresh keep the looser auth limiter.
-    let login_rate_limit_state = LoginRateLimitState {
-        inner: RateLimitState {
-            limiter: Arc::clone(&login_rate_limiter),
-            exemptions: Arc::clone(&exemptions),
-            enabled: rate_limit_enabled,
-            trusted_proxies: Arc::clone(&trusted_proxies),
-        },
-        backstop: Arc::clone(&login_global_rate_limiter),
-        failed_by_ip: Arc::clone(&login_failed_ip_rate_limiter),
     };
     // Separate state for the unauthenticated TOTP second-factor endpoint
     // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
@@ -580,9 +637,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let api_cleanup = Arc::clone(&api_rate_limiter);
         let search_cleanup = Arc::clone(&search_rate_limiter);
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
-        let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
-        let login_cleanup = Arc::clone(&login_rate_limiter);
-        let login_failed_ip_cleanup = Arc::clone(&login_failed_ip_rate_limiter);
+        let login_global_cleanup = Arc::clone(&login_rate_limit_state.backstop);
+        let login_cleanup = Arc::clone(&login_rate_limit_state.inner.limiter);
+        let login_failed_ip_cleanup = Arc::clone(&login_rate_limit_state.failed_by_ip);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         let device_code_cleanup = Arc::clone(&device_code_rate_limiter);
         let device_token_cleanup = Arc::clone(&device_token_rate_limiter);

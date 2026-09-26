@@ -451,7 +451,18 @@ pub async fn create_repo_token(
         .await?;
     let token_id = minted.id;
 
-    // Restrict the token to this repository
+    // Restrict the token to this repository. The restriction marker is set
+    // explicitly FIRST (#4228, #4265 follow-up): the mint and the pin are
+    // separate statements, and a crash between them used to leave a fully
+    // unrestricted, unmarked token -- exactly the state the migration-235
+    // backfill cannot recover. Marked-but-unpinned resolves to deny-all
+    // instead. The `AFTER INSERT` trigger still stamps the marker for any
+    // other writer of the join table.
+    sqlx::query("UPDATE api_tokens SET repository_restricted = true WHERE id = $1")
+        .bind(token_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
         .bind(token_id)
         .bind(repo.id)

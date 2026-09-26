@@ -42,6 +42,15 @@ pub struct ProxyCacheEntry {
 /// into a duplicate row. `cached_at`/`last_accessed_at` are refreshed so the
 /// row reflects the newest write. Best-effort at the call site: a failure here
 /// must never fail the client's stream/response.
+///
+/// `quarantine_until` mirrors the sidecar's Package Age Policy hold (#3912):
+/// it gives a held proxied object a releasable identity. A fresh cache write
+/// re-evaluates the hold from the newest upstream response, so the conflict
+/// arm also resets `quarantine_released_at` — an admin's release of the
+/// PREVIOUS fetch must not silently release the new bytes.
+///
+/// Runtime-checked (not `sqlx::query!`) so the offline `.sqlx` cache is
+/// untouched; the DB-backed tests in this module exercise the statement.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert(
     db: &PgPool,
@@ -53,13 +62,15 @@ pub async fn upsert(
     checksum_sha256: Option<&str>,
     content_type: Option<&str>,
     upstream_url: Option<&str>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO proxy_cache_artifacts
             (repository_id, path, storage_key, metadata_key, size_bytes,
-             checksum_sha256, content_type, upstream_url, cached_at, last_accessed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+             checksum_sha256, content_type, upstream_url, cached_at, last_accessed_at,
+             quarantine_until)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9)
         ON CONFLICT (repository_id, path) DO UPDATE SET
             storage_key      = EXCLUDED.storage_key,
             metadata_key     = EXCLUDED.metadata_key,
@@ -68,17 +79,22 @@ pub async fn upsert(
             content_type     = EXCLUDED.content_type,
             upstream_url     = EXCLUDED.upstream_url,
             cached_at        = now(),
-            last_accessed_at = now()
+            last_accessed_at = now(),
+            quarantine_until = EXCLUDED.quarantine_until,
+            -- A new cache write is a new upstream evaluation: any earlier
+            -- manual release applied to the previous bytes, not these.
+            quarantine_released_at = NULL
         "#,
-        repository_id,
-        path,
-        storage_key,
-        metadata_key,
-        size_bytes,
-        checksum_sha256,
-        content_type,
-        upstream_url,
     )
+    .bind(repository_id)
+    .bind(path)
+    .bind(storage_key)
+    .bind(metadata_key)
+    .bind(size_bytes)
+    .bind(checksum_sha256)
+    .bind(content_type)
+    .bind(upstream_url)
+    .bind(quarantine_until)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -138,13 +154,22 @@ pub async fn backfill_from_sidecar(
     size_bytes: i64,
     checksum_sha256: Option<&str>,
     content_type: Option<&str>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    sqlx::query!(
+    // Runtime-checked (not `sqlx::query!`) so the offline `.sqlx` cache is
+    // untouched; the DB-backed tests in this module exercise the statement.
+    //
+    // `quarantine_until` follows the placeholder guard like the other body
+    // fields (#3912): a placeholder gets the sidecar's hold, an authoritative
+    // row keeps what the commit wrote, and a manual release
+    // (`quarantine_released_at`) is never clobbered by a backfill.
+    sqlx::query(
         r#"
         INSERT INTO proxy_cache_artifacts
             (repository_id, path, storage_key, metadata_key, size_bytes,
-             checksum_sha256, content_type, cached_at, last_accessed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+             checksum_sha256, content_type, cached_at, last_accessed_at,
+             quarantine_until)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8)
         ON CONFLICT (repository_id, path) DO UPDATE SET
             storage_key = CASE
                 WHEN proxy_cache_artifacts.size_bytes = 0
@@ -162,6 +187,10 @@ pub async fn backfill_from_sidecar(
                 WHEN proxy_cache_artifacts.size_bytes = 0
                  AND proxy_cache_artifacts.checksum_sha256 IS NULL
                 THEN EXCLUDED.content_type ELSE proxy_cache_artifacts.content_type END,
+            quarantine_until = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.quarantine_until ELSE proxy_cache_artifacts.quarantine_until END,
             -- Assigned LAST: the guard reads the stored checksum, and an
             -- UPDATE SET list evaluates every right-hand side against the OLD
             -- row, so ordering is presentational only. Kept last regardless so
@@ -172,14 +201,15 @@ pub async fn backfill_from_sidecar(
                 THEN EXCLUDED.checksum_sha256 ELSE proxy_cache_artifacts.checksum_sha256 END,
             last_accessed_at = now()
         "#,
-        repository_id,
-        path,
-        storage_key,
-        metadata_key,
-        size_bytes,
-        checksum_sha256,
-        content_type,
     )
+    .bind(repository_id)
+    .bind(path)
+    .bind(storage_key)
+    .bind(metadata_key)
+    .bind(size_bytes)
+    .bind(checksum_sha256)
+    .bind(content_type)
+    .bind(quarantine_until)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -654,6 +684,89 @@ pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------
+// Proxy-cache quarantine identity (#3912)
+// ---------------------------------------------------------------------------
+
+/// One catalog row's quarantine fields, read for the proxy-quarantine release
+/// endpoint (#3912). `metadata_key` locates the cache sidecar whose
+/// `quarantine_until` the release must also clear: the sidecar is the
+/// read-path authority, this row the releasable identity.
+#[derive(Debug, Clone)]
+pub struct ProxyQuarantineRow {
+    pub id: Uuid,
+    pub metadata_key: String,
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub quarantine_released_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One row's quarantine fields by `(repository_id, path)` — the exact
+/// uniqueness key. Scoped to `repository_id` and returning `None` for both
+/// "no such path" and "that path is another repository's", so the caller's
+/// 404 is not a cross-tenant existence oracle. Runtime-checked so the
+/// offline `.sqlx` cache is untouched.
+pub async fn find_quarantine_row(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<ProxyQuarantineRow>> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        r#"
+        SELECT id, metadata_key, quarantine_until, quarantine_released_at
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1 AND path = $2
+        "#,
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(
+        |(id, metadata_key, quarantine_until, quarantine_released_at)| ProxyQuarantineRow {
+            id,
+            metadata_key,
+            quarantine_until,
+            quarantine_released_at,
+        },
+    ))
+}
+
+/// Record an admin's release of a held proxy-cache entry: the hold column is
+/// cleared and the release stamped, atomically and exactly once.
+///
+/// The `WHERE` guard makes the release conditional on the row still being
+/// under an unexpired, unreleased hold, so a double-release (or a release
+/// racing a natural window elapse) affects zero rows and the caller answers
+/// 409 — the same shape as the hosted `quarantine_service::transition`.
+/// Returns the affected-row count.
+pub async fn mark_quarantine_released(db: &PgPool, id: Uuid) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE proxy_cache_artifacts
+        SET quarantine_until = NULL, quarantine_released_at = now()
+        WHERE id = $1
+          AND quarantine_until IS NOT NULL
+          AND quarantine_until > now()
+          AND quarantine_released_at IS NULL
+        "#,
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -810,6 +923,7 @@ mod tests {
                     Some("d"),
                     Some("text/html"),
                     None,
+                    None,
                 )
                 .await
                 .expect("seed");
@@ -875,6 +989,7 @@ mod tests {
             Some("aaa"),
             Some("application/octet-stream"),
             None,
+            None,
         )
         .await
         .expect("first upsert");
@@ -889,6 +1004,7 @@ mod tests {
             250,
             Some("bbb"),
             Some("application/octet-stream"),
+            None,
             None,
         )
         .await
@@ -909,7 +1025,7 @@ mod tests {
         };
         let repo = insert_repo(&pool).await;
         let key = format!("proxy-cache/{}/p/__content__", repo.simple());
-        upsert(&pool, repo, "p", &key, "m", 42, Some("c"), None, None)
+        upsert(&pool, repo, "p", &key, "m", 42, Some("c"), None, None, None)
             .await
             .unwrap();
         assert_eq!(sum_by_repo(&pool, repo).await.unwrap(), 42);
@@ -930,7 +1046,7 @@ mod tests {
         let key = format!("proxy-cache/{}/k/__content__", repo.simple());
 
         // Absent -> backfill creates the row.
-        backfill_from_sidecar(&pool, repo, path, &key, "m", 500, Some("sha"), None)
+        backfill_from_sidecar(&pool, repo, path, &key, "m", 500, Some("sha"), None, None)
             .await
             .unwrap();
         let rows = list_paged(&pool, repo, None, 100).await.unwrap();
@@ -939,7 +1055,7 @@ mod tests {
 
         // Present -> a second backfill must NOT clobber the authoritative body
         // (ON CONFLICT DO NOTHING on size/checksum; only last_accessed bumps).
-        backfill_from_sidecar(&pool, repo, path, &key, "m", 999, Some("other"), None)
+        backfill_from_sidecar(&pool, repo, path, &key, "m", 999, Some("other"), None, None)
             .await
             .unwrap();
         let rows = list_paged(&pool, repo, None, 100).await.unwrap();
@@ -1009,6 +1125,7 @@ mod tests {
             8192,
             Some("realchecksum"),
             Some("application/octet-stream"),
+            None,
         )
         .await
         .expect("backfill");
@@ -1059,6 +1176,7 @@ mod tests {
             Some("e3b0c442"),
             None,
             None,
+            None,
         )
         .await
         .expect("authoritative zero-byte upsert");
@@ -1071,6 +1189,7 @@ mod tests {
             "m2",
             77,
             Some("wrong"),
+            None,
             None,
         )
         .await
@@ -1130,9 +1249,20 @@ mod tests {
 
         // The tee commit refines the SAME row in place with the true size /
         // checksum (no duplicate row).
-        upsert(&pool, repo, path, &key, &meta, 4096, Some("c"), None, None)
-            .await
-            .unwrap();
+        upsert(
+            &pool,
+            repo,
+            path,
+            &key,
+            &meta,
+            4096,
+            Some("c"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let rows = list_paged(&pool, repo, None, 100).await.unwrap();
         assert_eq!(
             rows.len(),
@@ -1164,6 +1294,7 @@ mod tests {
                 &format!("proxy-cache/{}/{p}/__content__", repo.simple()),
                 "m",
                 1,
+                None,
                 None,
                 None,
                 None,
@@ -1205,6 +1336,7 @@ mod tests {
                 "m",
                 i as i64,
                 Some("c"),
+                None,
                 None,
                 None,
             )
@@ -1271,6 +1403,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1333,7 +1466,7 @@ mod tests {
         };
         let repo = insert_repo(&pool).await;
         assert!(!has_rows(&pool, repo).await.unwrap(), "empty catalog");
-        upsert(&pool, repo, "p", "proxy-k", "m", 1, None, None, None)
+        upsert(&pool, repo, "p", "proxy-k", "m", 1, None, None, None, None)
             .await
             .unwrap();
         assert!(has_rows(&pool, repo).await.unwrap(), "cataloged repo");
@@ -1386,6 +1519,7 @@ mod tests {
             Some("c"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1414,6 +1548,7 @@ mod tests {
                 "m",
                 10,
                 Some("c"),
+                None,
                 None,
                 None,
             )

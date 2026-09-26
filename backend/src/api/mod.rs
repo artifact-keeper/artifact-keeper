@@ -51,6 +51,14 @@ pub const REPO_CACHE_TTL_SECS: u64 = 60;
 
 /// Cached repository metadata populated by the repo-visibility middleware
 /// and reused by format-handler resolvers to avoid a second DB round-trip.
+///
+/// The enforcement flags (`promotion_only`, `age_gate_*`, `curation_*`) ride
+/// the same entry so a cache-built [`RepoInfo`](crate::api::handlers::proxy_helpers::RepoInfo)
+/// is a faithful snapshot of the `repositories` row — a resolver that served
+/// defaults instead would silently fail those gates open (#3778). Writes to
+/// any of these columns fire the `ak_repository_changed_notify` trigger
+/// (migration 239), which evicts the entry fleet-wide; the 60-second TTL is
+/// the fallback bound.
 #[derive(Clone, Debug)]
 pub struct CachedRepo {
     pub id: Uuid,
@@ -63,6 +71,13 @@ pub struct CachedRepo {
     /// The `index_upstream_url` config value (cargo-specific; `None` for
     /// other formats or when not configured).
     pub index_upstream_url: Option<String>,
+    pub promotion_only: bool,
+    pub age_gate_enabled: bool,
+    pub age_gate_min_age_days: i32,
+    /// Age-source mode wire value (migration 191).
+    pub age_gate_mode: String,
+    pub curation_enabled: bool,
+    pub curation_default_action: String,
 }
 
 /// Thread-safe in-process cache for `CachedRepo` entries, keyed by repo key.
@@ -564,6 +579,12 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             is_public: true,
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -772,6 +793,12 @@ mod tests {
                     storage_backend: "filesystem".to_string(),
                     is_public: i % 2 == 0,
                     index_upstream_url: None,
+                    promotion_only: false,
+                    age_gate_enabled: false,
+                    age_gate_min_age_days: 7,
+                    age_gate_mode: "upstream_publish_time".to_string(),
+                    curation_enabled: false,
+                    curation_default_action: "allow".to_string(),
                 };
                 c.write().await.insert(key.clone(), (repo, Instant::now()));
                 // Hold a read guard briefly to interleave readers + writers.

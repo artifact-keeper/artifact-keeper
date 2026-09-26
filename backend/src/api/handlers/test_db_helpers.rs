@@ -693,8 +693,11 @@ fn cfg(storage_path: &str) -> Config {
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
         oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        npm_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
             crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+        npm_virtual_negative_cache_max_entries:
+            crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
@@ -2186,6 +2189,22 @@ pub fn build_state_with_proxy(
     proxy: Arc<crate::services::proxy_service::ProxyService>,
 ) -> crate::api::SharedState {
     let mut state = app_state_with(cfg(storage_path), pool, storage_path);
+    state.set_proxy_service(proxy);
+    Arc::new(state)
+}
+
+/// Like [`build_state_with_proxy`], but lets the caller adjust the test
+/// [`Config`] before the state is built (e.g. disabling the npm
+/// computed-packument cache so a test exercises the per-request merge).
+pub fn build_state_with_proxy_with(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    mutate: impl FnOnce(&mut Config),
+) -> crate::api::SharedState {
+    let mut config = cfg(storage_path);
+    mutate(&mut config);
+    let mut state = app_state_with(config, pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
 }

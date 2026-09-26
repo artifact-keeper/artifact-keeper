@@ -28543,6 +28543,66 @@ tonic-build = "0.12"
             );
         }
 
+        // -------------------------------------------------------------------
+        // #4089: alias false-positive bounding — the version-line guard
+        // -------------------------------------------------------------------
+
+        /// The alias claims "same project at the same upstream version" —
+        /// no more. The query therefore has to carry the CONDA package's
+        /// exact version, because OSV's own range matching is what keeps an
+        /// advisory for a different version line from becoming a false
+        /// positive against the conda package. For both renamed builtins
+        /// (`py-opencv` -> `opencv-python`, `matplotlib-base` ->
+        /// `matplotlib`): the query goes out under the alias name at the
+        /// conda's exact version, and the finding comes back naming the
+        /// shipped package on that same version line, with the alias the
+        /// claim rests on disclosed.
+        #[tokio::test]
+        async fn test_alias_query_and_finding_stay_on_the_conda_version_line_4089() {
+            for (conda_name, version, pypi_name) in [
+                ("py-opencv", "4.9.0", "opencv-python"),
+                ("matplotlib-base", "3.8.4", "matplotlib"),
+            ] {
+                let (server, scanner) =
+                    osv_backed_scanner(answered_with("OSV-line-1", "line check"), 1).await;
+                let out = scan_conda(&scanner, conda_name, version, &Bytes::new()).await;
+
+                let body = sent_osv_body(&server).await;
+                assert_eq!(
+                    body["queries"][0]["package"]["name"], pypi_name,
+                    "{conda_name} is queried as its PyPI alias"
+                );
+                assert_eq!(body["queries"][0]["package"]["ecosystem"], "PyPI");
+                assert_eq!(
+                    body["queries"][0]["version"], version,
+                    "the version line is the conda package's own — OSV's \
+                     range matching is the guard that keeps a different \
+                     line's advisory from matching {conda_name}"
+                );
+
+                assert_eq!(out.findings.len(), 1, "{conda_name}");
+                let finding = &out.findings[0];
+                assert_eq!(
+                    finding.affected_component.as_deref(),
+                    Some(conda_name),
+                    "the finding names the package the reader shipped, not the alias"
+                );
+                assert_eq!(
+                    finding.affected_version.as_deref(),
+                    Some(version),
+                    "the finding stays on the shipped package's version line"
+                );
+                let description = finding
+                    .description
+                    .as_deref()
+                    .expect("an aliased finding carries its provenance");
+                assert!(
+                    description.contains(pypi_name),
+                    "the alias the claim rests on is disclosed: {description:?}"
+                );
+            }
+        }
+
         /// The GitHub feed keys PyPI advisories under `pip`. A mapped conda
         /// package must reach it under that name or the secondary source
         /// contributes nothing.

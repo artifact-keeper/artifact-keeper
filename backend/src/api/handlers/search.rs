@@ -2824,8 +2824,11 @@ mod grant_visibility_db_tests {
         };
 
         // Reference: the shared tenant fragment AND the read action term.
-        let tenant =
-            crate::services::repository_service::permissions_grant_exists_for("rr.id", "$1");
+        let tenant = crate::services::repository_service::permissions_grant_exists_for(
+            "rr.id",
+            "$1",
+            crate::services::repository_service::IpConditionMode::Enforce,
+        );
         let reference_sql = format!(
             r#"
             SELECT rr.id FROM repositories rr

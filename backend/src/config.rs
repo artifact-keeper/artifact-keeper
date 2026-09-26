@@ -43,6 +43,37 @@ const _: () = assert!(
     DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
 );
 
+/// Default freshness window for the npm virtual-member negative cache
+/// (#3951).
+pub const DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+
+/// Default maximum entry count for the npm virtual-member negative cache.
+pub const DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Ceiling for [`Config::npm_virtual_negative_cache_ttl_ms`], tied to the
+/// proxy layer's own negative-cache window
+/// ([`crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS`], 45 s) —
+/// the same reasoning as [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]: the
+/// virtual member walk's entry records "this member did not have the
+/// package", which is weaker than the proxy layer's status-gated upstream
+/// 404, so it must not outlive that window.
+pub const MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 =
+    crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000;
+
+/// Ceiling for [`Config::npm_virtual_negative_cache_max_entries`]. The cap
+/// is the cache's memory bound, and the key holds a caller-supplied package
+/// name on a path an unauthenticated `npm install` reaches, so it stays
+/// bounded: 65 536 is 16x the default and a few tens of MiB.
+pub const MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 65_536;
+
+// Each default must stay strictly inside its ceiling, or the clamp would
+// silently change the behaviour an untouched deployment has today.
+const _: () =
+    assert!(DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS < MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+const _: () = assert!(
+    DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+);
+
 #[cfg(test)]
 mod test_env {
     //! Thread-local overlay over the process environment, compiled only into
@@ -1049,6 +1080,20 @@ pub struct Config {
     /// negative-cache inserts.
     pub oci_virtual_negative_cache_max_entries: usize,
 
+    /// Freshness window in milliseconds for negative npm virtual-member
+    /// resolution cache entries (#3951): a member whose upstream just
+    /// definitively 404'd a package is not re-asked within this window.
+    /// Env `NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000, clamped to
+    /// [`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]. Set to 0 to disable
+    /// negative-cache hits.
+    pub npm_virtual_negative_cache_ttl_ms: u64,
+
+    /// Maximum number of npm virtual-member negative-cache entries. Env
+    /// `NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`, default 4096, clamped to
+    /// [`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`]. Set to 0 to disable
+    /// negative-cache inserts.
+    pub npm_virtual_negative_cache_max_entries: usize,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -1243,6 +1288,8 @@ redacted_debug!(Config {
     show proxy_singleflight_lock_wait_timeout_secs,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
+    show npm_virtual_negative_cache_ttl_ms,
+    show npm_virtual_negative_cache_max_entries,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -1376,6 +1423,8 @@ impl Default for Config {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            npm_virtual_negative_cache_max_entries: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -1758,6 +1807,21 @@ impl Config {
                 DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             )
             .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
+            // Same clamp discipline as the OCI knobs above: an oversized TTL
+            // would pin "member does not have the package" past the proxy
+            // layer's own 45 s negative window (a package newly published
+            // upstream would stay invisible), and an oversized cap would
+            // unbound the cache's memory. `0` is allowed and disables it.
+            npm_virtual_negative_cache_ttl_ms: env_parse(
+                "NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS",
+                DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            )
+            .min(MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS),
+            npm_virtual_negative_cache_max_entries: env_parse(
+                "NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            )
+            .min(MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -4309,6 +4373,64 @@ mod tests {
         // `NEGATIVE_CACHE_TTL_SECS` moves, this moves with it on purpose.
         assert_eq!(
             MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
+        );
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_defaults() {
+        let config = Config::default();
+        assert_eq!(config.npm_virtual_negative_cache_ttl_ms, 5_000);
+        assert_eq!(config.npm_virtual_negative_cache_max_entries, 4096);
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "1234");
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "17");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.npm_virtual_negative_cache_ttl_ms, 1234);
+        assert_eq!(config.npm_virtual_negative_cache_max_entries, 17);
+
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_enormous_values_are_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "3600000");
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "100000000");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.npm_virtual_negative_cache_ttl_ms,
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.npm_virtual_negative_cache_max_entries,
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_ttl_ceiling_tracks_proxy_negative_window() {
+        // The member walk's negative entry records "this member did not have
+        // the package" — weaker than the proxy layer's status-gated 404 — so
+        // its ceiling must stay tied to that window (#3951).
+        assert_eq!(
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
         );
     }

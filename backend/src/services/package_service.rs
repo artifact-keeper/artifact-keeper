@@ -57,12 +57,31 @@ const VERSION_UPSERT_CTE: &str = r#"
 
 /// `EXISTS` test for a live `artifacts` row backing one `package_versions`
 /// row. Expects `p` (packages) and `pv` (package_versions) in scope.
+///
+/// The quarantine arm is the same predicate the download path
+/// (`quarantine_service::check_download_allowed`) and the catalog backfill
+/// apply (#4196): a held (`quarantined` with an unexpired or permanent hold)
+/// or `rejected` artifact is not live, so a package whose upload hold is
+/// still on is not listed at publish time and a later rejection delists it;
+/// a `released` (or elapsed-hold) artifact is live again, so release from
+/// quarantine re-lists the package with no catalog write. Before this arm
+/// existed the filter looked at `is_deleted` alone, which listed held
+/// uploads immediately and never delisted them on rejection.
 const LIVE_ARTIFACT_EXISTS: &str = r#"EXISTS (
             SELECT 1
             FROM artifacts a_live
             WHERE a_live.repository_id = p.repository_id
               AND a_live.checksum_sha256 = pv.checksum_sha256
               AND a_live.is_deleted = false
+              AND (
+                    a_live.quarantine_status IS NULL
+                    OR a_live.quarantine_status NOT IN ('quarantined', 'rejected')
+                    OR (
+                      a_live.quarantine_status = 'quarantined'
+                      AND a_live.quarantine_until IS NOT NULL
+                      AND a_live.quarantine_until <= NOW()
+                    )
+              )
         )"#;
 
 /// SQL predicate that is true when a `packages` row still has at least one
@@ -406,8 +425,19 @@ impl PackageService {
         // guard rejected the update (in which case that row is unchanged and
         // still the representative).
         if should_update_package_row {
-            sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                r#"
+            // #3931: two concurrent publishes of the same (package, version)
+            // race this statement — the loser's ON CONFLICT guard returns no
+            // `upserted` row and the fallback subquery still reads the
+            // statement-start snapshot, which predates the winner's
+            // just-committed `package_versions` row, so `COALESCE(NULL, NULL)`
+            // lands in `packages.size_bytes NOT NULL` (23502). A retry gets a
+            // fresh snapshot where the winner's row is visible. Bounded; any
+            // other error propagates immediately.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let result = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    r#"
                 {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET version = $2,
@@ -425,15 +455,23 @@ impl PackageService {
                     updated_at = NOW()
                 WHERE id = $1
                 "#
-            )))
-            .bind(package_id)
-            .bind(version)
-            .bind(size_bytes)
-            .bind(checksum_sha256)
-            .bind(description)
-            .bind(&metadata)
-            .execute(&self.db)
-            .await?;
+                )))
+                .bind(package_id)
+                .bind(version)
+                .bind(size_bytes)
+                .bind(checksum_sha256)
+                .bind(description)
+                .bind(&metadata)
+                .execute(&self.db)
+                .await;
+                const MAX_UPSERT_ATTEMPTS: u32 = 3;
+                let retryable = matches!(&result, Err(e)
+                    if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23502"));
+                if !retryable || attempt >= MAX_UPSERT_ATTEMPTS {
+                    result?;
+                    break;
+                }
+            }
         } else {
             // Data-modifying CTEs execute exactly once even when
             // unreferenced, so the version upsert still runs.
@@ -739,7 +777,7 @@ struct BackfillRow {
 
 /// True for a Maven path that describes a package rather than being one:
 /// repository metadata, or a checksum/signature beside a real asset (#4169).
-fn is_maven_sidecar(path: &str) -> bool {
+pub(crate) fn is_maven_sidecar(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
     file == "maven-metadata.xml"
         || file == "maven-metadata-local.xml"
@@ -810,6 +848,13 @@ pub fn backfill_catalog_coordinates(
         }
         // The protobuf label index is an artifact row, not a module.
         "protobuf" if version == "_labels" => None,
+        // Go publishes two artifact rows per module version: the `.zip` (the
+        // distributable) and the `.mod`/`.info` sidecars. Helm charts carry a
+        // `.prov` provenance sidecar. None of those may register catalog rows:
+        // the archive row does, and letting the sidecar race it makes the
+        // catalog's size_bytes flip with row order (#4191).
+        "go" if path.ends_with(".mod") || path.ends_with(".info") => None,
+        "helm" if path.ends_with(".prov") => None,
         _ => {
             let name = name.trim();
             if name.is_empty() {
@@ -1633,5 +1678,325 @@ mod catalog_maintenance_tests {
             (1, 1),
             "the jar and its pom are one package at one version"
         );
+    }
+
+    // -- catalog liveness vs quarantine (#4196) -----------------------------
+    //
+    // The read-side predicates the Packages page uses must agree with the
+    // download path and the backfill on what "live" means: a held or rejected
+    // artifact is not live, a released one (or one whose timed hold elapsed)
+    // is. Before #4196 the read side filtered on `is_deleted` alone, so a
+    // held upload was listed from publish time and never delisted on
+    // rejection, and a release never re-listed.
+
+    /// Evaluate `live_package_version_predicate()` exactly the way the
+    /// Packages-page version listing does: `pv`, `p` and `r` in scope,
+    /// catalog rows joined to their repository.
+    async fn listed_versions(fx: &tdh::Fixture, name: &str) -> Vec<String> {
+        let live_versions = live_package_version_predicate();
+        // AssertSqlSafe: the interpolated fragment is built from a `const
+        // &str` predicate — no runtime input reaches the SQL text.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            SELECT pv.version
+            FROM package_versions pv
+            JOIN packages p ON p.id = pv.package_id
+            JOIN repositories r ON r.id = p.repository_id
+            WHERE p.repository_id = $1 AND p.name = $2
+              AND {live_versions}
+            ORDER BY pv.version
+            "#
+        )))
+        .bind(fx.repo_id)
+        .bind(name)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("evaluate liveness predicate")
+    }
+
+    /// Evaluate `live_package_predicate()` the way the Packages-page listing
+    /// does: the package is visible while at least one version is live.
+    async fn package_is_listed(fx: &tdh::Fixture, name: &str) -> bool {
+        let live_packages = live_package_predicate();
+        // AssertSqlSafe: the interpolated fragment is built from a `const
+        // &str` predicate — no runtime input reaches the SQL text.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM packages p
+                JOIN repositories r ON r.id = p.repository_id
+                WHERE p.repository_id = $1 AND p.name = $2
+                  AND {live_packages}
+            )
+            "#
+        )))
+        .bind(fx.repo_id)
+        .bind(name)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("evaluate package liveness predicate")
+    }
+
+    /// Set the quarantine state of every artifact in the fixture repository.
+    async fn set_quarantine(fx: &tdh::Fixture, status: Option<&str>, until_sql: &str) {
+        // AssertSqlSafe: `until_sql` is a test-local string literal chosen
+        // from three constants below; no runtime input reaches the SQL text.
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "UPDATE artifacts SET quarantine_status = $1, quarantine_until = {until_sql} \
+             WHERE repository_id = $2"
+        )))
+        .bind(status)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("set quarantine state");
+    }
+
+    /// The full publish → hold → reject → release lifecycle through the
+    /// read-side predicate (#4196). The catalog rows are written at publish
+    /// time (as the 21 format handlers do) and never touched again: every
+    /// visibility change must come from the predicate.
+    #[tokio::test]
+    async fn liveness_follows_quarantine_transitions_without_catalog_writes() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "lifecycle-chart", "1.0.0").await;
+        assert_eq!(
+            listed_versions(&fx, "lifecycle-chart").await,
+            vec!["1.0.0".to_string()],
+            "a plain published package is listed"
+        );
+
+        // Upload hold applied at publish time (quarantined, hold in future):
+        // not live, so the Packages page must not show it.
+        set_quarantine(&fx, Some("quarantined"), "NOW() + INTERVAL '1 hour'").await;
+        assert!(
+            listed_versions(&fx, "lifecycle-chart").await.is_empty(),
+            "a held upload must not be listed"
+        );
+        assert!(
+            !package_is_listed(&fx, "lifecycle-chart").await,
+            "a package whose only version is held must not be listed"
+        );
+
+        // Rejection after publish: delisted.
+        set_quarantine(&fx, Some("rejected"), "NULL").await;
+        assert!(
+            listed_versions(&fx, "lifecycle-chart").await.is_empty(),
+            "a rejected artifact must be delisted"
+        );
+        assert!(!package_is_listed(&fx, "lifecycle-chart").await);
+
+        // Release from quarantine: listed again with no catalog write.
+        set_quarantine(&fx, Some("released"), "NULL").await;
+        assert_eq!(
+            listed_versions(&fx, "lifecycle-chart").await,
+            vec!["1.0.0".to_string()],
+            "a released artifact must be listed again"
+        );
+        assert!(package_is_listed(&fx, "lifecycle-chart").await);
+
+        fx.teardown().await;
+    }
+
+    /// A timed hold that has run out is live again — the same expiry escape
+    /// hatch `check_download_allowed` and the backfill apply.
+    #[tokio::test]
+    async fn liveness_restored_when_timed_hold_elapses() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "elapsed-chart", "2.0.0").await;
+        set_quarantine(&fx, Some("quarantined"), "NOW() - INTERVAL '1 minute'").await;
+        assert_eq!(
+            listed_versions(&fx, "elapsed-chart").await,
+            vec!["2.0.0".to_string()],
+            "an elapsed quarantine no longer withholds the package"
+        );
+        fx.teardown().await;
+    }
+
+    /// A permanent hold (`quarantine_until IS NULL`) never lapses into a
+    /// listing, mirroring `check_download_allowed`'s treatment of a
+    /// timestamp-less quarantine as blocked.
+    #[tokio::test]
+    async fn liveness_withheld_for_permanent_hold() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "perma-chart", "3.0.0").await;
+        set_quarantine(&fx, Some("quarantined"), "NULL").await;
+        assert!(
+            listed_versions(&fx, "perma-chart").await.is_empty(),
+            "a permanent hold must stay unlisted"
+        );
+        fx.teardown().await;
+    }
+
+    /// The remote-repository exemption is unchanged: proxy-cached packages
+    /// carry no `artifacts` row at all, so their catalog rows stay listed
+    /// regardless of the quarantine arm.
+    #[tokio::test]
+    async fn liveness_predicate_still_exempts_remote_repositories() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        // A catalog row with NO backing artifact — the proxy-cache shape.
+        PackageService::new(fx.pool.clone())
+            .create_or_update_from_artifact(
+                fx.repo_id,
+                "proxied-lib",
+                "1.0.0",
+                1,
+                &"c".repeat(64),
+                None,
+                None,
+            )
+            .await
+            .expect("seed remote catalog row");
+        assert!(
+            package_is_listed(&fx, "proxied-lib").await,
+            "remote catalog rows never join `artifacts` and stay listed"
+        );
+        fx.teardown().await;
+    }
+
+    // -- #4191 / #3931: sidecar exclusion and upsert race -------------------
+
+    /// #4191: Go publishes two artifact rows per module version (`.zip` +
+    /// `.mod`, plus `.info`), and Helm charts carry a `.prov` sidecar. Only
+    /// the archive row may produce catalog coordinates.
+    #[test]
+    fn backfill_excludes_go_and_helm_sidecar_rows_4191() {
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "go",
+                "example.com/mod/@v/v1.0.0.zip",
+                "example.com/mod",
+                Some("v1.0.0"),
+            ),
+            Some(("example.com/mod".to_string(), "v1.0.0".to_string()))
+        );
+        for path in [
+            "example.com/mod/@v/v1.0.0.mod",
+            "example.com/mod/@v/v1.0.0.info",
+        ] {
+            assert_eq!(
+                backfill_catalog_coordinates("go", path, "example.com/mod", Some("v1.0.0")),
+                None,
+                "{path}"
+            );
+        }
+        assert!(backfill_catalog_coordinates(
+            "helm",
+            "charts/mychart-1.0.0.tgz",
+            "mychart",
+            Some("1.0.0")
+        )
+        .is_some());
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "helm",
+                "charts/mychart-1.0.0.tgz.prov",
+                "mychart",
+                Some("1.0.0"),
+            ),
+            None
+        );
+    }
+
+    /// #4191: with both artifact rows present, the backfill reports the
+    /// archive's size — not whichever row the walk happened to hit last.
+    /// Pre-fix the `.mod` row wins deterministically here because its
+    /// (checksum, size) sorts lower, so this fails red before the fix.
+    #[tokio::test]
+    async fn backfill_go_module_reports_the_archive_size_4191() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        // (checksum, size) ordering puts the `.mod` row first, so the
+        // deterministic guard would pick it if the row were considered.
+        for (suffix, checksum, size) in [
+            ("mod", "0".repeat(64), 350_i64),
+            ("zip", "f".repeat(64), 100_000_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'example.com/mod', 'v1.0.0', $3, $4, 'application/octet-stream', $5)",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("example.com/mod/@v/v1.0.0.{suffix}"))
+            .bind(size)
+            .bind(checksum)
+            .bind(format!("testdata/4191/{suffix}"))
+            .execute(&fx.pool)
+            .await
+            .expect("seed go artifact row");
+        }
+
+        PackageService::new(fx.pool.clone())
+            .backfill_catalog(Some(fx.repo_id))
+            .await
+            .expect("backfill");
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'example.com/mod'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("packages row for the module");
+
+        fx.teardown().await;
+
+        assert_eq!(size, 100_000, "the catalog reports the archive's size");
+    }
+
+    /// #3931: two concurrent publishers of the same (name, version) raced the
+    /// upsert CTE into writing `COALESCE(NULL, NULL)` into
+    /// `packages.size_bytes NOT NULL` (23502). This loop made that crash
+    /// likely within a handful of iterations pre-fix; with the retry both
+    /// tasks run clean.
+    #[tokio::test]
+    async fn concurrent_publish_same_version_never_violates_size_not_null_3931() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut handles = Vec::new();
+        for tag in ["a", "b"] {
+            let svc = PackageService::new(fx.pool.clone());
+            let repo_id = fx.repo_id;
+            handles.push(tokio::spawn(async move {
+                for i in 0..60_i64 {
+                    svc.create_or_update_from_artifact(
+                        repo_id,
+                        "race-pkg",
+                        "1.0.0",
+                        if tag == "a" { 100 + i } else { 200 + i },
+                        &format!("{}{:0>63}", tag, i),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("upsert must not fail with 23502 (#3931)");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("publisher task panicked");
+        }
+
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'race-pkg'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("packages row exists");
+        assert!(size > 0, "size_bytes must be a real size, got {size}");
+
+        fx.teardown().await;
     }
 }

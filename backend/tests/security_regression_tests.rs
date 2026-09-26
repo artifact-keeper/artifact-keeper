@@ -1858,7 +1858,7 @@ mod guest_access_oci_3854 {
         };
         Router::new()
             .route("/v2/", oci_v2::version_check_handler())
-            .nest("/v2", oci_v2::router())
+            .nest("/v2", oci_v2::router(None))
             .with_state(shared)
             .layer(from_fn_with_state(guard_state, guest_access_guard))
     }
