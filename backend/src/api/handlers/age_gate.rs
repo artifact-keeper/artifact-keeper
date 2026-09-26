@@ -14,7 +14,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryType};
-use crate::services::age_gate_service::AgeGateReview;
+use crate::services::age_gate_service::{ActorTier, AgeGatePolicy, AgeGateReview};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::repository_service::RepositoryService as RepoSvc;
@@ -111,6 +111,9 @@ pub struct AgeGateReviewResponse {
     /// deleted — the audit log keeps the decision in that case.
     pub reviewed_by_username: Option<String>,
     pub reviewed_by_is_service_account: Option<bool>,
+    /// An instance administrator has decided this review, so a repository
+    /// administrator may reject it but not approve or reopen it (#4238).
+    pub instance_locked: bool,
     pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub review_reason: Option<String>,
     pub request_count: i32,
@@ -159,6 +162,7 @@ fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
         reviewed_by: review.reviewed_by,
         reviewed_by_username: review.reviewed_by_username,
         reviewed_by_is_service_account: review.reviewed_by_is_service_account,
+        instance_locked: review.instance_locked,
         reviewed_at: review.reviewed_at,
         review_reason: review.review_reason,
         request_count: review.request_count,
@@ -287,6 +291,34 @@ impl ReviewDecision {
     }
 }
 
+/// Audit label for the tier an age-gate action was taken at (#4238), so a
+/// repository administrator's decision is distinguishable from an instance
+/// administrator's in the trail.
+fn actor_tier_label(tier: ActorTier) -> &'static str {
+    match tier {
+        ActorTier::Instance => "instance_admin",
+        ActorTier::Repository => "repository_admin",
+    }
+}
+
+/// The audit record of one age-gate policy change (#4238): the policy it
+/// replaced, the actor's tier, and whether it weakened the gate — so a
+/// repository administrator relaxing a policy they set is visible in the
+/// trail as exactly that.
+fn age_gate_change_details(
+    previous: AgeGatePolicy,
+    next: AgeGatePolicy,
+    tier: ActorTier,
+) -> audit_details::AgeGateChangeDetails {
+    audit_details::AgeGateChangeDetails {
+        previous_enabled: previous.enabled,
+        previous_min_age_days: previous.min_age_days,
+        previous_mode: previous.mode.as_str().to_string(),
+        actor_tier: actor_tier_label(tier).to_string(),
+        relaxed: previous.is_relaxed_by(next),
+    }
+}
+
 /// Load review `id`, confirming it lies inside the caller's authority.
 ///
 /// `scope` is `None` for the instance-wide `/admin` queue and `Some(repo_id)`
@@ -324,23 +356,29 @@ async fn apply_review_decision(
     let svc = age_gate_service(state)?;
     load_review_in_scope(&svc, id, scope).await?;
 
-    let (review, details) = match decision {
+    // The actor's TIER, not the route, decides what it may relax: an instance
+    // admin acting through a repository route is still an instance admin, and
+    // only an instance admin may approve or reopen a review another instance
+    // admin decided (#4238, enforced in the service's compare-and-set).
+    let tier = ActorTier::of(auth.is_admin);
+    let (review, mut details) = match decision {
         ReviewDecision::Approve => {
-            let review = svc.approve(id, auth.user_id, reason).await?;
+            let review = svc.approve_as(id, auth.user_id, tier, reason).await?;
             let details = build_review_audit_details(&review, reason);
             (review, details)
         }
         ReviewDecision::Reject => {
-            let review = svc.reject(id, auth.user_id, reason).await?;
+            let review = svc.reject_as(id, auth.user_id, tier, reason).await?;
             let details = build_review_audit_details(&review, reason);
             (review, details)
         }
         ReviewDecision::Reopen => {
-            let (previous_status, review) = svc.reopen(id, auth.user_id, reason).await?;
+            let (previous_status, review) = svc.reopen_as(id, auth.user_id, tier, reason).await?;
             let details = build_reopen_audit_details(&review, &previous_status, reason);
             (review, details)
         }
     };
+    details["actor_tier"] = serde_json::json!(actor_tier_label(tier));
 
     Ok(log_review_action(state, auth, decision.audit_action(), review, details).await)
 }
@@ -612,8 +650,15 @@ pub async fn update_repo_age_gate(
     }
 
     let svc = age_gate_service(&state)?;
-    svc.update_repo_config(repo.id, body.enabled, body.min_age_days, mode)
-        .await?;
+    let next = AgeGatePolicy {
+        enabled: body.enabled,
+        min_age_days: body.min_age_days,
+        mode,
+    };
+    // A repository admin may tighten a policy an instance admin set, but not
+    // relax it (#4238); the service decides that under the row lock.
+    let tier = ActorTier::of(auth.is_admin);
+    let previous = svc.update_repo_config_as(repo.id, next, tier).await?;
 
     let audit = AuditService::new(state.db.clone());
     let _ = audit
@@ -636,6 +681,7 @@ pub async fn update_repo_age_gate(
                     age_gate_enabled: Some(body.enabled),
                     age_gate_min_age_days: Some(body.min_age_days),
                     age_gate_mode: Some(mode.as_str().to_string()),
+                    age_gate_change: Some(age_gate_change_details(previous, next, tier)),
                 }),
         )
         .await;
@@ -930,6 +976,7 @@ mod tests {
             basis_upstream_fingerprint: None,
             reviewed_by_username: None,
             reviewed_by_is_service_account: None,
+            instance_locked: false,
         }
     }
 
@@ -994,11 +1041,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #2264 low-sev disclosure: GET /repositories/{key}/age-gate is admin-only
-    // (parity with the PUT and the /admin review routes). Previously any
-    // authenticated caller with the "read" scope could read gate posture for
-    // any repository. DB-backed: skips without DATABASE_URL; the CI coverage
-    // job runs these against Postgres. The external-vantage twin lives in
+    // #2264 low-sev disclosure: GET /repositories/{key}/age-gate needs an
+    // administrative grant — the repository `admin` action or instance admin
+    // since #4238, in parity with the PUT. Previously any authenticated caller
+    // with the "read" scope could read gate posture for any repository.
+    // DB-backed: skips without DATABASE_URL; the CI coverage job runs these
+    // against Postgres. The external-vantage twin lives in
     // tests/security_regression_tests.rs.
     // -----------------------------------------------------------------------
 
@@ -1388,6 +1436,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            review_status(&pool, other_review).await,
+            "pending",
+            "the refused cross-repository approve must not have touched the review"
+        );
 
         // The other repository itself is refused outright: no `admin` there.
         let (status, _body) = tdh::send(
@@ -1498,5 +1551,370 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, sa_id).await;
         tdh::cleanup_user(&pool, sa_id).await;
+    }
+    // -----------------------------------------------------------------------
+    // #4238 review follow-ups: token scopes, cross-repository tokens, virtual
+    // keys, and the instance-admin lock on decisions and policy.
+    // -----------------------------------------------------------------------
+
+    async fn review_status(pool: &sqlx::PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM age_gate_reviews WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read review status")
+    }
+
+    fn decide(key: &str, id: Uuid, decision: &str) -> axum::http::Request<axum::body::Body> {
+        tdh::post(
+            format!("/{key}/age-gate/reviews/{id}/{decision}"),
+            "application/json",
+            bytes::Bytes::from_static(b"{}"),
+        )
+    }
+
+    fn put_policy(
+        key: &str,
+        enabled: bool,
+        min_age_days: i32,
+        mode: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let body = serde_json::json!({
+            "enabled": enabled, "min_age_days": min_age_days, "mode": mode
+        });
+        tdh::put_json(
+            format!("/{key}/age-gate"),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+    }
+
+    /// An API token for `user` carrying exactly `scopes`.
+    fn token(user: Uuid, name: &str, scopes: &[&str]) -> AuthExtension {
+        AuthExtension {
+            is_api_token: true,
+            scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+            ..tdh::make_auth(user, name)
+        }
+    }
+
+    /// The newest `REPOSITORY_UPDATED` details recorded for `repo_id`.
+    async fn latest_repository_update(pool: &sqlx::PgPool, repo_id: Uuid) -> serde_json::Value {
+        for _ in 0..40 {
+            let details: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'REPOSITORY_UPDATED' \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(repo_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read audit row")
+            .flatten();
+            if let Some(details) = details {
+                return details;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no REPOSITORY_UPDATED audit row for {repo_id}");
+    }
+
+    /// A repository admin's own grant does not stretch a narrow token: a
+    /// read-only or publish-only token is refused on the decision and policy
+    /// routes, which need `write:repositories`.
+    #[tokio::test]
+    async fn a_repo_admins_narrow_tokens_cannot_decide_or_set_policy_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let review_id = seed_review(&pool, repo_id, "left-pad").await;
+        let state = gated_state(pool.clone(), &dir);
+
+        for scopes in [&["read:repositories"][..], &["write:artifacts"][..]] {
+            let caller = token(user_id, &username, scopes);
+            let (status, _) = tdh::send(
+                review_app(state.clone(), caller.clone()),
+                decide(&key, review_id, "approve"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "decide with {scopes:?}"
+            );
+            let (status, _) = tdh::send(
+                config_app(state.clone(), caller),
+                put_policy(&key, true, 30, "first_seen"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "PUT with {scopes:?}"
+            );
+        }
+        assert_eq!(review_status(&pool, review_id).await, "pending");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A token restricted to repository A is refused on repository B even
+    /// when the user administers both: the token's ceiling, not the user's
+    /// grants, bounds what it can reach.
+    #[tokio::test]
+    async fn a_token_restricted_to_one_repo_cannot_reach_another_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_a, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_b, user_id).await;
+        let review_b = seed_review(&pool, repo_b, "left-pad").await;
+        let state = gated_state(pool.clone(), &dir_a);
+        let caller = AuthExtension {
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_a]),
+            ..token(
+                user_id,
+                &username,
+                &["read:repositories", "write:repositories"],
+            )
+        };
+
+        let (status, _) = tdh::send(
+            config_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{key_a}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "positive control on A");
+        let (status, _) = tdh::send(
+            config_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{key_b}/age-gate")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "config read on B"
+        );
+        let (status, _) = tdh::send(
+            review_app(state, caller),
+            decide(&key_b, review_b, "approve"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "decide on B");
+        assert_eq!(review_status(&pool, review_b).await, "pending");
+
+        tdh::cleanup(&pool, repo_a, user_id).await;
+        tdh::cleanup_member_repo(&pool, repo_b, &dir_b).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A member's review is not reachable through the virtual repository
+    /// that aggregates it: the review belongs to the member, so the virtual
+    /// key's scope does not contain it.
+    #[tokio::test]
+    async fn a_members_review_is_not_reachable_through_a_virtual_key_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (virtual_id, virtual_key, dir) = tdh::create_repo(&pool, "virtual", "npm").await;
+        let (member_id, _member_key, member_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 1).await;
+        tdh::grant_repo_admin(&pool, virtual_id, user_id).await;
+        let review_id = seed_review(&pool, member_id, "left-pad").await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+
+        let (status, _) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{virtual_key}/age-gate/reviews/{review_id}")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let (status, _) = tdh::send(
+            review_app(state, caller),
+            decide(&virtual_key, review_id, "approve"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(review_status(&pool, review_id).await, "pending");
+
+        tdh::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// An instance admin's decision can be TIGHTENED by a repository admin but
+    /// never relaxed (#4238). A rejection cannot be approved or reopened; an
+    /// approval can be rejected, and once rejected it stays locked, so the
+    /// repository admin cannot tighten-then-relax past the instance admin. A
+    /// repository admin's decisions on an unlocked review stay theirs to change.
+    #[tokio::test]
+    async fn an_instance_admins_review_decision_cannot_be_relaxed_by_a_repo_admin_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let rejected = seed_review(&pool, repo_id, "rejected-pkg").await;
+        let approved = seed_review(&pool, repo_id, "approved-pkg").await;
+        let own = seed_review(&pool, repo_id, "own-pkg").await;
+        let state = gated_state(pool.clone(), &dir);
+        // A real row: a decision's `reviewed_by` references `users`.
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let instance = tdh::admin_auth(admin_id, &admin_name);
+        let repo_admin = tdh::make_auth(user_id, &username);
+        let send = |caller: &AuthExtension, id, decision| {
+            tdh::send(
+                review_app(state.clone(), caller.clone()),
+                decide(&key, id, decision),
+            )
+        };
+
+        // The instance admin decides through the repository route: the tier is
+        // the actor's, not the route's.
+        let (status, body) = send(&instance, rejected, "reject").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["instance_locked"], true);
+        for decision in ["approve", "reopen"] {
+            let (status, _) = send(&repo_admin, rejected, decision).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "a repository admin must not {decision} an instance admin's rejection"
+            );
+        }
+        assert_eq!(review_status(&pool, rejected).await, "rejected");
+
+        let (status, _) = send(&instance, approved, "approve").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, _) = send(&repo_admin, approved, "reject").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "tightening is allowed");
+        let (status, _) = send(&repo_admin, approved, "approve").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "tighten-then-relax must not get past the instance admin"
+        );
+
+        for (decision, want) in [
+            ("reject", "rejected"),
+            ("approve", "approved"),
+            ("reopen", "pending"),
+        ] {
+            let (status, _) = send(&repo_admin, own, decision).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "own review: {decision}");
+            assert_eq!(review_status(&pool, own).await, want);
+        }
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    /// A policy an instance admin set can be tightened by a repository admin
+    /// but not relaxed, and every change records what it replaced (#4238).
+    /// A policy the repository admin set themselves stays theirs to relax,
+    /// and that relaxation is flagged in the audit trail.
+    #[tokio::test]
+    async fn an_instance_set_gate_policy_can_only_be_tightened_by_a_repo_admin_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (locked_id, locked_key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (own_id, own_key, own_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, locked_id, user_id).await;
+        tdh::grant_repo_admin(&pool, own_id, user_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        // A real row: a decision's `reviewed_by` references `users`.
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let instance = tdh::admin_auth(admin_id, &admin_name);
+        let repo_admin = tdh::make_auth(user_id, &username);
+        let put = |caller: &AuthExtension, key: &str, enabled, days, mode| {
+            tdh::send(
+                config_app(state.clone(), caller.clone()),
+                put_policy(key, enabled, days, mode),
+            )
+        };
+
+        let (status, _) = put(&instance, &locked_key, true, 30, "first_seen").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        for (enabled, days, mode) in [
+            (false, 30, "first_seen"),
+            (true, 10, "first_seen"),
+            (true, 30, "upstream_publish_time"),
+        ] {
+            let (status, _) = put(&repo_admin, &locked_key, enabled, days, mode).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "relaxing an instance-set policy: enabled={enabled} days={days} mode={mode}"
+            );
+        }
+        let (status, _) = put(&repo_admin, &locked_key, true, 60, "first_seen").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "tightening is allowed");
+        let change = &latest_repository_update(&pool, locked_id).await["age_gate_change"];
+        assert_eq!(change["previous_min_age_days"], 30);
+        assert_eq!(change["actor_tier"], "repository_admin");
+        assert_eq!(change["relaxed"], false);
+        // Still locked after the tightening: it cannot then be dropped.
+        let (status, _) = put(&repo_admin, &locked_key, true, 30, "first_seen").await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        let (status, _) = put(&repo_admin, &own_key, true, 30, "first_seen").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, _) = put(&repo_admin, &own_key, false, 30, "first_seen").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a repo admin's own policy"
+        );
+        let change = &latest_repository_update(&pool, own_id).await["age_gate_change"];
+        assert_eq!(change["previous_enabled"], true);
+        assert_eq!(
+            change["relaxed"], true,
+            "the weakening is visible in the trail"
+        );
+
+        tdh::cleanup(&pool, locked_id, user_id).await;
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    #[test]
+    fn age_gate_change_details_record_what_was_replaced() {
+        use crate::services::age_gate_service::AgeGateMode;
+        let before = AgeGatePolicy {
+            enabled: true,
+            min_age_days: 30,
+            mode: AgeGateMode::FirstSeen,
+        };
+        let weaker = AgeGatePolicy {
+            min_age_days: 7,
+            ..before
+        };
+        let details = age_gate_change_details(before, weaker, ActorTier::Repository);
+        assert!(details.previous_enabled);
+        assert_eq!(details.previous_min_age_days, 30);
+        assert_eq!(details.previous_mode, "first_seen");
+        assert_eq!(details.actor_tier, "repository_admin");
+        assert!(details.relaxed);
+        let tighter = AgeGatePolicy {
+            min_age_days: 60,
+            ..before
+        };
+        let details = age_gate_change_details(before, tighter, ActorTier::Instance);
+        assert_eq!(details.actor_tier, "instance_admin");
+        assert!(!details.relaxed);
     }
 }

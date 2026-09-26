@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::api::dto::Pagination;
 use crate::api::handlers::promotion::validate_promotion_repos;
-use crate::api::handlers::repositories::{require_repo_id_visible, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_id_visible, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -142,6 +144,17 @@ struct ApprovalRow {
 }
 
 impl ApprovalRow {
+    /// [`Self::into_response`], without the actor usernames unless
+    /// `names_visible` (see [`actor_names_visible`]).
+    fn into_response_for(self, names_visible: bool) -> ApprovalResponse {
+        let mut response = self.into_response();
+        if !names_visible {
+            response.requested_by_username = None;
+            response.reviewed_by_username = None;
+        }
+        response
+    }
+
     fn into_response(self) -> ApprovalResponse {
         ApprovalResponse {
             id: self.id,
@@ -349,6 +362,30 @@ pub(crate) async fn require_and_consume_approval(
     let pending = count_pending_approvals(db, artifact_id, source_repo_id, target_repo_id).await?;
     let outcome = classify_approval_consume(0, pending);
     Err(approval_required_conflict(&outcome))
+}
+
+/// Whether this caller may see WHO requested and reviewed approvals whose
+/// source is `source_repo_id` (#4238).
+///
+/// Only an instance administrator or an administrator of that repository. The
+/// read paths are gated by the source repository's visibility alone, so on a
+/// public source repository any signed-in user can read its approvals; showing
+/// them usernames would let them enumerate the instance's admin and CI
+/// accounts, where they previously saw only ids. Everyone else still gets the
+/// ids, exactly as before. `None` is the unfiltered listing, which is already
+/// instance-admin-only. Fails CLOSED: a permission-lookup error hides the
+/// names rather than failing an otherwise-authorized read.
+async fn actor_names_visible(
+    state: &SharedState,
+    auth: &AuthExtension,
+    source_repo_id: Option<Uuid>,
+) -> bool {
+    match source_repo_id {
+        None => auth.is_admin,
+        Some(repo_id) => require_repo_admin(auth, repo_id, &state.permission_service)
+            .await
+            .is_ok(),
+    }
 }
 
 const SELECT_APPROVAL: &str = r#"
@@ -605,7 +642,9 @@ pub async fn list_pending_approvals(
         auth.require_admin()?;
     }
 
-    let (rows, total): (Vec<ApprovalRow>, i64) = if let Some(ref source_key) =
+    let (rows, total, source_repo_id): (Vec<ApprovalRow>, i64, Option<Uuid>) = if let Some(
+        ref source_key,
+    ) =
         query.source_repository
     {
         let repo_service = RepositoryService::new(state.db.clone());
@@ -639,7 +678,7 @@ pub async fn list_pending_approvals(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        (rows, total.0)
+        (rows, total.0, Some(source.id))
     } else {
         let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
             "{} WHERE pa.status = 'pending' ORDER BY pa.requested_at DESC LIMIT $1 OFFSET $2",
@@ -658,13 +697,17 @@ pub async fn list_pending_approvals(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        (rows, total.0)
+        (rows, total.0, None)
     };
 
     let total_pages = compute_approval_total_pages(total, per_page);
+    let names_visible = actor_names_visible(&state, &auth, source_repo_id).await;
 
     Ok(Json(ApprovalListResponse {
-        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        items: rows
+            .into_iter()
+            .map(|r| r.into_response_for(names_visible))
+            .collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -717,7 +760,8 @@ pub async fn get_approval(
     )
     .await?;
 
-    Ok(Json(row.into_response()))
+    let names_visible = actor_names_visible(&state, &auth, Some(row.source_repo_id)).await;
+    Ok(Json(row.into_response_for(names_visible)))
 }
 
 /// Approve a pending promotion request. Admin-only.
@@ -1208,9 +1252,13 @@ pub async fn list_approval_history(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let total_pages = compute_approval_total_pages(total, per_page);
+    let names_visible = actor_names_visible(&state, &auth, source_repo_id).await;
 
     Ok(Json(ApprovalListResponse {
-        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        items: rows
+            .into_iter()
+            .map(|r| r.into_response_for(names_visible))
+            .collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -2752,6 +2800,82 @@ mod tests {
                 "public source, no grant: the request must be filed: {filed:?}"
             );
             assert_eq!(n, 1);
+        }
+
+        /// #4238: WHO requested and reviewed an approval is shown only to an
+        /// administrator of its source repository. A member who can read the
+        /// approval still gets the ids, as before, but not the usernames — on
+        /// a public source repository that member is any signed-in user.
+        #[tokio::test]
+        async fn test_approval_actor_names_need_source_repo_admin_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4238-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4238-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s4238", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t4238", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let requester = make_requester(&pool, "4238").await;
+            let member = make_requester(&pool, "4238m").await;
+            let owner = make_requester(&pool, "4238a").await;
+            grant_repo(&pool, member, src).await;
+            grant_repo(&pool, owner, src).await;
+            tdh::grant_repo_admin(&pool, src, owner).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg4238").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let as_member = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(member, "m4238")),
+                Path(approval),
+            )
+            .await
+            .expect("a member of the source repo may read the approval")
+            .0;
+            assert_eq!(as_member.requested_by, requester, "the id is still shown");
+            assert!(
+                as_member.requested_by_username.is_none(),
+                "a non-admin member must not be shown usernames"
+            );
+
+            let as_owner = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(owner, "a4238")),
+                Path(approval),
+            )
+            .await
+            .expect("a source repo admin may read the approval")
+            .0;
+            assert!(
+                as_owner.requested_by_username.is_some(),
+                "a source repo admin is shown who requested it"
+            );
+
+            // The filtered listing applies the same rule.
+            let listed = list_pending_approvals(
+                State(state),
+                Extension(tdh::make_auth(member, "m4238")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: Some(src_key.clone()),
+                }),
+            )
+            .await
+            .expect("a member may list the source repo's pending approvals")
+            .0;
+            assert!(listed
+                .items
+                .iter()
+                .all(|a| a.requested_by_username.is_none()));
+
+            cleanup(&pool, &[src, tgt], requester).await;
+            cleanup_user(&pool, member).await;
+            cleanup_user(&pool, owner).await;
         }
 
         /// #2443: the unfiltered pending-approvals aggregate is admin-only; a

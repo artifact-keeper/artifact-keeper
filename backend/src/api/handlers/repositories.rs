@@ -3458,6 +3458,7 @@ pub async fn create_repository(
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
+                age_gate_change: None,
             }),
     )
     .await;
@@ -4436,6 +4437,7 @@ pub async fn update_repository(
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
+                age_gate_change: None,
             }),
     )
     .await;
@@ -5149,6 +5151,7 @@ pub async fn delete_repository(
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
+                age_gate_change: None,
             }),
     )
     .await;

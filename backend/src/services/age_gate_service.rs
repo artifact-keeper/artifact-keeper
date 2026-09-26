@@ -465,6 +465,78 @@ pub struct AgeGateReview {
     pub reviewed_by_username: Option<String>,
     #[sqlx(default)]
     pub reviewed_by_is_service_account: Option<bool>,
+    /// An instance administrator has decided this review (migration 240): a
+    /// repository administrator may still reject it, but not approve or reopen
+    /// it. See [`require_may_relax_review`].
+    #[sqlx(default)]
+    pub instance_locked: bool,
+}
+
+/// Which tier of administrator is acting on the age gate (#4238).
+///
+/// Since #4238 a repository's own admins operate its gate alongside instance
+/// admins. The tier decides whether an action may RELAX something an instance
+/// admin decided: only an instance admin may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorTier {
+    Instance,
+    Repository,
+}
+
+impl ActorTier {
+    /// The tier of a caller, from its effective instance-admin bit.
+    pub fn of(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::Instance
+        } else {
+            Self::Repository
+        }
+    }
+
+    fn is_instance(self) -> bool {
+        self == Self::Instance
+    }
+}
+
+/// Refuse a repository-tier approve or reopen of a review an instance admin
+/// has decided (#4238). Rejecting stays allowed: it can only tighten.
+///
+/// Approving relaxes a rejection, and reopening does too — a reopened review
+/// is pending, and a pending review is honoured once the package ages past
+/// the threshold — so an instance admin's decision could otherwise be
+/// overturned by any administrator of the repository.
+pub fn require_may_relax_review(tier: ActorTier, instance_locked: bool) -> Result<()> {
+    if instance_locked && tier == ActorTier::Repository {
+        return Err(AppError::Authorization(
+            "This review was decided by an instance administrator. A repository \
+             administrator can reject it, but only an instance administrator can \
+             approve or reopen it."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A repository's age-gate policy (#4238).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgeGatePolicy {
+    pub enabled: bool,
+    pub min_age_days: i32,
+    pub mode: AgeGateMode,
+}
+
+impl AgeGatePolicy {
+    /// Whether replacing `self` with `next` makes the gate LESS strict:
+    /// disabling it, lowering the minimum age, or switching the age source.
+    ///
+    /// A mode switch counts because neither mode dominates the other — each
+    /// admits versions the other would hold back — so it cannot be treated as
+    /// a tightening. A disabled gate cannot be weakened further, so any change
+    /// from one is allowed.
+    pub fn is_relaxed_by(self, next: AgeGatePolicy) -> bool {
+        self.enabled
+            && (!next.enabled || next.min_age_days < self.min_age_days || next.mode != self.mode)
+    }
 }
 
 /// Drop every process-local memo of a decision this repository's age-gate
@@ -1071,7 +1143,8 @@ impl AgeGateService {
                 r.basis_mode, r.basis_upstream_fingerprint,
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
-                reviewer.is_service_account as reviewed_by_is_service_account
+                reviewer.is_service_account as reviewed_by_is_service_account,
+                r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
@@ -1103,7 +1176,8 @@ impl AgeGateService {
                 r.basis_mode, r.basis_upstream_fingerprint,
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
-                reviewer.is_service_account as reviewed_by_is_service_account
+                reviewer.is_service_account as reviewed_by_is_service_account,
+                r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
@@ -1117,13 +1191,32 @@ impl AgeGateService {
         .ok_or_else(|| AppError::NotFound("Age gate review not found".to_string()))
     }
 
+    /// Approve as an instance administrator — the only tier that could decide
+    /// a review before #4238.
     pub async fn approve(
         &self,
         id: Uuid,
         reviewer_id: Uuid,
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
+        self.approve_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Approve as `tier` (#4238). A repository-tier approval of an
+    /// instance-locked review is refused; the lock is ALSO a predicate of the
+    /// compare-and-set below, so an instance admin's decision that lands
+    /// between the read and the write turns this into a retryable conflict
+    /// instead of being overwritten.
+    pub async fn approve_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
+        reason: Option<&str>,
+    ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
+        require_may_relax_review(tier, review.instance_locked)?;
         require_distinct_status(&review.status, AgeGateReviewStatus::Approved)?;
         let expected_status = review.status.clone();
 
@@ -1133,8 +1226,9 @@ impl AgeGateService {
             "UPDATE age_gate_reviews
              SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(),
                  review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5
-             WHERE id = $1 AND status = $6",
+                 basis_upstream_fingerprint = $5,
+                 instance_locked = instance_locked OR $7
+             WHERE id = $1 AND status = $6 AND ($7 OR NOT instance_locked)",
         )
         .bind(id)
         .bind(reviewer_id)
@@ -1142,6 +1236,7 @@ impl AgeGateService {
         .bind(params.age_gate_mode.as_str())
         .bind(&fingerprint)
         .bind(&expected_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1162,10 +1257,27 @@ impl AgeGateService {
         self.get_review_by_id(id).await
     }
 
+    /// Reject as an instance administrator — the only tier that could decide
+    /// a review before #4238.
     pub async fn reject(
         &self,
         id: Uuid,
         reviewer_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<AgeGateReview> {
+        self.reject_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Reject as `tier` (#4238). Always allowed — a rejection only tightens —
+    /// and it never clears an instance lock: an instance admin's approval that
+    /// a repository admin rejects stays instance-locked, so the repository
+    /// admin cannot then re-approve it past the instance admin.
+    pub async fn reject_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
@@ -1178,7 +1290,8 @@ impl AgeGateService {
             "UPDATE age_gate_reviews
              SET status = 'rejected', reviewed_by = $2, reviewed_at = NOW(),
                  review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5
+                 basis_upstream_fingerprint = $5,
+                 instance_locked = instance_locked OR $7
              WHERE id = $1 AND status = $6",
         )
         .bind(id)
@@ -1187,6 +1300,7 @@ impl AgeGateService {
         .bind(params.age_gate_mode.as_str())
         .bind(&fingerprint)
         .bind(&expected_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1221,20 +1335,37 @@ impl AgeGateService {
         reviewer_id: Uuid,
         reason: Option<&str>,
     ) -> Result<(String, AgeGateReview)> {
+        self.reopen_as(id, reviewer_id, ActorTier::Instance, reason)
+            .await
+    }
+
+    /// Reopen as `tier` (#4238). Refused for a repository-tier actor on an
+    /// instance-locked review, with the lock also a compare-and-set
+    /// predicate — see [`Self::approve_as`].
+    pub async fn reopen_as(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        tier: ActorTier,
+        reason: Option<&str>,
+    ) -> Result<(String, AgeGateReview)> {
         let review = self.get_review_by_id(id).await?;
+        require_may_relax_review(tier, review.instance_locked)?;
         require_distinct_status(&review.status, AgeGateReviewStatus::Pending)?;
         let previous_status = review.status.clone();
 
         let res = sqlx::query(
             "UPDATE age_gate_reviews
              SET status = 'pending', reviewed_by = $2, reviewed_at = NOW(),
-                 review_reason = $3
-             WHERE id = $1 AND status = $4",
+                 review_reason = $3,
+                 instance_locked = instance_locked OR $5
+             WHERE id = $1 AND status = $4 AND ($5 OR NOT instance_locked)",
         )
         .bind(id)
         .bind(reviewer_id)
         .bind(reason)
         .bind(&previous_status)
+        .bind(tier.is_instance())
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1256,6 +1387,8 @@ impl AgeGateService {
         Ok((previous_status, updated))
     }
 
+    /// Set a repository's policy as an instance administrator — the only tier
+    /// that could before #4238.
     pub async fn update_repo_config(
         &self,
         repo_id: Uuid,
@@ -1263,7 +1396,36 @@ impl AgeGateService {
         min_age_days: i32,
         mode: AgeGateMode,
     ) -> Result<()> {
-        validate_min_age_days(min_age_days)?;
+        let next = AgeGatePolicy {
+            enabled,
+            min_age_days,
+            mode,
+        };
+        self.update_repo_config_as(repo_id, next, ActorTier::Instance)
+            .await
+            .map(|_previous| ())
+    }
+
+    /// Set a repository's policy as `tier` and return the policy it replaced,
+    /// so the audit entry can show what changed (#4238).
+    ///
+    /// A repository-tier actor may not RELAX a policy an instance admin set
+    /// ([`AgeGatePolicy::is_relaxed_by`]); it may still tighten it. The check
+    /// runs under the `FOR UPDATE` row lock that already serialises policy
+    /// writes, so it cannot race an instance admin's change. Only an instance
+    /// admin's write sets the lock, and none clears it.
+    pub async fn update_repo_config_as(
+        &self,
+        repo_id: Uuid,
+        next: AgeGatePolicy,
+        tier: ActorTier,
+    ) -> Result<AgeGatePolicy> {
+        validate_min_age_days(next.min_age_days)?;
+        let AgeGatePolicy {
+            enabled,
+            min_age_days,
+            mode,
+        } = next;
 
         let mut tx = self
             .db
@@ -1271,31 +1433,49 @@ impl AgeGateService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT age_gate_mode FROM repositories WHERE id = $1 FOR UPDATE")
-                .bind(repo_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+        let row: Option<(bool, i32, String, bool)> = sqlx::query_as(
+            "SELECT age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+                    age_gate_instance_locked \
+             FROM repositories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let current =
-            current.ok_or_else(|| AppError::NotFound(format!("Repository {repo_id} not found")))?;
+        let (current_enabled, current_min_age_days, current_mode, locked) =
+            row.ok_or_else(|| AppError::NotFound(format!("Repository {repo_id} not found")))?;
+        let current = AgeGatePolicy {
+            enabled: current_enabled,
+            min_age_days: current_min_age_days,
+            mode: AgeGateMode::parse(&current_mode)?,
+        };
+        if locked && tier == ActorTier::Repository && current.is_relaxed_by(next) {
+            return Err(AppError::Authorization(
+                "This repository's age gate was set by an instance administrator. A \
+                 repository administrator can tighten it, but only an instance \
+                 administrator can disable it, lower its minimum age, or change its mode."
+                    .to_string(),
+            ));
+        }
 
         sqlx::query(
             "UPDATE repositories
              SET age_gate_enabled = $2, age_gate_min_age_days = $3,
-                 age_gate_mode = $4, updated_at = NOW()
+                 age_gate_mode = $4, updated_at = NOW(),
+                 age_gate_instance_locked = age_gate_instance_locked OR $5
              WHERE id = $1",
         )
         .bind(repo_id)
         .bind(enabled)
         .bind(min_age_days)
         .bind(mode.as_str())
+        .bind(tier.is_instance())
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        if current != mode.as_str() {
+        if current.mode != mode {
             sqlx::query(
                 "UPDATE age_gate_reviews
                  SET upstream_published_at = NULL, basis_mode = NULL,
@@ -1313,7 +1493,7 @@ impl AgeGateService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         invalidate_decision_memos(repo_id);
-        Ok(())
+        Ok(current)
     }
 
     pub async fn find_last_known_good(
@@ -2110,6 +2290,55 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #4238: the instance-admin lock ------------------------------------------
+
+    #[test]
+    fn actor_tier_follows_the_instance_admin_bit() {
+        assert_eq!(ActorTier::of(true), ActorTier::Instance);
+        assert_eq!(ActorTier::of(false), ActorTier::Repository);
+    }
+
+    #[test]
+    fn only_an_instance_admin_may_relax_an_instance_locked_review() {
+        assert!(require_may_relax_review(ActorTier::Instance, true).is_ok());
+        assert!(require_may_relax_review(ActorTier::Instance, false).is_ok());
+        assert!(require_may_relax_review(ActorTier::Repository, false).is_ok());
+        assert!(matches!(
+            require_may_relax_review(ActorTier::Repository, true),
+            Err(AppError::Authorization(_))
+        ));
+    }
+
+    #[test]
+    fn a_policy_is_relaxed_by_disabling_lowering_or_switching_mode() {
+        let set = AgeGatePolicy {
+            enabled: true,
+            min_age_days: 30,
+            mode: AgeGateMode::FirstSeen,
+        };
+        let with = |f: fn(&mut AgeGatePolicy)| {
+            let mut p = set;
+            f(&mut p);
+            p
+        };
+        assert!(set.is_relaxed_by(with(|p| p.enabled = false)));
+        assert!(set.is_relaxed_by(with(|p| p.min_age_days = 29)));
+        assert!(set.is_relaxed_by(with(|p| p.mode = AgeGateMode::UpstreamPublishTime)));
+        assert!(
+            !set.is_relaxed_by(set),
+            "an identical write is not a relaxation"
+        );
+        assert!(!set.is_relaxed_by(with(|p| p.min_age_days = 60)));
+
+        // A disabled gate cannot be weakened further, whatever the new values.
+        let off = AgeGatePolicy {
+            enabled: false,
+            ..set
+        };
+        assert!(!off.is_relaxed_by(with(|p| p.min_age_days = 0)));
+        assert!(!off.is_relaxed_by(off));
+    }
     use chrono::{Duration, TimeZone};
 
     async fn try_db_pool() -> Option<sqlx::PgPool> {

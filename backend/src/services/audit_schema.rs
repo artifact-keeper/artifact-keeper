@@ -280,6 +280,7 @@ mod tests {
                     age_gate_enabled: None,
                     age_gate_min_age_days: None,
                     age_gate_mode: None,
+                    age_gate_change: None,
                 }),
         ];
         for entry in &entries {
@@ -347,6 +348,13 @@ mod tests {
                 age_gate_enabled: Some(true),
                 age_gate_min_age_days: Some(14),
                 age_gate_mode: None,
+                age_gate_change: Some(details::AgeGateChangeDetails {
+                    previous_enabled: true,
+                    previous_min_age_days: 30,
+                    previous_mode: "first_seen".into(),
+                    actor_tier: "repository_admin".into(),
+                    relaxed: true,
+                }),
             })
             .unwrap(),
         );

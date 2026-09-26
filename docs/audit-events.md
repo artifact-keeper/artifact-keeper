@@ -115,7 +115,7 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`) |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
