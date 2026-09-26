@@ -478,9 +478,12 @@ const OCI_BLOB_DIGEST_TEST_LOCK_KEY: i64 = 0x4244_3529; // "BD" + issue #3529
 /// Cross-process serialization guard for DB-backed OCI upload tests that
 /// commit a blob whose CONTENT another test also commits (#3529).
 ///
-/// `oci_upload_cleanup_keys.storage_key` is `UNIQUE` across the whole
-/// database and `blob_storage_key` is content-addressed, so two tests pushing
-/// identical bytes register the *same* cleanup-journal row: the second
+/// Until #3851, `oci_upload_cleanup_keys.storage_key` was `UNIQUE` across the
+/// whole database and `blob_storage_key` is content-addressed, so two tests
+/// pushing identical bytes registered the *same* cleanup-journal row. Rows are
+/// now per (repository, key), which removes the cross-repository collision
+/// described below; the lock is kept because tests pushing one digest also
+/// share its storage object. Historically the second
 /// `register_oci_upload_cleanup_key` hits `ON CONFLICT (storage_key)` and gets
 /// the first test's row id back. Whichever push commits first deletes that row
 /// inside its `oci_blobs` transaction (the #3187 guard) and then tears its
