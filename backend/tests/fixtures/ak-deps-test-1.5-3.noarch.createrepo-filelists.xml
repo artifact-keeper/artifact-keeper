@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="1">
+<package pkgid="66057711972d1f00c051d4ce7adbf5952b7ac9f035cf02702e32cdcfdad81fe9" name="ak-deps-test" arch="noarch">
+  <version epoch="2" ver="1.5" rel="3"/>
+  <file type="dir">/etc/ak-deps</file>
+  <file>/etc/ak-deps/ak.conf</file>
+  <file type="ghost">/etc/ak-deps/state.db</file>
+  <file>/usr/bin/ak-deps-tool</file>
+  <file>/usr/share/ak-deps/README</file>
+</package>
+</filelists>

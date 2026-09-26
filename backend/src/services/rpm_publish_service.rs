@@ -27,11 +27,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::handlers::rpm::{
-    generate_filelists_xml, generate_other_xml, gzip_bytes, sha256_hex, xml_escape, RpmArtifact,
+    generate_filelists_xml, generate_other_xml, gzip_bytes, push_rpm_entry_list, sha256_hex,
+    xml_escape, RpmArtifact,
 };
 use crate::error::AppError;
 use crate::formats::rpm::{generate_repomd, RepoMdChecksum, RepoMdData, RepoMdLocation};
-use crate::services::curation_sync::{RpmEntry, RpmPackageMetadata};
+use crate::services::curation_sync::RpmPackageMetadata;
 use crate::services::signing_service::SigningService;
 use crate::storage::StorageBackend;
 
@@ -624,14 +625,14 @@ fn push_format_xml(xml: &mut String, meta: &RpmPackageMetadata) {
             "      <rpm:header-range start=\"{start}\" end=\"{end}\"/>\n"
         ));
     }
-    push_entry_list(xml, "rpm:provides", &f.provides);
-    push_entry_list(xml, "rpm:requires", &f.requires);
-    push_entry_list(xml, "rpm:conflicts", &f.conflicts);
-    push_entry_list(xml, "rpm:obsoletes", &f.obsoletes);
-    push_entry_list(xml, "rpm:recommends", &f.recommends);
-    push_entry_list(xml, "rpm:suggests", &f.suggests);
-    push_entry_list(xml, "rpm:supplements", &f.supplements);
-    push_entry_list(xml, "rpm:enhances", &f.enhances);
+    push_rpm_entry_list(xml, "rpm:provides", &f.provides);
+    push_rpm_entry_list(xml, "rpm:requires", &f.requires);
+    push_rpm_entry_list(xml, "rpm:conflicts", &f.conflicts);
+    push_rpm_entry_list(xml, "rpm:obsoletes", &f.obsoletes);
+    push_rpm_entry_list(xml, "rpm:recommends", &f.recommends);
+    push_rpm_entry_list(xml, "rpm:suggests", &f.suggests);
+    push_rpm_entry_list(xml, "rpm:supplements", &f.supplements);
+    push_rpm_entry_list(xml, "rpm:enhances", &f.enhances);
     for file in &f.files {
         match &file.kind {
             Some(k) => xml.push_str(&format!(
@@ -643,36 +644,6 @@ fn push_format_xml(xml: &mut String, meta: &RpmPackageMetadata) {
         }
     }
     xml.push_str("    </format>\n");
-}
-
-fn push_entry_list(xml: &mut String, tag: &str, entries: &[RpmEntry]) {
-    if entries.is_empty() {
-        return;
-    }
-    xml.push_str(&format!("      <{tag}>\n"));
-    for e in entries {
-        xml.push_str(&format!(
-            "        <rpm:entry name=\"{}\"",
-            xml_escape(&e.name)
-        ));
-        if let Some(v) = &e.flags {
-            xml.push_str(&format!(" flags=\"{}\"", xml_escape(v)));
-        }
-        if let Some(v) = &e.epoch {
-            xml.push_str(&format!(" epoch=\"{}\"", xml_escape(v)));
-        }
-        if let Some(v) = &e.ver {
-            xml.push_str(&format!(" ver=\"{}\"", xml_escape(v)));
-        }
-        if let Some(v) = &e.rel {
-            xml.push_str(&format!(" rel=\"{}\"", xml_escape(v)));
-        }
-        if let Some(v) = &e.pre {
-            xml.push_str(&format!(" pre=\"{}\"", xml_escape(v)));
-        }
-        xml.push_str("/>\n");
-    }
-    xml.push_str(&format!("      </{tag}>\n"));
 }
 
 /// Build the minimal `RpmArtifact` the hosted stub generators consume. The pkgid
@@ -777,7 +748,7 @@ async fn put_blob(storage: &dyn StorageBackend, key: &str, bytes: Vec<u8>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::curation_sync::{RpmChecksum, RpmFormat, RpmSize, RpmTime};
+    use crate::services::curation_sync::{RpmChecksum, RpmEntry, RpmFormat, RpmSize, RpmTime};
 
     fn meta(name: &str, checksum: &str) -> RpmPackageMetadata {
         RpmPackageMetadata {

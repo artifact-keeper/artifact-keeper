@@ -620,8 +620,32 @@ pub(crate) fn build_rpm_artifact_metadata(
             }
         }
     }
+    attach_rpm_repodata_info(&mut metadata, content);
 
     Some(metadata)
+}
+
+/// Key of the header-derived repodata block inside an RPM artifact's
+/// `artifact_metadata` (#3801).
+const RPM_REPODATA_KEY: &str = "repodata";
+/// Shape version of that block. Bump it when the extraction changes in a way
+/// already-stored packages must pick up: blocks with any other version are
+/// ignored by the renderer and re-derived by [`heal_rpm_repodata_info`].
+const RPM_REPODATA_INFO_VERSION: u64 = 1;
+
+/// Record the dependency lists, file list, sizes and header range that
+/// `primary.xml`/`filelists.xml` need (#3801). Best-effort: an unparseable
+/// header leaves `metadata` untouched. Returns whether a block was attached.
+fn attach_rpm_repodata_info(metadata: &mut serde_json::Value, content: &[u8]) -> bool {
+    let Ok(info) = crate::formats::rpm::RpmHandler::parse_rpm_repodata_info(content) else {
+        return false;
+    };
+    let Ok(mut block) = serde_json::to_value(info) else {
+        return false;
+    };
+    block["v"] = serde_json::Value::from(RPM_REPODATA_INFO_VERSION);
+    metadata[RPM_REPODATA_KEY] = block;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -779,12 +803,13 @@ async fn cached_repodata(
     // render can only make the stored entry look older than its content, so
     // the next request re-renders — never serves stale bytes as fresh.
     let fingerprint = repodata_fingerprint(&state.db, repo_ids).await?;
-    let db = state.db.clone();
+    let render_state = state.clone();
     let ids = fingerprint.repo_ids.clone();
     state
         .rpm_repodata_cache
         .get_or_render(repo.id, fingerprint, || async move {
-            let artifacts = collect_repodata_artifacts(&db, &ids).await?;
+            let mut artifacts = collect_repodata_artifacts(&render_state.db, &ids).await?;
+            heal_rpm_repodata_info(&render_state, &mut artifacts).await;
             tokio::task::spawn_blocking(move || render_repodata(&artifacts))
                 .await
                 .map_err(|e| {
@@ -797,6 +822,158 @@ async fn cached_repodata(
                 })
         })
         .await
+}
+
+/// Upper bound on the header prefix read back from storage when healing a
+/// package's repodata block. Real headers are kilobytes to low megabytes (the
+/// file list dominates); the cap only stops a hostile size field from turning
+/// a render into an unbounded read.
+const RPM_HEAL_HEADER_LIMIT: usize = 32 * 1024 * 1024;
+/// Storage reads in flight while healing one render.
+const RPM_HEAL_CONCURRENCY: usize = 8;
+
+/// Packages stored before #3801 (or pushed through a path that could not see
+/// the whole header) carry no current [`RPM_REPODATA_KEY`] block, so their
+/// `primary.xml` entry would declare no dependencies. Re-derive the block from
+/// the stored package's header — a ranged read of the first few KiB, not the
+/// payload — persist it so this happens once per package, and render with it.
+///
+/// Best-effort throughout: a storage or parse failure leaves the artifact
+/// rendering as before (NEVRA + text fields only) and is retried on the next
+/// render. Persisting does not touch `artifacts.updated_at`, so the repodata
+/// fingerprint does not move and the healed render is what gets cached.
+async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifact]) {
+    use futures::StreamExt;
+
+    let stale: Vec<usize> = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| rpm_repodata_info(a).is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+
+    let ids: Vec<uuid::Uuid> = stale.iter().map(|&i| artifacts[i].id).collect();
+    let rows = match sqlx::query(
+        "SELECT a.id, r.storage_backend, r.storage_path \
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "RPM repodata heal: storage lookup failed");
+            return;
+        }
+    };
+    let locations: std::collections::HashMap<uuid::Uuid, crate::storage::StorageLocation> = rows
+        .iter()
+        .filter_map(|r| {
+            use sqlx::Row;
+            Some((
+                r.try_get("id").ok()?,
+                crate::storage::StorageLocation {
+                    backend: r.try_get("storage_backend").ok()?,
+                    path: r.try_get("storage_path").ok()?,
+                },
+            ))
+        })
+        .collect();
+
+    let jobs: Vec<_> = stale
+        .into_iter()
+        .filter_map(|i| {
+            let a = &artifacts[i];
+            let location = locations.get(&a.id)?.clone();
+            Some((i, a.storage_key.clone(), a.size_bytes, location))
+        })
+        .collect();
+    let headers: Vec<(usize, Option<Bytes>)> = futures::stream::iter(jobs)
+        .map(|(i, key, size, location)| async move {
+            (
+                i,
+                read_rpm_header_prefix(state, &location, &key, size).await,
+            )
+        })
+        .buffer_unordered(RPM_HEAL_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut healed = 0usize;
+    for (i, header) in headers {
+        let Some(header) = header else { continue };
+        let artifact = &mut artifacts[i];
+        let filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.path)
+            .to_string();
+        let mut metadata = match artifact.metadata.take() {
+            Some(m) if m.is_object() => m,
+            _ => match build_rpm_artifact_metadata(&filename, &header) {
+                Some(m) => m,
+                None => continue,
+            },
+        };
+        if !attach_rpm_repodata_info(&mut metadata, &header) {
+            artifact.metadata = Some(metadata);
+            continue;
+        }
+        if let Err(e) = sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'rpm', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET metadata = EXCLUDED.metadata",
+        )
+        .bind(artifact.id)
+        .bind(&metadata)
+        .execute(&state.db)
+        .await
+        {
+            warn!(artifact_id = %artifact.id, error = %e, "RPM repodata heal: persist failed");
+        }
+        artifact.metadata = Some(metadata);
+        healed += 1;
+    }
+    if healed > 0 {
+        info!(
+            healed,
+            "RPM repodata: derived dependency metadata for stored packages (#3801)"
+        );
+    }
+}
+
+/// Read just enough of a stored package to cover its lead, signature header
+/// and main header, growing the ranged read as the header sizes are learned.
+async fn read_rpm_header_prefix(
+    state: &SharedState,
+    location: &crate::storage::StorageLocation,
+    key: &str,
+    size_bytes: i64,
+) -> Option<Bytes> {
+    let storage = state.storage_for_repo(location).ok()?;
+    let size = usize::try_from(size_bytes).ok()?;
+    let mut want = size.min(64 * 1024);
+    for _ in 0..4 {
+        let bytes = storage.get_range(key, 0, want).await.ok()?;
+        match RpmHandler::header_bytes_needed(&bytes) {
+            Some(needed)
+                if needed > bytes.len()
+                    && needed > want
+                    && needed <= size
+                    && needed <= RPM_HEAL_HEADER_LIMIT =>
+            {
+                want = needed;
+            }
+            _ => return Some(bytes),
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,36 +2057,113 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             build_rpm_artifact_path(filename)
         };
 
+        // Header-derived repodata block (#3801): dependencies, file list,
+        // sizes, header range. Absent only for packages whose header could
+        // not be parsed at upload and has not been healed since.
+        let info = rpm_repodata_info(artifact);
+        let info = info.as_ref();
+        let epoch = info.and_then(|i| i.epoch).unwrap_or(0);
+        let group = meta_str("group");
+
+        // Element order is createrepo_c's: name, arch, version, checksum,
+        // summary, description, packager, url, time, size, location, format.
+        xml.push_str("  <package type=\"rpm\">\n");
+        xml.push_str(&format!("    <name>{}</name>\n", xml_escape(&name)));
+        xml.push_str(&format!("    <arch>{}</arch>\n", xml_escape(&arch)));
         xml.push_str(&format!(
-            r#"  <package type="rpm">
-    <name>{name}</name>
-    <version epoch="0" ver="{version}" rel="{release}"/>
-    <arch>{arch}</arch>
-    <checksum type="sha256" pkgid="YES">{checksum}</checksum>
-    <summary>{summary}</summary>
-    <description>{description}</description>
-    <url>{url}</url>
-    <size package="{size}" installed="0"/>
-    <location href="{location}"/>
-    <format>
-      <rpm:license>{license}</rpm:license>
-      <rpm:sourcerpm>{source_rpm}</rpm:sourcerpm>
-    </format>
-  </package>
-"#,
-            name = xml_escape(&name),
-            version = xml_escape(&version),
-            release = xml_escape(&release),
-            arch = xml_escape(&arch),
-            checksum = artifact.checksum_sha256,
-            summary = xml_escape(&summary),
-            description = xml_escape(&description),
-            url = xml_escape(&url),
-            size = artifact.size_bytes,
-            location = xml_escape(&location),
-            license = xml_escape(&license),
-            source_rpm = xml_escape(&source_rpm),
+            "    <version epoch=\"{epoch}\" ver=\"{}\" rel=\"{}\"/>\n",
+            xml_escape(&version),
+            xml_escape(&release),
         ));
+        xml.push_str(&format!(
+            "    <checksum type=\"sha256\" pkgid=\"YES\">{}</checksum>\n",
+            artifact.checksum_sha256
+        ));
+        xml.push_str(&format!(
+            "    <summary>{}</summary>\n",
+            xml_escape(&summary)
+        ));
+        xml.push_str(&format!(
+            "    <description>{}</description>\n",
+            xml_escape(&description)
+        ));
+        if let Some(p) = info.and_then(|i| i.packager.as_deref()) {
+            xml.push_str(&format!("    <packager>{}</packager>\n", xml_escape(p)));
+        }
+        xml.push_str(&format!("    <url>{}</url>\n", xml_escape(&url)));
+        xml.push_str(&format!(
+            "    <time file=\"{}\" build=\"{}\"/>\n",
+            artifact.updated_at.timestamp(),
+            info.and_then(|i| i.build_time).unwrap_or(0)
+        ));
+        let installed = info.and_then(|i| i.installed_size).unwrap_or(0);
+        match info.and_then(|i| i.archive_size) {
+            Some(archive) => xml.push_str(&format!(
+                "    <size package=\"{}\" installed=\"{installed}\" archive=\"{archive}\"/>\n",
+                artifact.size_bytes
+            )),
+            None => xml.push_str(&format!(
+                "    <size package=\"{}\" installed=\"{installed}\"/>\n",
+                artifact.size_bytes
+            )),
+        }
+        xml.push_str(&format!(
+            "    <location href=\"{}\"/>\n",
+            xml_escape(&location)
+        ));
+
+        xml.push_str("    <format>\n");
+        xml.push_str(&format!(
+            "      <rpm:license>{}</rpm:license>\n",
+            xml_escape(&license)
+        ));
+        if let Some(v) = info.and_then(|i| i.vendor.as_deref()) {
+            xml.push_str(&format!(
+                "      <rpm:vendor>{}</rpm:vendor>\n",
+                xml_escape(v)
+            ));
+        }
+        if !group.is_empty() {
+            xml.push_str(&format!(
+                "      <rpm:group>{}</rpm:group>\n",
+                xml_escape(&group)
+            ));
+        }
+        if let Some(v) = info.and_then(|i| i.buildhost.as_deref()) {
+            xml.push_str(&format!(
+                "      <rpm:buildhost>{}</rpm:buildhost>\n",
+                xml_escape(v)
+            ));
+        }
+        xml.push_str(&format!(
+            "      <rpm:sourcerpm>{}</rpm:sourcerpm>\n",
+            xml_escape(&source_rpm)
+        ));
+        if let Some(i) = info {
+            xml.push_str(&format!(
+                "      <rpm:header-range start=\"{}\" end=\"{}\"/>\n",
+                i.header_start, i.header_end
+            ));
+            push_rpm_entry_list(&mut xml, "rpm:provides", &i.provides);
+            push_rpm_entry_list(&mut xml, "rpm:requires", &i.requires);
+            push_rpm_entry_list(&mut xml, "rpm:conflicts", &i.conflicts);
+            push_rpm_entry_list(&mut xml, "rpm:obsoletes", &i.obsoletes);
+            push_rpm_entry_list(&mut xml, "rpm:suggests", &i.suggests);
+            push_rpm_entry_list(&mut xml, "rpm:enhances", &i.enhances);
+            push_rpm_entry_list(&mut xml, "rpm:recommends", &i.recommends);
+            push_rpm_entry_list(&mut xml, "rpm:supplements", &i.supplements);
+            // Only "primary" files (`/etc/*`, `*bin/*`, `/usr/lib/sendmail`)
+            // go here, as createrepo_c does; the full list is filelists.xml.
+            push_rpm_file_list(
+                &mut xml,
+                "      ",
+                i.files
+                    .iter()
+                    .filter(|f| crate::formats::rpm::is_primary_file(&f.path)),
+            );
+        }
+        xml.push_str("    </format>\n");
+        xml.push_str("  </package>\n");
     }
 
     xml.push_str("</metadata>\n");
@@ -1925,7 +2179,7 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     );
 
     for artifact in artifacts {
-        let (name, version, release, _arch) = if let Some(ref meta) = artifact.metadata {
+        let (name, version, release, arch) = if let Some(ref meta) = artifact.metadata {
             (
                 meta.get("name")
                     .and_then(|v| v.as_str())
@@ -1956,24 +2210,24 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
             })
         };
 
+        let info = rpm_repodata_info(artifact);
         xml.push_str(&format!(
             r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
-    <version epoch="0" ver="{version}" rel="{release}"/>
-  </package>
+    <version epoch="{epoch}" ver="{version}" rel="{release}"/>
 "#,
             checksum = artifact.checksum_sha256,
             name = xml_escape(&name),
-            arch = if let Some(ref meta) = artifact.metadata {
-                meta.get("arch")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("noarch")
-                    .to_string()
-            } else {
-                "noarch".to_string()
-            },
+            arch = xml_escape(&arch),
+            epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
             version = xml_escape(&version),
             release = xml_escape(&release),
         ));
+        // The complete file list (#3801), so file requirements outside the
+        // primary set (`/usr/share/...`, `/usr/lib64/...`) resolve too.
+        if let Some(i) = &info {
+            push_rpm_file_list(&mut xml, "    ", i.files.iter());
+        }
+        xml.push_str("  </package>\n");
     }
 
     xml.push_str("</filelists>\n");
@@ -2025,7 +2279,7 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
 
         xml.push_str(&format!(
             r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
-    <version epoch="0" ver="{version}" rel="{release}"/>
+    <version epoch="{epoch}" ver="{version}" rel="{release}"/>
   </package>
 "#,
             checksum = artifact.checksum_sha256,
@@ -2038,6 +2292,9 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
             } else {
                 "noarch".to_string()
             },
+            epoch = rpm_repodata_info(artifact)
+                .and_then(|i| i.epoch)
+                .unwrap_or(0),
             version = xml_escape(&version),
             release = xml_escape(&release),
         ));
@@ -2045,6 +2302,72 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
 
     xml.push_str("</otherdata>\n");
     xml
+}
+
+/// The header-derived repodata block recorded for `artifact` at upload (or
+/// healed since — see [`heal_rpm_repodata_info`]). `None` when absent or not
+/// in the current shape.
+fn rpm_repodata_info(artifact: &RpmArtifact) -> Option<crate::formats::rpm::RpmRepodataInfo> {
+    let value = artifact.metadata.as_ref()?.get(RPM_REPODATA_KEY)?;
+    if value.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION) {
+        return None;
+    }
+    serde_json::from_value(value.clone()).ok()
+}
+
+/// Serialize one `<rpm:provides>`/`<rpm:requires>`/... list in
+/// createrepo_c's element format (`<rpm:entry name flags epoch ver rel
+/// pre/>`, attributes present only when set). Omitted entirely when empty.
+/// Shared with the RPM publication serializer.
+pub(crate) fn push_rpm_entry_list(
+    xml: &mut String,
+    tag: &str,
+    entries: &[crate::services::curation_sync::RpmEntry],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    xml.push_str(&format!("      <{tag}>\n"));
+    for e in entries {
+        xml.push_str(&format!(
+            "        <rpm:entry name=\"{}\"",
+            xml_escape(&e.name)
+        ));
+        for (attr, value) in [
+            ("flags", &e.flags),
+            ("epoch", &e.epoch),
+            ("ver", &e.ver),
+            ("rel", &e.rel),
+            ("pre", &e.pre),
+        ] {
+            if let Some(v) = value {
+                xml.push_str(&format!(" {attr}=\"{}\"", xml_escape(v)));
+            }
+        }
+        xml.push_str("/>\n");
+    }
+    xml.push_str(&format!("      </{tag}>\n"));
+}
+
+/// Serialize `<file>` elements (`type="dir"`/`type="ghost"` when typed).
+fn push_rpm_file_list<'a>(
+    xml: &mut String,
+    indent: &str,
+    files: impl Iterator<Item = &'a crate::services::curation_sync::RpmFileEntry>,
+) {
+    for file in files {
+        match &file.kind {
+            Some(k) => xml.push_str(&format!(
+                "{indent}<file type=\"{}\">{}</file>\n",
+                xml_escape(k),
+                xml_escape(&file.path)
+            )),
+            None => xml.push_str(&format!(
+                "{indent}<file>{}</file>\n",
+                xml_escape(&file.path)
+            )),
+        }
+    }
 }
 
 fn generate_updateinfo_xml() -> String {
@@ -5183,5 +5506,237 @@ mod scriptlet_tests {
                 "{label}: expected NotRead, got {completeness:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3801: primary.xml / filelists.xml must carry the header's dependency
+// metadata in createrepo_c's exact format, or dnf resolves no dependencies.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod repodata_deps_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Built by `tests/fixtures/ak-deps-test.spec` (rpmbuild, Fedora): epoch 2,
+    /// versioned/unversioned/pre requires, virtual provides, conflicts,
+    /// obsoletes, weak deps, a dir, a ghost and a `/usr/bin` file.
+    const DEPS_RPM: &[u8] = include_bytes!("../../../tests/fixtures/ak-deps-test-1.5-3.noarch.rpm");
+    const DEPS_FILENAME: &str = "ak-deps-test-1.5-3.noarch.rpm";
+    /// `createrepo_c` 1.2.1's `primary.xml`/`filelists.xml` for exactly that
+    /// file: the reference the rendered documents are compared against.
+    const CREATEREPO_PRIMARY: &str =
+        include_str!("../../../tests/fixtures/ak-deps-test-1.5-3.noarch.createrepo-primary.xml");
+    const CREATEREPO_FILELISTS: &str =
+        include_str!("../../../tests/fixtures/ak-deps-test-1.5-3.noarch.createrepo-filelists.xml");
+
+    fn deps_artifact() -> RpmArtifact {
+        RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: format!("packages/{DEPS_FILENAME}"),
+            name: "ak-deps-test".to_string(),
+            version: Some("1.5-3".to_string()),
+            size_bytes: DEPS_RPM.len() as i64,
+            checksum_sha256: sha256_hex(DEPS_RPM),
+            storage_key: String::new(),
+            metadata: build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM),
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The `<package ...>...</package>` block's lines, trimmed of indentation
+    /// (the two generators indent differently), minus the lines that are
+    /// legitimately repository-specific: `<location>` (keeper serves
+    /// `packages/<file>`) and `<time>` (`file=` is the file mtime).
+    fn package_lines(doc: &str) -> Vec<String> {
+        let start = doc.find("<package ").expect("a <package> element");
+        let end = doc.rfind("</package>").expect("a </package> close") + "</package>".len();
+        doc[start..end]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("<location ") && !l.starts_with("<time "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Well-formedness: dnf/libsolv reject a document that does not parse.
+    fn assert_well_formed(doc: &str) {
+        let mut reader = quick_xml::Reader::from_str(doc);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("rendered XML is not well-formed: {e}\n{doc}"),
+            }
+        }
+    }
+
+    #[test]
+    fn upload_metadata_records_dependency_block() {
+        let meta = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM).unwrap();
+        let block = &meta[RPM_REPODATA_KEY];
+        assert_eq!(block["v"], RPM_REPODATA_INFO_VERSION);
+        let requires: Vec<&str> = block["requires"]
+            .as_array()
+            .expect("requires recorded")
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(requires.contains(&"openssl11-custom-libs"), "{requires:?}");
+        assert!(
+            requires.iter().all(|r| !r.starts_with("rpmlib(")),
+            "rpmlib() pseudo-requires are omitted like createrepo_c: {requires:?}"
+        );
+    }
+
+    /// The core #3801 regression: the rendered `<package>` entry — above all
+    /// its `<format>` block with provides/requires/conflicts/obsoletes and the
+    /// weak deps — must be exactly what createrepo_c writes for the same file,
+    /// element order included.
+    #[test]
+    fn primary_xml_package_matches_createrepo_c() {
+        let xml = generate_primary_xml(&[deps_artifact()]);
+        assert_well_formed(&xml);
+        assert!(
+            xml.contains(r#"<rpm:entry name="openssl11-custom-libs"/>"#),
+            "primary.xml must declare the header's requires (#3801): {xml}"
+        );
+        assert_eq!(
+            package_lines(&xml),
+            package_lines(CREATEREPO_PRIMARY),
+            "rendered primary.xml package entry differs from createrepo_c:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn filelists_xml_package_matches_createrepo_c() {
+        let xml = generate_filelists_xml(&[deps_artifact()]);
+        assert_well_formed(&xml);
+        assert_eq!(
+            package_lines(&xml),
+            package_lines(CREATEREPO_FILELISTS),
+            "rendered filelists.xml package entry differs from createrepo_c:\n{xml}"
+        );
+    }
+
+    /// A stored block in an unknown shape is ignored (and so re-derived by the
+    /// heal) rather than half-rendered.
+    #[test]
+    fn repodata_block_with_other_version_is_ignored() {
+        let mut a = deps_artifact();
+        a.metadata.as_mut().unwrap()[RPM_REPODATA_KEY]["v"] = serde_json::json!(0);
+        assert!(rpm_repodata_info(&a).is_none());
+        let xml = generate_primary_xml(&[a]);
+        assert!(!xml.contains("<rpm:requires>"), "{xml}");
+        assert_well_formed(&xml);
+    }
+
+    async fn primary_xml(f: &tdh::Fixture) -> String {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let (status, body) = tdh::send(
+            f.router_anon(super::router()),
+            tdh::get(format!("/{}/repodata/primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "primary.xml.gz");
+        let mut xml = String::new();
+        GzDecoder::new(&body[..])
+            .read_to_string(&mut xml)
+            .expect("decompress primary.xml.gz");
+        xml
+    }
+
+    /// End to end through the native `PUT /rpm/{key}/packages/{file}` path the
+    /// issue reports: the served primary.xml.gz carries the requires.
+    #[tokio::test]
+    async fn native_upload_serves_dependency_metadata() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/packages/{DEPS_FILENAME}", f.repo_key),
+                bytes::Bytes::from_static(DEPS_RPM),
+            ),
+        )
+        .await;
+        let xml = if status.is_success() {
+            primary_xml(&f).await
+        } else {
+            String::new()
+        };
+        f.teardown().await;
+
+        assert!(
+            status.is_success(),
+            "rpm upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            xml.contains(r#"<rpm:entry name="openssl11-custom-libs"/>"#),
+            "served primary.xml must carry the header's requires (#3801): {xml}"
+        );
+        assert!(
+            xml.contains(r#"<rpm:entry name="ak-deps-virtual" flags="EQ" epoch="0" ver="1.0"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<version epoch="2" ver="1.5" rel="3"/>"#),
+            "{xml}"
+        );
+    }
+
+    /// Packages stored before the fix have no repodata block. The render
+    /// re-derives it from the stored header and persists it, so no manual
+    /// backfill is needed.
+    #[tokio::test]
+    async fn legacy_package_is_healed_at_render() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let key = format!("rpm/{}/{DEPS_FILENAME}", f.repo_id);
+        let artifact_id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &key,
+            &format!("packages/{DEPS_FILENAME}"),
+            "ak-deps-test",
+            "1.5-3",
+            "application/x-rpm",
+            bytes::Bytes::from_static(DEPS_RPM),
+            f.user_id,
+        )
+        .await;
+        // The pre-#3801 upload shape: header text fields, no repodata block.
+        let mut legacy = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM).unwrap();
+        legacy.as_object_mut().unwrap().remove(RPM_REPODATA_KEY);
+        proxy_helpers::record_artifact_metadata(&f.pool, artifact_id, f.repo_id, "rpm", &legacy)
+            .await;
+
+        let xml = primary_xml(&f).await;
+        let stored: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&f.pool)
+                .await
+                .unwrap();
+        f.teardown().await;
+
+        assert!(
+            xml.contains(r#"<rpm:entry name="openssl11-custom-libs"/>"#),
+            "a pre-fix package must render its requires after the heal: {xml}"
+        );
+        let stored = stored.expect("metadata row");
+        assert_eq!(
+            stored[RPM_REPODATA_KEY]["v"], RPM_REPODATA_INFO_VERSION,
+            "the healed block must be persisted so it is derived once: {stored}"
+        );
+        assert_eq!(stored["summary"], legacy["summary"], "existing fields kept");
     }
 }
