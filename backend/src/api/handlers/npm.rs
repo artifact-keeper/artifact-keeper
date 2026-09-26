@@ -3807,6 +3807,70 @@ enum NpmVirtualOwnership {
     OwnedAtPriority(i32),
 }
 
+/// Resolve the npm virtual shadowing-guard ownership (#1217 / #3646 /
+/// #3955) of the tarball `filename` requested under `package_name` in the
+/// Virtual repo `virtual_repo_id`. See the guard comment in `serve_tarball`
+/// for the rules; the three arms are:
+///
+/// - the filename carries this package's version: version-aware and
+///   priority-aware (`OwnedAtPriority` / `NotOwned`);
+/// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
+/// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+async fn resolve_npm_virtual_ownership(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+    filename: &str,
+) -> Result<NpmVirtualOwnership, Response> {
+    if !crate::formats::npm::is_valid_npm_name(package_name) {
+        return Ok(NpmVirtualOwnership::NotOwned);
+    }
+    let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
+        // Fail-safe (#3646): no readable version, so fall back to the
+        // name-only guard rather than fan out on a shape we cannot read.
+        let owns_name =
+            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name).await?;
+        return Ok(if owns_name {
+            NpmVirtualOwnership::OwnedNameOnly
+        } else {
+            NpmVirtualOwnership::NotOwned
+        });
+    };
+    let owner_min_priority =
+        proxy_helpers::npm_virtual_owner_min_priority(db, virtual_repo_id, package_name, &version)
+            .await?;
+    Ok(match owner_min_priority {
+        Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
+        None => NpmVirtualOwnership::NotOwned,
+    })
+}
+
+/// The proxy service handed to the virtual tarball resolver for a given
+/// ownership outcome, over the member list the guard already filtered.
+/// `None` is the load-bearing security primitive: it withholds every
+/// Remote member from the resolver (the name-only fail-safe, and an owner
+/// that outranks every Remote member).
+fn npm_virtual_resolver_proxy<'a>(
+    ownership: NpmVirtualOwnership,
+    members: &[crate::models::repository::Repository],
+    proxy: Option<&'a crate::services::proxy_service::ProxyService>,
+) -> Option<&'a crate::services::proxy_service::ProxyService> {
+    match ownership {
+        NpmVirtualOwnership::NotOwned => proxy,
+        NpmVirtualOwnership::OwnedNameOnly => None,
+        NpmVirtualOwnership::OwnedAtPriority(_) => {
+            if members
+                .iter()
+                .any(|m| m.repo_type == RepositoryType::Remote)
+            {
+                proxy
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// The npm shadowing-guard suppression rule (#3955), the #2311 PyPI rule
 /// ported to npm: an owning non-Remote member suppresses a Remote member
 /// only when it OUTRANKS it (strictly lower priority value). A Remote
@@ -4004,34 +4068,8 @@ async fn serve_tarball(
         // Such names cannot reach `artifacts.name` so the guard would
         // always return `NotOwned`; skipping it spares the DB an existence
         // check on every malformed request.
-        let ownership = if crate::formats::npm::is_valid_npm_name(package_name) {
-            match npm_version_from_tarball_filename(package_name, filename) {
-                Some(version) => {
-                    match proxy_helpers::npm_virtual_owner_min_priority(
-                        &state.db,
-                        repo.id,
-                        package_name,
-                        &version,
-                    )
-                    .await?
-                    {
-                        Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
-                        None => NpmVirtualOwnership::NotOwned,
-                    }
-                }
-                None => {
-                    if proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name)
-                        .await?
-                    {
-                        NpmVirtualOwnership::OwnedNameOnly
-                    } else {
-                        NpmVirtualOwnership::NotOwned
-                    }
-                }
-            }
-        } else {
-            NpmVirtualOwnership::NotOwned
-        };
+        let ownership =
+            resolve_npm_virtual_ownership(&state.db, repo.id, package_name, filename).await?;
 
         // #2424: apply the per-member npm scope policy to the direct-tarball
         // path, exactly as the metadata/packument loops already do. Metadata
@@ -4093,20 +4131,8 @@ async fn serve_tarball(
         // members; the `None` below covers the two cases where none may
         // remain — the name-only fail-safe, and an owner that outranks
         // every Remote member (the pre-#3955 posture for that case).
-        let proxy_for_virtual = match ownership {
-            NpmVirtualOwnership::NotOwned => state.proxy_service.as_deref(),
-            NpmVirtualOwnership::OwnedNameOnly => None,
-            NpmVirtualOwnership::OwnedAtPriority(_) => {
-                if members
-                    .iter()
-                    .any(|m| m.repo_type == RepositoryType::Remote)
-                {
-                    state.proxy_service.as_deref()
-                } else {
-                    None
-                }
-            }
-        };
+        let proxy_for_virtual =
+            npm_virtual_resolver_proxy(ownership, &members, state.proxy_service.as_deref());
 
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
@@ -7215,6 +7241,165 @@ mod tests {
         // A Remote with no priority row fails safe: suppressed whenever an
         // owner exists, matching the pre-#3955 suppress-everything posture.
         assert!(remote_member_outranked_by_owner(5, None));
+    }
+
+    /// Virtual npm repo for the #3955 ownership-arm tests: a hosted member
+    /// at priority 1 owning `fail-safe-pkg@1.0.0` and a Remote member at
+    /// priority 2. Returns the fixture and the virtual's member list.
+    async fn setup_3955_ownership_rig() -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        Vec<crate::models::repository::Repository>,
+    )> {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let fx = tdh::Fixture::setup("virtual", "npm").await?;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, _rdir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        for (member_id, priority) in [(local_id, 1), (remote_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+        }
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let artifact_path = "fail-safe-pkg/1.0.0/fail-safe-pkg-1.0.0.tgz";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &local_repo,
+            &format!("npm/{artifact_path}"),
+            artifact_path,
+            "fail-safe-pkg",
+            "1.0.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz:fail-safe-pkg-1.0.0"),
+            fx.user_id,
+        )
+        .await;
+        let members = proxy_helpers::fetch_virtual_members(&fx.pool, fx.repo_id)
+            .await
+            .expect("fetch virtual members");
+        assert!(
+            members
+                .iter()
+                .any(|m| m.repo_type == RepositoryType::Remote),
+            "rig must carry a Remote member for the proxy assertions to mean anything"
+        );
+        Some((fx, members))
+    }
+
+    /// #3955 / #3646: a tarball filename that does not carry this package's
+    /// version falls back to the NAME-only guard, and a hosted owner of the
+    /// name then withholds the proxy from the resolver, so no Remote member
+    /// may serve the bytes (fail-safe: never fan out on a shape we cannot
+    /// read). Pins the name-only arm of `resolve_npm_virtual_ownership` and
+    /// the `OwnedNameOnly => None` arm of `npm_virtual_resolver_proxy`.
+    #[tokio::test]
+    async fn test_tarball_ownership_name_only_fail_safe_withholds_proxy_3955() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some((fx, members)) = setup_3955_ownership_rig().await else {
+            return;
+        };
+
+        // Control: a versioned filename takes the priority-aware arm.
+        let versioned = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg-1.0.0.tgz",
+        )
+        .await
+        .expect("versioned ownership");
+        assert!(
+            matches!(versioned, NpmVirtualOwnership::OwnedAtPriority(1)),
+            "versioned filename must resolve the owner's priority, got {versioned:?}"
+        );
+
+        // No readable version: the name-only fail-safe engages.
+        let name_only = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg.tgz",
+        )
+        .await
+        .expect("name-only ownership");
+        assert!(
+            matches!(name_only, NpmVirtualOwnership::OwnedNameOnly),
+            "an unreadable filename for an owned name must fail safe, got {name_only:?}"
+        );
+
+        // The fail-safe only engages on an OWNED name.
+        let unowned = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "nobody-owns-this-pkg",
+            "nobody-owns-this-pkg.tgz",
+        )
+        .await
+        .expect("unowned ownership");
+        assert!(
+            matches!(unowned, NpmVirtualOwnership::NotOwned),
+            "an unowned name must not engage the fail-safe, got {unowned:?}"
+        );
+
+        // And the fail-safe withholds the proxy even though a Remote member
+        // is present, while an unowned name still hands it to the resolver.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        assert!(
+            npm_virtual_resolver_proxy(name_only, &members, Some(proxy.as_ref())).is_none(),
+            "OwnedNameOnly must withhold the proxy: no Remote member may serve the tarball"
+        );
+        assert!(
+            npm_virtual_resolver_proxy(unowned, &members, Some(proxy.as_ref())).is_some(),
+            "NotOwned must hand the proxy to the resolver"
+        );
+    }
+
+    /// #3955: a name failing `is_valid_npm_name` (here: uppercase) skips the
+    /// ownership check entirely and yields `NotOwned`. The owner queries
+    /// compare `LOWER(name)`, so without the skip the uppercase spelling of
+    /// an owned name WOULD resolve as owned; the skip is what keeps the DB
+    /// out of malformed requests. Pins the `else` (invalid-name) arm.
+    #[tokio::test]
+    async fn test_tarball_ownership_invalid_name_skips_check_3955() {
+        let Some((fx, _members)) = setup_3955_ownership_rig().await else {
+            return;
+        };
+        assert!(!crate::formats::npm::is_valid_npm_name("Fail-Safe-Pkg"));
+
+        // Control: the lowercase spelling is owned.
+        let valid = resolve_npm_virtual_ownership(
+            &fx.pool,
+            fx.repo_id,
+            "fail-safe-pkg",
+            "fail-safe-pkg-1.0.0.tgz",
+        )
+        .await
+        .expect("valid-name ownership");
+        assert!(
+            matches!(valid, NpmVirtualOwnership::OwnedAtPriority(1)),
+            "control: the valid spelling must be owned, got {valid:?}"
+        );
+
+        for filename in ["Fail-Safe-Pkg-1.0.0.tgz", "Fail-Safe-Pkg.tgz"] {
+            let invalid =
+                resolve_npm_virtual_ownership(&fx.pool, fx.repo_id, "Fail-Safe-Pkg", filename)
+                    .await
+                    .expect("invalid-name ownership");
+            assert!(
+                matches!(invalid, NpmVirtualOwnership::NotOwned),
+                "an invalid npm name must skip the ownership check ({filename}), got {invalid:?}"
+            );
+        }
     }
 
     /// #3955: the packument merge honours member priority but the tarball
