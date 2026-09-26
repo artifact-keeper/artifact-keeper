@@ -118,7 +118,7 @@ pub async fn create_repo(
     std::fs::create_dir_all(&storage_path).expect("create storage dir");
     sqlx::query(
         "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         VALUES ($1, $2, $3, $4, $5::repository_type, $6::repository_format, $7)",
     )
     .bind(id)
     .bind(&key)
