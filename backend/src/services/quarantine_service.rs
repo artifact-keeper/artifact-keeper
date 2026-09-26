@@ -193,6 +193,28 @@ pub fn check_download_allowed(
     quarantine_until_ts: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    check_download_hold(quarantine_status, quarantine_until_ts, None, now)
+}
+
+/// Stored `quarantine_reason` for a scan-policy violation (`Policy 'name': …`).
+pub fn is_scan_policy_reason(reason: Option<&str>) -> bool {
+    reason.is_some_and(|r| r.contains("Policy '"))
+}
+
+/// Quarantine/age hold only. Scan-policy rows (`policy_blocked`, or a legacy
+/// `quarantined` stamp whose reason names a `Policy '…'`) are downloadable
+/// here so the scan-policy 403 can run instead of a quarantine 409.
+pub fn check_download_hold(
+    quarantine_status: Option<&str>,
+    quarantine_until_ts: Option<DateTime<Utc>>,
+    quarantine_reason: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if matches!(quarantine_status, Some("policy_blocked"))
+        || is_scan_policy_reason(quarantine_reason)
+    {
+        return Ok(());
+    }
     match quarantine_status {
         Some("quarantined") => {
             // If the quarantine period has expired, allow the download.
@@ -210,7 +232,7 @@ pub fn check_download_allowed(
         Some("rejected") => Err(AppError::Authorization(
             "Artifact was rejected during security review".to_string(),
         )),
-        // 'released', 'clean', 'unscanned', 'flagged', or NULL are all downloadable
+        // 'released', 'clean', 'unscanned', 'flagged', 'policy_blocked', or NULL
         _ => Ok(()),
     }
 }

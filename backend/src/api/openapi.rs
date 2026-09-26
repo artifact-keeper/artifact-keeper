@@ -219,6 +219,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("approval", handlers::approval::ApprovalApiDoc::openapi()),
         ("age_gate", handlers::age_gate::AgeGateApi::openapi()),
         (
+            "download_holds",
+            handlers::download_holds::DownloadHoldsApiDoc::openapi(),
+        ),
+        (
             "promotion_rules",
             handlers::promotion_rules::PromotionRulesApiDoc::openapi(),
         ),
