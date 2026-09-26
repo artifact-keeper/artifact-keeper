@@ -3037,6 +3037,14 @@ mod tests {
     /// galaxy.ansible.com spells it -- root-relative, against the ORIGIN and
     /// not against the configured `upstream_url` -- so a test that accidentally
     /// started following it would go somewhere the mock does not serve.
+    /// The handler table at its production `/ansible` prefix. Links are
+    /// derived from the path the request arrived on (#3873), so a test that
+    /// asserts the literal `/ansible/{key}/...` values a client sees in
+    /// production has to request through that prefix.
+    fn ansible_mount() -> axum::Router<SharedState> {
+        axum::Router::new().nest("/ansible", super::router())
+    }
+
     fn upstream_versions_page(versions: &[&str], count: usize, next: Option<&str>) -> String {
         let data: Vec<serde_json::Value> = versions
             .iter()
@@ -3466,11 +3474,11 @@ mod tests {
             .await;
         let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
 
-        let app = tdh::router_anon(super::router(), state);
+        let app = tdh::router_anon(ansible_mount(), state);
         let (status, body) = tdh::send(
             app,
             tdh::get(format!(
-                "/{}/api/v3/collections/testns/testcoll/versions/",
+                "/ansible/{}/api/v3/collections/testns/testcoll/versions/",
                 f.repo_key
             )),
         )
@@ -3710,11 +3718,11 @@ mod tests {
             .await;
         let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
 
-        let app = tdh::router_anon(super::router(), state);
+        let app = tdh::router_anon(ansible_mount(), state);
         let (status, body) = tdh::send(
             app,
             tdh::get(format!(
-                "/{}/api/v3/collections/testns/testcoll/versions/1.5.1/",
+                "/ansible/{}/api/v3/collections/testns/testcoll/versions/1.5.1/",
                 f.repo_key
             )),
         )
@@ -3967,11 +3975,11 @@ mod tests {
             .await;
         let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
 
-        let app = tdh::router_anon(super::router(), state);
+        let app = tdh::router_anon(ansible_mount(), state);
         let (status, body) = tdh::send(
             app,
             tdh::get(format!(
-                "/{}/api/v3/collections/testns/testcoll/",
+                "/ansible/{}/api/v3/collections/testns/testcoll/",
                 f.repo_key
             )),
         )
