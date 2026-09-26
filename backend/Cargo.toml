@@ -140,7 +140,7 @@ serde_yaml = "0.9"
 regex = "1.11"
 once_cell = "1"
 bzip2 = "0.6"
-zstd = "0.13"
+zstd = "0.14"
 rmp-serde = "1.3"
 # Conda semantics reference implementation (#4040): the crates pixi/prefix.dev
 # are built on, adopted so registry-side version ordering and MatchSpec
