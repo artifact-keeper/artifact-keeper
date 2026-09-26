@@ -285,6 +285,10 @@ Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
 
 Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artifactkeeper.com/docs/getting-started/quickstart/)**
 
+## ☁️ One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/artifact-keeper/)
+
 ## Documentation
 
 - **[Quickstart](https://artifactkeeper.com/docs/getting-started/quickstart/)** — Get running in 5 minutes
