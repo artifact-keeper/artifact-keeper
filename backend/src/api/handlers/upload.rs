@@ -740,10 +740,7 @@ async fn complete_session_commit(
     // immutability gate on the path this session already wrote.
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => {
-            UploadService::release_commit_lease(&state.db, &session).await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
-        }
+        Err(e) => return Err(release_after_precommit_failure(&state.db, &session, e).await),
     };
     if !is_replication_request {
         let admission =
@@ -759,8 +756,7 @@ async fn complete_session_commit(
                 Ok(admission) => admission,
                 Err(e) => {
                     drop(tx);
-                    UploadService::release_commit_lease(&state.db, &session).await;
-                    return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                    return Err(release_after_precommit_failure(&state.db, &session, e).await);
                 }
             };
         if !admission.allowed {
@@ -806,8 +802,7 @@ async fn complete_session_commit(
         Ok(id) => id,
         Err(e) => {
             drop(tx);
-            UploadService::release_commit_lease(&state.db, &session).await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            return Err(release_after_precommit_failure(&state.db, &session, e).await);
         }
     };
     if let Err(e) = tx.commit().await {
@@ -1072,6 +1067,25 @@ async fn settle_completed_session(
             Err(e)
         }
     }
+}
+
+/// A database failure BEFORE the artifact transaction commits (opening it,
+/// quota-ledger admission, the artifact upsert) leaves nothing written that a
+/// retry could collide with, and the staged chunks are still in storage: give
+/// the lease back so the client can re-issue the completion, and answer 500.
+/// The caller must already have dropped (rolled back) its transaction.
+async fn release_after_precommit_failure(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    error: impl std::fmt::Display,
+) -> Response {
+    tracing::warn!(
+        session = %session.id,
+        error = %error,
+        "chunked completion failed before commit; lease released for retry"
+    );
+    UploadService::release_commit_lease(db, session).await;
+    map_err(StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
 /// Map any displayable error to an HTTP error response.
@@ -4375,6 +4389,176 @@ mod tests {
         );
 
         cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
+    }
+
+    /// Session state after a completion attempt: (status, token, deadline).
+    async fn lease_state(
+        f: &tdh::Fixture,
+        session_id: Uuid,
+    ) -> (String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>) {
+        sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read lease state")
+    }
+
+    /// S4 (#3922 review): the shared pre-commit failure branch — used for a
+    /// failed `BEGIN`, a quota-ledger error and an upsert error — releases the
+    /// lease, keeps the staged chunks, answers 500, and leaves the session
+    /// completable.
+    #[tokio::test]
+    async fn precommit_failure_releases_the_lease_and_keeps_the_staged_chunks() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"precommit-failure-release-payload";
+        let (session_id, staged) = stage_completable_session(&f, payload).await;
+        let session = UploadService::complete_session(&f.pool, session_id, f.user_id)
+            .await
+            .expect("claim completion lease");
+
+        let resp =
+            release_after_precommit_failure(&f.pool, &session, "simulated BEGIN failure").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, token, deadline) = lease_state(&f, session_id).await;
+        assert_eq!(status, "in_progress", "a pre-commit failure is retryable");
+        assert!(
+            token.is_none() && deadline.is_none(),
+            "the lease is released"
+        );
+        assert!(
+            staged.exists().await,
+            "the staged chunks are kept for the retry"
+        );
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retried completion succeeds; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// S4 end to end: the artifact upsert fails (a path-scoped trigger
+    /// raises), the handler releases the lease and keeps the staged chunks,
+    /// and once the fault clears the same session completes.
+    #[tokio::test]
+    async fn complete_upsert_failure_is_retryable_without_reupload() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("s4/upsert-fails-{}.bin", Uuid::new_v4().simple());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let func = format!("ak_test_s4_fail_{suffix}");
+        let trigger = format!("ak_test_s4_trg_{suffix}");
+        let create_fn = format!(
+            "CREATE FUNCTION {func}() RETURNS trigger AS $$ BEGIN \
+               IF NEW.path = '{path}' THEN RAISE EXCEPTION 'injected upsert failure'; END IF; \
+               RETURN NEW; END; $$ LANGUAGE plpgsql"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(&*create_fn))
+            .execute(&f.pool)
+            .await
+            .expect("create failing trigger function");
+        let create_trg = format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(&*create_trg))
+            .execute(&f.pool)
+            .await
+            .expect("create failing trigger");
+
+        let payload: &[u8] = b"upsert-failure-retry-payload";
+        let (session_id, staged) = stage_completable_session_at(&f, payload, &path).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+
+        let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger} ON artifacts");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trg))
+            .execute(&f.pool)
+            .await;
+        let drop_fn = format!("DROP FUNCTION IF EXISTS {func}()");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_fn))
+            .execute(&f.pool)
+            .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (state, token, deadline) = lease_state(&f, session_id).await;
+        assert_eq!(
+            state, "in_progress",
+            "an upsert failure must not fail the session"
+        );
+        assert!(
+            token.is_none() && deadline.is_none(),
+            "the lease is released"
+        );
+        assert!(
+            staged.exists().await,
+            "the staged chunks survive for the retry"
+        );
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retried completion succeeds without re-uploading; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// The replication-retry cleanup deletes a stale replication session that
+    /// staged its chunks in shared storage, and purges those chunks inline —
+    /// the row it deletes was their only record besides the orphan queue.
+    #[tokio::test]
+    async fn stale_replication_session_cleanup_purges_storage_staged_chunks() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = "replication/stale-staged.bin";
+        let (session_id, staged) =
+            stage_completable_session_at(&f, b"stale replication bytes", path).await;
+        sqlx::query("UPDATE upload_sessions SET is_replication = true WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("mark replication session");
+        assert!(staged.exists().await);
+
+        cleanup_stale_replication_upload_sessions(&f.state, f.repo_id, path).await;
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "the stale replication session is removed");
+        assert!(
+            !staged.exists().await,
+            "its storage-staged chunks are purged inline"
+        );
+
+        let _ = sqlx::query("DELETE FROM upload_staging_orphans WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
         f.teardown().await;
     }
 

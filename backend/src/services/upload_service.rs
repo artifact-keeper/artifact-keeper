@@ -3641,6 +3641,69 @@ mod tests {
         teardown_lease_fixture(&f).await;
     }
 
+    /// Review nit 5: when the refused chunk's delete also fails, the session
+    /// is queued in `upload_staging_orphans` and the reaper purges it later.
+    #[tokio::test]
+    async fn refused_chunk_whose_delete_fails_is_queued_for_the_reaper() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_chunks SET status = 'pending' WHERE session_id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reopen chunk");
+        f.storage.delete(&f.chunk_key()).await.expect("unstage");
+
+        let storage = ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: Some((f.pool.clone(), f.session_id)),
+            fail_delete: std::sync::atomic::AtomicBool::new(true),
+        };
+        let result = UploadService::upload_chunk(
+            &f.pool,
+            &storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(LEASE_PAYLOAD),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UploadError::InvalidStatus(ref s)) if s == "cancelled"),
+            "got {result:?}"
+        );
+        assert!(
+            f.chunk_staged().await,
+            "the delete failed, so the chunk is still there"
+        );
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(queued, 1, "the leaked chunk must be queued for the reaper");
+
+        UploadService::cleanup_expired(&f.pool, &f.registry())
+            .await
+            .expect("reaper ok");
+        assert!(
+            !f.chunk_staged().await,
+            "the reaper purges the queued chunk"
+        );
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(left, 0, "the orphan row is consumed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
     /// S2: the reaper stamps `staging_purged_at` only after the deletes
     /// succeeded, so a storage failure leaves the session to be retried.
     #[tokio::test]
