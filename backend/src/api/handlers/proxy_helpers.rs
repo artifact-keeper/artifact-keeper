@@ -4278,8 +4278,9 @@ pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> b
 /// stored in a CALLER-INDEPENDENT cache (#3323).
 ///
 /// Several formats front their aggregated virtual document with a shared cache
-/// keyed by repository/document and NOT by caller — npm's computed packument
-/// cache, cargo's in-process sparse-index cache. Once the aggregation is
+/// keyed by repository/document and NOT by caller — cargo's in-process
+/// sparse-index cache, and npm's computed packument cache until #4240 keyed it
+/// by the caller's authorized member list instead. Once the aggregation is
 /// narrowed to the members the caller may read, that document becomes
 /// caller-dependent, and a caller-independent cache in front of it re-opens the
 /// leak from the other side: the first authorized request stores a document

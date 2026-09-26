@@ -222,6 +222,33 @@ fn base_url_hash(base_url: &str) -> String {
     hex::encode(Sha256::digest(base_url.as_bytes()))[..16].to_string()
 }
 
+/// Digest of a virtual repository's authorized member list, in merge order
+/// (#4240). The leading `m` makes the key segment self-describing and keeps it
+/// disjoint from the Accept segment (`full` / `corgi`) that follows the package
+/// in a Remote key.
+///
+/// ORDER, not set: the npm virtual merge is order-sensitive —
+/// the higher-priority member wins a version or dist-tag — so two orders of the
+/// same members can produce different documents and must not share an entry.
+/// Member ids are fixed-width, so concatenating them is unambiguous.
+pub fn member_list_digest(member_ids: &[uuid::Uuid]) -> String {
+    let mut hasher = Sha256::new();
+    for id in member_ids {
+        hasher.update(id.as_bytes());
+    }
+    format!("m{}", &hex::encode(hasher.finalize())[..16])
+}
+
+/// The `{repo_key}:{package}:` head of every key, followed by the member-list
+/// segment when there is one. Shared by every key constructor so the cache key,
+/// the flight key and the eviction prefixes cannot disagree on layout.
+fn key_head(repo_key: &str, package: &str, member_list: Option<&str>) -> String {
+    match member_list {
+        Some(digest) => format!("{}:{}:{}:", repo_key, package, digest),
+        None => format!("{}:{}:", repo_key, package),
+    }
+}
+
 /// Cache key: `"{repo_key}:{package}:{accept_variant}:{encoding}:{base_hash}"`.
 ///
 /// `repo_key` and `package` lead so [`invalidation_prefix`] can drop every
@@ -233,10 +260,26 @@ pub fn cache_key(
     gzip: bool,
     base_url: &str,
 ) -> String {
+    member_scoped_cache_key(repo_key, package, None, want_abbreviated, gzip, base_url)
+}
+
+/// [`cache_key`] for a document computed from one authorized member list
+/// (#4240): `"{repo_key}:{package}:{member_list}:{accept_variant}:..."`.
+///
+/// The member-list segment sits third, so [`invalidation_prefix`] still matches
+/// every list's entries (a publish drops them all) while
+/// [`member_list_prefix`] selects exactly one list's.
+pub fn member_scoped_cache_key(
+    repo_key: &str,
+    package: &str,
+    member_list: Option<&str>,
+    want_abbreviated: bool,
+    gzip: bool,
+    base_url: &str,
+) -> String {
     format!(
-        "{}:{}:{}:{}:{}",
-        repo_key,
-        package,
+        "{}{}:{}:{}",
+        key_head(repo_key, package, member_list),
         accept_variant(want_abbreviated),
         encoding_label(gzip),
         base_url_hash(base_url)
@@ -248,19 +291,36 @@ pub fn cache_key(
 /// encoding dimension is deliberately absent: gzip and identity requests for
 /// the same packument share one upstream fetch.
 pub fn flight_key(repo_key: &str, package: &str, want_abbreviated: bool, base_url: &str) -> String {
+    member_scoped_flight_key(repo_key, package, None, want_abbreviated, base_url)
+}
+
+/// [`flight_key`] for one authorized member list. Different lists compute
+/// different documents, so they must never coalesce onto one refresh.
+pub fn member_scoped_flight_key(
+    repo_key: &str,
+    package: &str,
+    member_list: Option<&str>,
+    want_abbreviated: bool,
+    base_url: &str,
+) -> String {
     format!(
-        "{}:{}:{}:{}",
-        repo_key,
-        package,
+        "{}{}:{}",
+        key_head(repo_key, package, member_list),
         accept_variant(want_abbreviated),
         base_url_hash(base_url)
     )
 }
 
+/// Prefix matching every cached variant of one package computed from ONE
+/// authorized member list (#4240), and nothing computed from any other list.
+pub fn member_list_prefix(repo_key: &str, package: &str, member_list: &str) -> String {
+    key_head(repo_key, package, Some(member_list))
+}
+
 /// Prefix matching every cached variant (full/corgi x identity/gzip x any
-/// base URL) of one package in one repo.
+/// base URL x any member list) of one package in one repo.
 pub fn invalidation_prefix(repo_key: &str, package: &str) -> String {
-    format!("{}:{}:", repo_key, package)
+    key_head(repo_key, package, None)
 }
 
 /// Recover the [`invalidation_prefix`] from a full cache key. Repo keys and
@@ -279,6 +339,55 @@ fn key_invalidation_prefix(key: &str) -> String {
         }
     }
     key[..end].to_string()
+}
+
+/// The index-set prefix an eviction for `prefix` must read: its two-segment
+/// package prefix, or `prefix` itself when it has fewer than two segments (the
+/// historical behaviour, kept for any caller passing something unusual).
+fn index_prefix_for(prefix: &str) -> String {
+    let package_prefix = key_invalidation_prefix(prefix);
+    if package_prefix.is_empty() {
+        prefix.to_string()
+    } else {
+        package_prefix
+    }
+}
+
+/// What one prefix eviction removes from a package's key-index set.
+#[derive(Debug, PartialEq, Eq)]
+struct IndexEviction {
+    /// Namespaced entry keys to unlink.
+    keys: Vec<Vec<u8>>,
+    /// Whether the index set itself goes too — only when the whole package is.
+    drop_index: bool,
+}
+
+/// Decide what the shared backend evicts for `prefix`, given the namespaced
+/// keys indexed under its `package_prefix` (#4240).
+///
+/// [`PackumentCacheBackend::invalidate_prefix`] promises to drop every entry
+/// whose key starts with `prefix`. The in-process backend always did; the
+/// Redis backend read `prefix` as the NAME of an index set, which only exists
+/// for a two-segment package prefix, so any narrower prefix was silently a
+/// no-op there. Filtering the package's index by `starts_with` makes the two
+/// agree. A package prefix still matches every member, so every pre-existing
+/// caller — all of which pass package prefixes — gets exactly the eviction it
+/// got before.
+fn plan_index_eviction(prefix: &str, package_prefix: &str, members: Vec<Vec<u8>>) -> IndexEviction {
+    if prefix == package_prefix {
+        return IndexEviction {
+            keys: members,
+            drop_index: true,
+        };
+    }
+    let wanted = format!("{}{}", REDIS_ENTRY_NAMESPACE, prefix);
+    IndexEviction {
+        keys: members
+            .into_iter()
+            .filter(|key| key.starts_with(wanted.as_bytes()))
+            .collect(),
+        drop_index: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +873,10 @@ impl SharedCacheBackend for RedisPackumentCache {
 
     async fn try_invalidate_prefix(&self, prefix: &str) -> Result<(), SharedCacheUnavailable> {
         let mut conn = self.connection().await?;
-        let index_key = Self::index_key(prefix);
+        // Entries are only ever indexed under their two-segment package
+        // prefix, so that is the set to read even when `prefix` is longer.
+        let package_prefix = index_prefix_for(prefix);
+        let index_key = Self::index_key(&package_prefix);
         let members: Vec<Vec<u8>> = redis::cmd("SMEMBERS")
             .arg(&index_key)
             .query_async(&mut conn)
@@ -772,13 +884,26 @@ impl SharedCacheBackend for RedisPackumentCache {
             // A failed invalidation means other replicas may serve this
             // package stale for up to the stale window.
             .map_err(|e| self.command_error("invalidate-index", &e))?;
-        let mut unlink = redis::cmd("UNLINK");
-        for member in &members {
-            unlink.arg(member);
+        let plan = plan_index_eviction(prefix, &package_prefix, members);
+        if plan.keys.is_empty() && !plan.drop_index {
+            self.note_success();
+            return Ok(());
         }
-        unlink.arg(&index_key);
-        unlink
-            .query_async::<()>(&mut conn)
+        let mut pipe = redis::pipe();
+        let unlink = pipe.cmd("UNLINK");
+        for key in &plan.keys {
+            unlink.arg(key);
+        }
+        if plan.drop_index {
+            unlink.arg(&index_key);
+        } else {
+            // A narrower eviction leaves the rest of the package indexed.
+            let srem = pipe.cmd("SREM").arg(&index_key);
+            for key in &plan.keys {
+                srem.arg(key);
+            }
+        }
+        pipe.query_async::<()>(&mut conn)
             .await
             .map_err(|e| self.command_error("invalidate-unlink", &e))?;
         self.note_success();
@@ -1118,6 +1243,27 @@ impl NpmPackumentCache {
         self.backend.invalidate_prefix(&prefix).await;
     }
 
+    /// Drop every cached variant of `package` computed from ONE authorized
+    /// member list (#4240), leaving every other list's entries in place.
+    ///
+    /// This is what a definitive 404 for that list evicts. A 404 computed from
+    /// list `L` says nothing about a larger list that includes a member still
+    /// carrying the package, and evicting the whole package on it would let
+    /// any caller flush every other caller's entries on demand. Each list
+    /// still evicts on its own next refresh, so a takedown reaches all of them.
+    ///
+    /// Deliberately does NOT bump the package's invalidation generation. That
+    /// counter exists so a publish beats in-flight computes; bumping it here
+    /// would let one list's 404 discard other lists' in-flight stores. The cost
+    /// is that a compute for this same list that started before the 404 can
+    /// re-store its pre-404 document, which that list's next refresh evicts
+    /// again.
+    pub async fn invalidate_member_list(&self, repo_key: &str, package: &str, member_list: &str) {
+        self.backend
+            .invalidate_prefix(&member_list_prefix(repo_key, package, member_list))
+            .await;
+    }
+
     /// Claim the background refresh for `flight_key`. Returns `None` when a
     /// refresh is already in flight, so a burst of stale hits spawns exactly
     /// one refresh task.
@@ -1300,6 +1446,155 @@ mod tests {
             content_encoding: Some("gzip".to_string()),
             etag: "\"test-etag-gz\"".to_string(),
         }
+    }
+
+    // -- member-list keys (#4240) ------------------------------------------------
+
+    fn ids(n: u8) -> Vec<uuid::Uuid> {
+        (1..=n).map(|i| uuid::Uuid::from_bytes([i; 16])).collect()
+    }
+
+    #[test]
+    fn member_list_digest_is_order_sensitive_and_self_describing() {
+        let forward = ids(2);
+        let reversed: Vec<_> = forward.iter().rev().copied().collect();
+        let digest = member_list_digest(&forward);
+        assert!(digest.starts_with('m') && digest.len() == 17, "{digest}");
+        assert_eq!(digest, member_list_digest(&forward), "deterministic");
+        assert_ne!(
+            digest,
+            member_list_digest(&reversed),
+            "two orders can merge differently, so they must not share an entry"
+        );
+        assert_ne!(
+            digest,
+            member_list_digest(&forward[..1]),
+            "a sub-list differs"
+        );
+    }
+
+    #[test]
+    fn remote_keys_keep_their_historical_layout() {
+        // Literal, not re-derived: a Remote key change would orphan every
+        // existing shared-cache entry on upgrade.
+        let key = cache_key("npm-remote", "left-pad", false, true, "http://a");
+        assert!(key.starts_with("npm-remote:left-pad:full:gzip:"), "{key}");
+        assert_eq!(
+            flight_key("npm-remote", "left-pad", true, "http://a"),
+            member_scoped_flight_key("npm-remote", "left-pad", None, true, "http://a")
+        );
+    }
+
+    #[test]
+    fn member_scoped_keys_nest_under_both_eviction_prefixes() {
+        let list_a = member_list_digest(&ids(2));
+        let list_b = member_list_digest(&ids(1));
+        let key_a = member_scoped_cache_key(
+            "npm-virtual",
+            "pkg",
+            Some(&list_a),
+            false,
+            false,
+            "http://a",
+        );
+        let key_b = member_scoped_cache_key(
+            "npm-virtual",
+            "pkg",
+            Some(&list_b),
+            false,
+            false,
+            "http://a",
+        );
+        let remote = cache_key("npm-virtual", "pkg", false, false, "http://a");
+
+        // A publish drops every list's entries...
+        let package = invalidation_prefix("npm-virtual", "pkg");
+        assert!(key_a.starts_with(&package) && key_b.starts_with(&package));
+        assert_eq!(key_invalidation_prefix(&key_a), package);
+        // ...and a list's own prefix selects that list and nothing else.
+        let prefix_a = member_list_prefix("npm-virtual", "pkg", &list_a);
+        assert!(key_a.starts_with(&prefix_a));
+        assert!(!key_b.starts_with(&prefix_a));
+        assert!(!remote.starts_with(&prefix_a));
+        // Different lists never coalesce onto one refresh.
+        assert_ne!(
+            member_scoped_flight_key("npm-virtual", "pkg", Some(&list_a), false, "http://a"),
+            member_scoped_flight_key("npm-virtual", "pkg", Some(&list_b), false, "http://a")
+        );
+    }
+
+    #[test]
+    fn index_eviction_for_a_package_prefix_is_unchanged() {
+        let members = vec![b"k1".to_vec(), b"k2".to_vec()];
+        let plan = plan_index_eviction("r:p:", "r:p:", members.clone());
+        assert_eq!(
+            plan,
+            IndexEviction {
+                keys: members,
+                drop_index: true
+            }
+        );
+        assert_eq!(index_prefix_for("r:p:"), "r:p:");
+        assert_eq!(index_prefix_for("r:p:mabc:"), "r:p:");
+        assert_eq!(index_prefix_for("no-separators"), "no-separators");
+    }
+
+    #[test]
+    fn index_eviction_for_a_narrower_prefix_filters_the_package_index() {
+        let ns = REDIS_ENTRY_NAMESPACE;
+        let keep = format!("{ns}r:p:mbbb:full:identity:h").into_bytes();
+        let drop_one = format!("{ns}r:p:maaa:full:identity:h").into_bytes();
+        let drop_two = format!("{ns}r:p:maaa:corgi:gzip:h").into_bytes();
+        let plan = plan_index_eviction(
+            "r:p:maaa:",
+            "r:p:",
+            vec![keep, drop_one.clone(), drop_two.clone()],
+        );
+        assert_eq!(plan.keys, vec![drop_one, drop_two]);
+        assert!(!plan.drop_index, "the rest of the package stays indexed");
+
+        let none = plan_index_eviction("r:p:mzzz:", "r:p:", vec![b"unrelated".to_vec()]);
+        assert!(none.keys.is_empty() && !none.drop_index);
+    }
+
+    #[tokio::test]
+    async fn invalidate_member_list_leaves_other_lists_and_generation_alone() {
+        let cache = NpmPackumentCache::new(
+            Arc::new(InProcessPackumentCache::new(Duration::from_secs(3600))),
+            Duration::from_secs(300),
+        );
+        let list_a = member_list_digest(&ids(2));
+        let list_b = member_list_digest(&ids(1));
+        let key = |list: &str, gzip| {
+            member_scoped_cache_key("npm-virtual", "pkg", Some(list), false, gzip, "http://a")
+        };
+        for list in [&list_a, &list_b] {
+            for gzip in [false, true] {
+                cache.store(&key(list, gzip), entry(b"{}")).await;
+            }
+        }
+        let guard = cache.begin_store("npm-virtual", "pkg");
+
+        cache
+            .invalidate_member_list("npm-virtual", "pkg", &list_a)
+            .await;
+        for gzip in [false, true] {
+            assert!(cache.lookup(&key(&list_a, gzip)).await.is_none());
+            assert!(cache.lookup(&key(&list_b, gzip)).await.is_some());
+        }
+        // Another list's in-flight compute still stores: no generation bump.
+        let late = key(&list_b, false);
+        cache
+            .store_guarded(&guard, &late, entry(b"{\"late\":1}"))
+            .await;
+        assert_eq!(
+            cache.lookup(&late).await.map(|(e, _)| e.bytes),
+            Some(Bytes::from_static(b"{\"late\":1}"))
+        );
+
+        // A publish still drops every list.
+        cache.invalidate_package("npm-virtual", "pkg").await;
+        assert!(cache.lookup(&key(&list_b, false)).await.is_none());
     }
 
     // -- freshness classification --------------------------------------------
@@ -1740,6 +2035,36 @@ mod tests {
                 .expect("get survivor")
                 .is_some(),
             "invalidation must not touch other packages"
+        );
+
+        // #4240: a narrower prefix evicts only the matching member list and
+        // keeps the rest of the package indexed, so a later package-wide
+        // invalidation still finds the survivor.
+        let list_a = member_list_digest(&[uuid::Uuid::from_bytes([1; 16])]);
+        let list_b = member_list_digest(&[uuid::Uuid::from_bytes([2; 16])]);
+        for list in [&list_a, &list_b] {
+            let key = member_scoped_cache_key(&repo, "pkg", Some(list), false, false, base);
+            backend
+                .try_set(&key, &prefix, entry(b"{}"))
+                .await
+                .expect("set member-list entry");
+        }
+        backend
+            .try_invalidate_prefix(&member_list_prefix(&repo, "pkg", &list_a))
+            .await
+            .expect("narrow invalidate");
+        let key_a = member_scoped_cache_key(&repo, "pkg", Some(&list_a), false, false, base);
+        let key_b = member_scoped_cache_key(&repo, "pkg", Some(&list_b), false, false, base);
+        assert_eq!(backend.try_get(&key_a).await.expect("get a"), None);
+        assert!(backend.try_get(&key_b).await.expect("get b").is_some());
+        backend
+            .try_invalidate_prefix(&prefix)
+            .await
+            .expect("package invalidate after narrow");
+        assert_eq!(
+            backend.try_get(&key_b).await.expect("get b after package"),
+            None,
+            "the survivor must still be indexed under the package"
         );
 
         // Repeat invalidation of a now-empty index is a no-op, not an error.
