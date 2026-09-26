@@ -2646,6 +2646,13 @@ async fn serve_artifact(
                 )
                 .await?;
 
+                // Only the winning member's result reaches here, so this counts once;
+                // proxy-member and row-less legacy serves carry `None` (#1278).
+                if let Some(artifact_id) = result.artifact_id {
+                    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
+                        .await;
+                }
+
                 return proxy_helpers::stream_fetch_result(
                     result,
                     content_type_for_path(path),
@@ -5803,6 +5810,7 @@ mod tests {
             .body(Body::empty())
             .expect("build GET alias jar");
         let (status, body) = tdh::send(router, req).await;
+        let recorded = poll_download_count(&pool, artifact_id_db, 1).await;
 
         // -- Cleanup first so a failed assert does not leak DB state.
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
@@ -5830,6 +5838,97 @@ mod tests {
             &jar_bytes[..],
             "virtual-served bytes must match the original jar content"
         );
+        assert_eq!(
+            recorded, 1,
+            "a SNAPSHOT alias served from a hosted virtual member must be counted once"
+        );
+    }
+
+    /// Poll (bounded, ~2s) until `artifact_id` has at least `expected`
+    /// `download_statistics` rows; `record_download` writes asynchronously (#2522).
+    async fn poll_download_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    /// A release jar served through a virtual repo from its hosted member is
+    /// counted exactly once, like the same jar fetched from the hosted repo
+    /// directly; a HEAD probe through the virtual is not counted.
+    #[tokio::test]
+    async fn test_virtual_repo_hosted_member_download_is_recorded() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (hosted_id, _hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let artifact_row_id =
+            insert_maven_artifact_row(&pool, hosted_id, user_id, "com.example.vdl", "counted")
+                .await;
+        let path = "com/example/vdl/counted/1.0.0/counted-1.0.0.jar";
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: hosted_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage_for_repo")
+            .put(&format!("maven/{path}"), bytes::Bytes::from_static(b"j"))
+            .await
+            .expect("put jar bytes on hosted storage");
+
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        tdh::publish_repo(&pool, hosted_id).await;
+
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let request = |method: &str| {
+            Request::builder()
+                .method(method)
+                .uri(format!("/{virtual_key}/{path}"))
+                .body(Body::empty())
+                .expect("build virtual jar request")
+        };
+
+        let (get_status, get_body) = tdh::send(router.clone(), request("GET")).await;
+        let after_get = poll_download_count(&pool, artifact_row_id, 1).await;
+        let (head_status, _) = tdh::send(router, request("HEAD")).await;
+        let after_head = poll_download_count(&pool, artifact_row_id, 2).await;
+
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            get_status,
+            StatusCode::OK,
+            "virtual GET must serve the hosted jar"
+        );
+        assert_eq!(&get_body[..], b"j");
+        assert_eq!(after_get, 1, "the virtual GET must record one download");
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(after_head, 1, "a HEAD through the virtual must not record");
     }
 
     /// #4286: every read of a hosted Maven artifact, direct or through a
@@ -5986,7 +6085,7 @@ mod tests {
         user_id: Uuid,
         group_id: &str,
         artifact_id: &str,
-    ) {
+    ) -> Uuid {
         let group_path = group_id.replace('.', "/");
         let version = "1.0.0";
         let path = format!(
@@ -6045,6 +6144,8 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert packages catalog row");
+
+        artifact_row_id
     }
 
     #[tokio::test]
