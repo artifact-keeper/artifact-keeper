@@ -27,6 +27,7 @@ pub mod conda_scripts;
 pub mod conda_semantics;
 pub mod declared_dependencies;
 pub mod dependency_track_service;
+pub mod device_service;
 pub mod download_event_dispatch;
 pub mod egress_proxy;
 pub mod email_dispatcher;

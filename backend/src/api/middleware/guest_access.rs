@@ -9,6 +9,8 @@
 //! * `/api/v1/auth/*`              login, refresh, logout, SSO callbacks
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
+//! * `/device`, `/device/app.js`,
+//!   `/device/app.css`             device authorization page (#3461)
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -117,6 +119,10 @@ fn is_allowlisted(path: &str) -> bool {
             | "/livez"
             | "/api/v1/system/config"
             | "/v2/token"
+            | "/device"
+            | "/device/"
+            | "/device/app.js"
+            | "/device/app.css"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")
@@ -355,6 +361,19 @@ mod tests {
             "/v2/library/nginx/referrers/sha256:abc",
         ] {
             assert!(!is_allowlisted(p), "{p} must not be allowlisted");
+        }
+    }
+
+    #[test]
+    fn allowlist_carries_the_device_page_exactly() {
+        // The RFC 8628 verification page must load with guest access off
+        // (the user signs in on it); its assets are exact entries, not a
+        // `/device` prefix that would open anything mounted beneath it.
+        for p in ["/device", "/device/app.js", "/device/app.css"] {
+            assert!(is_allowlisted(p), "{p} should be allowlisted");
+        }
+        for p in ["/device/other", "/devices", "/device/app.js/x", "/deviceX"] {
+            assert!(!is_allowlisted(p), "{p} must stay gated");
         }
     }
 

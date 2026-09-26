@@ -298,6 +298,97 @@ fn default_auth_max_concurrency() -> usize {
     std::cmp::max(32, cores.saturating_mul(8))
 }
 
+/// Settings for the Device Authorization Grant (RFC 8628, #3461).
+///
+/// The grant lets a headless client (a CLI, a CI runner, a device without a
+/// browser) obtain AK tokens by showing its user a short code that the user
+/// approves from an already signed-in browser session. It is an
+/// unauthenticated token-issuing surface and a well-known phishing lure
+/// (an attacker starts a flow and persuades a victim to approve the code), so
+/// it is **off by default**: operators opt in with `DEVICE_AUTH_ENABLED=true`.
+/// While it is off, every device route answers 404.
+///
+/// All numeric settings are clamped to safe ranges when read from the
+/// environment, so a typo cannot produce a code that never expires or a
+/// polling interval of zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceAuthConfig {
+    /// Master switch. Env: `DEVICE_AUTH_ENABLED` (`true`/`1`). Default off.
+    pub enabled: bool,
+    /// Lifetime of a device code / user code pair, in seconds. RFC 8628
+    /// §3.2 `expires_in`. Env: `DEVICE_AUTH_CODE_TTL_SECS`, clamped to
+    /// 60..=1800. Default 600.
+    pub code_ttl_secs: u32,
+    /// Minimum seconds between token polls (RFC 8628 §3.2 `interval`). Each
+    /// `slow_down` adds 5 seconds for that code. Env:
+    /// `DEVICE_AUTH_POLL_INTERVAL_SECS`, clamped to 1..=60. Default 5.
+    pub poll_interval_secs: u32,
+    /// Device-code requests allowed per client IP per
+    /// `rate_limit_window_secs`. Env: `DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW`,
+    /// clamped to 1..=1000. Default 10.
+    pub code_requests_per_window: u32,
+    /// Wrong or malformed user codes one user may submit per
+    /// `failed_attempt_window_secs` before verification, approval and denial
+    /// are refused with 429. Env: `DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER`,
+    /// clamped to 1..=100. Default 5.
+    pub max_failed_attempts_per_user: u32,
+    /// The same budget keyed by client IP, so one host cannot multiply its
+    /// guesses across many accounts. Env:
+    /// `DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP`, clamped to 1..=1000.
+    /// Default 20.
+    pub max_failed_attempts_per_ip: u32,
+    /// Window for both failed-attempt budgets, in seconds. Env:
+    /// `DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS`, clamped to 60..=86400.
+    /// Default 900.
+    pub failed_attempt_window_secs: u64,
+}
+
+impl Default for DeviceAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            code_ttl_secs: 600,
+            poll_interval_secs: 5,
+            code_requests_per_window: 10,
+            max_failed_attempts_per_user: 5,
+            max_failed_attempts_per_ip: 20,
+            failed_attempt_window_secs: 900,
+        }
+    }
+}
+
+impl DeviceAuthConfig {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            enabled: matches!(env::var("DEVICE_AUTH_ENABLED").as_deref(), Ok("true" | "1")),
+            code_ttl_secs: env_parse("DEVICE_AUTH_CODE_TTL_SECS", d.code_ttl_secs).clamp(60, 1800),
+            poll_interval_secs: env_parse("DEVICE_AUTH_POLL_INTERVAL_SECS", d.poll_interval_secs)
+                .clamp(1, 60),
+            code_requests_per_window: env_parse(
+                "DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW",
+                d.code_requests_per_window,
+            )
+            .clamp(1, 1000),
+            max_failed_attempts_per_user: env_parse(
+                "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER",
+                d.max_failed_attempts_per_user,
+            )
+            .clamp(1, 100),
+            max_failed_attempts_per_ip: env_parse(
+                "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP",
+                d.max_failed_attempts_per_ip,
+            )
+            .clamp(1, 1000),
+            failed_attempt_window_secs: env_parse(
+                "DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS",
+                d.failed_attempt_window_secs,
+            )
+            .clamp(60, 86_400),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -658,6 +749,10 @@ pub struct Config {
     /// on the server side: it gates no endpoint, so flipping it never locks
     /// anyone out.
     pub oidc_silent_sso_enabled: bool,
+
+    /// Device Authorization Grant (RFC 8628) settings (#3461). Off unless
+    /// `DEVICE_AUTH_ENABLED=true`; see [`DeviceAuthConfig`].
+    pub device_auth: DeviceAuthConfig,
 
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
@@ -1145,6 +1240,7 @@ redacted_debug!(Config {
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
+    show device_auth,
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
@@ -1276,6 +1372,7 @@ impl Default for Config {
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
+            device_auth: DeviceAuthConfig::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -1549,6 +1646,7 @@ impl Config {
                 env::var("OIDC_SILENT_SSO").as_deref(),
                 Ok("false" | "0")
             ),
+            device_auth: DeviceAuthConfig::from_env(),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
@@ -3544,6 +3642,54 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("OIDC_SILENT_SSO", saved_flag);
+    }
+
+    #[test]
+    fn test_device_auth_config_defaults_off_and_clamps() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        const KEYS: &[&str] = &[
+            "DEVICE_AUTH_ENABLED",
+            "DEVICE_AUTH_CODE_TTL_SECS",
+            "DEVICE_AUTH_POLL_INTERVAL_SECS",
+            "DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW",
+            "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER",
+            "DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP",
+            "DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS",
+        ];
+        let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
+
+        // Unset: the grant is off and every knob has its documented default.
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        assert_eq!(DeviceAuthConfig::from_env(), DeviceAuthConfig::default());
+        assert!(!DeviceAuthConfig::default().enabled);
+
+        // Only an explicit true/1 turns it on; a typo leaves it off.
+        env::set_var("DEVICE_AUTH_ENABLED", "yes");
+        assert!(!DeviceAuthConfig::from_env().enabled);
+        env::set_var("DEVICE_AUTH_ENABLED", "1");
+        assert!(DeviceAuthConfig::from_env().enabled);
+
+        // Out-of-range values are clamped rather than honoured, so a code can
+        // neither live forever nor be polled with no interval.
+        env::set_var("DEVICE_AUTH_CODE_TTL_SECS", "999999");
+        env::set_var("DEVICE_AUTH_POLL_INTERVAL_SECS", "0");
+        env::set_var("DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW", "0");
+        env::set_var("DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_USER", "100000");
+        env::set_var("DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP", "0");
+        env::set_var("DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS", "1");
+        let config = DeviceAuthConfig::from_env();
+        assert_eq!(config.code_ttl_secs, 1800);
+        assert_eq!(config.poll_interval_secs, 1);
+        assert_eq!(config.code_requests_per_window, 1);
+        assert_eq!(config.max_failed_attempts_per_user, 100);
+        assert_eq!(config.max_failed_attempts_per_ip, 1);
+        assert_eq!(config.failed_attempt_window_secs, 60);
+
+        for (key, value) in KEYS.iter().zip(saved) {
+            restore_env(key, value);
+        }
     }
 
     #[test]

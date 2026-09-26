@@ -21,6 +21,11 @@
 #   2. The SSO handler (`sso.rs`) references the shared federated-login audit
 #      helper `audit_federated_login`, and each production `authenticate_federated`
 #      call site is accompanied by at least one federated-login audit call.
+#   3. The device-grant handler (`device.rs`, #3461) persists every minted
+#      refresh JTI (so device-issued families take part in replay detection
+#      and revocation, #1819) and audits token issuance, code issuance,
+#      approval, denial, failed/throttled user-code attempts, replayed codes
+#      and approvals that expire unredeemed.
 #
 # Mirrors the style of `scripts/ci/check-token-mint-surface.sh` (#1315).
 # Exits non-zero (failing the build) on any drift.
@@ -109,6 +114,28 @@ if os.path.exists(sso_path):
             f"call(s). Each federated-login path MUST record both its success (Login) "
             f"and failure (LoginFailed) outcome (#1617 Phase 1)."
         )
+
+# --- 3. Device-grant mint and approval audit coverage ------------------------
+device_path = os.path.join(handlers_dir, "device.rs")
+if os.path.exists(device_path):
+    device_prod = production_text(device_path)
+    if "generate_tokens_with_scope" in device_prod:
+        required_markers = {
+            "persist_refresh_jti_from_pair": "persist the minted refresh JTI for replay detection",
+            "AuditAction::Login,": "audit device token issuance as a login",
+            "AuditAction::DeviceCodeIssued": "audit device code issuance",
+            "AuditAction::DeviceAuthorizationApproved": "audit device approvals",
+            "AuditAction::DeviceAuthorizationDenied": "audit device denials",
+            "AuditAction::DeviceAuthorizationFailed": "audit failed or throttled user-code attempts",
+            "AuditAction::DeviceTokenRejected": "audit replayed device codes",
+            "AuditAction::DeviceAuthorizationExpired": "audit approvals that expire unredeemed",
+        }
+        for marker, purpose in required_markers.items():
+            if marker not in device_prod:
+                errors.append(
+                    f"handlers/device.rs mints device-grant tokens but does not {purpose} "
+                    f"(missing `{marker}`)."
+                )
 
 if errors:
     sys.stderr.write("ERROR: auth-event audit coverage gap detected (issue #1617).\n\n")
