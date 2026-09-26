@@ -3881,6 +3881,10 @@ async fn load_hosted_v2_entries(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    // Every version reports the one authored id, the first push's spelling,
+    // as V3 does -- not whichever spelling that version was pushed under.
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let authored = authored_package_ids(&state.db, &repo_ids, &names).await;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -3902,7 +3906,7 @@ async fn load_hosted_v2_entries(
                 .as_ref()
                 .and_then(|hex| hex::decode(hex).ok().map(|bytes| base64_standard(&bytes)));
             V2Entry {
-                id: authored_package_id(meta.as_ref(), &r.name),
+                id: authored_or_stored(&authored, &r.name),
                 version: r.version.unwrap_or_default(),
                 authors,
                 description,
@@ -5970,7 +5974,29 @@ mod push_db_tests {
             format!("/{}/v3/registration/SOME.PACKAGE.ID/index.json", f.repo_key),
         )
         .await;
-        let autocomplete = get_json(app, format!("/{}/v3/autocomplete?q=some", f.repo_key)).await;
+        let autocomplete = get_json(
+            app.clone(),
+            format!("/{}/v3/autocomplete?q=some", f.repo_key),
+        )
+        .await;
+        // The hosted V2 feed, by id and unfiltered: every version of the
+        // package reports the first push's spelling, as V3 does.
+        let mut v2_feeds = Vec::new();
+        for (query, expected) in [
+            ("FindPackagesById()?id='some.package.id'", 2),
+            ("Packages(Id='some.package.id',Version='2.0.0')", 1),
+            ("Packages()", 2),
+            ("Search()?searchTerm='some'", 2),
+        ] {
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/{}", f.repo_key, query))
+                .body(axum::body::Body::empty())
+                .expect("build GET request");
+            let (status, body) = tdh::send(app.clone(), req).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "V2 {query}");
+            v2_feeds.push((query, expected, String::from_utf8_lossy(&body).to_string()));
+        }
         let catalog: Vec<String> =
             sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
                 .bind(f.repo_id)
@@ -6001,6 +6027,18 @@ mod push_db_tests {
                 .contains("/v3/flatcontainer/some.package.id/"));
         }
         assert_eq!(autocomplete["data"], serde_json::json!(["Some.Package.Id"]));
+        for (query, expected, feed) in &v2_feeds {
+            let ids: Vec<&str> = feed
+                .split("<d:Id>")
+                .skip(1)
+                .filter_map(|rest| rest.split("</d:Id>").next())
+                .collect();
+            assert_eq!(ids.len(), *expected, "V2 {query}: {feed}");
+            assert!(
+                ids.iter().all(|id| *id == "Some.Package.Id"),
+                "V2 {query}: {feed}"
+            );
+        }
         assert_eq!(catalog, vec!["Some.Package.Id".to_string()]);
     }
 
