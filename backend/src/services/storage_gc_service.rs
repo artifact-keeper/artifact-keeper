@@ -254,6 +254,10 @@ static OCI_GC_CANDIDATE_REFERENCED_SQL: Lazy<String> = Lazy::new(|| {
             "oci_manifest_refs",
             &format!("{is_manifest} AND t.parent_digest = {manifest_digest}"),
         ),
+        // #3851: another repository's cleanup-journal row for the key is an
+        // in-flight (or not yet reaped) push of this very object; the journal
+        // sweeps own it from here.
+        candidate_reference_arm("oci_upload_cleanup_keys", "t.storage_key = $1"),
     ]
     .join("\n   OR ")
 });
@@ -3474,6 +3478,14 @@ pub(crate) async fn record_oci_gc_candidates(
             UNION
             SELECT '{manifest}' || omr.parent_digest FROM oci_manifest_refs omr
              WHERE omr.repository_id = $1
+            UNION
+            -- #3851: a final blob object this repository's abandoned push
+            -- wrote (journaled, but its `oci_blobs` row never landed). The
+            -- repository delete leaves it in place on a shared-namespace
+            -- backend because another repository may use it; once the
+            -- journal row cascades away this candidate is its only record.
+            SELECT c.storage_key FROM oci_upload_cleanup_keys c
+             WHERE c.repository_id = $1 AND c.storage_key LIKE '{blob}%'
         ) AS k(storage_key)
         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING
         "#,
@@ -4214,6 +4226,7 @@ mod tests {
             "manifest_blob_refs",
             "oci_tags",
             "oci_manifest_refs",
+            "oci_upload_cleanup_keys",
         ] {
             assert!(
                 sql.contains(&format!("FROM {table} t ")),
@@ -4457,6 +4470,73 @@ mod tests {
             !manifest_b_final,
             "#3733: repo B's manifest must be reclaimed as well"
         );
+    }
+
+    /// #3851 review SF1: a cloud repository's abandoned push wrote its final
+    /// `oci-blobs/<digest>` object (journaled) but never landed the
+    /// `oci_blobs` row. Repository delete leaves shared-namespace blob keys in
+    /// place, and the journal row cascades away — so the recorded candidate is
+    /// the object's only record, and the sweep must reclaim it.
+    #[tokio::test]
+    async fn abandoned_journaled_blob_of_a_deleted_cloud_repo_is_reclaimed() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        const CLOUD: &str = "sf1-shared-cloud";
+        let shared: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&fx.storage_dir),
+        );
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(CLOUD.to_string(), shared.clone());
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            "filesystem".to_string(),
+        ));
+        sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+            .bind(CLOUD)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("cloud-style repo");
+        let location = StorageLocation {
+            backend: CLOUD.to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+
+        let key = format!("oci-blobs/sha256:{:0>64}", Uuid::new_v4().simple());
+        shared
+            .put(&key, Bytes::from_static(b"abandoned push"))
+            .await
+            .expect("final copy");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) VALUES ($1, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(&key)
+        .execute(&fx.pool)
+        .await
+        .expect("journal row");
+
+        delete_repo_recording_candidates(&fx.pool, fx.repo_id, &location).await;
+        let recorded = surviving_candidate_count(&fx.pool, std::slice::from_ref(&key)).await;
+        age_oci_gc_candidates(&fx.pool).await;
+        StorageGcService::new(fx.pool.clone(), registry)
+            .run_gc(false)
+            .await
+            .expect("gc");
+        let survived = shared.exists(&key).await.expect("exists");
+        let left = surviving_candidate_count(&fx.pool, std::slice::from_ref(&key)).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            recorded, 1,
+            "the journaled blob key must be recorded as a candidate"
+        );
+        assert!(!survived, "the orphaned object must be reclaimed");
+        assert_eq!(left, 0, "the candidate is consumed");
     }
 
     /// Repository-delete hand-off, as `delete_repository` performs it: record

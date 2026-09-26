@@ -4295,8 +4295,10 @@ async fn collect_repo_oci_upload_temp_keys(state: &SharedState, repo_id: Uuid) -
 /// on a backend whose repositories share one object namespace (S3/GCS/Azure)
 /// another repository may have committed the very same object while this
 /// repository's journal row for it lingered (cleanup-journal rows are per
-/// repository), so deleting it would destroy that repository's blob. Leave
-/// those to the blob GC, as the artifact purge already does for OCI objects.
+/// repository), so deleting it would destroy that repository's blob. Those
+/// keys are recorded as OCI GC candidates instead (`record_oci_gc_candidates`,
+/// before the delete), and the candidate sweep reclaims each one after its
+/// grace window unless something still references it.
 /// A repo-isolated backend (filesystem) gives the repository its own copy.
 fn oci_upload_keys_owned_by_deleted_repo(backend: &str, keys: Vec<String>) -> Vec<String> {
     if crate::storage::backend_is_repo_isolated(backend) {

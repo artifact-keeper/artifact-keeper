@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS upload_staging_orphans (
     total_chunks INT NOT NULL,
     storage_backend TEXT NOT NULL,
     storage_path TEXT NOT NULL,
+    -- Failed purge attempts; the reaper gives up (and logs) at 24.
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

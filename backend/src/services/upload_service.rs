@@ -640,9 +640,32 @@ impl UploadService {
 
         let Some((completed_chunks, bytes_received)) = updated else {
             let _ = tx.rollback().await;
-            let _ = storage
-                .delete(&staged_chunk_key(session_id, chunk_index))
-                .await;
+            let key = staged_chunk_key(session_id, chunk_index);
+            match storage.delete(&key).await {
+                Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+                Err(e) => {
+                    // The session's own purge may already have run; queue the
+                    // session for the reaper so this chunk is retried.
+                    tracing::warn!(
+                        session = %session_id,
+                        storage_key = %key,
+                        error = %e,
+                        "failed to delete a refused chunk; queued for the upload reaper"
+                    );
+                    let _ = sqlx::query(
+                        "INSERT INTO upload_staging_orphans \
+                             (session_id, total_chunks, storage_backend, storage_path) \
+                         SELECT id, total_chunks, staging_storage_backend, \
+                                COALESCE(staging_storage_path, '') \
+                         FROM upload_sessions \
+                         WHERE id = $1 AND staging_storage_backend IS NOT NULL \
+                         ON CONFLICT (session_id) DO NOTHING",
+                    )
+                    .bind(session_id)
+                    .execute(db)
+                    .await;
+                }
+            }
             let status: Option<String> =
                 sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
                     .bind(session_id)
@@ -1137,6 +1160,7 @@ impl UploadService {
                     "SELECT session_id, total_chunks, storage_backend, storage_path \
                      FROM upload_staging_orphans \
                      WHERE NOT (session_id = ANY($1)) \
+                       AND attempts < 24 \
                      ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
                 } else {
                     "SELECT id, total_chunks, staging_storage_backend, \
@@ -1173,6 +1197,9 @@ impl UploadService {
                     );
                     failed.push(id);
                     let _ = tx.rollback().await;
+                    if orphans {
+                        Self::record_orphan_purge_failure(db, id, &e.to_string()).await;
+                    }
                     continue;
                 }
                 let done = if orphans {
@@ -1215,6 +1242,34 @@ pub async fn sweep_stale_assembly_scratch(scratch_dir: &Path) -> usize {
         }
     }
     removed
+}
+
+/// Purge attempts after which an orphan (e.g. whose storage backend is no
+/// longer registered) is given up on rather than retried every pass.
+const ORPHAN_PURGE_MAX_ATTEMPTS: i32 = 24;
+
+impl UploadService {
+    async fn record_orphan_purge_failure(db: &PgPool, session_id: Uuid, error: &str) {
+        let attempts: Option<i32> = sqlx::query_scalar(
+            "UPDATE upload_staging_orphans \
+             SET attempts = attempts + 1, last_error = $2 \
+             WHERE session_id = $1 RETURNING attempts",
+        )
+        .bind(session_id)
+        .bind(error)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        if attempts == Some(ORPHAN_PURGE_MAX_ATTEMPTS) {
+            tracing::error!(
+                session = %session_id,
+                error = %error,
+                "giving up purging staged upload chunks after {ORPHAN_PURGE_MAX_ATTEMPTS} attempts; \
+                 the row stays in upload_staging_orphans for manual cleanup"
+            );
+        }
+    }
 }
 
 /// Chunk objects one reaper pass may delete before yielding to the next tick.
@@ -3669,5 +3724,56 @@ mod tests {
         assert_eq!(left, 0);
 
         teardown_lease_fixture(&f).await;
+    }
+
+    /// Review nit 4: an orphan whose storage backend is gone is not retried
+    /// every pass forever; it is given up on after the attempt cap.
+    #[tokio::test]
+    async fn orphan_purge_gives_up_after_the_attempt_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        assert_eq!(
+            ORPHAN_PURGE_MAX_ATTEMPTS, 24,
+            "keep the SQL literal in step"
+        );
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO upload_staging_orphans \
+                 (session_id, total_chunks, storage_backend, storage_path, attempts) \
+             VALUES ($1, 1, 'backend-that-was-removed', '', 22)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("orphan");
+        let registry = crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        );
+        let attempts = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM upload_staging_orphans WHERE session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("attempts")
+        };
+        for _ in 0..3 {
+            UploadService::cleanup_expired(&pool, &registry)
+                .await
+                .expect("reaper ok");
+        }
+        assert_eq!(
+            attempts(pool.clone()).await,
+            24,
+            "capped, not retried forever"
+        );
+        let _ = sqlx::query("DELETE FROM upload_staging_orphans WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await;
     }
 }
