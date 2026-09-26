@@ -1031,11 +1031,21 @@ fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
 ///
 /// This is the trust boundary for non-standard tarball layouts: a tarball
 /// URL on the configured upstream's origin may be fetched with the
-/// repository's upstream credentials, anything else may not.
+/// repository's upstream credentials, anything else may not. URLs carrying
+/// userinfo are rejected outright.
+///
+/// The match is origin-only: on a multi-tenant upstream host (Artifactory,
+/// GitLab) a packument can point at any path on that host. Only the upstream
+/// itself authors the packument, and the credentials sent are the ones
+/// configured for that same host, so this grants it nothing new.
 fn npm_same_origin(url: &str, upstream_url: &str) -> bool {
     match (reqwest::Url::parse(url), reqwest::Url::parse(upstream_url)) {
         (Ok(a), Ok(b)) => {
             matches!(a.scheme(), "http" | "https")
+                // Userinfo would add credentials beside the repo's own and
+                // leak them into the fetch URL and logs.
+                && a.username().is_empty()
+                && a.password().is_none()
                 && a.scheme() == b.scheme()
                 && a.host_str().map(str::to_ascii_lowercase)
                     == b.host_str().map(str::to_ascii_lowercase)
@@ -4599,30 +4609,23 @@ async fn serve_tarball(
         }
 
         // #3785: a Remote member whose upstream publishes tarballs outside the
-        // registry-standard `/-/` layout (GitHub Packages' `/download/…`)
-        // cannot be served by the shared resolver below, which fetches every
-        // member at the canonical `upstream_path`. Serve it here, from the
-        // URL its packument advertises, under the same canonical cache key.
-        if let Some(proxy) = proxy_for_virtual {
-            if let Some(resp) = serve_npm_virtual_relocated_tarball(
-                state,
-                proxy,
-                &members,
-                package_name,
-                &upstream_path,
-                filename,
-                ctx,
-            )
-            .await?
-            {
-                return Ok(resp);
-            }
-        }
-
-        let result = proxy_helpers::resolve_virtual_download_from_members(
+        // registry-standard `/-/` layout (GitHub Packages' `/download/…`) is
+        // fetched from the URL its packument advertises. The override only
+        // changes WHERE that member's upstream bytes come from: the resolver
+        // keeps the priority-ordered two-phase walk, Local members, the Pass-1
+        // cache probe and the negative cache, all keyed on the canonical
+        // `upstream_path`. A packument lookup that fails or does not list the
+        // file leaves the member on the canonical path — exactly main's
+        // behavior — so an unreadable higher-priority member can never hand
+        // the filename to a lower-priority one.
+        let member_fetch_urls =
+            npm_virtual_member_fetch_urls(proxy_for_virtual, &members, package_name, filename)
+                .await;
+        let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             members,
             proxy_for_virtual,
             &upstream_path,
+            &member_fetch_urls,
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();
@@ -4873,90 +4876,45 @@ fn build_scanned_tarball_response(
     builder.body(Body::from(bytes)).unwrap()
 }
 
-/// Virtual-over-Remote leg of #3785: serve `filename` from the first Remote
-/// member (in the resolver's priority order) whose packument advertises it,
-/// when that member's upstream serves it outside the canonical `/-/` path.
+/// Per-member absolute upstream fetch URLs for a virtual npm tarball (#3785),
+/// for [`proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls`].
 ///
-/// `members` is the already authorized, scope-filtered and #3955
-/// priority-guarded list the shared resolver would walk, so this never
-/// reaches a member the resolver could not. The walk stops at the first
-/// Remote member that advertises the tarball: if its upstream uses the
-/// canonical layout this returns `Ok(None)` and the shared resolver serves it
-/// exactly as before, so a registry-standard member is never overtaken. A
-/// member whose upstream 404s the advertised URL falls through to the next.
-async fn serve_npm_virtual_relocated_tarball(
-    state: &SharedState,
-    proxy: &crate::services::proxy_service::ProxyService,
+/// Only Remote members whose own packument advertises `filename` at a
+/// non-standard, same-origin URL (GitHub Packages) get an entry; every other
+/// member — and any member whose packument cannot be read — fetches the
+/// canonical path, so a lookup failure is never worse than no lookup. The
+/// lookups run concurrently (they are warm packument cache reads in the
+/// common case, #4241's rationale for the member walk).
+async fn npm_virtual_member_fetch_urls(
+    proxy: Option<&crate::services::proxy_service::ProxyService>,
     members: &[crate::models::repository::Repository],
     package_name: &str,
-    upstream_path: &str,
     filename: &str,
-    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
-) -> Result<Option<Response>, Response> {
-    for member in members {
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-        let Some(ref member_upstream) = member.upstream_url else {
-            continue;
-        };
-        let upstream = resolve_npm_tarball_upstream(
-            proxy,
-            member.id,
-            &member.key,
-            member_upstream,
-            package_name,
-            filename,
-        )
-        .await;
-        let Some(source) = upstream.source else {
-            if upstream.advertised {
-                // Advertised in the canonical layout: the shared resolver's
-                // walk serves it.
-                return Ok(None);
-            }
-            continue;
-        };
-        match proxy_helpers::proxy_fetch_streaming_with_cache_key(
-            proxy,
-            member.id,
-            &member.key,
-            member_upstream,
-            &source,
-            upstream_path,
-            member.format.clone(),
-        )
+) -> std::collections::HashMap<uuid::Uuid, String> {
+    let Some(proxy) = proxy else {
+        return std::collections::HashMap::new();
+    };
+    let lookups = members.iter().filter_map(|member| {
+        let upstream_url = member.upstream_url.as_deref()?;
+        (member.repo_type == RepositoryType::Remote).then(|| async move {
+            let source = resolve_npm_tarball_upstream(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                package_name,
+                filename,
+            )
+            .await
+            .source;
+            source.map(|url| (member.id, url))
+        })
+    });
+    futures::future::join_all(lookups)
         .await
-        {
-            Ok(result) => {
-                correct_cached_tarball_content_type(&state.db, member.id, upstream_path).await;
-                proxy_helpers::record_proxy_download(
-                    state,
-                    member.id,
-                    &member.key,
-                    upstream_path,
-                    ctx,
-                )
-                .await;
-                return Ok(Some(build_tarball_response_stream(
-                    result.body,
-                    filename,
-                    npm_virtual_tarball_content_type(result.content_type),
-                    result.content_length,
-                    result.content_encoding,
-                )));
-            }
-            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
-                debug!(
-                    member_key = %member.key,
-                    "npm virtual member's relocated tarball 404'd upstream; trying next member"
-                );
-                continue;
-            }
-            Err(resp) => return Err(resp),
-        }
-    }
-    Ok(None)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Inline scan-and-block for an npm proxy tarball download (#3003).
@@ -10449,6 +10407,18 @@ mod tests {
             ),
             ("https://evil.example/download/x/1/h", "x", "1.0.0", up),
             ("http://npm.pkg.github.com/download/x/1/h", "x", "1.0.0", up),
+            (
+                "https://u:p@npm.pkg.github.com/download/x/1/h",
+                "x",
+                "1.0.0",
+                up,
+            ),
+            (
+                "https://npm.pkg.github.com@evil.example/download/x/1/h",
+                "x",
+                "1.0.0",
+                up,
+            ),
             ("not a url", "x", "1.0.0", up),
             ("https://npm.pkg.github.com/d/x", "x", "../1", up),
             ("https://npm.pkg.github.com/d/x", "x", "", up),
@@ -10531,6 +10501,7 @@ mod tests {
     async fn mount_ghp_upstream(
         upstream: &wiremock::MockServer,
         bearer: Option<&str>,
+        downloads: std::ops::RangeInclusive<u64>,
     ) -> &'static [u8] {
         use base64::Engine as _;
         use wiremock::matchers::{header, method, path};
@@ -10563,9 +10534,7 @@ mod tests {
                     .insert_header("content-type", "application/octet-stream")
                     .set_body_bytes(BYTES),
             )
-            // At least one relocated fetch; a repeat pull is normally a cache
-            // hit, but the streamed cache commit may land after it starts.
-            .expect(1..=2)
+            .expect(downloads)
             .mount(upstream)
             .await;
         BYTES
@@ -10648,7 +10617,9 @@ mod tests {
             } else {
                 None
             };
-        let bytes = mount_ghp_upstream(&upstream, bearer).await;
+        // At least one relocated fetch; a repeat pull is normally a cache
+        // hit, but the streamed cache commit may land after it starts.
+        let bytes = mount_ghp_upstream(&upstream, bearer, 1..=2).await;
         sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
             .bind(upstream.uri())
             .bind(fx.repo_id)
@@ -10708,7 +10679,7 @@ mod tests {
             return;
         };
         let upstream = MockServer::start().await;
-        let bytes = mount_ghp_upstream(&upstream, None).await;
+        let bytes = mount_ghp_upstream(&upstream, None, 1..=1).await;
         let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
         sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
             .bind(upstream.uri())
@@ -10750,6 +10721,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], bytes);
+    }
+
+    /// #3785 review B1: the relocated fetch URL must not reorder the virtual
+    /// member walk. Priority 1 is a registry-standard Remote whose packument
+    /// read FAILS (5xx) but which serves the tarball at the canonical path;
+    /// priority 2 is a GitHub-Packages Remote advertising the same filename
+    /// with different bytes. The served bytes must be priority 1's: a failed
+    /// packument lookup falls back to the canonical path and the resolver's
+    /// priority order decides, never the lower-priority relocated member.
+    #[tokio::test]
+    async fn test_virtual_relocated_member_never_outranks_higher_priority_3785_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        const P1_BYTES: &[u8] = b"\x1f\x8b\x08priority-one-registry-bytes";
+        let p1 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@example-org%2Fexample-package"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&p1)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{GHP_SCOPED}/-/example-package-1.2.3.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(P1_BYTES))
+            .mount(&p1)
+            .await;
+        // Priority 2 may or may not be fanned out to; it must never win.
+        let p2 = MockServer::start().await;
+        let p2_bytes = mount_ghp_upstream(&p2, None, 0..=1).await;
+        assert_ne!(P1_BYTES, p2_bytes);
+
+        let mut members = Vec::new();
+        for (priority, upstream) in [(1, &p1), (2, &p2)] {
+            let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
+            )
+            .bind(upstream.uri())
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            tdh::publish_repo(&fx.pool, id).await;
+            members.push((id, dir));
+        }
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+
+        let served = match ghp_download(&state, &fx.repo_key).await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                Ok((status, body))
+            }
+            Err(resp) => Err(resp.status()),
+        };
+
+        for (id, dir) in &members {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+
+        let (status, body) =
+            served.unwrap_or_else(|status| panic!("priority 1 must serve: {status}"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            P1_BYTES,
+            "a lower-priority relocated member must never outrank priority 1"
+        );
     }
 
     /// #3297: a Remote npm proxy must request a scoped packument from
@@ -16268,17 +16327,17 @@ mod content_encoding_forwarding_tests {
             .unwrap_or(src);
 
         let call_sites = body.matches("build_tarball_response_stream(").count();
-        // 6 serves + the `fn` definition itself.
+        // 5 serves + the `fn` definition itself.
         assert_eq!(
-            call_sites, 7,
+            call_sites, 6,
             "npm tarball call-site count changed; re-check each new arm \
              forwards content_encoding (#3149)",
         );
         let forwarding = body.matches(".content_encoding,").count();
         assert_eq!(
-            forwarding, 5,
+            forwarding, 4,
             "every proxied npm tarball arm (remote, virtual, virtual-LKG, \
-             virtual-relocated #3785, scan-pending) must pass the fetch result's content_encoding; \
+             scan-pending) must pass the fetch result's content_encoding; \
              only the hosted arm passes None (#3149)",
         );
     }
