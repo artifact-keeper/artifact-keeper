@@ -1280,8 +1280,6 @@ struct NpmTarballUpstream {
     /// does not serve it at the canonical `{package}/-/{filename}` path
     /// (GitHub Packages' `/download/…` layout, #3785). `None` = canonical.
     source: Option<String>,
-    /// Whether the packument advertises `filename` at all.
-    advertised: bool,
 }
 
 /// Resolve the registry-published integrity for the tarball `filename` of
@@ -1337,7 +1335,6 @@ async fn resolve_npm_tarball_upstream(
         return NpmTarballUpstream::default();
     };
     NpmTarballUpstream {
-        advertised: npm_dist_for_filename(&packument, filename, Some(upstream_url)).is_some(),
         integrity: npm_integrity_for_filename_on_upstream(&packument, filename, Some(upstream_url)),
         source: npm_tarball_source_for_filename(&packument, filename, upstream_url),
     }
@@ -4896,7 +4893,7 @@ async fn npm_virtual_member_fetch_urls(
     };
     let lookups = members.iter().filter_map(|member| {
         let upstream_url = member.upstream_url.as_deref()?;
-        (member.repo_type == RepositoryType::Remote).then(|| async move {
+        (member.repo_type == RepositoryType::Remote).then_some(async move {
             let source = resolve_npm_tarball_upstream(
                 proxy,
                 member.id,
