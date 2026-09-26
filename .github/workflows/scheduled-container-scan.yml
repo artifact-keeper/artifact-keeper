@@ -126,21 +126,21 @@ jobs:
       # comes back online.
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend-scheduled'
 
       - name: Upload Backend (dev) Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         if: always()
         with:
           sarif_file: 'backend-dev-trivy.sarif'
           category: 'trivy-backend-dev-scheduled'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
