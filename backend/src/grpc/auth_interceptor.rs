@@ -207,6 +207,7 @@ mod tests {
     /// copy-paste clone between `make_token` and `make_token_for_sub`.
     fn test_claims(sub: Uuid, is_admin: bool, token_type: &str, iat_ms: Option<i64>) -> Claims {
         Claims {
+            read_expansion_repo_ids: None,
             sub,
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),

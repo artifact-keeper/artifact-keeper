@@ -1354,6 +1354,7 @@ mod tests {
             match_formats: vec!["docker".to_string(), "maven".to_string()],
             match_pattern: Some("libs-*".to_string()),
             match_repos: vec![],
+            include_virtual_members: false,
         };
 
         let json = serde_json::to_value(&sel).unwrap();
@@ -1400,6 +1401,7 @@ mod tests {
             match_formats: vec!["npm".to_string()],
             match_pattern: None,
             match_repos: vec![Uuid::nil()],
+            include_virtual_members: false,
         };
         let json = serde_json::to_string(&sel).unwrap();
         let roundtrip: RepoSelector = serde_json::from_str(&json).unwrap();
@@ -1736,6 +1738,7 @@ mod tests {
             match_formats: vec![],
             match_pattern: None,
             match_repos: vec![],
+            include_virtual_members: false,
         };
         let json: serde_json::Value = serde_json::to_value(&sel).unwrap();
         assert!(json.get("match_labels").is_some());

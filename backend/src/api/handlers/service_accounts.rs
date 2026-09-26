@@ -23,6 +23,7 @@ use crate::services::audit_service::{
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
+use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
 use crate::services::service_account_service::{ServiceAccountService, ServiceAccountSummary};
 use crate::services::token_service::TokenService;
 
@@ -674,8 +675,6 @@ pub async fn preview_repo_selector(
 ) -> Result<Json<PreviewRepoSelectorResponse>> {
     auth.require_admin()?;
 
-    use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-
     let selector: RepoSelector = serde_json::from_value(payload.repo_selector)
         .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
 
@@ -970,6 +969,37 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The mint guard for `include_virtual_members` (#4213 review), now the
+    // shared `validate_token_repo_selector` from #4227. The flag widens a match
+    // and is not a filter, so a selector carrying only it is EMPTY -- which an
+    // older token row reads back as unrestricted. The mint must refuse it.
+
+    #[test]
+    fn a_flag_only_selector_is_refused_at_the_mint() {
+        let selector = serde_json::json!({ "include_virtual_members": true });
+        assert!(
+            crate::services::repo_selector_service::validate_token_repo_selector(&selector)
+                .is_err(),
+            "a token for every repository is the opposite of what was asked for"
+        );
+    }
+
+    #[test]
+    fn the_flag_beside_a_real_filter_is_accepted_at_the_mint() {
+        for selector in [
+            serde_json::json!({ "include_virtual_members": true, "match_repos": [Uuid::new_v4()] }),
+            serde_json::json!({ "include_virtual_members": true, "match_formats": ["nuget"] }),
+            serde_json::json!({ "include_virtual_members": true, "match_pattern": "prod-*" }),
+            serde_json::json!({ "include_virtual_members": true, "match_labels": { "env": "prod" } }),
+        ] {
+            assert!(
+                crate::services::repo_selector_service::validate_token_repo_selector(&selector)
+                    .is_ok(),
+                "a known key beside a real filter is a usable scope: {selector}"
+            );
+        }
+    }
+
     // validate_create_token_exclusivity
     // -----------------------------------------------------------------------
 

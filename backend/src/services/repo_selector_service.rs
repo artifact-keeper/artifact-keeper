@@ -33,6 +33,49 @@ pub struct RepoSelector {
     /// Explicit repository UUIDs to include.
     #[serde(default)]
     pub match_repos: Vec<Uuid>,
+    /// Expand every matched virtual repository into its member repositories,
+    /// which are added to the match (#4130).
+    ///
+    /// A token scoped to a virtual repository alone reads nothing through it:
+    /// the listing and download paths both resolve the virtual's MEMBERS and
+    /// drop the ones outside the token's scope, and the parent being in scope
+    /// says nothing about them. This makes "the members of this virtual
+    /// repository" a scope a token can be minted with, re-resolved at
+    /// authentication time so a member added later is covered without
+    /// re-minting.
+    ///
+    /// Not a filter: on its own it matches nothing, and [`Self::is_empty`]
+    /// still reports such a selector as empty. Expansion is one level deep —
+    /// a virtual that is itself a member contributes only itself, matching
+    /// every read path, none of which recurse into a nested virtual.
+    ///
+    /// # For reads only
+    ///
+    /// The members this adds join the token's scope for READ requests only;
+    /// a write never sees them (`AuthExtension::with_read_expansion`). Nothing
+    /// can be published to a virtual repository at all
+    /// (`reject_write_if_not_hosted` answers 400), so the expansion exists to
+    /// serve reads, while write reach would hand the token mutation rights
+    /// over a member list maintained elsewhere. To write to a member, scope
+    /// the token to that member; a member the selector matches in its own
+    /// right keeps full access.
+    ///
+    /// One consequence of resolving at authentication time remains: a member
+    /// REMOVED from the virtual stays readable until the validated-token cache
+    /// entry expires (`API_TOKEN_CACHE_TTL_SECS`, 5 minutes) and for the
+    /// lifetime of any JWT already exchanged from the token. Revoke the token
+    /// to cut that short.
+    #[serde(default)]
+    pub include_virtual_members: bool,
+}
+
+/// The outcome of resolving a selector for a token: the repositories it holds
+/// for every action, and the ones `include_virtual_members` adds for reads.
+/// The two are disjoint.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedScope {
+    pub ids: Vec<Uuid>,
+    pub read_expansion_ids: Vec<Uuid>,
 }
 
 /// A repository matched by a selector.
@@ -78,7 +121,7 @@ impl RepoSelectorService {
 
     /// Resolve repositories matching a selector. Returns matched repo details.
     pub async fn resolve(&self, selector: &RepoSelector) -> Result<Vec<MatchedRepo>> {
-        let rows = self.resolve_rows(selector).await?;
+        let (rows, _read_only) = self.resolve_rows(selector).await?;
         Ok(rows
             .into_iter()
             .map(|r| MatchedRepo {
@@ -91,12 +134,43 @@ impl RepoSelectorService {
 
     /// Resolve just the IDs (convenience for the auth path).
     pub async fn resolve_ids(&self, selector: &RepoSelector) -> Result<Vec<Uuid>> {
-        let rows = self.resolve_rows(selector).await?;
+        let (rows, _read_only) = self.resolve_rows(selector).await?;
         Ok(rows.into_iter().map(|r| r.id).collect())
     }
 
+    /// The scope a token presents, split in two (#4213 review).
+    ///
+    /// `ids` is what the selector matches directly and holds for every action.
+    /// `read_expansion_ids` is what `include_virtual_members` adds, and it is
+    /// added to the scope for READ requests only — see
+    /// `AuthExtension::for_request`. Nothing can be published to a virtual
+    /// repository at all (`reject_write_if_not_hosted` answers 400), so the
+    /// expansion exists to serve reads, and granting mutation rights over a
+    /// member list maintained elsewhere is reach nobody asked for.
+    ///
+    /// Withholding the members from write requests, rather than marking them
+    /// read-only inside one scope, is deliberate: every handler then sees a
+    /// scope that is already right for the request, so a write path nobody
+    /// remembered to audit denies them anyway.
+    ///
+    /// A member the selector ALSO matches in its own right is in `ids`, not
+    /// here: the operator asked for it, so the flag must not narrow it.
+    pub async fn resolve_scope(&self, selector: &RepoSelector) -> Result<ResolvedScope> {
+        let (rows, read_expansion_ids) = self.resolve_rows(selector).await?;
+        let expansion: std::collections::HashSet<Uuid> =
+            read_expansion_ids.iter().copied().collect();
+        Ok(ResolvedScope {
+            ids: rows
+                .into_iter()
+                .map(|r| r.id)
+                .filter(|id| !expansion.contains(id))
+                .collect(),
+            read_expansion_ids,
+        })
+    }
+
     /// Core resolution logic.
-    async fn resolve_rows(&self, selector: &RepoSelector) -> Result<Vec<RepoRow>> {
+    async fn resolve_rows(&self, selector: &RepoSelector) -> Result<(Vec<RepoRow>, Vec<Uuid>)> {
         // If explicit repo IDs are given, use them directly
         if !selector.match_repos.is_empty() {
             let repos: Vec<RepoRow> = sqlx::query_as(
@@ -110,7 +184,7 @@ impl RepoSelectorService {
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-            return Ok(repos);
+            return self.with_virtual_members(selector, repos).await;
         }
 
         // Start with all repositories
@@ -126,7 +200,7 @@ impl RepoSelectorService {
 
         // Empty selector with no filters matches nothing
         if !has_any_filter {
-            return Ok(vec![]);
+            return Ok((vec![], Vec::new()));
         }
 
         // Filter by format (OR semantics)
@@ -151,7 +225,50 @@ impl RepoSelectorService {
             all_repos.retain(|r| label_repo_ids.contains(&r.id));
         }
 
-        Ok(all_repos)
+        self.with_virtual_members(selector, all_repos).await
+    }
+
+    /// Add the members of every matched virtual repository when the selector
+    /// asks for them (#4130). Applied after the filters, so membership widens
+    /// the match rather than being narrowed by `match_formats` — a virtual
+    /// repository and its members share a format, but a label or pattern
+    /// filter written for the parent will not describe them.
+    /// Returns the rows plus the ids this expansion ADDED, which are the ones
+    /// that become read-only.
+    async fn with_virtual_members(
+        &self,
+        selector: &RepoSelector,
+        matched: Vec<RepoRow>,
+    ) -> Result<(Vec<RepoRow>, Vec<Uuid>)> {
+        if !selector.include_virtual_members || matched.is_empty() {
+            return Ok((matched, Vec::new()));
+        }
+        let matched_ids: Vec<Uuid> = matched.iter().map(|r| r.id).collect();
+        let members: Vec<RepoRow> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.key, r.format::TEXT
+            FROM repositories r
+            INNER JOIN virtual_repo_members vrm ON vrm.member_repo_id = r.id
+            WHERE vrm.virtual_repo_id = ANY($1)
+            "#,
+        )
+        .bind(&matched_ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // `seen` starts as the DIRECT matches, so a member that is also a
+        // direct match is never counted as expansion-added.
+        let mut seen: std::collections::HashSet<Uuid> = matched_ids.into_iter().collect();
+        let mut rows = matched;
+        let mut added = Vec::new();
+        for member in members {
+            if seen.insert(member.id) {
+                added.push(member.id);
+                rows.push(member);
+            }
+        }
+        Ok((rows, added))
     }
 
     /// Find repository IDs that have all the given labels.
@@ -346,6 +463,77 @@ mod tests {
         assert!(RepoSelectorService::is_empty(&RepoSelector::default()));
     }
 
+    /// #4130: the flag widens a match, it is not a filter. A selector carrying
+    /// only the flag must still read as empty — the mint refuses it
+    /// (`validate_repo_selector`) rather than this reporting it as a scope.
+    #[test]
+    fn include_virtual_members_alone_is_still_an_empty_selector() {
+        let sel = RepoSelector {
+            include_virtual_members: true,
+            ..Default::default()
+        };
+        assert!(RepoSelectorService::is_empty(&sel));
+    }
+
+    /// #4130: a selector naming a virtual repository resolves to the virtual
+    /// plus its members, and re-resolves at authentication time, so a member
+    /// added after the token was minted is covered.
+    #[tokio::test]
+    async fn include_virtual_members_expands_a_selected_virtual_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vkey, vdir) = tdh::create_repo(&pool, "virtual", "nuget").await;
+        let (member_id, _mkey, mdir) = tdh::create_repo(&pool, "local", "nuget").await;
+        let (outsider_id, _okey, odir) = tdh::create_repo(&pool, "local", "nuget").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 1).await;
+
+        let svc = RepoSelectorService::new(pool.clone());
+        let without = svc
+            .resolve_ids(&RepoSelector {
+                match_repos: vec![virtual_id],
+                ..Default::default()
+            })
+            .await
+            .expect("resolve without expansion");
+        let with = svc
+            .resolve_ids(&RepoSelector {
+                match_repos: vec![virtual_id],
+                include_virtual_members: true,
+                ..Default::default()
+            })
+            .await
+            .expect("resolve with expansion");
+
+        for (id, dir) in [(virtual_id, vdir), (member_id, mdir), (outsider_id, odir)] {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(virtual_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(without, vec![virtual_id], "unexpanded: the parent only");
+        assert!(
+            with.contains(&virtual_id),
+            "the parent stays in scope: {with:?}"
+        );
+        assert!(
+            with.contains(&member_id),
+            "the member must be added to the scope: {with:?}"
+        );
+        assert!(
+            !with.contains(&outsider_id),
+            "a repository that is not a member must not be added: {with:?}"
+        );
+    }
+
     #[test]
     fn test_selector_with_formats_is_not_empty() {
         let sel = RepoSelector {
@@ -395,6 +583,7 @@ mod tests {
             match_formats: vec!["docker".to_string(), "npm".to_string()],
             match_pattern: Some("libs-*".to_string()),
             match_repos: vec![],
+            include_virtual_members: false,
         };
 
         let json = serde_json::to_value(&sel).unwrap();
@@ -745,6 +934,7 @@ mod tests {
             match_formats: vec!["docker".to_string()],
             match_pattern: Some("libs-*".to_string()),
             match_repos: vec![Uuid::new_v4()],
+            include_virtual_members: false,
         };
         let cloned = sel.clone();
         assert_eq!(sel.match_labels, cloned.match_labels);
@@ -760,6 +950,7 @@ mod tests {
             match_formats: vec![],
             match_pattern: None,
             match_repos: vec![],
+            include_virtual_members: false,
         };
         assert!(RepoSelectorService::is_empty(&sel));
     }
@@ -773,6 +964,7 @@ mod tests {
             match_formats: vec!["docker".to_string()],
             match_pattern: Some("*".to_string()),
             match_repos: vec![Uuid::new_v4()],
+            include_virtual_members: false,
         };
         assert!(!RepoSelectorService::is_empty(&sel));
     }
@@ -801,5 +993,288 @@ mod tests {
     fn test_sql_like_match_overlapping_segments() {
         assert!(sql_like_match("abab", "ab%ab"));
         assert!(!sql_like_match("ab", "ab%ab"));
+    }
+}
+
+/// End-to-end tests for `include_virtual_members` on the authentication path
+/// (#4213 review): a real minted token, validated the way a request validates
+/// it, so the expansion is exercised where it actually runs rather than only
+/// in `resolve_ids`.
+#[cfg(test)]
+mod token_validation_tests {
+    use std::sync::Arc;
+
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::{try_resolve_auth_outcome, AuthOutcome, ExtractedToken};
+    use crate::config::Config;
+    use crate::models::access_scope::AccessScope;
+    use crate::services::auth_service::AuthService;
+    use crate::services::permission_service::PermissionService;
+    use crate::services::repository_service::{RepoVisibility, RepositoryService};
+
+    use super::*;
+
+    fn config() -> Arc<Config> {
+        Arc::new(Config {
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-hs256".to_string(),
+            ..Config::default()
+        })
+    }
+
+    /// Mint a service-account token carrying `selector`; returns the service
+    /// and the plaintext token.
+    async fn mint(
+        pool: &PgPool,
+        user_id: Uuid,
+        selector: &serde_json::Value,
+    ) -> (AuthService, String) {
+        let auth = AuthService::new(pool.clone(), config());
+        let (token, token_id) = auth
+            .generate_api_token(user_id, "e2e-virtual-members", vec!["*".into()], None)
+            .await
+            .expect("mint token");
+        sqlx::query("UPDATE api_tokens SET repo_selector = $1 WHERE id = $2")
+            .bind(selector)
+            .bind(token_id)
+            .execute(pool)
+            .await
+            .expect("store selector");
+        (auth, token)
+    }
+
+    /// `(scope for every action, read expansion)` as `validate_api_token`
+    /// reports them.
+    async fn validate_with(
+        pool: &PgPool,
+        user_id: Uuid,
+        selector: serde_json::Value,
+    ) -> (Vec<Uuid>, Vec<Uuid>) {
+        let (auth, token) = mint(pool, user_id, &selector).await;
+        let v = auth
+            .validate_api_token(&token)
+            .await
+            .expect("validate token");
+        (ids(&v.allowed_repo_ids), v.read_expansion_repo_ids)
+    }
+
+    fn ids(scope: &AccessScope) -> Vec<Uuid> {
+        match scope {
+            AccessScope::Restricted(ids) => ids.clone(),
+            AccessScope::Admin => Vec::new(),
+        }
+    }
+
+    struct Repos {
+        pool: PgPool,
+        user_id: Uuid,
+        ids: Vec<Uuid>,
+        dirs: Vec<std::path::PathBuf>,
+        virtual_id: Uuid,
+    }
+
+    impl Repos {
+        /// A virtual repository plus `members` hosted members linked to it.
+        async fn build(pool: PgPool, members: usize) -> (Self, Vec<Uuid>) {
+            let (user_id, _name) = tdh::create_user(&pool).await;
+            let (virtual_id, _vk, vdir) = tdh::create_repo(&pool, "virtual", "generic").await;
+            let mut ids = vec![virtual_id];
+            let mut dirs = vec![vdir];
+            let mut member_ids = Vec::new();
+            for i in 0..members {
+                let (id, _k, dir) = tdh::create_repo(&pool, "local", "generic").await;
+                tdh::link_virtual_member(&pool, virtual_id, id, i as i32 + 1).await;
+                ids.push(id);
+                dirs.push(dir);
+                member_ids.push(id);
+            }
+            (
+                Self {
+                    pool,
+                    user_id,
+                    ids,
+                    dirs,
+                    virtual_id,
+                },
+                member_ids,
+            )
+        }
+
+        async fn extra(&mut self) -> Uuid {
+            let (id, _k, dir) = tdh::create_repo(&self.pool, "local", "generic").await;
+            self.ids.push(id);
+            self.dirs.push(dir);
+            id
+        }
+
+        async fn teardown(self) {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.pool)
+                .await;
+            for id in self.ids {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+            }
+            tdh::cleanup_user(&self.pool, self.user_id).await;
+            for dir in self.dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// #4213 review: the members the flag adds are kept OUT of the scope that
+    /// holds for every action, and reported separately for reads. A member
+    /// the selector also names directly stays in the full scope.
+    #[tokio::test]
+    async fn expansion_is_kept_apart_from_the_full_scope() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (fx, members) = Repos::build(pool.clone(), 2).await;
+        let (expanded, named) = (members[0], members[1]);
+
+        let (scope, expansion) = validate_with(
+            &pool,
+            fx.user_id,
+            serde_json::json!({ "match_repos": [fx.virtual_id, named], "include_virtual_members": true }),
+        )
+        .await;
+        let (no_flag_scope, no_flag_expansion) = validate_with(
+            &pool,
+            fx.user_id,
+            serde_json::json!({ "match_repos": [fx.virtual_id] }),
+        )
+        .await;
+        let virtual_id = fx.virtual_id;
+        fx.teardown().await;
+
+        assert!(
+            scope.contains(&virtual_id),
+            "the named parent holds for every action: {scope:?}"
+        );
+        assert!(
+            scope.contains(&named),
+            "a directly named member keeps full access: {scope:?}"
+        );
+        assert!(
+            !scope.contains(&expanded),
+            "an expansion-only member is not in the full scope: {scope:?}"
+        );
+        assert_eq!(
+            expansion,
+            vec![expanded],
+            "and is reported for reads instead"
+        );
+
+        assert_eq!(no_flag_scope, vec![virtual_id]);
+        assert!(no_flag_expansion.is_empty(), "no flag, no expansion");
+    }
+
+    /// The expansion is re-resolved at every validation, so a member linked
+    /// after minting is covered. Each half validates its own fresh token: the
+    /// SAME token keeps its cached result for up to `API_TOKEN_CACHE_TTL_SECS`.
+    #[tokio::test]
+    async fn a_member_added_after_minting_joins_the_read_expansion() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mut fx, members) = Repos::build(pool.clone(), 1).await;
+        let late = fx.extra().await;
+        let selector =
+            serde_json::json!({ "match_repos": [fx.virtual_id], "include_virtual_members": true });
+
+        let (_, before) = validate_with(&pool, fx.user_id, selector.clone()).await;
+        tdh::link_virtual_member(&pool, fx.virtual_id, late, 2).await;
+        let (_, after) = validate_with(&pool, fx.user_id, selector).await;
+        fx.teardown().await;
+
+        assert!(before.contains(&members[0]));
+        assert!(!before.contains(&late), "not a member yet: {before:?}");
+        assert!(
+            after.contains(&late),
+            "linked after minting, covered on the next validation: {after:?}"
+        );
+    }
+
+    /// The whole point of the rework, through the real credential-resolution
+    /// path the middlewares call: the SAME token yields a scope that includes
+    /// the member for a read and excludes it for a write. Every handler
+    /// downstream -- audited or not -- therefore denies a write to it.
+    #[tokio::test]
+    async fn the_principal_holds_the_member_for_reads_only() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (fx, members) = Repos::build(pool.clone(), 1).await;
+        let member = members[0];
+        let (auth, token) = mint(
+            &pool,
+            fx.user_id,
+            &serde_json::json!({ "match_repos": [fx.virtual_id], "include_virtual_members": true }),
+        )
+        .await;
+
+        let principal = |outcome: AuthOutcome| match outcome {
+            AuthOutcome::Resolved(ext) => ext,
+            other => panic!("token must resolve, got {other:?}"),
+        };
+        let read = principal(
+            try_resolve_auth_outcome(&auth, ExtractedToken::Bearer(&token), true, true).await,
+        );
+        let write = principal(
+            try_resolve_auth_outcome(&auth, ExtractedToken::Bearer(&token), true, false).await,
+        );
+        let virtual_id = fx.virtual_id;
+        fx.teardown().await;
+
+        assert!(read.can_access_repo(member), "a read reaches the member");
+        assert!(read.can_access_repo(virtual_id));
+        assert!(
+            !write.can_access_repo(member),
+            "a write does not see it at all"
+        );
+        assert!(
+            write.can_access_repo(virtual_id),
+            "the named parent is unaffected"
+        );
+    }
+
+    /// Scope is a ceiling, not an entitlement: even on a read, an expanded
+    /// member the account holds no grant on stays unreadable, and the
+    /// expansion never pulls in a repository that is not a member.
+    #[tokio::test]
+    async fn expansion_cannot_reach_what_the_account_is_not_granted() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mut fx, members) = Repos::build(pool.clone(), 1).await;
+        let member = members[0];
+        let outsider = fx.extra().await;
+
+        let (scope, expansion) = validate_with(
+            &pool,
+            fx.user_id,
+            serde_json::json!({ "match_repos": [fx.virtual_id], "include_virtual_members": true }),
+        )
+        .await;
+        let readable = RepositoryService::new(pool.clone())
+            .filter_visible_repo_ids(&[member], &RepoVisibility::User(fx.user_id))
+            .await
+            .expect("visibility query");
+        let writable = PermissionService::new(pool.clone())
+            .check_repository_action(fx.user_id, member, "write", false)
+            .await
+            .unwrap_or(false);
+        fx.teardown().await;
+
+        assert!(expansion.contains(&member));
+        assert!(
+            !expansion.contains(&outsider) && !scope.contains(&outsider),
+            "members only"
+        );
+        assert!(readable.is_empty(), "no grant, no read, expansion or not");
+        assert!(!writable, "and no write");
     }
 }

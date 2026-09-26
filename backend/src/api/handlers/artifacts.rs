@@ -1007,3 +1007,87 @@ mod public_read_repo_scope_3704 {
         );
     }
 }
+
+/// #4213 review: `check_artifact_visibility` receives the action and then
+/// consults the action-blind `can_access_repo`. Artifact labels, SBOM
+/// generation and security actions call it with `write` / `delete`. The first
+/// cut of the read-only rule was enforced per handler and missed this gate, so
+/// a flagged token could write labels on a member it could only read.
+///
+/// The fix is not here: the scope a request carries already omits the members
+/// on a write, so this gate refuses them without knowing the rule exists. This
+/// test pins that, using the principal the middleware builds for each kind of
+/// request.
+#[cfg(test)]
+mod read_expansion_never_reaches_a_write_4213 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::AuthExtension;
+    use crate::models::access_scope::AccessScope;
+
+    #[tokio::test]
+    async fn an_unaudited_write_gate_refuses_an_expanded_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (virtual_id, _vk, vdir) = tdh::create_repo(&pool, "virtual", "generic").await;
+        let (member_id, _mk, mdir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_actions(&pool, member_id, user_id, &["read", "write", "delete"]).await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, 'lib/1.0/lib.bin', 'lib', '1.0', 11, $2, \
+                     'application/octet-stream', $3) RETURNING id",
+        )
+        .bind(member_id)
+        .bind("0".repeat(64))
+        .bind(format!("k/{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("seed artifact");
+
+        // Exactly what the middleware builds for a token scoped to the virtual
+        // with `include_virtual_members`, per request kind.
+        let principal = |is_read: bool| {
+            AuthExtension {
+                user_id,
+                username: username.clone(),
+                allowed_repo_ids: AccessScope::Restricted(vec![virtual_id]),
+                is_api_token: true,
+                ..AuthExtension::default()
+            }
+            .with_read_expansion(vec![member_id], is_read)
+        };
+
+        let read =
+            check_artifact_visibility(&Some(principal(true)), artifact_id, &pool, "read").await;
+        let write =
+            check_artifact_visibility(&Some(principal(false)), artifact_id, &pool, "write").await;
+        let delete =
+            check_artifact_visibility(&Some(principal(false)), artifact_id, &pool, "delete").await;
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, member_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(vdir);
+        let _ = std::fs::remove_dir_all(mdir);
+
+        assert!(read.is_ok(), "a read reaches the member: {read:?}");
+        assert!(write.is_err(), "a label write on the member is refused");
+        assert!(delete.is_err(), "and so is a delete");
+    }
+}

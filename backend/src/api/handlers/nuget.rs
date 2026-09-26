@@ -4309,6 +4309,7 @@ mod tests {
     fn mint_access_jwt(secret: &str, username: &str) -> String {
         let now = Utc::now().timestamp();
         let claims = crate::services::auth_service::Claims {
+            read_expansion_repo_ids: None,
             sub: uuid::Uuid::new_v4(),
             username: username.to_string(),
             email: format!("{}@example.test", username),
