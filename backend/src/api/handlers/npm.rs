@@ -7282,9 +7282,15 @@ mod tests {
             fx.user_id,
         )
         .await;
-        let members = proxy_helpers::fetch_virtual_members(&fx.pool, fx.repo_id)
+        // The proxy mapping sees the caller-AUTHORIZED member set in
+        // `serve_tarball` (#3323), so the rig builds the same set for an
+        // anonymous caller; publish the repos so the Remote member survives.
+        for repo_id in [fx.repo_id, local_id, remote_id] {
+            tdh::publish_repo(&fx.pool, repo_id).await;
+        }
+        let members = proxy_helpers::authorized_virtual_members(&fx.pool, None, fx.repo_id)
             .await
-            .expect("fetch virtual members");
+            .expect("authorized virtual members");
         assert!(
             members
                 .iter()
