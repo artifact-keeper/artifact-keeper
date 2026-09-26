@@ -357,6 +357,7 @@ fn init_with_otel(
     OtelGuard { provider }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +631,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod sampler_tests {
     use super::*;

@@ -420,6 +420,25 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
     })
 }
 
+/// Whether a listing fragment narrows fine-grained rules by the in-flight
+/// request's client IP (#1849).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpConditionMode {
+    /// Append the `allowed_cidrs` predicate, evaluating the request's
+    /// resolved client IP (`client_ip_context_middleware`) inline — a
+    /// validated `IpAddr` literal, or `NULL` outside a request scope, which
+    /// fails closed (conditioned rules match nothing). For request-serving
+    /// paths.
+    Enforce,
+    /// Omit the predicate entirely. For report-only consumers that enumerate
+    /// OTHER principals' potential access (the admin_security
+    /// accessible-users report): there is no meaningful request IP to
+    /// evaluate those principals' conditions against, and the report's
+    /// documented contract is to over-approximate (superset), never
+    /// under-report.
+    Ignore,
+}
+
 /// SQL fragment: true when the user bound at `$user_param` holds a non-empty
 /// fine-grained `permissions` grant on `target_type = 'repository'` /
 /// `target_id = repo_id_expr`, either directly (`principal_type IN ('user',
@@ -456,7 +475,11 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
     // The positional-bind instantiation used by the listing/visibility callers:
     // the user principal is a single bound value `$user_param`. Delegates to the
     // expression-based builder so the generated SQL stays byte-identical.
-    permissions_grant_exists_for(repo_id_expr, &format!("${user_param}"))
+    permissions_grant_exists_for(
+        repo_id_expr,
+        &format!("${user_param}"),
+        IpConditionMode::Enforce,
+    )
 }
 
 /// Expression-based variant of [`permissions_grant_exists`]: `user_ref` is any
@@ -470,7 +493,23 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
 /// Kept `pub(crate)` so the enumeration reuses this EXACT fragment (the project
 /// arm, the group UNION, and the `actions <> '{}'` fail-closed rule) instead of
 /// hand-rolling a copy that would drift from the data-plane read predicate.
-pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -> String {
+///
+/// `ip_mode` gates the #1849 `allowed_cidrs` predicate: request-serving paths
+/// pass [`IpConditionMode::Enforce`] so a rule only counts when the caller's
+/// IP satisfies its conditions — mirroring `check_repository_action`; the
+/// accessible-users report passes [`IpConditionMode::Ignore`] (see the enum).
+pub(crate) fn permissions_grant_exists_for(
+    repo_id_expr: &str,
+    user_ref: &str,
+    ip_mode: IpConditionMode,
+) -> String {
+    let ip_condition = match ip_mode {
+        IpConditionMode::Enforce => crate::services::permission_service::ip_condition_sql(
+            "p",
+            &crate::services::permission_service::request_ip_sql_ref(),
+        ),
+        IpConditionMode::Ignore => String::new(),
+    };
     format!(
         r#"EXISTS (
             SELECT 1 FROM permissions p
@@ -487,6 +526,7 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
                       SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
                   ))
               )
+              {ip_condition}
         )"#
     )
 }
@@ -552,6 +592,14 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
 ///
 /// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
 pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) -> String {
+    // #1849: a rule counts only when the in-flight request's client IP
+    // satisfies its `allowed_cidrs` condition — the same predicate
+    // `check_repository_action` enforces on the data plane, inlined from the
+    // request scope (`NULL` outside one, which matches nothing).
+    let ip_condition = crate::services::permission_service::ip_condition_sql(
+        "p",
+        &crate::services::permission_service::request_ip_sql_ref(),
+    );
     format!(
         r#"FROM repositories {repo_alias}
             JOIN permissions p
@@ -566,7 +614,8 @@ pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) 
                     OR (p.principal_type = 'group' AND p.principal_id IN (
                         SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
                     ))
-                 )"#
+                 )
+              {ip_condition}"#
     )
 }
 
@@ -750,6 +799,9 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "conan" => Some(RepositoryFormat::Conan),
         "cargo" => Some(RepositoryFormat::Cargo),
         "generic" => Some(RepositoryFormat::Generic),
+        "github" => Some(RepositoryFormat::Github),
+        "mise" => Some(RepositoryFormat::Mise),
+        "aqua" => Some(RepositoryFormat::Aqua),
         "podman" => Some(RepositoryFormat::Podman),
         "buildx" => Some(RepositoryFormat::Buildx),
         "oras" => Some(RepositoryFormat::Oras),
@@ -913,6 +965,21 @@ impl RepositoryService {
     /// Create a new repository service with search indexing support.
     pub fn new_with_search(db: PgPool, search_service: Option<Arc<OpenSearchService>>) -> Self {
         Self { db, search_service }
+    }
+
+    /// Anonymous read decision (#1849): does an anonymous read rule —
+    /// `principal_type = 'anonymous'`, optionally narrowed by
+    /// `conditions.allowed_cidrs` — grant read on this repository (directly
+    /// or via its owning project) for the in-flight request's client IP?
+    ///
+    /// This is the anonymous arm of the canonical visibility gate
+    /// (`require_visible`'s `None` branch): it widens nothing for
+    /// authenticated callers and fails closed outside a request scope
+    /// (conditioned rules match nothing there).
+    pub async fn anonymous_can_read_repo(&self, repo_id: Uuid) -> Result<bool> {
+        crate::services::permission_service::PermissionService::new(self.db.clone())
+            .check_anonymous_repository_action(repo_id, "read")
+            .await
     }
 
     /// Set the search service for search indexing.
@@ -1966,6 +2033,55 @@ impl RepositoryService {
         Ok(repos)
     }
 
+    /// Keys of EVERY virtual repository that transitively contains `repo_id`
+    /// as a member — the recursive ancestor walk (#3840).
+    ///
+    /// Cache-invalidation paths (the npm packument cache, the cargo index
+    /// cache) must reach every ancestor virtual, not only the direct parents:
+    /// with nested virtuals a write to a leaf changes the document the TOP of
+    /// the chain serves too, and a single-level walk leaves those entries
+    /// stale. `UNION` de-duplicates by ancestor id, so even a cycle in the
+    /// stored graph (impossible through the API — the write-time guard
+    /// refuses it — but possible through direct table manipulation)
+    /// terminates in O(virtuals) instead of looping. Over-invalidation is
+    /// deliberate: the walk does not restrict itself to well-formed chains,
+    /// because a missed invalidation serves stale content while a spurious
+    /// one costs one recompute.
+    ///
+    /// Degrades to an empty list on error, matching the inline queries this
+    /// replaces: the owning repository's own entry is still invalidated by
+    /// the caller and ancestor entries age out through their TTL floor.
+    pub async fn virtual_ancestor_keys(&self, repo_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE ancestors AS (
+                SELECT vrm.virtual_repo_id
+                  FROM virtual_repo_members vrm
+                 WHERE vrm.member_repo_id = $1
+                UNION
+                SELECT vrm.virtual_repo_id
+                  FROM ancestors
+                  JOIN virtual_repo_members vrm
+                    ON vrm.member_repo_id = ancestors.virtual_repo_id
+            )
+            SELECT r.key
+              FROM ancestors
+              JOIN repositories r ON r.id = ancestors.virtual_repo_id
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "virtual ancestor lookup failed; ancestor virtuals converge on TTL"
+            );
+            Vec::new()
+        })
+    }
+
     /// Get repository storage usage
     pub async fn get_storage_usage(&self, repo_id: Uuid) -> Result<i64> {
         // #2218: single-repo sibling of the list-endpoint UNION. Proxy-cached
@@ -2818,6 +2934,7 @@ fn map_virtual_member_insert_error(
 /// of files, so a call site added in a NEW module is covered without anyone
 /// remembering to extend a constant. It needs no database and runs in the
 /// offline lib suite.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod action_gate_structural_tests {
     /// Bytes after a `.user_can_access_repo(` call in which its arguments — and
@@ -2993,6 +3110,7 @@ mod action_gate_structural_tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4751,6 +4869,34 @@ mod tests {
             cleanup_repo(&pool, repo2.id).await;
         }
 
+        #[tokio::test]
+        async fn test_create_github_mirror_formats_round_trip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            for format in [
+                RepositoryFormat::Github,
+                RepositoryFormat::Mise,
+                RepositoryFormat::Aqua,
+            ] {
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                let mut req = make_create_req(&suffix, format.clone());
+                req.repo_type = RepositoryType::Remote;
+                req.upstream_url = Some("https://github.com".into());
+                let repo = service.create(req).await.expect("create mirror");
+                assert_eq!(service.get_by_key(&repo.key).await.unwrap().format, format);
+                let label: String =
+                    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                        .bind(repo.id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(label, format.as_key());
+                cleanup_repo(&pool, repo.id).await;
+            }
+        }
+
         /// `jupyter` is a PyPI alias (#3784): a hosted repository of that
         /// format gates on the `pypi` handler, is stored under its own
         /// `repository_format` label (migration 212) and reads back as the
@@ -6273,6 +6419,105 @@ mod tests {
             cleanup_repo(&pool, a.id).await;
             cleanup_repo(&pool, b.id).await;
             cleanup_repo(&pool, c.id).await;
+        }
+
+        /// #3840: cache invalidation must reach EVERY ancestor virtual, not
+        /// only the direct parents — with nested virtuals a leaf write
+        /// changes the document the top of the chain serves too. The walk
+        /// must also terminate on a cycle in the stored graph (only possible
+        /// through direct table manipulation; the write-time guard refuses
+        /// cycle-closing inserts).
+        #[tokio::test]
+        async fn test_virtual_ancestor_keys_walks_nested_and_cycle_safe() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let leaf = service
+                .create(make_create_req(
+                    &format!("{suffix}leaf"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf");
+            let mid = service
+                .create(make_virtual_req(
+                    &format!("{suffix}mid"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create mid");
+            let top = service
+                .create(make_virtual_req(
+                    &format!("{suffix}top"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create top");
+            service
+                .add_virtual_member(mid.id, leaf.id, Some(1))
+                .await
+                .expect("link leaf into mid");
+            service
+                .add_virtual_member(top.id, mid.id, Some(1))
+                .await
+                .expect("link mid into top");
+
+            let mut ancestors = service.virtual_ancestor_keys(leaf.id).await;
+            ancestors.sort();
+            let mut expected = vec![mid.key.clone(), top.key.clone()];
+            expected.sort();
+            assert_eq!(
+                ancestors, expected,
+                "both the direct parent and the transitive ancestor must be returned"
+            );
+            // A non-member repository has no ancestors.
+            assert!(
+                service.virtual_ancestor_keys(top.id).await.is_empty(),
+                "nothing contains the top virtual"
+            );
+
+            // Cycle safety: raw SQL bypasses the write-time guard, simulating
+            // a corrupted graph. The walk must terminate and report both
+            // cycle members as ancestors of x (each transitively contains it).
+            let x = service
+                .create(make_virtual_req(
+                    &format!("{suffix}x"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create x");
+            let y = service
+                .create(make_virtual_req(
+                    &format!("{suffix}y"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create y");
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1), ($2, $1, 1)",
+            )
+            .bind(x.id)
+            .bind(y.id)
+            .execute(&pool)
+            .await
+            .expect("insert cycle");
+
+            let mut cyclic = service.virtual_ancestor_keys(x.id).await;
+            cyclic.sort();
+            let mut cyclic_expected = vec![x.key.clone(), y.key.clone()];
+            cyclic_expected.sort();
+            assert_eq!(
+                cyclic, cyclic_expected,
+                "a cycle must terminate and still report the reachable ancestors"
+            );
+
+            for id in [leaf.id, mid.id, top.id, x.id, y.id] {
+                cleanup_repo(&pool, id).await;
+            }
         }
 
         /// PF-007 (#2523): after inserts across all three components the

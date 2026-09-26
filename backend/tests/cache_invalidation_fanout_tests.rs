@@ -216,6 +216,12 @@ async fn warm_repo_cache(cache: &RepoCache, repo_id: Uuid, key: &str) {
         storage_backend: "filesystem".into(),
         is_public: true,
         index_upstream_url: None,
+        promotion_only: false,
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
+        age_gate_mode: "upstream_publish_time".into(),
+        curation_enabled: false,
+        curation_default_action: "allow".into(),
     };
     cache
         .write()

@@ -907,9 +907,11 @@ async fn cancel(
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
     // Token action-scope ceiling (GHSA-5f2q). Aborting an in-flight upload is a
-    // destructive action; require the `delete` scope, matching the direct
-    // artifact-delete path (`repositories::delete_artifact`).
-    auth.require_scope("delete")
+    // destructive action; require the `delete:artifacts` scope, matching the
+    // direct artifact-delete path (`repositories::delete_artifact`). The bare
+    // `delete` parent is deliberately not mintable (#2996), so the gate names
+    // the colon-form scope tokens can actually carry (#3831).
+    auth.require_scope("delete:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -1385,6 +1387,7 @@ fn replication_session_metadata_from_request<'a>(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
@@ -1616,8 +1619,8 @@ mod tests {
     #[test]
     fn cancel_requires_delete_scope() {
         assert!(
-            handler_body("cancel").contains("require_scope(\"delete\")"),
-            "cancel must enforce the token `delete` action-scope (GHSA-5f2q)"
+            handler_body("cancel").contains("require_scope(\"delete:artifacts\")"),
+            "cancel must enforce the mintable `delete:artifacts` action-scope (GHSA-5f2q, #3831)"
         );
     }
 
@@ -1657,6 +1660,23 @@ mod tests {
                 "read-scoped token must be denied the cancel delete scope"
             );
         }
+    }
+
+    #[test]
+    fn artifact_delete_scoped_token_allowed_cancel() {
+        // #3831: bare `delete` is not mintable, so the cancel gate must name
+        // the colon-form scope a token can actually carry.
+        let deleter = auth_with_scopes(vec!["delete:artifacts"]);
+        assert!(
+            deleter.require_scope("delete:artifacts").is_ok(),
+            "delete:artifacts token must be able to cancel its own upload session"
+        );
+        // ...without gaining the bare `delete` parent, which stays
+        // un-satisfiable by any colon-form scope.
+        assert!(
+            deleter.require_scope("delete").is_err(),
+            "delete:artifacts token must not satisfy the bare delete scope"
+        );
     }
 
     #[test]

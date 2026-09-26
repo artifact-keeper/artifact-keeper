@@ -2181,6 +2181,7 @@ fn check_embedded_code(lang: NestedLang, body: &str, out: &mut Vec<Hit>) {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

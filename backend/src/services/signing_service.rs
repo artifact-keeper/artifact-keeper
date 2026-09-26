@@ -1537,6 +1537,7 @@ impl SigningService {
 /// from the main `tests` module: every case here is pure arithmetic over
 /// durations and timestamps, so none of it needs a database, a keyring, or a
 /// real clock.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod signature_expiry_tests {
     use super::*;
@@ -1703,6 +1704,7 @@ mod signature_expiry_tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

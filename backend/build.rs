@@ -68,5 +68,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rustc-env=RELEASE_DATE_FLOOR_EPOCH={release_date_floor}");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
+    emit_test_shard_cfg();
+
     Ok(())
+}
+
+/// CI test shards, in the order scripts/ci/test-shards.py lists them. Keep
+/// in step with the `test-shard-*` features in Cargo.toml; the script's
+/// `check` fails when the three drift.
+const TEST_SHARDS: &[&str] = &[
+    "handlers-1",
+    "handlers-2",
+    "services-1",
+    "services-2",
+    "router",
+];
+
+/// Set `ak_test_shard = "<name>"` for the shards whose inline test modules
+/// this build compiles. Every test module is gated by
+/// `#[cfg(ak_test_shard = "<its shard>")]` on top of `#[cfg(test)]`.
+///
+/// No `test-shard-*` feature enabled -- every ordinary build, `cargo test`,
+/// `cargo nextest run`, clippy -- sets ALL of them, so nothing is gated out.
+/// `--features test-shard-<name>` sets only the ones selected, which is how
+/// a CI matrix leg compiles one slice of the tests. `ak_test_shard_subset`
+/// marks such a build: test helpers shared by several shards are then
+/// legitimately unused in some of them, and lib.rs relaxes `dead_code`
+/// for exactly that case (the full build keeps the lint).
+fn emit_test_shard_cfg() {
+    let values = TEST_SHARDS
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("cargo::rustc-check-cfg=cfg(ak_test_shard, values({values}))");
+    println!("cargo::rustc-check-cfg=cfg(ak_test_shard_subset)");
+
+    let feature_on = |shard: &str| {
+        let var = format!(
+            "CARGO_FEATURE_TEST_SHARD_{}",
+            shard.to_uppercase().replace('-', "_")
+        );
+        std::env::var_os(var).is_some()
+    };
+    let selected: Vec<&str> = TEST_SHARDS
+        .iter()
+        .copied()
+        .filter(|s| feature_on(s))
+        .collect();
+    let active: &[&str] = if selected.is_empty() {
+        TEST_SHARDS
+    } else {
+        &selected
+    };
+    if active.len() < TEST_SHARDS.len() {
+        println!("cargo:rustc-cfg=ak_test_shard_subset");
+    }
+    for shard in active {
+        println!("cargo:rustc-cfg=ak_test_shard=\"{shard}\"");
+    }
 }

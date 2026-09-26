@@ -3634,6 +3634,7 @@ fn extract_deb_maintainer_scripts(body: &[u8]) -> ExtractedScripts {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5255,6 +5256,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_db_tests {
     use super::*;
@@ -5560,6 +5562,7 @@ mod upload_db_tests {
 //     to an empty local-DB 200 (`apt`'s "File has unexpected size");
 //   * a 404 member is still skipped so the caller can fall through to the
 //     local-DB (hosted) path or the next mirror.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_dists_cap_tests {
     use super::*;
@@ -6209,6 +6212,7 @@ mod virtual_dists_cap_tests {
 // Unit tests: newline normalization & deb822 formatting helpers
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod apt_release_helpers_tests {
     use super::*;
@@ -6362,6 +6366,7 @@ mod apt_release_helpers_tests {
 // (generation-layer, defense-in-depth for #2489)
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod apt_release_metadata_db_tests {
     use super::*;
@@ -6902,6 +6907,7 @@ mod apt_release_metadata_db_tests {
 // #3596 — package content under dists/ must stream, not buffer
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod dists_package_content_tests {
     use super::*;
@@ -7161,6 +7167,7 @@ mod dists_package_content_tests {
 /// Maintainer-script extraction (#4033). Fixtures are built in-test: an `ar`
 /// wrapper around a `control.tar*` built with `tar::Builder`, so no binary
 /// package is checked in.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod maintainer_script_tests {
     use super::*;

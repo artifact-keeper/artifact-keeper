@@ -106,6 +106,7 @@ pub(crate) fn synthetic_email_for_subject(subject: &str, domain: &str) -> String
     format!("{}.{}@{}", prefix, fingerprint, domain)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

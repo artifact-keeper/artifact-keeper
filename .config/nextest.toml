@@ -95,6 +95,13 @@
 # coverage-specific workaround, and removing an entry breaks the unit-test gate
 # outright rather than degrading one job.
 #
+# CI now runs that suite as a matrix of test shards (scripts/ci/test-shards.py),
+# one leg per shard, each with its own Postgres. A group therefore only has
+# to serialize the members that land in the same shard -- members in
+# different legs cannot see each other's rows -- but a local run of the whole
+# suite still has every member in one invocation, so the filters below stay
+# complete and shard-agnostic.
+#
 # An earlier revision of this comment claimed a plain single-process
 # `cargo test` job kept the in-process mutexes working there. That job no
 # longer exists, and the premise did not generalize anyway: the `sync_worker`

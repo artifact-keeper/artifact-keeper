@@ -476,6 +476,7 @@ fn parse_from_path_segments(artifact_path: &str) -> Option<ParsedArtifact> {
 // tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

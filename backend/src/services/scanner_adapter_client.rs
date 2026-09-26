@@ -451,6 +451,7 @@ pub(crate) mod test_support {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::test_support::{mount_fs_ready_and_submit, mount_fs_scan_success};

@@ -1488,6 +1488,7 @@ pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
     weighted_sum / weight_sum
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

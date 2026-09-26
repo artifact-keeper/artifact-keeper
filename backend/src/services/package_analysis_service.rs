@@ -596,6 +596,7 @@ async fn insert_script(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,6 +704,7 @@ mod tests {
 /// suite. Skips cleanly when no `DATABASE_URL` is configured; under
 /// [`crate::testing::REQUIRE_DB_ENV`] (CI) an unreachable database fails
 /// loudly instead of reporting a false PASS (#2924).
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod db_tests {
     use super::*;

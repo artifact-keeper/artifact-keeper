@@ -2698,7 +2698,8 @@ impl AuthService {
         let stored_token_opt = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
-                   at.repo_selector, at.revoked_at, at.last_used_at
+                   at.repo_selector, at.revoked_at, at.last_used_at,
+                   at.repository_restricted
             FROM api_tokens at
             WHERE at.token_prefix = $1
             "#,
@@ -2773,18 +2774,34 @@ impl AuthService {
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
         let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
-            use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-            let selector: RepoSelector =
-                serde_json::from_value(selector_json.clone()).unwrap_or_default();
-            if RepoSelectorService::is_empty(&selector) {
-                None // empty selector = unrestricted
-            } else {
-                let svc = RepoSelectorService::new(self.db.clone());
-                let ids = svc.resolve_ids(&selector).await?;
-                if ids.is_empty() {
-                    Some(vec![]) // selector matched nothing, deny all
-                } else {
-                    Some(ids)
+            use crate::services::repo_selector_service::{
+                parse_token_selector_strict, RepoSelectorService,
+            };
+            match parse_token_selector_strict(selector_json) {
+                // Fail closed (#4226): a stored selector that does not parse,
+                // or that carries a key `RepoSelector` does not know, used to
+                // become an empty selector here, i.e. unrestricted. It now
+                // grants no repository at all.
+                Err(e) => {
+                    tracing::warn!(
+                        token_id = %stored_token.id,
+                        error = %e,
+                        "API token has an unparseable repo_selector; denying all repositories"
+                    );
+                    Some(vec![])
+                }
+                // An explicitly empty selector (`{}` or only empty criteria)
+                // keeps its legacy meaning of unrestricted. Every mint now
+                // refuses one, so only rows written before that carry it.
+                Ok(selector) if RepoSelectorService::is_empty(&selector) => None,
+                Ok(selector) => {
+                    let svc = RepoSelectorService::new(self.db.clone());
+                    let ids = svc.resolve_ids(&selector).await?;
+                    if ids.is_empty() {
+                        Some(vec![]) // selector matched nothing, deny all
+                    } else {
+                        Some(ids)
+                    }
                 }
             }
         } else {
@@ -2797,7 +2814,23 @@ impl AuthService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
             if repo_rows.is_empty() {
-                None // unrestricted
+                // #4228: the join rows are `ON DELETE CASCADE`, so an empty
+                // set has two meanings -- "never restricted" and "restricted
+                // at mint, every repository since deleted". The marker
+                // written at pin time tells them apart: a restricted token
+                // whose allow-list emptied out denies every repository
+                // (`Restricted(vec![])`, deny-by-default) instead of falling
+                // open to the whole instance. Deleting repositories can only
+                // ever narrow a token, never widen it.
+                if stored_token.repository_restricted {
+                    tracing::warn!(
+                        token_id = %stored_token.id,
+                        "API token's repository allow-list is empty (repositories deleted); denying all repositories"
+                    );
+                    Some(vec![])
+                } else {
+                    None // unrestricted
+                }
             } else {
                 Some(repo_rows.into_iter().map(|r| r.repo_id).collect())
             }
@@ -3784,6 +3817,7 @@ fn check_token_validation_result(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4313,8 +4347,12 @@ mod tests {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            npm_virtual_negative_cache_ttl_ms:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            npm_virtual_negative_cache_max_entries:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -4409,6 +4447,132 @@ mod tests {
         assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
         assert!(!empty.allowed_repo_ids.grants(repo_a));
         assert!(!empty.allowed_repo_ids.grants(repo_b));
+    }
+
+    /// #4228: deleting repositories must only ever NARROW a restricted
+    /// token, never widen it. `api_token_repositories.repo_id` is
+    /// `ON DELETE CASCADE`; before the restriction marker, a token whose
+    /// rows all cascaded away looked exactly like a never-restricted token
+    /// and became unrestricted.
+    ///
+    /// DB-backed; no-op when DATABASE_URL is unset (CI seeds Postgres).
+    #[tokio::test]
+    async fn test_deleted_repositories_never_widen_a_restricted_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(
+                user_id,
+                "scoped-4228",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        // Pin the token to both repositories through the same join-table
+        // store the repo-token and service-account mint paths write.
+        for repo in [repo_a, repo_b] {
+            sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+                .bind(token_id)
+                .bind(repo)
+                .execute(&pool)
+                .await
+                .expect("pin token to repo");
+        }
+
+        // The trigger must have stamped the restriction marker at pin time.
+        let marked: bool =
+            sqlx::query_scalar("SELECT repository_restricted FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read restriction marker");
+        assert!(marked, "pinning rows must mark the token restricted");
+
+        // A fresh service per validation: `validate_api_token` caches per
+        // instance, and the point here is what the STORED state resolves to.
+        let fresh = || AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        // The allow-list query has no ORDER BY, so compare as sets.
+        let sorted = |scope: &AccessScope| match scope {
+            AccessScope::Restricted(ids) => {
+                let mut ids = ids.clone();
+                ids.sort();
+                Some(ids)
+            }
+            AccessScope::Admin => None,
+        };
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        let mut expected = vec![repo_a, repo_b];
+        expected.sort();
+        assert_eq!(sorted(&v.allowed_repo_ids), Some(expected));
+
+        // Deleting ONE repository narrows the token to the survivor...
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("delete repo A");
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Restricted(vec![repo_b]),
+            "deleting one repository must narrow the token to the survivor"
+        );
+
+        // ...and deleting the LAST one denies everything. This is the
+        // regression pin: pre-fix this came back `AccessScope::Admin`.
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await
+            .expect("delete repo B");
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Restricted(vec![]),
+            "a restricted token whose repositories were all deleted must deny every repository"
+        );
+        assert!(!v.allowed_repo_ids.grants(Uuid::new_v4()));
+
+        // Control: a never-restricted token (no join rows ever) stays
+        // unrestricted -- the marker is what tells the two empty-row cases
+        // apart.
+        let (open_token, open_id) = svc
+            .generate_api_token(
+                user_id,
+                "unscoped-4228",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint unscoped token");
+        let v = fresh()
+            .validate_api_token(&open_token)
+            .await
+            .expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Admin,
+            "a token that never had join rows must stay unrestricted"
+        );
+
+        // Cleanup: tokens cascade away with the user; repos are gone.
+        sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
+            .bind(vec![token_id, open_id])
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     // We cannot create a PgPool without a real database, so for unit tests that

@@ -471,6 +471,7 @@ fn scrub_json_pii(value: &serde_json::Value, level: ScrubLevel) -> serde_json::V
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

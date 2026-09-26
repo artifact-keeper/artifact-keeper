@@ -53,34 +53,33 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// Coerce the requested `is_public` value against the server-wide guest-access
-/// policy (issue #850).
+/// Refuse a request that asks for a public repository while guest access is
+/// disabled server-wide (#3855).
 ///
-/// When guest access is disabled, public repositories are meaningless: anonymous
-/// users will never reach them. We therefore silently coerce `true` to `false`
-/// on create/update so the persisted state matches the runtime policy. Returns
-/// the value to persist, plus a flag indicating whether coercion happened so
-/// the caller can emit a structured `tracing::warn!` log.
-fn coerce_is_public_for_create(requested: bool, guest_access_enabled: bool) -> (bool, bool) {
+/// `AK_GUEST_ACCESS_ENABLED=false` is a deliberate operator decision, and a
+/// create/update asking for `is_public = true` contradicts it — a
+/// configuration mistake on one side or the other. Historically the request
+/// was silently rewritten to private (issue #850): the caller got a `201`/
+/// `200` for a repository shaped differently from the one it asked for,
+/// which produced perpetual Terraform drift ("is_public flips on every
+/// plan") and late "why can nobody pull this anonymously" surprises with no
+/// connection to the create call. Reject the contradiction instead (400),
+/// matching how the neighbouring `visibility`/`is_public` conflict is
+/// already a 400 rather than a silent resolution.
+///
+/// `requested` is the payload's effective `is_public` (`allow_anonymous_access`
+/// already folded in). For updates, pass `false` when the field is absent —
+/// leaving visibility unchanged is never a contradiction.
+fn require_public_visibility_allowed(requested: bool, guest_access_enabled: bool) -> Result<()> {
     if requested && !guest_access_enabled {
-        (false, true)
-    } else {
-        (requested, false)
+        return Err(AppError::Validation(
+            "guest access is disabled on this instance (AK_GUEST_ACCESS_ENABLED=false); \
+             repositories cannot be public. Enable guest access, or choose a non-public \
+             visibility."
+                .to_string(),
+        ));
     }
-}
-
-/// Update-side counterpart of [`coerce_is_public_for_create`]. The update
-/// payload uses `Option<bool>` because callers can leave the flag unchanged;
-/// only an explicit `Some(true)` is coerced.
-fn coerce_is_public_for_update(
-    requested: Option<bool>,
-    guest_access_enabled: bool,
-) -> (Option<bool>, bool) {
-    if matches!(requested, Some(true)) && !guest_access_enabled {
-        (Some(false), true)
-    } else {
-        (requested, false)
-    }
+    Ok(())
 }
 
 /// Check that the authenticated user can access a specific repository.
@@ -246,20 +245,24 @@ pub(crate) async fn require_repo_admin(
 /// own ACLs — must use [`member_read_visibility`] instead.
 ///
 /// * anonymous              -> public repositories only
+/// * repo-scoped API token  -> exactly the token's allowed set. This arm is
+///   checked BEFORE the admin arm (#3901): token scope is confinement, not
+///   a privilege boundary, so an admin holding a repository-scoped token is
+///   narrowed to the token's set exactly as
+///   `search::intersect_token_scope` and the webhook reads already do
+///   (#1803, #3715)
 /// * global admin           -> everything
-/// * repo-scoped API token  -> exactly the token's allowed set (checked before
-///   the general user arm; admin tokens are handled above and bypass scope)
 /// * any other principal    -> public repositories plus their own grants
 pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibility {
     match auth {
         None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
             a.allowed_repo_ids
                 .as_allowed_repo_ids()
                 .unwrap_or_default()
                 .to_vec(),
         ),
+        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -462,7 +465,25 @@ pub(crate) async fn require_visible(
                 Err(not_found())
             }
         }
-        None => Err(not_found()),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // non-public repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial
+        // collapses to the same existence-hiding 404 as before, so a caller
+        // outside the CIDRs cannot tell a conditioned repo from a rules-less
+        // or nonexistent one; a lookup error fails CLOSED (denied, not
+        // served), matching the anonymous arms in the native-format
+        // middleware and the OCI read resolver.
+        None => {
+            let granted = repo_service
+                .anonymous_can_read_repo(repo.id)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(())
+            } else {
+                Err(not_found())
+            }
+        }
     }
 }
 
@@ -957,7 +978,10 @@ pub struct UpdateRepositoryRequest {
     /// "unverified upstream"); send an ASCII-armored PUBLIC key block to set
     /// it. A private-key block or malformed armor is rejected (400). The
     /// response never echoes the key — only `has_trusted_gpg_key`.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<String>)]
     pub trusted_gpg_key: Option<Option<String>>,
     /// Update the keyless-sync unverified-ingest opt-in (#2569). When provided,
@@ -995,7 +1019,10 @@ pub struct UpdateRepositoryRequest {
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
     /// update onto the stored config. Only valid for Debian Remote repos.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<DebianConfigPatch>)]
     pub debian: Option<Option<DebianConfigPatch>>,
     /// Enable curation-rule enforcement on this repository's proxy paths.
@@ -1008,21 +1035,6 @@ pub struct UpdateRepositoryRequest {
     /// rather than an unconstrained string.
     #[schema(value_type = String, example = "allow")]
     pub curation_default_action: Option<String>,
-}
-
-/// Deserialize a nullable optional field into `Option<Option<T>>` so a handler
-/// can distinguish three states: the key absent (`None`), the key present and
-/// `null` (`Some(None)`), and the key present with a value (`Some(Some(v))`).
-/// Serde maps a bare `Option<T>` null to `None`, collapsing the first two —
-/// this preserves the distinction needed for partial-update-vs-clear.
-fn deserialize_double_option<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 impl UpdateRepositoryRequest {
@@ -1193,10 +1205,11 @@ async fn with_quarantine_settings(
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
     let (enabled, duration) = quarantine_service::repo_settings(db, repo_id).await;
-    // #3647: a row written before the enable-time gate existed still blocks
-    // every uncached fetch on a proxying repository with no release path. The
-    // stored value is left exactly as the operator set it; reading the repo
-    // just says so out loud, the same audit the startup scan emits.
+    // #3647 / #3912: a row written before the enable-time gate existed is dead
+    // state on a virtual repository (the only type still unsupported — the
+    // policy belongs on its member remotes). The stored value is left exactly
+    // as the operator set it; reading the repo just says so out loud, the
+    // same audit the startup scan emits.
     if enabled == Some(true)
         && !RepositoryType::from_db_str(&response.repo_type)
             .as_ref()
@@ -1205,9 +1218,10 @@ async fn with_quarantine_settings(
         tracing::warn!(
             repository = %response.key,
             repo_type = %response.repo_type,
-            "repository has quarantine enabled but is a {} repository; the hold blocks all \
-             uncached content and has no release path (#3647). Set \
-             `quarantine_enabled: false` on this repository.",
+            "repository has quarantine enabled but is a {} repository; a virtual has no \
+             cache of its own, so the setting is never consulted (#3647, #3912). Enable the \
+             Package Age Policy on the member remote repositories and set \
+             `quarantine_enabled: false` here.",
             response.repo_type
         );
     }
@@ -1606,13 +1620,16 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 }
 
 /// Reject `quarantine_enabled = true` on repositories that serve proxied
-/// content (#3647).
+/// content without a quarantine identity of their own (#3647, #3912).
 ///
-/// Quarantine state is keyed on `artifacts`; a Remote or Virtual repository
-/// records what it serves in `proxy_cache_artifacts`, which has no quarantine
-/// columns, so the hold has no release path and degrades into a total block on
-/// all uncached content. Refusing the write surfaces that at configuration time
-/// instead of at first pull. The explicit
+/// Hosted and Remote repositories qualify: hosted content carries
+/// `artifacts.quarantine_*`, and remote (proxy) content got its quarantine
+/// identity in #3912 (`proxy_cache_artifacts.quarantine_until`, the
+/// release-date window on both fetch paths, and the
+/// `POST /api/v1/quarantine/proxy-cache/{key}/release` endpoint). A Virtual
+/// repository caches nothing itself — its members' Remote legs do — so
+/// enabling the policy on it would be dead state. Refusing the write surfaces
+/// that at configuration time instead of at first pull. The explicit
 /// `quarantine_service::supports_quarantine` call is what the structural
 /// regression test below greps for.
 ///
@@ -1621,7 +1638,7 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
     if !quarantine_service::supports_quarantine(repo_type) {
         return Err(AppError::Validation(
-            quarantine_service::PROXY_QUARANTINE_UNSUPPORTED.to_string(),
+            quarantine_service::VIRTUAL_QUARANTINE_UNSUPPORTED.to_string(),
         ));
     }
     Ok(())
@@ -1663,7 +1680,7 @@ pub async fn set_cache_ttl(
     Json(payload): Json<SetCacheTtlRequest>,
 ) -> Result<Json<CacheTtlResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2051,7 +2068,7 @@ pub async fn set_npm_scope_policy(
     Json(payload): Json<SetNpmScopePolicyRequest>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2123,7 +2140,7 @@ pub async fn get_npm_scope_policy(
     Path(key): Path<String>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2200,7 +2217,7 @@ pub async fn invalidate_cache(
     Query(query): Query<InvalidateCacheQuery>,
 ) -> Result<Json<InvalidateCacheResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2377,7 +2394,7 @@ pub async fn put_pypi_track(
     Json(payload): Json<PypiTrackRequest>,
 ) -> Result<Json<PypiTrackResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2443,7 +2460,7 @@ pub async fn delete_pypi_track(
     Path((key, project)): Path<(String, String)>,
 ) -> Result<axum::http::StatusCode> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2493,6 +2510,9 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "conan" => Ok(RepositoryFormat::Conan),
         "cargo" => Ok(RepositoryFormat::Cargo),
         "generic" => Ok(RepositoryFormat::Generic),
+        "github" => Ok(RepositoryFormat::Github),
+        "mise" => Ok(RepositoryFormat::Mise),
+        "aqua" => Ok(RepositoryFormat::Aqua),
         "podman" => Ok(RepositoryFormat::Podman),
         "buildx" => Ok(RepositoryFormat::Buildx),
         "oras" => Ok(RepositoryFormat::Oras),
@@ -2741,7 +2761,7 @@ pub async fn create_repository(
     // unauth requests carrying a payload the schema didn't recognize with
     // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
@@ -2914,18 +2934,14 @@ pub async fn create_repository(
         }
     }
 
-    // Issue #850: silently coerce `is_public` to false when guest access is
-    // disabled server-wide so the persisted state matches the runtime policy.
-    let (is_public, coerced) = coerce_is_public_for_create(
+    // #3855: a public repository contradicts a server-wide guest-access
+    // disable; refuse it explicitly rather than silently creating a private
+    // one the caller never asked for.
+    require_public_visibility_allowed(
         payload.effective_is_public(),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %payload.key,
-            "Coercing repository to private: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
+    let is_public = payload.effective_is_public();
 
     let repo = service
         .create(ServiceCreateRepoReq {
@@ -3739,7 +3755,7 @@ pub async fn update_repository(
     Json(payload): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
@@ -3802,19 +3818,15 @@ pub async fn update_repository(
         }
     }
 
-    // Issue #850: ignore any attempt to flip a repository back to public when
-    // guest access is disabled. The web UI hides the toggle, but API clients
-    // and stale forms may still send `true`.
-    let (effective_is_public, coerced) = coerce_is_public_for_update(
-        payload.effective_is_public(),
+    // #3855: flipping a repository to public contradicts a server-wide
+    // guest-access disable; refuse it explicitly rather than silently keeping
+    // the repository private while answering 200. An absent field leaves
+    // visibility unchanged and is never a contradiction.
+    require_public_visibility_allowed(
+        payload.effective_is_public().unwrap_or(false),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %key,
-            "Ignoring is_public=true on update: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
+    let effective_is_public = payload.effective_is_public();
 
     let repo = service
         .update(
@@ -4660,7 +4672,7 @@ pub async fn delete_repository(
     Path(key): Path<String>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -5208,9 +5220,7 @@ pub async fn list_artifacts(
         // appear in the listing.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
 
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Aggregating over
@@ -6343,9 +6353,7 @@ async fn list_artifacts_grouped_by_maven_component(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: same unfiltered member walk as the flat listing — narrow to
         // the members this caller may see before the catalog is queried, so a
         // private member's GAV coordinates are not disclosed through the
@@ -7081,9 +7089,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Narrow to the
         // members this caller may see before the tag rows are queried, so a
@@ -9276,7 +9282,7 @@ pub async fn delete_artifact(
     headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:artifacts")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -9685,7 +9691,7 @@ pub async fn add_virtual_member(
     Json(payload): Json<AddVirtualMemberRequest>,
 ) -> Result<Json<VirtualMemberResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9765,7 +9771,7 @@ pub async fn remove_virtual_member(
     Path((key, member_key)): Path<(String, String)>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9857,7 +9863,7 @@ pub async fn update_virtual_members(
     Json(payload): Json<UpdateVirtualMembersRequest>,
 ) -> Result<Json<VirtualMembersListResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -10035,7 +10041,7 @@ pub async fn set_upstream_auth(
     Json(payload): Json<UpstreamAuthRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10222,7 +10228,7 @@ pub async fn set_egress_proxy(
     Json(payload): Json<EgressProxyRequest>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10269,7 +10275,7 @@ pub async fn get_egress_proxy(
     Path(key): Path<String>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     // Read is admin-gated too: the redacted URL still discloses the internal
     // proxy host and port, which is infrastructure topology.
@@ -10303,10 +10309,13 @@ pub async fn test_upstream(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
-    let repo_service = RepositoryService::new(state.db.clone());
-    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
+    // Repository-admin gated like `get_egress_proxy` (#4265 follow-up): this
+    // probe sends a request to the upstream WITH the repository's stored
+    // upstream credentials, so its status is a validity oracle for those
+    // credentials and it is a configuration diagnostic, not a content read.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
@@ -10435,7 +10444,7 @@ pub async fn set_routing_rules(
     Json(payload): Json<SetRoutingRulesRequest>,
 ) -> Result<Json<RoutingRulesResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate every rule before persisting
     for (i, rule) in payload.rules.iter().enumerate() {
@@ -10500,7 +10509,7 @@ pub async fn delete_routing_rules(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -10718,6 +10727,7 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
 
@@ -15222,8 +15232,11 @@ mod tests {
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
-    // short-circuits (token scope, public, admin, anonymous) run everywhere;
-    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // short-circuits (token scope, public, admin) run everywhere; the
+    // anonymous-on-private denial now consults the permissions store for an
+    // anonymous read rule (#1849) and must fail CLOSED when it is
+    // unreachable — the dead pool below drives exactly that. The per-repo
+    // role-assignment branch is exercised by the `*_db` tests,
     // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
     // (the same `try_pool()` convention the virtual-member tests use).
     // -----------------------------------------------------------------------
@@ -15462,6 +15475,7 @@ mod tests {
                 10 + i as i64,
                 Some("f00d"),
                 Some("application/x-test"),
+                None,
                 None,
             )
             .await
@@ -16065,6 +16079,68 @@ mod tests {
     /// supply-chain control, same tier as delete/update). Granting
     /// `repository:admin` lets the same user through, and a global admin is
     /// always allowed. Skips when no `DATABASE_URL` is configured.
+    /// #3831 end to end (#4265 follow-up): a `write:repositories` API token
+    /// whose user holds `repository:admin` drives a repository-management
+    /// handler successfully, while a `write:artifacts` token on the same
+    /// user is refused at the scope gate before any per-repo check runs.
+    /// The 14-handler pin above only greps the gate text; this exercises it.
+    #[tokio::test]
+    async fn set_cache_ttl_accepts_write_repositories_token_and_refuses_write_artifacts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["admin"]).await;
+        let req = || SetCacheTtlRequest {
+            cache_ttl_seconds: 1,
+        };
+        let token = |scope: &str| AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec![scope.to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_id]),
+            ..tdh::make_auth(user_id, &username)
+        };
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_cache_ttl(
+            State(state),
+            Extension(Some(token("write:repositories"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused = set_cache_ttl(
+            State(state2),
+            Extension(Some(token("write:artifacts"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            allowed.is_ok(),
+            "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
+        match refused {
+            Err(AppError::Authorization(msg)) => assert!(
+                msg.contains("scope"),
+                "the refusal must come from the scope gate: {msg}"
+            ),
+            other => panic!("write:artifacts must be refused at the scope gate, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn set_cache_ttl_requires_repo_admin_grant_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -17934,9 +18010,12 @@ mod tests {
     // model (role_assignments) for private repositories, so the cases that
     // exercise the DB grant lookup (private + authenticated non-admin) are
     // covered by integration/live verification rather than these pure tests.
-    // The cases below short-circuit BEFORE any DB access (public repos, the
-    // anonymous-on-private denial, and the token-scope mismatch denial) and so
-    // remain DB-free; we drive them with an unused pool handle.
+    // The public-repo and token-scope cases below short-circuit BEFORE any DB
+    // access and so remain DB-free; the anonymous-on-private denial now
+    // CONSULTS the permissions store for an anonymous read rule (#1849) and
+    // fails CLOSED when it is unreachable — which is exactly what the
+    // unused pool handle below drives: the denial must stay the
+    // existence-hiding NotFound, never a 500.
 
     #[tokio::test]
     async fn test_require_visible_public_no_auth() {
@@ -19487,66 +19566,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Guest-access coercion (issue #850)
+    // Guest-access public-visibility denial (#3855)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn coerce_create_passthrough_when_guests_enabled() {
-        // When guests are enabled (the default), the requested value is
-        // returned unchanged regardless of whether it is true or false.
-        assert_eq!(coerce_is_public_for_create(true, true), (true, false));
-        assert_eq!(coerce_is_public_for_create(false, true), (false, false));
+    fn public_visibility_allowed_when_guests_enabled() {
+        assert!(require_public_visibility_allowed(true, true).is_ok());
+        assert!(require_public_visibility_allowed(false, true).is_ok());
     }
 
     #[test]
-    fn coerce_create_forces_private_when_guests_disabled() {
-        assert_eq!(coerce_is_public_for_create(true, false), (false, true));
+    fn public_visibility_rejected_when_guests_disabled() {
+        // The core #3855 contract: asking for public while guest access is
+        // disabled is a 400 naming both resolutions, never a silent rewrite.
+        let err = require_public_visibility_allowed(true, false).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("AK_GUEST_ACCESS_ENABLED=false"),
+                    "message must name the operator switch: {msg}"
+                );
+                assert!(
+                    msg.contains("cannot be public"),
+                    "message must say what was refused: {msg}"
+                );
+            }
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
     }
 
     #[test]
-    fn coerce_create_already_private_is_noop_when_guests_disabled() {
-        // No coercion needed when the request is already private; the flag
-        // returned in `.1` must be `false` so the caller does not log a
-        // misleading warning.
-        assert_eq!(coerce_is_public_for_create(false, false), (false, false));
-    }
-
-    #[test]
-    fn coerce_update_passthrough_when_guests_enabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), true),
-            (Some(true), false)
-        );
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), true),
-            (Some(false), false)
-        );
-        assert_eq!(coerce_is_public_for_update(None, true), (None, false));
-    }
-
-    #[test]
-    fn coerce_update_forces_private_when_guests_disabled_and_some_true() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), false),
-            (Some(false), true)
-        );
-    }
-
-    #[test]
-    fn coerce_update_some_false_is_noop_when_guests_disabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), false),
-            (Some(false), false)
-        );
-    }
-
-    #[test]
-    fn coerce_update_none_is_noop_when_guests_disabled() {
-        // An update payload that does not touch the visibility field must
-        // remain `None` so the service layer leaves the existing value
-        // untouched. We never silently flip an existing public repo to
-        // private on unrelated updates.
-        assert_eq!(coerce_is_public_for_update(None, false), (None, false));
+    fn private_request_is_not_a_contradiction_when_guests_disabled() {
+        // Asking for (or leaving) private visibility never contradicts the
+        // policy — this includes the update path's absent-field `false`.
+        assert!(require_public_visibility_allowed(false, false).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -19823,6 +19876,58 @@ mod tests {
         .execute(pool)
         .await
         .expect("update repo upstream_url");
+    }
+
+    #[tokio::test]
+    async fn github_mirror_download_route_preserves_cache_format() {
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_service::{CacheMetadata, ProxyService};
+        let asset = "owner/repo/releases/download/v1/asset";
+        for (format, ttl) in [
+            ("github", 604800),
+            ("mise", 604800),
+            ("aqua", 604800),
+            ("generic", 300),
+            ("maven", 300),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{asset}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_bytes(b"release".as_ref()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            let proxy =
+                tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(
+                fx.pool.clone(),
+                fx.storage_dir.to_str().unwrap(),
+                proxy,
+            );
+            let router = tdh::router_anon(crate::api::handlers::general::router(), state);
+            let (status, body) =
+                tdh::send(router, tdh::get(format!("/{}/{asset}", fx.repo_key))).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(&body[..], b"release");
+            tdh::wait_for_cache_commit(&fx.storage_dir, body.len() as u64).await;
+            let key =
+                ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &fx.repo_key, asset)
+                    .unwrap();
+            let metadata: CacheMetadata =
+                serde_json::from_slice(&std::fs::read(fx.storage_dir.join(key)).unwrap()).unwrap();
+            assert_eq!(
+                (metadata.expires_at - metadata.cached_at).num_seconds(),
+                ttl,
+                "{format} cache lifetime through /general"
+            );
+            fx.teardown().await;
+        }
     }
 
     #[tokio::test]
@@ -22348,8 +22453,8 @@ mod tests {
         assert_eq!(composed, "../etc/passwd");
 
         // `make_auth` builds a JWT-style AuthExtension (is_api_token =
-        // false), so `require_scope("write")` automatically passes - no
-        // need to populate `scopes`.
+        // false), so the handler's `require_scope("write:artifacts")` gate
+        // automatically passes - no need to populate `scopes`.
         let auth = tdh::make_auth(fx.user_id, &fx.username);
 
         let result = upload_artifact(
@@ -22435,6 +22540,127 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         fx.teardown().await;
+    }
+
+    // -------------------------------------------------------------------
+    // #3831: repository-management handlers must gate on scopes an API
+    // token can actually CARRY. Bare `write`/`read`/`delete` are
+    // deliberately not mintable (#2996) and `scopes_grant_access` is
+    // broad-covers-specific only, so a bare-scope gate admitted session
+    // auth and `admin`/`*` tokens -- and nothing else, not even a
+    // `write:repositories` token held by a global admin.
+    // -------------------------------------------------------------------
+
+    /// Return the source of a single `pub async fn <name>(...)` body from
+    /// this file (the string-grep gate idiom from `upload.rs::handler_body`;
+    /// the handlers need a real DB to execute end to end).
+    fn repo_handler_body(name: &str) -> &'static str {
+        let source = include_str!("repositories.rs");
+        let needle = format!("pub async fn {}(", name);
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{} not found", name));
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn repo_management_handlers_require_mintable_scopes() {
+        // The fourteen write-side handlers that gated on the un-mintable
+        // bare `write` parent now name `write:repositories`.
+        for handler in [
+            "create_repository",
+            "update_repository",
+            "set_cache_ttl",
+            "invalidate_cache",
+            "set_npm_scope_policy",
+            "put_pypi_track",
+            "delete_pypi_track",
+            "add_virtual_member",
+            "update_virtual_members",
+            "remove_virtual_member",
+            "set_upstream_auth",
+            "set_egress_proxy",
+            "set_routing_rules",
+            "delete_routing_rules",
+        ] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"write:repositories\")"),
+                "{handler} must require the mintable `write:repositories` scope (#3831)"
+            );
+        }
+        // The delete pair names the resource-specific mintable scopes.
+        assert!(
+            repo_handler_body("delete_repository")
+                .contains("require_scope(\"delete:repositories\")"),
+            "delete_repository must require `delete:repositories` (#3831)"
+        );
+        assert!(
+            repo_handler_body("delete_artifact").contains("require_scope(\"delete:artifacts\")"),
+            "delete_artifact must require `delete:artifacts` (#3831)"
+        );
+        // The read-side repo-management handlers name `read:repositories`.
+        for handler in ["get_npm_scope_policy", "get_egress_proxy", "test_upstream"] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"read:repositories\")"),
+                "{handler} must require the mintable `read:repositories` scope (#3831)"
+            );
+        }
+    }
+
+    /// Behavioral pin for the gate decision itself: a `write:repositories`
+    /// token passes the repository-management scope gate, a session
+    /// (unscoped) caller is untouched, and an artifact-only token is still
+    /// refused -- the fix widens nothing beyond the intended resource.
+    #[test]
+    fn repo_management_scope_gate_decision() {
+        let uid = Uuid::new_v4();
+        let repo_scoped = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:repositories".to_string()]),
+            ..tdh::make_auth(uid, "repo-writer-3831")
+        };
+        assert!(
+            repo_scoped.require_scope("write:repositories").is_ok(),
+            "write:repositories token must pass the repo-management gate (#3831)"
+        );
+
+        let session = tdh::make_auth(uid, "session-3831");
+        assert!(
+            session.require_scope("write:repositories").is_ok(),
+            "session auth (scopes: None) must keep passing the gate"
+        );
+
+        let artifact_only = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-writer-3831")
+        };
+        assert!(
+            artifact_only.require_scope("write:repositories").is_err(),
+            "write:artifacts must NOT cross resources into repo management"
+        );
+        assert!(
+            artifact_only.require_scope("delete:repositories").is_err(),
+            "write:artifacts must NOT satisfy delete:repositories"
+        );
+
+        let artifact_deleter = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["delete:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-deleter-3831")
+        };
+        assert!(
+            artifact_deleter.require_scope("delete:artifacts").is_ok(),
+            "delete:artifacts token must pass the artifact-delete gate (#3831)"
+        );
+        assert!(
+            artifact_deleter
+                .require_scope("delete:repositories")
+                .is_err(),
+            "delete:artifacts must NOT satisfy the repository-delete gate"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -22658,6 +22884,247 @@ mod tests {
             b.extend(o);
         }
         Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
+    }
+
+    // -----------------------------------------------------------------------
+    // #3855: public create/update while guest access is disabled is an
+    // explicit 400, never a silent rewrite to private.
+    // -----------------------------------------------------------------------
+
+    /// Create with `is_public: true` under `AK_GUEST_ACCESS_ENABLED=false`
+    /// must be rejected with the Validation error naming the switch, and must
+    /// leave NO repository row behind; a private create under the same policy
+    /// succeeds (control).
+    #[tokio::test]
+    async fn public_create_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-c-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        let key = format!("ph-3855-pub-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &key,
+                "public repo",
+                "generic",
+                serde_json::json!({ "is_public": true }),
+            ),
+        )
+        .await
+        .expect_err("public create under AK_GUEST_ACCESS_ENABLED=false must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphaned, 0,
+            "a rejected create must not persist a repository row"
+        );
+
+        // Control: a create that does not ask for public succeeds under the
+        // same policy.
+        let private_key = format!("ph-3855-priv-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &private_key,
+                "private repo",
+                "generic",
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("private create under the disabled policy must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Update flipping `is_public` to true under the disabled policy is a
+    /// 400; an update that leaves the field alone succeeds, and the stored
+    /// visibility never changes under a rejected flip.
+    #[tokio::test]
+    async fn public_update_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-u-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-3855-upd-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(&key, "repo to flip", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let flip: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"is_public": true}"#).expect("deserialize flip payload");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(flip),
+        )
+        .await
+        .expect_err("flipping is_public to true under the disabled policy must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let persisted: bool =
+            sqlx::query_scalar("SELECT is_public FROM repositories WHERE id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read persisted visibility");
+        assert!(
+            !persisted,
+            "a rejected flip must leave the stored visibility untouched"
+        );
+
+        // Control: an update that leaves visibility alone succeeds.
+        let noop: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"description": "still private"}"#)
+                .expect("deserialize noop payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(noop),
+        )
+        .await
+        .expect("an update that does not touch visibility must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: the anonymous arm of `require_visible` — an IP-conditioned
+    // anonymous read rule admits matching anonymous callers to a private
+    // repository; everyone else gets the same existence-hiding 404.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn require_visible_admits_anonymous_callers_with_a_matching_ip_rule() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-1849-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-1849-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin)),
+            make_create_request(&key, "ip gated repo", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let repo_service = RepositoryService::new(pool.clone());
+        let repo = repo_service
+            .get_by_id(created.id)
+            .await
+            .expect("load repository model");
+
+        // No rule yet: even a CI-range anonymous caller gets the
+        // existence-hiding 404 (control — the arm must not fall open).
+        let denied = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "with no anonymous rule, a private repo stays hidden from anonymous callers"
+        );
+
+        // The conditioned anonymous read rule.
+        sqlx::query(
+            "INSERT INTO permissions \
+               (principal_type, principal_id, target_type, target_id, actions, conditions) \
+             VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'], $3)",
+        )
+        .bind(Uuid::nil())
+        .bind(created.id)
+        .bind(serde_json::json!({"allowed_cidrs": ["10.40.0.0/16"]}))
+        .execute(&pool)
+        .await
+        .expect("insert conditioned anonymous rule");
+
+        // Inside the CIDR: admitted.
+        let inside = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            inside.is_ok(),
+            "an anonymous caller inside allowed_cidrs must be admitted"
+        );
+
+        // Outside it: the identical existence-hiding 404 as the rules-less
+        // control above, so the caller cannot tell a conditioned repo from a
+        // rules-less one.
+        let outside = with_client_ip_scope(
+            Some("192.0.2.9".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(outside, Err(AppError::NotFound(_))),
+            "outside allowed_cidrs the denial must be the existence-hiding 404"
+        );
+
+        // No request IP (background): fail closed.
+        assert!(
+            matches!(
+                require_visible(&repo, &None, &repo_service).await,
+                Err(AppError::NotFound(_))
+            ),
+            "with no request IP a conditioned rule must fail closed"
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// When a format string is not a built-in variant but there IS an
@@ -23059,21 +23526,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // quarantine_enabled is refused on proxying repository types (#3647)
+    // quarantine_enabled is refused on virtual repositories only (#3647, #3912)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_quarantine_enableable_rejects_proxy_types() {
+    fn test_is_quarantine_enableable_rejects_only_virtual() {
         assert!(is_quarantine_enableable(&RepositoryType::Local).is_ok());
         assert!(is_quarantine_enableable(&RepositoryType::Staging).is_ok());
-        for proxying in [RepositoryType::Remote, RepositoryType::Virtual] {
-            let err = is_quarantine_enableable(&proxying)
-                .expect_err("quarantine must be refused on a proxying repository");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")),
-                "expected a Validation error naming the reason, got {err:?}",
-            );
-        }
+        // #3912: Remote repositories got a releasable quarantine identity
+        // (proxy_cache_artifacts columns + the proxy-cache release endpoint),
+        // so enabling the policy there is allowed.
+        assert!(is_quarantine_enableable(&RepositoryType::Remote).is_ok());
+        let err = is_quarantine_enableable(&RepositoryType::Virtual)
+            .expect_err("quarantine must still be refused on a virtual repository");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("member remote")),
+            "expected a Validation error naming the alternative, got {err:?}",
+        );
     }
 
     /// Structural regression guard: the update path must keep routing
@@ -23092,11 +23561,13 @@ mod tests {
         );
     }
 
-    /// DB-backed: PATCH `{"quarantine_enabled": true}` is refused with a 400 on
-    /// a Remote and on a Virtual repository, nothing is written, and disabling
-    /// stays allowed so an existing enabled row can still be turned off.
+    /// DB-backed: since #3912, PATCH `{"quarantine_enabled": true}` SUCCEEDS on
+    /// a Remote repository (proxied content carries a releasable quarantine
+    /// identity now) and is still refused with a 400 on a Virtual repository
+    /// (no cache of its own), writing nothing. Disabling stays allowed on both
+    /// so an existing enabled row can always be turned off.
     #[tokio::test]
-    async fn test_quarantine_enable_refused_on_proxy_repositories_db() {
+    async fn test_quarantine_enable_remote_allowed_virtual_refused_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::extract::{Extension, Path, State};
 
@@ -23126,31 +23597,42 @@ mod tests {
             }
         };
 
-        for (repo_id, repo_key) in [(remote_id, &remote_key), (virtual_id, &virtual_key)] {
-            let err = update_repository(
-                State(state.clone()),
-                Extension(Some(admin_auth(user_id, &username))),
-                Path(repo_key.clone()),
-                Json(update(r#"{"quarantine_enabled":true}"#)),
-            )
-            .await
-            .expect_err("enabling quarantine on a proxying repo must be refused");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")
-                    && msg.contains("release")),
-                "the refusal must say why there is no release path, got {err:?}",
-            );
-            assert_eq!(
-                err.into_response().status(),
-                StatusCode::BAD_REQUEST,
-                "the refusal must surface as a 400"
-            );
-            assert_eq!(
-                stored(repo_id).await,
-                None,
-                "a refused enable must not write the config row"
-            );
-        }
+        // Remote: allowed since #3912 and persisted.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(remote_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect("enabling quarantine on a remote repo must succeed since #3912");
+        assert_eq!(resp.quarantine_enabled, Some(true));
+        assert_eq!(stored(remote_id).await.as_deref(), Some("true"));
+
+        // Virtual: still refused, with a 400 naming the alternative, and
+        // nothing is written.
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(virtual_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect_err("enabling quarantine on a virtual repo must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("release")),
+            "the refusal must say where the release path lives, got {err:?}",
+        );
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "the refusal must surface as a 400"
+        );
+        assert_eq!(
+            stored(virtual_id).await,
+            None,
+            "a refused enable must not write the config row"
+        );
 
         // Disabling remains allowed on a proxying repo: that is the escape
         // hatch for a row written before this gate existed.
@@ -23670,6 +24152,23 @@ mod tests {
     // formats that don't normalise, and npm-family repos quietly fall
     // back to the stored path on the second probe.
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn github_shaped_generic_files_remain_deletable() {
+        for format in [
+            RepositoryFormat::Generic,
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            assert!(!delete_blocked_by_immutability(
+                &format,
+                "myorg/myapp/releases/download/v1/app.tar.gz",
+                false,
+                false
+            ));
+        }
+    }
 
     #[test]
     fn test_delete_blocked_by_immutability_matches_classification() {
@@ -24221,8 +24720,10 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // The guard reports the owning local member's priority (2), NOT a
-        // blanket "suppress all remotes".
+        // The guard reports the owning local member's resolution RANK (2 —
+        // for a flat virtual with priorities 1..n the rank equals the
+        // priority, see `virtual_member_ranks`), NOT a blanket "suppress all
+        // remotes".
         let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
             .await
             .expect("isolation query");
@@ -24537,6 +25038,7 @@ mod tests {
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod generic_path_coordinate_tests {
     use super::derive_generic_path_coordinate;
@@ -24594,6 +25096,7 @@ mod generic_path_coordinate_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod docker_tag_search_escape_tests {
     use super::*;
@@ -24776,6 +25279,7 @@ mod docker_tag_search_escape_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod apt_validation_tests {
     use super::*;
@@ -25824,18 +26328,20 @@ mod apt_validation_tests {
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped)),
-            RepoVisibility::Ids(scoped_to)
+            RepoVisibility::Ids(scoped_to.clone())
         );
 
-        // An ADMIN repo-scoped token still resolves to `All`: the admin arm is
-        // matched first, mirroring the listing.
+        // #3901: an ADMIN repo-scoped token is confined to the token's set --
+        // the scope arm is matched ahead of the admin arm, exactly as
+        // `search::intersect_token_scope` and the webhook reads already
+        // narrow an admin's scoped credential.
         let scoped_admin = AuthExtension {
             is_admin: true,
             ..scoped
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped_admin)),
-            RepoVisibility::All
+            RepoVisibility::Ids(scoped_to)
         );
     }
 
@@ -26226,6 +26732,7 @@ mod apt_validation_tests {
 ///
 /// These are two INDEPENDENT hand-rolled builders in two different handlers,
 /// so each carries its own guard.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -26565,6 +27072,7 @@ mod content_encoding_forwarding_tests {
 /// with `allowed_repo_ids = AccessScope::Admin` — i.e. unrestricted token
 /// scope. That is exactly a browser JWT session, and it is the shape for which
 /// the pre-fix `can_access_repo` filter returned `true` for every member.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_visibility_tests {
     use super::*;
@@ -27117,6 +27625,7 @@ mod virtual_member_visibility_tests {
 // POSITIVE CONTROL in the SAME fixture -- an entitled caller still gets the
 // bytes, an admin still sees everything, a public member is still reachable.
 // A "fix" that denied everyone would fail those controls.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use super::*;

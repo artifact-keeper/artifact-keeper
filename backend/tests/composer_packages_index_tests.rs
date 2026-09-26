@@ -154,8 +154,12 @@ fn test_config(storage_path: &str) -> Config {
         proxy_singleflight_lock_wait_timeout_secs: 65,
         oci_virtual_negative_cache_ttl_ms:
             artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        npm_virtual_negative_cache_ttl_ms:
+            artifact_keeper_backend::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
             artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+        npm_virtual_negative_cache_max_entries:
+            artifact_keeper_backend::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,

@@ -580,6 +580,7 @@ pub struct DashboardSummary {
     pub repos_grade_f: i64,
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

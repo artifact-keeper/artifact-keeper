@@ -490,6 +490,7 @@ pub fn catalog_payload(files: &[(String, Vec<u8>)]) -> Vec<BinaryFinding> {
     out
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

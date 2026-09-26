@@ -1267,21 +1267,18 @@ pub async fn invalidate_package_and_virtuals(
         .await;
 }
 
-/// Keys of every virtual repository containing `repo_id` as a member.
-/// Failures degrade to an empty list: the member repo itself is still
-/// invalidated, and virtual entries age out through the TTL floor.
+/// Keys of every virtual repository containing `repo_id` as a member —
+/// recursively, so a write to a leaf invalidates the packuments of every
+/// ANCESTOR virtual, not only its direct parents (#3840). Failures degrade
+/// to an empty list: the member repo itself is still invalidated, and
+/// virtual entries age out through the TTL floor.
 pub async fn virtual_repo_keys(db: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<String> {
-    sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
+    crate::services::repository_service::RepositoryService::new(db.clone())
+        .virtual_ancestor_keys(repo_id)
+        .await
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

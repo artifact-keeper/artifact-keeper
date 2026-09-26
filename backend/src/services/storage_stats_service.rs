@@ -758,6 +758,7 @@ impl StorageStatsService {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +982,7 @@ mod tests {
 /// this repo regardless of concurrently running peers. Skips cleanly when no
 /// `DATABASE_URL` is configured; under [`crate::testing::REQUIRE_DB_ENV`]
 /// (CI) an unreachable database fails loudly instead (#2924).
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod db_tests {
     use super::*;

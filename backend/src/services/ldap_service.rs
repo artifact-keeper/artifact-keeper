@@ -1118,6 +1118,7 @@ impl LdapService {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,8 +1240,12 @@ mod tests {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            npm_virtual_negative_cache_ttl_ms:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            npm_virtual_negative_cache_max_entries:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,

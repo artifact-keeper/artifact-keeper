@@ -346,6 +346,7 @@ pub async fn get_system_config(
 )]
 pub struct SystemConfigApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

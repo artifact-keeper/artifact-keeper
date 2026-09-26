@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4089]
+---
+- **Conda packages now inherit PyPI advisory coverage through a conda-to-PyPI alias graph, instead of scanning bit-for-bit identically to a clean package** (#4089). OSV has no `conda` ecosystem and the GitHub feed skipped conda silently, so a conda dependency got nothing from either advisory source and the result looked exactly like an all-clear. A scanned conda package is now resolved through the alias graph and branches on what it learns: a package with a known PyPI counterpart (`py-opencv` → `opencv-python`, `pytorch` → `torch`, `matplotlib-base` → `matplotlib`) is queried as that distribution in the `PyPI` ecosystem; a package that positively ships no PyPI distribution is queried across every ecosystem like a vendored native library; and a Python package with no known alias degrades the scan to `partial` rather than publishing an empty findings list as a clean bill. Findings name the conda package actually installed and disclose the alias the match rests on, at the package's own version line.

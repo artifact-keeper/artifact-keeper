@@ -1978,6 +1978,7 @@ pub struct RestoreResult {
     pub integrity_anchor: IntegrityAnchor,
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

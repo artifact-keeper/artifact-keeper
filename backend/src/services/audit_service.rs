@@ -447,6 +447,22 @@ impl AuditEntry {
         self
     }
 
+    /// Attach the in-flight request's client IP, resolved by
+    /// `client_ip_context_middleware` (#3888): the TCP peer, with
+    /// `X-Forwarded-For` believed only under the configured trusted-proxy
+    /// policy (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`). Outside a request scope —
+    /// background jobs, startup, detached tasks — or when the address could
+    /// not be resolved, the entry keeps `ip_address: NULL`: the audit row
+    /// records "unknown", never a sentinel. Authentication emitters call this
+    /// so login/logout/refresh events carry the address the credential was
+    /// presented from.
+    pub fn with_request_client_ip(mut self) -> Self {
+        if let Some(ip) = crate::api::middleware::client_ip::current_client_ip() {
+            self.ip_address = Some(ip);
+        }
+        self
+    }
+
     /// Attach a best-effort actor display name for the export envelope (#2413).
     ///
     /// Populate this where the handler already has the acting principal's name
@@ -1131,6 +1147,7 @@ macro_rules! audit_log {
     };
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1504,27 @@ mod tests {
                 "system:stuck_scan_janitor".to_string()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_request_client_ip_picks_up_scoped_request_ip() {
+        // #3888: inside a request scope (what client_ip_context_middleware
+        // establishes) the entry carries the resolved client IP.
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let entry = crate::api::middleware::client_ip::with_client_ip_scope(Some(ip), async {
+            AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(ip));
+    }
+
+    #[tokio::test]
+    async fn test_with_request_client_ip_outside_scope_keeps_none() {
+        // Background jobs / detached tasks have no request IP; the entry must
+        // record NULL rather than a sentinel or a stale address.
+        let entry =
+            AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip();
+        assert!(entry.ip_address.is_none());
     }
 
     #[test]

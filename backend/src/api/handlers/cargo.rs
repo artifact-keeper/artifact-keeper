@@ -119,6 +119,31 @@ async fn resolve_upstream_dl_url(
         .as_deref()
         .or(repo.upstream_url.as_deref())?;
 
+    fetch_dl_template(state, repo.id, repo_key, base_url).await
+}
+
+/// Fetch `config.json` from `base_url` through the proxy cache and extract
+/// the `dl` download URL template.
+///
+/// This is the shared core of [`resolve_upstream_dl_url`], factored out so
+/// the Virtual download path can resolve the template for each of its Remote
+/// MEMBERS by id (#3952) — a member is a [`crate::models::repository::Repository`],
+/// not the [`RepoInfo`] the direct-Remote arm carries. The fetch is keyed to
+/// `(repo_id, "config.json")` in the proxy cache and memoized process-wide by
+/// `base_url` for `CONFIG_CACHE_TTL_SECS`, so per-member resolution after the
+/// first request costs one in-memory lookup per member.
+///
+/// Returns `Some(dl_url)` on success, `None` if the config could not be fetched
+/// or parsed. Callers treat `None` as "no template" and fall back to the
+/// canonical `api/v1/crates/{name}/{version}/download` against the upstream
+/// base URL — the pre-`dl`-resolution behavior, correct for registries whose
+/// index and download hosts coincide.
+async fn fetch_dl_template(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    base_url: &str,
+) -> Option<String> {
     // Check the cache first.
     if let Some(cached) = config_cache_get(base_url).await {
         return Some(cached);
@@ -128,7 +153,7 @@ async fn resolve_upstream_dl_url(
     let proxy = state.proxy_service.as_ref()?;
     let config_bytes = proxy_helpers::proxy_fetch_capped(
         proxy,
-        repo.id,
+        repo_id,
         repo_key,
         base_url,
         "config.json",
@@ -218,20 +243,61 @@ async fn resolve_index_cksum(
 }
 
 /// Build the full download URL for a crate, using the upstream `dl` template
-/// when available. Falls back to `{upstream_url}/api/v1/crates/{name}/{version}/download`.
+/// when available. Falls back to `{dl_url}/{name}/{version}/download` when the
+/// template carries no markers.
 ///
 /// The `dl` field from `config.json` can be either a plain base URL
 /// (e.g. `https://crates.io/api/v1/crates`) to which `/{name}/{version}/download`
-/// is appended, or a template with `{crate}` / `{version}` markers. This
-/// function handles both forms.
+/// is appended, or a template with markers. The cargo registry spec defines
+/// `{crate}`, `{version}`, `{prefix}`, `{lowerprefix}` and
+/// `{sha256-checksum}`. This function expands all but `{sha256-checksum}`: the
+/// checksum is only knowable from the crate's sparse-index entry, which a
+/// URL builder has no access to (and the Virtual path never resolves one), so
+/// that marker — which no known registry uses in practice — is left literal
+/// rather than half-substituted, the same failure shape it had before.
+/// `{prefix}` is computed from the name as passed (both callers hand over the
+/// lowercased name, so `{prefix}` and `{lowerprefix}` coincide here; the
+/// distinct expansions stay for spec fidelity).
 fn build_download_url(dl_url: &str, name: &str, version: &str) -> String {
-    if dl_url.contains("{crate}") || dl_url.contains("{version}") {
+    let is_template = [
+        "{crate}",
+        "{version}",
+        "{lowerprefix}",
+        "{prefix}",
+        "{sha256-checksum}",
+    ]
+    .iter()
+    .any(|marker| dl_url.contains(marker));
+    if is_template {
         dl_url
             .replace("{crate}", name)
             .replace("{version}", version)
+            .replace("{lowerprefix}", &cargo_dl_prefix(&name.to_lowercase()))
+            .replace("{prefix}", &cargo_dl_prefix(name))
     } else {
         let base = dl_url.trim_end_matches('/');
         format!("{}/{}/{}/download", base, name, version)
+    }
+}
+
+/// The cargo registry spec's index `{prefix}` for a crate name: `1` / `2` /
+/// `3/{c}` for one-, two- and three-character names, `{ab}/{cd}` for longer
+/// ones (e.g. `se/rd` for `serde`). Computed with boundary-safe slicing so a
+/// non-ASCII name (invalid, but reachable as a raw path parameter before the
+/// publish-side name validation ever ran) degrades to a literal instead of a
+/// panic; valid cargo names are ASCII and take the spec arms.
+fn cargo_dl_prefix(name: &str) -> String {
+    match name.len() {
+        1 => "1".to_string(),
+        2 => "2".to_string(),
+        3 => match name.get(..1) {
+            Some(first) => format!("3/{}", first),
+            None => name.to_string(),
+        },
+        _ => match (name.get(..2), name.get(2..4)) {
+            (Some(first), Some(second)) => format!("{}/{}", first, second),
+            _ => name.to_string(),
+        },
     }
 }
 
@@ -248,6 +314,66 @@ fn split_url(url: &str) -> Option<(String, String)> {
     let origin = &url[..scheme_end + 3 + slash];
     let path = &url[scheme_end + 3 + slash + 1..];
     Some((origin.to_string(), path.to_string()))
+}
+
+/// Resolve each Remote member's `dl` download template for the Virtual
+/// download path (#3952), returning `member.id -> absolute download URL` for
+/// the requested `{name_lower}@{version}`.
+///
+/// Every step degrades to "no entry", which hands the member the canonical
+/// `api/v1/crates/{name}/{version}/download` path against its own
+/// `upstream_url` in the resolver — the exact pre-#3952 behavior, correct for
+/// registries whose index and download hosts coincide:
+///
+/// * a member that is not Remote, or has no `upstream_url`, or whose
+///   `config.json` cannot be fetched/parsed, gets no entry;
+/// * a member whose `config.json` carries no `dl` gets no entry.
+///
+/// The one deliberate member-scoped failure is SSRF: a hostile or
+/// misconfigured `config.json` could set `dl` to a cloud-metadata or internal
+/// URL, so the expanded URL goes through `validate_outbound_url` exactly as
+/// the direct-Remote arm's does. There the check is request-scoped (the one
+/// upstream is the only source of bytes, so failing loud is right); here it
+/// is MEMBER-scoped — a compromised lower-priority member's `dl` must not
+/// deny the whole virtual's downloads, so the member falls back to its
+/// canonical index-host path with a warning rather than the request failing.
+async fn resolve_virtual_member_dl_urls(
+    state: &SharedState,
+    members: &[crate::models::repository::Repository],
+    name_lower: &str,
+    version: &str,
+) -> HashMap<uuid::Uuid, String> {
+    let mut urls = HashMap::new();
+    if state.proxy_service.is_none() {
+        return urls;
+    }
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let index_url_overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
+    for member in members {
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(upstream_url) = member.upstream_url.as_deref() else {
+            continue;
+        };
+        let base_url = resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
+        let Some(dl_url) = fetch_dl_template(state, member.id, &member.key, &base_url).await else {
+            continue;
+        };
+        let full = build_download_url(&dl_url, name_lower, version);
+        if let Err(e) = validate_outbound_url(&full, "Cargo upstream download URL") {
+            tracing::warn!(
+                member_key = %member.key,
+                crate_name = %name_lower,
+                error = %e,
+                "virtual member's config.json `dl` failed SSRF validation; \
+                 falling back to its index host for this download"
+            );
+            continue;
+        }
+        urls.insert(member.id, full);
+    }
+    urls
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,6 +1291,8 @@ async fn resolve_cargo_repo(
     let repo = sqlx::query(
         "SELECT id, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, \
          upstream_url, is_public, \
+         promotion_only, age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+         curation_enabled, curation_default_action, \
          (SELECT value FROM repository_config \
           WHERE repository_id = repositories.id \
           AND key = 'index_upstream_url') AS index_upstream_url \
@@ -1210,6 +1338,15 @@ async fn resolve_cargo_repo(
                     storage_backend: storage_backend.clone(),
                     is_public,
                     index_upstream_url: index_upstream_url.clone(),
+                    // Populated faithfully (not defaulted) so any resolver
+                    // reusing this entry sees the same row the middleware
+                    // would have cached (#3778).
+                    promotion_only: repo.get("promotion_only"),
+                    age_gate_enabled: repo.get("age_gate_enabled"),
+                    age_gate_min_age_days: repo.get("age_gate_min_age_days"),
+                    age_gate_mode: repo.get("age_gate_mode"),
+                    curation_enabled: repo.get("curation_enabled"),
+                    curation_default_action: repo.get("curation_default_action"),
                 },
                 Instant::now(),
             ),
@@ -1701,16 +1838,13 @@ async fn publish(
     // Invalidate the index cache for this crate so the next fetch sees the new version.
     index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
 
-    // Also invalidate any virtual repos that include this hosted repo.
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    // Also invalidate every virtual repo that includes this hosted repo —
+    // recursively, so a virtual nesting the crate's direct parent converges
+    // too instead of serving a stale index entry (#3840).
+    let virtual_keys: Vec<String> =
+        crate::services::repository_service::RepositoryService::new(state.db.clone())
+            .virtual_ancestor_keys(repo.id)
+            .await;
 
     for vkey in &virtual_keys {
         index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
@@ -1963,18 +2097,34 @@ async fn download(
                 let vversion = version.clone();
                 let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
 
-                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // If a non-Remote member of this Virtual repo owns the
-                // crate name, block Remote members from satisfying the
-                // download. The guard runs on the case-folded crate name
-                // (`name_lower` is already lowercase). When the guard
-                // fires we pass `None` to `resolve_virtual_download` so
-                // Remote members fall to `VirtualMemberFetchStrategy::Skip`.
-                // The `None` argument is load-bearing: see the comment
-                // on `serve_virtual_tarball_local_only` in hex.rs for
-                // why any future refactor that threads a real proxy
-                // service through this branch would re-open the
-                // shadowing attack.
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s;
+                // narrowed to name + EXACT VERSION by #3953). If a non-Remote
+                // member of this Virtual repo owns this exact `name@version`,
+                // block Remote members from satisfying the download — the
+                // dependency-confusion case the guard exists for. The guard
+                // runs on the case-folded crate name (`name_lower` is already
+                // lowercase) and the exact version string (`artifacts.version`
+                // is the published semver string cargo clients request
+                // byte-for-byte, the same comparison npm's
+                // `virtual_non_remote_owns_name_exact_version` makes — see
+                // #3646 / PR #3743, which named cargo as the deliberate
+                // follow-up). Before #3953 the guard fired on the NAME alone,
+                // so one hosted fork build of a crates.io name shadowed every
+                // upstream version the merged sparse index kept advertising,
+                // and `cargo build` 404'd a version the index it just read
+                // told it existed.
+                //
+                // When the guard fires we pass `None` to the download
+                // resolver so Remote members fall to
+                // `VirtualMemberFetchStrategy::Skip`. The `None` argument is
+                // load-bearing: see the comment on
+                // `serve_virtual_tarball_local_only` in hex.rs for why any
+                // future refactor that threads a real proxy service through
+                // this branch would re-open the shadowing attack. Narrowing
+                // the guard to name+version keeps that mechanism exactly as
+                // it is — it only stops firing for versions no local member
+                // actually holds, which is precisely the set the merged index
+                // advertises from upstream.
                 //
                 // Fail-closed: if the requested name does not parse as a
                 // valid crate name, do not run the guard. Bad names
@@ -1983,8 +2133,13 @@ async fn download(
                 // anyway, and skipping it spares the DB an existence
                 // check on every malformed request.
                 let local_owns = if crate::formats::cargo::is_valid_cargo_name(&name_lower) {
-                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &name_lower)
-                        .await?
+                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                        &state.db,
+                        repo.id,
+                        &name_lower,
+                        &version,
+                    )
+                    .await?
                 } else {
                     false
                 };
@@ -2005,11 +2160,12 @@ async fn download(
                 // resolver is left untouched so maven/hex and the other
                 // formats routed through it are unaffected.
                 //
-                // Only runs when the name is not locally owned: with
-                // `proxy_for_virtual` at `None` every Remote member resolves to
-                // `VirtualMemberFetchStrategy::Skip` and cannot serve bytes at
-                // all, so evaluating them would be a policy decision (and an
-                // upstream index fetch) with nothing behind it.
+                // Only runs when the exact name@version is not locally owned:
+                // with `proxy_for_virtual` at `None` every Remote member
+                // resolves to `VirtualMemberFetchStrategy::Skip` and cannot
+                // serve bytes at all, so evaluating them would be a policy
+                // decision (and an upstream index fetch) with nothing behind
+                // it.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
                 let had_members = !members.is_empty();
                 let members = proxy_helpers::authorize_virtual_members(
@@ -2040,10 +2196,30 @@ async fn download(
                     members
                 };
 
-                let result = proxy_helpers::resolve_virtual_download_from_members(
+                // #3952: resolve each Remote member's own `dl` download
+                // template (from that member's `config.json`) so the upstream
+                // fetch goes to the member's DOWNLOAD host. The pre-filtered
+                // member walk above used to hand the resolver a single
+                // `api/v1/crates/{name}/{version}/download` path joined to
+                // each member's `upstream_url` — the INDEX host — so a member
+                // whose registry splits index and downloads across hosts
+                // (crates.io: index.crates.io vs static.crates.io) 404'd
+                // every crate not already warm from a prior remote-path
+                // fetch. The canonical path stays the proxy-cache key; only
+                // the fetch URL is overridden per member. Skipped when the
+                // guard suppressed the proxy: Remote members cannot serve
+                // then, so no `config.json` round-trip is owed to them.
+                let member_fetch_urls = if proxy_for_virtual.is_some() {
+                    resolve_virtual_member_dl_urls(&state, &members, &name_lower, &version).await
+                } else {
+                    HashMap::new()
+                };
+
+                let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
                     members,
                     proxy_for_virtual,
                     &upstream_path,
+                    &member_fetch_urls,
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -2371,8 +2547,9 @@ async fn try_remote_index(
 ///   repos that host crates directly; rebuild the sparse-index lines from
 ///   DB rows.
 ///
-/// * **Virtual** (nested) — skipped defensively to avoid recursion; not
-///   a supported configuration.
+/// * **Virtual** (nested) — unreachable post-#3840 (the member walk is
+///   recursive and leaf-only); the arm stays as a defensive skip so a
+///   regression that lets a virtual row through cannot recurse.
 ///
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
 /// resolution honours `index_upstream_url` config overrides for the proxy
@@ -2506,23 +2683,48 @@ async fn try_virtual_index(
                     continue;
                 }
 
-                // Ungated member: unchanged. The 2-tuple fetch discards the
-                // upstream `Content-Encoding`, so a stored-coded member body
-                // still contributes zero entries here — a pre-existing latent
-                // defect (#3184 stopped the shared client decoding) that is
-                // deliberately not "fixed" under this change, which would
-                // alter ungated behavior on a path this PR is not about.
-                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    &base_url,
-                    &index_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await
+                // Ungated member (#3937): the coding-preserving `_encoded`
+                // fetch plus `decode_cargo_index_body`, the same pair the
+                // gated arm uses. The 2-tuple `proxy_fetch_capped` this
+                // replaces structurally discarded the `Content-Encoding`, and
+                // since #3184 nothing on this path decodes — so a member body
+                // STORED content-coded (object stores return a stored coding
+                // regardless of the request) reached `merge_index_lines` as
+                // compressed bytes, parsed as zero NDJSON lines, and the
+                // member silently contributed nothing to the merged index.
+                // Both fetch variants key the proxy cache on the same
+                // upstream index path, so a warm entry is shared and the
+                // switch costs no extra round trip.
+                //
+                // Member-scoped miss posture, unchanged: a failed fetch or an
+                // undecodable body withholds THIS member's contribution
+                // (matching `gated_member_index_contribution` and npm's
+                // `remote_member_packument_value`) rather than failing the
+                // whole aggregate.
+                if let Ok((content, _content_type, content_encoding)) =
+                    proxy_helpers::proxy_fetch_capped_encoded(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        &base_url,
+                        &index_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await
                 {
-                    merge_index_lines(&content, &mut aggregated, &mut seen_versions);
+                    match decode_cargo_index_body(&content, content_encoding.as_deref()) {
+                        Ok(decoded) => {
+                            merge_index_lines(&decoded, &mut aggregated, &mut seen_versions);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                member_key = %member.key,
+                                crate_name = %name_lower,
+                                "ungated virtual member's sparse index could not be \
+                                 decoded; withholding its contribution"
+                            );
+                        }
+                    }
                 }
             }
             RepositoryType::Local | RepositoryType::Staging => {
@@ -2560,8 +2762,9 @@ async fn try_virtual_index(
                 }
             }
             RepositoryType::Virtual => {
-                // Nested virtuals are not supported and would cause recursion.
-                // Skip defensively rather than attempting a lookup.
+                // Unreachable post-#3840 (the member walk is recursive and
+                // leaf-only); defensive skip so a regression that lets a
+                // virtual row through skips instead of recursing.
                 continue;
             }
         }
@@ -2863,6 +3066,7 @@ fn cargo_sparse_index_path_upstream(name: &str) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5564,6 +5768,73 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // build_download_url: {prefix} / {lowerprefix} markers (#3952 secondary)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_download_url_prefix_markers() {
+        // The cargo registry spec allows `{prefix}` and `{lowerprefix}` in the
+        // `dl` template; before #3952 they were left literal in the URL.
+        let dl = "https://dl.example.com/{lowerprefix}/{crate}/{version}/download";
+        let url = build_download_url(dl, "serde", "1.0.200");
+        assert_eq!(url, "https://dl.example.com/se/rd/serde/1.0.200/download");
+
+        // `{prefix}` follows the case of the name as passed; both call sites
+        // pass the lowercased name, so the two markers coincide in practice.
+        let dl = "https://dl.example.com/{prefix}/{crate}/{version}/download";
+        let url = build_download_url(dl, "Inflector", "0.11.4");
+        assert_eq!(
+            url,
+            "https://dl.example.com/In/fl/Inflector/0.11.4/download"
+        );
+        let dl = "https://dl.example.com/{lowerprefix}/{crate}/{version}/download";
+        let url = build_download_url(dl, "Inflector", "0.11.4");
+        assert_eq!(
+            url,
+            "https://dl.example.com/in/fl/Inflector/0.11.4/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_prefix_short_names() {
+        // The spec prefix for 1/2/3-character names is `1` / `2` / `3/{c}`.
+        for (name, prefix) in [("a", "1"), ("ab", "2"), ("abc", "3/a"), ("abcd", "ab/cd")] {
+            let dl = "https://dl.example.com/{lowerprefix}/{crate}/{version}/download";
+            let url = build_download_url(dl, name, "0.1.0");
+            assert_eq!(
+                url,
+                format!("https://dl.example.com/{prefix}/{name}/0.1.0/download"),
+                "prefix for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_download_url_non_ascii_name_does_not_panic() {
+        // Invalid per cargo's name rules, but the raw download path parameter
+        // reaches this builder before any name validation runs on it: a
+        // multi-byte name must degrade rather than panic on a byte slice.
+        let dl = "https://dl.example.com/{lowerprefix}/{crate}/{version}/download";
+        let url = build_download_url(dl, "étude", "1.0.0");
+        assert!(url.contains("/étude/1.0.0/download"), "got {url}");
+    }
+
+    #[test]
+    fn test_cargo_dl_prefix_matches_sparse_index_layout() {
+        // The `{prefix}` expansion must agree with the sparse-index path the
+        // same name produces, or a registry whose `dl` uses it would 404.
+        for name in ["a", "ab", "abc", "serde", "cc", "regex"] {
+            let sparse = cargo_sparse_index_path_upstream(name);
+            let prefix = cargo_dl_prefix(name);
+            assert_eq!(
+                sparse,
+                format!("{prefix}/{name}"),
+                "sparse path for {name} is the prefix plus the name"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // split_url
     // -----------------------------------------------------------------------
 
@@ -5870,6 +6141,7 @@ mod tests {
 /// Cargo parses the index server-side rather than writing it to disk, so this
 /// degrades (a failed parse) instead of silently corrupting an artifact, which
 /// is why it is the lower-severity half of the issue.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod index_content_encoding_tests {
     use super::*;
@@ -6052,6 +6324,7 @@ mod index_content_encoding_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -6173,6 +6446,13 @@ mod catalog_registration_tests {
 /// bypassable by an exact version already pinned in a `Cargo.lock`, and a
 /// download gate alone would let cargo resolve a version it is then refused —
 /// so a change that fixes one and regresses the other must fail here.
+///
+/// The `VirtualRig` built for the Phase 3 member-parity tests also hosts the
+/// virtual-member regression tests that are not age-gate work — #3937
+/// (coding-blind ungated member fetch), #3953 (name-only ownership guard)
+/// and #3952 (unresolved `dl` template) — because building one virtual repo
+/// with per-member wiremock upstreams is the expensive part they all share.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod age_gate_tests {
     use super::*;
@@ -7762,6 +8042,220 @@ mod age_gate_tests {
         assert!(
             text.contains("\"vers\":\"1.0.0\""),
             "a healthy member is unaffected by its neighbour's broken coding; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #3937: an UNGATED member whose index body arrives (or is stored)
+    /// content-encoded must still contribute its versions to the merged
+    /// sparse index.
+    ///
+    /// The ungated member fetch went through the 2-tuple
+    /// `proxy_fetch_capped`, which structurally discards the
+    /// `Content-Encoding`; since #3184 nothing decodes on that path, so the
+    /// coded body reached `merge_index_lines` as compressed bytes, parsed as
+    /// zero NDJSON lines, and the member silently contributed nothing — with
+    /// a single member the virtual 404s a crate the upstream plainly serves.
+    /// The gated member path never had the defect
+    /// (`gated_member_index_contribution` reads the `_encoded` variant and
+    /// decodes); this pins the same coding-awareness on the ungated arm.
+    #[tokio::test]
+    async fn test_virtual_index_decodes_a_stored_coded_ungated_member_body_3937() {
+        let name = "coded-member";
+        let index_doc = format!("{}\n", index_line(name, "1.2.3", &"7".repeat(64), None));
+        let (_plain, coded) = tdh::coded_fixture("gzip", index_doc.as_bytes());
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        rig.mount_index(
+            member,
+            name,
+            ResponseTemplate::new(200)
+                .set_body_bytes(coded)
+                .append_header("content-encoding", "gzip"),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a gzip-stored member body must still parse; got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("\"vers\":\"1.2.3\""),
+            "the coded member's version must reach the merged index; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #3953: the Virtual download ownership guard is name + EXACT VERSION,
+    /// so a hosted member holding `name@1.0.0` no longer shadows every other
+    /// version the merged sparse index advertises from upstream.
+    ///
+    /// The npm instance of this defect was #3646, fixed by PR #3743, whose
+    /// own text named cargo as a deliberate follow-up: the name-only guard
+    /// made one internally-published fork build of a crates.io name suppress
+    /// every upstream version on the download path while the merged index
+    /// kept listing them — cargo resolved a version the virtual then 404'd.
+    ///
+    /// The shadowing defence the name-only guard carried is pinned by the
+    /// second half of the test: the OWNED coordinate is still served by the
+    /// local member, and the Remote member is never asked for it
+    /// (`.expect(0)`).
+    #[tokio::test]
+    async fn test_virtual_download_shadows_only_the_locally_owned_version_3953() {
+        let name = "shared-name";
+        let upstream_body = b"the upstream 2.0.0 crate bytes".repeat(4);
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let remote = rig.add_remote(2, false, true).await;
+        rig.add_local(1, name, "1.0.0").await;
+        rig.mount_download(remote, name, "2.0.0", &upstream_body, 1)
+            .await;
+        rig.mount_download(remote, name, "1.0.0", b"must never be served", 0)
+            .await;
+
+        // A version no local member holds resolves through the Remote
+        // member — the exact request the name-only guard used to 404.
+        let (status, served, _) = rig.get(rig.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an upstream-only version must resolve through the virtual; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &upstream_body[..]);
+
+        // The locally OWNED coordinate still comes from the local member,
+        // and the Remote member is never consulted for it (.expect(0)).
+        let (status, served, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            b"a locally published crate",
+            "the dependency-confusion shadowing defence is unchanged"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #3952: the Virtual download route resolves each Remote member's `dl`
+    /// template from that member's own `config.json`, so a member whose
+    /// index and download hosts differ (crates.io: index.crates.io vs
+    /// static.crates.io) serves crate bodies from the DOWNLOAD host.
+    ///
+    /// The route used to build `api/v1/crates/{name}/{version}/download`
+    /// against the member's `upstream_url` — the INDEX host — and 404'd any
+    /// crate not already warm from a prior remote-path fetch. The member's
+    /// wiremock here serves `config.json` but no crate body; the body exists
+    /// only on a second server the `dl` template names, so the download can
+    /// only succeed by resolving the template. The `dl` host must be the
+    /// non-loopback test server: `validate_outbound_url` hard-blocks
+    /// loopback, and the guard allowlists exactly the bound /32 for the
+    /// lifetime of the test (see `tdh::non_loopback_mock_server`).
+    #[tokio::test]
+    async fn test_virtual_download_resolves_member_dl_template_3952() {
+        let name = "split-host";
+        let dl_body = b"crate bytes from the download host".repeat(4);
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        let (dl_server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+
+        // The member's index host serves `config.json` naming a SEPARATE
+        // download host; the crate body exists only there.
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dl": format!("{}/crates/{{crate}}/{{version}}/download", dl_server.uri()),
+                "api": rig.remotes[member].server.uri(),
+            })))
+            .mount(&rig.remotes[member].server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/crates/{name}/1.0.0/download")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(dl_body.clone()))
+            .expect(1)
+            .mount(&dl_server)
+            .await;
+        // The pre-fix URL shape: the canonical path against the INDEX host.
+        // It must never be requested once the `dl` template is resolved.
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/1.0.0/download")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&rig.remotes[member].server)
+            .await;
+
+        let (status, served, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the virtual must fetch from the member's `dl` host, not its index \
+             host; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &dl_body[..]);
+
+        rig.teardown().await;
+    }
+
+    /// #3952 companion for the handler test above:
+    /// `resolve_virtual_member_dl_urls` itself. The member whose `config.json`
+    /// names a public download host gets an expanded `{crate}`/`{version}` URL
+    /// in the map; the member whose `dl` points at a cloud-metadata address
+    /// gets NO entry — the SSRF guard is member-scoped, so a hostile member
+    /// falls back to its index host rather than failing the virtual, and the
+    /// metadata URL is never fetched.
+    #[tokio::test]
+    async fn test_resolve_virtual_member_dl_urls_expands_and_refuses_ssrf_3952() {
+        let name = "template-crate";
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let good = rig.add_remote(1, false, true).await;
+        let hostile = rig.add_remote(2, false, true).await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dl": "https://dl.example.com/crates/{crate}/{version}/download",
+            })))
+            .mount(&rig.remotes[good].server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dl": "http://169.254.169.254/latest/meta-data/{crate}/{version}",
+            })))
+            .mount(&rig.remotes[hostile].server)
+            .await;
+
+        // The production path only ever resolves `dl` URLs for members the
+        // CALLER may see, so walk the authorized set, not the raw one
+        // (#3323 sweep covers this file). `None` auth sees every member
+        // here: the rig makes them all public.
+        let members =
+            proxy_helpers::authorized_virtual_members(&rig.virt.pool, None, rig.virt.repo_id)
+                .await
+                .expect("authorized members");
+        let urls = super::resolve_virtual_member_dl_urls(&rig.state, &members, name, "1.0.0").await;
+
+        assert_eq!(
+            urls.get(&rig.remotes[good].id).map(String::as_str),
+            Some("https://dl.example.com/crates/template-crate/1.0.0/download"),
+            "a public `dl` template is expanded with {{crate}}/{{version}}"
+        );
+        assert!(
+            !urls.contains_key(&rig.remotes[hostile].id),
+            "a metadata-endpoint `dl` must not become a fetch URL"
         );
 
         rig.teardown().await;

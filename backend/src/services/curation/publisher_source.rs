@@ -71,6 +71,12 @@ pub struct PublisherIdentity {
 /// gives it a verifiable provenance record whose cert-bound owner is a
 /// publisher identity, and its `about.json` metadata carries a self-asserted
 /// fallback — the same two-tier shape as PyPI and npm.
+///
+/// This is a list of publisher *families*, not raw repository formats: a
+/// format is applicable when [`publisher_family`] maps it onto one of these.
+/// `conda_native` repositories map onto `conda` (#4251) — the conda handler
+/// serves both formats through the same code, with the same CEP-27
+/// attestations and `about.json` metadata.
 pub const APPLICABLE_FORMATS: &[&str] = &["pypi", "npm", "conda"];
 
 /// Returns `true` if `format` has a publisher concept this module can
@@ -92,9 +98,11 @@ pub fn is_applicable_format(format: &str) -> bool {
 /// `conda` is mapped here directly instead: it has no public download-count
 /// source wired into the popularity signal, so adding it there would claim a
 /// popularity answer that does not exist, while publisher trust needs only
-/// the extraction mapping.
+/// the extraction mapping. `conda_native` joins that family (#4251): the
+/// conda handler serves it identically, so a publisher-trust rule on a
+/// `conda_native` repository must not silently evaluate to `NotApplicable`.
 fn publisher_family(format: &str) -> Option<&'static str> {
-    if format.eq_ignore_ascii_case("conda") {
+    if crate::services::conda_semantics::is_conda_format(format) {
         return Some("conda");
     }
     super::popularity_source::ecosystem_for_format(format)
@@ -343,6 +351,7 @@ fn display_name_from_contact(value: Option<&Value>) -> Option<String> {
     Some(name.to_string())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +422,15 @@ mod tests {
             assert_eq!(
                 extract_publisher(f, &npm_with_provenance()),
                 extract_publisher("npm", &npm_with_provenance()),
+                "{f}"
+            );
+        }
+        // #4251: conda_native is conda's publisher family, not a new one.
+        for f in ["conda_native", "CONDA_NATIVE"] {
+            assert_eq!(publisher_family(f), Some("conda"), "{f}");
+            assert_eq!(
+                extract_publisher(f, &conda_metadata_only()),
+                extract_publisher("conda", &conda_metadata_only()),
                 "{f}"
             );
         }
@@ -525,6 +543,9 @@ mod tests {
         // verification exists.
         assert!(is_applicable_format("conda"));
         assert!(is_applicable_format("Conda"));
+        // #4251: conda_native is served by the same handler as conda.
+        assert!(is_applicable_format("conda_native"));
+        assert!(is_applicable_format("Conda_Native"));
         assert!(!is_applicable_format("raw"));
         assert!(!is_applicable_format("docker"));
         assert!(!is_applicable_format("maven"));
@@ -702,6 +723,17 @@ mod tests {
             id.verified,
             "a persisted verified record sets verified=true"
         );
+    }
+
+    #[test]
+    fn conda_native_verified_marker_yields_cert_bound_owner() {
+        // #4251: the verified-attestation path applies to conda_native too.
+        let mut md = conda_metadata_only();
+        md[VERIFICATION_MARKER] = json!({"state": "verified", "owner": "conda-forge"});
+        let id = extract_publisher("conda_native", &md).unwrap();
+        assert_eq!(id.name, "conda-forge");
+        assert_eq!(id.source, PublisherSource::Attestation);
+        assert!(id.verified);
     }
 
     #[test]

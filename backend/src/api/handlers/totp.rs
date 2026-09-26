@@ -417,6 +417,7 @@ pub async fn verify_totp(
         audit_fire_and_forget(
             state.db.clone(),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .with_request_client_ip()
                 .user(claims.sub)
                 .resource(claims.sub)
                 .details_typed(
@@ -503,6 +504,7 @@ pub async fn verify_totp(
             audit_fire_and_forget(
                 state.db.clone(),
                 AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                    .with_request_client_ip()
                     .user(claims.sub)
                     .resource(claims.sub)
                     .details_typed(crate::services::audit_export::details::AuthDetails {
@@ -617,6 +619,7 @@ async fn issue_session_after_totp(
     audit_fire_and_forget(
         state.db.clone(),
         AuditEntry::new(AuditAction::Login, ResourceType::User)
+            .with_request_client_ip()
             .user(user.id)
             .resource(user.id)
             .details(serde_json::json!({
@@ -755,6 +758,7 @@ pub async fn enroll_complete(
         audit_fire_and_forget(
             state.db.clone(),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .with_request_client_ip()
                 .user(claims.sub)
                 .resource(claims.sub)
                 .details_typed(crate::services::audit_export::details::AuthDetails {
@@ -980,6 +984,7 @@ pub async fn disable_totp(
 )]
 pub struct TotpApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1304,7 @@ mod tests {
 // `is_token_invalidated` is consulted with a real user row in place.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod totp_token_invalidation_regression_tests {
     use super::*;
@@ -1661,6 +1667,7 @@ mod totp_token_invalidation_regression_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod totp_verify_hardening_tests {
     //! Regression coverage for the round-3 2FA hardening:
@@ -1837,6 +1844,7 @@ mod totp_verify_hardening_tests {
 /// Phase 1): TOTP enable, disable and login-verify must each emit the right
 /// audit rows, while a failed 2FA verify emits `LOGIN_FAILED`. Each test
 /// no-ops when `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod totp_audit_tests {
     use super::*;

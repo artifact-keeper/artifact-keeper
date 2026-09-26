@@ -20,6 +20,7 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use futures::FutureExt;
 use moka::future::Cache as MokaCache;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
@@ -233,8 +234,60 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
-
-async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+/// Resolve the repository for a Maven request, consulting the shared
+/// in-process repo cache first (#3778). `repo_visibility_middleware`
+/// populates the cache before handlers run, so a warm request resolves with
+/// zero DB round-trips instead of re-selecting static repository metadata on
+/// every GET — with a remote PostgreSQL, that lookup was a measurable slice
+/// of every cached artifact's latency.
+///
+/// The cached entry carries the full enforcement surface (`promotion_only`,
+/// `age_gate_*`, `curation_*`), so a cache-served [`RepoInfo`] is the same
+/// snapshot the DB lookup would have produced; writes to those columns evict
+/// the entry via the migration-239 trigger, with the 60-second TTL as the
+/// fallback bound. A cache miss falls back to the DB lookup. The fallback
+/// deliberately does NOT populate the cache: it only runs when the
+/// middleware was bypassed (tests), and `resolve_repo_by_key` does not
+/// select `is_public` — a handler-populated entry without it would be a
+/// visibility-gate lie the next middleware pass might trust.
+async fn resolve_maven_repo(
+    db: &PgPool,
+    repo_key: &str,
+    repo_cache: &crate::api::RepoCache,
+) -> Result<RepoInfo, Response> {
+    {
+        let cache = repo_cache.read().await;
+        if let Some((entry, at)) = cache.get(repo_key) {
+            if at.elapsed().as_secs() < crate::api::REPO_CACHE_TTL_SECS {
+                let fmt_lower = entry.format.to_lowercase();
+                if fmt_lower != "maven" && fmt_lower != "gradle" {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Repository '{}' is not a Maven repository (format: {})",
+                            repo_key, entry.format
+                        ),
+                    )
+                        .into_response());
+                }
+                return Ok(RepoInfo {
+                    id: entry.id,
+                    key: repo_key.to_string(),
+                    storage_path: entry.storage_path.clone(),
+                    storage_backend: entry.storage_backend.clone(),
+                    repo_type: entry.repo_type.clone(),
+                    format: entry.format.clone(),
+                    upstream_url: entry.upstream_url.clone(),
+                    promotion_only: entry.promotion_only,
+                    age_gate_enabled: entry.age_gate_enabled,
+                    age_gate_min_age_days: entry.age_gate_min_age_days,
+                    age_gate_mode: entry.age_gate_mode.clone(),
+                    curation_enabled: entry.curation_enabled,
+                    curation_default_action: entry.curation_default_action.clone(),
+                });
+            }
+        }
+    }
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["maven", "gradle"], "a Maven").await
 }
 
@@ -484,6 +537,14 @@ async fn maven_local_fetch_snapshot(
     let resolved = resolve_snapshot_artifact(db, repo_id, path)
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    // #4286: the alias resolves to a real artifact row, so it gets that row's
+    // full download gate (quarantine AND scan policy), the same one
+    // `local_fetch_by_path` applies to an exact-path hit. Without it a blocked
+    // or quarantined timestamped SNAPSHOT was served through a virtual repo.
+    crate::services::quarantine_service::check_artifact_download(db, resolved.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let stream = storage
@@ -903,6 +964,26 @@ fn parse_maven_sha1_sidecar(
     None
 }
 
+/// Whether a proxied Maven path is subject to `.sha1` sidecar gating — the
+/// synchronous half of [`resolve_maven_sha1_sidecar`]'s skip rules, extracted
+/// so `serve_artifact` can decide up front (without any fetch) between the
+/// digest-gated and ungated streaming arms (#3982).
+///
+/// Only RELEASE-versioned package assets are gated. Checksum/signature
+/// sidecars and `maven-metadata.xml` are excluded by the catalog's own skip
+/// rules (`maven_proxy_package_name`), and `-SNAPSHOT` assets are mutable —
+/// a racing re-deploy would pin a stale sidecar and refuse to cache a
+/// legitimate body.
+fn maven_sha1_sidecar_gate_applies(path: &str) -> bool {
+    if crate::services::proxy_service::maven_proxy_package_name(path).is_none() {
+        return false;
+    }
+    match crate::formats::maven::MavenHandler::parse_coordinates(path) {
+        Ok(coords) => !coords.version.ends_with("-SNAPSHOT"),
+        Err(_) => false,
+    }
+}
+
 /// Resolve the upstream `.sha1` sidecar for a proxied Maven package asset so
 /// the streamed download can gate its proxy-cache commit on it —
 /// serve-but-don't-cache on a mismatch, mirroring Cargo's #2929 `cksum` gate
@@ -911,14 +992,11 @@ fn parse_maven_sha1_sidecar(
 /// sidecar server-side, so a `.jar`/`.pom` whose bytes disagreed with its
 /// sidecar was committed to the cache and served warm from then on.
 ///
-/// Only RELEASE-versioned package assets are gated. Checksum/signature
-/// sidecars and `maven-metadata.xml` are excluded by the catalog's own skip
-/// rules (`maven_proxy_package_name`), and `-SNAPSHOT` assets are mutable —
-/// a racing re-deploy would pin a stale sidecar and refuse to cache a
-/// legitimate body. The sidecar fetch rides the proxy cache (a Maven/Gradle
-/// client requests the sidecar anyway, so it is usually warm or
-/// negative-cached), and any failure — absent, unparseable, upstream error —
-/// returns `None`: the download proceeds unverified, exactly as before.
+/// Gating applies only where [`maven_sha1_sidecar_gate_applies`] holds. The
+/// sidecar fetch rides the proxy cache (a Maven/Gradle client requests the
+/// sidecar anyway, so it is usually warm or negative-cached), and any
+/// failure — absent, unparseable, upstream error — returns `None`: the
+/// download proceeds unverified, exactly as before.
 async fn resolve_maven_sha1_sidecar(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -926,9 +1004,7 @@ async fn resolve_maven_sha1_sidecar(
     upstream_url: &str,
     path: &str,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
-    crate::services::proxy_service::maven_proxy_package_name(path)?;
-    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
-    if coords.version.ends_with("-SNAPSHOT") {
+    if !maven_sha1_sidecar_gate_applies(path) {
         return None;
     }
     let (content, _ct, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
@@ -977,7 +1053,7 @@ async fn download_root(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
-    let repo = resolve_maven_repo(&state.db, &repo_key).await?;
+    let repo = resolve_maven_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
@@ -1065,7 +1141,7 @@ async fn download(
     headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let repo = resolve_maven_repo(&state.db, &repo_key).await?;
+    let repo = resolve_maven_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -1988,10 +2064,13 @@ async fn fetch_maven_prefixes_bytes_uncached(
                         // the hosted generator would report it as
                         // CONFIRMED-EMPTY and the group would publish an
                         // allowlist missing everything behind it — the
-                        // spurious file #3383 forbids. Nesting is supported
-                        // (`MAX_VIRTUAL_DEPTH`), so this is reachable; treat
-                        // it as "set unknown" and bail the whole union, the
-                        // same as an unreachable Remote member.
+                        // spurious file #3383 forbids. Post-#3840 the member
+                        // walk is recursive and leaf-only, so this arm is
+                        // unreachable in practice; it stays as a fail-closed
+                        // guard — if a virtual row ever reached this loop the
+                        // union would be unknowable and must bail (the same
+                        // as an unreachable Remote member), never report
+                        // confirmed-empty.
                         RepositoryType::Virtual => Err(PrefixesError::NotFound(
                             "Prefix file not available".to_string(),
                         )),
@@ -2253,6 +2332,16 @@ async fn serve_artifact(
             Some(a) => Some(a),
             None if path.contains("-SNAPSHOT") => {
                 if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
+                    // #4286: the exact-path arm below gates its row with
+                    // `check_artifact_download`; the alias-resolved row must
+                    // pass the same quarantine + scan-policy gate before its
+                    // bytes (or a presigned redirect to them) are served.
+                    crate::services::quarantine_service::check_artifact_download(
+                        &state.db,
+                        resolved.id,
+                    )
+                    .await
+                    .map_err(|e| e.into_response())?;
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
@@ -2311,10 +2400,35 @@ async fn serve_artifact(
                     // with the sidecar is streamed to the client (which
                     // verifies it) but never cached. No sidecar -> the
                     // unverified fetch, exactly as before.
-                    if let Some(expected) =
-                        resolve_maven_sha1_sidecar(proxy, repo.id, repo_key, upstream_url, path)
+                    //
+                    // #3982: the sidecar resolution is DEFERRED, not awaited
+                    // before the content fetch starts. The two used to run as
+                    // sequential proxy-cache round-trips on EVERY GET — on
+                    // network-attached storage (NFS) that roughly doubled
+                    // warm-cache latency. The digest is only needed by the
+                    // final verify-and-commit step, so the content fetch
+                    // starts immediately: a warm hit never resolves the
+                    // sidecar at all (one round-trip total) and a cold miss
+                    // overlaps the sidecar with the body stream, deciding the
+                    // cache commit on both results exactly as before.
+                    if maven_sha1_sidecar_gate_applies(path) {
+                        let repo_id = repo.id;
+                        let proxy_for_sidecar = Arc::clone(proxy);
+                        let sidecar_repo_key = repo_key.to_string();
+                        let sidecar_upstream = upstream_url.clone();
+                        let sidecar_path = path.to_string();
+                        let digest = async move {
+                            resolve_maven_sha1_sidecar(
+                                &proxy_for_sidecar,
+                                repo_id,
+                                &sidecar_repo_key,
+                                &sidecar_upstream,
+                                &sidecar_path,
+                            )
                             .await
-                    {
+                        }
+                        .boxed()
+                        .shared();
                         let gated_repo = proxy_helpers::build_remote_repo_with_format(
                             repo.id,
                             repo_key,
@@ -2322,11 +2436,12 @@ async fn serve_artifact(
                             RepositoryFormat::Maven,
                         );
                         let result = proxy
-                            .fetch_artifact_streaming_with_cache_path_gated_digest(
+                            .fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
                                 &gated_repo,
                                 path,
                                 path,
-                                Some(expected),
+                                crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
+                                digest,
                             )
                             .await
                             .map_err(IntoResponse::into_response)?;
@@ -2346,8 +2461,10 @@ async fn serve_artifact(
                         // format that never did, so a jar pulled through a
                         // maven-central proxy always reported 0 downloads.
                         // HEAD-guarded + best-effort inside.
-                        proxy_helpers::record_proxy_download(state, repo.id, repo_key, path, ctx)
-                            .await;
+                        proxy_helpers::record_proxy_download_deferred(
+                            state, repo.id, repo_key, path, ctx,
+                        )
+                        .await;
                         return Ok(response);
                     }
                     // #3459: carry the Maven format so a released coordinate
@@ -2367,8 +2484,12 @@ async fn serve_artifact(
                         RepositoryFormat::Maven,
                     )
                     .await?;
-                    // #3265: same counting as the sidecar-gated branch above.
-                    proxy_helpers::record_proxy_download(state, repo.id, repo_key, path, ctx).await;
+                    // #3265: same counting as the sidecar-gated branch above;
+                    // #3778: recorded off the response path (spawned task).
+                    proxy_helpers::record_proxy_download_deferred(
+                        state, repo.id, repo_key, path, ctx,
+                    )
+                    .await;
                     return Ok(response);
                 }
             }
@@ -2443,7 +2564,14 @@ async fn serve_artifact(
                         async move {
                             // Fast path: strict path match (covers release artifacts
                             // and SNAPSHOT files deployed under their `-SNAPSHOT` alias).
-                            if let Ok(result) = proxy_helpers::local_fetch_by_path(
+                            //
+                            // #4286: only a genuine miss (404) falls through to the
+                            // fallbacks below. A quarantine / scan-policy refusal
+                            // (403/409) or an infrastructure error from the gated
+                            // lookup is this member's answer; swallowing it let the
+                            // storage-direct fallback anchor on a different,
+                            // passing GAV sibling and serve the refused bytes.
+                            match proxy_helpers::local_fetch_by_path(
                                 &db,
                                 &state,
                                 member_id,
@@ -2452,7 +2580,9 @@ async fn serve_artifact(
                             )
                             .await
                             {
-                                return Ok(result);
+                                Ok(result) => return Ok(result),
+                                Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+                                Err(resp) => return Err(resp),
                             }
 
                             // Fallback A: SNAPSHOT alias resolution (#839).
@@ -2863,7 +2993,7 @@ async fn upload(
     // this push endpoint. Require the write scope before doing any work.
     let auth = require_auth_basic_scope(auth, "maven", "write:artifacts")?;
     let user_id = auth.user_id;
-    let repo = resolve_maven_repo(&state.db, &repo_key).await?;
+    let repo = resolve_maven_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -3263,6 +3393,7 @@ async fn upload(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3872,6 +4003,143 @@ mod tests {
             repo.upstream_url.as_deref(),
             Some("https://repo1.maven.org/maven2")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_maven_repo — shared repo cache fast path (#3778)
+    // -----------------------------------------------------------------------
+
+    /// An entry as `repo_visibility_middleware` would cache it, with the
+    /// enforcement surface set AWAY from the defaults so a resolver that
+    /// silently defaulted them fails here (that direction fails the gates
+    /// open).
+    fn cached_maven_repo_entry(repo_id: uuid::Uuid, format: &str) -> crate::api::CachedRepo {
+        crate::api::CachedRepo {
+            id: repo_id,
+            format: format.to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+            storage_path: "/cache/maven".to_string(),
+            storage_backend: "filesystem".to_string(),
+            is_public: true,
+            index_upstream_url: None,
+            promotion_only: true,
+            age_gate_enabled: true,
+            age_gate_min_age_days: 14,
+            age_gate_mode: "first_seen".to_string(),
+            curation_enabled: true,
+            curation_default_action: "review".to_string(),
+        }
+    }
+
+    async fn seeded_repo_cache(key: &str, entry: crate::api::CachedRepo) -> crate::api::RepoCache {
+        let cache = crate::api::RepoCache::default();
+        cache
+            .write()
+            .await
+            .insert(key.to_string(), (entry, std::time::Instant::now()));
+        cache
+    }
+    #[tokio::test]
+    async fn test_resolve_maven_repo_cache_hit_never_touches_db_3778() {
+        // A pool that fails any query: if the cache path touches the DB, this
+        // errors instead of resolving.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache = seeded_repo_cache(
+            "maven-central",
+            cached_maven_repo_entry(uuid::Uuid::new_v4(), "maven"),
+        )
+        .await;
+        let repo_id = cache.read().await.get("maven-central").unwrap().0.id;
+
+        let repo = resolve_maven_repo(&pool, "maven-central", &cache)
+            .await
+            .expect("a fresh cache entry must resolve without the DB");
+        assert_eq!(repo.id, repo_id);
+        assert_eq!(repo.key, "maven-central");
+        assert_eq!(repo.repo_type, "remote");
+        assert_eq!(
+            repo.upstream_url.as_deref(),
+            Some("https://repo1.maven.org/maven2")
+        );
+        assert!(repo.promotion_only);
+        assert!(repo.age_gate_enabled);
+        assert_eq!(repo.age_gate_min_age_days, 14);
+        assert_eq!(repo.age_gate_mode, "first_seen");
+        assert!(repo.curation_enabled);
+        assert_eq!(repo.curation_default_action, "review");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_maven_repo_cache_accepts_gradle_format_3778() {
+        // `gradle`-format repositories share the Maven handler (the DB path
+        // accepts both via `expected_formats`).
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache = seeded_repo_cache(
+            "gradle-plugins",
+            cached_maven_repo_entry(uuid::Uuid::new_v4(), "gradle"),
+        )
+        .await;
+        let repo = resolve_maven_repo(&pool, "gradle-plugins", &cache)
+            .await
+            .expect("a gradle-format entry must resolve on the Maven surface");
+        assert_eq!(repo.format, "gradle");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_maven_repo_cache_rejects_wrong_format_3778() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").expect("lazy pool");
+        let cache = seeded_repo_cache(
+            "npm-proxy",
+            cached_maven_repo_entry(uuid::Uuid::new_v4(), "npm"),
+        )
+        .await;
+        let err = resolve_maven_repo(&pool, "npm-proxy", &cache)
+            .await
+            .err()
+            .expect("a non-Maven entry must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(err.into_body(), 1 << 20)
+            .await
+            .expect("error body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("Repository 'npm-proxy' is not a Maven repository (format: npm)"),
+            "the cache path must answer byte-identically to the DB path: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_maven_repo_stale_entry_falls_back_to_db_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "maven").await;
+
+        // An expired cache entry (inserted 2 minutes ago, TTL is 60s) must
+        // not be served — the resolver falls back to the DB row.
+        let cache = crate::api::RepoCache::default();
+        let mut entry = cached_maven_repo_entry(uuid::Uuid::new_v4(), "maven");
+        entry.upstream_url = Some("https://stale.example.invalid/".to_string());
+        cache.write().await.insert(
+            repo_key.clone(),
+            (
+                entry,
+                std::time::Instant::now() - std::time::Duration::from_secs(120),
+            ),
+        );
+
+        let repo = resolve_maven_repo(&pool, &repo_key, &cache)
+            .await
+            .expect("stale entry must fall back to the DB");
+        assert_eq!(repo.id, repo_id, "the DB row, not the stale entry");
+        assert!(
+            repo.upstream_url.as_deref() != Some("https://stale.example.invalid/"),
+            "a stale entry must never be served"
+        );
+
+        tdh::cleanup(&pool, repo_id, uuid::Uuid::nil()).await;
     }
 
     // -----------------------------------------------------------------------
@@ -5564,6 +5832,150 @@ mod tests {
         );
     }
 
+    /// #4286: every read of a hosted Maven artifact, direct or through a
+    /// virtual, must pass that artifact's full download gate (quarantine AND
+    /// scan policy).
+    ///
+    /// Two bypasses, both closed here:
+    ///   * the virtual member closure discarded the gated exact-path lookup's
+    ///     403 (`if let Ok(..)`) and fell through to the storage-direct fallback,
+    ///     which anchored on a newer, scanned `.zip` in the same GAV and served
+    ///     the blocked `.jar`'s bytes;
+    ///   * a `-SNAPSHOT` alias resolved to its timestamped row and was served
+    ///     with no gate at all, on the direct hosted route
+    ///     (`serve_artifact`) and through a virtual (`maven_local_fetch_snapshot`).
+    ///
+    /// POSITIVE CONTROL in the same fixture: every request serves 200 with the
+    /// real bytes before the policy exists and again after it is removed.
+    #[tokio::test]
+    async fn test_hosted_reads_apply_scan_policy_direct_and_virtual_4286() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("attach hosted member");
+        // Anonymous probes: publish both so the subject is the gate, not authz.
+        tdh::publish_repo(&pool, hosted_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/gate4286/lib/1.0/lib-1.0.jar";
+        let zip_path = "com/example/gate4286/lib/1.0/lib-1.0.zip";
+        let snap_path = "com/example/gate4286/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4286/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let mut seeded = Vec::new();
+        for (path, version) in [
+            (jar_path, "1.0"),
+            (zip_path, "1.0"),
+            (snap_path, "1.0-SNAPSHOT"),
+        ] {
+            seeded.push(
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &hosted,
+                    &format!("maven/{path}"),
+                    path,
+                    "gate4286",
+                    version,
+                    "application/java-archive",
+                    Bytes::from(format!("bytes:{path}")),
+                    user_id,
+                )
+                .await,
+            );
+        }
+        // The zip is the newest primary-extension row, so the storage-direct
+        // fallback's Gate 2 anchors on it; mark it scanned so it passes.
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(seeded[1])
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("mark the zip scanned");
+        let app = tdh::router_anon(super::router(), state);
+
+        // (route, bytes the route must serve when allowed)
+        let probes = [
+            (format!("/{virtual_key}/{jar_path}"), jar_path),
+            (format!("/{hosted_key}/{jar_path}"), jar_path),
+            (format!("/{virtual_key}/{snap_alias}"), snap_path),
+            (format!("/{hosted_key}/{snap_alias}"), snap_path),
+        ];
+        let probe = |app: axum::Router| {
+            let probes = probes.clone();
+            async move {
+                let mut out = Vec::new();
+                for (route, served) in probes {
+                    let (status, body) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                    out.push((route, status, body == format!("bytes:{served}").as_bytes()));
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4286-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        let after = probe(app).await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        for (route, status, matched) in before.iter().chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must serve with no scan policy \
+                 (HTTP {status}, bytes matched: {matched})"
+            );
+        }
+        for (route, status, _) in &blocked {
+            assert_eq!(
+                *status,
+                StatusCode::FORBIDDEN,
+                "#4286: GET {route} must be refused while the hosted repository's scan \
+                 policy blocks the artifact"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // `.meta/prefixes.txt` (repository prefix file)
     // -----------------------------------------------------------------------
@@ -5898,14 +6310,18 @@ mod tests {
         );
     }
 
-    /// #3382 round 2: a Virtual member owns no artifacts of its own, so
-    /// routing it to the hosted generator counted it as confirmed-empty and
-    /// the group published an allowlist missing everything behind it. The
-    /// union is unknowable without recursing, so the group must 404 (which
-    /// Resolver reads as "don't filter, ask the repository") rather than
-    /// serve the spurious file #3383 forbids.
+    /// #3382 round 2, UPDATED by #3840: pre-#3840 a nested Virtual member
+    /// made the union unknowable (the single-level member walk returned the
+    /// intermediate virtual row, which owns no artifacts), so the group bailed
+    /// with 404 rather than publish a spurious partial allowlist. Member
+    /// expansion is now RECURSIVE — the nested virtual contributes its leaf
+    /// members, so the union IS complete and the group serves 200 with the
+    /// leaf's prefixes merged in. The defensive `RepositoryType::Virtual` bail
+    /// arm in `fetch_maven_prefixes_bytes_uncached` stays: it is unreachable
+    /// while the walk returns leaves only, and it keeps a future regression
+    /// failing closed.
     #[tokio::test]
-    async fn test_virtual_prefixes_bails_on_nested_virtual_member() {
+    async fn test_virtual_prefixes_merges_nested_virtual_member() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -5982,15 +6398,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&inner_dir);
         let _ = std::fs::remove_dir_all(&outer_dir);
 
-        assert_ne!(
+        assert_eq!(
             status,
             StatusCode::OK,
-            "a nested virtual member makes the union unknowable; publishing a \
-             partial allowlist would make Resolver stop asking for the members \
-             behind it: {}",
+            "recursive member expansion (#3840) makes the union complete: the \
+             nested virtual contributes its leaf, so the group must serve the \
+             merged prefixes, not bail: {}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&body);
+        let prefix_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('/')).collect();
+        assert_eq!(
+            prefix_lines,
+            ["/com/acme/prfxnest"],
+            "the nested leaf's group prefix must appear exactly once (the leaf \
+             is a direct member AND reachable through the nested virtual — the \
+             walk dedups it): {}",
+            text
+        );
+    }
+
+    /// #3840 companion to the merge test above: there the leaf is ALSO a
+    /// direct member, so a single-level walk would still have listed its
+    /// prefix. Here a prefix lives ONLY behind the nested virtual, so it can
+    /// appear in the union only if the walk really recursed.
+    #[tokio::test]
+    async fn test_virtual_prefixes_includes_prefix_only_behind_nested_virtual() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // `leaf` sits ONLY behind the inner virtual; `direct` is a direct
+        // member of the outer one. A single-level walk lists `direct` alone.
+        let (leaf_id, _leaf_key, leaf_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (direct_id, _direct_key, direct_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        insert_maven_artifact_row(&pool, leaf_id, user_id, "com.acme.prfxonly.inner", "leaf").await;
+        insert_maven_artifact_row(
+            &pool,
+            direct_id,
+            user_id,
+            "com.acme.prfxonly.direct",
+            "direct",
+        )
+        .await;
+
+        // inner virtual -> leaf ; outer virtual -> [inner, direct]
+        let mut virtual_ids = Vec::new();
+        for _ in 0..2 {
+            let id = Uuid::new_v4();
+            let key = format!("v-prfxonly-{}", id.simple());
+            let dir = std::env::temp_dir().join(format!("prfxonly-{}", id));
+            std::fs::create_dir_all(&dir).expect("create virtual storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format, true)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(&key)
+            .bind(&*dir.to_string_lossy())
+            .execute(&pool)
+            .await
+            .expect("insert virtual repo");
+            virtual_ids.push((id, key, dir));
+        }
+        let (inner_id, _inner_key, inner_dir) = virtual_ids[0].clone();
+        let (outer_id, outer_key, outer_dir) = virtual_ids[1].clone();
+
+        tdh::link_virtual_member(&pool, inner_id, leaf_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, inner_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, direct_id, 2).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![leaf_id, direct_id])
+            .execute(&pool)
+            .await
+            .expect("publish leaf members");
+
+        let state = tdh::build_state(pool.clone(), leaf_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", outer_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(inner_id)
+            .execute(&pool)
+            .await;
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, leaf_id, &leaf_dir).await;
+        tdh::cleanup_member_repo(&pool, direct_id, &direct_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&inner_dir);
+        let _ = std::fs::remove_dir_all(&outer_dir);
+
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "with recursive member expansion the union is knowable and the \
+             group must publish it: {text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/acme/prfxonly/direct", "/com/acme/prfxonly/inner"],
+            "the prefix that lives only behind the nested virtual must be in \
+             the union alongside the direct member's: {text}"
+        );
     }
 
     #[test]
@@ -6390,28 +6926,135 @@ mod tests {
     /// #3265 regression: the Maven remote (proxy) download branch is the one
     /// proxying format that never recorded the serve, so a jar pulled through
     /// a maven-central proxy always reported `download_count: 0` in the UI.
-    /// Every other format calls `record_proxy_download` (directly, as pypi and
-    /// npm do, or via the shared `try_remote_or_virtual_download`); Maven has
-    /// its own branch and must call it on BOTH exits — the sha1-sidecar-gated
-    /// fetch and the plain streaming fetch.
+    /// Every other format calls the proxy-download recorder (directly, as pypi
+    /// and npm do, or via the shared `try_remote_or_virtual_download`); Maven
+    /// has its own branch and must record on BOTH exits — the
+    /// sha1-sidecar-gated fetch and the plain streaming fetch.
     ///
-    /// Asserted structurally rather than over HTTP because the branch requires
-    /// a live upstream; the recorder itself is covered by
-    /// `proxy_catalog::record_proxy_download`'s own tests.
-    #[test]
-    fn remote_download_records_proxy_download_on_both_exits() {
-        // Split so this assertion's own source text is not counted as a call
-        // site (the needle only exists joined at compile time).
-        let needle = concat!(
-            "record_proxy_download",
-            "(state, repo.id, repo_key, path, ctx)"
-        );
-        let calls = MAVEN_HANDLER_SRC.matches(needle).count();
+    /// Asserted BEHAVIORALLY (the recorder moved to a spawned task off the
+    /// response path in #3778, so the row lands asynchronously): GET one
+    /// release jar whose upstream publishes a sidecar (gated arm) and one
+    /// `-SNAPSHOT` jar (the gate structurally skips mutable snapshots, so the
+    /// plain streaming arm serves it), then poll for exactly one
+    /// `proxy_download_statistics` row per path. The former source-text
+    /// assertion pinned the call-site name and could not survive the
+    /// recorder's move off the hot path; this pins the outcome instead.
+    #[tokio::test]
+    async fn test_remote_download_records_proxy_download_on_both_exits() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The ungated streaming arm is reached only where the sidecar gate
+        // structurally does not apply — a `-SNAPSHOT` asset (mutable; a racing
+        // re-deploy must not pin a stale sidecar). The gated arm is a release
+        // jar whose upstream publishes a valid sidecar.
+        const GATED_JAR: &str = "com/example/gated/1.0/gated-1.0.jar";
+        const UNGATED_JAR: &str = "com/example/ungated/1.0-SNAPSHOT/ungated-1.0-SNAPSHOT.jar";
+        let mock = MockServer::start().await;
+        for (jar, with_sidecar) in [(GATED_JAR, true), (UNGATED_JAR, false)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{jar}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/java-archive")
+                        .set_body_bytes(format!("bytes-{jar}").into_bytes()),
+                )
+                .mount(&mock)
+                .await;
+            // GATED_JAR gets a valid sidecar (digest gate engages);
+            // UNGATED_JAR is a SNAPSHOT — the gate never applies, so the
+            // plain streaming arm serves it.
+            let sidecar_body = if with_sidecar {
+                hex::encode(sha1::Sha1::digest(format!("bytes-{jar}").into_bytes()))
+            } else {
+                String::new()
+            };
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{jar}.sha1")))
+                .respond_with(if with_sidecar {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string(sidecar_body)
+                } else {
+                    ResponseTemplate::new(404)
+                })
+                .mount(&mock)
+                .await;
+        }
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        for jar in [GATED_JAR, UNGATED_JAR] {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((remote_key.clone(), jar.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {remote_key}/{jar} must proxy 200, got {e:?}"));
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+        }
+
+        // The recording rides a spawned task (#3778) — poll briefly for the
+        // two statistics rows to land.
+        let mut counts = (0i64, 0i64);
+        for _ in 0..100 {
+            for (idx, jar) in [GATED_JAR, UNGATED_JAR].into_iter().enumerate() {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM proxy_download_statistics d \
+                     JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                     WHERE a.repository_id = $1 AND a.path = $2",
+                )
+                .bind(remote_id)
+                .bind(jar)
+                .fetch_one(&pool)
+                .await
+                .expect("count statistics rows");
+                if idx == 0 {
+                    counts.0 = count;
+                } else {
+                    counts.1 = count;
+                }
+            }
+            if counts.0 >= 1 && counts.1 >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, remote_id, uuid::Uuid::nil()).await;
+
         assert_eq!(
-            calls, 2,
-            "expected the Maven remote download branch to record a proxy download on both \
-             the sha1-gated and the plain streaming exit — without it the UI reports \
-             0 downloads for every proxied Maven artifact (#3265)"
+            counts,
+            (1, 1),
+            "each remote download exit must record exactly one proxy download — \
+             without it the UI reports 0 downloads for every proxied Maven \
+             artifact (#3265)"
         );
     }
 
@@ -6742,6 +7385,249 @@ mod tests {
              the immutable assertions from passing under a \
              'cache every checksum forever' change"
         );
+    }
+    /// #3982: a warm Remote-repo GET must not re-resolve the `.sha1` sidecar.
+    ///
+    /// Before the fix, `serve_artifact` awaited `resolve_maven_sha1_sidecar` —
+    /// a full proxy-cache round-trip of its own — before starting the content
+    /// fetch on EVERY GET, warm or cold, so each artifact download paid two
+    /// sequential storage round-trips (the multiplier that made resolve-heavy
+    /// Maven builds ~2x slower on network-attached storage).
+    ///
+    /// Proof: warm the jar AND its sidecar, then evict ONLY the sidecar's
+    /// cache entry. The next jar GET is a warm hit; a handler that still
+    /// resolves the sidecar first misses the evicted entry and goes back
+    /// upstream for it (visible to wiremock). The fixed handler defers the
+    /// digest to cache-commit time, which a warm hit never reaches, so
+    /// upstream sees zero further requests.
+    #[tokio::test]
+    async fn test_remote_warm_hit_does_not_refetch_sha1_sidecar_3982() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const JAR: &str = "com/example/lib/1.0/lib-1.0.jar";
+        const JAR_BODY: &[u8] = b"jar-bytes-3982";
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(JAR_BODY.to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        // A valid sidecar, so the cold GET's digest gate commits the jar.
+        let sha1_hex = hex::encode(sha1::Sha1::digest(JAR_BODY));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(sha1_hex),
+            )
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        async fn get_jar(
+            state: &crate::api::SharedState,
+            repo_key: &str,
+            ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+        ) {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((repo_key.to_string(), JAR.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {repo_key}/{JAR} must proxy 200, got {e:?}"));
+            assert_eq!(resp.status(), StatusCode::OK, "GET {repo_key}/{JAR}");
+            // Drain the body so the streaming tee commits the cache entry.
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+        }
+
+        // Cold GET: populates the jar cache entry and (through the deferred
+        // digest gate) the `.sha1` sidecar entry.
+        get_jar(&state, &remote_key, &ctx).await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}/__cache_meta__.json"
+        )))
+        .await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}.sha1/__cache_meta__.json"
+        )))
+        .await;
+
+        // Evict ONLY the sidecar's cache entry (content + metadata live under
+        // the same `<path>/` prefix), then snapshot the upstream request log.
+        std::fs::remove_dir_all(dir.join(format!("proxy-cache/{remote_key}/{JAR}.sha1")))
+            .expect("evict sidecar cache entry");
+        let requests_before = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+
+        // Warm GET: served from the jar's own cache entry.
+        get_jar(&state, &remote_key, &ctx).await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+
+        let requests_after = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+        assert_eq!(
+            requests_after,
+            requests_before,
+            "a warm jar GET must not touch upstream at all — the pre-#3982 \
+             handler re-resolved the `.sha1` sidecar first, and the evicted \
+             sidecar entry forced an upstream refetch ({} new requests)",
+            requests_after - requests_before
+        );
+    }
+
+    /// #3778: a warm Maven proxy GET must not require synchronous PostgreSQL
+    /// I/O for repository metadata. Proof: warm the cache, seed the shared
+    /// repo cache exactly as `repo_visibility_middleware` would, then DELETE
+    /// the `repositories` row — the warm GET still serves 200 from the proxy
+    /// cache, which is only possible if nothing on the hot path re-selected
+    /// the row. Before the fix, `resolve_maven_repo` queried
+    /// `repositories WHERE key = $1` on every GET and this request 404'd.
+    #[tokio::test]
+    async fn test_remote_warm_hit_serves_without_repo_row_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const JAR: &str = "com/example/lib/2.0/lib-2.0.jar";
+        const JAR_BODY: &[u8] = b"jar-bytes-3778";
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(JAR_BODY.to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        // No `.sha1` upstream (404): the ungated streaming arm.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}.sha1")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let upstream_url = mock.uri();
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&upstream_url)
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        // Cold GET through the DB-resolving path: warms the proxy cache.
+        let resp = download(
+            State(state.clone()),
+            Extension(None),
+            Path((remote_key.clone(), JAR.to_string())),
+            axum::http::HeaderMap::new(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("cold GET must proxy 200, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}/__cache_meta__.json"
+        )))
+        .await;
+        // Seed the shared repo cache as the middleware would (enforcement
+        // defaults OFF, so nothing downstream of resolution reaches the DB
+        // either), then remove the row entirely: any synchronous
+        // `repositories` read on the warm path now fails or 404s.
+        let mut entry = cached_maven_repo_entry(remote_id, "maven");
+        entry.upstream_url = Some(upstream_url.clone());
+        entry.storage_path = dir.to_string_lossy().into_owned();
+        entry.promotion_only = false;
+        entry.age_gate_enabled = false;
+        entry.age_gate_min_age_days = 7;
+        entry.age_gate_mode = "upstream_publish_time".to_string();
+        entry.curation_enabled = false;
+        entry.curation_default_action = "allow".to_string();
+        state
+            .repo_cache
+            .write()
+            .await
+            .insert(remote_key.clone(), (entry, std::time::Instant::now()));
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+
+        let resp = download(
+            State(state.clone()),
+            Extension(None),
+            Path((remote_key.clone(), JAR.to_string())),
+            axum::http::HeaderMap::new(),
+            ctx.clone(),
+        )
+        .await
+        .expect("a warm proxy hit must serve with the repositories row gone");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "warm hit must serve from cache + repo cache alone (#3778)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read warm body");
+        assert_eq!(
+            body.as_ref(),
+            JAR_BODY,
+            "the warm hit must serve the cached bytes"
+        );
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
     }
 
     /// #3211: `download_root` forwards the upstream root body VERBATIM, so it
@@ -7965,6 +8851,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod remote_skip_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -8038,6 +8925,7 @@ mod remote_skip_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod maven_prefix_reserved_tests {
     use crate::api::handlers::test_db_helpers as tdh;

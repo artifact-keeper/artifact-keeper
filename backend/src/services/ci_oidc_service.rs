@@ -245,7 +245,16 @@ pub struct UpdateCiOidcMappingRequest {
     pub name: Option<String>,
     pub priority: Option<i32>,
     pub claim_filters: Option<serde_json::Value>,
-    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Repository restriction update. Three-way semantics (#4198): omit the
+    /// field to leave the restriction unchanged; send `null` to clear it
+    /// (the mapping becomes unrestricted — all repositories); send an array
+    /// to restrict (`[]` denies every repository).
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<Vec<Uuid>>)]
+    pub allowed_repo_ids: Option<Option<Vec<Uuid>>>,
     pub is_enabled: Option<bool>,
 }
 
@@ -766,7 +775,7 @@ impl CiOidcService {
         .bind(req.name.unwrap_or(existing.name))
         .bind(req.priority.unwrap_or(existing.priority))
         .bind(req.claim_filters.unwrap_or(existing.claim_filters))
-        .bind(req.allowed_repo_ids.or(existing.allowed_repo_ids))
+        .bind(req.allowed_repo_ids.unwrap_or(existing.allowed_repo_ids))
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
         .fetch_one(&self.db)
         .await
@@ -1438,6 +1447,7 @@ impl CiOidcService {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1492,6 +1502,26 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// #4198: `allowed_repo_ids` is tri-state on PATCH — an absent key means
+    /// "unchanged", an explicit `null` means "clear the restriction", and an
+    /// empty array stays deny-all.
+    #[test]
+    fn update_mapping_request_allowed_repo_ids_is_tri_state() {
+        let absent: super::UpdateCiOidcMappingRequest =
+            serde_json::from_value(json!({})).expect("empty body should deserialize");
+        assert_eq!(absent.allowed_repo_ids, None);
+
+        let null: super::UpdateCiOidcMappingRequest =
+            serde_json::from_value(json!({"allowed_repo_ids": null}))
+                .expect("explicit null should deserialize");
+        assert_eq!(null.allowed_repo_ids, Some(None));
+
+        let empty: super::UpdateCiOidcMappingRequest =
+            serde_json::from_value(json!({"allowed_repo_ids": []}))
+                .expect("empty array should deserialize");
+        assert_eq!(empty.allowed_repo_ids, Some(Some(vec![])));
     }
 
     #[tokio::test]
@@ -1920,7 +1950,7 @@ mod tests {
                     name: Some("release-branch".to_string()),
                     priority: Some(5),
                     claim_filters: Some(json!({"ref": ["refs/heads/main", "refs/heads/release"]})),
-                    allowed_repo_ids: Some(vec![repo_a, repo_b]),
+                    allowed_repo_ids: Some(Some(vec![repo_a, repo_b])),
                     is_enabled: Some(true),
                 },
             )
@@ -1954,13 +1984,52 @@ mod tests {
                     name: None,
                     priority: None,
                     claim_filters: None,
-                    allowed_repo_ids: Some(vec![]),
+                    allowed_repo_ids: Some(Some(vec![])),
                     is_enabled: Some(true),
                 },
             )
             .await
             .expect("explicit empty repo scope should be persisted as deny-all");
         assert_eq!(deny_all.allowed_repo_ids, Some(vec![]));
+
+        // #4198: an explicit `null` (decoded to `Some(None)`) clears the
+        // restriction entirely; a subsequent read must show it unrestricted.
+        let reset = svc
+            .update_mapping(
+                provider.id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: Some(None),
+                    is_enabled: Some(true),
+                },
+            )
+            .await
+            .expect("explicit null repo scope should clear the restriction");
+        assert_eq!(reset.allowed_repo_ids, None);
+
+        let reread = svc
+            .get_mapping(provider.id, created.id)
+            .await
+            .expect("mapping should be readable after scope reset");
+        assert_eq!(reread.allowed_repo_ids, None);
+
+        // Restrict again so the resolve assertion below stays a deny-all pin.
+        svc.update_mapping(
+            provider.id,
+            created.id,
+            super::UpdateCiOidcMappingRequest {
+                name: None,
+                priority: None,
+                claim_filters: None,
+                allowed_repo_ids: Some(Some(vec![])),
+                is_enabled: Some(true),
+            },
+        )
+        .await
+        .expect("re-restricting should update");
 
         let resolved = svc
             .resolve_mapping(provider.id, &json!({"ref": "refs/heads/release"}))

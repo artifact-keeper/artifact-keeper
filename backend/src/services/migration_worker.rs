@@ -3998,6 +3998,7 @@ pub(crate) fn decide_duplicate_match(
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

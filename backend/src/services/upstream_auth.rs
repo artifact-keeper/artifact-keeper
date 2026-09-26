@@ -391,6 +391,7 @@ pub fn build_credentials_json(auth: &UpstreamAuthType) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +906,7 @@ mod tests {
 /// credentials from, so wiring verified here is wiring verified for all of
 /// them. No AWS is contacted: the provider's API endpoint is redirected at a
 /// `wiremock` server for a test-only region.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod aws_provider_db_tests {
     use super::*;

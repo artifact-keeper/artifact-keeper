@@ -244,33 +244,46 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // committed between two separate queries can't be observed inconsistently
     // (which would let the quarantine check be skipped).
     if is_primary {
-        let own =
-            sqlx::query_as::<_, (bool, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
-                "SELECT is_deleted, quarantine_status, quarantine_until \
+        let own = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                bool,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT id, is_deleted, quarantine_status, quarantine_until \
              FROM artifacts \
              WHERE repository_id = $1 AND path = $2 \
              LIMIT 1",
-            )
-            .bind(repo_id)
-            .bind(artifact_path)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| internal_error("Database", e))?;
+        )
+        .bind(repo_id)
+        .bind(artifact_path)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| internal_error("Database", e))?;
 
         match own {
             // Retracted: refuse even if a live sibling would satisfy Gate 2.
-            Some((true, _, _)) => {
+            Some((_, true, _, _)) => {
                 return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response())
             }
-            // Live own row: also check quarantine on the primary's own row so a
-            // CLEAN sibling cannot anchor past a quarantined primary.
-            Some((false, quarantine_status, quarantine_until)) => {
+            // Live own row: apply the primary's FULL download gate so a
+            // passing sibling cannot anchor past a quarantined OR
+            // scan-policy-blocked primary (#4286). This used to check only
+            // quarantine, so the policy verdict depended on which row Gate 2
+            // happened to pick as the anchor.
+            Some((own_id, false, quarantine_status, quarantine_until)) => {
                 crate::services::quarantine_service::check_download_allowed(
                     quarantine_status.as_deref(),
                     quarantine_until,
                     chrono::Utc::now(),
                 )
                 .map_err(|e| e.into_response())?;
+                crate::services::quarantine_service::enforce_scan_policy_gate(db, own_id, repo_id)
+                    .await
+                    .map_err(|e| e.into_response())?;
             }
             // No own row (rowless primary — GAV-grouped). Proceed to Gate 2
             // to anchor on the live sibling.
@@ -376,6 +389,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +804,117 @@ mod tests {
             after,
             Ok(()),
             "negative control: removing the policy must restore the companion serve"
+        );
+    }
+
+    /// #4286: Gate 1.5 must apply the requested primary's SCAN POLICY, not
+    /// only its quarantine state.
+    ///
+    /// Gate 3 gates the Gate-2 anchor, which is the newest primary-extension
+    /// row in the GAV and need not be the primary that was asked for. A GAV
+    /// holding a policy-blocked `.jar` and a newer, scanned `.zip` anchored on
+    /// the `.zip`, so the only check the `.jar`'s own row got was the
+    /// quarantine-only Gate 1.5 and its bytes were served from storage.
+    ///
+    /// POSITIVE CONTROL in the same fixture: the jar serves before the policy
+    /// exists, and the scanned `.zip` keeps serving while it is in force.
+    #[tokio::test]
+    async fn test_storage_fallback_applies_own_primary_scan_policy_4286() {
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let jar_path = "com/example/gate4286/1.0/gate4286-1.0.jar";
+        let zip_path = "com/example/gate4286/1.0/gate4286-1.0.zip";
+        let jar = Bytes::from_static(b"gate-4286-unscanned-jar");
+        insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            jar_path,
+            &format!("maven/{jar_path}"),
+        )
+        .await;
+        put_artifact_bytes(&state, &repo, &format!("maven/{jar_path}"), jar.clone())
+            .await
+            .expect("put jar");
+        // Newer primary-extension row: Gate 2 prefers it as the anchor.
+        let zip_id = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            zip_path,
+            &format!("maven/{zip_path}"),
+        )
+        .await;
+        put_artifact_bytes(
+            &state,
+            &repo,
+            &format!("maven/{zip_path}"),
+            Bytes::from_static(b"gate-4286-scanned-zip"),
+        )
+        .await
+        .expect("put zip");
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(zip_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("mark the zip anchor scanned");
+        let location = repo.storage_location();
+        let fetch = |path: &'static str| {
+            let (pool, state, location) = (pool.clone(), state.clone(), location.clone());
+            async move {
+                match maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, path)
+                    .await
+                {
+                    Ok(r) => (StatusCode::OK, r.collect().await.unwrap_or_default()),
+                    Err(e) => (e.status(), Bytes::new()),
+                }
+            }
+        };
+
+        let before = fetch(jar_path).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4286-maven-{repo_id}"))
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = fetch(jar_path).await;
+        let zip_while_blocked = fetch(zip_path).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE artifact_id = $1")
+            .bind(zip_id)
+            .execute(&pool)
+            .await;
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            before,
+            (StatusCode::OK, jar),
+            "positive control: jar serves"
+        );
+        assert_eq!(
+            zip_while_blocked.0,
+            StatusCode::OK,
+            "positive control: the scanned zip still serves under the policy"
+        );
+        assert_eq!(
+            blocked.0,
+            StatusCode::FORBIDDEN,
+            "#4286: a policy-blocked primary must not be served because a passing \
+             sibling became the Gate-2 anchor"
         );
     }
 

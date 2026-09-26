@@ -201,6 +201,7 @@ async fn process_candidate(
     Ok(inserted)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

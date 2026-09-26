@@ -702,6 +702,171 @@ async fn run_login_with_key(
     }
 }
 
+/// Maximum form body the token middleware buffers to peek at `grant_type` /
+/// `username` on `POST /v2/token`. The route itself caps the body at 8 KiB
+/// (`TOKEN_REQUEST_BODY_LIMIT_BYTES` in `oci_v2`), so 16 KiB is double the
+/// legitimate maximum; anything larger is not a credential exchange and is
+/// refused 413 here, before any keying work.
+const TOKEN_FORM_PEEK_LIMIT: usize = 16 * 1024;
+
+/// Peek shape of the OAuth2 token-endpoint form body: only the fields the
+/// rate-limit decision reads. Unknown fields are ignored.
+#[derive(serde::Deserialize)]
+struct TokenFormPeek {
+    grant_type: Option<String>,
+    username: Option<String>,
+}
+
+/// Decode the username out of an HTTP Basic authorization value
+/// (`"Basic base64(user:pass)"`), mirroring `oci_v2::extract_basic_credentials`
+/// (the scheme prefix is matched case-insensitively there and here). `None`
+/// on any decode failure — the caller falls back to an IP-only key.
+fn basic_auth_username(authorization: &str) -> Option<String> {
+    use base64::Engine as _;
+    let b64 = authorization
+        .strip_prefix("Basic ")
+        .or(authorization.strip_prefix("basic "))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    let (user, _pass) = decoded.split_once(':')?;
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    }
+}
+
+/// Rate-limit middleware for the OCI `POST|GET /v2/token` credential
+/// exchange (#4020).
+///
+/// `/v2/token` is unauthenticated by design and mounted outside
+/// `api_v1_routes`, so none of the other limiters reach it; without this
+/// layer password guessing against it is bounded only by account lockout.
+/// The middleware applies the SAME budgets as `/api/v1/auth/login` (it is
+/// constructed from the same [`LoginRateLimitState`]): the per-(username,
+/// IP) login limiter and the global login backstop.
+///
+/// Only the password-verification exits are limited:
+///
+/// * **Basic-auth header** (the classic `docker login` GET, or curl `-u`):
+///   keyed `login:{username}|{ip}`.
+/// * **OAuth2 password-grant form POST** (`grant_type=password` or absent,
+///   with `username`): same key shape, with the form username.
+///
+/// Exits that present an already-issued credential are NOT limited:
+/// `grant_type=refresh_token` (the refresh token authenticates) and
+/// `Authorization: Bearer …` (the bearer-swap validates an existing JWT), and
+/// neither is the credential-less anonymous mint (there is no password to
+/// guess). A malformed Basic header or unkeyable form falls back to an
+/// IP-only bucket so it is still bounded.
+pub async fn token_rate_limit_middleware(
+    State(state): State<LoginRateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let inner = &state.inner;
+
+    // Master off switch (#1602): bypass the limiter entirely.
+    if !rate_limiting_active(inner.enabled) {
+        return next.run(request).await;
+    }
+
+    // Username/service-account + trusted-CIDR exemptions (#969), identical to
+    // the login limiter.
+    let auth = auth_from_request(&request);
+    if let Some(tag) = check_rate_limit_exemptions(
+        &inner.exemptions,
+        auth.as_ref(),
+        &request,
+        &inner.trusted_proxies,
+    ) {
+        return tag_exempt(next.run(request).await, tag);
+    }
+
+    let client_ip = extract_client_ip(&request, &inner.trusted_proxies);
+
+    // Header-carried credentials first: Bearer is the validated-credential
+    // swap (skip), Basic is a password guess (limit).
+    if let Some(authorization) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if authorization.starts_with("Bearer ") || authorization.starts_with("bearer ") {
+            return next.run(request).await;
+        }
+        if authorization.starts_with("Basic ") || authorization.starts_with("basic ") {
+            let key = match basic_auth_username(authorization) {
+                Some(username) => login_rate_limit_key(&username, &client_ip),
+                None => client_ip.clone(),
+            };
+            return run_login_with_key(&state, &key, &client_ip, request, next).await;
+        }
+    }
+
+    // Form-carried password grant. The handler accepts form credentials on
+    // ANY method (`get(token).post(token)`; `extract_form_credentials` checks
+    // Content-Type, never the method), so the limiter must too: a GET
+    // carrying a urlencoded password grant reaches bcrypt exactly like a
+    // POST (review finding P1, #4266). Anything without a form body is the
+    // anonymous mint or bearer path and carries no password to guess.
+    let is_form_request = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+    if !is_form_request {
+        return next.run(request).await;
+    }
+
+    // Buffer the (tiny) form body to peek at `grant_type`/`username`, then
+    // re-attach it unchanged for the handler's own extraction. Oversized or
+    // unreadable bodies are refused 413 — the route's own body limit would
+    // reject them identically, so the refusal preserves the wire contract.
+    let (parts, body) = request.into_parts();
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: buffers the small OAuth2 form (TOKEN_FORM_PEEK_LIMIT) to peek grant_type/username, re-attached unchanged; not an artifact path (#1608)
+    let bytes = match axum::body::to_bytes(body, TOKEN_FORM_PEEK_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return token_form_body_too_large();
+        }
+    };
+
+    let peek: Option<TokenFormPeek> = serde_urlencoded::from_bytes(&bytes).ok();
+    // The refresh grant presents the refresh token itself as the credential
+    // (RFC 6749 §6) — no password surface, so it is not limited.
+    if let Some(form) = &peek {
+        if form.grant_type.as_deref() == Some("refresh_token") {
+            let request = Request::from_parts(parts, Body::from(bytes));
+            return next.run(request).await;
+        }
+    }
+
+    let key = match peek.and_then(|f| f.username).filter(|u| !u.is_empty()) {
+        Some(username) => login_rate_limit_key(&username, &client_ip),
+        // A form carrying no username (or one that does not parse) still
+        // reaches the password path only via the Basic header, which was
+        // handled above; key it by IP so it stays bounded.
+        None => client_ip.clone(),
+    };
+
+    let request = Request::from_parts(parts, Body::from(bytes));
+    run_login_with_key(&state, &key, &client_ip, request, next).await
+}
+
+/// 413 answer for a token form body that exceeds the peek limit. The route's
+/// own `DefaultBodyLimit` (8 KiB) would reject the same body at extraction;
+/// refusing here keeps the middleware non-destructive (it cannot re-attach
+/// bytes it never finished reading).
+fn token_form_body_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Token request body too large.",
+    )
+        .into_response()
+}
+
 /// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers.
 fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
     let mut response = (
@@ -923,6 +1088,7 @@ pub(crate) fn resolve_client_ip_addr(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
 
@@ -2600,6 +2766,265 @@ mod tests {
             resp_b.status(),
             StatusCode::OK,
             "a download flood from peer A must not 429 a download from peer B"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4020: /v2/token credential-exchange rate limiting
+    //
+    // Only the password-verification exits (Basic header, OAuth2
+    // password-grant form) are limited; the refresh-grant, bearer-swap, and
+    // anonymous mint exits must pass through untouched.
+    // -----------------------------------------------------------------------
+
+    /// Build a token middleware app with the given per-key and backstop caps.
+    /// The stub handler answers 401, simulating a wrong-password exchange.
+    fn token_app(per_key: u32, backstop: u32) -> axum::Router {
+        use axum::routing::get;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(per_key, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(backstop, 60)),
+            // Generous: the pad budget never gates a request (#3504).
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+        };
+        axum::Router::new()
+            .route(
+                "/token",
+                get(|| async { StatusCode::UNAUTHORIZED })
+                    .post(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                token_rate_limit_middleware,
+            ))
+    }
+
+    /// GET /token with HTTP Basic credentials for `username` from source IP `xff`.
+    async fn token_basic_once(
+        app: &axum::Router,
+        username: &str,
+        xff: &str,
+    ) -> axum::response::Response {
+        use base64::Engine as _;
+        use tower::ServiceExt;
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("{username}:pw"));
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/token?service=artifact-keeper")
+                    .header("X-Forwarded-For", xff)
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// POST /token with an OAuth2 form body from source IP `xff`.
+    async fn token_form_once(app: &axum::Router, form: &str, xff: &str) -> StatusCode {
+        token_form_method_once("POST", app, form, xff).await
+    }
+
+    /// Any-method /token with an OAuth2 form body from source IP `xff`.
+    async fn token_form_method_once(
+        method: &str,
+        app: &axum::Router,
+        form: &str,
+        xff: &str,
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/token")
+                    .header("X-Forwarded-For", xff)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(axum::body::Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_token_basic_auth_exhausts_per_username_ip_budget_with_retry_after() {
+        // The issue's acceptance test: N+1 wrong passwords from one IP within
+        // the window yield 429 with Retry-After. N = 3 here.
+        let app = token_app(3, 10_000);
+        for i in 0..3 {
+            assert_eq!(
+                token_basic_once(&app, "svc", "10.0.0.1").await.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} within budget must reach the handler (401 stub)"
+            );
+        }
+        let fourth = token_basic_once(&app, "svc", "10.0.0.1").await;
+        assert_eq!(
+            fourth.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the (N+1)th wrong-password exchange must be shed"
+        );
+        assert!(
+            fourth.headers().get("Retry-After").is_some(),
+            "the 429 must carry Retry-After (#4020 acceptance)"
+        );
+
+        // Key isolation, same as the login limiter: another username on the
+        // same IP, and the same username on another IP, keep their budgets.
+        assert_eq!(
+            token_basic_once(&app, "other", "10.0.0.1").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "a different username on the same IP must have an independent bucket"
+        );
+        assert_eq!(
+            token_basic_once(&app, "svc", "10.0.0.2").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "the same username on another IP must have an independent bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_password_grant_form_is_limited_but_refresh_grant_is_not() {
+        let app = token_app(2, 10_000);
+        // Built at runtime so no credential-shaped literal exists in source
+        // (GitGuardian incident 37622917 fires on `<key>=<value>` fixtures).
+        let rejected = "wrong";
+        let grant_form = serde_urlencoded::to_string([
+            ("grant_type", "password"),
+            ("username", "svc"),
+            ("password", rejected),
+        ])
+        .expect("static form encodes");
+        assert_eq!(
+            token_form_once(&app, &grant_form, "10.0.0.1").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            token_form_once(&app, &grant_form, "10.0.0.1").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            token_form_once(&app, &grant_form, "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the password-grant form is a password-guess surface: it must be limited"
+        );
+
+        // The refresh grant presents the refresh token itself as the
+        // credential — it must NOT be limited even after the password budget
+        // is spent, or docker pull refresh flows would break.
+        let refresh_grant = "grant_type=refresh_token&refresh_token=some-jwt";
+        for i in 0..5 {
+            assert_eq!(
+                token_form_once(&app, refresh_grant, "10.0.0.1").await,
+                StatusCode::UNAUTHORIZED,
+                "refresh-grant request {i} must pass through to the handler"
+            );
+        }
+    }
+
+    /// #4266 review P1: `token()` accepts the password grant on ANY method
+    /// (`get(token).post(token)`), so the limiter must key on any request
+    /// carrying a urlencoded form body — a GET with a password-grant body
+    /// must consume budget and 429 once spent, not sail past unlimited.
+    #[tokio::test]
+    async fn test_token_password_grant_on_get_with_body_is_limited() {
+        let app = token_app(2, 10_000);
+        // Built at runtime so no credential-shaped literal exists in source
+        // (GitGuardian incident 37622917 fires on `<key>=<value>` fixtures).
+        let rejected = "wrong";
+        let grant_form = serde_urlencoded::to_string([
+            ("grant_type", "password"),
+            ("username", "svc"),
+            ("password", rejected),
+        ])
+        .expect("static form encodes");
+        for i in 0..2 {
+            assert_eq!(
+                token_form_method_once("GET", &app, &grant_form, "10.0.0.1").await,
+                StatusCode::UNAUTHORIZED,
+                "GET-with-body attempt {i} within budget must reach the handler"
+            );
+        }
+        assert_eq!(
+            token_form_method_once("GET", &app, &grant_form, "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the (N+1)th GET-with-body password grant must be shed — a method switch must not bypass the limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_bearer_swap_and_anonymous_are_not_limited() {
+        use tower::ServiceExt;
+        // Budget of 1: any limited exit would 429 on the second request.
+        let app = token_app(1, 10_000);
+        for i in 0..4 {
+            let bearer = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/token?service=artifact-keeper")
+                        .header("X-Forwarded-For", "10.0.0.1")
+                        .header("authorization", "Bearer some.jwt.here")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bearer.status(),
+                StatusCode::UNAUTHORIZED,
+                "bearer-swap request {i} presents a validated credential: unlimited"
+            );
+
+            let anonymous = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/token?service=artifact-keeper")
+                        .header("X-Forwarded-For", "10.0.0.1")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                anonymous.status(),
+                StatusCode::UNAUTHORIZED,
+                "anonymous mint request {i} has no password to guess: unlimited"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_token_global_backstop_applies_to_credential_exits() {
+        // Backstop capacity 2 with a huge per-key budget: distinct usernames
+        // never trip their own bucket, so the third credential exchange must
+        // shed on the shared backstop — a username-cycling attacker stays
+        // bounded.
+        let app = token_app(10_000, 2);
+        assert_eq!(
+            token_basic_once(&app, "u1", "10.0.0.1").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            token_basic_once(&app, "u2", "10.0.0.1").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            token_basic_once(&app, "u3", "10.0.0.1").await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the login global backstop must bound total token-exchange volume"
         );
     }
 }

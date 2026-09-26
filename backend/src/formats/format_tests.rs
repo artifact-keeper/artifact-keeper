@@ -3,6 +3,7 @@
 //! Tests the format handler registry (get_core_handler, get_handler_for_format),
 //! handler trait compliance, and ensures every format has a working handler.
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -314,6 +315,24 @@ mod tests {
         assert_eq!(by_key.format_key(), "conda_native");
         assert!(!by_key.is_wasm_plugin());
         assert_eq!(parse_format_str("conda"), Some(RepositoryFormat::Conda));
+    }
+
+    #[test]
+    fn test_github_mirror_aliases_use_generic_handler() {
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            assert_eq!(format.handler_key(), "generic");
+            assert_eq!(get_handler_for_format(&format).format_key(), "generic");
+            assert_eq!(
+                get_core_handler(format.as_key()).unwrap().format_key(),
+                "generic"
+            );
+            assert_eq!(parse_format_str(format.as_key()), Some(format.clone()));
+            assert!(crate::formats::age_gate_spec(&format).is_none());
+        }
     }
 
     /// `jupyter` is a PyPI alias exactly like `poetry` (#3784): its own

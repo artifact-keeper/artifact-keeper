@@ -874,19 +874,22 @@ async fn virtual_member_checksum(
             Ok(members) => members.into_iter().map(|m| m.id).collect(),
             Err(_) => return None,
         };
+    // `member_ids` is already in resolution order — the recursive walk's
+    // depth-first priority order (#3840), narrowed to this caller — so the
+    // winner is the first of them holding the path. Ranking by position in
+    // that list (not by the direct `virtual_repo_members.priority`, which a
+    // leaf nested inside a member virtual does not have) keeps this row the
+    // one `resolve_virtual_download` actually served.
     match sqlx::query_scalar::<_, Option<String>>(
         "SELECT a.checksum_sha256 FROM artifacts a \
-         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
          JOIN repositories r ON r.id = a.repository_id \
-         WHERE vrm.virtual_repo_id = $1 \
-           AND a.repository_id = ANY($3) \
+         WHERE a.repository_id = ANY($2::uuid[]) \
            AND r.repo_type != 'remote' \
-           AND a.path = $2 \
+           AND a.path = $1 \
            AND a.is_deleted = false \
-         ORDER BY vrm.priority \
+         ORDER BY array_position($2::uuid[], a.repository_id) \
          LIMIT 1",
     )
-    .bind(virtual_repo_id)
     .bind(artifact_path)
     .bind(&member_ids)
     .fetch_optional(db)
@@ -1312,6 +1315,7 @@ async fn list_files_impl(
         .unwrap())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3309,6 +3313,7 @@ mod tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;

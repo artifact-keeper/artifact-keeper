@@ -163,7 +163,7 @@ fn range_header(headers: &HeaderMap) -> String {
 /// POST a fresh upload session under `repo_key`/`image` and return its session
 /// UUID (from the `Docker-Upload-UUID` response header).
 async fn start_upload(state: &SharedState, repo_key: &str, image: &str, auth: &str) -> Uuid {
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let req = Request::builder()
         .method("POST")
         .uri(format!("/{}/{}/blobs/uploads/", repo_key, image))
@@ -204,7 +204,7 @@ async fn patch_range_header_is_inclusive_for_various_lengths() {
     // inlined `format!("0-{}", new_bytes)` would emit `0-1` here.
     for n in [1usize, 2, 17, 4096] {
         let session_id = start_upload(&state, &key, "img", &auth).await;
-        let app = oci_v2::router().with_state(state.clone());
+        let app = oci_v2::router(None).with_state(state.clone());
         let body = vec![b'a'; n];
         let req = Request::builder()
             .method("PATCH")
@@ -245,7 +245,7 @@ async fn patch_zero_byte_body_range_is_zero_zero() {
     let auth = basic_auth_header(&username, "pushpass");
 
     let session_id = start_upload(&state, &key, "img", &auth).await;
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let req = Request::builder()
         .method("PATCH")
         .uri(format!("/{}/img/blobs/uploads/{}", key, session_id))
@@ -285,7 +285,7 @@ async fn resume_contract_honors_returned_range_and_digest_verifies() {
 
     // First PATCH: offset 0. The returned inclusive Range end is the last byte
     // written, so the next write must start at end + 1.
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let req = Request::builder()
         .method("PATCH")
         .uri(format!("/{}/img/blobs/uploads/{}", key, session_id))
@@ -306,7 +306,7 @@ async fn resume_contract_honors_returned_range_and_digest_verifies() {
     // Second PATCH: resume at the offset the server just reported, asserted via
     // an explicit inclusive Content-Range. If the offset math were wrong the
     // server's `Content-Range starts at .. expected ..` guard would reject it.
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let content_range = format!("{}-{}", next_offset, whole.len() - 1);
     let req = Request::builder()
         .method("PATCH")
@@ -332,7 +332,7 @@ async fn resume_contract_honors_returned_range_and_digest_verifies() {
 
     // Finalize honoring the returned progress: the concatenated bytes must hash
     // to the requested digest, or completion fails with DIGEST_INVALID.
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let req = Request::builder()
         .method("PUT")
         .uri(format!(

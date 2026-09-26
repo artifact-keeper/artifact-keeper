@@ -23,15 +23,131 @@ pub const SYSTEM_TARGET_TYPE: &str = "system";
 /// use this nil UUID as a conventional placeholder.
 pub const SYSTEM_SENTINEL_ID: Uuid = Uuid::nil();
 
+/// Principal type for anonymous (unauthenticated) access rules (#1849).
+///
+/// Anonymous rules let an operator grant READ access to a repository (or its
+/// owning project) to callers presenting no credential — the CI-runner
+/// use case — optionally restricted by `allowed_cidrs`. They are evaluated
+/// only by [`PermissionService::check_anonymous_repository_action`]; the
+/// authenticated resolvers never match them (their principal disjuncts name
+/// user/group/service-account rows), and write-time validation restricts
+/// them to `read` actions on `repository`/`project` targets with the nil
+/// principal id.
+pub const ANONYMOUS_PRINCIPAL_TYPE: &str = "anonymous";
+
+/// Optional conditions narrowing when a permission rule applies (#1849).
+///
+/// Today the only condition kind is `allowed_cidrs`: the rule applies only
+/// to requests whose client IP (resolved under the trusted-proxy policy,
+/// see `client_ip_context_middleware`) falls inside one of the listed CIDR
+/// ranges; an unknown client IP matches nothing (fail closed). The struct
+/// is deliberately open to future condition kinds (artifact, version, ...)
+/// without a schema change, which is why it serializes as a JSONB object —
+/// but unknown keys are rejected at write time so a typo cannot silently
+/// widen a rule.
+///
+/// # Interaction with the role-assignment fallback
+///
+/// Applicability is per-rule, not per-principal: when a principal's
+/// conditioned rule falls out of `applicable_rules` on an IP miss, the
+/// decision falls to the legacy `role_assignments` fallback, exactly as if
+/// the rule did not exist for that request. So inside the CIDR the rule is
+/// authoritative, while outside it the principal keeps whatever its role
+/// assignments grant unconditionally. That can mean MORE access outside the
+/// CIDR for a principal holding both — the documented role model, not an
+/// escalation: the fallback never grants beyond the role's unconditional
+/// capabilities (recorded from review finding P3, #4266). An operator who
+/// wants a principal restricted to the CIDR must grant it ONLY through the
+/// conditioned rule, not additionally via a role.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionConditions {
+    /// CIDR ranges (IPv4 or IPv6) the request's client IP must fall inside
+    /// for the rule to apply. `None` (absent) means no IP restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+}
+
+impl PermissionConditions {
+    /// Validate the condition set for writing. Every CIDR must parse; a
+    /// present-but-empty `allowed_cidrs` is rejected (it would make the rule
+    /// match nothing, which is almost certainly an authoring mistake).
+    pub fn validate(&self) -> Result<()> {
+        if let Some(cidrs) = &self.allowed_cidrs {
+            if cidrs.is_empty() {
+                return Err(AppError::Validation(
+                    "conditions.allowed_cidrs must name at least one CIDR range".to_string(),
+                ));
+            }
+            for cidr in cidrs {
+                crate::api::middleware::rate_limit::CidrRange::parse(cidr)
+                    .map_err(|e| AppError::Validation(format!("conditions.allowed_cidrs: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize for persistence in the `conditions` JSONB column.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+}
+
+/// SQL predicate limiting a permission rule's applicability by the request's
+/// client IP (#1849): a rule carrying `conditions.allowed_cidrs` applies
+/// only when `ip_ref` (a bind like `$4` or an inet-castable SQL literal)
+/// falls inside one of the listed CIDRs. A NULL `ip_ref` matches nothing
+/// (fail closed). Rules without the key are unaffected.
+///
+/// `alias` is the `permissions` table alias in the enclosing query. The
+/// generated text is interpolated unescaped, so both parameters MUST be
+/// trusted fragments (bind placeholders, validated `IpAddr` literals) —
+/// never request-derived text.
+pub(crate) fn ip_condition_sql(alias: &str, ip_ref: &str) -> String {
+    format!(
+        "AND (\
+             NOT ({alias}.conditions ? 'allowed_cidrs') \
+             OR EXISTS ( \
+                 SELECT 1 \
+                 FROM jsonb_array_elements_text(\
+                     {alias}.conditions->'allowed_cidrs'\
+                 ) AS ak_ip_cidr(cidr) \
+                 WHERE {ip_ref}::inet <<= ak_ip_cidr.cidr::inet \
+             )\
+         )"
+    )
+}
+
+/// The current request's client IP as a SQL expression for the listing
+/// fragments (#1849): a quoted `IpAddr` literal inside a request scope, or
+/// `NULL` outside one (background jobs, detached tasks) — where the fail-
+/// closed semantics of [`ip_condition_sql`] exclude every conditioned rule.
+/// `IpAddr`'s `Display` contains only digits, dots and colons, so quoting it
+/// is injection-safe.
+pub(crate) fn request_ip_sql_ref() -> String {
+    match crate::api::middleware::client_ip::current_client_ip() {
+        Some(ip) => format!("'{ip}'"),
+        None => "NULL".to_string(),
+    }
+}
+
 /// How long cached permission entries remain valid before a fresh DB lookup.
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Composite cache key: (user_id, target_type, target_id).
+/// Composite cache key: (user_id, target_type, target_id, client_ip).
+///
+/// The client IP is part of the key because `allowed_cidrs` conditions
+/// (#1849) make the granted action set IP-dependent: caching a result
+/// resolved under one source address and serving it to the same principal
+/// arriving from another would leak the grant for the 30 s TTL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     user_id: Uuid,
     target_type: String,
     target_id: Uuid,
+    client_ip: Option<std::net::IpAddr>,
 }
 
 impl CacheKey {
@@ -40,6 +156,7 @@ impl CacheKey {
             user_id,
             target_type: target_type.to_string(),
             target_id,
+            client_ip: crate::api::middleware::client_ip::current_client_ip(),
         }
     }
 }
@@ -169,8 +286,13 @@ impl PermissionService {
         if is_admin {
             return Ok(true);
         }
-
-        let allowed: bool = sqlx::query_scalar(
+        // #1849: a rule carrying `conditions.allowed_cidrs` is applicable
+        // only to requests whose client IP falls inside it. The IP is the
+        // in-flight request's (`client_ip_context_middleware`); outside a
+        // request scope (background jobs, detached tasks) it is None, which
+        // matches nothing — conditioned grants fail closed there.
+        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        let query = format!(
             r#"
             WITH applicable_rules AS (
                 SELECT p.actions
@@ -197,6 +319,7 @@ impl PermissionService {
                         )
                     )
                 )
+                {ip_condition}
             ),
             assigned_roles AS (
                 SELECT r.permissions
@@ -225,15 +348,73 @@ impl PermissionService {
                     )
                 END
             "#,
-        )
-        .bind(user_id)
-        .bind(repository_id)
-        .bind(action)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            ip_condition = ip_condition_sql("p", "$4"),
+        );
+        let allowed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
+            .bind(user_id)
+            .bind(repository_id)
+            .bind(action)
+            .bind(client_ip.map(|ip| ip.to_string()))
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(allowed)
+    }
+
+    /// Check an action for an ANONYMOUS (unauthenticated) caller against
+    /// `principal_type = 'anonymous'` rules (#1849).
+    ///
+    /// This is the grant behind IP-restricted anonymous downloads: an
+    /// operator grants the anonymous principal `read` on a repository (or
+    /// its owning project), optionally narrowed by `allowed_cidrs`, and CI
+    /// runners inside those ranges can pull without credentials while every
+    /// other anonymous caller keeps the existence-hiding denial. There is no
+    /// role-assignment fallback (an anonymous caller holds no roles) and no
+    /// admin bypass. Write-time validation confines anonymous rules to
+    /// `read` on `repository`/`project` targets, and every gate only ever
+    /// asks this resolver about `read`.
+    ///
+    /// The client IP is the in-flight request's, exactly as in
+    /// [`Self::check_repository_action`]: `None` outside a request scope
+    /// fails closed (conditioned rules match nothing; an unconditioned
+    /// anonymous rule still applies, since it names no CIDR).
+    pub async fn check_anonymous_repository_action(
+        &self,
+        repository_id: Uuid,
+        action: &str,
+    ) -> Result<bool> {
+        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        let query = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM permissions p
+                WHERE p.principal_type = 'anonymous'
+                  AND (
+                      (p.target_type = 'repository' AND p.target_id = $1)
+                      OR (
+                          p.target_type = 'project'
+                          AND p.target_id = (
+                              SELECT project_id
+                              FROM repositories
+                              WHERE id = $1
+                          )
+                      )
+                  )
+                  AND ($2 = ANY(p.actions) OR 'admin' = ANY(p.actions))
+                  {ip_condition}
+            )
+            "#,
+            ip_condition = ip_condition_sql("p", "$3"),
+        );
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
+            .bind(repository_id)
+            .bind(action)
+            .bind(client_ip.map(|ip| ip.to_string()))
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Return true when at least one permission rule exists for the given
@@ -360,10 +541,24 @@ impl PermissionService {
     /// Reject it at write time with a 400 rather than persisting a grant that
     /// resolves against the wrong principal.
     pub async fn validate_principal(&self, principal_type: &str, principal_id: Uuid) -> Result<()> {
+        // #1849: the anonymous principal names no table row — it stands for
+        // every unauthenticated caller — so existence is trivially true. The
+        // nil UUID is its only valid id, keeping
+        // `(principal_type, principal_id, target_type, target_id)` unique and
+        // giving hand-written SQL one unambiguous spelling.
+        if principal_type == ANONYMOUS_PRINCIPAL_TYPE {
+            if !principal_id.is_nil() {
+                return Err(AppError::Validation(format!(
+                    "principal_type '{ANONYMOUS_PRINCIPAL_TYPE}' requires the nil principal_id, \
+                     got {principal_id}"
+                )));
+            }
+            return Ok(());
+        }
         let query = principal_existence_query(principal_type).ok_or_else(|| {
             AppError::Validation(format!(
                 "Invalid principal_type '{principal_type}': expected one of user, \
-                 service_account, group"
+                 service_account, group, {ANONYMOUS_PRINCIPAL_TYPE}"
             ))
         })?;
         let exists: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
@@ -475,36 +670,46 @@ impl PermissionService {
         // `$2 = 'repository'` guard confines inheritance to repository
         // targets; for a project-less repository the subquery yields NULL and
         // the project arm never matches, so behavior is unchanged.
-        let rows: Vec<(String,)> = sqlx::query_as(
+        // #1849: `allowed_cidrs`-conditioned rules resolve to no actions
+        // unless the in-flight request's client IP falls inside the range
+        // (None outside a request scope fails closed), exactly as in
+        // `check_repository_action`.
+        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        let query = format!(
             r#"
             SELECT DISTINCT unnest(actions) as action
-            FROM permissions
+            FROM permissions p
             WHERE (
-                (principal_type IN ('user', 'service_account') AND principal_id = $1)
+                (p.principal_type IN ('user', 'service_account') AND p.principal_id = $1)
                 OR
-                (principal_type = 'group' AND principal_id IN (
+                (p.principal_type = 'group' AND p.principal_id IN (
                     SELECT group_id FROM user_group_members WHERE user_id = $1
                 ))
             )
             AND (
-                (target_type = $2 AND target_id = $3)
-                OR ($2 = 'repository' AND target_type = 'project' AND target_id = (
+                (p.target_type = $2 AND p.target_id = $3)
+                OR ($2 = 'repository' AND p.target_type = 'project' AND p.target_id = (
                     SELECT project_id FROM repositories WHERE id = $3
                 ))
             )
+            {ip_condition}
             "#,
-        )
-        .bind(user_id)
-        .bind(target_type)
-        .bind(target_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            ip_condition = ip_condition_sql("p", "$4"),
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
+            .bind(user_id)
+            .bind(target_type)
+            .bind(target_id)
+            .bind(client_ip.map(|ip| ip.to_string()))
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().map(|(action,)| action).collect())
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2011,6 +2216,214 @@ mod tests {
 
             tx.rollback().await.expect("rollback migration fixture");
         }
+
+        // -------------------------------------------------------------------
+        // #1849: `allowed_cidrs` request-IP conditions.
+        //
+        // A conditioned rule applies only to requests whose client IP falls
+        // inside the range; outside it — and with no request IP at all
+        // (background jobs) — the rule is inapplicable (fail closed), exactly
+        // as if the grant did not exist for that caller.
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn allowed_cidrs_condition_gates_the_rule_by_request_ip() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_scope;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (user_id, _) = tdh::create_user(&pool).await;
+            let (control_id, _) = tdh::create_user(&pool).await;
+
+            // The conditioned grant: read for `user_id`, only from 10.20.0.0/16.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions, conditions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'], $3)",
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .bind(serde_json::json!({"allowed_cidrs": ["10.20.0.0/16"]}))
+            .execute(&pool)
+            .await
+            .expect("insert conditioned rule");
+            // Control: an UNconditioned grant to another principal, proving the
+            // predicate narrows only rules that carry it.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(control_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert unconditioned control rule");
+
+            let inside = with_client_ip_scope(
+                Some("10.20.3.4".parse().unwrap()),
+                service.check_repository_action(user_id, repo_id, "read", false),
+            )
+            .await
+            .expect("decision inside CIDR");
+            assert!(
+                inside,
+                "a request from inside allowed_cidrs must be granted"
+            );
+
+            let outside = with_client_ip_scope(
+                Some("192.0.2.9".parse().unwrap()),
+                service.check_repository_action(user_id, repo_id, "read", false),
+            )
+            .await
+            .expect("decision outside CIDR");
+            assert!(
+                !outside,
+                "a request from outside allowed_cidrs must be denied (fail closed)"
+            );
+
+            // No request scope (background job): the conditioned grant does
+            // not apply. The unconditioned control still does.
+            assert!(
+                !service
+                    .check_repository_action(user_id, repo_id, "read", false)
+                    .await
+                    .expect("decision without a request scope"),
+                "outside a request scope a conditioned rule must fail closed"
+            );
+            assert!(
+                service
+                    .check_repository_action(control_id, repo_id, "read", false)
+                    .await
+                    .expect("unconditioned control decision"),
+                "an unconditioned rule applies regardless of client IP"
+            );
+
+            // The cached `check_permission` path answers the same way (its
+            // cache key carries the client IP, so the two scopes cannot
+            // share a stale entry).
+            let cached_inside = with_client_ip_scope(
+                Some("10.20.3.4".parse().unwrap()),
+                service.check_permission(user_id, "repository", repo_id, "read", false),
+            )
+            .await
+            .expect("cached decision inside CIDR");
+            assert!(cached_inside);
+            let cached_outside = with_client_ip_scope(
+                Some("192.0.2.9".parse().unwrap()),
+                service.check_permission(user_id, "repository", repo_id, "read", false),
+            )
+            .await
+            .expect("cached decision outside CIDR");
+            assert!(
+                !cached_outside,
+                "the cached fast path must not serve a grant resolved under another IP"
+            );
+
+            cleanup_action_fixture(&pool, repo_id, &[user_id, control_id], &storage_dir).await;
+        }
+
+        #[tokio::test]
+        async fn anonymous_rule_grants_read_by_ip_and_fails_closed() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_scope;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (open_repo_id, _, open_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (user_id, _) = tdh::create_user(&pool).await;
+
+            // Conditioned anonymous read grant (the CI use case).
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions, conditions) \
+                 VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'], $3)",
+            )
+            .bind(Uuid::nil())
+            .bind(repo_id)
+            .bind(serde_json::json!({"allowed_cidrs": ["10.30.0.0/16"]}))
+            .execute(&pool)
+            .await
+            .expect("insert conditioned anonymous rule");
+            // Unconditioned anonymous read grant on the second repository.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(Uuid::nil())
+            .bind(open_repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert unconditioned anonymous rule");
+
+            // Inside the CIDR: the conditioned grant holds.
+            let inside = with_client_ip_scope(
+                Some("10.30.1.2".parse().unwrap()),
+                service.check_anonymous_repository_action(repo_id, "read"),
+            )
+            .await
+            .expect("anonymous decision inside CIDR");
+            assert!(
+                inside,
+                "anonymous read from inside allowed_cidrs must be granted"
+            );
+
+            // Outside it / no scope: fail closed.
+            let outside = with_client_ip_scope(
+                Some("192.0.2.9".parse().unwrap()),
+                service.check_anonymous_repository_action(repo_id, "read"),
+            )
+            .await
+            .expect("anonymous decision outside CIDR");
+            assert!(
+                !outside,
+                "anonymous read outside allowed_cidrs must be denied"
+            );
+            assert!(
+                !service
+                    .check_anonymous_repository_action(repo_id, "read")
+                    .await
+                    .expect("anonymous decision without a request scope"),
+                "a conditioned anonymous rule must fail closed with no request IP"
+            );
+
+            // The rule carries read only: write is denied even from inside.
+            let write = with_client_ip_scope(
+                Some("10.30.1.2".parse().unwrap()),
+                service.check_anonymous_repository_action(repo_id, "write"),
+            )
+            .await
+            .expect("anonymous write decision");
+            assert!(!write, "anonymous read rules never confer write");
+
+            // The unconditioned grant applies with no request IP at all.
+            assert!(
+                service
+                    .check_anonymous_repository_action(open_repo_id, "read")
+                    .await
+                    .expect("unconditioned anonymous decision"),
+                "an unconditioned anonymous rule applies regardless of client IP"
+            );
+
+            cleanup_action_fixture(&pool, repo_id, &[user_id], &storage_dir).await;
+            let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+                .bind(open_repo_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(open_repo_id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(&open_dir);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2130,6 +2543,116 @@ mod tests {
         assert!(
             !granted_delete,
             "the granted principal holds read+write only; delete must be denied"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: PermissionConditions + helpers (no database)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conditions_validate_accepts_absent_and_well_formed() {
+        assert!(PermissionConditions::default().validate().is_ok());
+        let ok = PermissionConditions {
+            allowed_cidrs: Some(vec!["10.0.0.0/8".to_string(), "fc00::/7".to_string()]),
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_conditions_validate_rejects_empty_cidr_list() {
+        let empty = PermissionConditions {
+            allowed_cidrs: Some(vec![]),
+        };
+        let err = empty.validate().unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("at least one")),
+            "an empty allowed_cidrs must be a validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_conditions_validate_rejects_unparseable_cidr() {
+        for bad in ["10.0.0.0/33", "not-a-cidr", "10.0.0.0/x"] {
+            let c = PermissionConditions {
+                allowed_cidrs: Some(vec![bad.to_string()]),
+            };
+            assert!(
+                matches!(c.validate(), Err(AppError::Validation(_))),
+                "{bad} must fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conditions_reject_unknown_keys_at_deserialization() {
+        // A typo like `allowed_ciders` must not silently widen a rule.
+        let err =
+            serde_json::from_str::<PermissionConditions>(r#"{"allowed_ciders": ["10.0.0.0/8"]}"#);
+        assert!(err.is_err(), "unknown condition keys are rejected");
+    }
+
+    #[test]
+    fn test_conditions_round_trip_json_shape() {
+        let c = PermissionConditions {
+            allowed_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
+        };
+        assert_eq!(
+            c.to_json(),
+            serde_json::json!({"allowed_cidrs": ["10.0.0.0/8"]})
+        );
+        // Default (absent) serializes to the unconditional empty object.
+        assert_eq!(
+            PermissionConditions::default().to_json(),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_ip_sql_ref_is_null_outside_a_scope_and_quoted_ip_inside() {
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+
+        assert_eq!(request_ip_sql_ref(), "NULL");
+        let inside = with_client_ip_scope(Some("203.0.113.7".parse().unwrap()), async {
+            request_ip_sql_ref()
+        })
+        .await;
+        assert_eq!(inside, "'203.0.113.7'");
+    }
+
+    #[test]
+    fn test_ip_condition_sql_fail_closed_shape() {
+        let sql = ip_condition_sql("p", "$4");
+        // The two load-bearing properties: rules without the key are exempt,
+        // and the membership test runs inside the rule's own array.
+        assert!(
+            sql.contains("NOT (p.conditions ? 'allowed_cidrs')"),
+            "{sql}"
+        );
+        assert!(sql.contains("jsonb_array_elements_text"), "{sql}");
+        assert!(sql.contains("$4::inet <<="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_principal_accepts_nil_anonymous_and_rejects_non_nil() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = PermissionService::new(pool);
+
+        service
+            .validate_principal(ANONYMOUS_PRINCIPAL_TYPE, Uuid::nil())
+            .await
+            .expect("the nil anonymous principal is always valid");
+
+        let err = service
+            .validate_principal(ANONYMOUS_PRINCIPAL_TYPE, Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("nil principal_id")),
+            "a non-nil anonymous principal id must be rejected, got {err:?}"
         );
     }
 }

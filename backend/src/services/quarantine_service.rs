@@ -126,32 +126,33 @@ pub fn should_quarantine(config: &QuarantineConfig) -> bool {
     config.enabled
 }
 
-/// The error returned when quarantine is enabled on a proxying repository
-/// (#3647). Spelled out in full because the reason is not guessable from the
-/// field name: the hold has no release path on that repository type.
-pub const PROXY_QUARANTINE_UNSUPPORTED: &str = "quarantine is not supported on remote \
-     (proxy) or virtual repositories: proxied content is recorded in \
-     `proxy_cache_artifacts`, which carries no quarantine identity, so \
-     POST /api/v1/quarantine/{artifact_id}/release has no artifact to act on and the \
-     hold becomes a total block on all uncached content with no release path other \
-     than turning quarantine off again. Enable quarantine on the local or staging \
-     repository the content lands in instead.";
+/// The error returned when quarantine is enabled on a virtual repository
+/// (#3647, narrowed by #3912). A virtual repository caches nothing itself:
+/// its members' Remote legs own the `proxy_cache_artifacts` rows, so the
+/// policy is enabled on the member remotes instead, where every cached object
+/// carries a releasable quarantine identity.
+pub const VIRTUAL_QUARANTINE_UNSUPPORTED: &str = "quarantine is not supported on virtual \
+     repositories: a virtual serves content cached per member remote repository, so the \
+     Package Age Policy belongs on the member remote repositories, where each cached object \
+     has a quarantine identity and POST /api/v1/quarantine/proxy-cache/{key}/release can \
+     act on it. Enable quarantine on the members (or on a local/staging repository) instead.";
 
 /// Whether the Package Age / quarantine policy can be enabled for a repository
-/// of this type (#3647).
+/// of this type (#3647, #3912).
 ///
-/// Only hosted repositories (`Local` / `Staging`) qualify. `Remote` and
-/// `Virtual` serve proxied content, which lives in `proxy_cache_artifacts` and
-/// has no row in `artifacts` — the table the whole quarantine state machine
-/// (`quarantine_status` / `quarantine_until`, the release endpoint, the admin
-/// transitions) is keyed on. A hold there is unreleasable by construction, and
-/// on the streaming proxy path it is not even age-aware: `open_streaming_leader`
-/// refuses to open the upstream fetch at all while the policy is on, so the
-/// release-date window `quarantine_until_from_release` exists to apply is never
-/// reached. Refusing the write makes that limitation discoverable at
-/// configuration time rather than at first pull.
+/// Hosted repositories (`Local` / `Staging`) qualify: their content lives in
+/// `artifacts`, the table the quarantine state machine (`quarantine_status` /
+/// `quarantine_until`, the release endpoint, the admin transitions) is keyed
+/// on. `Remote` repositories qualify since #3912: the streaming and buffered
+/// fetch paths honour the release-date window, and `proxy_cache_artifacts`
+/// carries the quarantine columns that give a held cached object a releasable
+/// identity. Only `Virtual` is refused: it has no cache of its own, so the
+/// setting would be dead state — the policy is set on its member remotes.
 pub fn supports_quarantine(repo_type: &RepositoryType) -> bool {
-    matches!(repo_type, RepositoryType::Local | RepositoryType::Staging)
+    matches!(
+        repo_type,
+        RepositoryType::Local | RepositoryType::Staging | RepositoryType::Remote
+    )
 }
 
 /// Calculate the quarantine expiry timestamp from now.
@@ -411,24 +412,23 @@ async fn repo_is_hosted(db: &PgPool, repository_id: Uuid) -> bool {
             .flatten();
     matches!(repo_type.as_deref(), Some("local") | Some("staging"))
 }
-
-/// Report every repository that already has `quarantine_enabled = true` stored
-/// against a Remote or Virtual type (#3647).
+/// Report every repository that still has `quarantine_enabled = true` stored
+/// against a Virtual type (#3647, narrowed to virtual-only by #3912).
 ///
-/// Enabling it there is refused at the API now, but rows written before that
-/// gate existed keep blocking every uncached fetch with no release path. The
-/// stored config is deliberately **not** rewritten: silently flipping an
-/// operator's security setting during startup is worse than a loud warning, and
-/// the operator may be mid-migration to a hosted repository. Returns the
-/// repository keys it warned about so the audit is assertable in tests; a read
-/// failure yields an empty list rather than failing startup.
-pub async fn warn_unsupported_proxy_quarantine(db: &PgPool) -> Vec<String> {
+/// Enabling it there is refused at the API: a virtual has no cache of its
+/// own, so the setting would be dead state — the policy belongs on the
+/// member remote repositories. Rows written before the gate existed are
+/// reported rather than silently rewritten: flipping an operator's security
+/// setting during startup is worse than a loud warning. Returns the
+/// repository keys it warned about so the audit is assertable in tests; a
+/// read failure yields an empty list rather than failing startup.
+pub async fn warn_unsupported_virtual_quarantine(db: &PgPool) -> Vec<String> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT r.key, r.repo_type::text \
          FROM repositories r \
          JOIN repository_config c ON c.repository_id = r.id \
          WHERE c.key = 'quarantine_enabled' AND c.value IN ('true', '1') \
-           AND r.repo_type::text IN ('remote', 'virtual') \
+           AND r.repo_type::text = 'virtual' \
          ORDER BY r.key",
     )
     .fetch_all(db)
@@ -439,11 +439,11 @@ pub async fn warn_unsupported_proxy_quarantine(db: &PgPool) -> Vec<String> {
         tracing::warn!(
             repository = %repo_key,
             repo_type = %repo_type,
-            "repository has quarantine enabled but is a {} repository: proxied content lives \
-             in `proxy_cache_artifacts` and has no quarantine identity, so the hold blocks all \
-             uncached content with no release path (#3647). Disable it with \
-             `PATCH /api/v1/repositories/{}` and `{{\"quarantine_enabled\": false}}`; the \
-             stored setting has been left unchanged.",
+            "repository has quarantine enabled but is a {} repository: a virtual has no \
+             cache of its own, so the setting is never consulted (#3647, #3912). Enable the \
+             Package Age Policy on the member remote repositories instead, then disable it \
+             here with `PATCH /api/v1/repositories/{}` and `{{\"quarantine_enabled\": false}}`; \
+             the stored setting has been left unchanged.",
             repo_type,
             repo_key
         );
@@ -788,6 +788,7 @@ pub fn validate_duration(minutes: i64) -> i64 {
 // Unit tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,28 +1167,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Proxy repositories are not quarantine-capable (#3647)
+    // Only virtual repositories are not quarantine-capable (#3647, #3912)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_supports_quarantine_only_for_hosted_types() {
+    fn test_supports_quarantine_hosted_and_remote_types() {
         assert!(supports_quarantine(&RepositoryType::Local));
         assert!(supports_quarantine(&RepositoryType::Staging));
-        // Remote and Virtual serve proxied content out of
-        // `proxy_cache_artifacts`, which has no quarantine identity.
-        assert!(!supports_quarantine(&RepositoryType::Remote));
+        // Remote qualifies since #3912: the fetch paths honour the
+        // release-date window and `proxy_cache_artifacts` carries a
+        // releasable quarantine identity.
+        assert!(supports_quarantine(&RepositoryType::Remote));
+        // A virtual has no cache of its own — the policy is set on its
+        // member remotes, so enabling it there is refused.
         assert!(!supports_quarantine(&RepositoryType::Virtual));
     }
 
     #[test]
-    fn test_proxy_quarantine_message_names_the_reason() {
-        // The operator has to be able to act on this without reading the code:
-        // it must name the table with no quarantine identity and the fact that
-        // there is no release path.
-        assert!(PROXY_QUARANTINE_UNSUPPORTED.contains("proxy_cache_artifacts"));
-        assert!(PROXY_QUARANTINE_UNSUPPORTED.contains("release"));
+    fn test_virtual_quarantine_message_names_the_alternative() {
+        // The operator has to be able to act on this without reading the
+        // code: it must say where the policy DOES belong.
+        assert!(VIRTUAL_QUARANTINE_UNSUPPORTED.contains("member remote"));
+        assert!(VIRTUAL_QUARANTINE_UNSUPPORTED.contains("release"));
     }
-
     /// Collects `tracing` output emitted on this thread while the guard lives.
     #[derive(Clone, Default)]
     struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1212,13 +1214,13 @@ mod tests {
     }
 
     /// DB-backed: a row that already has `quarantine_enabled = true` on a
-    /// Remote repository (written before the enable-time gate existed) is
+    /// Virtual repository (written before the enable-time gate existed) is
     /// reported by the startup audit with a WARN naming the repository, and the
     /// stored config is left exactly as it was.
     #[tokio::test]
-    async fn test_startup_audit_warns_for_preexisting_enabled_proxy_repo() {
+    async fn test_startup_audit_warns_for_preexisting_enabled_virtual_repo() {
         use crate::api::handlers::test_db_helpers::Fixture;
-        let Some(fx) = Fixture::setup("remote", "maven").await else {
+        let Some(fx) = Fixture::setup("virtual", "maven").await else {
             return;
         };
         enable_quarantine(&fx.pool, fx.repo_id, 60).await;
@@ -1231,12 +1233,12 @@ mod tests {
                     .with_max_level(tracing::Level::WARN)
                     .finish(),
             );
-            warn_unsupported_proxy_quarantine(&fx.pool).await
+            warn_unsupported_virtual_quarantine(&fx.pool).await
         };
 
         assert!(
             warned.contains(&fx.repo_key),
-            "the audit must report the enabled proxy repo, got {warned:?}"
+            "the audit must report the enabled virtual repo, got {warned:?}"
         );
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(
@@ -1254,6 +1256,24 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// DB-backed: #3912 made Remote repositories quarantine-capable, so a
+    /// remote row with quarantine enabled is SUPPORTED and must not be
+    /// warned about anymore.
+    #[tokio::test]
+    async fn test_startup_audit_ignores_remote_repos_now_supported() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        enable_quarantine(&fx.pool, fx.repo_id, 60).await;
+        let warned = warn_unsupported_virtual_quarantine(&fx.pool).await;
+        assert!(
+            !warned.contains(&fx.repo_key),
+            "a remote repo with quarantine on is supported since #3912 and must not be warned about: {warned:?}"
+        );
+        fx.teardown().await;
+    }
+
     /// DB-backed: a hosted repository with quarantine enabled is NOT reported.
     #[tokio::test]
     async fn test_startup_audit_ignores_hosted_repos() {
@@ -1262,7 +1282,7 @@ mod tests {
             return;
         };
         enable_quarantine(&fx.pool, fx.repo_id, 60).await;
-        let warned = warn_unsupported_proxy_quarantine(&fx.pool).await;
+        let warned = warn_unsupported_virtual_quarantine(&fx.pool).await;
         assert!(
             !warned.contains(&fx.repo_key),
             "a local repo with quarantine on is supported and must not be warned about: {warned:?}"

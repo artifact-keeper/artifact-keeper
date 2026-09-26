@@ -230,6 +230,44 @@ impl AuthExtension {
         Ok(())
     }
 
+    /// Repository ceiling for token minting (#4225), the repository-scope
+    /// counterpart of [`enforce_mint_ceiling`](Self::enforce_mint_ceiling).
+    ///
+    /// Returns the repositories a token minted by this credential must be
+    /// restricted to, or `None` when the credential has no repository
+    /// restriction (interactive sessions and unrestricted tokens), in which
+    /// case the request's own restriction, if any, applies unchanged.
+    ///
+    /// A repository-restricted credential (a token restricted by
+    /// `repo_selector` or `repository_ids`, or a JWT exchanged from one) passes
+    /// its restriction on: the new token is stamped with the credential's
+    /// resolved repositories. It may not name its own restriction
+    /// (`requests_restriction`), because a selector is resolved at
+    /// authentication time and cannot be proven no wider than the credential's
+    /// here; that is a 403 rather than a silent override. A credential whose
+    /// restriction currently matches no repository cannot mint at all, since
+    /// an empty restriction would be stored as none. Admins are not exempt: an
+    /// admin token restricted to some repositories is still restricted.
+    pub fn mint_repo_ceiling(
+        &self,
+        requests_restriction: bool,
+    ) -> crate::error::Result<Option<Vec<Uuid>>> {
+        match &self.allowed_repo_ids {
+            AccessScope::Admin => Ok(None),
+            AccessScope::Restricted(_) if requests_restriction => Err(AppError::Authorization(
+                "A repository-restricted credential cannot set a repository restriction on \
+                 the token it mints; the new token inherits the credential's own"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) if ids.is_empty() => Err(AppError::Authorization(
+                "The presenting credential is restricted to repositories that match nothing, \
+                 so it cannot mint a token"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) => Ok(Some(ids.clone())),
+        }
+    }
+
     /// Fold the effective-admin decision at construction time so every
     /// downstream `is_admin` read (both `require_admin` and the ~34 raw
     /// `if !auth.is_admin` handler checks) inherits scope awareness from a
@@ -2281,6 +2319,8 @@ pub async fn repo_visibility_middleware(
             let row = sqlx::query(
                 "SELECT id, format::text as format, repo_type::text as repo_type, \
                  upstream_url, storage_backend, storage_path, is_public, \
+                 promotion_only, age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+                 curation_enabled, curation_default_action, \
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
@@ -2308,6 +2348,12 @@ pub async fn repo_visibility_middleware(
                     storage_path: r.get("storage_path"),
                     is_public: r.get("is_public"),
                     index_upstream_url: r.get("index_upstream_url"),
+                    promotion_only: r.get("promotion_only"),
+                    age_gate_enabled: r.get("age_gate_enabled"),
+                    age_gate_min_age_days: r.get("age_gate_min_age_days"),
+                    age_gate_mode: r.get("age_gate_mode"),
+                    curation_enabled: r.get("curation_enabled"),
+                    curation_default_action: r.get("curation_default_action"),
                 };
                 // Populate the shared cache; evict stale entries on write.
                 {
@@ -2482,7 +2528,24 @@ pub async fn repo_visibility_middleware(
 
     // Check visibility: public repos are open for reads, private repos need auth.
     if !should_allow_repo_access(is_public, auth_ext.is_some()) {
-        return unauthorized_response();
+        // #1849: an anonymous caller may still hold an anonymous read rule
+        // (`principal_type = 'anonymous'`) on this non-public repository —
+        // the IP-restricted CI download grant — evaluated against the
+        // in-flight request's client IP. This arm is only reachable for a
+        // READ: anonymous writes already left by the #508 gate above, and
+        // `auth_ext.is_some()` callers answered `true` just now. A denial
+        // keeps the identical 401 challenge, so a caller outside the CIDRs
+        // cannot tell a conditioned repo from a rules-less one; a lookup
+        // error fails closed (denied, not served).
+        let anonymous_read_granted = auth_ext.is_none()
+            && vis_state
+                .permission_service
+                .check_anonymous_repository_action(repo.id, "read")
+                .await
+                .unwrap_or(false);
+        if !anonymous_read_granted {
+            return unauthorized_response();
+        }
     }
 
     // #504: Enforce API token repository scope. If the token carries an
@@ -2844,6 +2907,7 @@ pub async fn repo_visibility_middleware(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7055,6 +7119,12 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             is_public,
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -7104,6 +7174,77 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/private/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #3778: the cache-miss SELECT must carry the enforcement columns
+    /// (`promotion_only`, `age_gate_*`, `curation_*`) into `CachedRepo` —
+    /// Maven's resolver now builds its `RepoInfo` from this entry instead of
+    /// re-querying `repositories`, so a dropped column would read as a query
+    /// error (repo 404s) or, worse, silently default a gate. Pins the full
+    /// row -> entry mapping against a real database. DB-backed.
+    #[tokio::test]
+    async fn test_repo_visibility_cache_entry_carries_enforcement_columns_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, \
+             curation_default_action = 'review', promotion_only = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 14, \
+             age_gate_mode = 'first_seen' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set enforcement columns");
+        tdh::publish_repo(&pool, repo_id).await;
+
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let state = RepoVisibilityState {
+            auth_service: make_test_auth_service(),
+            db: pool.clone(),
+            repo_cache: cache.clone(),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let resp = run_through_visibility(
+            state,
+            empty_get(&format!(
+                "/maven/{repo_key}/com/example/lib/1.0/lib-1.0.jar"
+            )),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo read passes through (handler stub reached)"
+        );
+
+        let entry = {
+            let cache = cache.read().await;
+            cache.get(&repo_key).map(|(e, _)| e.clone())
+        }
+        .expect("the middleware must populate the shared cache on its miss");
+        assert!(
+            entry.curation_enabled,
+            "curation_enabled must ride the cache"
+        );
+        assert_eq!(entry.curation_default_action, "review");
+        assert!(entry.promotion_only, "promotion_only must ride the cache");
+        assert!(
+            entry.age_gate_enabled,
+            "age_gate_enabled must ride the cache"
+        );
+        assert_eq!(entry.age_gate_min_age_days, 14);
+        assert_eq!(entry.age_gate_mode, "first_seen");
+
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     #[tokio::test]
@@ -8130,6 +8271,12 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 is_public: false,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()
@@ -8273,6 +8420,12 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 is_public: false,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()

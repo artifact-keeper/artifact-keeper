@@ -66,6 +66,99 @@ use crate::models::curation::CurationDecision;
 
 use super::publisher_source::{self, PublisherSource};
 
+/// Accepted values for the config's `match` key.
+pub const MATCH_MODES: [&str; 2] = ["attestation", "metadata"];
+
+/// Accepted values for the config's `action` key.
+pub const ACTIONS: [&str; 3] = ["allow", "flag", "block"];
+
+/// Why a `publisher_trust` config is invalid (#4246). The `Display` text names
+/// the offending field and its accepted values; the API returns it as a 400
+/// and the evaluator embeds it in its fail-safe `Flag` reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `trusted_publishers` is absent, not a list, or has no non-blank names.
+    MissingTrustedPublishers,
+    /// `match` holds a value outside [`MATCH_MODES`].
+    UnknownMatch(String),
+    /// `action` holds a value outside [`ACTIONS`].
+    UnknownAction(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTrustedPublishers => write!(
+                f,
+                "`trusted_publishers` is missing or empty: expected a non-empty list of publisher names"
+            ),
+            Self::UnknownMatch(other) => write!(
+                f,
+                "unknown match mode `{other}`: `match` must be one of {MATCH_MODES:?}"
+            ),
+            Self::UnknownAction(other) => write!(
+                f,
+                "unknown action `{other}`: `action` must be one of {ACTIONS:?}"
+            ),
+        }
+    }
+}
+
+/// A `publisher_trust` config that passed [`parse_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedConfig<'a> {
+    /// Trimmed, lowercased, non-empty publisher names.
+    pub trusted: Vec<String>,
+    /// One of [`MATCH_MODES`].
+    pub match_mode: &'a str,
+    /// One of [`ACTIONS`].
+    pub action: &'a str,
+}
+
+/// Parses and validates a `publisher_trust` config (see module docs).
+///
+/// This is the single definition of a valid config: the API calls it at
+/// create/update time to reject bad configs with a 400, and [`evaluate`] calls
+/// it at evaluation time so rows stored before that check fail safe to `Flag`.
+/// Sharing it keeps the two from drifting (#4246).
+pub fn parse_config(config: &Value) -> Result<ParsedConfig<'_>, ConfigError> {
+    let trusted: Vec<String> = config
+        .get("trusted_publishers")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // A list whose entries are all blank (or non-strings) is as empty as `[]`.
+    if trusted.is_empty() {
+        return Err(ConfigError::MissingTrustedPublishers);
+    }
+
+    let match_mode = match config.get("match").and_then(Value::as_str) {
+        // Secure default: only verified provenance satisfies the allowlist.
+        None => "attestation",
+        Some(m) if MATCH_MODES.contains(&m) => m,
+        Some(other) => return Err(ConfigError::UnknownMatch(other.to_string())),
+    };
+
+    let action = match config.get("action").and_then(Value::as_str) {
+        // Fail-safe default: surface for review rather than allow or block.
+        None => "flag",
+        Some(a) if ACTIONS.contains(&a) => a,
+        Some(other) => return Err(ConfigError::UnknownAction(other.to_string())),
+    };
+
+    Ok(ParsedConfig {
+        trusted,
+        match_mode,
+        action,
+    })
+}
+
 /// Evaluates a `publisher_trust` rule against one package.
 ///
 /// `config` is the rule's JSON config (see module docs), `format` the package
@@ -83,41 +176,16 @@ pub fn evaluate(
         return CurationDecision::NotApplicable;
     }
 
-    let trusted: Vec<String> = match config.get("trusted_publishers").and_then(Value::as_array) {
-        Some(list) if !list.is_empty() => list
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if trusted.is_empty() {
-        return CurationDecision::Flag(
-            "publisher_trust rule misconfigured: `trusted_publishers` is missing or empty"
-                .to_string(),
-        );
-    }
-
-    let match_mode = match config.get("match").and_then(Value::as_str) {
-        // Secure default: only verified provenance satisfies the allowlist.
-        None => "attestation",
-        Some(m @ ("attestation" | "metadata")) => m,
-        Some(other) => {
-            return CurationDecision::Flag(format!(
-                "publisher_trust rule misconfigured: unknown match mode `{other}`"
-            ));
-        }
-    };
-
-    let action = match config.get("action").and_then(Value::as_str) {
-        // Fail-safe default: surface for review rather than allow or block.
-        None => "flag",
-        Some(a @ ("allow" | "flag" | "block")) => a,
-        Some(other) => {
-            return CurationDecision::Flag(format!(
-                "publisher_trust rule misconfigured: unknown action `{other}`"
-            ));
+    let ParsedConfig {
+        trusted,
+        match_mode,
+        action,
+    } = match parse_config(config) {
+        Ok(parsed) => parsed,
+        // Fail-safe for rows stored before write-time validation (#4246):
+        // surface the misconfiguration for review rather than deciding.
+        Err(err) => {
+            return CurationDecision::Flag(format!("publisher_trust rule misconfigured: {err}"));
         }
     };
 
@@ -219,6 +287,7 @@ fn untrusted_reason(
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +701,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_names_the_field_and_accepted_values() {
+        // #4246: the write-time API check and the evaluator share this parser.
+        for cfg in [
+            json!({}),
+            json!({"trusted_publishers": []}),
+            json!({"trusted_publishers": "NumFOCUS"}),
+            json!({"trusted_publishers": ["  ", ""]}),
+            json!({"trusted_publishers": [1, null]}),
+        ] {
+            let err = parse_config(&cfg).unwrap_err();
+            assert_eq!(err, ConfigError::MissingTrustedPublishers, "{cfg}");
+            assert!(err.to_string().contains("trusted_publishers"), "{err}");
+        }
+
+        let err =
+            parse_config(&json!({"trusted_publishers": ["a"], "match": "vibes"})).unwrap_err();
+        assert_eq!(err, ConfigError::UnknownMatch("vibes".to_string()));
+        let msg = err.to_string();
+        for needle in ["match", "vibes", "attestation", "metadata"] {
+            assert!(msg.contains(needle), "{msg} must mention {needle}");
+        }
+
+        let err =
+            parse_config(&json!({"trusted_publishers": ["a"], "action": "yolo"})).unwrap_err();
+        assert_eq!(err, ConfigError::UnknownAction("yolo".to_string()));
+        let msg = err.to_string();
+        for needle in ["action", "yolo", "allow", "flag", "block"] {
+            assert!(msg.contains(needle), "{msg} must mention {needle}");
+        }
+    }
+
+    #[test]
+    fn parse_config_normalizes_names_and_applies_defaults() {
+        let cfg = json!({"trusted_publishers": [" NumFOCUS ", "", "Microsoft"]});
+        let parsed = parse_config(&cfg).expect("valid config");
+        assert_eq!(parsed.trusted, vec!["numfocus", "microsoft"]);
+        assert_eq!(parsed.match_mode, "attestation");
+        assert_eq!(parsed.action, "flag");
+        for m in MATCH_MODES {
+            for a in ACTIONS {
+                let cfg = json!({"trusted_publishers": ["x"], "match": m, "action": a});
+                let parsed = parse_config(&cfg).expect("every accepted combination parses");
+                assert_eq!((parsed.match_mode, parsed.action), (m, a));
+            }
+        }
+    }
+
+    #[test]
+    fn stored_all_blank_allowlist_still_flags_at_evaluation() {
+        // A row written before #4246 with only blank names keeps the
+        // fail-safe Flag rather than deciding.
+        let d = evaluate(
+            &json!({"trusted_publishers": ["  "], "action": "block"}),
+            "pypi",
+            "p",
+            "1",
+            &pypi_attested(),
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("misconfigured") && r.contains("trusted_publishers")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
     fn defaults_are_secure_attestation_match_and_fail_safe_flag_action() {
         // No `match`, no `action`: attestation-only matching, flag action.
         let cfg = json!({"trusted_publishers": ["NumFOCUS"]});
@@ -835,6 +969,78 @@ mod tests {
         let d = evaluate(
             &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"}),
             "conda",
+            "mystery-pkg",
+            "0.1.0",
+            &json!({"name": "mystery-pkg"}),
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("publisher unknown")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn conda_native_is_gated_exactly_like_conda() {
+        // #4251: `conda_native` repositories are served by the conda handler
+        // and carry the same CEP-27 / about.json shapes. A publisher-trust rule
+        // on one used to evaluate to NotApplicable — the rule saved, looked
+        // active, and checked nothing. Every case below must decide the same
+        // way on both formats, and never NotApplicable.
+        let block = json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"});
+        let allow = json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "allow"});
+        let metadata =
+            json!({"trusted_publishers": ["conda-forge"], "match": "metadata", "action": "block"});
+        let cases: [(&Value, Value); 6] = [
+            // Verified, listed publisher: allowed.
+            (&block, conda_verified("conda-forge")),
+            (&allow, conda_verified("conda-forge")),
+            // Verified but unlisted: blocked.
+            (&block, conda_verified("some-rando-org")),
+            // Self-asserted listed name under match:attestation: blocked / flagged.
+            (&block, conda_metadata_only("conda-forge")),
+            (&allow, conda_metadata_only("conda-forge")),
+            // Explicit metadata opt-in: an untrusted maintainer is blocked.
+            (&metadata, conda_metadata_only("someone-else")),
+        ];
+        for (config, md) in &cases {
+            let conda = evaluate(config, "conda", "numpy", "1.26.4", md);
+            let native = evaluate(config, "conda_native", "numpy", "1.26.4", md);
+            assert_ne!(native, CurationDecision::NotApplicable, "{config} {md}");
+            assert_eq!(native, conda, "{config} {md}");
+        }
+
+        // Spot-check the decisions themselves on conda_native, so the parity
+        // loop above cannot pass by both sides being wrong together.
+        let d = evaluate(
+            &block,
+            "conda_native",
+            "numpy",
+            "1.26.4",
+            &conda_verified("conda-forge"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+        let d = evaluate(
+            &block,
+            "conda_native",
+            "numpy",
+            "1.26.4",
+            &conda_verified("some-rando-org"),
+        );
+        assert!(
+            matches!(d, CurationDecision::Block(ref r) if r.contains("not in the trusted-publisher list")),
+            "got {d:?}"
+        );
+        let d = evaluate(
+            &allow,
+            "conda_native",
+            "numpyy",
+            "99.0.0",
+            &conda_metadata_only("conda-forge"),
+        );
+        assert!(matches!(d, CurationDecision::Flag(_)), "got {d:?}");
+        let d = evaluate(
+            &block,
+            "conda_native",
             "mystery-pkg",
             "0.1.0",
             &json!({"name": "mystery-pkg"}),

@@ -681,6 +681,7 @@ fn matches_pattern(value: &str, pattern: &str) -> bool {
     value == pattern
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
