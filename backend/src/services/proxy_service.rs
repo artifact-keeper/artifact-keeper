@@ -6745,18 +6745,37 @@ impl ProxyService {
     /// is still streaming, the single-flight coordinator owns coalescing. The
     /// re-read after the wait drops any memoised `None` from the metadata LRU
     /// first, so the sidecar the writer just published is actually observed.
+    ///
+    /// The same window exists when the key already has an EXPIRED sidecar that
+    /// the in-flight publish is replacing (a stale mutable entry being
+    /// refilled): the reader observes the old sidecar — from storage, or from
+    /// the LRU entry memoised by the request that triggered the refill, which
+    /// the writer only invalidates after its sidecar `put` — classifies it
+    /// Stale, and revalidates / refetches upstream a second time. So an
+    /// expired sidecar gets the same bounded wait. A fresh sidecar never
+    /// consults the registry, keeping the warm-hit path lock-free.
     async fn load_cache_metadata_awaiting_publish(
         &self,
         metadata_key: &str,
     ) -> Option<CacheMetadata> {
         let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
-        if metadata.is_some() {
-            return metadata;
+        match &metadata {
+            Some(m) if m.expires_at > Utc::now() => return metadata,
+            Some(_) => {
+                // Expired: whether we waited or the writer had already
+                // finished (and invalidated the LRU) between our load and the
+                // registry check, one re-read observes its sidecar.
+                if await_tee_publish(metadata_key).await {
+                    invalidate_proxy_metadata_lru(metadata_key).await;
+                }
+            }
+            None => {
+                if !await_tee_publish(metadata_key).await {
+                    return None;
+                }
+                invalidate_proxy_metadata_lru(metadata_key).await;
+            }
         }
-        if !await_tee_publish(metadata_key).await {
-            return None;
-        }
-        invalidate_proxy_metadata_lru(metadata_key).await;
         self.load_cache_metadata(metadata_key).await.unwrap_or(None)
     }
 
@@ -20501,6 +20520,63 @@ mod tests {
             metadata.is_some(),
             "the reader must observe the sidecar published while it waited (#3335), \
              not the memoised miss"
+        );
+    }
+
+    /// Refill half of #3335: when the key already holds an EXPIRED sidecar
+    /// (memoised in the LRU by the request that triggered the refill) and a
+    /// tail-phase publish is replacing it, the reader must wait for the writer
+    /// and observe the new sidecar — not classify the old one as Stale and go
+    /// upstream a second time. This was the root of the flaky
+    /// `github_mirror_streaming_assets_revalidate_and_refresh` (a second GET
+    /// in the window between the tee's sidecar `put` and its LRU invalidate).
+    #[tokio::test]
+    async fn test_load_cache_metadata_awaiting_publish_replaces_expired_sidecar() {
+        let repo_key = format!("tee-refill-{}", Uuid::new_v4());
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, "some/artifact.bin")
+            .unwrap();
+        let storage = Arc::new(MutableMapStorage {
+            entries: std::sync::Mutex::new(std::collections::HashMap::from([(
+                keys.metadata.clone(),
+                expired_metadata_bytes(),
+            )])),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone());
+
+        // The refill-triggering request memoises the expired sidecar.
+        let stale = svc.load_cache_metadata(&keys.metadata).await.unwrap();
+        assert!(stale.is_some_and(|m| m.expires_at < Utc::now()));
+
+        let guard = TeePublishGuard::register(&keys.metadata);
+        guard
+            .entry_handle()
+            .tail
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Writer publishes the replacement sidecar, then finishes. It does not
+        // invalidate the LRU: the reader must not depend on winning that race.
+        let writer_storage = storage.clone();
+        let metadata_key = keys.metadata.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::services::storage_service::StorageBackend::put(
+                writer_storage.as_ref(),
+                &metadata_key,
+                fresh_metadata_bytes(),
+            )
+            .await
+            .unwrap();
+            drop(guard);
+        });
+
+        let metadata = svc
+            .load_cache_metadata_awaiting_publish(&keys.metadata)
+            .await
+            .expect("sidecar present");
+        assert!(
+            metadata.expires_at > Utc::now(),
+            "the reader must observe the replacement sidecar published while it \
+             waited, not the memoised expired one"
         );
     }
 
