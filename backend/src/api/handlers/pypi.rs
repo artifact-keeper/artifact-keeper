@@ -2221,7 +2221,14 @@ async fn serve_remote_metadata(
             content,
             content_encoding.as_deref(),
         )),
-        Err(AppError::NotFound(_)) => {
+        // A missing sidecar falls back to the wheel. 403 counts as missing
+        // here only (#3886): CloudFront/S3 answer an absent key with 403, and
+        // mapping that to 502 turned an optional resource into a hard install
+        // failure. Ordinary distribution downloads still surface 403 as 502.
+        Err(e)
+            if matches!(e, AppError::NotFound(_))
+                || crate::services::proxy_service::is_upstream_forbidden(&e) =>
+        {
             let wheel_target = resolve_pypi_remote_fetch_target(
                 proxy,
                 repo_id,
@@ -4282,15 +4289,51 @@ async fn serve_metadata(
     }
 }
 
+/// Entry-count ceiling for locating a wheel's METADATA (#3886).
+///
+/// The shared `MAX_INGEST_ARCHIVE_ENTRIES` (10,000) is sized for walks that
+/// inflate or inspect every entry. Real wheels exceed it: `torch 2.12.0+cpu`
+/// ships 12,704 entries, so every PEP 658 sidecar for it answered "Metadata not
+/// available" (404) while the wheel itself downloaded fine. This lookup
+/// inflates exactly ONE entry, still capped at `MAX_INGEST_METADATA_ENTRY_BYTES`,
+/// and the central directory being walked is already resident (the whole
+/// wheel is in `content`), so the count only bounds a name comparison per
+/// entry. The ceiling stays finite so a crafted archive cannot make the walk
+/// unbounded.
+const MAX_WHEEL_METADATA_LOOKUP_ENTRIES: u64 = 1_000_000;
+
+/// Whether a wheel member is the distribution's own core metadata:
+/// `{name}-{version}.dist-info/METADATA` at the archive ROOT (#3886).
+///
+/// The previous `contains(".dist-info/") && ends_with("METADATA")` predicate
+/// also matched vendored copies nested anywhere in the tree
+/// (`pkg/_vendor/foo-1.0.dist-info/METADATA`) and look-alikes such as
+/// `.dist-info/licenses/NOT_METADATA`, whichever came first in the archive.
+/// The `.dist-info` suffix is compared case-insensitively so a wheel built on
+/// a case-folding filesystem still resolves.
+fn is_wheel_core_metadata_entry(name: &str) -> bool {
+    let Some((dir, file)) = name.split_once('/') else {
+        return false;
+    };
+    file == "METADATA"
+        && dir.len() > ".dist-info".len()
+        && dir
+            .get(dir.len() - ".dist-info".len()..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dist-info"))
+}
+
 fn extract_metadata_from_wheel(content: &[u8]) -> Option<String> {
     // Bound the zip decompression (#2556): a crafted wheel served via PEP 658
     // `.metadata` cannot inflate the METADATA entry unbounded. On a cap breach
     // this returns None -> a bounded "Metadata not available" response instead
     // of an unbounded inflate.
     let cursor = std::io::Cursor::new(content);
-    let bytes = crate::util::bounded_archive::read_metadata_from_zip(cursor, |name| {
-        name.contains(".dist-info/") && name.ends_with("METADATA")
-    })
+    let bytes = crate::util::bounded_archive::read_metadata_from_zip_limited(
+        cursor,
+        is_wheel_core_metadata_entry,
+        MAX_WHEEL_METADATA_LOOKUP_ENTRIES,
+        crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+    )
     .ok()??;
     String::from_utf8(bytes).ok()
 }
@@ -7001,7 +7044,7 @@ fn find_upstream_url_for_file(
             .map(|m| m.as_str())
             .unwrap_or("");
         let href_filename = href.rsplit('/').next().unwrap_or("");
-        if href_filename != filename {
+        if !href_basename_names_file(href_filename, filename) {
             continue;
         }
 
@@ -7025,6 +7068,27 @@ fn find_upstream_url_for_file(
         }
     }
     None
+}
+
+/// Whether the basename of an upstream simple-index href names `filename`
+/// (#3886).
+///
+/// `filename` arrives from the route already percent-decoded, while an href is
+/// a URL and may percent-encode its basename. PyTorch's index writes every
+/// local-version wheel as `torch-2.12.0%2Bcpu-...whl`; comparing that
+/// byte-for-byte against the decoded `torch-2.12.0+cpu-...whl` never matched,
+/// so resolution silently fell back to the reconstructed
+/// `{upstream}/{project}/{filename}` URL — a path PyTorch's flat layout does
+/// not have (403 on `download.pytorch.org`, 404 on `download-r2`), for the
+/// PEP 658 sidecar and the wheel alike. Both spellings are accepted: the raw
+/// one keeps every previously-matching href matching, the decoded one is the
+/// fix. The href itself is still returned (and SSRF-validated) verbatim.
+fn href_basename_names_file(href_basename: &str, filename: &str) -> bool {
+    if href_basename == filename {
+        return true;
+    }
+    href_basename.contains('%')
+        && urlencoding::decode(href_basename).is_ok_and(|decoded| decoded == filename)
 }
 
 /// Extract the `#sha256=` fragment the upstream simple index advertises for
@@ -7051,7 +7115,7 @@ fn find_upstream_sha256_for_file(index_html: &str, filename: &str) -> Option<Str
             continue;
         };
         let url_no_query = url_part.split('?').next().unwrap_or(url_part);
-        if url_no_query.rsplit('/').next().unwrap_or("") != filename {
+        if !href_basename_names_file(url_no_query.rsplit('/').next().unwrap_or(""), filename) {
             continue;
         }
         let Some(digest) = fragment.strip_prefix("sha256=") else {
@@ -15002,6 +15066,305 @@ mod tests {
             metadata,
             "served metadata must be the wheel's METADATA bytes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3886: PEP 658 for PyTorch remotes and large local wheels.
+    // -----------------------------------------------------------------------
+
+    /// Coordinates the #3886 report used verbatim.
+    const TORCH_WHEEL: &str = "torch-2.12.0+cpu-cp313-cp313-win_amd64.whl";
+    const TORCH_WHEEL_HREF: &str = "torch-2.12.0%2Bcpu-cp313-cp313-win_amd64.whl";
+    const TORCH_SHA: &str = "d85bdbc271bf22ef1931375a81b0366ab11081509728c58df730cf194a090818";
+
+    /// PyTorch's flat index, shaped exactly as `download.pytorch.org/whl/cpu/torch/`
+    /// serves it: an ABSOLUTE href to the file host, the `+` of the local
+    /// version percent-encoded, and both PEP 658/714 metadata attributes.
+    fn pytorch_flat_index_html(file_host: &str) -> String {
+        format!(
+            "<html><body><h1>Links for torch</h1>\
+             <a href=\"{file_host}/whl/cpu/{TORCH_WHEEL_HREF}#sha256={TORCH_SHA}\" \
+             data-dist-info-metadata=\"sha256=4dea\" data-core-metadata=\"sha256=4dea\">\
+             {TORCH_WHEEL}</a><br/></body></html>"
+        )
+    }
+
+    /// #3886: the upstream href percent-encodes `+`, the route hands the
+    /// handler the DECODED filename. Resolution must still find the anchor —
+    /// before the fix it never matched and fell back to the reconstructed
+    /// `{upstream}/torch/{wheel}` path, which PyTorch does not serve.
+    #[test]
+    fn find_upstream_url_matches_percent_encoded_href_3886() {
+        let html = pytorch_flat_index_html("https://download-r2.pytorch.org");
+        let index = Some("https://download.pytorch.org/whl/cpu/torch/");
+        assert_eq!(
+            find_upstream_url_for_file(&html, TORCH_WHEEL, index).as_deref(),
+            Some("https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp313-cp313-win_amd64.whl"),
+            "the advertised URL must be used verbatim, without a project directory"
+        );
+        assert_eq!(
+            find_upstream_metadata_url(&html, &format!("{TORCH_WHEEL}.metadata"), index).as_deref(),
+            Some(
+                "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp313-cp313-win_amd64.whl.metadata"
+            ),
+        );
+        assert_eq!(
+            find_upstream_sha256_for_file(&html, TORCH_WHEEL).as_deref(),
+            Some(TORCH_SHA),
+            "the index-pinned digest must be lifted for the decoded filename too"
+        );
+        // The raw (encoded) spelling keeps matching, and a different local
+        // version must not.
+        assert!(find_upstream_url_for_file(&html, TORCH_WHEEL_HREF, index).is_some());
+        assert!(find_upstream_url_for_file(
+            &html,
+            "torch-2.12.0+cu121-cp313-cp313-win_amd64.whl",
+            index
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn wheel_core_metadata_entry_is_root_dist_info_only_3886() {
+        assert!(is_wheel_core_metadata_entry(
+            "torch-2.12.0+cpu.dist-info/METADATA"
+        ));
+        assert!(is_wheel_core_metadata_entry(
+            "Foo_Bar-1.0.DIST-INFO/METADATA"
+        ));
+        assert!(!is_wheel_core_metadata_entry(
+            "torch/_vendor/six-1.0.dist-info/METADATA"
+        ));
+        assert!(!is_wheel_core_metadata_entry(
+            "foo-1.0.dist-info/licenses/METADATA"
+        ));
+        assert!(!is_wheel_core_metadata_entry(
+            "foo-1.0.dist-info/NOT_METADATA"
+        ));
+        assert!(!is_wheel_core_metadata_entry(".dist-info/METADATA"));
+        assert!(!is_wheel_core_metadata_entry("METADATA"));
+    }
+
+    /// A wheel with `entries` filler files AHEAD of its `.dist-info`, the
+    /// order real wheels use (dist-info is written last). Includes a vendored
+    /// `.dist-info/METADATA` that must NOT be mistaken for the wheel's own.
+    fn wheel_with_many_entries(dist_info: &str, metadata: &[u8], entries: usize) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("torch/_vendor/decoy-0.1.dist-info/METADATA", options)
+            .expect("decoy entry");
+        zip.write_all(b"Metadata-Version: 2.1\nName: decoy\nVersion: 0.1\n")
+            .expect("decoy body");
+        for i in 0..entries {
+            zip.start_file(format!("torch/include/h{i}.h"), options)
+                .expect("filler entry");
+        }
+        zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
+            .expect("METADATA entry");
+        zip.write_all(metadata).expect("METADATA body");
+        zip.finish().expect("finish wheel");
+        cursor.into_inner()
+    }
+
+    /// #3886: `torch 2.12.0+cpu` has 12,704 zip entries, over the shared
+    /// 10,000-entry ingest cap, so METADATA extraction returned None and the
+    /// advertised sidecar 404'd while the wheel downloaded.
+    #[test]
+    fn extract_metadata_from_wheel_over_ingest_entry_cap_3886() {
+        let metadata = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
+        let wheel = wheel_with_many_entries("torch-2.12.0+cpu", metadata, 12_704);
+        assert_eq!(
+            extract_metadata_from_wheel(&wheel).as_deref(),
+            Some(std::str::from_utf8(metadata).unwrap()),
+            "the ROOT dist-info METADATA must be served, not the vendored decoy"
+        );
+    }
+
+    /// #3886 local arm, end to end through the router: the reported artifact
+    /// (`torch/2.12.0+cpu/<wheel>`), requested with the `%2B` pip sends. The
+    /// wheel served 200 and its advertised sidecar 404'd.
+    #[tokio::test]
+    async fn test_local_torch_wheel_metadata_is_served_3886() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let repo_info = fx.repo_info("local", None);
+        let wheel = "torch-2.12.0+cpu-cp311-cp311-manylinux_2_28_x86_64.whl";
+        let encoded = "torch-2.12.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl";
+        let metadata = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
+        seed_distribution(
+            &fx.state,
+            &fx.pool,
+            fx.user_id,
+            &repo_info,
+            "torch",
+            "2.12.0+cpu",
+            wheel,
+            Some("torch/2.12.0+cpu"),
+            &wheel_with_many_entries("torch-2.12.0+cpu", metadata, 12_704),
+        )
+        .await;
+
+        let (wheel_status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/simple/torch/{encoded}", fx.repo_key)),
+        )
+        .await;
+        let (meta_status, meta_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/simple/torch/{encoded}.metadata", fx.repo_key)),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(wheel_status, StatusCode::OK, "premise: the wheel downloads");
+        assert_eq!(
+            meta_status,
+            StatusCode::OK,
+            "#3886: an advertised sidecar for a downloadable wheel must not 404; body {}",
+            String::from_utf8_lossy(&meta_body)
+        );
+        assert_eq!(&meta_body[..], metadata);
+    }
+
+    /// Drive a `.metadata` request for [`TORCH_WHEEL`] against a Remote repo
+    /// configured exactly as the #3886 report (flat layout,
+    /// `pypi_upstream_index_path = ""`, upstream `<host>/whl/cpu`). The index
+    /// at `/whl/cpu/torch/` advertises the file at `/whl/cpu/<wheel>`; the
+    /// project-directory path the old fallback built answers 403, as
+    /// `download.pytorch.org` does.
+    async fn pytorch_remote_metadata_e2e(
+        sidecar: wiremock::ResponseTemplate,
+        wheel: wiremock::ResponseTemplate,
+    ) -> Option<(StatusCode, Bytes)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let fx = tdh::Fixture::setup("remote", "pypi").await?;
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind("pypi_upstream_index_path")
+        .bind("")
+        .execute(&fx.pool)
+        .await
+        .expect("configure flat layout");
+
+        Mock::given(method("GET"))
+            .and(path("/whl/cpu/torch/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(pytorch_flat_index_html(&upstream.uri())),
+            )
+            .mount(&upstream)
+            .await;
+        // The wrong, reconstructed shape: CloudFront answers a missing key 403.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/whl/cpu/torch/torch-"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/whl/cpu/torch-2\.12\.0(%2B|\+)cpu-cp313-cp313-win_amd64\.whl\.metadata$",
+            ))
+            .respond_with(sidecar)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/whl/cpu/torch-2\.12\.0(%2B|\+)cpu-cp313-cp313-win_amd64\.whl$",
+            ))
+            .respond_with(wheel)
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) =
+            tdh::rewire_remote_proxy(&fx, &format!("{}/whl/cpu", upstream.uri())).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/torch/{TORCH_WHEEL_HREF}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+        Some((status, body))
+    }
+
+    /// #3886 remote arm: the sidecar PyTorch actually serves at the advertised
+    /// URL must be reached. Before the fix the `%2B` href never matched, the
+    /// fetch went to `/whl/cpu/torch/<wheel>.metadata`, got 403, and the client
+    /// saw 502.
+    #[tokio::test]
+    async fn test_remote_pytorch_flat_index_metadata_uses_advertised_url_3886() {
+        use wiremock::ResponseTemplate;
+
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
+        let Some((status, body)) = pytorch_remote_metadata_e2e(
+            ResponseTemplate::new(200).set_body_bytes(metadata),
+            ResponseTemplate::new(500),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "#3886: the advertised sidecar must be fetched; body {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+    }
+
+    /// #3886 remote arm: an upstream sidecar that answers 403 (CloudFront's
+    /// "no such key") falls back to extracting METADATA from the wheel at the
+    /// URL the index advertised, exactly as a 404 does.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_403_falls_back_to_wheel_metadata_3886() {
+        use wiremock::ResponseTemplate;
+
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
+        let Some((status, body)) = pytorch_remote_metadata_e2e(
+            ResponseTemplate::new(403),
+            ResponseTemplate::new(200)
+                .set_body_bytes(wheel_with_metadata("torch-2.12.0+cpu", metadata)),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "#3886: an upstream 403 on the sidecar must fall back to the wheel; body {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+    }
+
+    #[test]
+    fn upstream_forbidden_classification_is_403_only_3886() {
+        use crate::services::proxy_service::is_upstream_forbidden;
+        let status = |s: StatusCode| {
+            AppError::BadGateway(format!("Upstream returned error status {s}: http://x"))
+        };
+        assert!(is_upstream_forbidden(&status(StatusCode::FORBIDDEN)));
+        assert!(!is_upstream_forbidden(&status(StatusCode::UNAUTHORIZED)));
+        assert!(!is_upstream_forbidden(&AppError::NotFound("x".into())));
     }
 
     // -----------------------------------------------------------------------

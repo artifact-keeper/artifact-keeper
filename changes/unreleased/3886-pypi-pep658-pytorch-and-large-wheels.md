@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3886]
+---
+- **PyPI PEP 658 `.whl.metadata` now works for PyTorch remote indexes and for large local wheels such as `torch`** (#3886). Remote resolution compared the upstream index's percent-encoded hrefs (`torch-2.12.0%2Bcpu-...whl`) against the decoded request filename, so every local-version wheel missed and fell back to a reconstructed `{upstream}/{project}/{file}` URL that PyTorch's flat layout does not serve (403 on `download.pytorch.org`, reported as 502; 404 on `download-r2.pytorch.org`). Hrefs are now matched on their decoded basename too, so the advertised URL is used verbatim, and an upstream 403 on the sidecar falls back to extracting METADATA from the wheel just as a 404 does (ordinary downloads still surface 403 as 502). Locally, METADATA extraction was refused for wheels with more than 10,000 entries (`torch` has 12,704), so the advertised sidecar 404'd while the wheel downloaded; the lookup now allows large wheels and reads only the root `*.dist-info/METADATA`, never a vendored copy.

@@ -821,6 +821,22 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `err` is the error [`validate_upstream_status`] produces for an
+/// upstream `403 Forbidden`.
+///
+/// Ordinary fetches keep surfacing that as 502. The one caller is PyPI's PEP
+/// 658 sidecar fetch (#3886): object stores behind CloudFront (PyTorch's
+/// `download.pytorch.org`) answer a missing key with 403 rather than 404, so
+/// for an OPTIONAL derived resource that has a local recovery (extract METADATA
+/// from the wheel) the 403 means "not here", exactly like 404.
+pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::BadGateway(msg)
+            if msg.starts_with(&format!("Upstream returned error status {}", StatusCode::FORBIDDEN))
+    )
+}
+
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG
 /// URL parser uses when it normalizes a path.
 ///
