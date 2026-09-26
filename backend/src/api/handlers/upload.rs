@@ -244,7 +244,7 @@ async fn create_session(
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
 
     if is_replication {
-        cleanup_stale_replication_upload_sessions(&state.db, repo.0, &req.artifact_path).await;
+        cleanup_stale_replication_upload_sessions(&state, repo.0, &req.artifact_path).await;
     }
 
     // Repository storage-quota gate (parity with the direct artifact-write
@@ -270,7 +270,6 @@ async fn create_session(
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
-        storage_path: &state.config.storage_path,
         user_id,
         repo_id,
         repo_key: &req.repository_key,
@@ -406,8 +405,13 @@ async fn upload_chunk(
         ));
     }
 
+    // #3918: stage the chunk in the repository's storage backend, not on this
+    // replica's local disk, so any replica can accept the next chunk or the
+    // completion.
+    let storage = staging_storage(&state, session.repository_id).await?;
     let result = UploadService::upload_chunk(
         &state.db,
+        storage.as_ref(),
         session_id,
         chunk_index,
         start,
@@ -508,8 +512,28 @@ async fn complete(
     auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
+    let outcome = complete_session_commit(&state, &auth, &headers, session_id).await;
+    if outcome.is_err() {
+        // #3922: a completion that failed terminally (checksum mismatch,
+        // quota, a post-copy database failure) can never be retried, so its
+        // staged chunks are garbage now. Reclaim them immediately rather than
+        // leaving them to the hourly reaper. A retryable failure released the
+        // lease back to `in_progress`, which this leaves alone.
+        reclaim_failed_session_staging(&state, session_id).await;
+    }
+    outcome
+}
+
+async fn complete_session_commit(
+    state: &SharedState,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+    session_id: Uuid,
+) -> Result<Response, Response> {
+    // The `write:artifacts` scope ceiling is enforced by `complete` before
+    // this runs.
     let user_id = auth.user_id;
-    let is_replication_request = super::is_replication_request(&headers);
+    let is_replication_request = super::is_replication_request(headers);
 
     // C3: Verify user owns this session.
     //
@@ -535,7 +559,7 @@ async fn complete(
     // `committing` would wedge it for the full lease TTL: retries get "already
     // in progress" and cancel refuses to touch a live committer.
     if let Err(e) = require_repo_action(
-        &auth,
+        auth,
         session.repository_id,
         "write",
         &state.permission_service,
@@ -615,7 +639,17 @@ async fn complete(
         return Err(e.into_response());
     }
 
-    let temp_path = std::path::PathBuf::from(&session.temp_file_path);
+    // #3918: reassemble the staged chunks from the repository's backend into a
+    // scratch file on *this* replica and verify size + SHA256. The chunks may
+    // have been PATCHed to any replica. The scratch file is removed when
+    // `assembled` drops, on every path below (#3922); `assemble_for_commit`
+    // settles the lease itself when it fails.
+    let scratch_dir = std::path::PathBuf::from(&state.config.storage_path).join(".uploads");
+    let assembled =
+        UploadService::assemble_for_commit(&state.db, storage.as_ref(), &session, &scratch_dir)
+            .await
+            .map_err(map_upload_err)?;
+    let temp_path = assembled.path();
 
     // The key is content-addressed and every backend writes it atomically, so
     // an object already present under it is the object we would write and can
@@ -644,7 +678,7 @@ async fn complete(
         // file into memory. The default implementation still reads into
         // memory, but backends can override for true streaming (S3 multipart,
         // etc.).
-        if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
+        if let Err(e) = storage.put_file(&storage_key, temp_path).await {
             UploadService::release_commit_lease(&state.db, &session).await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
@@ -659,15 +693,15 @@ async fn complete(
     let format_header_prefix = if session.artifact_metadata_format.is_none()
         && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
     {
-        read_file_prefix(&temp_path, FORMAT_HEADER_PREFIX_LIMIT)
+        read_file_prefix(temp_path, FORMAT_HEADER_PREFIX_LIMIT)
             .await
             .ok()
     } else {
         None
     };
 
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    // Clean up the scratch copy now that the bytes are in final storage.
+    drop(assembled);
 
     // Create artifact record
     let artifact_name = completed_artifact_name(&session);
@@ -863,6 +897,19 @@ async fn complete(
         .map_err(map_upload_err)?;
     drop(commit_renewal);
 
+    // #3922: the staged chunks are no longer needed. Best-effort: a failure
+    // leaves `staging_purged_at` unset and the hourly reaper retries.
+    if let Err(e) = UploadService::purge_staged_chunks(
+        &state.db,
+        storage.as_ref(),
+        session.id,
+        session.total_chunks,
+    )
+    .await
+    {
+        tracing::warn!(session = %session.id, error = %e, "failed to purge staged upload chunks");
+    }
+
     tracing::info!(
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
         session_id,
@@ -917,9 +964,19 @@ async fn cancel(
     let user_id = auth.user_id;
 
     // C3: Verify user owns this session
-    UploadService::cancel_session(&state.db, session_id, user_id)
+    let cancelled = UploadService::cancel_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
+    if let Some(session) = cancelled {
+        // #3922: reclaim the staged chunks now; the reaper backstops failure.
+        purge_session_staging_best_effort(
+            &state,
+            session.id,
+            session.repository_id,
+            session.total_chunks,
+        )
+        .await;
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -976,6 +1033,12 @@ fn map_upload_err(e: UploadError) -> Response {
             "Database error".into(),
         ),
         UploadError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "I/O error".into()),
+        // Staged chunks live in the repository's storage backend (#3918); a
+        // failure reaching it is transient from the client's point of view.
+        UploadError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Storage backend error; retry the request".into(),
+        ),
     };
 
     super::with_retry_after_on_503(
@@ -1287,11 +1350,80 @@ fn completed_package_metadata(
         .or_else(|| maven_package_metadata_from_artifact_metadata(session))
 }
 
-async fn cleanup_completed_upload_session(db: &sqlx::PgPool, session_id: Uuid) {
-    match sqlx::query("DELETE FROM upload_sessions WHERE id = $1 AND status = 'completed'")
-        .bind(session_id)
-        .execute(db)
+/// Resolve the storage backend a session's chunks are staged in: the
+/// repository's own backend, which every replica resolves identically (#3918).
+async fn staging_storage(
+    state: &SharedState,
+    repository_id: Uuid,
+) -> Result<std::sync::Arc<dyn crate::storage::StorageBackend>, Response> {
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_id(repository_id)
         .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Delete a session's staged chunks now, best-effort (#3922). A failure is
+/// logged and left to the hourly reaper, which retries every terminal session
+/// whose `staging_purged_at` is still unset.
+async fn purge_session_staging_best_effort(
+    state: &SharedState,
+    session_id: Uuid,
+    repository_id: Uuid,
+    total_chunks: i32,
+) {
+    let result = match staging_storage(state, repository_id).await {
+        Ok(storage) => {
+            UploadService::purge_staged_chunks(
+                &state.db,
+                storage.as_ref(),
+                session_id,
+                total_chunks,
+            )
+            .await
+        }
+        Err(_) => Err(UploadError::Storage(
+            "could not resolve the repository's storage backend".into(),
+        )),
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            session = %session_id,
+            error = %e,
+            "failed to purge staged upload chunks; the upload reaper will retry"
+        );
+    }
+}
+
+/// After an unsuccessful completion: purge the staged chunks if the session
+/// ended `failed` (terminal). A session released back to `in_progress` keeps
+/// its chunks so the client can retry the completion.
+async fn reclaim_failed_session_staging(state: &SharedState, session_id: Uuid) {
+    let row = sqlx::query_as::<_, (Uuid, i32)>(
+        "SELECT repository_id, total_chunks FROM upload_sessions \
+         WHERE id = $1 AND status = 'failed' \
+           AND staged_in_storage AND staging_purged_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.db)
+    .await;
+    if let Ok(Some((repository_id, total_chunks))) = row {
+        purge_session_staging_best_effort(state, session_id, repository_id, total_chunks).await;
+    }
+}
+
+async fn cleanup_completed_upload_session(db: &sqlx::PgPool, session_id: Uuid) {
+    // A row whose staged chunks were not purged is kept: it is the reaper's
+    // only record of those objects (#3922).
+    match sqlx::query(
+        "DELETE FROM upload_sessions WHERE id = $1 AND status = 'completed' \
+         AND (NOT staged_in_storage OR staging_purged_at IS NOT NULL)",
+    )
+    .bind(session_id)
+    .execute(db)
+    .await
     {
         Ok(result) if result.rows_affected() == 0 => {
             tracing::warn!(
@@ -1311,22 +1443,23 @@ async fn cleanup_completed_upload_session(db: &sqlx::PgPool, session_id: Uuid) {
 }
 
 async fn cleanup_stale_replication_upload_sessions(
-    db: &sqlx::PgPool,
+    state: &SharedState,
     repository_id: Uuid,
     artifact_path: &str,
 ) {
-    let stale = match sqlx::query_as::<_, (Uuid, String)>(
+    let stale = match sqlx::query_as::<_, (Uuid, String, bool, bool, i32)>(
         r#"
         DELETE FROM upload_sessions
         WHERE repository_id = $1
           AND artifact_path = $2
           AND is_replication = true
-        RETURNING id, temp_file_path
+        RETURNING id, temp_file_path, staged_in_storage,
+                  staging_purged_at IS NULL, total_chunks
         "#,
     )
     .bind(repository_id)
     .bind(artifact_path)
-    .fetch_all(db)
+    .fetch_all(&state.db)
     .await
     {
         Ok(stale) => stale,
@@ -1341,8 +1474,22 @@ async fn cleanup_stale_replication_upload_sessions(
         }
     };
 
-    for (session_id, temp_file_path) in &stale {
-        let _ = tokio::fs::remove_file(temp_file_path).await;
+    for (session_id, temp_file_path, staged, unpurged, total_chunks) in &stale {
+        if !staged {
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+        } else if *unpurged {
+            // The row is gone, so the reaper can no longer find these chunks:
+            // delete them now (#3922).
+            if let Ok(storage) = staging_storage(state, repository_id).await {
+                let _ = UploadService::purge_staged_chunks(
+                    &state.db,
+                    storage.as_ref(),
+                    *session_id,
+                    *total_chunks,
+                )
+                .await;
+            }
+        }
         tracing::info!(
             %session_id,
             %repository_id,
@@ -1825,6 +1972,8 @@ mod tests {
             error_message: None,
             state_token: None,
             committing_expires_at: None,
+            staged_in_storage: true,
+            staging_purged_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -3546,6 +3695,21 @@ mod tests {
             (1, 1),
             "regular completed upload sessions remain queryable for client status"
         );
+        // #3918/#3922: the chunk was staged in the repository's backend (not
+        // a replica-local temp file) and is purged once the upload completes.
+        assert!(
+            !f.storage_dir
+                .join(upload_service::staged_chunk_key(session_id, 0))
+                .exists(),
+            "staged chunk must be purged after completion"
+        );
+        let purged: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT staging_purged_at FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("purge marker");
+        assert!(purged.is_some(), "completion must record the staging purge");
 
         // 4) The new path uses content-addressable storage under the
         //    repo-scoped backend. Verify the bytes are there at the expected
@@ -3598,14 +3762,25 @@ mod tests {
         f.teardown().await;
     }
 
-    /// Stage a verifiable session directly in the database (temp file on disk,
-    /// size and checksum consistent) so `complete` gets past
-    /// `complete_session` — and therefore past the point where the commit
-    /// lease is taken — without needing an authorized create/PATCH first.
-    async fn stage_completable_session(
-        f: &tdh::Fixture,
-        payload: &[u8],
-    ) -> (Uuid, std::path::PathBuf) {
+    /// A session's staged payload: its single chunk object in the backend the
+    /// repository resolves to (#3918). `exists` reads the object back rather
+    /// than calling `exists`, which some tests fail on purpose.
+    struct StagedPayload {
+        storage: Arc<dyn crate::storage::StorageBackend>,
+        key: String,
+    }
+
+    impl StagedPayload {
+        async fn exists(&self) -> bool {
+            self.storage.get(&self.key).await.is_ok()
+        }
+    }
+
+    /// Stage a one-chunk, fully uploaded session directly in the database and
+    /// the fixture repository's filesystem backend, so a completion can run
+    /// straight to the lease — without needing an authorized create/PATCH
+    /// first.
+    async fn stage_completable_session(f: &tdh::Fixture, payload: &[u8]) -> (Uuid, StagedPayload) {
         stage_completable_session_at(f, payload, "authz/staged.bin").await
     }
 
@@ -3619,38 +3794,51 @@ mod tests {
         f: &tdh::Fixture,
         payload: &[u8],
         artifact_path: &str,
-    ) -> (Uuid, std::path::PathBuf) {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(payload);
-        let checksum = hex::encode(hasher.finalize());
+    ) -> (Uuid, StagedPayload) {
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+        );
+        stage_completable_session_in(f, storage, payload, artifact_path).await
+    }
 
-        let dir = std::env::temp_dir().join("ak_upload_authz_release_test");
-        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
-        let temp_path = dir.join(format!("staged-{}", Uuid::new_v4()));
-        tokio::fs::write(&temp_path, payload).await.expect("write");
-
-        let session_id: Uuid = sqlx::query_scalar(
+    /// As [`stage_completable_session_at`], staging into `storage` (the
+    /// backend the fixture repository was pointed at).
+    async fn stage_completable_session_in(
+        f: &tdh::Fixture,
+        storage: Arc<dyn crate::storage::StorageBackend>,
+        payload: &[u8],
+        artifact_path: &str,
+    ) -> (Uuid, StagedPayload) {
+        let session_id = Uuid::new_v4();
+        sqlx::query(
             "INSERT INTO upload_sessions \
-                 (user_id, repository_id, repository_key, artifact_path, \
+                 (id, user_id, repository_id, repository_key, artifact_path, \
                   total_size, chunk_size, total_chunks, completed_chunks, \
-                  bytes_received, checksum_sha256, temp_file_path, status) \
-             VALUES ($1, $2, $3, $7, $4, 1048576, 1, 1, $4, $5, $6, \
-                     'in_progress') \
-             RETURNING id",
+                  bytes_received, checksum_sha256, temp_file_path, status, \
+                  staged_in_storage) \
+             VALUES ($1, $2, $3, $4, $7, $5, 1048576, 1, 1, $5, $6, \
+                     'upload-staging', 'in_progress', TRUE)",
         )
+        .bind(session_id)
         .bind(f.user_id)
         .bind(f.repo_id)
         .bind(&f.repo_key)
         .bind(payload.len() as i64)
-        .bind(&checksum)
-        .bind(&*temp_path.to_string_lossy())
+        .bind(sha256_hex(payload))
         .bind(artifact_path)
-        .fetch_one(&f.pool)
+        .execute(&f.pool)
         .await
         .expect("insert staged session");
 
-        (session_id, temp_path)
+        let key = upload_service::staged_chunk_key(session_id, 0);
+        crate::storage::StorageBackend::put(
+            storage.as_ref(),
+            &key,
+            Bytes::copy_from_slice(payload),
+        )
+        .await
+        .expect("stage chunk");
+        (session_id, StagedPayload { storage, key })
     }
 
     /// Point the fixture repository at an observable registered backend while
@@ -3682,7 +3870,7 @@ mod tests {
     async fn assert_completion_is_retryable(
         f: &tdh::Fixture,
         session_id: Uuid,
-        temp_path: &std::path::Path,
+        temp_path: &StagedPayload,
     ) {
         let (status, token, deadline): (
             String,
@@ -3706,17 +3894,13 @@ mod tests {
             "released lease must clear its committing deadline"
         );
         assert!(
-            temp_path.exists(),
+            temp_path.exists().await,
             "storage failure must retain the staged payload for retry"
         );
     }
 
-    async fn cleanup_staged_session(
-        f: &tdh::Fixture,
-        session_id: Uuid,
-        temp_path: &std::path::Path,
-    ) {
-        let _ = tokio::fs::remove_file(temp_path).await;
+    async fn cleanup_staged_session(f: &tdh::Fixture, session_id: Uuid, temp_path: &StagedPayload) {
+        let _ = temp_path.storage.delete(&temp_path.key).await;
         let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
             .bind(session_id)
             .execute(&f.pool)
@@ -3786,8 +3970,14 @@ mod tests {
                 .is_some_and(|m| m.contains("session completion update failed")),
             "terminal failure must explain the post-artifact database error"
         );
-
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        // #3922: the handler's post-failure hook reclaims a terminally failed
+        // session's staged chunks at once instead of leaving them behind.
+        assert!(temp_path.exists().await);
+        reclaim_failed_session_staging(&f.state, session_id).await;
+        assert!(
+            !temp_path.exists().await,
+            "#3922: a terminally failed completion must reclaim its staged chunks"
+        );
         let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
             .bind(session_id)
             .execute(&f.pool)
@@ -3913,7 +4103,8 @@ mod tests {
         let state = state_with_complete_recording_storage(&f, storage.clone()).await;
         let payload = b"chunked completion deduplication payload";
 
-        let (first_session, first_temp_path) = stage_completable_session(&f, payload).await;
+        let (first_session, first_temp_path) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/staged.bin").await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(state.clone(), auth);
         let (status, body) = tdh::send(app, complete_req(first_session)).await;
@@ -3925,7 +4116,7 @@ mod tests {
         );
         assert_eq!(storage.put_file_calls(), 1, "first completion writes once");
         assert!(
-            !first_temp_path.exists(),
+            !first_temp_path.exists().await,
             "successful completion removes the staged payload"
         );
         let expected_key =
@@ -3941,7 +4132,8 @@ mod tests {
         // Own coordinate: the point here is content dedup, not the #3924
         // immutability gate that an occupied path would trip.
         let (second_session, second_temp_path) =
-            stage_completable_session_at(&f, payload, "authz/staged-second.bin").await;
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/staged-second.bin")
+                .await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(state, auth);
         let (status, body) = tdh::send(app, complete_req(second_session)).await;
@@ -3957,7 +4149,7 @@ mod tests {
             "existing content-addressed object must not be written again"
         );
         assert!(
-            !second_temp_path.exists(),
+            !second_temp_path.exists().await,
             "deduplicated completion still removes its staged payload"
         );
 
@@ -4065,7 +4257,8 @@ mod tests {
         .await
         .expect("seed the existence hit");
 
-        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let (session_id, temp_path) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/staged.bin").await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(state, auth);
         let (status, body) = tdh::send(app, complete_req(session_id)).await;
@@ -4097,8 +4290,13 @@ mod tests {
         };
         let storage = Arc::new(CompleteRecordingStorage::default());
         let state = state_with_complete_recording_storage(&f, storage.clone()).await;
-        let (session_id, temp_path) =
-            stage_completable_session(&f, b"chunked exists failure retry payload").await;
+        let (session_id, temp_path) = stage_completable_session_in(
+            &f,
+            storage.clone(),
+            b"chunked exists failure retry payload",
+            "authz/staged.bin",
+        )
+        .await;
 
         storage.set_fail_exists(true);
         let auth = tdh::make_auth(f.user_id, &f.username);
@@ -4128,7 +4326,7 @@ mod tests {
             "retry writes the retained payload"
         );
         assert!(
-            !temp_path.exists(),
+            !temp_path.exists().await,
             "successful retry cleans up staged payload"
         );
 
@@ -4143,8 +4341,13 @@ mod tests {
         };
         let storage = Arc::new(CompleteRecordingStorage::default());
         let state = state_with_complete_recording_storage(&f, storage.clone()).await;
-        let (session_id, temp_path) =
-            stage_completable_session(&f, b"chunked put_file failure retry payload").await;
+        let (session_id, temp_path) = stage_completable_session_in(
+            &f,
+            storage.clone(),
+            b"chunked put_file failure retry payload",
+            "authz/staged.bin",
+        )
+        .await;
 
         storage.set_fail_put_file(true);
         let auth = tdh::make_auth(f.user_id, &f.username);
@@ -4174,7 +4377,7 @@ mod tests {
             "retry performs a second write attempt"
         );
         assert!(
-            !temp_path.exists(),
+            !temp_path.exists().await,
             "successful retry cleans up staged payload"
         );
 
@@ -4239,7 +4442,7 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
 
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        drop(temp_path);
         let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
             .bind(session_id)
             .execute(&f.pool)

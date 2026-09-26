@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3918]
+---
+- **Chunked (resumable) uploads work behind more than one backend replica** (#3918). Upload sessions assembled their bytes in `$STORAGE_PATH/.uploads/<session_id>` on whichever replica served `POST /api/v1/uploads`, so with per-pod storage a `PATCH` or `PUT .../complete` routed to another replica failed with `I/O error` or produced a corrupt object. Each chunk is now staged as its own object in the repository's storage backend and session state stays in the database, so any replica can accept any chunk and complete the session; completion reassembles the chunks into a request-scoped scratch file on the completing replica, verifies size and SHA256, and removes it afterwards. A chunk must now cover exactly its placeholder's byte range (`chunk_index * chunk_size`, full chunk length except the last), which every client that follows the returned `chunk_size` already does. Sessions created by an earlier server version cannot be continued after the upgrade and are refused with a clear message; restart those uploads.

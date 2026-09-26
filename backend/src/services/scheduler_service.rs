@@ -854,6 +854,10 @@ pub fn spawn_all(
         // to the manual admin /cleanup endpoint (gap in merged #1622). Run it on
         // the same hourly cadence and 24h threshold as the session reaper.
         let storage_path = config.storage_path.clone();
+        // #3922: the reaper also purges staged chunk objects of failed,
+        // cancelled and expired sessions, which live in each repository's
+        // storage backend.
+        let upload_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
@@ -862,7 +866,12 @@ pub fn spawn_all(
                 ticker.tick().await;
                 tracing::debug!("Cleaning up expired upload sessions");
 
-                match crate::services::upload_service::UploadService::cleanup_expired(&db).await {
+                match crate::services::upload_service::UploadService::cleanup_expired(
+                    &db,
+                    &upload_registry,
+                )
+                .await
+                {
                     Ok(count) if count > 0 => {
                         tracing::info!("Cleaned up {} expired upload sessions", count);
                     }
