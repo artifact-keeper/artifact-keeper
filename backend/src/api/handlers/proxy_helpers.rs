@@ -5921,6 +5921,10 @@ pub async fn find_artifact_by_name_lowercase(
 /// List every non-deleted artifact whose name matches `name`
 /// case-insensitively in `repository_id`, newest first.
 ///
+/// The `id` tiebreaker makes the order total: rows written in one transaction
+/// share `created_at`, and a caller that pages over this list (the Galaxy
+/// version list, #3873) must see the same order on every page request.
+///
 /// Companion to [`find_artifact_by_name_lowercase`] for endpoints that
 /// need the full version history (e.g. RubyGems versions, Puppet release
 /// list, Hex package versions).
@@ -5939,7 +5943,7 @@ pub async fn list_artifacts_by_name_lowercase(
          WHERE a.repository_id = $1 \
            AND a.is_deleted = false \
            AND LOWER(a.name) = LOWER($2) \
-         ORDER BY a.created_at DESC",
+         ORDER BY a.created_at DESC, a.id DESC",
     )
     .bind(repository_id)
     .bind(name)

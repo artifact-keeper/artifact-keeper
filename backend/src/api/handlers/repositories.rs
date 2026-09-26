@@ -8826,6 +8826,9 @@ pub async fn download_artifact(
     // #3873: a Galaxy API read addressed through this route is answered by the
     // Galaxy handler, not by streaming the upstream's JSON -- whose pagination
     // links are root-relative to the upstream origin and leave the repository.
+    // So is the `download/{file}.tar.gz` the Galaxy documents advertise on this
+    // mount, which the Galaxy download route resolves by collection filename
+    // (behind the same quarantine / scan-policy gate as every download).
     // Virtual repositories keep the member walk below: the Galaxy handler has
     // no virtual resolution to delegate to.
     if repo.format == RepositoryFormat::Ansible && repo.repo_type != RepositoryType::Virtual {
@@ -8834,7 +8837,7 @@ pub async fn download_artifact(
             .get::<axum::extract::OriginalUri>()
             .map_or_else(|| request.uri().clone(), |o| o.0.clone());
         if let Some(response) =
-            super::ansible::serve_galaxy_api_path(&state, &key, &path, &uri).await
+            super::ansible::serve_galaxy_api_path(&state, &key, &path, &uri, &auth, &dl_ctx).await
         {
             return Ok(response);
         }

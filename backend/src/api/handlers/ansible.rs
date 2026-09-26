@@ -174,38 +174,72 @@ pub(crate) async fn serve_galaxy_api_path(
     repo_key: &str,
     path: &str,
     uri: &Uri,
+    auth: &Option<AuthExtension>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Option<Response> {
     let segments: Vec<&str> = path.split('/').collect();
     let st = State(state.clone());
     let key = repo_key.to_string();
     let own = |s: &&str| s.to_string();
+    let ouri = || OriginalUri(uri.clone());
     let result = match segments.as_slice() {
+        // Discovery, both spellings, as the dedicated router registers them
+        // (#3137). The bare one is the one that matters: ansible-core builds
+        // the discovery URL as `_urljoin(server, '/api/')`, which strips the
+        // slashes, so a server configured as `.../download/` is probed at
+        // `.../download/api`. An Ansible repository's own artifacts are
+        // `*.tar.gz` collections, so no stored path is shadowed by it.
         ["api"] | ["api", ""] => api_root(st, Path(key)).await,
-        ["api", "v3", ""] => api_v3_root(st, Path(key)).await,
-        ["api", "v3", "collections", ""] => {
-            list_collections(st, Path(key), OriginalUri(uri.clone())).await
-        }
+        ["api", "v3", ""] => api_v3_root(st, Path(key), ouri()).await,
+        ["api", "v3", "collections", ""] => list_collections(st, Path(key), ouri()).await,
         ["api", "v3", "collections", ns, name, ""] if !ns.is_empty() && !name.is_empty() => {
-            collection_info(st, Path((key, own(ns), own(name)))).await
+            collection_info(st, Path((key, own(ns), own(name))), ouri()).await
         }
         ["api", "v3", "collections", ns, name, "versions", ""]
             if !ns.is_empty() && !name.is_empty() =>
         {
-            version_list(
-                st,
-                Path((key, own(ns), own(name))),
-                OriginalUri(uri.clone()),
-            )
-            .await
+            version_list(st, Path((key, own(ns), own(name))), ouri()).await
         }
         ["api", "v3", "collections", ns, name, "versions", version, ""]
             if !ns.is_empty() && !name.is_empty() && !version.is_empty() =>
         {
-            version_info(st, Path((key, own(ns), own(name), own(version)))).await
+            version_info(st, Path((key, own(ns), own(name), own(version))), ouri()).await
+        }
+        // The `download_url` the documents above advertise on this mount
+        // (`{base}/download/{file}`): served by the Galaxy download route so
+        // it resolves the stored collection by filename (and proxies a Remote
+        // miss) exactly as `/ansible/{key}/download/{file}` does, rather than
+        // by the literal stored path the generic route keys on.
+        ["download", file] if file.ends_with(".tar.gz") => {
+            download_collection(
+                st,
+                Extension(auth.clone()),
+                Path((key, own(file))),
+                ctx.clone(),
+            )
+            .await
         }
         _ => return None,
     };
     Some(result.unwrap_or_else(|err| err))
+}
+
+/// The URL prefix every link in a Galaxy document is spelled under: the path the
+/// client addressed with this endpoint's own `tail_segments` trailing segments
+/// removed -- `/ansible/{key}` on the dedicated mount,
+/// `/api/v1/repositories/{key}/download` on the generic one (#3873).
+///
+/// Everything a client follows out of a document (`href`, `versions_url`,
+/// `download_url`, paging links) has to stay under the URL it was configured
+/// with: a reverse proxy that forwards only one of the two mounts cannot route
+/// a link spelled against the other. The count is taken from the raw request
+/// path, which the router matched segment for segment, so it is exact.
+fn galaxy_base(uri: &Uri, tail_segments: usize) -> String {
+    uri.path()
+        .rsplitn(tail_segments + 1, '/')
+        .last()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The `task` value returned by `upload_collection` and the `href` echoed back
@@ -253,13 +287,16 @@ async fn api_root(
 async fn api_v3_root(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let _ = resolve_ansible_repo(&state.db, &repo_key).await?;
+    // `{base}/api/v3/`
+    let base = galaxy_base(&uri, 3);
 
     let json = serde_json::json!({
-        "collections": format!("/ansible/{}/api/v3/collections/", repo_key),
+        "collections": format!("{}/api/v3/collections/", base),
         "artifacts": {
-            "collections": format!("/ansible/{}/api/v3/artifacts/collections/", repo_key),
+            "collections": format!("{}/api/v3/artifacts/collections/", base),
         },
     });
     Ok(super::json_response(&json))
@@ -290,7 +327,7 @@ fn collection_filename(namespace: &str, name: &str, version: &str) -> String {
 /// filename would advertise a path the download route cannot resolve (the
 /// Ansible analogue of the RPM `<location>` fix, #2587 / #2589).
 fn collection_download_url(
-    repo_key: &str,
+    base: &str,
     path: &str,
     namespace: &str,
     name: &str,
@@ -300,7 +337,7 @@ fn collection_download_url(
         path,
         &collection_filename(namespace, name, version),
     );
-    format!("/ansible/{}/download/{}", repo_key, filename)
+    format!("{}/download/{}", base, filename)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,10 +397,10 @@ fn galaxy_coordinate_is_addressable(part: &str) -> bool {
 }
 
 /// The `href` this repository advertises for one collection version.
-fn version_href(repo_key: &str, namespace: &str, name: &str, version: &str) -> String {
+fn version_href(base: &str, namespace: &str, name: &str, version: &str) -> String {
     format!(
-        "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
-        repo_key, namespace, name, version
+        "{}/api/v3/collections/{}/{}/versions/{}/",
+        base, namespace, name, version
     )
 }
 
@@ -556,6 +593,7 @@ async fn fetch_upstream_versions(
 /// promise the download route could not keep.
 fn merge_upstream_versions(
     repo_key: &str,
+    base: &str,
     namespace: &str,
     name: &str,
     upstream: Vec<String>,
@@ -584,7 +622,7 @@ fn merge_upstream_versions(
         }
         out.push(serde_json::json!({
             "version": version,
-            "href": version_href(repo_key, namespace, name, &version),
+            "href": version_href(base, namespace, name, &version),
         }));
         seen.insert(version);
     }
@@ -628,7 +666,7 @@ fn merge_upstream_versions(
 /// download accounting and the repository's own authorization apply to it.
 #[allow(clippy::too_many_arguments)]
 fn version_info_document(
-    repo_key: &str,
+    base: &str,
     namespace: &str,
     name: &str,
     version: &str,
@@ -649,16 +687,13 @@ fn version_info_document(
 
     let mut doc = serde_json::json!({
         "version": version,
-        "href": version_href(repo_key, namespace, name, version),
+        "href": version_href(base, namespace, name, version),
         // Object, not a bare string: the client indexes `['name']` into it.
         "namespace": { "name": namespace },
         "name": name,
         "collection": {
             "name": name,
-            "href": format!(
-                "/ansible/{}/api/v3/collections/{}/{}/",
-                repo_key, namespace, name
-            ),
+            "href": format!("{}/api/v3/collections/{}/{}/", base, namespace, name),
         },
         "download_url": download_url,
         "artifact": {
@@ -701,6 +736,7 @@ async fn fetch_upstream_version_info(
     proxy: &ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
+    base: &str,
     upstream_url: &str,
     namespace: &str,
     name: &str,
@@ -728,16 +764,18 @@ async fn fetch_upstream_version_info(
             .into_response()
     })?;
 
-    rewrite_upstream_version_info(repo_key, namespace, name, version, &doc).map_err(|reason| {
-        tracing::warn!(
-            repository = %repo_key,
-            collection = %format!("{}.{}", namespace, name),
-            version = %version,
-            %reason,
-            "refusing to advertise an upstream collection version"
-        );
-        (StatusCode::BAD_GATEWAY, reason).into_response()
-    })
+    rewrite_upstream_version_info(repo_key, base, namespace, name, version, &doc).map_err(
+        |reason| {
+            tracing::warn!(
+                repository = %repo_key,
+                collection = %format!("{}.{}", namespace, name),
+                version = %version,
+                %reason,
+                "refusing to advertise an upstream collection version"
+            );
+            (StatusCode::BAD_GATEWAY, reason).into_response()
+        },
+    )
 }
 
 /// Fetch a collection's detail document from the upstream Galaxy server and
@@ -754,6 +792,7 @@ async fn fetch_upstream_collection_info(
     proxy: &ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
+    base: &str,
     upstream_url: &str,
     namespace: &str,
     name: &str,
@@ -778,13 +817,13 @@ async fn fetch_upstream_collection_info(
     })?;
 
     Ok(rewrite_upstream_collection_info(
-        repo_key, namespace, name, &doc,
+        base, namespace, name, &doc,
     ))
 }
 
 /// Pure half of [`fetch_upstream_collection_info`].
 fn rewrite_upstream_collection_info(
-    repo_key: &str,
+    base: &str,
     namespace: &str,
     name: &str,
     upstream: &serde_json::Value,
@@ -801,14 +840,11 @@ fn rewrite_upstream_collection_info(
         "name": name,
         "description": upstream.get("description").and_then(|v| v.as_str()).unwrap_or(""),
         "deprecated": upstream.get("deprecated").and_then(|v| v.as_bool()).unwrap_or(false),
-        "href": format!("/ansible/{}/api/v3/collections/{}/{}/", repo_key, namespace, name),
-        "versions_url": format!(
-            "/ansible/{}/api/v3/collections/{}/{}/versions/",
-            repo_key, namespace, name
-        ),
+        "href": format!("{}/api/v3/collections/{}/{}/", base, namespace, name),
+        "versions_url": format!("{}/api/v3/collections/{}/{}/versions/", base, namespace, name),
         "highest_version": {
             "version": highest,
-            "href": version_href(repo_key, namespace, name, &highest),
+            "href": version_href(base, namespace, name, &highest),
         },
     });
     // Read by the client as its response-cache key; forwarded when present and
@@ -845,6 +881,7 @@ fn rewrite_upstream_collection_info(
 ///   outright rather than advertised as unverifiable.
 fn rewrite_upstream_version_info(
     repo_key: &str,
+    base: &str,
     namespace: &str,
     name: &str,
     version: &str,
@@ -898,12 +935,12 @@ fn rewrite_upstream_version_info(
     let requires_ansible = upstream.get("requires_ansible").and_then(|v| v.as_str());
 
     Ok(version_info_document(
-        repo_key,
+        base,
         namespace,
         name,
         version,
         &filename,
-        &format!("/ansible/{}/download/{}", repo_key, filename),
+        &format!("{}/download/{}", base, filename),
         size_bytes,
         sha256,
         dependencies,
@@ -923,6 +960,8 @@ async fn list_collections(
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+    // `{base}/api/v3/collections/`
+    let base = galaxy_base(&uri, 4);
 
     let artifacts = sqlx::query!(
         r#"
@@ -951,16 +990,10 @@ async fn list_collections(
             Some(serde_json::json!({
                 "namespace": namespace,
                 "name": coll_name,
-                "href": format!(
-                    "/ansible/{}/api/v3/collections/{}/{}/",
-                    repo_key, namespace, coll_name
-                ),
+                "href": format!("{}/api/v3/collections/{}/{}/", base, namespace, coll_name),
                 "highest_version": {
                     "version": latest_version,
-                    "href": format!(
-                        "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
-                        repo_key, namespace, coll_name, latest_version
-                    ),
+                    "href": version_href(&base, &namespace, &coll_name, &latest_version),
                 },
             }))
         })
@@ -976,8 +1009,11 @@ async fn list_collections(
 async fn collection_info(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+    // `{base}/api/v3/collections/{ns}/{name}/`
+    let base = galaxy_base(&uri, 6);
 
     // Validate via format handler
     let validate_path = format!("api/v3/collections/{}/{}", namespace, name);
@@ -1022,6 +1058,7 @@ async fn collection_info(
                 proxy,
                 repo.id,
                 &repo_key,
+                &base,
                 upstream_url,
                 &namespace,
                 &name,
@@ -1049,17 +1086,11 @@ async fn collection_info(
         "description": description,
         "highest_version": {
             "version": latest_version,
-            "href": format!(
-                "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
-                repo_key, namespace, name, latest_version
-            ),
+            "href": version_href(&base, &namespace, &name, &latest_version),
         },
-        "versions_url": format!(
-            "/ansible/{}/api/v3/collections/{}/{}/versions/",
-            repo_key, namespace, name
-        ),
+        "versions_url": format!("{}/api/v3/collections/{}/{}/versions/", base, namespace, name),
         "download_url": collection_download_url(
-            &repo_key,
+            &base,
             &artifact.path,
             &namespace,
             &name,
@@ -1080,6 +1111,8 @@ async fn version_list(
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+    // `{base}/api/v3/collections/{ns}/{name}/versions/`
+    let base = galaxy_base(&uri, 7);
 
     let collection_name = format!("{}-{}", namespace, name);
     let artifacts =
@@ -1092,7 +1125,7 @@ async fn version_list(
             let version = a.version.clone().unwrap_or_default();
             serde_json::json!({
                 "version": version,
-                "href": version_href(&repo_key, &namespace, &name, &version),
+                "href": version_href(&base, &namespace, &name, &version),
             })
         })
         .collect();
@@ -1132,9 +1165,14 @@ async fn version_list(
             )
             .await
             {
-                Ok(upstream) => {
-                    merge_upstream_versions(&repo_key, &namespace, &name, upstream, &mut versions)
-                }
+                Ok(upstream) => merge_upstream_versions(
+                    &repo_key,
+                    &base,
+                    &namespace,
+                    &name,
+                    upstream,
+                    &mut versions,
+                ),
                 // Upstream is unreachable or unparseable. With nothing held
                 // locally there is no honest list to serve: an empty `data` is
                 // indistinguishable from "this collection has no versions",
@@ -1173,8 +1211,11 @@ async fn version_list(
 async fn version_info(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name, version)): Path<(String, String, String, String)>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Response> {
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+    // `{base}/api/v3/collections/{ns}/{name}/versions/{version}/`
+    let base = galaxy_base(&uri, 8);
 
     // Validate via format handler
     let validate_path = format!(
@@ -1246,7 +1287,7 @@ async fn version_info(
         };
 
         let json = version_info_document(
-            &repo_key,
+            &base,
             &namespace,
             &name,
             &version,
@@ -1254,7 +1295,7 @@ async fn version_info(
                 &artifact.path,
                 &collection_filename(&namespace, &name, &version),
             ),
-            &collection_download_url(&repo_key, &artifact.path, &namespace, &name, &version),
+            &collection_download_url(&base, &artifact.path, &namespace, &name, &version),
             artifact.size_bytes.unwrap_or(0),
             sha256,
             dependencies,
@@ -1293,6 +1334,7 @@ async fn version_info(
                 proxy,
                 repo.id,
                 &repo_key,
+                &base,
                 upstream_url,
                 &namespace,
                 &name,
@@ -1822,7 +1864,7 @@ mod tests {
     fn test_collection_download_url_native_path_is_byte_identical() {
         assert_eq!(
             collection_download_url(
-                "gx",
+                "/ansible/gx",
                 "community-general-1.2.3.tar.gz",
                 "community",
                 "general",
@@ -1838,11 +1880,23 @@ mod tests {
         // so the suffix download route (with #2587 exact-path fallback) serves
         // it, instead of the canonical filename that would 404.
         assert_eq!(
-            collection_download_url("gx", "blob.tar.gz", "community", "general", "1.2.3"),
+            collection_download_url(
+                "/ansible/gx",
+                "blob.tar.gz",
+                "community",
+                "general",
+                "1.2.3"
+            ),
             "/ansible/gx/download/blob.tar.gz"
         );
         assert_eq!(
-            collection_download_url("gx", "uploads/x/c.tar.gz", "community", "general", "1.2.3"),
+            collection_download_url(
+                "/ansible/gx",
+                "uploads/x/c.tar.gz",
+                "community",
+                "general",
+                "1.2.3"
+            ),
             "/ansible/gx/download/c.tar.gz"
         );
     }
@@ -3036,6 +3090,7 @@ mod tests {
         let mut out: Vec<serde_json::Value> = Vec::new();
         merge_upstream_versions(
             "gx",
+            "/ansible/gx",
             "testns",
             "testcoll",
             vec!["2.0.0".to_string(), "1.5.1".to_string()],
@@ -3076,6 +3131,7 @@ mod tests {
 
         merge_upstream_versions(
             "gx",
+            "/ansible/gx",
             "testns",
             "testcoll",
             vec!["1.5.1".to_string(), "2.0.0".to_string()],
@@ -3115,7 +3171,14 @@ mod tests {
                 "{bad:?} cannot form one path segment and must not be advertised"
             );
             let mut out: Vec<serde_json::Value> = Vec::new();
-            merge_upstream_versions("gx", "testns", "testcoll", vec![bad.to_string()], &mut out);
+            merge_upstream_versions(
+                "gx",
+                "/ansible/gx",
+                "testns",
+                "testcoll",
+                vec![bad.to_string()],
+                &mut out,
+            );
             assert!(
                 out.is_empty(),
                 "the unaddressable version must be omitted, got {out:?}"
@@ -3142,7 +3205,14 @@ mod tests {
                 "{good:?} is a legitimate collection version and must stay advertisable"
             );
             let mut out: Vec<serde_json::Value> = Vec::new();
-            merge_upstream_versions("gx", "testns", "testcoll", vec![good.to_string()], &mut out);
+            merge_upstream_versions(
+                "gx",
+                "/ansible/gx",
+                "testns",
+                "testcoll",
+                vec![good.to_string()],
+                &mut out,
+            );
             assert_eq!(out.len(), 1, "{good:?} must be advertised");
             assert_eq!(out[0]["version"], good);
         }
@@ -3156,7 +3226,7 @@ mod tests {
     #[test]
     fn test_version_info_document_satisfies_the_client_contract_3365() {
         let doc = version_info_document(
-            "gx",
+            "/ansible/gx",
             "testns",
             "testcoll",
             "1.5.1",
@@ -3195,7 +3265,7 @@ mod tests {
     #[test]
     fn test_version_info_document_always_carries_a_dependency_map_3365() {
         let doc = version_info_document(
-            "gx",
+            "/ansible/gx",
             "testns",
             "testcoll",
             "1.0.0",
@@ -3226,8 +3296,15 @@ mod tests {
     fn test_rewrite_upstream_version_info_points_download_at_this_repo_3365() {
         let upstream: serde_json::Value =
             serde_json::from_str(&upstream_version_info_doc()).unwrap();
-        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
-            .expect("a complete upstream document must be accepted");
+        let doc = rewrite_upstream_version_info(
+            "gx",
+            "/ansible/gx",
+            "testns",
+            "testcoll",
+            "1.5.1",
+            &upstream,
+        )
+        .expect("a complete upstream document must be accepted");
 
         assert_eq!(
             doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
@@ -3264,8 +3341,15 @@ mod tests {
         let upstream = serde_json::json!({
             "artifact": { "filename": "../../../../etc/passwd", "sha256": "abc", "size": 1 },
         });
-        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
-            .expect("a document with a usable sha256 must be accepted");
+        let doc = rewrite_upstream_version_info(
+            "gx",
+            "/ansible/gx",
+            "testns",
+            "testcoll",
+            "1.5.1",
+            &upstream,
+        )
+        .expect("a document with a usable sha256 must be accepted");
         assert_eq!(
             doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
             "an unaddressable upstream filename must never be interpolated into \
@@ -3288,8 +3372,15 @@ mod tests {
                 "size": 1,
             },
         });
-        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
-            .expect("a document with a usable sha256 must be accepted");
+        let doc = rewrite_upstream_version_info(
+            "gx",
+            "/ansible/gx",
+            "testns",
+            "testcoll",
+            "1.5.1",
+            &upstream,
+        )
+        .expect("a document with a usable sha256 must be accepted");
         assert_eq!(
             doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
             "an addressable-but-substituted upstream filename must not reach the \
@@ -3333,12 +3424,19 @@ mod tests {
             ),
         ];
         for (label, upstream) in cases {
-            let err = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
-                .expect_err(&format!(
-                    "an upstream document with {label} must be refused, not \
+            let err = rewrite_upstream_version_info(
+                "gx",
+                "/ansible/gx",
+                "testns",
+                "testcoll",
+                "1.5.1",
+                &upstream,
+            )
+            .expect_err(&format!(
+                "an upstream document with {label} must be refused, not \
                      advertised with an empty sha256 the client reads as \
                      'skip verification'"
-                ));
+            ));
             assert!(
                 err.contains("sha256"),
                 "the refusal must name the missing digest ({label}): {err}"
@@ -3910,7 +4008,7 @@ mod tests {
         let upstream = serde_json::json!({
             "highest_version": { "version": "../../../../etc/passwd" },
         });
-        let doc = rewrite_upstream_collection_info("gx", "testns", "testcoll", &upstream);
+        let doc = rewrite_upstream_collection_info("/ansible/gx", "testns", "testcoll", &upstream);
         assert_eq!(
             doc["highest_version"]["version"], "",
             "an unaddressable version must not be advertised: {doc}"
@@ -4064,7 +4162,96 @@ mod tests {
         let (s3, p3) = get_json(nested_app_with_auth(&f), format!("{ansible}?limit=2")).await;
         let (s4, all) = get_json(generic_download_app(f.state.clone()), generic.clone()).await;
 
+        // Every link a client follows out of the documents stays under the
+        // mount that served them -- not only the paging links (#3873).
+        let gbase = format!("/api/v1/repositories/{}/download", f.repo_key);
+        let abase = format!("/ansible/{}", f.repo_key);
+        let coll = "api/v3/collections/testns/testcoll/";
+        let (s5, g_coll) = get_json(
+            generic_download_app(f.state.clone()),
+            format!("{gbase}/{coll}"),
+        )
+        .await;
+        let (s6, g_ver) = get_json(
+            generic_download_app(f.state.clone()),
+            format!("{gbase}/{coll}versions/1.0.0/"),
+        )
+        .await;
+        let (s7, g_root) = get_json(
+            generic_download_app(f.state.clone()),
+            format!("{gbase}/api/v3/"),
+        )
+        .await;
+        let (s8, a_ver) = get_json(
+            nested_app_with_auth(&f),
+            format!("{abase}/{coll}versions/1.0.0/"),
+        )
+        .await;
+        // The advertised tarball URL on the generic mount actually serves it.
+        let tarball = g_ver["download_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (s9, bytes) = tdh::send(
+            generic_download_app(f.state.clone()),
+            tdh::get(tarball.clone()),
+        )
+        .await;
+
         f.teardown().await;
+
+        assert_eq!(s5, StatusCode::OK, "{g_coll}");
+        assert_eq!(g_coll["versions_url"], format!("{gbase}/{coll}versions/"));
+        assert!(
+            g_coll["download_url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with(&format!("{gbase}/download/testns-testcoll-"))),
+            "{g_coll}"
+        );
+        assert!(
+            g_coll["highest_version"]["href"]
+                .as_str()
+                .is_some_and(|u| u.starts_with(&format!("{gbase}/{coll}versions/"))),
+            "{g_coll}"
+        );
+        assert_eq!(s6, StatusCode::OK, "{g_ver}");
+        assert_eq!(g_ver["href"], format!("{gbase}/{coll}versions/1.0.0/"));
+        assert_eq!(g_ver["collection"]["href"], format!("{gbase}/{coll}"));
+        assert_eq!(
+            tarball,
+            format!("{gbase}/download/testns-testcoll-1.0.0.tar.gz")
+        );
+        assert_eq!(s9, StatusCode::OK, "GET {tarball}");
+        assert_eq!(&bytes[..], b"collection-bytes");
+        assert_eq!(s7, StatusCode::OK, "{g_root}");
+        assert_eq!(
+            g_root["collections"],
+            format!("{gbase}/api/v3/collections/")
+        );
+        assert_eq!(s8, StatusCode::OK, "{a_ver}");
+        assert_eq!(a_ver["href"], format!("{abase}/{coll}versions/1.0.0/"));
+        assert_eq!(
+            a_ver["download_url"],
+            format!("{abase}/download/testns-testcoll-1.0.0.tar.gz")
+        );
+        for v in p1["data"].as_array().unwrap() {
+            assert!(
+                v["href"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{gbase}/{coll}versions/")),
+                "{v}"
+            );
+        }
+        for v in p3["data"].as_array().unwrap() {
+            assert!(
+                v["href"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{abase}/{coll}versions/")),
+                "{v}"
+            );
+        }
 
         assert_eq!(s1, StatusCode::OK, "{p1}");
         assert_eq!(p1["meta"]["count"], 3);
@@ -4130,6 +4317,11 @@ mod tests {
             )))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/1.5.1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_version_info_doc()))
+            .mount(&server)
+            .await;
         let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
 
         let generic = format!(
@@ -4139,6 +4331,11 @@ mod tests {
         let (status, doc) = get_json(
             generic_download_app_for(&f, state.clone()).await,
             format!("{generic}?limit=1"),
+        )
+        .await;
+        let (info_status, info) = get_json(
+            generic_download_app(state.clone()),
+            format!("{generic}1.5.1/"),
         )
         .await;
         let (disc_status, disc) = get_json(
@@ -4156,12 +4353,19 @@ mod tests {
         assert_eq!(doc["data"][0]["version"], "2.0.0");
         assert_eq!(
             doc["data"][0]["href"],
+            format!("{generic}2.0.0/"),
+            "hrefs are this repository's, under the URL the client configured"
+        );
+        assert_eq!(info_status, StatusCode::OK, "{info}");
+        assert_eq!(
+            info["download_url"],
             format!(
-                "/ansible/{}/api/v3/collections/testns/testcoll/versions/2.0.0/",
+                "/api/v1/repositories/{}/download/download/testns-testcoll-1.5.1.tar.gz",
                 f.repo_key
             ),
-            "hrefs are this repository's, not the upstream's"
+            "the tarball must be fetched back through the URL the client configured"
         );
+        assert_eq!(info["href"], format!("{generic}1.5.1/"));
         assert_eq!(disc_status, StatusCode::OK);
         assert_eq!(disc["available_versions"]["v3"], "v3/");
     }
