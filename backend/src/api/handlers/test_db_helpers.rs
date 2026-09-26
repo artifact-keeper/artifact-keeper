@@ -1188,16 +1188,23 @@ pub async fn send_with_headers(
 /// tests use this for an ordinary read/write repository member; owner-specific
 /// tests should grant the `repository-owner` role explicitly.
 pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    grant_repo_role(pool, repo_id, user_id, "developer").await;
+}
+
+/// Grant `user_id` the built-in role `role` (e.g. `reader`, `developer`,
+/// `repository-owner`) scoped to `repo_id`. Cleaned up by [`cleanup`].
+pub async fn grant_repo_role(pool: &PgPool, repo_id: Uuid, user_id: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name = $3 \
          ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
     )
     .bind(user_id)
     .bind(repo_id)
+    .bind(role)
     .execute(pool)
     .await
-    .expect("grant developer role");
+    .unwrap_or_else(|e| panic!("grant {role} role: {e}"));
 }
 
 /// Like [`make_auth`] but for a GLOBAL admin (`is_admin = true`). Used by

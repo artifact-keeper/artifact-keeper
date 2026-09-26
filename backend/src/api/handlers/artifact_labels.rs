@@ -10,6 +10,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
+use crate::api::handlers::repositories::require_repo_action;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -98,12 +99,36 @@ fn authorize_label_read(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 /// the `write:artifacts` scope (bare `write` satisfies via the parent rule,
 /// #2989), mirroring the sibling artifact-mutation handlers.
 ///
-/// Repository visibility/scope is enforced separately by
-/// [`check_artifact_visibility`] (which needs DB access) at the call site.
+/// This is the token half only. The repository half, which needs DB access,
+/// is [`authorize_label_mutation`] at the call site.
 fn authorize_label_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     let auth = require_auth(auth)?;
     auth.require_scope("write:artifacts")?;
     Ok(auth)
+}
+
+/// Repository half of a label mutation (#4193): the existence-hiding
+/// visibility gate, then the repository `write` action through the canonical
+/// deny-by-default [`require_repo_action`] choke-point.
+///
+/// [`check_artifact_visibility`] answers READ visibility whatever `action` it
+/// is given: it lets any signed-in caller through on a public repository and
+/// asks only for `read` on a private one. Label changes re-evaluate sync
+/// policies, which drive replication, so visibility alone must not authorize
+/// them (the GHSA-ww52-pmcg-f53c shape the SBOM mutations were fixed for).
+///
+/// Set, add and remove all need `write`, not `delete`: the token-scope gate
+/// already classes every label operation as `write:artifacts` (#2989), and a
+/// `PUT` can replace the whole label set with `write`, so asking `delete` of a
+/// `DELETE` would be a boundary the `PUT` walks around.
+async fn authorize_label_mutation(
+    state: &SharedState,
+    auth: &AuthExtension,
+    artifact_id: Uuid,
+) -> Result<()> {
+    check_artifact_visibility(&Some(auth.clone()), artifact_id, &state.db, "write").await?;
+    let repository_id = live_artifact_repository_id(&state.db, artifact_id).await?;
+    require_repo_action(auth, repository_id, "write", &state.permission_service).await
 }
 
 fn label_to_response(label: ArtifactLabel) -> ArtifactLabelResponse {
@@ -162,7 +187,7 @@ async fn list_labels(
     let auth = authorize_label_read(auth)?;
 
     check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
-    verify_artifact_exists(&state.db, id).await?;
+    live_artifact_repository_id(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
     let labels = label_service.get_labels(id).await?;
@@ -194,9 +219,7 @@ async fn set_labels(
     Json(payload): Json<SetArtifactLabelsRequest>,
 ) -> Result<Json<ArtifactLabelsListResponse>> {
     let auth = authorize_label_write(auth)?;
-
-    check_artifact_visibility(&Some(auth), id, &state.db, "write").await?;
-    verify_artifact_exists(&state.db, id).await?;
+    authorize_label_mutation(&state, &auth, id).await?;
 
     let entries: Vec<LabelEntry> = payload
         .labels
@@ -240,9 +263,7 @@ async fn add_label(
     Json(payload): Json<AddArtifactLabelRequest>,
 ) -> Result<Json<ArtifactLabelResponse>> {
     let auth = authorize_label_write(auth)?;
-
-    check_artifact_visibility(&Some(auth), id, &state.db, "write").await?;
-    verify_artifact_exists(&state.db, id).await?;
+    authorize_label_mutation(&state, &auth, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
     let label = label_service
@@ -277,9 +298,7 @@ async fn delete_label(
     Path((id, label_key)): Path<(Uuid, String)>,
 ) -> Result<axum::http::StatusCode> {
     let auth = authorize_label_write(auth)?;
-
-    check_artifact_visibility(&Some(auth), id, &state.db, "delete").await?;
-    verify_artifact_exists(&state.db, id).await?;
+    authorize_label_mutation(&state, &auth, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
     label_service.remove_label(id, &label_key).await?;
@@ -289,24 +308,18 @@ async fn delete_label(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Verify an artifact exists (not deleted).
-async fn verify_artifact_exists(db: &sqlx::PgPool, artifact_id: Uuid) -> Result<()> {
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
+/// Resolve the repository of a live (not deleted) artifact, answering 404 when
+/// the artifact does not exist or has been deleted.
+async fn live_artifact_repository_id(db: &sqlx::PgPool, artifact_id: Uuid) -> Result<Uuid> {
+    let repository_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts WHERE id = $1 AND is_deleted = false",
     )
     .bind(artifact_id)
-    .fetch_one(db)
+    .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let exists = exists.unwrap_or(false);
-
-    if !exists {
-        return Err(AppError::NotFound(format!(
-            "Artifact {artifact_id} not found"
-        )));
-    }
-    Ok(())
+    repository_id.ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -775,5 +788,273 @@ mod tests {
         assert!(json.get("value").is_some());
         assert!(json.get("label_key").is_none());
         assert!(json.get("label_value").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4193: a label mutation needs the repository `write` action, not visibility.
+//
+// Router-level and DB-backed, driven through the real `artifact_labels_router`
+// so the whole handler runs, token half and repository half. No-ops when no
+// database is configured; `AK_TESTS_REQUIRE_DB=1` turns an unreachable
+// database into a hard failure rather than a silent skip.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod label_write_authz_4193 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+
+    /// What `require_repo_action` answers a caller without the action: 403,
+    /// asserted with its body so it cannot be mistaken for the token-scope
+    /// ceiling's 403 or the private-repository arm's existence-hiding 404.
+    fn permission_denied() -> (StatusCode, String) {
+        (
+            StatusCode::FORBIDDEN,
+            "{\"code\":\"FORBIDDEN\",\"message\":\"You do not have permission to perform \
+             this action on this repository\"}"
+                .to_string(),
+        )
+    }
+
+    /// Seed an artifact in the fixture repository carrying the one label
+    /// `stage=qa`, so a refused set, add or delete each has something to change.
+    async fn seed_labelled_artifact(fx: &tdh::Fixture) -> Uuid {
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "pkg/file.txt",
+            "pkg/file.txt",
+            "file.txt",
+            "1.0.0",
+            "text/plain",
+            Bytes::from_static(b"label-authz-4193"),
+            fx.user_id,
+        )
+        .await;
+        ArtifactLabelService::new(fx.pool.clone())
+            .add_label(artifact_id, "stage", "qa")
+            .await
+            .expect("seed label");
+        artifact_id
+    }
+
+    /// The artifact's labels as `(key, value)` pairs, ordered by key.
+    async fn labels_of(pool: &sqlx::PgPool, artifact_id: Uuid) -> Vec<(String, String)> {
+        ArtifactLabelService::new(pool.clone())
+            .get_labels(artifact_id)
+            .await
+            .expect("read labels")
+            .into_iter()
+            .map(|l| (l.label_key, l.label_value))
+            .collect()
+    }
+
+    fn pairs(labels: &[(&str, &str)]) -> Vec<(String, String)> {
+        labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Send one request through the label router as `auth`.
+    async fn send_as(
+        fx: &tdh::Fixture,
+        auth: &AuthExtension,
+        req: Request<Body>,
+    ) -> (StatusCode, String) {
+        let app = tdh::router_with_auth(artifact_labels_router(), fx.state.clone(), auth.clone());
+        let (status, body) = tdh::send(app, req).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Set, add and delete as `auth`, in that order: the PUT rewrites `stage` to
+    /// `prod`, the POST adds `k2=v2`, the DELETE removes `stage`. Returns each
+    /// answer.
+    async fn mutate_labels(
+        fx: &tdh::Fixture,
+        auth: &AuthExtension,
+        artifact_id: Uuid,
+    ) -> Vec<(StatusCode, String)> {
+        let requests = [
+            tdh::put_json(
+                format!("/{artifact_id}/labels"),
+                Bytes::from_static(br#"{"labels":[{"key":"stage","value":"prod"}]}"#),
+            ),
+            tdh::post(
+                format!("/{artifact_id}/labels/k2"),
+                "application/json",
+                Bytes::from_static(br#"{"value":"v2"}"#),
+            ),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{artifact_id}/labels/stage"))
+                .body(Body::empty())
+                .expect("build DELETE"),
+        ];
+        let mut answers = Vec::with_capacity(requests.len());
+        for req in requests {
+            answers.push(send_as(fx, auth, req).await);
+        }
+        answers
+    }
+
+    /// Verified-bug regression for #4193 (public repository).
+    ///
+    /// The three label mutations checked the `write:artifacts` token scope,
+    /// which an interactive session always passes, and
+    /// `check_artifact_visibility`, which lets every signed-in caller through
+    /// on a public repository. A user with no grant on the repository could
+    /// therefore rewrite, add and delete its artifacts' labels, and every
+    /// change re-evaluates the sync policies that drive replication.
+    #[tokio::test]
+    async fn test_4193_public_repo_label_writes_need_a_write_grant() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let artifact_id = seed_labelled_artifact(&fx).await;
+        let (outsider, outsider_name) = tdh::create_user(&fx.pool).await;
+        let outsider_auth = tdh::make_auth(outsider, &outsider_name);
+
+        let outsider_answers = mutate_labels(&fx, &outsider_auth, artifact_id).await;
+        let after_outsider = labels_of(&fx.pool, artifact_id).await;
+        let outsider_list = send_as(
+            &fx,
+            &outsider_auth,
+            tdh::get(format!("/{artifact_id}/labels")),
+        )
+        .await;
+        let outsider_missing = send_as(
+            &fx,
+            &outsider_auth,
+            tdh::put_json(
+                format!("/{}/labels", Uuid::new_v4()),
+                Bytes::from_static(br#"{"labels":[]}"#),
+            ),
+        )
+        .await;
+        // The fixture user holds `developer` (read + write) on the repository.
+        let member_auth = tdh::make_auth(fx.user_id, &fx.username);
+        let member_answers = mutate_labels(&fx, &member_auth, artifact_id).await;
+        let after_member = labels_of(&fx.pool, artifact_id).await;
+
+        fx.teardown().await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+
+        assert_eq!(
+            outsider_answers,
+            vec![permission_denied(); 3],
+            "#4193: set, add and delete of a label on a PUBLIC repository must be \
+             refused to a signed-in user with no grant on it: public visibility is \
+             a read baseline, never a write grant"
+        );
+        assert_eq!(
+            after_outsider,
+            pairs(&[("stage", "qa")]),
+            "a refused label mutation must leave the labels untouched"
+        );
+        assert_eq!(
+            outsider_list.0,
+            StatusCode::OK,
+            "unchanged: the public read baseline still lists the labels: {outsider_list:?}"
+        );
+        assert_eq!(
+            outsider_missing.0,
+            StatusCode::NOT_FOUND,
+            "unchanged: a missing artifact is still a 404, not a permission refusal: \
+             {outsider_missing:?}"
+        );
+        let member_statuses: Vec<StatusCode> = member_answers.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            member_statuses,
+            [StatusCode::OK, StatusCode::OK, StatusCode::NO_CONTENT],
+            "POSITIVE CONTROL: a member holding `write` sets, adds and deletes, so \
+             the refusals above are the missing grant and not a broken fixture: \
+             {member_answers:?}"
+        );
+        assert_eq!(
+            after_member,
+            pairs(&[("k2", "v2")]),
+            "POSITIVE CONTROL: the member's add landed and its delete removed `stage`"
+        );
+    }
+
+    /// The same gap on a PRIVATE repository: `check_artifact_visibility` asks a
+    /// member for the `read` action whatever the mutation, so a read-only
+    /// `reader` could rewrite labels as well.
+    #[tokio::test]
+    async fn test_4193_read_only_member_cannot_write_labels() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_labelled_artifact(&fx).await;
+        let (reader, reader_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_role(&fx.pool, fx.repo_id, reader, "reader").await;
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+
+        let answers = mutate_labels(&fx, &reader_auth, artifact_id).await;
+        let after = labels_of(&fx.pool, artifact_id).await;
+        let list = send_as(
+            &fx,
+            &reader_auth,
+            tdh::get(format!("/{artifact_id}/labels")),
+        )
+        .await;
+
+        fx.teardown().await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+
+        assert_eq!(
+            list.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the reader can see the artifact, so the refusals \
+             below are about the action and not the existence-hiding 404: {list:?}"
+        );
+        assert_eq!(
+            answers,
+            vec![permission_denied(); 3],
+            "#4193: a read-only member must not set, add or delete labels"
+        );
+        assert_eq!(
+            after,
+            pairs(&[("stage", "qa")]),
+            "a refused label mutation must leave the labels untouched"
+        );
+    }
+
+    /// Pin the #4193 gate structurally: the DB-backed tests above skip without
+    /// Postgres, so assert in source that every label mutation routes through
+    /// the repository half, and that the repository half asks the per-action
+    /// choke-point for `write`.
+    #[test]
+    fn label_mutation_handlers_require_repo_action() {
+        let source = include_str!("artifact_labels.rs");
+        let body_of = |item: &str| {
+            let start = source
+                .find(item)
+                .unwrap_or_else(|| panic!("`{item}` not found"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        };
+        for handler in [
+            "async fn set_labels(",
+            "async fn add_label(",
+            "async fn delete_label(",
+        ] {
+            assert!(
+                body_of(handler).contains("authorize_label_mutation(&state, &auth, id)"),
+                "handler `{handler}` must route through `authorize_label_mutation` (#4193)"
+            );
+        }
+        assert!(
+            body_of("async fn authorize_label_mutation(").contains(
+                r#"require_repo_action(auth, repository_id, "write", &state.permission_service)"#
+            ),
+            "`authorize_label_mutation` must require the repository `write` action (#4193)"
+        );
     }
 }

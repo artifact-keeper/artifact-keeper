@@ -26,11 +26,11 @@ use crate::error::{AppError, Result};
 /// # The `action` argument (#3704)
 ///
 /// `action` is the `permissions` verb the calling handler performs — `read`
-/// for the by-id reads and their sub-resource siblings, `write` / `delete` for
-/// the label and SBOM mutations that share this gate. It is threaded (rather
-/// than fixed, the way `require_visible` fixes `read`) precisely because the
-/// call sites genuinely differ, and only the `read` ones take the public
-/// short-circuit below.
+/// for the by-id reads and their sub-resource siblings, `write` for the label
+/// and SBOM mutations that share this gate. It is threaded (rather than fixed,
+/// the way `require_visible` fixes `read`) precisely because the call sites
+/// genuinely differ, and only the `read` ones take the public short-circuit
+/// below.
 ///
 /// On a `read`, a **public** repository satisfies the token repository-scope
 /// ceiling, via the same [`public_read_satisfies_acl`] baseline
@@ -42,12 +42,19 @@ use crate::error::{AppError, Result};
 ///
 /// Writes and deletes are unaffected: `public_read_satisfies_acl` is read-only
 /// by construction, so a token scoped to repo A still cannot set or remove a
-/// label on an artifact in public repo B — which matters here because
-/// `authorize_label_write` checks only the token's *action* scope, leaving this
-/// gate as the sole repository ceiling on that path. Private repositories never
-/// take the shortcut.
+/// label on an artifact in public repo B. Private repositories never take the
+/// shortcut.
+///
+/// # This gate never authorizes a mutation (#4193)
+///
+/// Past the token ceiling it answers READ visibility only, whatever `action`
+/// says: a public repository admits every signed-in caller, and a private one
+/// asks for the `read` action. A mutating caller must therefore also pass
+/// [`require_repo_action`] for its own action, as the label (#4193) and SBOM
+/// (GHSA-ww52-pmcg-f53c) mutations do.
 ///
 /// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
+/// [`require_repo_action`]: crate::api::handlers::repositories::require_repo_action
 pub(crate) async fn check_artifact_visibility(
     auth: &Option<AuthExtension>,
     artifact_id: Uuid,
