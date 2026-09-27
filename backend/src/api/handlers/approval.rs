@@ -2634,15 +2634,7 @@ mod tests {
                 Json(req()),
             )
             .await;
-            assert!(
-                matches!(denied, Err(AppError::NotFound(_))),
-                "no-grant caller on an internal source must 404: {denied:?}"
-            );
-            assert_eq!(
-                pending(&pool, src).await,
-                0,
-                "a refused request wrote a row"
-            );
+            let after_denied = pending(&pool, src).await;
 
             let filed = request_approval(
                 State(state),
@@ -2650,16 +2642,80 @@ mod tests {
                 Json(req()),
             )
             .await;
-            match filed {
-                Ok((status, _)) => assert_eq!(status, axum::http::StatusCode::CREATED),
-                Err(e) => panic!("reader member of the internal source must file: {e:?}"),
-            }
-            assert_eq!(pending(&pool, src).await, 1);
+            let after_filed = pending(&pool, src).await;
 
+            // Clean up before asserting so a failure does not leak rows.
             cleanup(&pool, &[src, tgt], outsider).await;
             cleanup_user(&pool, reader).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(
+                matches!(denied, Err(AppError::NotFound(_))),
+                "no-grant caller on an internal source must 404: {denied:?}"
+            );
+            assert_eq!(after_denied, 0, "a refused request wrote a row");
+            match filed {
+                Ok((status, _)) => assert_eq!(status, axum::http::StatusCode::CREATED),
+                Err(e) => panic!("reader member of the internal source must file: {e:?}"),
+            }
+            assert_eq!(after_filed, 1);
+        }
+
+        /// #3812 (N2): a PUBLIC source keeps its long-standing behaviour -- any
+        /// signed-in caller that passes the visibility gate may file a request,
+        /// with no grant. Pins the `allows_anonymous_read` early return in
+        /// `require_source_grant_for_request`.
+        #[tokio::test]
+        async fn test_request_approval_public_source_needs_no_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr3812p-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr3812p-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s3812p", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t3812p", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1")
+                .bind(src)
+                .execute(&pool)
+                .await
+                .expect("make source public");
+            let outsider = make_requester(&pool, "3812po").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg3812p").await;
+
+            let filed = request_approval(
+                State(state),
+                Extension(tdh::make_auth(outsider, "po3812")),
+                Json(ApprovalRequest {
+                    source_repository: src_key.clone(),
+                    target_repository: tgt_key.clone(),
+                    artifact_id: artifact,
+                    skip_policy_check: false,
+                    notes: Some("pr3812p".to_string()),
+                }),
+            )
+            .await;
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM promotion_approvals WHERE source_repo_id = $1",
+            )
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("count approvals");
+
+            cleanup(&pool, &[src, tgt], outsider).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(
+                matches!(filed, Ok((status, _)) if status == axum::http::StatusCode::CREATED),
+                "public source, no grant: the request must be filed: {filed:?}"
+            );
+            assert_eq!(n, 1);
         }
 
         /// #2443: the unfiltered pending-approvals aggregate is admin-only; a
