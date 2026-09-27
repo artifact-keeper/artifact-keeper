@@ -2338,9 +2338,13 @@ fn generate_primary_xml_with(
             "    <description>{}</description>\n",
             xml_escape(&description)
         ));
-        if let Some(p) = info.and_then(|i| i.packager.as_deref()) {
-            xml.push_str(&format!("    <packager>{}</packager>\n", xml_escape(p)));
-        }
+        // createrepo_c writes <packager>, <url>, <rpm:vendor>, <rpm:group>
+        // and <rpm:buildhost> even when the header has no value (empty).
+        let packager = info.and_then(|i| i.packager.as_deref()).unwrap_or("");
+        xml.push_str(&format!(
+            "    <packager>{}</packager>\n",
+            xml_escape(packager)
+        ));
         xml.push_str(&format!("    <url>{}</url>\n", xml_escape(&url)));
         xml.push_str(&format!(
             "    <time file=\"{}\" build=\"{}\"/>\n",
@@ -2368,24 +2372,20 @@ fn generate_primary_xml_with(
             "      <rpm:license>{}</rpm:license>\n",
             xml_escape(&license)
         ));
-        if let Some(v) = info.and_then(|i| i.vendor.as_deref()) {
-            xml.push_str(&format!(
-                "      <rpm:vendor>{}</rpm:vendor>\n",
-                xml_escape(v)
-            ));
-        }
-        if !group.is_empty() {
-            xml.push_str(&format!(
-                "      <rpm:group>{}</rpm:group>\n",
-                xml_escape(&group)
-            ));
-        }
-        if let Some(v) = info.and_then(|i| i.buildhost.as_deref()) {
-            xml.push_str(&format!(
-                "      <rpm:buildhost>{}</rpm:buildhost>\n",
-                xml_escape(v)
-            ));
-        }
+        let vendor = info.and_then(|i| i.vendor.as_deref()).unwrap_or("");
+        xml.push_str(&format!(
+            "      <rpm:vendor>{}</rpm:vendor>\n",
+            xml_escape(vendor)
+        ));
+        xml.push_str(&format!(
+            "      <rpm:group>{}</rpm:group>\n",
+            xml_escape(&group)
+        ));
+        let buildhost = info.and_then(|i| i.buildhost.as_deref()).unwrap_or("");
+        xml.push_str(&format!(
+            "      <rpm:buildhost>{}</rpm:buildhost>\n",
+            xml_escape(buildhost)
+        ));
         xml.push_str(&format!(
             "      <rpm:sourcerpm>{}</rpm:sourcerpm>\n",
             xml_escape(&source_rpm)
