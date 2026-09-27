@@ -1,4 +1,4 @@
--- Migration 240: an instance administrator's age-gate decisions can only be
+-- Migration 244: an instance administrator's age-gate decisions can only be
 -- relaxed by an instance administrator (#4238).
 --
 -- Since #4238 a repository's own admins can operate its gate, not only an
