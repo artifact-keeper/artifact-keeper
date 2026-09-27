@@ -43,7 +43,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
-use crate::formats::pypi::{PkgInfo, PypiHandler};
+use crate::formats::pypi::{is_wheel_core_metadata_entry, PkgInfo, PypiHandler};
 use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
@@ -4301,26 +4301,6 @@ async fn serve_metadata(
 /// entry. The ceiling stays finite so a crafted archive cannot make the walk
 /// unbounded.
 const MAX_WHEEL_METADATA_LOOKUP_ENTRIES: u64 = 1_000_000;
-
-/// Whether a wheel member is the distribution's own core metadata:
-/// `{name}-{version}.dist-info/METADATA` at the archive ROOT (#3886).
-///
-/// The previous `contains(".dist-info/") && ends_with("METADATA")` predicate
-/// also matched vendored copies nested anywhere in the tree
-/// (`pkg/_vendor/foo-1.0.dist-info/METADATA`) and look-alikes such as
-/// `.dist-info/licenses/NOT_METADATA`, whichever came first in the archive.
-/// The `.dist-info` suffix is compared case-insensitively so a wheel built on
-/// a case-folding filesystem still resolves.
-fn is_wheel_core_metadata_entry(name: &str) -> bool {
-    let Some((dir, file)) = name.split_once('/') else {
-        return false;
-    };
-    file == "METADATA"
-        && dir.len() > ".dist-info".len()
-        && dir
-            .get(dir.len() - ".dist-info".len()..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dist-info"))
-}
 
 fn extract_metadata_from_wheel(content: &[u8]) -> Option<String> {
     // Bound the zip decompression (#2556): a crafted wheel served via PEP 658

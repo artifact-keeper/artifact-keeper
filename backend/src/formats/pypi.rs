@@ -32,6 +32,30 @@ pub const SDIST_DECOMPRESSION_BUDGET_MSG: &str =
 /// PyPI format handler
 pub struct PypiHandler;
 
+/// Whether a wheel member is the distribution's own core metadata:
+/// `{name}-{version}.dist-info/METADATA` at the archive ROOT (#3886).
+///
+/// The previous `contains(".dist-info/") && ends_with("METADATA")` predicate
+/// also matched vendored copies nested anywhere in the tree
+/// (`pkg/_vendor/foo-1.0.dist-info/METADATA`) and look-alikes such as
+/// `.dist-info/licenses/NOT_METADATA`, whichever came first in the archive.
+/// The `.dist-info` suffix is compared case-insensitively so a wheel built on
+/// a case-folding filesystem still resolves.
+///
+/// Shared by upload validation ([`PypiHandler::extract_wheel_metadata_reader`])
+/// and the PEP 658 `.metadata` sidecar, so the METADATA the name/version
+/// binding checks at publish is the one pip is later served.
+pub fn is_wheel_core_metadata_entry(name: &str) -> bool {
+    let Some((dir, file)) = name.split_once('/') else {
+        return false;
+    };
+    file == "METADATA"
+        && dir.len() > ".dist-info".len()
+        && dir
+            .get(dir.len() - ".dist-info".len()..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dist-info"))
+}
+
 impl PypiHandler {
     pub fn new() -> Self {
         Self
@@ -402,8 +426,10 @@ impl PypiHandler {
 
             let name = file.name().to_string();
 
-            // Look for METADATA file in .dist-info directory
-            if name.contains(".dist-info/") && name.ends_with("METADATA") {
+            // The ROOT `{name}-{version}.dist-info/METADATA` only (#3886): the
+            // same predicate the `.metadata` sidecar serves by, so a vendored
+            // decoy earlier in the archive cannot be what upload validates.
+            if is_wheel_core_metadata_entry(&name) {
                 let mut content = String::new();
                 file.take(MAX_PKG_INFO_BYTES)
                     .read_to_string(&mut content)
@@ -1095,6 +1121,33 @@ pub fn generate_simple_package_index(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// #3886 review: upload validation reads the SAME METADATA the PEP 658
+    /// sidecar serves — the root dist-info — not a vendored decoy that sits
+    /// earlier in the archive. Before, the first `contains(".dist-info/")`
+    /// match won, so the name/version binding checked the decoy.
+    #[test]
+    fn extract_wheel_metadata_ignores_vendored_decoy_3886() {
+        use std::io::Write;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("demo/_vendor/decoy-9.9.dist-info/METADATA", options)
+            .unwrap();
+        zip.write_all(b"Metadata-Version: 2.1\nName: decoy\nVersion: 9.9\n")
+            .unwrap();
+        zip.start_file("demo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        zip.write_all(b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n")
+            .unwrap();
+        zip.finish().unwrap();
+
+        let info = PypiHandler::extract_wheel_metadata(&cursor.into_inner()).unwrap();
+        assert_eq!(info.name, "demo");
+        assert_eq!(info.version, "1.0");
+    }
 
     // ========================================================================
     // render_simple_root_html tests (B8): the PEP 503 root index must emit
