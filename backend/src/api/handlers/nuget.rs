@@ -1286,7 +1286,7 @@ async fn local_autocomplete_data(
     .fetch_one(db)
     .await
     .map_err(crate::api::handlers::db_err)?;
-    let authored = authored_package_ids(db, repo_ids, &ids).await;
+    let authored = catalog_display_ids(db, repo_ids, &ids).await;
     let ids = ids
         .iter()
         .map(|id| authored_or_stored(&authored, id))
@@ -2202,47 +2202,44 @@ struct SearchPackageRow {
     description: Option<String>,
 }
 
-/// The `.nuspec` spelling of a NuGet id, read from its push metadata (#3835).
+/// The display casing of each of `names` across `repo_ids`, keyed by
+/// lowercased id, read from the package catalog (#3835).
 ///
 /// `artifacts.name` holds the lowercased id every lookup compares against
-/// (NuGet ids are case-insensitive), while the id exactly as authored is kept
-/// in `artifact_metadata.metadata->>'id'`. V3 search / registration and the V2
-/// feed report the authored casing, as nuget.org does; only URLs are
-/// lowercased. A metadata id that is not the same id as `name` is ignored.
-fn authored_package_id(metadata: Option<&serde_json::Value>, name: &str) -> String {
-    metadata
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
-        .filter(|id| id.to_lowercase() == name.to_lowercase())
-        .unwrap_or(name)
-        .to_string()
-}
-
-/// The authored casing of each of `names` (compared lowercased) across
-/// `repo_ids`, keyed by lowercased id (#3835). The earliest push wins, the same
-/// rule the catalog registration follows (#3976), so a later push that spells
-/// the id differently does not change how it is reported. Best-effort: an id
-/// with no push metadata, or a failed query, is simply absent and the caller
-/// falls back to the stored name.
-async fn authored_package_ids(
+/// (NuGet ids are case-insensitive); the id as authored lives in the one
+/// `packages` row per package, which a push names once, with the spelling the
+/// first push declared, and reuses thereafter (#3976 / #3978). Reading the
+/// display id from that row, rather than from per-version push metadata, keeps
+/// it stable when versions are deleted or re-pushed and makes V3 search,
+/// registration, autocomplete and the V2 feed report the same id.
+///
+/// Deterministic when several rows qualify (a virtual repository's members,
+/// or the lowercased twin a pre-#3978 push wrote beside the authored row): a
+/// row whose name carries casing beats an all-lowercase one, then the oldest
+/// row, then the lowest id. On a virtual repository the rows come only from
+/// the members `repo_ids` already narrowed to the caller (#3323), so the
+/// casing can differ between callers who can see different members.
+///
+/// Best-effort: an id with no catalog row, or a failed query, is absent and
+/// the caller reports the stored (lowercased) name.
+async fn catalog_display_ids(
     db: &PgPool,
     repo_ids: &[uuid::Uuid],
     names: &[String],
 ) -> std::collections::HashMap<String, String> {
-    if names.is_empty() {
+    let mut lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    lowered.sort_unstable();
+    lowered.dedup();
+    if lowered.is_empty() || repo_ids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
     let rows: Vec<(String, String)> = sqlx::query_as(
         r#"
-        SELECT DISTINCT ON (LOWER(a.name)) LOWER(a.name), am.metadata->>'id'
-          FROM artifacts a
-          JOIN artifact_metadata am ON am.artifact_id = a.id
-         WHERE a.repository_id = ANY($1::uuid[])
-           AND a.is_deleted = false
-           AND LOWER(a.name) = ANY($2::text[])
-           AND LOWER(am.metadata->>'id') = LOWER(a.name)
-         ORDER BY LOWER(a.name), a.created_at ASC
+        SELECT DISTINCT ON (LOWER(p.name)) LOWER(p.name), p.name
+          FROM packages p
+         WHERE p.repository_id = ANY($1::uuid[])
+           AND LOWER(p.name) = ANY($2::text[])
+         ORDER BY LOWER(p.name), (p.name = LOWER(p.name)), p.created_at, p.id
         "#,
     )
     .bind(repo_ids)
@@ -2250,7 +2247,7 @@ async fn authored_package_ids(
     .fetch_all(db)
     .await
     .unwrap_or_else(|e| {
-        warn!(error = %e, "NuGet authored-id lookup failed; reporting stored ids");
+        warn!(error = %e, "NuGet catalog id lookup failed; reporting stored ids");
         Vec::new()
     });
     rows.into_iter().collect()
@@ -2339,7 +2336,7 @@ async fn search_packages(
     .map_err(crate::api::handlers::db_err)?;
 
     let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
-    let authored = authored_package_ids(&state.db, &repo_ids, &names).await;
+    let authored = catalog_display_ids(&state.db, &repo_ids, &names).await;
     let mut data: Vec<serde_json::Value> = packages
         .iter()
         .map(|p| {
@@ -2656,11 +2653,16 @@ async fn registration_index(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
-    // The earliest push's `.nuspec` spelling, as the catalog keeps it (#3835).
-    let display_id = artifacts
-        .first()
-        .map(|a| authored_package_id(a.metadata.as_ref(), &package_id_lower))
-        .unwrap_or_else(|| package_id_lower.clone());
+    // The catalog's spelling, as search and the V2 feed report it (#3835).
+    let display_id = authored_or_stored(
+        &catalog_display_ids(
+            &state.db,
+            &repo_ids,
+            std::slice::from_ref(&package_id_lower),
+        )
+        .await,
+        &package_id_lower,
+    );
     let items: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
@@ -3884,7 +3886,7 @@ async fn load_hosted_v2_entries(
     // Every version reports the one authored id, the first push's spelling,
     // as V3 does -- not whichever spelling that version was pushed under.
     let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
-    let authored = authored_package_ids(&state.db, &repo_ids, &names).await;
+    let authored = catalog_display_ids(&state.db, &repo_ids, &names).await;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -4095,6 +4097,11 @@ fn base64_standard(bytes: &[u8]) -> String {
 /// keeps a later push that spells the id differently on the row the first push
 /// created instead of opening a twin beside it.
 ///
+/// Chosen by the same rule the reads report the id with
+/// ([`catalog_display_ids`]), so the row a push extends is the row whose
+/// spelling clients see, including where a pre-#3978 push left a lowercased
+/// twin beside the authored row.
+///
 /// Best-effort like the catalog writes it feeds: a failed lookup falls back to
 /// the `.nuspec` casing rather than failing the push.
 async fn existing_catalog_name(
@@ -4102,21 +4109,9 @@ async fn existing_catalog_name(
     repository_id: uuid::Uuid,
     lowercased_id: &str,
 ) -> Option<String> {
-    sqlx::query_scalar(
-        r#"
-        SELECT name
-          FROM packages
-         WHERE repository_id = $1
-           AND LOWER(name) = $2
-         ORDER BY created_at
-         LIMIT 1
-        "#,
-    )
-    .bind(repository_id)
-    .bind(lowercased_id)
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None)
+    catalog_display_ids(db, &[repository_id], &[lowercased_id.to_string()])
+        .await
+        .remove(lowercased_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -4777,19 +4772,11 @@ mod tests {
     }
 
     #[test]
-    fn test_authored_package_id_prefers_the_matching_nuspec_spelling() {
-        let meta = serde_json::json!({"id": "Some.Package.Id"});
-        assert_eq!(
-            authored_package_id(Some(&meta), "some.package.id"),
-            "Some.Package.Id"
-        );
-        // A metadata id naming a different package is never reported (#3835).
-        let other = serde_json::json!({"id": "Other.Id"});
-        assert_eq!(authored_package_id(Some(&other), "some.id"), "some.id");
-        assert_eq!(authored_package_id(None, "some.id"), "some.id");
+    fn test_authored_or_stored_falls_back_to_the_stored_name() {
         let mut authored = std::collections::HashMap::new();
         authored.insert("a.b".to_string(), "A.B".to_string());
         assert_eq!(authored_or_stored(&authored, "a.b"), "A.B");
+        assert_eq!(authored_or_stored(&authored, "A.b"), "A.B");
         assert_eq!(authored_or_stored(&authored, "c.d"), "c.d");
     }
 
@@ -5938,15 +5925,110 @@ mod push_db_tests {
         assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
     }
 
-    async fn get_json(app: axum::Router, uri: String) -> serde_json::Value {
+    /// Push each `(id, version)` to the fixture repo, in order.
+    async fn push_all(app: &axum::Router, repo_key: &str, pushes: &[(&str, &str)]) {
+        for (id, version) in pushes {
+            let pkg = build_nupkg(id, version, "authored casing");
+            let req = put_nupkg(format!("/{repo_key}/api/v2/package"), pkg).await;
+            let (status, _) = tdh::send(app.clone(), req).await;
+            assert!(
+                status.is_success(),
+                "push of {id} {version} failed: {status}"
+            );
+        }
+    }
+
+    async fn get_text(app: &axum::Router, uri: String) -> String {
         let req = axum::http::Request::builder()
             .method("GET")
-            .uri(uri)
+            .uri(uri.clone())
             .body(axum::body::Body::empty())
             .expect("build GET request");
-        let (status, body) = tdh::send(app, req).await;
-        assert_eq!(status, axum::http::StatusCode::OK, "GET failed");
-        serde_json::from_slice(&body).expect("response is JSON")
+        let (status, body) = tdh::send(app.clone(), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "GET {uri}");
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// Every id `Some.Package.Id` is reported under -- V3 search,
+    /// registration and autocomplete, and each V2 feed shape -- must be
+    /// `expected`, with `versions` live versions, `latest` the newest (#3835).
+    /// V3 URLs stay lowercased; the V2 entry URLs carry the reported id, as
+    /// nuget.org's V2 feed does.
+    async fn assert_every_reported_id(
+        app: &axum::Router,
+        repo_key: &str,
+        expected: &str,
+        versions: usize,
+        latest: &str,
+    ) {
+        let text = |uri: String| get_text(app, uri);
+        let json = |body: String| -> serde_json::Value {
+            serde_json::from_str(&body).expect("response is JSON")
+        };
+        let search = json(text(format!("/{repo_key}/v3/search?q=some.package")).await);
+        assert_eq!(search["totalHits"], 1, "one package: {search}");
+        let hit = &search["data"][0];
+        assert_eq!(hit["id"], expected, "search id: {search}");
+        assert!(
+            hit["registration"]
+                .as_str()
+                .unwrap()
+                .ends_with("/v3/registration/some.package.id/index.json"),
+            "V3 URLs stay lowercased: {search}"
+        );
+
+        let registration = json(
+            text(format!(
+                "/{repo_key}/v3/registration/SOME.PACKAGE.ID/index.json"
+            ))
+            .await,
+        );
+        let leaves = registration["items"][0]["items"]
+            .as_array()
+            .expect("inline registration leaves");
+        assert_eq!(leaves.len(), versions, "{registration}");
+        for leaf in leaves {
+            assert_eq!(leaf["catalogEntry"]["id"], expected, "{registration}");
+            assert!(leaf["packageContent"]
+                .as_str()
+                .unwrap()
+                .contains("/v3/flatcontainer/some.package.id/"));
+        }
+
+        let autocomplete = json(text(format!("/{repo_key}/v3/autocomplete?q=some")).await);
+        assert_eq!(autocomplete["data"], serde_json::json!([expected]));
+
+        for (query, count) in [
+            (
+                "FindPackagesById()?id='some.package.id'".to_string(),
+                versions,
+            ),
+            (
+                format!("Packages(Id='some.package.id',Version='{latest}')"),
+                1,
+            ),
+            ("Packages()".to_string(), versions),
+            ("Search()?searchTerm='some'".to_string(), versions),
+        ] {
+            let feed = text(format!("/{repo_key}/v2/{query}")).await;
+            let ids: Vec<&str> = feed
+                .split("<d:Id>")
+                .skip(1)
+                .filter_map(|rest| rest.split("</d:Id>").next())
+                .collect();
+            assert_eq!(ids.len(), count, "V2 {query}: {feed}");
+            assert!(ids.iter().all(|id| *id == expected), "V2 {query}: {feed}");
+            assert_eq!(
+                feed.matches(&format!("/Packages(Id='{expected}',")).count(),
+                count,
+                "V2 entry <id> URLs: {feed}"
+            );
+            assert_eq!(
+                feed.matches(&format!("/package/{expected}/")).count(),
+                count,
+                "V2 <content src> URLs: {feed}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5956,47 +6038,14 @@ mod push_db_tests {
         };
         let app = f.router_with_auth(super::router());
         // The second push spells the id differently; the id is reported as
-        // the first push declared it, like the catalog row (#3835, #3976).
-        for (id, version) in [("Some.Package.Id", "1.0.0"), ("SOME.package.ID", "2.0.0")] {
-            let pkg = build_nupkg(id, version, "authored casing");
-            let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
-            let (status, _) = tdh::send(app.clone(), req).await;
-            assert!(status.is_success(), "push of {id} failed: {status}");
-        }
-
-        let search = get_json(
-            app.clone(),
-            format!("/{}/v3/search?q=some.package", f.repo_key),
+        // the first push declared it, from the catalog row (#3835, #3976).
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("SOME.package.ID", "2.0.0")],
         )
         .await;
-        let registration = get_json(
-            app.clone(),
-            format!("/{}/v3/registration/SOME.PACKAGE.ID/index.json", f.repo_key),
-        )
-        .await;
-        let autocomplete = get_json(
-            app.clone(),
-            format!("/{}/v3/autocomplete?q=some", f.repo_key),
-        )
-        .await;
-        // The hosted V2 feed, by id and unfiltered: every version of the
-        // package reports the first push's spelling, as V3 does.
-        let mut v2_feeds = Vec::new();
-        for (query, expected) in [
-            ("FindPackagesById()?id='some.package.id'", 2),
-            ("Packages(Id='some.package.id',Version='2.0.0')", 1),
-            ("Packages()", 2),
-            ("Search()?searchTerm='some'", 2),
-        ] {
-            let req = axum::http::Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/{}", f.repo_key, query))
-                .body(axum::body::Body::empty())
-                .expect("build GET request");
-            let (status, body) = tdh::send(app.clone(), req).await;
-            assert_eq!(status, axum::http::StatusCode::OK, "V2 {query}");
-            v2_feeds.push((query, expected, String::from_utf8_lossy(&body).to_string()));
-        }
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 2, "2.0.0").await;
         let catalog: Vec<String> =
             sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
                 .bind(f.repo_id)
@@ -6005,41 +6054,62 @@ mod push_db_tests {
                 .expect("query packages");
         f.teardown().await;
 
-        assert_eq!(search["totalHits"], 1, "one package: {search}");
-        let hit = &search["data"][0];
-        assert_eq!(hit["id"], "Some.Package.Id", "search id: {search}");
-        assert!(
-            hit["registration"]
-                .as_str()
-                .unwrap()
-                .ends_with("/v3/registration/some.package.id/index.json"),
-            "URLs stay lowercased: {search}"
-        );
-        let leaves = registration["items"][0]["items"]
-            .as_array()
-            .expect("inline registration leaves");
-        assert_eq!(leaves.len(), 2, "both versions: {registration}");
-        for leaf in leaves {
-            assert_eq!(leaf["catalogEntry"]["id"], "Some.Package.Id");
-            assert!(leaf["packageContent"]
-                .as_str()
-                .unwrap()
-                .contains("/v3/flatcontainer/some.package.id/"));
-        }
-        assert_eq!(autocomplete["data"], serde_json::json!(["Some.Package.Id"]));
-        for (query, expected, feed) in &v2_feeds {
-            let ids: Vec<&str> = feed
-                .split("<d:Id>")
-                .skip(1)
-                .filter_map(|rest| rest.split("</d:Id>").next())
-                .collect();
-            assert_eq!(ids.len(), *expected, "V2 {query}: {feed}");
-            assert!(
-                ids.iter().all(|id| *id == "Some.Package.Id"),
-                "V2 {query}: {feed}"
-            );
-        }
         assert_eq!(catalog, vec!["Some.Package.Id".to_string()]);
+    }
+
+    /// Deleting the versions the first push created does not hand the
+    /// displayed casing to a later pusher: the id comes from the catalog row,
+    /// which outlives the versions (#3835 review).
+    #[tokio::test]
+    async fn deleting_the_first_version_keeps_the_authored_casing() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("SOME.package.ID", "2.0.0")],
+        )
+        .await;
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = '1.0.0'",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("delete 1.0.0");
+
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 1, "2.0.0").await;
+        f.teardown().await;
+    }
+
+    /// A version with no push metadata (the metadata write is best-effort)
+    /// does not make registration disagree with search: every surface reads
+    /// the one catalog row (#3835 review).
+    #[tokio::test]
+    async fn a_version_without_metadata_reports_the_same_id_everywhere() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("Some.Package.Id", "2.0.0")],
+        )
+        .await;
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1 AND version = '1.0.0')",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("drop 1.0.0 metadata");
+
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 2, "2.0.0").await;
+        f.teardown().await;
     }
 
     #[tokio::test]
@@ -10001,7 +10071,7 @@ mod remote_discovery_tests {
                     .finish(),
             );
             let (status, _) = tdh::send(
-                app,
+                app.clone(),
                 tdh::get(format!(
                     "/{}/v3/registration/serilog/page/0.1.6/1.2.47.json",
                     fx.repo_key
@@ -10010,10 +10080,50 @@ mod remote_discovery_tests {
             .await;
             status
         };
+        let first_phase = capture.0.lock().unwrap().len();
+
+        // An upstream configured with `user:pass@` credentials never reaches
+        // these log lines unredacted.
+        let with_userinfo = upstream.uri().replacen("://", "://ak-user:sekret-pass@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{with_userinfo}/v3/index.json"))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set credentialed upstream");
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{}/v3/registration/serilog/page/1.2.48/2.0.0.json",
+                    fx.repo_key
+                )),
+            )
+            .await;
+        }
         fx.teardown().await;
 
+        let all = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let credentialed: Vec<&str> = all[first_phase..]
+            .lines()
+            .filter(|l| l.contains("NuGet upstream resolution step"))
+            .collect();
+        assert!(!credentialed.is_empty(), "no step logged: {all}");
+        for line in credentialed {
+            assert!(!line.contains("sekret-pass"), "password logged: {line}");
+            assert!(!line.contains("ak-user"), "username logged: {line}");
+            assert!(line.contains(&upstream.uri()), "upstream missing: {line}");
+        }
+
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let logs = String::from_utf8(capture.0.lock().unwrap()[..first_phase].to_vec()).unwrap();
         let line = logs
             .lines()
             .find(|l| l.contains("step=\"registration_page\""))
