@@ -5,15 +5,11 @@
 -- "readable by every authenticated principal, but never anonymously" -- the
 -- state most internal repositories on a corporate instance actually need.
 --
--- The server-wide guest-access flag (#850) is not a substitute for it, and using
--- it as one is lossy: `coerce_visibility_for_create`/`_for_update` silently
--- rewrite a requested `public` to `private` when guest access is disabled, so
--- the operator's intent is destroyed rather than reinterpreted, and re-enabling
--- guest access does not restore it. That coercion is UNCHANGED by this
--- migration -- the point here is that a state worth asking for should not have
--- to be approximated by a server-wide switch, not that the switch is being
--- fixed. An operator who wants "readable by everyone logged in" now declares it
--- on the repository.
+-- The server-wide guest-access flag (#850) is not a substitute for it: it is
+-- all-or-nothing for anonymous callers, and a create/update asking for `public`
+-- while it is disabled is refused (#3855; earlier versions silently rewrote it to
+-- `private`). An operator who wants "readable by everyone logged in" now declares
+-- it on the repository.
 --
 -- `visibility` is the authoritative field from here on. `is_public` is KEPT as a
 -- real column -- not a view and not a generated column, both of which would stop
@@ -24,7 +20,7 @@
 -- Backfill is exactly access-preserving: no repository's read audience changes
 -- at upgrade time, and no repository becomes `internal` automatically. Rows that
 -- were meant to be internal but were coerced to `is_public = false` by the
--- guest-access rule above are indistinguishable from ordinary private
+-- pre-#3855 guest-access rule are indistinguishable from ordinary private
 -- repositories; they are recovered by a documented operator review step, not
 -- here.
 
@@ -175,6 +171,10 @@ ALTER TABLE repositories
 -- ---------------------------------------------------------------------------
 -- Cache invalidation must fire on a visibility change.
 --
+-- This redefinition keeps every column migration 239 added for the #3778
+-- enforcement fields (`promotion_only`, `age_gate_*`, `curation_*`); dropping
+-- them here would silently re-open that stale-cache window.
+--
 -- The repository-changed NOTIFY trigger from migration 142 lists the columns
 -- that affect cached repository metadata, and `repo_cache` in the repo
 -- visibility middleware now carries `visibility` instead of `is_public`.
@@ -198,6 +198,12 @@ CREATE TRIGGER ak_repository_changed_notify
         OR OLD.storage_backend IS DISTINCT FROM NEW.storage_backend
         OR OLD.storage_path IS DISTINCT FROM NEW.storage_path
         OR OLD.is_public IS DISTINCT FROM NEW.is_public
+        OR OLD.promotion_only IS DISTINCT FROM NEW.promotion_only
+        OR OLD.age_gate_enabled IS DISTINCT FROM NEW.age_gate_enabled
+        OR OLD.age_gate_min_age_days IS DISTINCT FROM NEW.age_gate_min_age_days
+        OR OLD.age_gate_mode IS DISTINCT FROM NEW.age_gate_mode
+        OR OLD.curation_enabled IS DISTINCT FROM NEW.curation_enabled
+        OR OLD.curation_default_action IS DISTINCT FROM NEW.curation_default_action
         OR OLD.visibility IS DISTINCT FROM NEW.visibility
     )
     EXECUTE FUNCTION ak_notify_repository_changed();
