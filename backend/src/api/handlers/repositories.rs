@@ -288,7 +288,7 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 /// half on its own. `require_visible` is
 ///
 /// ```text
-/// is_public OR (in_scope AND (is_admin OR grants))
+/// public OR (in_scope AND (internal OR is_admin OR grants))
 /// ```
 ///
 /// and BOTH conjuncts have to survive:
@@ -347,10 +347,10 @@ pub(crate) fn member_read_visibility(auth: Option<&AuthExtension>) -> MemberVisi
 /// because `require_visible` is
 ///
 /// ```text
-/// is_public OR (in_scope AND (is_admin OR grants))
+/// public OR (in_scope AND (internal OR is_admin OR grants))
 /// ```
 ///
-/// and the `Ids` arm is `in_scope` alone. It drops the `is_public` arm — so an
+/// and the `Ids` arm is `in_scope` alone. It drops the `public` arm — so an
 /// authenticated scoped caller saw LESS than an anonymous one — and it drops
 /// the grant conjunct, so a token kept working against a member after its
 /// owner's grant was revoked. Scope is a mint-time snapshot; entitlement is not.
@@ -573,7 +573,7 @@ fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
 /// private repository in the instance and read it straight back out.
 ///
 /// The gate is [`require_visible`] — the canonical
-/// `is_public OR (in_scope AND (is_admin OR grants))` — applied to the member
+/// `public OR (in_scope AND (internal OR is_admin OR grants))` — applied to the member
 /// repository the handler has already loaded. A member the caller may not see
 /// therefore collapses to the same existence-hiding 404 as a direct `GET`,
 /// rather than the 403 the old token-scope wrapper produced, which confirmed
@@ -27461,7 +27461,7 @@ mod apt_validation_tests {
     /// principal shape, i.e.
     ///
     /// ```text
-    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// public OR (in_scope AND (internal OR is_admin OR grants))
     /// ```
     ///
     /// Walks all five: anonymous, admin unrestricted, admin + `Restricted`,
@@ -27670,7 +27670,7 @@ mod apt_validation_tests {
     /// `require_visible` is
     ///
     /// ```text
-    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// public OR (in_scope AND (internal OR is_admin OR grants))
     /// ```
     ///
     /// and it early-returns `Ok` on `is_public` *without ever consulting
