@@ -15084,10 +15084,10 @@ mod tests {
     /// PyTorch's flat index, shaped exactly as `download.pytorch.org/whl/cpu/torch/`
     /// serves it: an ABSOLUTE href to the file host, the `+` of the local
     /// version percent-encoded, and both PEP 658/714 metadata attributes.
-    fn pytorch_flat_index_html(file_host: &str) -> String {
+    fn pytorch_flat_index_html(file_host: &str, pinned_sha256: &str) -> String {
         format!(
             "<html><body><h1>Links for torch</h1>\
-             <a href=\"{file_host}/whl/cpu/{TORCH_WHEEL_HREF}#sha256={TORCH_SHA}\" \
+             <a href=\"{file_host}/whl/cpu/{TORCH_WHEEL_HREF}#sha256={pinned_sha256}\" \
              data-dist-info-metadata=\"sha256=4dea\" data-core-metadata=\"sha256=4dea\">\
              {TORCH_WHEEL}</a><br/></body></html>"
         )
@@ -15099,7 +15099,7 @@ mod tests {
     /// `{upstream}/torch/{wheel}` path, which PyTorch does not serve.
     #[test]
     fn find_upstream_url_matches_percent_encoded_href_3886() {
-        let html = pytorch_flat_index_html("https://download-r2.pytorch.org");
+        let html = pytorch_flat_index_html("https://download-r2.pytorch.org", TORCH_SHA);
         let index = Some("https://download.pytorch.org/whl/cpu/torch/");
         assert_eq!(
             find_upstream_url_for_file(&html, TORCH_WHEEL, index).as_deref(),
@@ -15244,9 +15244,14 @@ mod tests {
     /// at `/whl/cpu/torch/` advertises the file at `/whl/cpu/<wheel>`; the
     /// project-directory path the old fallback built answers 403, as
     /// `download.pytorch.org` does.
+    ///
+    /// `pinned_sha256` is the index `#sha256=` for the wheel. It must agree
+    /// with the bytes `wheel` serves whenever the fallback is expected to
+    /// extract: the fallback refuses a wheel the index does not vouch for.
     async fn pytorch_remote_metadata_e2e(
         sidecar: wiremock::ResponseTemplate,
         wheel: wiremock::ResponseTemplate,
+        pinned_sha256: &str,
     ) -> Option<(StatusCode, Bytes)> {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path, path_regex};
@@ -15268,7 +15273,7 @@ mod tests {
             .and(path("/whl/cpu/torch/"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(pytorch_flat_index_html(&upstream.uri())),
+                    .set_body_string(pytorch_flat_index_html(&upstream.uri(), pinned_sha256)),
             )
             .mount(&upstream)
             .await;
@@ -15320,6 +15325,7 @@ mod tests {
         let Some((status, body)) = pytorch_remote_metadata_e2e(
             ResponseTemplate::new(200).set_body_bytes(metadata),
             ResponseTemplate::new(500),
+            TORCH_SHA,
         )
         .await
         else {
@@ -15342,10 +15348,15 @@ mod tests {
         use wiremock::ResponseTemplate;
 
         let metadata: &[u8] = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
+        let wheel = wheel_with_metadata("torch-2.12.0+cpu", metadata);
+        let pinned = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&wheel))
+        };
         let Some((status, body)) = pytorch_remote_metadata_e2e(
             ResponseTemplate::new(403),
-            ResponseTemplate::new(200)
-                .set_body_bytes(wheel_with_metadata("torch-2.12.0+cpu", metadata)),
+            ResponseTemplate::new(200).set_body_bytes(wheel),
+            &pinned,
         )
         .await
         else {
