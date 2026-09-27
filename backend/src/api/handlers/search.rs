@@ -2342,7 +2342,7 @@ mod grant_visibility_db_tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
         sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -2352,32 +2352,31 @@ mod grant_visibility_db_tests {
 
         // Authenticated, holding NO grant on the repository at all.
         let auth = Some(tdh::make_auth(user_id, &username));
-        let visible = resolve_visible_repos(&pool, &auth)
-            .await
-            .expect("resolve visible");
-        let ids = visible.expect("a non-admin gets an explicit set, not None");
+        let visible = resolve_visible_repos(&pool, &auth).await;
+        // ...and anonymously.
+        let anon = resolve_visible_repos(&pool, &None).await;
+
+        // Clean up before asserting so a failure does not leak the fixture.
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ids = visible
+            .expect("resolve visible")
+            .expect("a non-admin gets an explicit set, not None");
         assert!(
             ids.contains(&repo_id),
             "an internal repo must be searchable by any authenticated caller \
              without a grant"
         );
-
-        // ...and must NOT be visible anonymously.
-        let anon = resolve_visible_repos(&pool, &None)
-            .await
-            .expect("resolve visible anonymously");
-        if let Some(anon_ids) = anon {
-            assert!(
-                !anon_ids.contains(&repo_id),
-                "an internal repo must never appear in an anonymous search set"
-            );
-        }
-
-        sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(repo_id)
-            .execute(&pool)
-            .await
-            .ok();
+        // An anonymous caller is PublicOnly and must get an explicit set; a
+        // `None` (unrestricted) here would itself be the bug.
+        let anon_ids = anon
+            .expect("resolve visible anonymously")
+            .expect("an anonymous caller gets an explicit set, not None");
+        assert!(
+            !anon_ids.contains(&repo_id),
+            "an internal repo must never appear in an anonymous search set"
+        );
     }
 
     impl SearchGrantFixture {
