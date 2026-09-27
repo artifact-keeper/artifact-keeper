@@ -4908,13 +4908,11 @@ async fn npm_virtual_member_fetch_urls(
     for batch in remotes.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
         let lookups = batch.iter().map(|member| async move {
             let upstream_url = member.upstream_url.as_deref()?;
-            let source = tokio::time::timeout(
+            let source = npm_lookup_within(
                 NPM_RELOCATION_LOOKUP_TIMEOUT,
                 npm_cached_tarball_source(proxy, &member.key, upstream_url, package_name, filename),
             )
-            .await
-            .ok()
-            .flatten()?;
+            .await?;
             Some((member.id, source))
         });
         urls.extend(
@@ -4925,6 +4923,15 @@ async fn npm_virtual_member_fetch_urls(
         );
     }
     urls
+}
+
+/// Run an optional lookup under `limit`: a lookup that does not finish in
+/// time yields `None` (the canonical path), never an error or a stall.
+async fn npm_lookup_within<T>(
+    limit: std::time::Duration,
+    lookup: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout(limit, lookup).await.ok().flatten()
 }
 
 /// Cache-only sibling of [`resolve_npm_tarball_upstream`]'s source lookup:
@@ -10930,6 +10937,346 @@ mod tests {
         );
     }
 
+    /// #3785 coverage: every conjunct of `npm_same_origin` is pinned on its
+    /// own — each rejected row differs from the upstream in exactly ONE
+    /// property, so deleting any single check turns that row green.
+    #[test]
+    fn test_npm_same_origin_pins_each_check_3785() {
+        const UP: &str = "https://npm.pkg.github.com";
+        let accept = [
+            // (url, upstream, why)
+            ("https://npm.pkg.github.com/download/x", UP, "same origin"),
+            (
+                "https://npm.pkg.github.com:443/download/x",
+                UP,
+                "explicit default port",
+            ),
+            (
+                "https://NPM.Pkg.GitHub.com/download/x",
+                UP,
+                "host case is normalized",
+            ),
+            (
+                "https://npm.pkg.github.com/x",
+                "https://npm.pkg.github.com/owner/",
+                "upstream path prefix ignored",
+            ),
+            (
+                "https://xn--bcher-kva.example/x",
+                "https://bücher.example",
+                "IDN == punycode",
+            ),
+            (
+                "https://npm.example:8443/x",
+                "https://npm.example:8443",
+                "explicit non-default port",
+            ),
+        ];
+        for (url, upstream, why) in accept {
+            assert!(npm_same_origin(url, upstream), "{why}: {url} vs {upstream}");
+        }
+        let reject = [
+            (
+                "https://npm.pkg.github.com:8443/x",
+                UP,
+                "port check: same host, other port",
+            ),
+            (
+                "https://npm.example/x",
+                "https://npm.example:8443",
+                "port check: upstream on explicit port",
+            ),
+            (
+                "http://npm.pkg.github.com:443/x",
+                UP,
+                "scheme check: only the scheme differs",
+            ),
+            (
+                "https://u@npm.pkg.github.com/x",
+                UP,
+                "username check: username only",
+            ),
+            (
+                "https://:p@npm.pkg.github.com/x",
+                UP,
+                "password check: password only",
+            ),
+            ("https://u:p@npm.pkg.github.com/x", UP, "userinfo"),
+            (
+                "https://npm.pkg.github.com@evil.com/x",
+                UP,
+                "host check: userinfo/host confusion",
+            ),
+            (
+                "https://npm.pkg.github.com./x",
+                UP,
+                "host check: trailing dot",
+            ),
+            ("https://evil.example/x", UP, "host check"),
+            (
+                "ftp://npm.example/x",
+                "ftp://npm.example",
+                "http(s) allowlist: ftp",
+            ),
+            ("file:///etc/passwd", "file:///", "http(s) allowlist: file"),
+            ("not a url", UP, "unparsable url"),
+            (
+                "https://npm.pkg.github.com/x",
+                "not a url",
+                "unparsable upstream",
+            ),
+        ];
+        for (url, upstream, why) in reject {
+            assert!(
+                !npm_same_origin(url, upstream),
+                "{why}: {url} vs {upstream}"
+            );
+        }
+    }
+
+    /// #3785 coverage: the relocation lookup's timeout wrapper yields `None`
+    /// (canonical path) for a lookup that never finishes, and passes a
+    /// finished lookup through. Paused clock: no real waiting.
+    #[tokio::test(start_paused = true)]
+    async fn test_npm_lookup_within_times_out_to_none_3785() {
+        let limit = std::time::Duration::from_secs(2);
+        let stalled = npm_lookup_within(limit, std::future::pending::<Option<u8>>()).await;
+        assert_eq!(stalled, None);
+        let slow = npm_lookup_within(limit, async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Some(1u8)
+        })
+        .await;
+        assert_eq!(slow, None, "a lookup slower than the limit is cut");
+        assert_eq!(npm_lookup_within(limit, async { Some(7u8) }).await, Some(7));
+        assert_eq!(npm_lookup_within(limit, async { None::<u8> }).await, None);
+    }
+
+    /// #3785 coverage: the virtual relocation lookup is CACHE-ONLY. A GH-shaped
+    /// Remote member whose packument is not cached must receive ZERO packument
+    /// requests while its tarball is served; the resolver still fetches the
+    /// canonical tarball path (the member's fallback).
+    #[tokio::test]
+    async fn test_virtual_relocation_lookup_makes_no_upstream_packument_request_3785_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@example-org%2Fexample-package"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ghp_packument(&upstream.uri(), "sha512-x")),
+            )
+            .expect(0)
+            .named("packument (must not be requested by the lookup)")
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{GHP_SCOPED}/-/example-package-1.2.3.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(P1_BYTES))
+            .expect(1)
+            .named("canonical tarball")
+            .mount(&upstream)
+            .await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        attach_public_remote(&fx, remote_id, &upstream.uri(), 1).await;
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let served = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        assert_priority_one_served(served);
+        // wiremock verifies expect(0) / expect(1) on drop.
+    }
+
+    /// #3785 coverage: more Remote members than `MAX_VIRTUAL_FANOUT` — the
+    /// lookup batches, a relocated member in the SECOND batch is still found,
+    /// and priority order still decides: priorities 1..=FANOUT 404
+    /// everything, FANOUT+1 is GH-relocated, FANOUT+2 serves different bytes
+    /// on the canonical path and must lose.
+    #[tokio::test]
+    async fn test_virtual_relocation_lookup_batches_beyond_fanout_3785_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let fanout = proxy_helpers::MAX_VIRTUAL_FANOUT;
+        let dead = MockServer::start().await; // no mocks: every request 404s
+        let relocated = MockServer::start().await;
+        let relocated_bytes = mount_ghp_upstream(&relocated, None, 1..=1).await;
+        let last = MockServer::start().await;
+        mount_priority_one(&last, ResponseTemplate::new(404)).await;
+
+        let mut members = Vec::new();
+        for priority in 1..=(fanout as i32 + 2) {
+            let uri = match priority as usize {
+                p if p <= fanout => dead.uri(),
+                p if p == fanout + 1 => relocated.uri(),
+                _ => last.uri(),
+            };
+            let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            attach_public_remote(&fx, id, &uri, priority).await;
+            members.push((id, dir));
+        }
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        // Warm the member packuments the way `npm install` does.
+        let url = ghp_served_tarball_url(&state, &fx.repo_key, false).await;
+        let served = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+
+        for (id, dir) in &members {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+
+        assert!(url.ends_with("/@example-org/example-package/-/example-package-1.2.3.tgz"));
+        let (status, body) = served.unwrap_or_else(|s| panic!("must serve: {s}"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            relocated_bytes,
+            "the second-batch relocated member (priority {}) outranks priority {}",
+            fanout + 1,
+            fanout + 2
+        );
+    }
+
+    /// Attach `member_id` as a public Remote member of the fixture's virtual.
+    async fn attach_public_remote(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        member_id: uuid::Uuid,
+        upstream: &str,
+        priority: i32,
+    ) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+        crate::api::handlers::test_db_helpers::publish_repo(&fx.pool, member_id).await;
+    }
+
+    async fn drain_download(
+        result: Result<Response, Response>,
+    ) -> Result<(StatusCode, Bytes), StatusCode> {
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                Ok((status, body))
+            }
+            Err(resp) => Err(resp.status()),
+        }
+    }
+
+    /// Remote fixture pointed at `upstream`, with its proxy-backed state.
+    async fn remote_on(
+        upstream: &wiremock::MockServer,
+    ) -> Option<(crate::api::handlers::test_db_helpers::Fixture, SharedState)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let fx = tdh::Fixture::setup("remote", "npm").await?;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        Some((fx, state))
+    }
+
+    /// #3785 coverage (`fetch_remote_packument`): the per-version document
+    /// (`GET /npm/{repo}/{package}/{version}`) on a Remote over GitHub
+    /// Packages advertises THIS repository's tarball URL.
+    #[tokio::test]
+    async fn test_remote_version_document_rewrites_github_packages_tarball_3785_db() {
+        let upstream = wiremock::MockServer::start().await;
+        mount_ghp_upstream(&upstream, None, 0..=0).await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let result = super::get_package_version_metadata(
+            &state,
+            None,
+            &fx.repo_key,
+            GHP_SCOPED,
+            "1.2.3",
+            "http://localhost",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        fx.teardown().await;
+
+        let resp = result.unwrap_or_else(|r| panic!("version document: HTTP {}", r.status()));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            json["dist"]["tarball"],
+            format!(
+                "http://localhost/npm/{key}/@example-org/example-package/-/example-package-1.2.3.tgz"
+            )
+        );
+    }
+
+    /// #3785 coverage (`resolve_npm_tarball_upstream` non-JSON fallback): a
+    /// packument body that is not JSON yields no relocation — the tarball is
+    /// fetched from the canonical path on the configured upstream.
+    #[tokio::test]
+    async fn test_remote_non_json_packument_falls_back_to_canonical_tarball_3785_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_priority_one(
+            &upstream,
+            ResponseTemplate::new(200).set_body_string("<html>not json</html>"),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/download/{GHP_SCOPED}/1.2.3/0123456789abcdef"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"wrong".to_vec()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let served = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+        fx.teardown().await;
+        assert_priority_one_served(served);
+    }
+
     /// #3297: a Remote npm proxy must request a scoped packument from
     /// upstream with the scope separator percent-encoded (`@scope%2Fpkg` —
     /// private registries require that form) while keying the LOCAL proxy
@@ -15871,6 +16218,91 @@ mod proxy_scan_block_tests {
         match result {
             Ok(r) => panic!(
                 "scoped vulnerable tarball must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// #3785: a tarball RELOCATED to a GitHub Packages `/download/…` URL
+    /// still goes through the scan-on-proxy gate: the bytes are fetched from
+    /// the relocated URL (the canonical path is not mounted) and a vulnerable
+    /// verdict for their digest blocks the serve.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_gates_relocated_github_packages_tarball_3785() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        const TARBALL: &[u8] = b"\x1f\x8b relocated-npm-tarball-3785-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(TARBALL));
+
+        let upstream = wiremock::MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "@example-org/example-package",
+            "versions": {"1.2.3": {
+                "name": "@example-org/example-package",
+                "version": "1.2.3",
+                "dist": {"tarball": format!(
+                    "{}/download/@example-org/example-package/1.2.3/0123456789abcdef",
+                    upstream.uri()
+                )}
+            }}
+        });
+        Mock::given(method("GET"))
+            .and(path("/@example-org%2Fexample-package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(packument))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/download/@example-org/example-package/1.2.3/0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let result = super::serve_tarball(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            "@example-org/example-package",
+            "example-package-1.2.3.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "relocated vulnerable tarball must be blocked, got {}",
                 r.status()
             ),
             Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
