@@ -2239,12 +2239,6 @@ async fn serve_remote_metadata(
                 &index_path,
             )
             .await?;
-            let wheel_repo = proxy_helpers::build_remote_repo_with_format(
-                repo_id,
-                repo_key,
-                &wheel_target.fetch_base,
-                RepositoryFormat::Pypi,
-            );
             // Unlike the arm above, this one PARSES the upstream bytes: it
             // opens the wheel as a zip to read `*.dist-info/METADATA`. A coded
             // wheel is not a parseable zip, so before #3193 a perfectly valid
@@ -2252,19 +2246,30 @@ async fn serve_remote_metadata(
             // available" — forwarding a header would not have helped, the bytes
             // have to be DECODED before the parser sees them.
             //
-            // `_capped` at `DEFAULT_METADATA_MAX_BYTES` is the same ceiling the
-            // uncapped `fetch_artifact_with_cache_path` already delegates with,
-            // so the byte budget is unchanged; the capped form is used because
-            // it is the variant that reports the coding (#3184).
-            let (wheel, _content_type, wheel_encoding) = proxy
-                .fetch_artifact_with_cache_path_capped(
-                    &wheel_repo,
-                    &wheel_target.fetch_path,
-                    &wheel_target.cache_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await
-                .map_err(|e| e.into_response())?;
+            // UNCACHED (#3886 review). This used to go through
+            // `fetch_artifact_with_cache_path_capped` under
+            // `wheel_target.cache_path`, which is the SAME key the distribution
+            // download serves warm or presigns (`simple/{project}/{file}`), and
+            // it committed with no index-digest check. The download path gates
+            // its cache commit on the index's `#sha256=` (GHSA-qxv7-p3mq-88fv);
+            // this side door did not, so an upstream serving a wheel that
+            // disagreed with the index got it cached here and served from then
+            // on. The body is used only to read METADATA, so it is fetched
+            // without touching the cache, and it is still verified against the
+            // index digest before anything is extracted from it (below).
+            //
+            // Same `DEFAULT_METADATA_MAX_BYTES` ceiling as before; the `_with_link`
+            // variant is the uncached one that reports the coding (#3193).
+            let wheel_body = proxy_helpers::proxy_fetch_uncached_with_link(
+                proxy,
+                repo_id,
+                repo_key,
+                &wheel_target.fetch_base,
+                &wheel_target.fetch_path,
+            )
+            .await?;
+            let (wheel, wheel_encoding) = (wheel_body.content, wheel_body.content_encoding);
+            let expected_sha256 = wheel_target.expected_sha256.as_deref();
             // Decode and parse under ONE extraction permit: both halves are
             // CPU work on upstream-controlled bytes, so they are admission-
             // controlled together, and the decode is bounded by the same
@@ -2275,6 +2280,14 @@ async fn serve_remote_metadata(
                     wheel_encoding.as_deref(),
                 ) {
                     Ok(crate::util::content_coding::Decoded::Bytes(bytes)) => {
+                        // METADATA from a wheel the index does not vouch for
+                        // would hand pip `Requires-Dist` for different bytes
+                        // than it will install; refuse rather than extract.
+                        if !wheel_matches_index_digest(&bytes, expected_sha256) {
+                            return Err(AppError::BadGateway(
+                                "Upstream wheel does not match the index sha256".to_string(),
+                            ));
+                        }
                         Ok(extract_metadata_from_wheel(&bytes))
                     }
                     // A coding this build cannot strip (`br`) degrades to the
@@ -2298,6 +2311,17 @@ async fn serve_remote_metadata(
             Ok(pep658_metadata_response(Bytes::from(metadata), None))
         }
         Err(error) => Err(error.into_response()),
+    }
+}
+
+/// Whether decoded wheel bytes match the `#sha256=` the upstream index pinned
+/// for them. `None` (no usable fragment) is accepted, exactly as the download
+/// path fetches unverified when the index pins nothing.
+fn wheel_matches_index_digest(wheel: &[u8], expected_sha256: Option<&str>) -> bool {
+    use sha2::{Digest, Sha256};
+    match expected_sha256 {
+        Some(expected) => format!("{:x}", Sha256::digest(wheel)) == expected,
+        None => true,
     }
 }
 
@@ -15334,6 +15358,179 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(&body[..], metadata);
+    }
+
+    /// #3886 review: the wheel the metadata fallback reads must be checked
+    /// against the index `#sha256=` and must never land in the proxy cache,
+    /// whose key (`simple/{project}/{file}`) the distribution download serves
+    /// from. Upstream index pins digest X, the sidecar is missing (403 and 404
+    /// both), the file host serves bytes hashing to Y.
+    ///
+    /// Before the fix the fallback cached Y under the download key with no
+    /// digest check and answered 200 with Y's METADATA; the next wheel
+    /// download was then served Y warm from cache without contacting the
+    /// upstream (the GHSA-qxv7-p3mq-88fv gate lives only on the download
+    /// path's commit).
+    #[tokio::test]
+    async fn test_remote_metadata_fallback_does_not_cache_unverified_wheel_3886() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for sidecar_status in [403u16, 404] {
+            let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+                return;
+            };
+            let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+            let project = "demo";
+            let wheel = "demo-1.0-py3-none-any.whl";
+            let served = wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\nRequires-Dist: evil\n",
+            );
+            // X: the digest the index pins, deliberately not the served bytes'.
+            let pinned = "a".repeat(64);
+            Mock::given(method("GET"))
+                .and(path(format!("/simple/{project}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "<html><body><a href=\"/packages/{wheel}#sha256={pinned}\" \
+                     data-core-metadata=\"sha256=beef\">{wheel}</a></body></html>"
+                )))
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}.metadata")))
+                .respond_with(ResponseTemplate::new(sidecar_status))
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(served.clone()))
+                .mount(&upstream)
+                .await;
+
+            let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+            let (meta_status, meta_body) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!(
+                    "/{}/simple/{project}/{wheel}.metadata",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            let wheel_hits_after_metadata = upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == format!("/packages/{wheel}"))
+                .count();
+            let (_dl_status, _dl_body) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/simple/{project}/{wheel}", fx.repo_key)),
+            )
+            .await;
+            let wheel_hits_after_download = upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == format!("/packages/{wheel}"))
+                .count();
+
+            fx.teardown().await;
+
+            assert_ne!(
+                meta_status,
+                StatusCode::OK,
+                "sidecar {sidecar_status}: METADATA must not be extracted from a wheel \
+                 that disagrees with the index digest; body {}",
+                String::from_utf8_lossy(&meta_body)
+            );
+            assert!(
+                !String::from_utf8_lossy(&meta_body).contains("Requires-Dist: evil"),
+                "sidecar {sidecar_status}: unverified METADATA leaked"
+            );
+            assert_eq!(
+                wheel_hits_after_metadata, 1,
+                "premise: the fallback fetched the wheel once"
+            );
+            assert_eq!(
+                wheel_hits_after_download, 2,
+                "sidecar {sidecar_status}: the wheel download must go back upstream (and \
+                 through the digest-gated commit), not be served the unverified bytes \
+                 the metadata fallback fetched"
+            );
+        }
+    }
+
+    /// Control for the test above: when the served wheel DOES match the index
+    /// digest the fallback still extracts METADATA (the pin must not break the
+    /// #3886 fix it guards).
+    #[tokio::test]
+    async fn test_remote_metadata_fallback_accepts_wheel_matching_index_digest_3886() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let served = wheel_with_metadata("demo-1.0", metadata);
+        let pinned = format!("{:x}", Sha256::digest(&served));
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<html><body><a href=\"/packages/{wheel}#sha256={pinned}\" \
+                 data-core-metadata=\"sha256=beef\">{wheel}</a></body></html>"
+            )))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+    }
+
+    #[test]
+    fn wheel_matches_index_digest_pins_only_when_advertised_3886() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"wheel";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        assert!(wheel_matches_index_digest(bytes, Some(&digest)));
+        assert!(wheel_matches_index_digest(bytes, None));
+        assert!(!wheel_matches_index_digest(bytes, Some(&"0".repeat(64))));
     }
 
     #[test]
