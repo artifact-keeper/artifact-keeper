@@ -722,11 +722,105 @@ fn parse_files_listing_json(bytes: &[u8]) -> Vec<String> {
     }
 }
 
+/// A Conan metadata query answered by a remote upstream (#3887).
+///
+/// * `Ok(Some(bytes))`: the upstream answered 2xx with a JSON body of the
+///   expected shape (`shape_ok`).
+/// * `Ok(None)`: the upstream answered 404, i.e. it does not hold the
+///   reference. This is the ONLY outcome that means "absent".
+/// * `Err(response)`: anything else. That is an upstream 5xx (folded to 503 by
+///   `map_proxy_error`), a timeout / connect / TLS / upstream-credential
+///   failure (502), or a 2xx body that is not the JSON shape Conan defines
+///   (502). Callers must not turn this into a 404: a 404 tells a multi-remote
+///   Conan client to try its NEXT remote, so reporting an outage as "not found"
+///   would silently resolve the reference from a different, possibly
+///   untrusted, remote (a dependency-confusion fail-open). Callers surface it
+///   instead whenever their local cache contributed nothing.
+async fn conan_upstream_json(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    upstream_path: &str,
+    shape_ok: fn(&serde_json::Value) -> bool,
+) -> Result<Option<Bytes>, Response> {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((bytes, _ct)) => {
+            let well_formed = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(|v| shape_ok(&v))
+                .unwrap_or(false);
+            if well_formed {
+                Ok(Some(bytes))
+            } else {
+                tracing::warn!(
+                    "conan: upstream of '{}' answered 2xx with a malformed body for '{}'",
+                    repo_key,
+                    upstream_path
+                );
+                Err(conan_bad_upstream_response())
+            }
+        }
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(resp) => {
+            tracing::debug!(
+                "conan: upstream of '{}' failed for '{}' with {}",
+                repo_key,
+                upstream_path,
+                resp.status()
+            );
+            Err(resp)
+        }
+    }
+}
+
+/// 502 for a 2xx upstream body that is not the Conan JSON shape it should be.
+fn conan_bad_upstream_response() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        "Upstream returned an invalid Conan response",
+    )
+        .into_response()
+}
+
+fn has_revisions_array(v: &serde_json::Value) -> bool {
+    v.get("revisions").is_some_and(|r| r.is_array())
+}
+
+fn has_files_object(v: &serde_json::Value) -> bool {
+    v.get("files").is_some_and(|f| f.is_object())
+}
+
+fn has_revision_string(v: &serde_json::Value) -> bool {
+    v.get("revision").is_some_and(|r| r.is_string())
+}
+
+/// Fold a remote-listing outcome into a Remote arm (#3887). An upstream miss
+/// contributes nothing. An upstream error is surfaced only when the local
+/// cache contributed nothing (`have_local == false`); with cached rows the arm
+/// degrades to them, as it always has.
+fn remote_contribution<T: Default>(
+    outcome: Result<Option<T>, Response>,
+    have_local: bool,
+) -> Result<T, Response> {
+    match outcome {
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Ok(T::default()),
+        Err(_) if have_local => Ok(T::default()),
+        Err(resp) => Err(resp),
+    }
+}
+
 /// Forward a recipe-revisions list query to a remote upstream and parse the
-/// `revisions` array. Returns `Vec::new()` on any non-2xx response or parse
-/// error (mirrors [`search_recipes_from_remote`]) so a flaky/offline upstream
-/// degrades to local-only instead of erroring. The caller merges the result
-/// with local cache rows.
+/// `revisions` array. See [`conan_upstream_json`] for the outcome contract.
 #[allow(clippy::too_many_arguments)]
 async fn recipe_revisions_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -737,37 +831,25 @@ async fn recipe_revisions_from_remote(
     version: &str,
     user: &str,
     channel: &str,
-) -> Vec<RecipeRevisionRow> {
+) -> Result<Option<Vec<RecipeRevisionRow>>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions",
         name, version, user, channel
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_revisions_array,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_recipe_revisions_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan recipe_revisions: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            Vec::new()
-        }
-    }
+    .await?;
+    Ok(body.map(|b| parse_recipe_revisions_json(&b)))
 }
 
 /// Forward a recipe files-list query to a remote upstream and parse the `files`
-/// object keys. Same degradation rules as [`recipe_revisions_from_remote`]: a
-/// non-2xx response or parse error yields `Vec::new()` so a flaky/offline
-/// upstream degrades to the local cache instead of erroring. The caller merges
-/// the result with local file names, deduped.
+/// object keys. See [`conan_upstream_json`] for the outcome contract.
 #[allow(clippy::too_many_arguments)]
 async fn recipe_files_list_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -779,40 +861,31 @@ async fn recipe_files_list_from_remote(
     user: &str,
     channel: &str,
     revision: &str,
-) -> Vec<String> {
+) -> Result<Option<Vec<String>>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/files",
         name, version, user, channel, revision
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_files_object,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan recipe_files_list: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            Vec::new()
-        }
-    }
+    .await?;
+    Ok(body.map(|b| parse_files_listing_json(&b)))
 }
 
 /// Forward a package-search query for a recipe revision to a remote upstream
 /// and parse the returned package map (#2058). Applies the repository's
-/// configured upstream credentials via [`proxy_helpers::proxy_fetch`] (which
-/// loads them by `repo_id`), so an authenticated upstream registry is queried
-/// with the stored basic/bearer auth. Returns `None` on any non-2xx response so
-/// a flaky/offline upstream degrades to local-only; `Some` (possibly empty) when
-/// the upstream answered 2xx, which proves the recipe revision exists there even
-/// if it has no binaries (#3887). A malformed 2xx body parses to an empty map.
+/// configured upstream credentials via [`proxy_helpers::proxy_fetch_capped`]
+/// (which loads them by `repo_id`), so an authenticated upstream registry is
+/// queried with the stored basic/bearer auth. `Ok(Some(map))`, even an empty
+/// one, proves the recipe revision exists upstream without binaries. A
+/// non-object 2xx body is an upstream error, the same as a malformed `/files`
+/// body. See [`conan_upstream_json`] for the outcome contract.
 #[allow(clippy::too_many_arguments)]
 async fn package_search_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -824,35 +897,26 @@ async fn package_search_from_remote(
     user: &str,
     channel: &str,
     revision: &str,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/search",
         name, version, user, channel, revision
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        serde_json::Value::is_object,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => Some(parse_package_search_json(&bytes)),
-        Err(_e) => {
-            tracing::debug!(
-                "conan package_search: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            None
-        }
-    }
+    .await?;
+    Ok(body.map(|b| parse_package_search_json(&b)))
 }
 
-/// Forward a recipe `/latest` query to a remote upstream. Returns `None` on any
-/// non-2xx response or parse error so the caller can fall through to a 404 only
-/// when the upstream truly has no revision. Mirrors the file-download Remote arm.
+/// Forward a recipe `/latest` query to a remote upstream. `Ok(None)` only when
+/// the upstream answered 404. An outage is an `Err` that the caller surfaces
+/// instead of a 404 (#3887). See [`conan_upstream_json`].
 #[allow(clippy::too_many_arguments)]
 async fn recipe_latest_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -863,31 +927,22 @@ async fn recipe_latest_from_remote(
     version: &str,
     user: &str,
     channel: &str,
-) -> Option<String> {
+) -> Result<Option<String>, Response> {
     let upstream_path = format!("v2/conans/{}/{}/{}/{}/latest", name, version, user, channel);
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_revision_string,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan recipe_latest: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            None
-        }
-    }
+    .await?;
+    Ok(body.and_then(|b| parse_latest_revision_json(&b)))
 }
 
 /// Forward a package-revisions list query to a remote upstream and parse the
-/// `revisions` array. Same degradation rules as [`recipe_revisions_from_remote`].
+/// `revisions` array. See [`conan_upstream_json`] for the outcome contract.
 #[allow(clippy::too_many_arguments)]
 async fn package_revisions_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -900,34 +955,25 @@ async fn package_revisions_from_remote(
     channel: &str,
     revision: &str,
     package_id: &str,
-) -> Vec<PackageRevisionRow> {
+) -> Result<Option<Vec<PackageRevisionRow>>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_revisions_array,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_package_revisions_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan package_revisions: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            Vec::new()
-        }
-    }
+    .await?;
+    Ok(body.map(|b| parse_package_revisions_json(&b)))
 }
 
 /// Forward a package files-list query to a remote upstream and parse the `files`
-/// object keys. Same degradation rules as [`recipe_files_list_from_remote`].
+/// object keys. See [`conan_upstream_json`] for the outcome contract.
 #[allow(clippy::too_many_arguments)]
 async fn package_files_list_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -941,34 +987,25 @@ async fn package_files_list_from_remote(
     revision: &str,
     package_id: &str,
     pkg_revision: &str,
-) -> Vec<String> {
+) -> Result<Option<Vec<String>>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files",
         name, version, user, channel, revision, package_id, pkg_revision
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_files_object,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan package_files_list: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            Vec::new()
-        }
-    }
+    .await?;
+    Ok(body.map(|b| parse_files_listing_json(&b)))
 }
 
-/// Forward a package `/latest` query to a remote upstream. Same degradation
-/// rules as [`recipe_latest_from_remote`].
+/// Forward a package `/latest` query to a remote upstream. Same outcome
+/// contract as [`recipe_latest_from_remote`].
 #[allow(clippy::too_many_arguments)]
 async fn package_latest_from_remote(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -981,30 +1018,21 @@ async fn package_latest_from_remote(
     channel: &str,
     revision: &str,
     package_id: &str,
-) -> Option<String> {
+) -> Result<Option<String>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/latest",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch_capped(
+    let body = conan_upstream_json(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        has_revision_string,
     )
-    .await
-    {
-        Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
-        Err(_e) => {
-            tracing::debug!(
-                "conan package_latest: upstream fetch failed or non-2xx for '{}'",
-                repo_key
-            );
-            None
-        }
-    }
+    .await?;
+    Ok(body.and_then(|b| parse_latest_revision_json(&b)))
 }
 
 async fn search(
@@ -1177,8 +1205,9 @@ async fn recipe_latest(
         found.ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
     } else if repo.repo_type == RepositoryType::Remote {
         // Local cache first; on a miss forward to the upstream `/latest`. Only
-        // 404 when both local cache and upstream have nothing. Mirrors the
-        // file-download Remote arm.
+        // 404 when both local cache and upstream have nothing. An upstream
+        // outage surfaces as its 5xx rather than a 404 (#3887), so a
+        // multi-remote client does not silently fall through to its next remote.
         match latest_recipe_revision_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
             .await
             .map_err(map_db_err)?
@@ -1197,7 +1226,7 @@ async fn recipe_latest(
                             &user,
                             &channel,
                         )
-                        .await
+                        .await?
                     }
                     _ => None,
                 };
@@ -1338,6 +1367,9 @@ async fn recipe_revisions(
                 &channel,
             )
             .await;
+            // #3887: an upstream outage is surfaced, not reported as absent,
+            // unless the local cache already answered.
+            let remote = remote_contribution(remote, !merged.is_empty())?;
             merge_unique_by(remote, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
@@ -1495,6 +1527,28 @@ async fn hosted_package_search(
     Ok((ids, exists))
 }
 
+/// Fold one upstream package-search outcome into [`recipe_package_search`]'s
+/// running state: a 2xx map proves the recipe revision exists and contributes
+/// its packages, a 404 contributes nothing, and the first upstream failure is
+/// kept so it can be surfaced if no source found the revision (#3887).
+fn absorb_remote_search(
+    outcome: Result<Option<serde_json::Map<String, serde_json::Value>>, Response>,
+    packages: &mut serde_json::Map<String, serde_json::Value>,
+    recipe_found: &mut bool,
+    upstream_err: &mut Option<Response>,
+) {
+    match outcome {
+        Ok(Some(remote)) => {
+            *recipe_found = true;
+            packages.extend(remote);
+        }
+        Ok(None) => {}
+        Err(resp) => {
+            upstream_err.get_or_insert(resp);
+        }
+    }
+}
+
 async fn recipe_package_search(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1518,6 +1572,10 @@ async fn recipe_package_search(
     // for one without binaries; an empty map alone cannot tell them apart
     // (#3887).
     let mut recipe_found = false;
+    // First upstream failure (not a 404) from any consulted remote. Surfaced
+    // instead of the 404 when nothing found the revision, so an outage is not
+    // reported as "absent" (#3887).
+    let mut upstream_err: Option<Response> = None;
     let add_local = |packages: &mut serde_json::Map<String, serde_json::Value>,
                      ids: Vec<String>| {
         for id in ids {
@@ -1546,7 +1604,7 @@ async fn recipe_package_search(
                     member.upstream_url.as_deref(),
                     state.proxy_service.as_deref(),
                 ) {
-                    if let Some(remote) = package_search_from_remote(
+                    let outcome = package_search_from_remote(
                         proxy,
                         member.id,
                         &member.key,
@@ -1557,11 +1615,13 @@ async fn recipe_package_search(
                         &channel,
                         &revision,
                     )
-                    .await
-                    {
-                        recipe_found = true;
-                        packages.extend(remote);
-                    }
+                    .await;
+                    absorb_remote_search(
+                        outcome,
+                        &mut packages,
+                        &mut recipe_found,
+                        &mut upstream_err,
+                    );
                 }
             }
         }
@@ -1576,7 +1636,7 @@ async fn recipe_package_search(
             if let (Some(upstream_url), Some(proxy)) =
                 (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
             {
-                if let Some(remote) = package_search_from_remote(
+                let outcome = package_search_from_remote(
                     proxy,
                     repo.id,
                     &repo_key,
@@ -1587,16 +1647,16 @@ async fn recipe_package_search(
                     &channel,
                     &revision,
                 )
-                .await
-                {
-                    recipe_found = true;
-                    packages.extend(remote);
-                }
+                .await;
+                absorb_remote_search(outcome, &mut packages, &mut recipe_found, &mut upstream_err);
             }
         }
     }
 
     if !recipe_found {
+        if let Some(resp) = upstream_err {
+            return Err(resp);
+        }
         return Err(conan_recipe_not_found(
             &name,
             &version,
@@ -1718,6 +1778,9 @@ async fn recipe_files_list(
                 &revision,
             )
             .await;
+            // #3887: an upstream outage is surfaced, not reported as absent,
+            // unless the local cache already answered.
+            let remote = remote_contribution(remote, !merged.is_empty())?;
             merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
         }
         merged
@@ -2186,7 +2249,8 @@ async fn package_latest(
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?
     } else if repo.repo_type == RepositoryType::Remote {
         // Local cache first; on a miss forward to the upstream package `/latest`.
-        // Only 404 when both local and upstream have nothing.
+        // Only 404 when both local and upstream have nothing; an upstream
+        // outage surfaces as its 5xx (#3887).
         match latest_package_revision_for_repo(
             &state.db,
             repo.id,
@@ -2214,7 +2278,7 @@ async fn package_latest(
                             &revision,
                             &package_id,
                         )
-                        .await
+                        .await?
                     }
                     _ => None,
                 };
@@ -2374,6 +2438,9 @@ async fn package_revisions(
                 &package_id,
             )
             .await;
+            // #3887: an upstream outage is surfaced, not reported as absent,
+            // unless the local cache already answered.
+            let remote = remote_contribution(remote, !merged.is_empty())?;
             merge_unique_by(remote, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
@@ -2552,6 +2619,9 @@ async fn package_files_list(
                 &pkg_revision,
             )
             .await;
+            // #3887: an upstream outage is surfaced, not reported as absent,
+            // unless the local cache already answered.
+            let remote = remote_contribution(remote, !merged.is_empty())?;
             merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
         }
         merged
@@ -9560,5 +9630,341 @@ mod not_found_3887 {
         }
         let json: serde_json::Value = serde_json::from_slice(&results[4].1).expect("json");
         assert_eq!(json, serde_json::json!({}));
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream outage vs upstream miss (#3887 review S1). Only an upstream 404
+    // means "absent". A 5xx, a timeout-class transport failure or a malformed
+    // 2xx must NOT answer 404: that is the signal that sends a multi-remote
+    // Conan client on to its next remote (dependency-confusion fail-open).
+    // -----------------------------------------------------------------------
+
+    /// Every Conan v2 read endpoint that consults a remote upstream, for the
+    /// reference `up/1.0@_/_#rr:pid#p1`.
+    fn remote_probe_uris(key: &str) -> Vec<String> {
+        let base = format!("/{key}/v2/conans/up/1.0/_/_");
+        let pkg = format!("{base}/revisions/rr/packages/pid");
+        vec![
+            format!("{base}/latest"),
+            format!("{base}/revisions"),
+            format!("{base}/revisions/rr/files"),
+            format!("{base}/revisions/rr/search"),
+            format!("{pkg}/latest"),
+            format!("{pkg}/revisions"),
+            format!("{pkg}/revisions/p1/files"),
+        ]
+    }
+
+    /// Point a fresh Remote repo (own proxy cache, nothing cached locally) at
+    /// `upstream` and probe every endpoint. Returns `(uri, status, body)`.
+    async fn probe_remote(upstream: &str) -> Option<Vec<(String, StatusCode, String)>> {
+        let fx = tdh::Fixture::setup("remote", "conan").await?;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, upstream).await;
+        let mut out = Vec::new();
+        for uri in remote_probe_uris(&fx.repo_key) {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) = send(app, tdh::get(uri.clone())).await;
+            out.push((uri, status, text(&body)));
+        }
+        fx.teardown().await;
+        Some(out)
+    }
+
+    async fn upstream_answering(template: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn assert_outage_surfaced(label: &str, results: &[(String, StatusCode, String)]) {
+        for (uri, status, body) in results {
+            assert!(
+                status.is_server_error(),
+                "{label}: {uri} must surface the upstream failure as 5xx, not \
+                 {status} (a 404 would send the client to its next remote); body={body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_upstream_5xx_is_not_404_on_any_endpoint() {
+        let server = upstream_answering(wiremock::ResponseTemplate::new(503)).await;
+        let Some(results) = probe_remote(&server.uri()).await else {
+            return;
+        };
+        assert_outage_surfaced("upstream 503", &results);
+        for (uri, status, _) in &results {
+            assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_upstream_gateway_timeout_is_not_404_on_any_endpoint() {
+        let server = upstream_answering(wiremock::ResponseTemplate::new(504)).await;
+        let Some(results) = probe_remote(&server.uri()).await else {
+            return;
+        };
+        assert_outage_surfaced("upstream 504", &results);
+    }
+
+    /// Transport-level failure: the same `map_proxy_error` arm (502) that a
+    /// read/connect timeout takes. A real timeout needs the 60s
+    /// `HTTP_TIMEOUT_SECS` to elapse, so this uses a refused connection to a
+    /// port nothing listens on.
+    #[tokio::test]
+    async fn remote_upstream_unreachable_is_not_404_on_any_endpoint() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let Some(results) = probe_remote(&format!("http://127.0.0.1:{port}")).await else {
+            return;
+        };
+        assert_outage_surfaced("unreachable upstream", &results);
+    }
+
+    /// Review N1: a 2xx with a body that is not the Conan JSON shape is an
+    /// upstream error on every endpoint (search included), not "exists".
+    #[tokio::test]
+    async fn remote_upstream_malformed_2xx_is_not_404_or_200() {
+        let server = upstream_answering(
+            wiremock::ResponseTemplate::new(200).set_body_string("<html>proxy error</html>"),
+        )
+        .await;
+        let Some(results) = probe_remote(&server.uri()).await else {
+            return;
+        };
+        for (uri, status, body) in &results {
+            assert_eq!(*status, StatusCode::BAD_GATEWAY, "{uri}: body={body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_upstream_404_is_404_on_every_endpoint() {
+        let server = upstream_answering(wiremock::ResponseTemplate::new(404)).await;
+        let Some(results) = probe_remote(&server.uri()).await else {
+            return;
+        };
+        for (uri, status, body) in &results {
+            assert_eq!(*status, StatusCode::NOT_FOUND, "{uri}: body={body}");
+        }
+    }
+
+    /// With something cached locally, an upstream outage still degrades to the
+    /// cache (the pre-#3887 behaviour) instead of failing the listing.
+    #[tokio::test]
+    async fn remote_upstream_outage_degrades_to_local_cache() {
+        let server = upstream_answering(wiremock::ResponseTemplate::new(503)).await;
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        seed_recipe_row(
+            &fx.pool,
+            fx.repo_id,
+            "up",
+            "1.0",
+            "_",
+            "_",
+            "rr",
+            "conanfile.py",
+        )
+        .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let key = fx.repo_key.clone();
+        let mut results = Vec::new();
+        for uri in [
+            format!("/{key}/v2/conans/up/1.0/_/_/revisions"),
+            format!("/{key}/v2/conans/up/1.0/_/_/revisions/rr/files"),
+            format!("/{key}/v2/conans/up/1.0/_/_/revisions/rr/search"),
+            format!("/{key}/v2/conans/up/1.0/_/_/latest"),
+        ] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) = send(app, tdh::get(uri.clone())).await;
+            results.push((uri, status, text(&body)));
+        }
+        fx.teardown().await;
+        for (uri, status, body) in &results {
+            assert_eq!(*status, StatusCode::OK, "{uri}: body={body}");
+        }
+    }
+
+    /// Review N3: a Remote member inside a virtual whose upstream errors on
+    /// `/search`: with no hosted member holding the revision, the virtual
+    /// surfaces the upstream failure rather than a 404. An upstream 404 there
+    /// is still a 404.
+    #[tokio::test]
+    async fn virtual_remote_member_search_upstream_error_is_not_404() {
+        async fn run(template: wiremock::ResponseTemplate) -> Option<(StatusCode, String)> {
+            let fx = tdh::Fixture::setup("virtual", "conan").await?;
+            let server = upstream_answering(template).await;
+            let (member_id, _mk, member_dir) = tdh::create_repo(&fx.pool, "remote", "conan").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
+            )
+            .bind(server.uri())
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+            let storage = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+            let app = tdh::router_anon(super::router(), state);
+            let (status, body) = send(
+                app,
+                tdh::get(format!(
+                    "/{}/v2/conans/vup/1.0/_/_/revisions/rr/search",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+            fx.teardown().await;
+            Some((status, text(&body)))
+        }
+
+        let Some((outage, outage_body)) = run(wiremock::ResponseTemplate::new(503)).await else {
+            return;
+        };
+        let Some((miss, _)) = run(wiremock::ResponseTemplate::new(404)).await else {
+            return;
+        };
+        assert_eq!(
+            outage,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "virtual /search must surface a remote member's outage; body={outage_body}"
+        );
+        assert_eq!(miss, StatusCode::NOT_FOUND);
+    }
+
+    /// Review N2: the no-leak claim, pinned properly. Through the real
+    /// `repo_visibility_middleware` and the SAME URL, a revision that exists
+    /// only in a member the caller cannot read answers byte-identically
+    /// (status, headers, body) to that revision not existing at all, for an
+    /// authenticated non-reader and for an anonymous caller. The entitled
+    /// reader sees it.
+    #[tokio::test]
+    async fn virtual_hidden_revision_is_byte_identical_to_absent_through_middleware() {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use crate::services::auth_service::AuthService;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (reader_id, reader, reader_pw) = create_user(&pool).await;
+        let (outsider_id, outsider, outsider_pw) = create_user(&pool).await;
+        let (member_id, _mk, member_dir) = create_conan_repo(&pool, "local").await;
+        let (virtual_id, virtual_key, virtual_dir) = create_conan_repo(&pool, "virtual").await;
+        // Public virtual so both callers pass the URL-repo gate; PRIVATE member
+        // readable by `reader` only.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await
+            .expect("make virtual public");
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 0).await;
+        tdh::grant_repo_access(&pool, member_id, reader_id).await;
+        seed_recipe_row(
+            &pool,
+            member_id,
+            "vlib",
+            "1.0",
+            "_",
+            "_",
+            "rv",
+            "conanfile.py",
+        )
+        .await;
+
+        let state = build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let vis_state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(
+                pool.clone(),
+                Arc::new(state.config.clone()),
+            )),
+            db: pool.clone(),
+            repo_cache: state.repo_cache.clone(),
+            repo_miss_cache: state.repo_miss_cache.clone(),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let app = axum::Router::new()
+            .nest("/conan", super::router())
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                vis_state,
+                repo_visibility_middleware,
+            ));
+        let call = |uri: String, cred: Option<(String, String)>| {
+            let app = app.clone();
+            async move {
+                let mut b = axum::http::Request::builder().uri(uri);
+                if let Some((u, p)) = cred {
+                    b = b.header(axum::http::header::AUTHORIZATION, basic_auth(&u, &p));
+                }
+                let req = b.body(axum::body::Body::empty()).expect("request");
+                let (status, body, headers) = tdh::send_with_headers(app, req).await;
+                (status, headers, body)
+            }
+        };
+
+        let uris = [
+            format!("/conan/{virtual_key}/v2/conans/vlib/1.0/_/_/revisions"),
+            format!("/conan/{virtual_key}/v2/conans/vlib/1.0/_/_/revisions/rv/files"),
+            format!("/conan/{virtual_key}/v2/conans/vlib/1.0/_/_/revisions/rv/search"),
+        ];
+        let reader_cred = Some((reader.clone(), reader_pw.clone()));
+        let outsider_cred = Some((outsider.clone(), outsider_pw.clone()));
+        let mut reader_hidden = Vec::new();
+        let mut outsider_hidden = Vec::new();
+        let mut anon_hidden = Vec::new();
+        for uri in &uris {
+            reader_hidden.push(call(uri.clone(), reader_cred.clone()).await);
+            outsider_hidden.push(call(uri.clone(), outsider_cred.clone()).await);
+            anon_hidden.push(call(uri.clone(), None).await);
+        }
+        // Now make the revision genuinely absent and probe the SAME URLs.
+        let _ = sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(member_id)
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(member_id)
+            .execute(&pool)
+            .await;
+        let mut reader_absent = Vec::new();
+        for uri in &uris {
+            reader_absent.push(call(uri.clone(), reader_cred.clone()).await);
+        }
+
+        tdh::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        cleanup(&pool, virtual_id, reader_id).await;
+        tdh::cleanup_user(&pool, outsider_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        for (i, uri) in uris.iter().enumerate() {
+            assert_eq!(
+                reader_hidden[i].0,
+                StatusCode::OK,
+                "entitled reader must see {uri}"
+            );
+            assert_eq!(reader_absent[i].0, StatusCode::NOT_FOUND, "{uri}");
+            for (who, hidden) in [
+                ("outsider", &outsider_hidden[i]),
+                ("anonymous", &anon_hidden[i]),
+            ] {
+                assert_eq!(hidden.0, reader_absent[i].0, "{who} status for {uri}");
+                assert_eq!(hidden.1, reader_absent[i].1, "{who} headers for {uri}");
+                assert_eq!(hidden.2, reader_absent[i].2, "{who} body for {uri}");
+            }
+        }
     }
 }
