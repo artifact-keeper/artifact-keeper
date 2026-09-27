@@ -582,11 +582,19 @@ fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)
 pub(crate) fn build_rpm_artifact_metadata(
     filename: &str,
     content: &[u8],
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, RpmUploadRejected> {
+    // The repodata block first: a header over the indexing limits refuses
+    // the upload whatever else parses (#3801).
+    let block = match rpm_repodata_block(content, true) {
+        RepodataBlock::OverLimit(reason) => return Err(RpmUploadRejected(reason)),
+        RepodataBlock::Info(b) | RepodataBlock::Unparseable(b) => Some(b),
+        RepodataBlock::Pending => None,
+    };
+
     let parsed = parse_rpm_filename(filename);
     let header = crate::formats::rpm::RpmHandler::parse_rpm_header(content).ok();
     if parsed.is_none() && header.is_none() {
-        return None;
+        return Ok(None);
     }
 
     let (file_name, file_version, file_release, file_arch) = parsed.unwrap_or_default();
@@ -620,10 +628,27 @@ pub(crate) fn build_rpm_artifact_metadata(
             }
         }
     }
-    attach_rpm_repodata_info(&mut metadata, content);
+    if let Some(block) = block {
+        metadata[RPM_REPODATA_KEY] = block;
+    }
+    // createrepo_c refuses a package with C0 control characters (other than
+    // tab/LF/CR) in any field it writes (`cr_Package_contains_forbidden_
+    // control_chars`): XML 1.0 cannot carry them, so one such package would
+    // make the whole repository's metadata ill-formed for dnf.
+    if let Some(field) = forbidden_control_char_field(&metadata) {
+        return Err(RpmUploadRejected(format!(
+            "RPM header field {field} contains control characters that repository \
+             metadata cannot carry"
+        )));
+    }
 
-    Some(metadata)
+    Ok(Some(metadata))
 }
+
+/// An RPM upload refused at upload time (answered with 400) because its
+/// header cannot be indexed safely (#3801).
+#[derive(Debug)]
+pub(crate) struct RpmUploadRejected(pub(crate) String);
 
 /// Key of the header-derived repodata block inside an RPM artifact's
 /// `artifact_metadata` (#3801).
@@ -633,19 +658,101 @@ const RPM_REPODATA_KEY: &str = "repodata";
 /// ignored by the renderer and re-derived by [`heal_rpm_repodata_info`].
 const RPM_REPODATA_INFO_VERSION: u64 = 1;
 
-/// Record the dependency lists, file list, sizes and header range that
-/// `primary.xml`/`filelists.xml` need (#3801). Best-effort: an unparseable
-/// header leaves `metadata` untouched. Returns whether a block was attached.
-fn attach_rpm_repodata_info(metadata: &mut serde_json::Value, content: &[u8]) -> bool {
-    let Ok(info) = crate::formats::rpm::RpmHandler::parse_rpm_repodata_info(content) else {
-        return false;
-    };
-    let Ok(mut block) = serde_json::to_value(info) else {
-        return false;
-    };
-    block["v"] = serde_json::Value::from(RPM_REPODATA_INFO_VERSION);
-    metadata[RPM_REPODATA_KEY] = block;
-    true
+/// Outcome of deriving the repodata block from a package's leading bytes.
+enum RepodataBlock {
+    /// The header's repodata fields, as the stored JSON block.
+    Info(serde_json::Value),
+    /// A deterministic "no repodata for this package" marker
+    /// (`{"v":1,"unparseable":true,"reason":..}`), stored so the heal never
+    /// re-reads the package; it renders with NEVRA and text fields only.
+    Unparseable(serde_json::Value),
+    /// Over the indexing limits: an upload is refused; a stored package gets
+    /// an [`RepodataBlock::Unparseable`] marker instead.
+    OverLimit(String),
+    /// The bytes end before the header does (a bounded upload prefix); leave
+    /// the block for the heal, which reads the stored package.
+    Pending,
+}
+
+fn unparseable_block(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "v": RPM_REPODATA_INFO_VERSION,
+        "unparseable": true,
+        "reason": reason,
+    })
+}
+
+/// Derive the dependency lists, file list, sizes and header range that
+/// `primary.xml`/`filelists.xml` need (#3801). `may_be_prefix` is true when
+/// `content` is a bounded prefix that may end inside the header.
+fn rpm_repodata_block(content: &[u8], may_be_prefix: bool) -> RepodataBlock {
+    use crate::formats::rpm::RpmHeaderError;
+    match RpmHandler::parse_rpm_repodata_info(content) {
+        Ok(info) => match serde_json::to_value(info) {
+            Ok(mut block) => {
+                block["v"] = serde_json::Value::from(RPM_REPODATA_INFO_VERSION);
+                if let Some(field) = forbidden_control_char_field(&block) {
+                    return RepodataBlock::OverLimit(format!(
+                        "RPM header field {field} contains control characters that \
+                         repository metadata cannot carry"
+                    ));
+                }
+                RepodataBlock::Info(block)
+            }
+            Err(e) => RepodataBlock::Unparseable(unparseable_block(&e.to_string())),
+        },
+        Err(RpmHeaderError::OverLimit(reason)) => RepodataBlock::OverLimit(reason),
+        Err(RpmHeaderError::Malformed(reason)) => {
+            if may_be_prefix
+                && RpmHandler::header_bytes_needed(content).is_some_and(|n| n > content.len())
+            {
+                RepodataBlock::Pending
+            } else {
+                RepodataBlock::Unparseable(unparseable_block(&reason))
+            }
+        }
+    }
+}
+
+/// XML 1.0 cannot represent C0 controls other than tab, LF and CR.
+fn is_forbidden_xml_control(c: char) -> bool {
+    (c < '\u{20}' && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{fffe}' | '\u{ffff}')
+}
+
+/// The JSON path of the first string (value or key) in `value` carrying a
+/// character XML 1.0 cannot represent, if any.
+fn forbidden_control_char_field(value: &serde_json::Value) -> Option<String> {
+    fn walk(v: &serde_json::Value, path: &mut String) -> bool {
+        match v {
+            serde_json::Value::String(s) => s.chars().any(is_forbidden_xml_control),
+            serde_json::Value::Array(items) => items.iter().enumerate().any(|(i, item)| {
+                let len = path.len();
+                path.push_str(&format!("[{i}]"));
+                let hit = walk(item, path);
+                if !hit {
+                    path.truncate(len);
+                }
+                hit
+            }),
+            serde_json::Value::Object(map) => map.iter().any(|(k, item)| {
+                let len = path.len();
+                path.push('.');
+                path.push_str(
+                    &k.chars()
+                        .filter(|c| !is_forbidden_xml_control(*c))
+                        .collect::<String>(),
+                );
+                let hit = k.chars().any(is_forbidden_xml_control) || walk(item, path);
+                if !hit {
+                    path.truncate(len);
+                }
+                hit
+            }),
+            _ => false,
+        }
+    }
+    let mut path = String::new();
+    walk(value, &mut path).then(|| path.trim_start_matches('.').to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -809,8 +916,8 @@ async fn cached_repodata(
         .rpm_repodata_cache
         .get_or_render(repo.id, fingerprint, || async move {
             let mut artifacts = collect_repodata_artifacts(&render_state.db, &ids).await?;
-            heal_rpm_repodata_info(&render_state, &mut artifacts).await;
-            tokio::task::spawn_blocking(move || render_repodata(&artifacts))
+            let heal_complete = heal_rpm_repodata_info(&render_state, &mut artifacts).await;
+            let mut rendered = tokio::task::spawn_blocking(move || render_repodata(&artifacts))
                 .await
                 .map_err(|e| {
                     error!(error = %e, "RPM repodata render task failed");
@@ -819,40 +926,61 @@ async fn cached_repodata(
                         "Failed to render repository metadata",
                     )
                         .into_response()
-                })
+                })?;
+            // A render missing some packages' dependency data (transient heal
+            // failure) is served but not cached: the fingerprint would not
+            // move again, so caching it would pin the gap (#3801).
+            rendered.cacheable = heal_complete;
+            Ok(rendered)
         })
         .await
 }
 
 /// Upper bound on the header prefix read back from storage when healing a
-/// package's repodata block. Real headers are kilobytes to low megabytes (the
-/// file list dominates); the cap only stops a hostile size field from turning
-/// a render into an unbounded read.
-const RPM_HEAL_HEADER_LIMIT: usize = 32 * 1024 * 1024;
+/// package's repodata block: the same cap the parser puts on a header's data
+/// store, so a hostile size field cannot turn a render into a large read.
+const RPM_HEAL_HEADER_LIMIT: usize = crate::formats::rpm::RPM_HEADER_DATA_MAX;
 /// Storage reads in flight while healing one render.
 const RPM_HEAL_CONCURRENCY: usize = 8;
+
+/// Whether `artifact` still needs its repodata block derived: no block of
+/// the current version, neither real nor an "unparseable" marker.
+fn needs_repodata_heal(artifact: &RpmArtifact) -> bool {
+    artifact
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(RPM_REPODATA_KEY))
+        .and_then(|b| b.get("v"))
+        .and_then(|v| v.as_u64())
+        != Some(RPM_REPODATA_INFO_VERSION)
+}
 
 /// Packages stored before #3801 (or pushed through a path that could not see
 /// the whole header) carry no current [`RPM_REPODATA_KEY`] block, so their
 /// `primary.xml` entry would declare no dependencies. Re-derive the block from
 /// the stored package's header — a ranged read of the first few KiB, not the
-/// payload — persist it so this happens once per package, and render with it.
+/// payload — and render with it.
 ///
-/// Best-effort throughout: a storage or parse failure leaves the artifact
-/// rendering as before (NEVRA + text fields only) and is retried on the next
-/// render. Persisting does not touch `artifacts.updated_at`, so the repodata
-/// fingerprint does not move and the healed render is what gets cached.
-async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifact]) {
+/// Each package's block is persisted as soon as its own read and parse
+/// finish, so a render cancelled half-way (a client timing out on a large
+/// legacy repository) keeps its progress. A package whose header is
+/// malformed, over the limits or missing from storage gets a persisted
+/// "unparseable" marker and is never re-read. Returns `false` when any
+/// package could not be settled for a transient reason (storage or database
+/// error): that render still serves, but must not be cached, so the next
+/// request retries instead of pinning dependency-less metadata. Persisting
+/// does not touch `artifacts.updated_at`, so the fingerprint does not move.
+async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifact]) -> bool {
     use futures::StreamExt;
 
     let stale: Vec<usize> = artifacts
         .iter()
         .enumerate()
-        .filter(|(_, a)| rpm_repodata_info(a).is_none())
+        .filter(|(_, a)| needs_repodata_heal(a))
         .map(|(i, _)| i)
         .collect();
     if stale.is_empty() {
-        return;
+        return true;
     }
 
     let ids: Vec<uuid::Uuid> = stale.iter().map(|&i| artifacts[i].id).collect();
@@ -868,7 +996,7 @@ async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifac
         Ok(rows) => rows,
         Err(e) => {
             warn!(error = %e, "RPM repodata heal: storage lookup failed");
-            return;
+            return false;
         }
     };
     let locations: std::collections::HashMap<uuid::Uuid, crate::storage::StorageLocation> = rows
@@ -885,60 +1013,37 @@ async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifac
         })
         .collect();
 
-    let jobs: Vec<_> = stale
-        .into_iter()
-        .filter_map(|i| {
-            let a = &artifacts[i];
-            let location = locations.get(&a.id)?.clone();
-            Some((i, a.storage_key.clone(), a.size_bytes, location))
-        })
-        .collect();
-    let headers: Vec<(usize, Option<Bytes>)> = futures::stream::iter(jobs)
-        .map(|(i, key, size, location)| async move {
-            (
-                i,
-                read_rpm_header_prefix(state, &location, &key, size).await,
-            )
-        })
+    let mut complete = true;
+    let mut jobs = Vec::with_capacity(stale.len());
+    for i in stale {
+        let a = &artifacts[i];
+        let Some(location) = locations.get(&a.id).cloned() else {
+            complete = false;
+            continue;
+        };
+        jobs.push(HealJob {
+            index: i,
+            artifact_id: a.id,
+            filename: a.path.rsplit('/').next().unwrap_or(&a.path).to_string(),
+            storage_key: a.storage_key.clone(),
+            size_bytes: a.size_bytes,
+            location,
+            metadata: a.metadata.clone().filter(|m| m.is_object()),
+        });
+    }
+    let results: Vec<(usize, Option<serde_json::Value>, bool)> = futures::stream::iter(jobs)
+        .map(|job| heal_one(state, job))
         .buffer_unordered(RPM_HEAL_CONCURRENCY)
         .collect()
         .await;
 
     let mut healed = 0usize;
-    for (i, header) in headers {
-        let Some(header) = header else { continue };
-        let artifact = &mut artifacts[i];
-        let filename = artifact
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&artifact.path)
-            .to_string();
-        let mut metadata = match artifact.metadata.take() {
-            Some(m) if m.is_object() => m,
-            _ => match build_rpm_artifact_metadata(&filename, &header) {
-                Some(m) => m,
-                None => continue,
-            },
-        };
-        if !attach_rpm_repodata_info(&mut metadata, &header) {
-            artifact.metadata = Some(metadata);
-            continue;
+    for (i, metadata, settled) in results {
+        complete &= settled;
+        if let Some(metadata) = metadata {
+            artifacts[i].metadata = Some(metadata);
+            healed += 1;
         }
-        if let Err(e) = sqlx::query(
-            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-             VALUES ($1, 'rpm', $2) \
-             ON CONFLICT (artifact_id) DO UPDATE SET metadata = EXCLUDED.metadata",
-        )
-        .bind(artifact.id)
-        .bind(&metadata)
-        .execute(&state.db)
-        .await
-        {
-            warn!(artifact_id = %artifact.id, error = %e, "RPM repodata heal: persist failed");
-        }
-        artifact.metadata = Some(metadata);
-        healed += 1;
     }
     if healed > 0 {
         info!(
@@ -946,6 +1051,95 @@ async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifac
             "RPM repodata: derived dependency metadata for stored packages (#3801)"
         );
     }
+    complete
+}
+
+struct HealJob {
+    index: usize,
+    artifact_id: uuid::Uuid,
+    filename: String,
+    storage_key: String,
+    size_bytes: i64,
+    location: crate::storage::StorageLocation,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Heal one package: read its header, derive the block off the async
+/// runtime, persist it. Returns the metadata to render with (when a block
+/// was derived) and whether the package is settled (persisted).
+async fn heal_one(state: &SharedState, job: HealJob) -> (usize, Option<serde_json::Value>, bool) {
+    let block_and_base = match read_rpm_header_prefix(
+        state,
+        &job.location,
+        &job.storage_key,
+        job.size_bytes,
+    )
+    .await
+    {
+        Ok(prefix) => {
+            let (filename, needs_base) = (job.filename.clone(), job.metadata.is_none());
+            tokio::task::spawn_blocking(move || {
+                let block = match rpm_repodata_block(&prefix, false) {
+                    RepodataBlock::Info(b) | RepodataBlock::Unparseable(b) => b,
+                    RepodataBlock::OverLimit(reason) => unparseable_block(&reason),
+                    RepodataBlock::Pending => unparseable_block("RPM header incomplete"),
+                };
+                // A row with no metadata at all also gets the NEVRA/text
+                // fields the upload would have recorded, where they parse.
+                let base = needs_base
+                    .then(|| {
+                        build_rpm_artifact_metadata(&filename, &prefix)
+                            .ok()
+                            .flatten()
+                    })
+                    .flatten();
+                (block, base)
+            })
+            .await
+            .ok()
+        }
+        Err(HeaderRead::Permanent(reason)) => Some((unparseable_block(&reason), None)),
+        Err(HeaderRead::Transient) => None,
+    };
+    let Some((block, base)) = block_and_base else {
+        return (job.index, None, false);
+    };
+
+    let mut metadata = job
+        .metadata
+        .or(base)
+        .unwrap_or_else(|| serde_json::json!({ "filename": job.filename }));
+    metadata[RPM_REPODATA_KEY] = block;
+    // Merge only the block into an existing row: a concurrent writer of any
+    // other key is not overwritten with this render's stale copy.
+    let persisted = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'rpm', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = CASE \
+             WHEN jsonb_typeof(artifact_metadata.metadata) = 'object' \
+             THEN artifact_metadata.metadata \
+                  || jsonb_build_object($3::text, EXCLUDED.metadata -> $3::text) \
+             ELSE EXCLUDED.metadata END",
+    )
+    .bind(job.artifact_id)
+    .bind(&metadata)
+    .bind(RPM_REPODATA_KEY)
+    .execute(&state.db)
+    .await;
+    if let Err(e) = &persisted {
+        warn!(artifact_id = %job.artifact_id, error = %e, "RPM repodata heal: persist failed");
+    }
+    (job.index, Some(metadata), persisted.is_ok())
+}
+
+/// Why a stored package's header could not be read back.
+#[derive(Debug)]
+enum HeaderRead {
+    /// Retrying cannot help (object missing, corrupt size, a header that
+    /// keeps growing): record the package as unparseable.
+    Permanent(String),
+    /// Storage unavailable or erroring: retry on a later render.
+    Transient,
 }
 
 /// Read just enough of a stored package to cover its lead, signature header
@@ -955,8 +1149,10 @@ async fn read_rpm_header_prefix(
     location: &crate::storage::StorageLocation,
     key: &str,
     size_bytes: i64,
-) -> Option<Bytes> {
-    let storage = state.storage_for_repo(location).ok()?;
+) -> Result<Bytes, HeaderRead> {
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|_| HeaderRead::Transient)?;
     read_rpm_header_prefix_from(storage.as_ref(), key, size_bytes).await
 }
 
@@ -967,11 +1163,17 @@ async fn read_rpm_header_prefix_from(
     storage: &dyn crate::storage::StorageBackend,
     key: &str,
     size_bytes: i64,
-) -> Option<Bytes> {
-    let size = usize::try_from(size_bytes).ok()?;
+) -> Result<Bytes, HeaderRead> {
+    let size = usize::try_from(size_bytes)
+        .map_err(|_| HeaderRead::Permanent("negative recorded package size".into()))?;
     let mut want = size.min(64 * 1024);
     for _ in 0..4 {
-        let bytes = storage.get_range(key, 0, want).await.ok()?;
+        let bytes = storage.get_range(key, 0, want).await.map_err(|e| match e {
+            crate::error::AppError::NotFound(_) => {
+                HeaderRead::Permanent("stored package not found".into())
+            }
+            _ => HeaderRead::Transient,
+        })?;
         match RpmHandler::header_bytes_needed(&bytes) {
             Some(needed)
                 if needed > bytes.len()
@@ -981,10 +1183,12 @@ async fn read_rpm_header_prefix_from(
             {
                 want = needed;
             }
-            _ => return Some(bytes),
+            _ => return Ok(bytes),
         }
     }
-    None
+    Err(HeaderRead::Permanent(
+        "RPM header size did not converge".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,19 +1205,22 @@ fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
     // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
     // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
     // (#1780); omitting them causes stricter clients to reject the metadata.
-    let primary_xml = generate_primary_xml(artifacts);
+    // The stored repodata blocks are deserialized once per render and shared
+    // by the three generators.
+    let infos = repodata_infos(artifacts);
+    let primary_xml = generate_primary_xml_with(artifacts, &infos);
     let primary_open_sha256 = sha256_hex(primary_xml.as_bytes());
     let primary_open_size = primary_xml.len();
     let primary_gz = gzip_bytes(primary_xml.as_bytes());
     let primary_sha256 = sha256_hex(&primary_gz);
 
-    let filelists_xml = generate_filelists_xml(artifacts);
+    let filelists_xml = generate_filelists_xml_with(artifacts, &infos);
     let filelists_open_sha256 = sha256_hex(filelists_xml.as_bytes());
     let filelists_open_size = filelists_xml.len();
     let filelists_gz = gzip_bytes(filelists_xml.as_bytes());
     let filelists_sha256 = sha256_hex(&filelists_gz);
 
-    let other_xml = generate_other_xml(artifacts);
+    let other_xml = generate_other_xml_with(artifacts, &infos);
     let other_open_sha256 = sha256_hex(other_xml.as_bytes());
     let other_open_size = other_xml.len();
     let other_gz = gzip_bytes(other_xml.as_bytes());
@@ -1097,6 +1304,7 @@ fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
         primary_gz: Bytes::from(primary_gz),
         filelists_gz: Bytes::from(filelists_gz),
         other_gz: Bytes::from(other_gz),
+        cacheable: true,
     }
 }
 
@@ -1800,6 +2008,25 @@ async fn store_rpm(
     let full_version = build_rpm_full_version(&pkg_version, &release);
     let artifact_path = build_rpm_artifact_path(filename);
 
+    // Parse the (untrusted) header before anything is stored: a header over
+    // the indexing limits, or with XML-forbidden control characters, is
+    // refused with 400 (#3801). The parse runs on the blocking pool — it is
+    // linear, but proportional to the uploaded header.
+    let parsed_metadata = {
+        let (name, bytes) = (filename.to_string(), content.clone());
+        tokio::task::spawn_blocking(move || build_rpm_artifact_metadata(&name, &bytes))
+            .await
+            .map_err(|e| {
+                error!(error = %e, "RPM header parse task failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to parse RPM header",
+                )
+                    .into_response()
+            })?
+            .map_err(|rejected| (StatusCode::BAD_REQUEST, rejected.0).into_response())?
+    };
+
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         repo.id,
@@ -1834,7 +2061,7 @@ async fn store_rpm(
     // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
     // describe the package fully (#2588). The filename already parsed above,
     // so the builder always yields metadata here.
-    let rpm_metadata = build_rpm_artifact_metadata(filename, &content)
+    let rpm_metadata = parsed_metadata
         .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
@@ -1994,7 +2221,20 @@ fn extract_rpm_filename(headers: &HeaderMap, body: &[u8]) -> String {
 // XML generation helpers
 // ---------------------------------------------------------------------------
 
+/// Each artifact's current repodata block, deserialized once.
+fn repodata_infos(artifacts: &[RpmArtifact]) -> Vec<Option<crate::formats::rpm::RpmRepodataInfo>> {
+    artifacts.iter().map(rpm_repodata_info).collect()
+}
+
+#[cfg(test)]
 fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
+    generate_primary_xml_with(artifacts, &repodata_infos(artifacts))
+}
+
+fn generate_primary_xml_with(
+    artifacts: &[RpmArtifact],
+    infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
+) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="{}">
@@ -2002,7 +2242,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         artifacts.len()
     );
 
-    for artifact in artifacts {
+    for (artifact, info) in artifacts.iter().zip(infos) {
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
         // Extract metadata from artifact_metadata if available, else parse filename
@@ -2071,7 +2311,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         // Header-derived repodata block (#3801): dependencies, file list,
         // sizes, header range. Absent only for packages whose header could
         // not be parsed at upload and has not been healed since.
-        let info = rpm_repodata_info(artifact);
+        // Header-derived block, deserialized once per render.
         let info = info.as_ref();
         let epoch = info.and_then(|i| i.epoch).unwrap_or(0);
         let group = meta_str("group");
@@ -2182,6 +2422,13 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
 }
 
 pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
+    generate_filelists_xml_with(artifacts, &repodata_infos(artifacts))
+}
+
+fn generate_filelists_xml_with(
+    artifacts: &[RpmArtifact],
+    infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
+) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="{}">
@@ -2189,7 +2436,7 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
         artifacts.len()
     );
 
-    for artifact in artifacts {
+    for (artifact, info) in artifacts.iter().zip(infos) {
         let (name, version, release, arch) = if let Some(ref meta) = artifact.metadata {
             (
                 meta.get("name")
@@ -2221,7 +2468,7 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
             })
         };
 
-        let info = rpm_repodata_info(artifact);
+        let info = info.as_ref();
         xml.push_str(&format!(
             r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
     <version epoch="{epoch}" ver="{version}" rel="{release}"/>
@@ -2229,13 +2476,13 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
             checksum = artifact.checksum_sha256,
             name = xml_escape(&name),
             arch = xml_escape(&arch),
-            epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
+            epoch = info.and_then(|i| i.epoch).unwrap_or(0),
             version = xml_escape(&version),
             release = xml_escape(&release),
         ));
         // The complete file list (#3801), so file requirements outside the
         // primary set (`/usr/share/...`, `/usr/lib64/...`) resolve too.
-        if let Some(i) = &info {
+        if let Some(i) = info {
             push_rpm_file_list(&mut xml, "    ", i.files.iter());
         }
         xml.push_str("  </package>\n");
@@ -2246,6 +2493,13 @@ pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
 }
 
 pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
+    generate_other_xml_with(artifacts, &repodata_infos(artifacts))
+}
+
+fn generate_other_xml_with(
+    artifacts: &[RpmArtifact],
+    infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
+) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <otherdata xmlns="http://linux.duke.edu/metadata/other" packages="{}">
@@ -2253,7 +2507,7 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
         artifacts.len()
     );
 
-    for artifact in artifacts {
+    for (artifact, info) in artifacts.iter().zip(infos) {
         let (name, version, release) = if let Some(ref meta) = artifact.metadata {
             (
                 meta.get("name")
@@ -2295,17 +2549,15 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
 "#,
             checksum = artifact.checksum_sha256,
             name = xml_escape(&name),
-            arch = if let Some(ref meta) = artifact.metadata {
-                meta.get("arch")
+            arch = xml_escape(
+                artifact
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("arch"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("noarch")
-                    .to_string()
-            } else {
-                "noarch".to_string()
-            },
-            epoch = rpm_repodata_info(artifact)
-                .and_then(|i| i.epoch)
-                .unwrap_or(0),
+            ),
+            epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
             version = xml_escape(&version),
             release = xml_escape(&release),
         ));
@@ -2320,7 +2572,9 @@ pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
 /// in the current shape.
 fn rpm_repodata_info(artifact: &RpmArtifact) -> Option<crate::formats::rpm::RpmRepodataInfo> {
     let value = artifact.metadata.as_ref()?.get(RPM_REPODATA_KEY)?;
-    if value.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION) {
+    if value.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION)
+        || value.get("unparseable").is_some()
+    {
         return None;
     }
     serde_json::from_value(value.clone()).ok()
@@ -2404,12 +2658,24 @@ pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish failed")
 }
 
+/// Escape `s` for an XML 1.0 text node or attribute value. Characters XML
+/// 1.0 cannot represent at all (C0 controls other than tab/LF/CR, U+FFFE,
+/// U+FFFF) are dropped: uploads carrying them are refused (#3801), but rows
+/// stored earlier must still never make a whole document ill-formed.
 pub(crate) fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if is_forbidden_xml_control(c) => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3128,6 +3394,7 @@ mod tests {
     #[test]
     fn test_build_rpm_artifact_metadata_extracts_header_fields() {
         let meta = build_rpm_artifact_metadata("ak-meta-test-1.0-1.noarch.rpm", TEST_RPM)
+            .expect("not rejected")
             .expect("metadata for a real RPM");
         assert_eq!(meta["name"], "ak-meta-test");
         assert_eq!(meta["version"], "1.0");
@@ -3145,6 +3412,7 @@ mod tests {
     #[test]
     fn test_build_rpm_artifact_metadata_header_wins_over_filename() {
         let meta = build_rpm_artifact_metadata("wrong-9.9-9.x86_64.rpm", TEST_RPM)
+            .expect("not rejected")
             .expect("metadata for a real RPM");
         assert_eq!(meta["name"], "ak-meta-test");
         assert_eq!(meta["version"], "1.0");
@@ -3158,6 +3426,7 @@ mod tests {
     #[test]
     fn test_build_rpm_artifact_metadata_unparseable_content_uses_filename() {
         let meta = build_rpm_artifact_metadata("hello-2.10-1.el8.noarch.rpm", b"not an rpm")
+            .expect("not rejected")
             .expect("filename-derived metadata");
         assert_eq!(meta["name"], "hello");
         assert_eq!(meta["version"], "2.10");
@@ -3170,8 +3439,12 @@ mod tests {
     /// No signal from either source -> no metadata row at all.
     #[test]
     fn test_build_rpm_artifact_metadata_no_signal_returns_none() {
-        assert!(build_rpm_artifact_metadata("blob.bin", b"junk").is_none());
-        assert!(build_rpm_artifact_metadata("bad.rpm", b"junk").is_none());
+        assert!(build_rpm_artifact_metadata("blob.bin", b"junk")
+            .expect("not rejected")
+            .is_none());
+        assert!(build_rpm_artifact_metadata("bad.rpm", b"junk")
+            .expect("not rejected")
+            .is_none());
     }
 
     /// primary.xml must surface the header-derived format metadata (#2588):
@@ -5552,7 +5825,7 @@ mod repodata_deps_tests {
             size_bytes: DEPS_RPM.len() as i64,
             checksum_sha256: sha256_hex(DEPS_RPM),
             storage_key: String::new(),
-            metadata: build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM),
+            metadata: build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM).expect("not rejected"),
             updated_at: chrono::DateTime::UNIX_EPOCH,
         }
     }
@@ -5586,7 +5859,9 @@ mod repodata_deps_tests {
 
     #[test]
     fn upload_metadata_records_dependency_block() {
-        let meta = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM).unwrap();
+        let meta = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM)
+            .expect("not rejected")
+            .unwrap();
         let block = &meta[RPM_REPODATA_KEY];
         assert_eq!(block["v"], RPM_REPODATA_INFO_VERSION);
         let requires: Vec<&str> = block["requires"]
@@ -5725,7 +6000,9 @@ mod repodata_deps_tests {
         )
         .await;
         // The pre-#3801 upload shape: header text fields, no repodata block.
-        let mut legacy = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM).unwrap();
+        let mut legacy = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM)
+            .expect("not rejected")
+            .unwrap();
         legacy.as_object_mut().unwrap().remove(RPM_REPODATA_KEY);
         proxy_helpers::record_artifact_metadata(&f.pool, artifact_id, f.repo_id, "rpm", &legacy)
             .await;
@@ -5855,8 +6132,269 @@ mod repodata_deps_tests {
     async fn header_prefix_rejects_negative_size() {
         let pkg = synthetic_rpm(16, None);
         let (_dir, fs) = stored(&pkg).await;
-        assert!(read_rpm_header_prefix_from(&fs, "pkg.rpm", -1)
+        assert!(matches!(
+            read_rpm_header_prefix_from(&fs, "pkg.rpm", -1).await,
+            Err(HeaderRead::Permanent(_))
+        ));
+    }
+
+    /// A missing object is permanent (marked unparseable), not retried.
+    #[tokio::test]
+    async fn header_prefix_missing_object_is_permanent() {
+        let (_dir, fs) = stored(b"x").await;
+        assert!(matches!(
+            read_rpm_header_prefix_from(&fs, "absent.rpm", 4096).await,
+            Err(HeaderRead::Permanent(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Review follow-ups: self-provided requires parity, control characters,
+    // upload-time limits, heal markers and merge.
+    // -----------------------------------------------------------------------
+
+    const SELFPROV_RPM: &[u8] =
+        include_bytes!("../../../tests/fixtures/ak-selfprov-test-2.0-1.noarch.rpm");
+    const SELFPROV_PRIMARY: &str = include_str!(
+        "../../../tests/fixtures/ak-selfprov-test-2.0-1.noarch.createrepo-primary.xml"
+    );
+
+    #[test]
+    fn primary_xml_self_provided_requires_match_createrepo_c() {
+        let filename = "ak-selfprov-test-2.0-1.noarch.rpm";
+        let a = RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: format!("packages/{filename}"),
+            name: "ak-selfprov-test".to_string(),
+            version: Some("2.0-1".to_string()),
+            size_bytes: SELFPROV_RPM.len() as i64,
+            checksum_sha256: sha256_hex(SELFPROV_RPM),
+            storage_key: String::new(),
+            metadata: build_rpm_artifact_metadata(filename, SELFPROV_RPM).expect("not rejected"),
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let xml = generate_primary_xml(&[a]);
+        assert_well_formed(&xml);
+        assert_eq!(
+            package_lines(&xml),
+            package_lines(SELFPROV_PRIMARY),
+            "{xml}"
+        );
+    }
+
+    /// Lead + empty signature header + a main header with NAME/VERSION/
+    /// RELEASE/ARCH strings, a REQUIRENAME array and optionally a BASENAMES
+    /// array of `basenames` empty strings.
+    fn rpm_with_requires(requires: &[&str], basenames: u32) -> Vec<u8> {
+        let mut store = Vec::new();
+        let mut entries: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for (tag, value) in [
+            (1000u32, "hostile"),
+            (1001, "1.0"),
+            (1002, "1"),
+            (1022, "noarch"),
+        ] {
+            entries.push((tag, 6, store.len() as u32, 1));
+            store.extend_from_slice(value.as_bytes());
+            store.push(0);
+        }
+        entries.push((1049, 8, store.len() as u32, requires.len() as u32));
+        for r in requires {
+            store.extend_from_slice(r.as_bytes());
+            store.push(0);
+        }
+        if basenames > 0 {
+            entries.push((1117, 8, store.len() as u32, basenames));
+            store.resize(store.len() + basenames as usize, 0);
+        }
+        let mut p = vec![0u8; 96];
+        p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        p[4] = 3;
+        p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+        p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        p.extend_from_slice(&(store.len() as u32).to_be_bytes());
+        for (tag, ty, off, count) in entries {
+            for v in [tag, ty, off, count] {
+                p.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        p.extend_from_slice(&store);
+        p
+    }
+
+    #[test]
+    fn control_characters_are_refused_at_upload() {
+        let pkg = rpm_with_requires(&["ok", "bad\u{1}name"], 0);
+        let err = build_rpm_artifact_metadata("hostile-1.0-1.noarch.rpm", &pkg)
+            .expect_err("a control character in a dependency must be refused");
+        assert!(err.0.contains("control characters"), "{}", err.0);
+        // Tab/LF/CR are legal XML and pass.
+        let ok = rpm_with_requires(&["tab\tname"], 0);
+        assert!(build_rpm_artifact_metadata("hostile-1.0-1.noarch.rpm", &ok).is_ok());
+    }
+
+    #[test]
+    fn over_budget_header_is_refused_at_upload() {
+        let pkg = rpm_with_requires(
+            &["x"],
+            crate::formats::rpm::RPM_MAX_LIST_ELEMENTS as u32 + 1,
+        );
+        let err = build_rpm_artifact_metadata("hostile-1.0-1.noarch.rpm", &pkg)
+            .expect_err("an over-budget header must be refused");
+        assert!(err.0.contains("entries"), "{}", err.0);
+    }
+
+    /// Rows stored before the upload check may still carry control
+    /// characters: the renderer drops them rather than emit ill-formed XML.
+    #[test]
+    fn legacy_control_characters_never_reach_the_xml() {
+        let mut a = deps_artifact();
+        let meta = a.metadata.as_mut().unwrap();
+        meta["summary"] = serde_json::json!("sum\u{1}mary\u{1b}[31m");
+        meta[RPM_REPODATA_KEY]["requires"][0]["name"] = serde_json::json!("/bin/\u{7}sh");
+        meta[RPM_REPODATA_KEY]["files"][0]["path"] = serde_json::json!("/etc/\u{0}x");
+        let a = vec![a];
+        for xml in [
+            generate_primary_xml(&a),
+            generate_filelists_xml(&a),
+            generate_other_xml(&a),
+        ] {
+            assert_well_formed(&xml);
+            assert!(!xml.chars().any(is_forbidden_xml_control), "{xml:?}");
+        }
+        assert_eq!(xml_escape("a\u{1}b\tc\u{fffe}"), "ab\tc");
+    }
+
+    #[test]
+    fn other_xml_escapes_arch() {
+        let mut a = deps_artifact();
+        a.metadata.as_mut().unwrap()["arch"] = serde_json::json!("x86_64\"><evil/>");
+        let xml = generate_other_xml(&[a]);
+        assert_well_formed(&xml);
+        assert!(
+            xml.contains("arch=\"x86_64&quot;&gt;&lt;evil/&gt;\""),
+            "{xml}"
+        );
+    }
+
+    /// The native PUT refuses an over-limit header with 400 and stores
+    /// nothing.
+    #[tokio::test]
+    async fn native_upload_rejects_over_limit_header() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let pkg = rpm_with_requires(
+            &["x"],
+            crate::formats::rpm::RPM_MAX_LIST_ELEMENTS as u32 + 1,
+        );
+        let (status, _) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/packages/hostile-1.0-1.noarch.rpm", f.repo_key),
+                bytes::Bytes::from(pkg),
+            ),
+        )
+        .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        f.teardown().await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rows, 0, "a refused upload must not create an artifact");
+    }
+
+    /// A stored package whose header cannot be indexed gets a persisted
+    /// "unparseable" marker, so later renders never read it again; the heal
+    /// merges only its block into the row, keeping keys written since.
+    #[tokio::test]
+    async fn heal_marks_unparseable_and_merges_into_the_row() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let junk = "junk-1.0-1.noarch.rpm";
+        let junk_id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("rpm/{}/{junk}", f.repo_id),
+            &format!("packages/{junk}"),
+            "junk",
+            "1.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"definitely not an rpm package"),
+            f.user_id,
+        )
+        .await;
+        let deps_id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("rpm/{}/{DEPS_FILENAME}", f.repo_id),
+            &format!("packages/{DEPS_FILENAME}"),
+            "ak-deps-test",
+            "1.5-3",
+            "application/x-rpm",
+            bytes::Bytes::from_static(DEPS_RPM),
+            f.user_id,
+        )
+        .await;
+        // The row gains a key the render's (stale) copy does not have.
+        let mut legacy = build_rpm_artifact_metadata(DEPS_FILENAME, DEPS_RPM)
+            .expect("not rejected")
+            .unwrap();
+        legacy.as_object_mut().unwrap().remove(RPM_REPODATA_KEY);
+        let mut row = legacy.clone();
+        row["written_concurrently"] = serde_json::json!(true);
+        proxy_helpers::record_artifact_metadata(&f.pool, deps_id, f.repo_id, "rpm", &row).await;
+
+        let mut artifacts = collect_repodata_artifacts(&f.pool, &[f.repo_id])
             .await
-            .is_none());
+            .unwrap();
+        for a in &mut artifacts {
+            if a.id == deps_id {
+                a.metadata = Some(legacy.clone());
+            }
+        }
+        let complete = heal_rpm_repodata_info(&f.state, &mut artifacts).await;
+        let second = {
+            let again = collect_repodata_artifacts(&f.pool, &[f.repo_id])
+                .await
+                .unwrap();
+            again.iter().filter(|a| needs_repodata_heal(a)).count()
+        };
+        let stored = |id: uuid::Uuid| {
+            let pool = f.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT metadata FROM artifact_metadata WHERE artifact_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let junk_row = stored(junk_id).await;
+        let deps_row = stored(deps_id).await;
+        f.teardown().await;
+
+        assert!(complete, "nothing transient failed");
+        assert_eq!(second, 0, "every package is settled after one heal");
+        assert_eq!(
+            junk_row[RPM_REPODATA_KEY]["unparseable"], true,
+            "{junk_row}"
+        );
+        assert_eq!(deps_row[RPM_REPODATA_KEY]["v"], RPM_REPODATA_INFO_VERSION);
+        assert_eq!(
+            deps_row["written_concurrently"], true,
+            "the heal must merge its block, not overwrite the row: {deps_row}"
+        );
     }
 }

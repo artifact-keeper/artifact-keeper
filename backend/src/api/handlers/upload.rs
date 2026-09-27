@@ -659,6 +659,40 @@ async fn complete_session_commit(
             .map_err(map_upload_err)?;
     let temp_path = assembled.path();
 
+    // #2588: packages pushed through the generic chunked flow must still
+    // surface format metadata (the native format routes parse it at upload
+    // time). Parse a bounded prefix of the uploaded file *before* the bytes
+    // are stored, so a header the server refuses to index (over rpm's limits
+    // or carrying XML-forbidden control characters, #3801) is rejected with
+    // 400 instead of leaving an object behind. The parse runs on the
+    // blocking pool: it is linear but proportional to an untrusted header.
+    // Replication sessions carry the source row's metadata instead, so
+    // nothing is read for them.
+    let rpm_upload_metadata = if session.artifact_metadata_format.is_none()
+        && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+    {
+        match read_file_prefix(temp_path, FORMAT_HEADER_PREFIX_LIMIT).await {
+            Ok(prefix) => {
+                let filename = artifact_name_from_path(&session.artifact_path).to_string();
+                match tokio::task::spawn_blocking(move || {
+                    super::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+                })
+                .await
+                {
+                    Ok(Ok(metadata)) => metadata,
+                    Ok(Err(rejected)) => {
+                        UploadService::fail_committing(&state.db, &session, &rejected.0).await;
+                        return Err(map_err(StatusCode::BAD_REQUEST, rejected.0));
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // The key is content-addressed and every backend writes it atomically, so
     // an object already present under it is the object we would write and can
     // be reused instead of rewritten -- the same dedup the two direct upload
@@ -691,22 +725,6 @@ async fn complete_session_commit(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     }
-
-    // #2588: packages pushed through the generic chunked flow must still
-    // surface format metadata (the native format routes parse it at upload
-    // time). Capture a bounded prefix of the uploaded file *before* the temp
-    // copy is deleted so the format header can be parsed once the artifact
-    // row exists. Replication sessions carry the source row's metadata
-    // instead, so nothing is read for them.
-    let format_header_prefix = if session.artifact_metadata_format.is_none()
-        && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
-    {
-        read_file_prefix(temp_path, FORMAT_HEADER_PREFIX_LIMIT)
-            .await
-            .ok()
-    } else {
-        None
-    };
 
     // Clean up the scratch copy now that the bytes are in final storage.
     drop(assembled);
@@ -844,22 +862,18 @@ async fn complete_session_commit(
             .await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
-    } else if let Some(prefix) = &format_header_prefix {
-        // #2588: extract RPM header metadata for generically-pushed packages,
-        // mirroring what the native RPM upload route records. Best-effort:
-        // unparseable or non-package objects simply record no metadata, they
-        // never fail the upload.
-        let filename = artifact_name_from_path(&session.artifact_path);
-        if let Some(metadata) = super::rpm::build_rpm_artifact_metadata(filename, prefix) {
-            crate::api::handlers::proxy_helpers::record_artifact_metadata(
-                &state.db,
-                artifact_id,
-                session.repository_id,
-                "rpm",
-                &metadata,
-            )
-            .await;
-        }
+    } else if let Some(metadata) = &rpm_upload_metadata {
+        // #2588: record the RPM header metadata parsed above, mirroring what
+        // the native RPM upload route records. Unparseable or non-package
+        // objects simply record no metadata; they never fail the upload.
+        crate::api::handlers::proxy_helpers::record_artifact_metadata(
+            &state.db,
+            artifact_id,
+            session.repository_id,
+            "rpm",
+            metadata,
+        )
+        .await;
     }
 
     if let Some((package_name, package_version)) =

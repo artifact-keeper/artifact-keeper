@@ -95,6 +95,10 @@ pub struct RenderedRepodata {
     pub primary_gz: Bytes,
     pub filelists_gz: Bytes,
     pub other_gz: Bytes,
+    /// False when the render is known to be incomplete for a transient
+    /// reason (an RPM header could not be read back, #3801): it is served
+    /// but not cached, so the next request renders again.
+    pub cacheable: bool,
 }
 
 impl RenderedRepodata {
@@ -199,7 +203,9 @@ impl RpmRepodataCache {
         }
         let rendered = Arc::new(render().await?);
         self.renders.fetch_add(1, Ordering::Relaxed);
-        self.insert(repo_id, fingerprint, rendered.clone()).await;
+        if rendered.cacheable {
+            self.insert(repo_id, fingerprint, rendered.clone()).await;
+        }
         Ok(rendered)
     }
 
@@ -272,7 +278,44 @@ mod tests {
             primary_gz: Bytes::copy_from_slice(format!("primary-{tag}").as_bytes()),
             filelists_gz: Bytes::copy_from_slice(format!("filelists-{tag}").as_bytes()),
             other_gz: Bytes::copy_from_slice(format!("other-{tag}").as_bytes()),
+            cacheable: true,
         }
+    }
+
+    /// A render flagged incomplete (#3801: a package's header could not be
+    /// read back) is served but never cached, so the next request retries
+    /// instead of pinning the gap until the repository next changes.
+    #[tokio::test]
+    async fn non_cacheable_render_is_served_but_not_cached() {
+        let cache = RpmRepodataCache::new();
+        let repo = Uuid::new_v4();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            let out = cache
+                .get_or_render::<(), _, _>(repo, fp(3, 100, vec![repo]), || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let mut r = rendered("partial");
+                    r.cacheable = false;
+                    Ok(r)
+                })
+                .await
+                .unwrap();
+            assert_eq!(out.repomd_xml, Bytes::from_static(b"repomd-partial"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "every request re-renders");
+
+        // Once complete, it is cached as usual.
+        for _ in 0..2 {
+            cache
+                .get_or_render::<(), _, _>(repo, fp(3, 100, vec![repo]), || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(rendered("full"))
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

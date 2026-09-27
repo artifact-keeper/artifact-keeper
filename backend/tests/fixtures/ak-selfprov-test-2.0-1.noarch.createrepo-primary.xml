@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="1">
+<package type="rpm">
+  <name>ak-selfprov-test</name>
+  <arch>noarch</arch>
+  <version epoch="0" ver="2.0" rel="1"/>
+  <checksum type="sha256" pkgid="YES">469026e61b85635e09f762a93677480f56b4bd61caf1cbb7e024106725d4a93e</checksum>
+  <summary>Artifact Keeper self-provided requires fixture</summary>
+  <description>Fixture: requires the package satisfies itself, and duplicate handling.</description>
+  <packager></packager>
+  <url></url>
+  <time file="1790520636" build="1790000000"/>
+  <size package="7285" installed="18" archive="424"/>
+  <location href="ak-selfprov-test-2.0-1.noarch.rpm"/>
+  <format>
+    <rpm:license>MIT</rpm:license>
+    <rpm:vendor></rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:buildhost>ak-fixture-host</rpm:buildhost>
+    <rpm:sourcerpm>ak-selfprov-test-2.0-1.src.rpm</rpm:sourcerpm>
+    <rpm:header-range start="4504" end="7145"/>
+    <rpm:provides>
+      <rpm:entry name="ak-selfprov-test" flags="EQ" epoch="0" ver="2.0" rel="1"/>
+      <rpm:entry name="ak-virt" flags="EQ" epoch="0" ver="1.0"/>
+      <rpm:entry name="ak-virt-unversioned"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="/usr/bin/sh"/>
+      <rpm:entry name="/usr/share/ak-selfprov/README"/>
+      <rpm:entry name="ak-dup"/>
+      <rpm:entry name="ak-mixed-dep" pre="1"/>
+      <rpm:entry name="ak-selfprov-test"/>
+      <rpm:entry name="ak-virt"/>
+      <rpm:entry name="ak-virt" flags="EQ" epoch="0" ver="1.0"/>
+    </rpm:requires>
+    <file>/usr/sbin/ak-selfprov</file>
+  </format>
+</package>
+</metadata>

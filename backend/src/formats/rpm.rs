@@ -251,7 +251,19 @@ impl RpmHandler {
 
     /// Parse RPM header section
     fn parse_header_section(data: &[u8]) -> Result<RpmMetadata> {
-        let h = HeaderIndex::parse(data)?;
+        let h = HeaderIndex::parse(data).map_err(|e| AppError::Validation(e.to_string()))?;
+        // Same element budget as the repodata extraction; over it, the lists
+        // are left empty rather than materialized.
+        let names = |tag: u32| -> Vec<String> {
+            if h.count(RPMTAG_PROVIDENAME) + h.count(RPMTAG_REQUIRENAME) > RPM_MAX_LIST_ELEMENTS {
+                return Vec::new();
+            }
+            h.string_array(tag)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
 
         let get_string = |tag: u32| -> String { h.string(tag).unwrap_or_default() };
         let get_optional = |tag: u32| -> Option<String> { h.string(tag) };
@@ -268,8 +280,8 @@ impl RpmHandler {
             url: get_optional(RPMTAG_URL),
             size: h.int(RPMTAG_LONGSIZE).or_else(|| h.int(RPMTAG_SIZE)),
             source_rpm: get_optional(RPMTAG_SOURCERPM),
-            provides: h.string_array(RPMTAG_PROVIDENAME),
-            requires: h.string_array(RPMTAG_REQUIRENAME),
+            provides: names(RPMTAG_PROVIDENAME),
+            requires: names(RPMTAG_REQUIRENAME),
             pre_install: get_optional(RPMTAG_PREIN),
             post_install: get_optional(RPMTAG_POSTIN),
             pre_uninstall: get_optional(RPMTAG_PREUN),
@@ -335,10 +347,17 @@ impl RpmHandler {
     /// fields (#3801): epoch, packager/vendor/buildhost, build time, installed
     /// and archive sizes, the header byte range, the dependency lists and the
     /// file list. Dependency lists follow `createrepo_c`'s rules exactly — see
-    /// [`dependency_entries`].
-    pub fn parse_rpm_repodata_info(content: &[u8]) -> Result<RpmRepodataInfo> {
+    /// [`requires_entries`].
+    ///
+    /// The header is untrusted: it is bounded by rpm's own header limits
+    /// (see [`HeaderIndex::parse`]) and by [`RPM_MAX_LIST_ELEMENTS`] before
+    /// any list is materialized, so work and memory are linear in a capped
+    /// input.
+    pub fn parse_rpm_repodata_info(
+        content: &[u8],
+    ) -> std::result::Result<RpmRepodataInfo, RpmHeaderError> {
         if content.len() < 96 + 16 || content[..4] != RPM_MAGIC {
-            return Err(AppError::Validation("Invalid RPM package".to_string()));
+            return Err(RpmHeaderError::Malformed("not an RPM package".into()));
         }
         let sig = if content[96..99] == RPM_HEADER_MAGIC {
             HeaderIndex::parse(&content[96..]).ok()
@@ -347,29 +366,50 @@ impl RpmHandler {
         };
         let start = Self::main_header_offset(content);
         if content.len() < start.saturating_add(16) {
-            return Err(AppError::Validation("RPM header truncated".to_string()));
+            return Err(RpmHeaderError::Malformed("RPM header truncated".into()));
         }
         let h = HeaderIndex::parse(&content[start..])?;
         let end = start + h.len;
 
-        let files = file_entries(&h);
-        let own_files: std::collections::HashSet<&str> =
-            files.iter().map(|f| f.path.as_str()).collect();
-        let provides = dependency_entries(
+        // Budget every list before materializing any of it: tags may alias
+        // the same bytes, so per-tag bounds alone do not bound the total.
+        let declared: usize = REPODATA_LIST_TAGS.iter().map(|&t| h.count(t)).sum();
+        if declared > RPM_MAX_LIST_ELEMENTS {
+            return Err(RpmHeaderError::OverLimit(format!(
+                "RPM header declares {declared} dependency/file entries \
+                 (limit {RPM_MAX_LIST_ELEMENTS})"
+            )));
+        }
+
+        let files = file_entries(&h)?;
+        let provides_raw = raw_deps(
             &h,
             RPMTAG_PROVIDENAME,
             RPMTAG_PROVIDEFLAGS,
             RPMTAG_PROVIDEVERSION,
-            None,
+        )?;
+        // createrepo_c's `provided_hashtable`: provides that survived the
+        // bad-epoch filter, keyed by name + flag string + RAW version string.
+        let provided: std::collections::HashSet<String> = provides_raw
+            .iter()
+            .filter(|d| d.entry().is_some())
+            .map(RawDep::nfv_key)
+            .collect();
+        let own_files: std::collections::HashSet<&str> =
+            files.iter().map(|f| f.path.as_str()).collect();
+        let requires = requires_entries(
+            raw_deps(
+                &h,
+                RPMTAG_REQUIRENAME,
+                RPMTAG_REQUIREFLAGS,
+                RPMTAG_REQUIREVERSION,
+            )?,
+            &provided,
+            &own_files,
         );
-        let requires = dependency_entries(
-            &h,
-            RPMTAG_REQUIRENAME,
-            RPMTAG_REQUIREFLAGS,
-            RPMTAG_REQUIREVERSION,
-            Some((provides.as_slice(), &own_files)),
-        );
-        let dep = |n, f, v| dependency_entries(&h, n, f, v, None);
+        let dep = |n, f, v| -> std::result::Result<Vec<RpmEntry>, RpmHeaderError> {
+            Ok(plain_entries(raw_deps(&h, n, f, v)?))
+        };
 
         let archive_size = h
             .int(RPMTAG_LONGARCHIVESIZE)
@@ -391,38 +431,91 @@ impl RpmHandler {
                 RPMTAG_CONFLICTNAME,
                 RPMTAG_CONFLICTFLAGS,
                 RPMTAG_CONFLICTVERSION,
-            ),
+            )?,
             obsoletes: dep(
                 RPMTAG_OBSOLETENAME,
                 RPMTAG_OBSOLETEFLAGS,
                 RPMTAG_OBSOLETEVERSION,
-            ),
+            )?,
             suggests: dep(
                 RPMTAG_SUGGESTNAME,
                 RPMTAG_SUGGESTFLAGS,
                 RPMTAG_SUGGESTVERSION,
-            ),
+            )?,
             enhances: dep(
                 RPMTAG_ENHANCENAME,
                 RPMTAG_ENHANCEFLAGS,
                 RPMTAG_ENHANCEVERSION,
-            ),
+            )?,
             recommends: dep(
                 RPMTAG_RECOMMENDNAME,
                 RPMTAG_RECOMMENDFLAGS,
                 RPMTAG_RECOMMENDVERSION,
-            ),
+            )?,
             supplements: dep(
                 RPMTAG_SUPPLEMENTNAME,
                 RPMTAG_SUPPLEMENTFLAGS,
                 RPMTAG_SUPPLEMENTVERSION,
-            ),
-            provides,
+            )?,
+            provides: plain_entries(provides_raw),
             requires,
             files,
         })
     }
 }
+
+/// Why a package's header could not be indexed (#3801).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpmHeaderError {
+    /// Not a well-formed RPM header (rpm itself would refuse it). Uploads
+    /// are still accepted, as before, with filename-derived metadata only.
+    Malformed(String),
+    /// Well-formed but beyond the resource limits this server indexes.
+    /// Uploads are rejected; stored packages are marked unparseable.
+    OverLimit(String),
+}
+
+impl std::fmt::Display for RpmHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(m) => write!(f, "malformed RPM header: {m}"),
+            Self::OverLimit(m) => write!(f, "RPM header over limit: {m}"),
+        }
+    }
+}
+
+/// rpm's own cap on header index entries (`HEADER_TAGS_MAX`, 0xffff, in
+/// rpm's `lib/header.cc`; `hdrchkTags`).
+pub const RPM_HEADER_TAGS_MAX: usize = 0xffff;
+/// rpm's cap on the element count of one non-BIN tag (`HEADER_ARRAY_MAX`,
+/// 0xfffff, `lib/header.cc`; `hdrchkArray`).
+const RPM_HEADER_ARRAY_MAX: usize = 0xf_ffff;
+/// Largest header data store indexed. rpm accepts up to 256 MiB
+/// (`HEADER_DATA_MAX`); real headers are kilobytes to a few MiB, so the
+/// practical cap matches the ranged-read cap used to heal stored packages.
+pub const RPM_HEADER_DATA_MAX: usize = 32 * 1024 * 1024;
+/// Total dependency + file-list entries one package may declare. Tags can
+/// alias the same bytes, so this bounds the materialized lists (and the
+/// persisted/rendered metadata) independently of the per-tag limits. Far
+/// above real packages (the largest distribution packages list tens of
+/// thousands of files).
+pub const RPM_MAX_LIST_ELEMENTS: usize = 262_144;
+
+/// Every string-array tag [`RpmHandler::parse_rpm_repodata_info`]
+/// materializes as a list; their declared counts share one budget.
+const REPODATA_LIST_TAGS: [u32; 11] = [
+    RPMTAG_PROVIDENAME,
+    RPMTAG_REQUIRENAME,
+    RPMTAG_CONFLICTNAME,
+    RPMTAG_OBSOLETENAME,
+    RPMTAG_SUGGESTNAME,
+    RPMTAG_ENHANCENAME,
+    RPMTAG_RECOMMENDNAME,
+    RPMTAG_SUPPLEMENTNAME,
+    RPMTAG_BASENAMES,
+    RPMTAG_DIRNAMES,
+    RPMTAG_OLDFILENAMES,
+];
 
 fn be_u32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
@@ -453,36 +546,74 @@ struct HeaderIndex<'a> {
     len: usize,
 }
 
+/// Minimum bytes one element of `data_type` occupies in the store; `None`
+/// for a type outside rpm's range (`hdrchkType`).
+fn element_width(data_type: u32) -> Option<usize> {
+    match data_type {
+        0 => Some(0), // RPM_NULL_TYPE
+        1 | RPM_INT8_TYPE | 7 => Some(1),
+        RPM_INT16_TYPE => Some(2),
+        RPM_INT32_TYPE => Some(4),
+        RPM_INT64_TYPE => Some(8),
+        // Strings: at least the terminating NUL each.
+        6 | RPM_STRING_ARRAY_TYPE | RPM_I18NSTRING_TYPE => Some(1),
+        _ => None,
+    }
+}
+
 impl<'a> HeaderIndex<'a> {
-    fn parse(data: &'a [u8]) -> Result<Self> {
+    /// Parse and validate one header structure the way rpm's
+    /// `hdrblobVerifyInfo` does (`lib/header.cc`): at most
+    /// [`RPM_HEADER_TAGS_MAX`] entries, a store of at most
+    /// [`RPM_HEADER_DATA_MAX`] bytes, and for every entry a known type, a
+    /// count in `1..=`[`RPM_HEADER_ARRAY_MAX`] (BIN excepted), an offset
+    /// inside the store, and element data that fits in the remaining bytes.
+    /// Any violation rejects the whole header, as rpm would.
+    fn parse(data: &'a [u8]) -> std::result::Result<Self, RpmHeaderError> {
+        let malformed = |m: &str| RpmHeaderError::Malformed(m.to_string());
         if data.len() < 16 || data[..3] != RPM_HEADER_MAGIC {
-            return Err(AppError::Validation("Invalid RPM header".to_string()));
+            return Err(malformed("Invalid RPM header magic"));
         }
         let nindex = be_u32(&data[8..]) as usize;
         let hsize = be_u32(&data[12..]) as usize;
-        let store_start = nindex
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(16))
-            .ok_or_else(|| AppError::Validation("RPM header truncated".to_string()))?;
-        let len = store_start
-            .checked_add(hsize)
-            .filter(|&end| end <= data.len())
-            .ok_or_else(|| AppError::Validation("RPM header truncated".to_string()))?;
+        if nindex > RPM_HEADER_TAGS_MAX {
+            return Err(RpmHeaderError::OverLimit(format!(
+                "{nindex} header entries (rpm allows {RPM_HEADER_TAGS_MAX})"
+            )));
+        }
+        if hsize > RPM_HEADER_DATA_MAX {
+            return Err(RpmHeaderError::OverLimit(format!(
+                "{hsize}-byte header data (limit {RPM_HEADER_DATA_MAX})"
+            )));
+        }
+        let store_start = 16 + nindex * 16;
+        let len = store_start + hsize;
+        if len > data.len() {
+            return Err(malformed("RPM header truncated"));
+        }
 
         let store = &data[store_start..len];
         let mut entries = HashMap::with_capacity(nindex);
         for i in 0..nindex {
             let e = &data[16 + i * 16..16 + i * 16 + 16];
+            let tag = be_u32(e);
+            let data_type = be_u32(&e[4..]);
             let offset = be_u32(&e[8..]) as usize;
-            if offset >= store.len() {
-                continue;
+            let count = be_u32(&e[12..]) as usize;
+            let width = element_width(data_type)
+                .ok_or_else(|| malformed("header entry with an unknown data type"))?;
+            if count == 0 || (data_type != 7 && count > RPM_HEADER_ARRAY_MAX) {
+                return Err(malformed("header entry count out of range"));
+            }
+            if offset >= store.len() || count * width > store.len() - offset {
+                return Err(malformed("header entry data outside the store"));
             }
             entries.insert(
-                be_u32(e),
+                tag,
                 HeaderEntry {
-                    data_type: be_u32(&e[4..]),
+                    data_type,
                     offset,
-                    count: be_u32(&e[12..]) as usize,
+                    count,
                 },
             );
         }
@@ -493,45 +624,60 @@ impl<'a> HeaderIndex<'a> {
         })
     }
 
-    /// NUL-terminated strings starting at `offset`, at most `max`.
-    fn strings_at(&self, offset: usize, max: usize) -> Vec<String> {
-        self.store[offset..]
-            .split(|&b| b == 0)
-            .take(max)
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect()
+    /// Declared element count of `tag` (0 when absent).
+    fn count(&self, tag: u32) -> usize {
+        self.entries.get(&tag).map_or(0, |e| e.count)
     }
 
     /// The tag's (first) string value; `None` when absent or empty. For an
     /// I18N string this is the untranslated (C locale) value.
     fn string(&self, tag: u32) -> Option<String> {
         let e = self.entries.get(&tag)?;
-        self.strings_at(e.offset, 1)
-            .into_iter()
+        self.store[e.offset..]
+            .split(|&b| b == 0)
             .next()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
             .filter(|s| !s.is_empty())
     }
 
     /// Every string of a STRING_ARRAY/I18NSTRING tag (a plain STRING yields
-    /// one element). Empty when absent.
-    fn string_array(&self, tag: u32) -> Vec<String> {
+    /// one element), at most `max`. Empty when absent. Every returned string
+    /// must be NUL-terminated inside the store — as rpm's `dataLength`
+    /// demands — or the header is malformed.
+    fn string_array_n(
+        &self,
+        tag: u32,
+        max: usize,
+    ) -> std::result::Result<Vec<String>, RpmHeaderError> {
         let Some(e) = self.entries.get(&tag) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let n = match e.data_type {
             RPM_STRING_ARRAY_TYPE | RPM_I18NSTRING_TYPE => e.count,
             _ => 1,
-        };
-        let mut out = self.strings_at(e.offset, n);
-        // `split` yields a trailing fragment when the store ends without a
-        // NUL; never report more elements than the index declares.
-        out.truncate(n);
-        out
+        }
+        .min(max);
+        let mut out = Vec::with_capacity(n);
+        let mut rest = &self.store[e.offset..];
+        while out.len() < n {
+            let Some(nul) = rest.iter().position(|&b| b == 0) else {
+                return Err(RpmHeaderError::Malformed(
+                    "string array runs past the header store".into(),
+                ));
+            };
+            out.push(String::from_utf8_lossy(&rest[..nul]).into_owned());
+            rest = &rest[nul + 1..];
+        }
+        Ok(out)
     }
 
-    /// Every value of an integer tag, widened to u64. Empty when absent,
-    /// not an integer type, or truncated.
-    fn ints(&self, tag: u32) -> Vec<u64> {
+    fn string_array(&self, tag: u32) -> std::result::Result<Vec<String>, RpmHeaderError> {
+        self.string_array_n(tag, usize::MAX)
+    }
+
+    /// Up to `max` values of an integer tag, widened to u64. Empty when
+    /// absent or not an integer type (bounds were verified by `parse`).
+    fn ints_n(&self, tag: u32, max: usize) -> Vec<u64> {
         let Some(e) = self.entries.get(&tag) else {
             return Vec::new();
         };
@@ -542,22 +688,15 @@ impl<'a> HeaderIndex<'a> {
             RPM_INT64_TYPE => 8,
             _ => return Vec::new(),
         };
-        let Some(bytes) = e
-            .count
-            .checked_mul(width)
-            .and_then(|n| n.checked_add(e.offset))
-            .and_then(|end| self.store.get(e.offset..end))
-        else {
-            return Vec::new();
-        };
-        bytes
+        let n = e.count.min(max);
+        self.store[e.offset..e.offset + n * width]
             .chunks_exact(width)
             .map(|c| c.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
             .collect()
     }
 
     fn int(&self, tag: u32) -> Option<u64> {
-        self.ints(tag).into_iter().next()
+        self.ints_n(tag, 1).into_iter().next()
     }
 }
 
@@ -570,10 +709,11 @@ const RPMSENSE_PREREQ: u64 = 1 << 6;
 const RPMSENSE_PRETRANS: u64 = 1 << 7;
 const RPMSENSE_SCRIPT_PRE: u64 = 1 << 9;
 const RPMSENSE_SCRIPT_POST: u64 = 1 << 10;
-/// Requirements `createrepo_c` marks `pre="1"`: anything needed before the
-/// package's own install-time scriptlets/transaction hooks run. `%preun` and
-/// `%postun` requirements are deliberately NOT pre (verified against
-/// createrepo_c 1.2.1 output for the `ak-deps-test` fixture).
+/// Requirements `createrepo_c` marks `pre="1"` — exactly the mask in its
+/// `src/parsehdr.c` ("Calculate pre value"): PREREQ | SCRIPT_PRE |
+/// POSTTRANS | PRETRANS | SCRIPT_POST. `%preun`/`%postun` and
+/// RPMSENSE_KEYRING are NOT in it (rpm's own `isInstallPreReq` differs;
+/// the repodata contract is createrepo_c's).
 const RPMSENSE_PRE_MASK: u64 = RPMSENSE_PREREQ
     | RPMSENSE_SCRIPT_PRE
     | RPMSENSE_SCRIPT_POST
@@ -593,20 +733,28 @@ fn sense_flag_str(flags: u64) -> Option<&'static str> {
 }
 
 /// Split `[epoch:]version[-release]` the way `createrepo_c`'s
-/// `cr_str_to_evr` does: a missing epoch is `"0"`, the release is whatever
-/// follows the LAST hyphen.
-fn split_evr(evr: &str) -> (String, Option<String>, Option<String>) {
+/// `cr_str_to_evr` (`src/misc.c`) does: an epoch is the text before the
+/// first `:` and must be numeric (`None` = bad epoch, which createrepo_c
+/// answers by skipping the dependency); a missing or empty epoch is `"0"`;
+/// the release is whatever follows the FIRST `-` after the epoch. Empty
+/// version/release parts are absent.
+fn split_evr(evr: &str) -> Option<(String, Option<String>, Option<String>)> {
     let (epoch, rest) = match evr.split_once(':') {
-        Some((e, rest)) if !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit()) => {
-            (e.to_string(), rest)
+        Some((e, rest)) => {
+            // strtol semantics: optional leading whitespace and sign.
+            let digits = e.trim_start().trim_start_matches(['+', '-']);
+            if !e.is_empty() && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())) {
+                return None;
+            }
+            (if e.is_empty() { "0" } else { e }.to_string(), rest)
         }
-        _ => ("0".to_string(), evr),
+        None => ("0".to_string(), evr),
     };
-    let (ver, rel) = match rest.rsplit_once('-') {
-        Some((v, r)) => (v, Some(r.to_string())),
+    let (ver, rel) = match rest.split_once('-') {
+        Some((v, r)) => (v, Some(r.to_string()).filter(|r| !r.is_empty())),
         None => (rest, None),
     };
-    (epoch, Some(ver.to_string()).filter(|v| !v.is_empty()), rel)
+    Some((epoch, Some(ver.to_string()).filter(|v| !v.is_empty()), rel))
 }
 
 /// `createrepo_c`'s primary-file predicate: files that go into
@@ -615,98 +763,164 @@ pub fn is_primary_file(path: &str) -> bool {
     path.starts_with("/etc/") || path == "/usr/lib/sendmail" || path.contains("bin/")
 }
 
-/// Build one dependency list in `createrepo_c` form. `requires_ctx` is
-/// `Some((provides, own_files))` for the requires list only, enabling the
-/// filters `createrepo_c` applies there: `rpmlib(...)` pseudo-requirements
-/// are dropped, a requirement on one of the package's own primary files is
-/// dropped, a requirement the package itself provides with the identical
-/// flags/version is dropped, and exact duplicates are collapsed.
-fn dependency_entries(
+/// One dependency exactly as the header states it.
+struct RawDep {
+    name: String,
+    flags: u64,
+    evr: String,
+}
+
+impl RawDep {
+    /// createrepo_c's `depnfv` key: name, flag string and the RAW version
+    /// string concatenated (so `= 1.0` and `= 0:1.0` are different keys).
+    fn nfv_key(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.name,
+            sense_flag_str(self.flags).unwrap_or(""),
+            self.evr
+        )
+    }
+
+    /// The `<rpm:entry>`; `None` for a bad (non-numeric) epoch, which
+    /// createrepo_c skips. Version attributes only accompany a flag.
+    fn entry(&self) -> Option<RpmEntry> {
+        let flag_str = sense_flag_str(self.flags);
+        let mut entry = RpmEntry {
+            name: self.name.clone(),
+            flags: flag_str.map(str::to_string),
+            ..Default::default()
+        };
+        if !self.evr.is_empty() {
+            let (epoch, ver, rel) = split_evr(&self.evr)?;
+            if flag_str.is_some() {
+                entry.epoch = Some(epoch);
+                entry.ver = ver;
+                entry.rel = rel;
+            }
+        }
+        Some(entry)
+    }
+}
+
+/// Read one dependency list (names plus the parallel flags and versions,
+/// never more of those than there are names). Empty names are dropped.
+fn raw_deps(
     h: &HeaderIndex<'_>,
     name_tag: u32,
     flags_tag: u32,
     version_tag: u32,
-    requires_ctx: Option<(&[RpmEntry], &std::collections::HashSet<&str>)>,
+) -> std::result::Result<Vec<RawDep>, RpmHeaderError> {
+    let names = h.string_array(name_tag)?;
+    let flags = h.ints_n(flags_tag, names.len());
+    let versions = h.string_array_n(version_tag, names.len())?;
+    Ok(names
+        .into_iter()
+        .enumerate()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(i, name)| RawDep {
+            name,
+            flags: flags.get(i).copied().unwrap_or(0),
+            evr: versions.get(i).cloned().unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// A non-requires list: every well-formed entry, header order.
+fn plain_entries(raw: Vec<RawDep>) -> Vec<RpmEntry> {
+    raw.iter().filter_map(RawDep::entry).collect()
+}
+
+/// The requires list, with `createrepo_c`'s filters in its order
+/// (`src/parsehdr.c`): `rpmlib(...)` pseudo-requirements dropped; a
+/// requirement on one of the package's own primary files dropped; a
+/// requirement whose name+flags+raw-version key the package itself provides
+/// dropped; `pre` computed; a requirement identical (flags, raw version,
+/// pre) to the LAST one emitted under the same name dropped; bad epochs
+/// dropped. All lookups are hashed, so the cost is linear in the list.
+fn requires_entries(
+    raw: Vec<RawDep>,
+    provided: &std::collections::HashSet<String>,
+    own_files: &std::collections::HashSet<&str>,
 ) -> Vec<RpmEntry> {
-    let names = h.string_array(name_tag);
-    let flags = h.ints(flags_tag);
-    let versions = h.string_array(version_tag);
-    let mut out: Vec<RpmEntry> = Vec::with_capacity(names.len());
-    for (i, name) in names.into_iter().enumerate() {
-        if name.is_empty() {
+    let mut last_by_name: HashMap<String, (Option<&'static str>, String, bool)> = HashMap::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for d in raw {
+        if d.name.starts_with("rpmlib(") {
             continue;
         }
-        let raw_flags = flags.get(i).copied().unwrap_or(0);
-        let evr = versions.get(i).map(String::as_str).unwrap_or("");
-        let flag_str = sense_flag_str(raw_flags);
-        let mut entry = RpmEntry {
-            name,
-            flags: flag_str.map(str::to_string),
-            ..Default::default()
+        if d.name.starts_with('/')
+            && own_files.contains(d.name.as_str())
+            && is_primary_file(&d.name)
+        {
+            continue;
+        }
+        if provided.contains(&d.nfv_key()) {
+            continue;
+        }
+        let pre = d.flags & RPMSENSE_PRE_MASK != 0;
+        let flag_str = sense_flag_str(d.flags);
+        if last_by_name
+            .get(&d.name)
+            .is_some_and(|(f, v, p)| *f == flag_str && *v == d.evr && *p == pre)
+        {
+            continue;
+        }
+        let Some(mut entry) = d.entry() else {
+            continue;
         };
-        if flag_str.is_some() && !evr.is_empty() {
-            let (epoch, ver, rel) = split_evr(evr);
-            entry.epoch = Some(epoch);
-            entry.ver = ver;
-            entry.rel = rel;
+        if pre {
+            entry.pre = Some("1".to_string());
         }
-        if let Some((provides, own_files)) = requires_ctx {
-            if entry.name.starts_with("rpmlib(") {
-                continue;
-            }
-            if entry.name.starts_with('/')
-                && own_files.contains(entry.name.as_str())
-                && is_primary_file(&entry.name)
-            {
-                continue;
-            }
-            if provides.contains(&entry) {
-                continue;
-            }
-            if raw_flags & RPMSENSE_PRE_MASK != 0 {
-                entry.pre = Some("1".to_string());
-            }
-            if out.contains(&entry) {
-                continue;
-            }
-        }
+        last_by_name.insert(d.name, (flag_str, d.evr, pre));
         out.push(entry);
     }
     out
 }
 
 /// The package's file list in header order, typed the way `createrepo_c`
-/// types `<file>` elements (`dir`, `ghost`, or plain).
-fn file_entries(h: &HeaderIndex<'_>) -> Vec<RpmFileEntry> {
+/// types `<file>` elements (`dir`, `ghost`, or plain). Entries with an
+/// empty basename are dropped.
+fn file_entries(h: &HeaderIndex<'_>) -> std::result::Result<Vec<RpmFileEntry>, RpmHeaderError> {
     const S_IFMT: u64 = 0o170000;
     const S_IFDIR: u64 = 0o040000;
     const RPMFILE_GHOST: u64 = 1 << 6;
 
-    let basenames = h.string_array(RPMTAG_BASENAMES);
-    let paths: Vec<String> = if basenames.is_empty() {
-        h.string_array(RPMTAG_OLDFILENAMES)
+    let basenames = h.string_array(RPMTAG_BASENAMES)?;
+    let n;
+    let paths: Vec<Option<String>> = if basenames.is_empty() {
+        let old = h.string_array(RPMTAG_OLDFILENAMES)?;
+        n = old.len();
+        old.into_iter()
+            .map(|p| Some(p).filter(|p| !p.is_empty()))
+            .collect()
     } else {
-        let dirnames = h.string_array(RPMTAG_DIRNAMES);
-        let dirindexes = h.ints(RPMTAG_DIRINDEXES);
+        n = basenames.len();
+        let dirnames = h.string_array(RPMTAG_DIRNAMES)?;
+        let dirindexes = h.ints_n(RPMTAG_DIRINDEXES, n);
         basenames
             .into_iter()
             .enumerate()
             .map(|(i, base)| {
+                if base.is_empty() {
+                    return None;
+                }
                 let dir = dirindexes
                     .get(i)
                     .and_then(|&d| dirnames.get(d as usize))
                     .map(String::as_str)
                     .unwrap_or("");
-                format!("{dir}{base}")
+                Some(format!("{dir}{base}"))
             })
             .collect()
     };
-    let modes = h.ints(RPMTAG_FILEMODES);
-    let fflags = h.ints(RPMTAG_FILEFLAGS);
-    paths
+    let modes = h.ints_n(RPMTAG_FILEMODES, n);
+    let fflags = h.ints_n(RPMTAG_FILEFLAGS, n);
+    Ok(paths
         .into_iter()
         .enumerate()
-        .map(|(i, path)| {
+        .filter_map(|(i, path)| {
+            let path = path?;
             let kind = if modes.get(i).is_some_and(|m| m & S_IFMT == S_IFDIR) {
                 Some("dir")
             } else if fflags.get(i).is_some_and(|f| f & RPMFILE_GHOST != 0) {
@@ -714,12 +928,12 @@ fn file_entries(h: &HeaderIndex<'_>) -> Vec<RpmFileEntry> {
             } else {
                 None
             };
-            RpmFileEntry {
+            Some(RpmFileEntry {
                 path,
                 kind: kind.map(str::to_string),
-            }
+            })
         })
-        .collect()
+        .collect())
 }
 
 /// Repodata-only fields of an RPM header, beyond [`RpmMetadata`] (#3801).
@@ -1680,15 +1894,18 @@ mod tests {
 
     #[test]
     fn test_split_evr_and_sense_flags() {
-        assert_eq!(
-            split_evr("3:2.40-1"),
-            ("3".into(), Some("2.40".into()), Some("1".into()))
-        );
-        assert_eq!(split_evr("1.0"), ("0".into(), Some("1.0".into()), None));
-        assert_eq!(
-            split_evr("1.0-2-3"),
-            ("0".into(), Some("1.0-2".into()), Some("3".into()))
-        );
+        let evr = |e: &str, v: &str, r: Option<&str>| {
+            Some((e.to_string(), Some(v.to_string()), r.map(str::to_string)))
+        };
+        assert_eq!(split_evr("3:2.40-1"), evr("3", "2.40", Some("1")));
+        assert_eq!(split_evr("1.0"), evr("0", "1.0", None));
+        // createrepo_c's cr_str_to_evr splits at the FIRST hyphen.
+        assert_eq!(split_evr("1.0-2-3"), evr("0", "1.0", Some("2-3")));
+        assert_eq!(split_evr(":1.0"), evr("0", "1.0", None));
+        assert_eq!(split_evr("1.0-"), evr("0", "1.0", None));
+        // Non-numeric epoch: createrepo_c skips the whole dependency.
+        assert_eq!(split_evr("x:1.0"), None);
+        assert_eq!(split_evr("1a:1.0"), None);
         assert_eq!(sense_flag_str(RPMSENSE_LESS | RPMSENSE_EQUAL), Some("LE"));
         assert_eq!(sense_flag_str(RPMSENSE_GREATER), Some("GT"));
         assert_eq!(sense_flag_str(0), None);
@@ -1705,8 +1922,9 @@ mod tests {
     }
 
     // ========================================================================
-    // Hostile headers: every bounds/type guard must yield a clean "absent"
-    // value or Err, never a panic or an out-of-bounds read (#3801).
+    // Hostile headers: rpm's own limits (lib/header.cc hdrblobVerifyInfo)
+    // plus a total element budget bound the work; every guard answers with
+    // a clean Err, never a panic, an out-of-bounds read or unbounded output.
     // ========================================================================
 
     /// One header structure: intro (magic, version, nindex, hsize), index
@@ -1734,57 +1952,206 @@ mod tests {
         p
     }
 
-    #[test]
-    fn test_hostile_entry_offset_past_store_is_skipped() {
-        // NAME points exactly at the end of the store (offset == hsize) and
-        // VERSION far past it: `strings_at` would slice out of bounds.
-        let store = b"pkg\0";
-        let main = hostile_header(
-            &[
-                (RPMTAG_NAME, 6, store.len() as u32, 1),
-                (RPMTAG_VERSION, 6, u32::MAX, 1),
-                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 1_000, 3),
-            ],
-            store,
+    fn assert_malformed(main: &[u8]) {
+        assert!(
+            matches!(HeaderIndex::parse(main), Err(RpmHeaderError::Malformed(_))),
+            "header must be rejected as malformed"
         );
-        let h = HeaderIndex::parse(&main).unwrap();
-        assert!(h.entries.is_empty(), "out-of-store entries are dropped");
-        assert_eq!(h.string(RPMTAG_NAME), None);
-        assert!(h.string_array(RPMTAG_REQUIRENAME).is_empty());
-
-        let pkg = hostile_package(&main);
-        let meta = RpmHandler::parse_rpm_header(&pkg).unwrap();
-        assert_eq!(meta.name, "");
-        assert!(meta.requires.is_empty());
-        let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
-        assert!(info.requires.is_empty());
+        let pkg = hostile_package(main);
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::Malformed(_))
+        ));
+        assert!(RpmHandler::parse_rpm_header(&pkg).is_err());
     }
 
     #[test]
-    fn test_hostile_int_array_past_store_yields_nothing() {
-        // 8 bytes of store; INT32 arrays claiming 3 values (12 bytes) and
-        // u32::MAX values from inside the store, INT64 straddling the end.
+    fn test_hostile_entry_offset_past_store_is_rejected() {
+        // Offset exactly at the end of the store (offset == hsize), and far
+        // past it: rpm's hdrchkRange / dataLength reject both.
+        let store = b"pkg\0";
+        assert_malformed(&hostile_header(&[(RPMTAG_NAME, 6, 4, 1)], store));
+        assert_malformed(&hostile_header(&[(RPMTAG_VERSION, 6, u32::MAX, 1)], store));
+    }
+
+    #[test]
+    fn test_hostile_counts_are_rejected() {
         let store = [0u8, 0, 0, 7, 0, 0, 0, 9];
-        let main = hostile_header(
+        // INT32 array running past the store; u32::MAX count; zero count;
+        // unknown type; string array count > remaining bytes.
+        assert_malformed(&hostile_header(
+            &[(RPMTAG_EPOCH, RPM_INT32_TYPE, 0, 3)],
+            &store,
+        ));
+        assert_malformed(&hostile_header(
+            &[(RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 4, u32::MAX)],
+            &store,
+        ));
+        assert_malformed(&hostile_header(
+            &[(RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, u32::MAX)],
+            &store,
+        ));
+        assert_malformed(&hostile_header(
+            &[(RPMTAG_EPOCH, RPM_INT32_TYPE, 0, 0)],
+            &store,
+        ));
+        assert_malformed(&hostile_header(&[(RPMTAG_EPOCH, 42, 0, 1)], &store));
+        assert_malformed(&hostile_header(
+            &[(RPMTAG_LONGSIZE, RPM_INT64_TYPE, 4, 1)],
+            &store,
+        ));
+        // A string array whose declared strings are not all NUL-terminated
+        // inside the store (count fits the byte bound, strings do not).
+        let pkg = hostile_package(&hostile_header(
+            &[(RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 3)],
+            b"ab\0cd",
+        ));
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn test_hostile_rpm_header_limits_are_over_limit() {
+        // nindex over rpm's HEADER_TAGS_MAX, hsize over the data cap: both
+        // decided from the 16-byte intro, before anything else is read.
+        let mut many = vec![0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0];
+        many.extend_from_slice(&(RPM_HEADER_TAGS_MAX as u32 + 1).to_be_bytes());
+        many.extend_from_slice(&0u32.to_be_bytes());
+        assert!(matches!(
+            HeaderIndex::parse(&many),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        let mut big = vec![0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        big.extend_from_slice(&(RPM_HEADER_DATA_MAX as u32 + 1).to_be_bytes());
+        assert!(matches!(
+            HeaderIndex::parse(&big),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        let pkg = hostile_package(&many);
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+    }
+
+    /// Every list tag aliasing the SAME bytes: each tag is individually in
+    /// bounds, but together they would materialize millions of entries. The
+    /// shared budget rejects the header before any list is built.
+    #[test]
+    fn test_hostile_aliased_tags_hit_the_element_budget() {
+        // 8 MiB zero-filled store: 8M empty strings available to EVERY tag.
+        let store = vec![0u8; 8 * 1024 * 1024];
+        let n = store.len() as u32;
+        let entries: Vec<(u32, u32, u32, u32)> = REPODATA_LIST_TAGS
+            .iter()
+            .map(|&t| {
+                (
+                    t,
+                    RPM_STRING_ARRAY_TYPE,
+                    0,
+                    n.min(RPM_HEADER_ARRAY_MAX as u32),
+                )
+            })
+            .collect();
+        let pkg = hostile_package(&hostile_header(&entries, &store));
+        match RpmHandler::parse_rpm_repodata_info(&pkg) {
+            Err(RpmHeaderError::OverLimit(m)) => assert!(m.contains("entries"), "{m}"),
+            other => panic!("expected the element budget to reject, got {other:?}"),
+        }
+        // A single tag just over the budget is enough on its own.
+        let one = [(
+            RPMTAG_BASENAMES,
+            RPM_STRING_ARRAY_TYPE,
+            0,
+            RPM_MAX_LIST_ELEMENTS as u32 + 1,
+        )];
+        let pkg = hostile_package(&hostile_header(&one, &store));
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        // parse_rpm_header does not materialize over-budget lists either.
+        let meta = RpmHandler::parse_rpm_header(&hostile_package(&hostile_header(
             &[
-                (RPMTAG_EPOCH, RPM_INT32_TYPE, 0, 3),
-                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 4, u32::MAX),
-                (RPMTAG_LONGSIZE, RPM_INT64_TYPE, 4, 1),
-                (RPMTAG_BUILDTIME, RPM_INT32_TYPE, 4, 1),
+                (
+                    RPMTAG_PROVIDENAME,
+                    RPM_STRING_ARRAY_TYPE,
+                    0,
+                    RPM_MAX_LIST_ELEMENTS as u32,
+                ),
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 1),
             ],
             &store,
-        );
-        let h = HeaderIndex::parse(&main).unwrap();
-        assert!(h.ints(RPMTAG_EPOCH).is_empty());
-        assert!(h.ints(RPMTAG_REQUIREFLAGS).is_empty());
-        assert_eq!(h.int(RPMTAG_LONGSIZE), None);
-        // The in-bounds control entry still reads.
-        assert_eq!(h.int(RPMTAG_BUILDTIME), Some(9));
+        )))
+        .unwrap();
+        assert!(meta.provides.is_empty() && meta.requires.is_empty());
+    }
 
-        let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)).unwrap();
-        assert_eq!(info.epoch, None);
-        assert_eq!(info.installed_size, None);
-        assert_eq!(info.build_time, Some(9));
+    /// Within budget, empty names and basenames are dropped rather than
+    /// emitted as `<rpm:entry name=""/>` / `<file></file>`.
+    #[test]
+    fn test_empty_names_and_basenames_are_dropped() {
+        let store = b"\0\0real\0/d/\0";
+        let pkg = hostile_package(&hostile_header(
+            &[
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 3),
+                (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, 3),
+                (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, 7, 1),
+            ],
+            store,
+        ));
+        let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
+        assert_eq!(info.requires, vec![entry("real")]);
+        let files: Vec<&str> = info.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, vec!["real"], "no dirindexes: bare basename");
+    }
+
+    /// createrepo_c 1.2.1 on `ak-selfprov-test.spec`: a requirement is
+    /// dropped only when a provide has the identical name + flags + RAW
+    /// version string (`= 1.0` dropped, `= 0:1.0` kept); a duplicate is
+    /// judged against the last one kept under that name; `(pre,preun)` is
+    /// pre; the own non-primary file requirement stays.
+    #[test]
+    fn test_self_provided_requires_match_createrepo_c() {
+        const SELFPROV_RPM: &[u8] =
+            include_bytes!("../../tests/fixtures/ak-selfprov-test-2.0-1.noarch.rpm");
+        let info = RpmHandler::parse_rpm_repodata_info(SELFPROV_RPM).unwrap();
+        assert_eq!(
+            info.requires,
+            vec![
+                entry("/usr/bin/sh"),
+                entry("/usr/share/ak-selfprov/README"),
+                entry("ak-dup"),
+                pre(entry("ak-mixed-dep")),
+                entry("ak-selfprov-test"),
+                entry("ak-virt"),
+                versioned("ak-virt", "EQ", "0", "1.0", None),
+            ]
+        );
+    }
+
+    /// The quadratic-dedup scenario: requires and provides alias one list of
+    /// distinct names. With hashed lookups this is linear; every require is
+    /// satisfied by the identical provide and dropped.
+    #[test]
+    fn test_aliased_requires_and_provides_dedup_linearly() {
+        let mut store = Vec::new();
+        let n = 100_000u32;
+        for i in 0..n {
+            store.extend_from_slice(format!("{i:07}\0").as_bytes());
+        }
+        let pkg = hostile_package(&hostile_header(
+            &[
+                (RPMTAG_PROVIDENAME, RPM_STRING_ARRAY_TYPE, 0, n),
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, n),
+            ],
+            &store,
+        ));
+        let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
+        assert_eq!(info.provides.len(), n as usize);
+        assert!(info.requires.is_empty());
     }
 
     #[test]
@@ -1797,15 +2164,18 @@ mod tests {
                 (RPMTAG_EPOCH, 6, 0, 1),
                 (RPMTAG_SIZE, RPM_STRING_ARRAY_TYPE, 0, 2),
                 (RPMTAG_PROVIDEFLAGS, 7, 0, 2),
-                (RPMTAG_PROVIDENAME, RPM_INT32_TYPE, 3, 50),
+                (RPMTAG_PROVIDENAME, RPM_INT32_TYPE, 3, 1),
             ],
             store,
         );
         let h = HeaderIndex::parse(&main).unwrap();
-        assert!(h.ints(RPMTAG_EPOCH).is_empty());
-        assert!(h.ints(RPMTAG_SIZE).is_empty());
-        assert!(h.ints(RPMTAG_PROVIDEFLAGS).is_empty());
-        assert_eq!(h.string_array(RPMTAG_PROVIDENAME), vec!["abc".to_string()]);
+        assert!(h.ints_n(RPMTAG_EPOCH, usize::MAX).is_empty());
+        assert!(h.ints_n(RPMTAG_SIZE, usize::MAX).is_empty());
+        assert!(h.ints_n(RPMTAG_PROVIDEFLAGS, usize::MAX).is_empty());
+        assert_eq!(
+            h.string_array(RPMTAG_PROVIDENAME).unwrap(),
+            vec!["abc".to_string()]
+        );
 
         let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)).unwrap();
         assert_eq!(info.epoch, None);
