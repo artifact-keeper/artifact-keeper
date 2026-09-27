@@ -20485,6 +20485,28 @@ mod tests {
         assert_eq!(update.binds(), (None, Some(false)));
     }
 
+    /// Migration 245 (M1): the update trigger decides from which VALUE
+    /// changed, so a statement writing both columns can widen a repository
+    /// (a same-value `visibility` plus `is_public = true` lands `public`). The
+    /// service layer must therefore never bind both; pin it for every variant.
+    #[test]
+    fn visibility_update_never_binds_both_columns() {
+        use crate::models::repository::RepositoryVisibility as V;
+        for update in [
+            VisibilityUpdate::Unchanged,
+            VisibilityUpdate::ClearPublic,
+            VisibilityUpdate::Set(V::Public),
+            VisibilityUpdate::Set(V::Internal),
+            VisibilityUpdate::Set(V::Private),
+        ] {
+            let (visibility, is_public) = update.binds();
+            assert!(
+                visibility.is_none() || is_public.is_none(),
+                "{update:?} binds both visibility and is_public"
+            );
+        }
+    }
+
     #[test]
     fn public_visibility_allowed_when_guests_enabled() {
         assert!(require_public_visibility_allowed(true, true).is_ok());

@@ -3466,6 +3466,89 @@ mod tests {
             .ok();
     }
 
+    /// Migration 245 (M1): the UPDATE trigger decides from which VALUE
+    /// changed, not from which columns the statement named. A `visibility`
+    /// written equal to its current value alongside `is_public = true`
+    /// therefore does not win: the `is_public` branch runs and the repository
+    /// lands `public`. This is why the application never writes both columns
+    /// in one statement (`VisibilityUpdate::binds`); the test documents the
+    /// trigger's behaviour so a refactor that starts writing both is caught by
+    /// reading it, and so the trigger's semantics cannot drift silently.
+    #[tokio::test]
+    async fn visibility_trigger_same_value_visibility_with_is_public_true_widens() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+        let both = sqlx::query(
+            "UPDATE repositories SET visibility = 'internal', is_public = true WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await;
+        let row: std::result::Result<(String, bool), sqlx::Error> =
+            sqlx::query_as("SELECT visibility::text, is_public FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        both.expect("the pair is accepted by the trigger");
+        assert_eq!(
+            row.expect("read back"),
+            ("public".to_string(), true),
+            "a same-value visibility does not win over is_public = true"
+        );
+    }
+
+    /// Migration 245: the INSERT trigger refuses `is_public = true` with a
+    /// non-public `visibility` instead of resolving the contradiction.
+    #[tokio::test]
+    async fn visibility_trigger_insert_rejects_is_public_true_with_non_public_visibility() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        for visibility in ["internal", "private"] {
+            let id = Uuid::new_v4();
+            let key = format!("vis-insert-{}", &id.to_string()[..8]);
+            let res = sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                 is_public, visibility) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, true, \
+                 $4::repository_visibility)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/tmp/{key}"))
+            .bind(visibility)
+            .execute(&pool)
+            .await;
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            let err = res.expect_err("contradictory insert must be refused");
+            let db_err = err.as_database_error().expect("a database error");
+            assert_eq!(
+                db_err.code().as_deref(),
+                Some("23514"),
+                "{visibility}: expected check_violation, got {db_err}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // UpdateRepositoryRequest construction tests
     // -----------------------------------------------------------------------

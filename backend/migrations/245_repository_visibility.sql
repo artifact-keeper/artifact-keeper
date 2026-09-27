@@ -54,8 +54,9 @@ COMMENT ON COLUMN repositories.visibility IS
 
 COMMENT ON COLUMN repositories.is_public IS
     'DEPRECATED mirror of (visibility = ''public''), kept for API and Terraform '
-    'provider compatibility. Maintained by ak_repositories_sync_visibility; do '
-    'not write both columns in one statement expecting independent effects.';
+    'provider compatibility. Maintained by ak_repositories_sync_visibility. Never '
+    'write both columns in one UPDATE: the trigger compares values, so a '
+    'visibility equal to the current one plus is_public = true widens to public.';
 
 -- Listing, search, and the OCI/native read gates all filter on visibility, and
 -- `private` rows dominate on a typical instance. Index the two states that are
@@ -77,9 +78,15 @@ CREATE INDEX IF NOT EXISTS idx_repositories_visibility
 --           resolved. If it was not supplied, `visibility` is derived from
 --           `is_public`, which is the legacy insert path.
 --
---   UPDATE  Whichever column the statement actually changed is authoritative.
---           When a statement changes both, `visibility` wins, because that is
---           the modern client writing the authoritative field.
+--   UPDATE  Whichever column's VALUE changed is authoritative. When both
+--           values change, `visibility` wins. The trigger compares OLD and NEW
+--           and cannot see which columns the statement named in SET, so a
+--           `visibility` written equal to its current value does NOT win: an
+--           UPDATE that sets `visibility = 'internal', is_public = true` on an
+--           internal repository takes the `is_public` branch and lands
+--           `public`. The application therefore never writes both columns in
+--           one statement (`VisibilityUpdate::binds` in the repositories
+--           handler, pinned by a unit test); direct SQL must not either.
 --
 -- Deriving from the column that CHANGED, rather than from the column's value,
 -- is what makes an `internal` repository safe under a legacy full-object write.
