@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3785]
+---
+- **npm Remote repositories now rewrite and proxy tarball URLs from upstreams that do not use the npmjs `/-/` layout, such as GitHub Packages** (#3785). A packument served through a Remote whose upstream is `https://npm.pkg.github.com` kept GitHub's `/download/@scope/pkg/<version>/<hash>` tarball URLs, so clients bypassed the proxy and failed without GitHub credentials. Any tarball URL on the configured upstream's host is now rewritten to this repository's `/npm/<repo>/@scope/pkg/-/pkg-<version>.tgz` route, and the download fetches the original upstream URL with the repository's upstream credentials only when it is on the same origin (scheme, host and port; URLs carrying a username or password are rejected). Virtual repositories resolve these tarballs through the normal priority-ordered member walk, so member priority, local ownership and caching behave as before. The separate proxy-cache catalog "Artifact not found" on delete reported alongside this is tracked in #4305.
