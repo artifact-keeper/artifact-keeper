@@ -918,7 +918,10 @@ pub fn read_metadata_from_tar_limited<R: Read>(
 /// and no total-stream budget is needed; instead an entry-count cap is checked
 /// up front and the matched entry is read through a header-size pre-check plus
 /// the per-entry `.take()` cap — exactly swift's `extract_manifest_from_zip`
-/// pattern. `matches` selects the target entry by its name.
+/// pattern. `matches` selects the target entry by its name, read from the
+/// central directory BEFORE the entry is opened (#3886): an unmatched entry
+/// is never opened, so a corrupt or unsupported entry that is not the target
+/// no longer fails the read.
 pub fn read_metadata_from_zip<R: Read + Seek>(
     reader: R,
     matches: impl Fn(&str) -> bool,
@@ -1227,6 +1230,112 @@ mod tests {
         let err =
             read_metadata_from_zip_limited(cursor, |n| n.ends_with(".nuspec"), 5, 1024 * 1024);
         assert!(err.is_err(), "zip entry-count breach must reject");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3886: PyPI's wheel lookup raised ITS entry cap to 1,000,000 and the walk
+    // now matches on the central-directory name before opening an entry. The
+    // default `read_metadata_from_zip` callers (nuget, composer, vscode, the
+    // scanner) must keep the 10,000-entry cap, and the 8 MiB inflate cap must
+    // still fire under the raised lookup cap.
+    // -----------------------------------------------------------------------
+
+    fn zip_with_filler(filler: usize, target: &str, data: &[u8], deflate: bool) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let target_opts = if deflate {
+                stored.compression_method(zip::CompressionMethod::Deflated)
+            } else {
+                stored
+            };
+            for i in 0..filler {
+                w.start_file(format!("f/{i}"), stored).unwrap();
+            }
+            w.start_file(target, target_opts).unwrap();
+            w.write_all(data).unwrap();
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn default_zip_callers_keep_entry_cap_3886() {
+        let json = br#"{"name":"acme/pkg","version":"1.0.0"}"#;
+        // A non-PyPI caller: composer's upload parser goes through
+        // `read_metadata_from_zip` with the shared cap.
+        let ok = zip_with_filler(10, "composer.json", json, false);
+        assert!(crate::formats::composer::ComposerHandler::parse_composer_json(&ok).is_ok());
+        let over = zip_with_filler(
+            MAX_INGEST_ARCHIVE_ENTRIES as usize,
+            "composer.json",
+            json,
+            false,
+        );
+        let err = crate::formats::composer::ComposerHandler::parse_composer_json(&over)
+            .expect_err("composer must still refuse > MAX_INGEST_ARCHIVE_ENTRIES");
+        assert!(err.to_string().contains("too many entries"), "{err}");
+        assert!(read_metadata_from_zip(std::io::Cursor::new(&over), |n| n
+            .ends_with("composer.json"))
+        .is_err());
+    }
+
+    #[test]
+    fn default_zip_callers_keep_inflate_cap_3886() {
+        let bomb = vec![0u8; (MAX_INGEST_METADATA_ENTRY_BYTES + 1) as usize];
+        let archive = zip_with_filler(0, "composer.json", &bomb, true);
+        assert!(
+            archive.len() < 1024 * 1024,
+            "premise: the entry is a small deflate bomb"
+        );
+        assert!(crate::formats::composer::ComposerHandler::parse_composer_json(&archive).is_err());
+    }
+
+    /// The raised lookup cap bounds only the name walk: the one matched entry
+    /// is still refused past `MAX_INGEST_METADATA_ENTRY_BYTES`, both when its
+    /// header is honest and when it understates the inflated size.
+    #[test]
+    fn raised_entry_cap_still_enforces_inflate_cap_3886() {
+        let bomb = vec![0u8; (MAX_INGEST_METADATA_ENTRY_BYTES + 1) as usize];
+        let is_meta = |n: &str| n == "demo-1.0.dist-info/METADATA";
+        let honest = zip_with_filler(10_001, "demo-1.0.dist-info/METADATA", &bomb, true);
+        assert!(read_metadata_from_zip_limited(
+            std::io::Cursor::new(&honest),
+            is_meta,
+            1_000_000,
+            MAX_INGEST_METADATA_ENTRY_BYTES,
+        )
+        .is_err());
+
+        // Rewrite every recorded uncompressed size of the target to 16 bytes
+        // (local header offset 22, central directory offset 24), so the
+        // header pre-check passes and only the streaming `.take()` cap stands.
+        let mut lying = zip_with_filler(0, "demo-1.0.dist-info/METADATA", &bomb, true);
+        let patch = |buf: &mut Vec<u8>, sig: &[u8], off: usize| {
+            let mut i = 0;
+            while let Some(p) = buf[i..].windows(4).position(|w| w == sig) {
+                let at = i + p + off;
+                buf[at..at + 4].copy_from_slice(&16u32.to_le_bytes());
+                i = i + p + 4;
+            }
+        };
+        patch(&mut lying, b"PK\x03\x04", 22);
+        patch(&mut lying, b"PK\x01\x02", 24);
+        match read_metadata_from_zip_limited(
+            std::io::Cursor::new(&lying),
+            is_meta,
+            1_000_000,
+            MAX_INGEST_METADATA_ENTRY_BYTES,
+        ) {
+            Err(_) => {}
+            Ok(Some(bytes)) => assert!(
+                bytes.len() as u64 <= MAX_INGEST_METADATA_ENTRY_BYTES,
+                "a lying header must not inflate past the cap"
+            ),
+            Ok(None) => {}
+        }
     }
 
     #[test]

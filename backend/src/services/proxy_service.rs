@@ -13322,6 +13322,32 @@ mod tests {
         );
     }
 
+    /// `is_upstream_forbidden` recognises 403 by the message
+    /// `validate_upstream_status` writes (AppError carries no status code, and
+    /// adding a variant would touch every exhaustive match on it). Pin the
+    /// pair against the PRODUCER, not a hand-written string, so a rewording of
+    /// that message fails here instead of silently turning PyPI's #3886 403
+    /// sidecar fallback back into a 502.
+    #[test]
+    fn test_is_upstream_forbidden_tracks_validate_upstream_status_3886() {
+        let err = |s: StatusCode| {
+            validate_upstream_status(s, "https://up.example/x").expect_err("non-2xx must fail")
+        };
+        assert!(is_upstream_forbidden(&err(StatusCode::FORBIDDEN)));
+        for other in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                !is_upstream_forbidden(&err(other)),
+                "{other} must not be classified as an upstream 403"
+            );
+        }
+    }
+
     #[test]
     fn test_validate_upstream_status_2xx_is_ok() {
         validate_upstream_status(StatusCode::OK, "http://x").expect("200 must pass");
