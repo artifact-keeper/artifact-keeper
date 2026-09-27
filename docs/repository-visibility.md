@@ -69,34 +69,20 @@ it is disabled, no anonymous request is served at all, so a `public` repository
 is unreachable by the audience that makes it public.
 
 A request to create or update a repository as `public` while guest access is
-disabled is therefore **coerced to `private`**, and the coercion is logged as a
-structured warning. This is long-standing behaviour; adding `internal` did not
-change it.
+disabled is therefore **refused with a 400** (#3855) that names
+`AK_GUEST_ACCESS_ENABLED=false`. Earlier versions silently coerced such a request
+to `private`, which a Terraform provider read back as drift on every plan.
 
-Coercing to `private` is lossy, and deliberately so. `internal` is visibly the
-state that would preserve the operator's intent — anonymous access still
-impossible, "broadly readable" retained — and coercing to it was considered and
-rejected. The reason is who reaches the coercion at all. A caller who can name
-`internal` is never coerced: `internal` does not ask for anonymous access, so it
-passes through untouched. The callers that *are* coerced are the ones speaking
-only the deprecated boolean — the Terraform provider, older SDKs — whose
-`is_public: true` is read as `public` before the coercion runs. They can neither
-ask for `internal` nor decline it, so coercing them to it would quietly make
-their repositories org-readable on exactly the instances that disabled guest
-access to prevent that.
+`internal` is never refused: it does not ask for anonymous access, so it passes
+the guest-access check untouched. The request is not rewritten to `internal`
+either. The callers that send `public` on such an instance are mostly the ones
+speaking only the deprecated boolean (the Terraform provider, older SDKs), which
+can neither ask for `internal` nor decline it, so rewriting them to it would
+quietly make their repositories org-readable on exactly the instances that
+disabled guest access to prevent that. An operator who wants `internal` asks for
+it.
 
-So an operator who wants `internal` has to ask for it. Whether the coercion
-should eventually target `internal` is a live question, tracked separately; what
-is true today is that it does not.
-
-Note that the coercion is **silent to the client** in either direction: the
-request succeeds, the repository is created with a visibility the caller did not
-ask for, and the only record is a server-side warning. A Terraform provider
-reads the substituted value back as drift and proposes the same change on every
-subsequent plan. Tracked as artifact-keeper#3855.
-
-Visibility itself is never changed by toggling the policy. Only requests that
-explicitly ask for `public` while guests are disabled are affected.
+Visibility itself is never changed by toggling the policy.
 
 ## API representation
 
@@ -143,11 +129,11 @@ user table.
 
 ## Upgrading
 
-Migration 235 introduces the column and backfills it from the previous boolean:
+Migration 245 introduces the column and backfills it from the previous boolean:
 `is_public = true` becomes `public`, `false` becomes `private`. No repository
 becomes `internal` automatically, and no repository's audience changes.
 
 Repositories that were *meant* to be internal but were coerced to
-`is_public = false` by the guest-access rule above — which this change leaves in
-place — cannot be recovered from the data — they are indistinguishable from ordinary private repositories. See the
-upgrade note in [`CHANGELOG.md`](../CHANGELOG.md) for the review query.
+`is_public = false` by the pre-#3855 guest-access coercion cannot be recovered
+from the data: they are indistinguishable from ordinary private repositories. See
+the upgrade note in the release's `CHANGELOG.md` entry for the review query.
