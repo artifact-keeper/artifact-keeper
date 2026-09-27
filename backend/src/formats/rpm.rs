@@ -554,8 +554,9 @@ fn rendered_len(raw: &[u8]) -> usize {
                 .valid()
                 .bytes()
                 .map(|b| match b {
-                    b'&' | b'<' | b'>' => 4,
-                    b'"' | b'\'' => 5,
+                    b'&' => 4,         // &amp;
+                    b'<' | b'>' => 3,  // &lt; &gt;
+                    b'"' | b'\'' => 5, // &quot; &apos;
                     _ => 0,
                 })
                 .sum();
