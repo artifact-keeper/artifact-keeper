@@ -317,7 +317,9 @@ async fn create_session(
         (status = 400, description = "Invalid chunk or Content-Range", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
-        (status = 410, description = "Session expired", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Another request is uploading this chunk right now; retry shortly", body = crate::api::openapi::ErrorResponse),
+        (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Staging storage or database temporarily unavailable; retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -444,7 +446,7 @@ async fn upload_chunk(
     responses(
         (status = 200, description = "Session status", body = SessionStatusResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
-        (status = 410, description = "Session expired", body = crate::api::openapi::ErrorResponse),
+        (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -459,6 +461,11 @@ async fn get_session_status(
     let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
+    // A pre-upgrade session cannot be continued; answer 410 so a client that
+    // checks status before resuming discards it and starts a new one.
+    if !session.staged_in_storage {
+        return Err(map_upload_err(UploadError::LegacySession));
+    }
 
     Ok(Json(SessionStatusResponse {
         session_id: session.id,
@@ -496,7 +503,8 @@ async fn get_session_status(
             (2) Immutable path occupied (#3924): an artifact already exists at this path and may not be overwritten. \
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
             so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
-        (status = 410, description = "Session expired", body = crate::api::openapi::ErrorResponse),
+        (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Staging storage or database temporarily unavailable; the session is left completable, retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1019,8 +1027,10 @@ fn map_upload_err(e: UploadError) -> Response {
         // Staged chunks live in the repository's storage backend (#3918); a
         // failure reaching it is transient from the client's point of view.
         // A pre-upgrade session cannot be continued; the client must start a
-        // new one.
-        UploadError::LegacySession => (StatusCode::CONFLICT, e.to_string()),
+        // new one. 410 (not 409, which means "chunk in progress, retry") is
+        // what the web UI and CLI already treat as "discard the saved session
+        // and start over".
+        UploadError::LegacySession => (StatusCode::GONE, e.to_string()),
         UploadError::Storage(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Storage backend error; retry the request".into(),
@@ -4389,6 +4399,68 @@ mod tests {
         );
 
         cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
+    }
+
+    #[test]
+    fn legacy_session_is_gone_and_chunk_in_progress_stays_conflict() {
+        let gone = map_upload_err(UploadError::LegacySession);
+        assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(
+            map_upload_err(UploadError::ChunkInProgress(3)).status(),
+            StatusCode::CONFLICT,
+            "409 keeps its retryable chunk-in-progress meaning"
+        );
+    }
+
+    /// A session created before the upgrade (bytes on one replica's disk)
+    /// answers 410 on status, PATCH and complete, which the web UI and CLI
+    /// treat as "drop the saved session and start a new one"; a 409 made them
+    /// retry the dead session until it expired.
+    #[tokio::test]
+    async fn legacy_session_answers_gone_on_status_patch_and_complete() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"legacy-session-bytes";
+        let (session_id, staged) = stage_completable_session(&f, payload).await;
+        sqlx::query("UPDATE upload_sessions SET staged_in_storage = FALSE WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("mark legacy");
+
+        let requests = [
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/{}", session_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            axum::http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/{}", session_id))
+                .header(
+                    "content-range",
+                    format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+                )
+                .body(axum::body::Body::from(payload.to_vec()))
+                .unwrap(),
+            complete_req(session_id),
+        ];
+        for req in requests {
+            let label = format!("{} {}", req.method(), req.uri());
+            let auth = tdh::make_auth(f.user_id, &f.username);
+            let app = upload_router_with_auth(f.state.clone(), auth);
+            let (status, body) = tdh::send(app, req).await;
+            assert_eq!(status, StatusCode::GONE, "{label}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("earlier server version"),
+                "{label}: body must explain why: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        cleanup_staged_session(&f, session_id, &staged).await;
         f.teardown().await;
     }
 
