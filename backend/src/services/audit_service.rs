@@ -128,6 +128,14 @@ pub enum AuditAction {
     // state. Appended at the END of the enum to keep the additive change
     // conflict-free with in-flight taxonomy work.
     ProxyScanVerdictDeleted,
+
+    // CI OIDC group binding reconciled on a mapping write (#4117, #4235
+    // review). Recorded when an admin's create/update of an identity mapping
+    // changed its service account's group memberships, so a grant or a
+    // revocation made through a binding is reviewable after the fact.
+    // Appended at the END of the enum to keep the additive change
+    // conflict-free with in-flight taxonomy work.
+    CiOidcGroupBindingReconciled,
 }
 
 impl AuditAction {
@@ -188,6 +196,7 @@ impl AuditAction {
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
             AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
+            AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
         }
     }
 }

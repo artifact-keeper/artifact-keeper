@@ -202,7 +202,7 @@ async fn exchange_validated_claims(
             &auth_service,
             credentials,
             mapping.allowed_repo_ids.clone(),
-            mapping.group_binding_ids.clone(),
+            mapping.group_binding_ids.is_some().then_some(mapping.id),
             assertion_expiry(claims),
         )
     };
@@ -253,7 +253,7 @@ async fn mint_ci_session(
     auth_service: &AuthService,
     credentials: FederatedCredentials,
     allowed_repo_ids: Option<Vec<Uuid>>,
-    group_binding_ids: Option<Vec<Uuid>>,
+    bound_mapping_id: Option<Uuid>,
     assertion_exp: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(User, TokenPair)> {
     let user = auth_service
@@ -278,25 +278,45 @@ async fn mint_ci_session(
     // Reconcile the account's group memberships to the mapping's binding on
     // EVERY exchange (design D3), not only on mapping write: this is what
     // makes the binding authoritative in practice, self-healing against any
-    // membership added by other means. Skipped entirely when the mapping
-    // declares no binding (`None`) — an unbound mapping's account keeps
-    // whatever memberships it already holds (design D2). Best-effort, like
-    // the SSO/LDAP group syncs this mirrors (`sso.rs`): a reconcile failure
-    // does not fail the exchange, since the next exchange retries and the
-    // account's *existing* memberships (from the last successful reconcile,
-    // or none yet) are still a coherent state, never a mix of two syncs.
-    if let Some(target_group_ids) = group_binding_ids {
-        if let Err(e) = svc
-            .reconcile_group_binding(user.id, &target_group_ids)
-            .await
-        {
-            tracing::warn!(
-                target: "security",
-                user_id = %user.id,
-                error = %e,
-                "CI OIDC: failed to reconcile service account's group binding; \
-                 exchange still succeeds, the next one retries"
-            );
+    // membership added by other means. `bound_mapping_id` is `Some` only when
+    // the resolved mapping declared a binding; an unbound mapping's account
+    // keeps whatever memberships it already holds (design D2), with no query
+    // on this path.
+    //
+    // Fails closed (design D7). The binding is the authorization control
+    // itself, not a mirror of an external IdP, so an exchange that cannot
+    // enforce it mints nothing: a token issued now would be backed by
+    // memberships the mapping may no longer grant. The reconciler reads the
+    // binding as stored rather than the copy resolved at the start of this
+    // exchange, so a narrowing committed in between is not undone here.
+    if let Some(mapping_id) = bound_mapping_id {
+        match svc.reconcile_mapping_binding(mapping_id, user.id).await {
+            Ok(_) => {}
+            Err(AppError::NotFound(_)) => {
+                tracing::warn!(
+                    target: "security",
+                    user_id = %user.id,
+                    mapping_id = %mapping_id,
+                    "CI OIDC: identity mapping deleted during the exchange; refusing"
+                );
+                return Err(AppError::Authentication(
+                    "The CI identity mapping for this exchange no longer exists".into(),
+                ));
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "security",
+                    user_id = %user.id,
+                    mapping_id = %mapping_id,
+                    error = %e,
+                    "CI OIDC: failed to reconcile service account's group binding; \
+                     refusing the exchange"
+                );
+                return Err(AppError::ServiceUnavailable(
+                    "Could not apply the CI identity mapping's group binding; retry the exchange"
+                        .into(),
+                ));
+            }
         }
     }
 
@@ -2044,67 +2064,212 @@ mod tests {
             fx.cleanup().await;
         }
 
-        /// Design D3: reconciliation on the exchange is best-effort. When it
-        /// fails the credential is still minted, and the account keeps the
-        /// memberships from its last successful reconcile — here the one the
-        /// mapping write performed — rather than losing them.
-        #[tokio::test]
-        async fn a_failed_reconcile_does_not_fail_the_exchange() {
-            let Some(mut fx) = Fixture::new().await else {
-                return;
-            };
-            let repo_id = fx.repo().await;
-            let group_id = fx.group_granting(repo_id, &["read"]).await;
-            let (_mapping_id, account_id) = fx
-                .mapping(
-                    json!({"project_path": "group/app"}),
-                    None,
-                    Some(vec![group_id]),
-                )
-                .await;
-            let claims = gitlab("group/app", "main");
+        /// Resolve `claims` to its mapping and credentials exactly as an
+        /// exchange does, stopping short of the mint, so a test can mint
+        /// through a service of its choosing or with a stale mapping.
+        async fn resolved(
+            fx: &Fixture,
+            claims: &serde_json::Value,
+        ) -> (
+            crate::services::ci_oidc_service::CiOidcIdentityMapping,
+            crate::services::auth_service::FederatedCredentials,
+        ) {
             let provider = fx.svc.get(fx.provider_id).await.unwrap();
             let mapping = fx
                 .svc
-                .resolve_mapping(fx.provider_id, &claims)
+                .resolve_mapping(fx.provider_id, claims)
                 .await
                 .unwrap();
             let credentials = fx
                 .svc
                 .resolve_service_account(
                     &mapping,
-                    CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims),
+                    CiOidcService::extract_identity_from_mapping(&provider, &mapping, claims),
                 )
                 .await
                 .unwrap();
+            (mapping, credentials)
+        }
 
-            // A service whose every query fails: nothing listens on port 1.
+        /// A service whose every query fails: nothing listens on port 1.
+        fn broken_svc() -> CiOidcService {
             let unreachable = sqlx::postgres::PgPoolOptions::new()
                 .acquire_timeout(std::time::Duration::from_millis(200))
                 .connect_lazy("postgresql://nobody:nobody@127.0.0.1:1/none")
                 .expect("lazy pool");
-            let broken_svc = CiOidcService::new(unreachable);
+            CiOidcService::new(unreachable)
+        }
+
+        async fn refresh_jtis(pool: &PgPool, user_id: Uuid) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        /// Design D7, spec "An exchange that cannot reconcile issues
+        /// nothing": the binding is the authorization control, so a bound
+        /// mapping whose reconcile fails refuses the exchange with a
+        /// retryable 503 and mints no access or refresh token.
+        #[tokio::test]
+        async fn a_failed_reconcile_refuses_the_exchange() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+            let (_mapping, credentials) = resolved(&fx, &gitlab("group/app", "main")).await;
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
 
-            let (user, tokens) = mint_ci_session(
+            let err = mint_ci_session(
                 &fx.pool,
-                &broken_svc,
+                &broken_svc(),
                 &auth_service,
                 credentials,
                 None,
-                // A binding the reconcile would have to act on: dropping the
-                // group the account holds.
-                Some(vec![]),
+                Some(mapping_id),
                 None,
             )
             .await
-            .expect("the exchange succeeds although the reconcile failed");
+            .expect_err("a bound exchange whose reconcile fails must mint nothing");
+
+            assert!(
+                matches!(err, crate::error::AppError::ServiceUnavailable(_)),
+                "got: {err}"
+            );
+            assert_eq!(refresh_jtis(&fx.pool, account_id).await, 0);
+            fx.cleanup().await;
+        }
+
+        /// Spec "An unbound mapping is unaffected by reconciliation
+        /// failures": with no binding there is nothing to enforce, so no
+        /// reconcile is attempted and the exchange succeeds even where one
+        /// would have failed.
+        #[tokio::test]
+        async fn an_unbound_exchange_never_fails_on_reconcile() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let (_mapping_id, account_id) = fx
+                .mapping(json!({"project_path": "group/app"}), None, None)
+                .await;
+            let (mapping, credentials) = resolved(&fx, &gitlab("group/app", "main")).await;
+            let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+
+            let (user, _tokens) = mint_ci_session(
+                &fx.pool,
+                &broken_svc(),
+                &auth_service,
+                credentials,
+                None,
+                mapping.group_binding_ids.is_some().then_some(mapping.id),
+                None,
+            )
+            .await
+            .expect("an unbound exchange does not touch the reconciler");
 
             assert_eq!(user.id, account_id);
+            fx.cleanup().await;
+        }
+
+        /// Design D7, spec "An exchange in flight cannot undo a narrowing":
+        /// an exchange resolves the mapping while it binds {a, b}; an
+        /// operator narrows it to {b} before that exchange reconciles. The
+        /// exchange then reconciles to what is stored, so `a` stays revoked.
+        #[tokio::test]
+        async fn an_exchange_in_flight_cannot_undo_a_narrowing() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_a = fx.repo().await;
+            let repo_b = fx.repo().await;
+            let group_a = fx.group_granting(repo_a, &["read"]).await;
+            let group_b = fx.group_granting(repo_b, &["read"]).await;
+            let (mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_a, group_b]),
+                )
+                .await;
+            let (stale, credentials) = resolved(&fx, &gitlab("group/app", "main")).await;
+            assert_eq!(stale.group_binding_ids.as_ref().map(Vec::len), Some(2));
+
+            fx.set_binding(mapping_id, Some(vec![group_b])).await;
+
+            let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+            let (_user, tokens) = mint_ci_session(
+                &fx.pool,
+                &fx.svc,
+                &auth_service,
+                credentials,
+                stale.allowed_repo_ids.clone(),
+                stale.group_binding_ids.is_some().then_some(stale.id),
+                None,
+            )
+            .await
+            .expect("the exchange succeeds");
+
             assert!(
-                fx.can(&tokens, repo_id, RepoAccess::READ).await,
-                "the membership from the last successful reconcile is kept"
+                !fx.can(&tokens, repo_a, RepoAccess::READ).await,
+                "the exchange must not restore the group the narrowing removed"
             );
+            assert!(fx.can(&tokens, repo_b, RepoAccess::READ).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "Deleting a mapping withdraws its conferral", mid-exchange:
+        /// a mapping deleted after the exchange resolved it refuses as an
+        /// authentication failure rather than minting.
+        #[tokio::test]
+        async fn a_mapping_deleted_mid_exchange_refuses() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+            let (_mapping, credentials) = resolved(&fx, &gitlab("group/app", "main")).await;
+            // Remove only the mapping row: the account stays active, so the
+            // refusal can only come from the reconcile finding no mapping.
+            sqlx::query("DELETE FROM ci_oidc_identity_mappings WHERE id = $1")
+                .bind(mapping_id)
+                .execute(&fx.pool)
+                .await
+                .unwrap();
+
+            let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+            let err = mint_ci_session(
+                &fx.pool,
+                &fx.svc,
+                &auth_service,
+                credentials,
+                None,
+                Some(mapping_id),
+                None,
+            )
+            .await
+            .expect_err("a deleted mapping must not mint");
+
+            assert!(
+                matches!(err, crate::error::AppError::Authentication(_)),
+                "got: {err}"
+            );
+            assert_eq!(refresh_jtis(&fx.pool, account_id).await, 0);
             fx.cleanup().await;
         }
     }

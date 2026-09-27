@@ -145,13 +145,33 @@ account are likewise re-derived on every exchange, the same way as for other
 federated accounts, and are not a place to grant CI access.
 
 **Revocation window.** Narrowing a binding reconciles immediately when you
-write the mapping, so a request made *after* your `PUT` sees the narrower
-access right away — permissions are checked live against the database, not
-baked into the token at mint time. A credential a pipeline had already been
-handed keeps working as a bearer token until it expires (default 15 minutes);
-what it can *do* with that token is re-evaluated on every request against the
-current binding, same as any other credential. There is no separate
-revocation list — shorten the access-token TTL if you need a tighter bound.
+write the mapping, in the same transaction as the write, so a request made
+*after* your `PUT` returns sees the narrower access right away — group grants
+are not baked into the token at mint time. The write also clears the
+permission cache on the replica that served it; other replicas are told to
+clear theirs through the database's cache-invalidation notifications, and a
+replica that has lost that connection falls back to the cache's 30-second
+expiry. A credential a pipeline had already been handed keeps working as a
+bearer token until it expires (default 15 minutes); what it can *do* with
+that token is re-evaluated on every request against the current binding, same
+as any other credential. There is no separate revocation list — shorten the
+access-token TTL if you need a tighter bound.
+
+**A binding is enforced or nothing happens.** If a mapping write cannot
+reconcile its binding, the write fails and nothing changes: the mapping keeps
+its previous binding and the account its previous memberships (a failed
+create leaves no mapping and no account, so retrying it is safe). If an
+exchange through a bound mapping cannot reconcile, it is refused with `503`
+and no token is issued; the pipeline can retry. An exchange that was already
+under way when you narrowed a binding applies the narrowed binding, never the
+one it started with. Mappings without a binding never refuse an exchange on
+these grounds.
+
+**Every membership change is audited.** A mapping create or update that adds
+or removes memberships writes a `CI_OIDC_GROUP_BINDING_RECONCILED` entry to
+the audit log, naming the mapping, the service account, and the groups added,
+removed, or no longer existing. A write that changes no membership writes no
+entry.
 
 **Adopting a binding on a mapping that already has hand-wired access:**
 declare the binding, verify the pipeline still authenticates and acts
