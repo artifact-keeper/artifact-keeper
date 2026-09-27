@@ -4377,4 +4377,253 @@ mod tests {
         assert_eq!(disc_status, StatusCode::OK);
         assert_eq!(disc["available_versions"]["v3"], "v3/");
     }
+
+    /// #3873 paging edges the walk test does not reach. `offset` without
+    /// `limit` pages with the whole list as the page size, so every link is
+    /// spelled with that same `limit` and following any of them is a valid
+    /// request; an offset off a page boundary pages from where it was asked;
+    /// a paged request on an empty list answers count 0 with `first`/`last` at
+    /// offset 0 and nothing to step to.
+    #[test]
+    fn test_galaxy_paginated_list_paging_edges_3873() {
+        let o = page_of("/p/?offset=2", 5);
+        assert_eq!(o["meta"]["count"], 5);
+        assert_eq!(
+            o["data"],
+            serde_json::json!([{ "i": 2 }, { "i": 3 }, { "i": 4 }])
+        );
+        assert_eq!(o["links"]["first"], "/p/?limit=5&offset=0");
+        assert_eq!(o["links"]["previous"], "/p/?limit=5&offset=0");
+        assert_eq!(o["links"]["next"], serde_json::Value::Null);
+        assert_eq!(o["links"]["last"], "/p/?limit=5&offset=0");
+
+        let u = page_of("/p/?limit=2&offset=1", 5);
+        assert_eq!(u["data"], serde_json::json!([{ "i": 1 }, { "i": 2 }]));
+        assert_eq!(u["links"]["previous"], "/p/?limit=2&offset=0");
+        assert_eq!(u["links"]["next"], "/p/?limit=2&offset=3");
+        assert_eq!(u["links"]["last"], "/p/?limit=2&offset=4");
+
+        let e = page_of("/p/?limit=2", 0);
+        assert_eq!(e["meta"]["count"], 0);
+        assert_eq!(e["data"], serde_json::json!([]));
+        assert_eq!(e["links"]["first"], "/p/?limit=2&offset=0");
+        assert_eq!(e["links"]["previous"], serde_json::Value::Null);
+        assert_eq!(e["links"]["next"], serde_json::Value::Null);
+        assert_eq!(e["links"]["last"], "/p/?limit=2&offset=0");
+    }
+
+    /// #3873, the negative side of the generic-route dispatch: only the Galaxy
+    /// read endpoints are diverted. A stored artifact at any other path of an
+    /// Ansible repository -- including ones that merely start with `api` or sit
+    /// under the upstream-only `api/v3/plugin/...` tree -- is still served by
+    /// the ordinary artifact route, bytes and 404s alike.
+    #[tokio::test]
+    async fn test_generic_route_serves_non_galaxy_paths_as_artifacts_3873() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let stored = [
+            "testns-testcoll-1.0.0.tar.gz",
+            "some/dir/file.txt",
+            "apidocs/readme.md",
+            "api-v2/x",
+            "api/v3/plugin/ansible/content/x.txt",
+        ];
+        for (i, path) in stored.iter().enumerate() {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("key-3873-neg-{i}"),
+                path,
+                &format!("neg-artifact{i}"),
+                "1.0.0",
+                "application/octet-stream",
+                bytes::Bytes::from(format!("bytes-of:{path}")),
+                f.user_id,
+            )
+            .await;
+        }
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+
+        let gbase = format!("/api/v1/repositories/{}/download", f.repo_key);
+        let mut got = Vec::new();
+        for path in stored {
+            let (status, body) = tdh::send(
+                generic_download_app(f.state.clone()),
+                tdh::get(format!("{gbase}/{path}")),
+            )
+            .await;
+            got.push((path, status, body));
+        }
+        let (missing_status, missing_body) = tdh::send(
+            generic_download_app(f.state.clone()),
+            tdh::get(format!("{gbase}/api/v3/plugin/ansible/content/missing.txt")),
+        )
+        .await;
+
+        f.teardown().await;
+
+        for (path, status, body) in got {
+            assert_eq!(status, StatusCode::OK, "GET {path}");
+            assert_eq!(
+                &body[..],
+                format!("bytes-of:{path}").as_bytes(),
+                "GET {path} must return the stored artifact, not a Galaxy document"
+            );
+        }
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&missing_body) {
+            assert!(
+                v.get("links").is_none() && v.get("data").is_none(),
+                "a non-Galaxy miss is the ordinary 404, not a Galaxy list: {v}"
+            );
+        }
+    }
+
+    /// #3873: on a Remote repository an upstream-only path (not one of the
+    /// Galaxy read endpoints) still goes to the raw proxy, byte for byte.
+    #[tokio::test]
+    async fn test_generic_route_proxies_upstream_only_path_on_remote_3873() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let upstream_only =
+            "api/v3/plugin/ansible/content/published/collections/artifacts/testns-testcoll-1.5.1.tar.gz";
+        Mock::given(method("GET"))
+            .and(path(format!("/{upstream_only}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"raw-upstream-bytes".to_vec()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = generic_download_app_for(&f, state).await;
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/api/v1/repositories/{}/download/{upstream_only}",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"raw-upstream-bytes");
+    }
+
+    /// #3873 for the collection LIST: walked with `?limit=1` through the
+    /// generic URL over three collections, the `next` chain stays under that
+    /// URL and ends with `next` null, every `href` is under it, and the pages
+    /// neither overlap nor gap; the `/ansible` mount gets `/ansible` links. A
+    /// paged request on an empty version list is a consistent empty page.
+    #[tokio::test]
+    async fn test_collection_list_pagination_links_keep_the_mount_prefix_3873() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for ns in ["nsa", "nsb", "nsc"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("key-3873-coll-{ns}"),
+                &format!("{ns}-coll-1.0.0.tar.gz"),
+                &format!("{ns}-coll"),
+                "1.0.0",
+                "application/gzip",
+                bytes::Bytes::from_static(b"collection-bytes"),
+                f.user_id,
+            )
+            .await;
+        }
+        let gbase = format!("/api/v1/repositories/{}/download", f.repo_key);
+        let abase = format!("/ansible/{}", f.repo_key);
+        let glist = format!("{gbase}/api/v3/collections/");
+
+        let mut pages = Vec::new();
+        let mut url = Some(format!("{glist}?limit=1"));
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+        while let Some(u) = url.take() {
+            if pages.len() > 5 {
+                break;
+            }
+            let (status, doc) = get_json(generic_download_app(f.state.clone()), u.clone()).await;
+            url = doc["links"]["next"].as_str().map(str::to_string);
+            pages.push((u, status, doc));
+        }
+        let (a_status, a_doc) = get_json(
+            nested_app_with_auth(&f),
+            format!("{abase}/api/v3/collections/?limit=1"),
+        )
+        .await;
+        let (e_status, empty) = get_json(
+            generic_download_app(f.state.clone()),
+            format!("{gbase}/api/v3/collections/none/missing/versions/?limit=2"),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            pages.len(),
+            3,
+            "three collections in pages of one: {pages:?}"
+        );
+        let mut seen = Vec::new();
+        for (i, (u, status, doc)) in pages.iter().enumerate() {
+            assert_eq!(*status, StatusCode::OK, "GET {u}: {doc}");
+            assert_eq!(doc["meta"]["count"], 3);
+            assert_eq!(doc["links"]["first"], format!("{glist}?limit=1&offset=0"));
+            assert_eq!(doc["links"]["last"], format!("{glist}?limit=1&offset=2"));
+            let next = if i < 2 {
+                serde_json::json!(format!("{glist}?limit=1&offset={}", i + 1))
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(doc["links"]["next"], next, "page {i}");
+            let previous = if i == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(format!("{glist}?limit=1&offset={}", i - 1))
+            };
+            assert_eq!(doc["links"]["previous"], previous, "page {i}");
+            let data = doc["data"].as_array().unwrap();
+            assert_eq!(data.len(), 1, "{doc}");
+            let ns = data[0]["namespace"].as_str().unwrap().to_string();
+            assert_eq!(data[0]["href"], format!("{glist}{ns}/coll/"));
+            assert_eq!(
+                data[0]["highest_version"]["href"],
+                format!("{glist}{ns}/coll/versions/1.0.0/")
+            );
+            seen.push(ns);
+        }
+        assert_eq!(seen, ["nsa", "nsb", "nsc"], "pages must not overlap or gap");
+
+        assert_eq!(a_status, StatusCode::OK, "{a_doc}");
+        assert_eq!(
+            a_doc["links"]["next"],
+            format!("{abase}/api/v3/collections/?limit=1&offset=1")
+        );
+        assert_eq!(
+            a_doc["data"][0]["href"],
+            format!("{abase}/api/v3/collections/nsa/coll/")
+        );
+
+        assert_eq!(e_status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["meta"]["count"], 0);
+        assert_eq!(empty["data"], serde_json::json!([]));
+        let elist = format!("{gbase}/api/v3/collections/none/missing/versions/");
+        assert_eq!(empty["links"]["first"], format!("{elist}?limit=2&offset=0"));
+        assert_eq!(empty["links"]["last"], format!("{elist}?limit=2&offset=0"));
+        assert_eq!(empty["links"]["next"], serde_json::Value::Null);
+        assert_eq!(empty["links"]["previous"], serde_json::Value::Null);
+    }
 }
