@@ -917,6 +917,7 @@ async fn cached_repodata(
         .get_or_render(repo.id, fingerprint, || async move {
             let mut artifacts = collect_repodata_artifacts(&render_state.db, &ids).await?;
             let heal_complete = heal_rpm_repodata_info(&render_state, &mut artifacts).await;
+            let valid_until = earliest_retry_deadline(&artifacts);
             let mut rendered = tokio::task::spawn_blocking(move || render_repodata(&artifacts))
                 .await
                 .map_err(|e| {
@@ -931,6 +932,7 @@ async fn cached_repodata(
             // failure) is served but not cached: the fingerprint would not
             // move again, so caching it would pin the gap (#3801).
             rendered.cacheable = heal_complete;
+            rendered.valid_until = valid_until;
             Ok(rendered)
         })
         .await
@@ -942,6 +944,27 @@ async fn cached_repodata(
 const RPM_HEAL_HEADER_LIMIT: usize = crate::formats::rpm::RPM_HEADER_READ_MAX;
 /// Storage reads in flight while healing one render.
 const RPM_HEAL_CONCURRENCY: usize = 8;
+
+/// The instant the earliest retryable marker among `artifacts` falls due:
+/// a render describing such a package must not outlive it, or a stable
+/// repository would never retry the package (#3801).
+fn earliest_retry_deadline(artifacts: &[RpmArtifact]) -> Option<std::time::Instant> {
+    let now = chrono::Utc::now().timestamp();
+    artifacts
+        .iter()
+        .filter_map(|a| {
+            a.metadata
+                .as_ref()?
+                .get(RPM_REPODATA_KEY)?
+                .get("retry_after")?
+                .as_i64()
+        })
+        .min()
+        .map(|due| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(u64::try_from(due - now).unwrap_or(0))
+        })
+}
 
 /// Whether `artifact` still needs its repodata block derived: no block of
 /// the current version, neither real nor an "unparseable" marker.
@@ -1123,6 +1146,7 @@ async fn heal_one(state: &SharedState, job: HealJob) -> (usize, Option<serde_jso
         }
         Err(HeaderRead::Permanent(reason)) => Some((unparseable_block(&reason), None)),
         Err(HeaderRead::Transient(reason)) => {
+            metrics::counter!("ak_rpm_repodata_heal_transient_failures_total").increment(1);
             warn!(artifact_id = %job.artifact_id, %reason, "RPM repodata heal: header read failed");
             None
         }
@@ -1215,6 +1239,12 @@ async fn record_transient_heal_failure(db: &sqlx::PgPool, artifact_id: uuid::Uui
     if failures < RPM_HEAL_MAX_TRANSIENT_FAILURES {
         return false;
     }
+    metrics::counter!("ak_rpm_repodata_heal_retry_markers_total").increment(1);
+    warn!(
+        artifact_id = %artifact_id,
+        failures,
+        "RPM repodata heal: package unreadable, retried in {RPM_HEAL_RETRY_SECS}s"
+    );
     let mut marker = unparseable_block(&format!(
         "stored package unreadable after {failures} attempts"
     ));
@@ -1436,6 +1466,7 @@ fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
         filelists_gz: Bytes::from(filelists_gz),
         other_gz: Bytes::from(other_gz),
         cacheable: true,
+        valid_until: None,
     }
 }
 

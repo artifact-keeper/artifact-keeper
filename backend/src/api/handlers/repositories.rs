@@ -8184,6 +8184,32 @@ async fn persist_generic_staged_upload(
     )
     .map_err(|e| e.into_response())?;
 
+    // #3801: an `.rpm` pushed into an RPM repository through this generic
+    // endpoint gets the same header parse as the native and chunked paths —
+    // on the blocking pool, BEFORE anything is stored — so a header over the
+    // indexing limits (or with XML-forbidden control characters) is refused
+    // with 400 here too, and the package's repodata block is recorded at
+    // upload instead of being derived later by the heal. Replication pushes
+    // are peer-trusted and skip it, as on the chunked path.
+    let rpm_metadata = if super::upload::rpm_header_metadata_eligible(&repo.format, &path)
+        && !is_replication_request(headers)
+    {
+        match super::upload::read_rpm_header_prefix(staged.path()).await {
+            Ok(prefix) => {
+                let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
+                tokio::task::spawn_blocking(move || {
+                    super::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+                })
+                .await
+                .map_err(|e| proxy_helpers::internal_error("Parsing RPM header", e))?
+                .map_err(|rejected| (StatusCode::BAD_REQUEST, rejected.0).into_response())?
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -8309,6 +8335,13 @@ async fn persist_generic_staged_upload(
         .map_err(|e| e.into_response())?;
     // Scratch file no longer needed once the service has consumed the stream.
     drop(staged);
+    if let Some(metadata) = &rpm_metadata {
+        if let Err(e) =
+            super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
+        {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "RPM metadata could not be recorded");
+        }
+    }
 
     let downloads = artifact_service
         .get_download_stats(artifact.id)
@@ -22953,6 +22986,67 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #3801: the generic single-shot PUT parses an `.rpm` pushed into an
+    /// RPM repository like the native and chunked paths do: a header over
+    /// the indexing limits (here a byte-budget blowup — 3,300 files naming
+    /// one 20 KB dirname) is refused with 400 before anything is stored.
+    #[tokio::test]
+    async fn test_upload_artifact_rejects_over_limit_rpm_with_400() {
+        let Some(fx) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let payload = {
+            let files = 3_300u32;
+            let mut store = Vec::new();
+            for _ in 0..files {
+                store.extend_from_slice(b"a\0");
+            }
+            let dir_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(b'd', 20 * 1024));
+            store.push(0);
+            let idx_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+            let entries: [(u32, u32, u32, u32); 3] = [
+                (1117, 8, 0, files),
+                (1118, 8, dir_off, 1),
+                (1116, 4, idx_off, files),
+            ];
+            let mut p = vec![0u8; 96];
+            p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+            p[4] = 3;
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+            p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            p.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            for (tag, ty, off, count) in entries {
+                for v in [tag, ty, off, count] {
+                    p.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            p.extend_from_slice(&store);
+            p
+        };
+        let result = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            Path((fx.repo_key.clone(), "hostile-1.0-1.noarch.rpm".to_string())),
+            HeaderMap::new(),
+            Body::from(payload),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let err = result.expect_err("an over-limit RPM must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rows, 0, "nothing stored for a refused RPM");
     }
 
     #[tokio::test]

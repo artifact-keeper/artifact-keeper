@@ -511,13 +511,58 @@ pub const RPM_HEADER_DATA_MAX: usize = 32 * 1024 * 1024;
 /// above real packages (the largest distribution packages list tens of
 /// thousands of files).
 pub const RPM_MAX_LIST_ELEMENTS: usize = 262_144;
-/// Total bytes of strings and file paths one header may expand into.
-/// Counting entries is not enough: tags may alias the same bytes and every
-/// file may name the same (long) dirname, so a ~2 MiB package could
-/// otherwise ask for hundreds of GiB. Charged before each allocation. Real
-/// packages expand to a few MiB (a 40k-file package at ~100 bytes a path is
-/// ~4 MiB).
+/// Absolute ceiling on the bytes of strings and file paths one header may
+/// expand into; the effective budget is [`materialization_budget`], which
+/// is also proportional to the header's own size. Counting entries is not
+/// enough: tags may alias the same bytes and every file may name the same
+/// (long) dirname, so a ~2 MiB package could otherwise ask for hundreds of
+/// GiB. Charged before each allocation, in rendered (UTF-8, XML-escaped)
+/// bytes.
 pub const RPM_MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+/// Fixed allowance of the proportional budget.
+const RPM_MATERIALIZED_BASE_BYTES: usize = 1024 * 1024;
+/// Rendered bytes allowed per byte of main header, on top of the base.
+///
+/// Real packages expand far less than their header: measured as file-path
+/// bytes / main-header bytes on a Fedora host, kernel-devel 0.55,
+/// breeze-icon-theme 0.54, kernel-modules 0.19, glibc-devel 0.09 (paths are
+/// the bulk of what is materialized). 4x plus 1 MiB leaves ample headroom
+/// for those while making what an uploader can make the server build
+/// linear in the bytes they actually store — a ~40 KB header whose 3,300
+/// files all name one 20 KB dirname would otherwise expand to 64 MiB, and
+/// every render holds each package's expansion in memory.
+const RPM_MATERIALIZED_PER_HEADER_BYTE: usize = 4;
+
+/// The materialization budget for a main header of `header_len` bytes:
+/// `min(64 MiB, 1 MiB + 4 x header_len)`.
+fn materialization_budget(header_len: usize) -> usize {
+    RPM_MAX_MATERIALIZED_BYTES.min(
+        RPM_MATERIALIZED_BASE_BYTES
+            .saturating_add(header_len.saturating_mul(RPM_MATERIALIZED_PER_HEADER_BYTE)),
+    )
+}
+
+/// Bytes `raw` occupies once converted with `String::from_utf8_lossy` (each
+/// maximal invalid sequence becomes a 3-byte U+FFFD) and then XML-escaped
+/// (`&` -> `&amp;`, `"` -> `&quot;`, ...), computed without allocating.
+/// This is what the budget is charged, so neither lossy conversion nor
+/// escaping can multiply past it.
+fn rendered_len(raw: &[u8]) -> usize {
+    raw.utf8_chunks()
+        .map(|chunk| {
+            let escapes: usize = chunk
+                .valid()
+                .bytes()
+                .map(|b| match b {
+                    b'&' | b'<' | b'>' => 4,
+                    b'"' | b'\'' => 5,
+                    _ => 0,
+                })
+                .sum();
+            chunk.valid().len() + escapes + if chunk.invalid().is_empty() { 0 } else { 3 }
+        })
+        .sum()
+}
 /// Most leading bytes needed to read a within-limits package's lead,
 /// signature header and main header (two headers of at most
 /// [`RPM_HEADER_TAGS_MAX`] entries and [`RPM_HEADER_DATA_MAX`] data each,
@@ -676,7 +721,7 @@ impl<'a> HeaderIndex<'a> {
             store,
             entries,
             len,
-            bytes_left: std::cell::Cell::new(RPM_MAX_MATERIALIZED_BYTES),
+            bytes_left: std::cell::Cell::new(materialization_budget(len)),
             over_budget: std::cell::Cell::new(false),
         })
     }
@@ -688,8 +733,10 @@ impl<'a> HeaderIndex<'a> {
         if n > left {
             self.over_budget.set(true);
             return Err(RpmHeaderError::OverLimit(format!(
-                "RPM header expands to more than {RPM_MAX_MATERIALIZED_BYTES} bytes of \
-                 strings and paths"
+                "RPM header expands to more bytes of strings and paths than its size \
+                 allows ({} for a {}-byte header)",
+                materialization_budget(self.len),
+                self.len
             )));
         }
         self.bytes_left.set(left - n);
@@ -714,7 +761,7 @@ impl<'a> HeaderIndex<'a> {
     /// Charge the budget for a string tag without materializing it (used so
     /// every path that parses a header answers the same over-limit question).
     fn charge_string(&self, tag: u32) -> std::result::Result<(), RpmHeaderError> {
-        self.charge(self.first_string_bytes(tag).map_or(0, <[u8]>::len))
+        self.charge(self.first_string_bytes(tag).map_or(0, rendered_len))
     }
 
     /// Declared element count of `tag` (0 when absent).
@@ -728,7 +775,7 @@ impl<'a> HeaderIndex<'a> {
     /// OverLimit (see [`Self::budget_result`]).
     fn string(&self, tag: u32) -> Option<String> {
         let bytes = self.first_string_bytes(tag)?;
-        self.charge(bytes.len()).ok()?;
+        self.charge(rendered_len(bytes)).ok()?;
         Some(String::from_utf8_lossy(bytes).into_owned()).filter(|s| !s.is_empty())
     }
 
@@ -757,7 +804,7 @@ impl<'a> HeaderIndex<'a> {
                     "string array runs past the header store".into(),
                 ));
             };
-            self.charge(nul)?;
+            self.charge(rendered_len(&rest[..nul]))?;
             out.push(String::from_utf8_lossy(&rest[..nul]).into_owned());
             rest = &rest[nul + 1..];
         }
@@ -1017,7 +1064,9 @@ fn file_entries(h: &HeaderIndex<'_>) -> std::result::Result<Vec<RpmFileEntry>, R
                 .unwrap_or("");
             // Every basename may name the same (long) dirname: charge the
             // joined path before building it.
-            h.charge(dir.len() + base.len())?;
+            // (Both parts are already lossy-converted; charge their escaped
+            // length.)
+            h.charge(rendered_len(dir.as_bytes()) + rendered_len(base.as_bytes()))?;
             paths.push(Some(format!("{dir}{base}")));
         }
         paths
@@ -2237,6 +2286,90 @@ mod tests {
             Err(RpmHeaderError::OverLimit(m)) => assert!(m.contains("bytes"), "{m}"),
             other => panic!("expected the byte budget to reject, got {other:?}"),
         }
+    }
+
+    /// The reviewer's case: ~3,300 files all naming one 20 KB dirname fit
+    /// a ~40 KB header yet expand to ~64 MiB of paths. The proportional
+    /// budget (1 MiB + 4 x header) refuses it — and the real fixtures, far
+    /// below 4x, still parse.
+    #[test]
+    fn test_budget_is_proportional_to_the_header() {
+        let files = 3_300u32;
+        let mut store = Vec::new();
+        for _ in 0..files {
+            store.extend_from_slice(b"a\0");
+        }
+        let dir_off = store.len() as u32;
+        store.extend_from_slice(b"/usr/bin/");
+        store.extend(std::iter::repeat_n(b'd', 20 * 1024));
+        store.push(0);
+        let idx_off = store.len() as u32;
+        store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+        let main = hostile_header(
+            &[
+                (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, files),
+                (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, dir_off, 1),
+                (RPMTAG_DIRINDEXES, RPM_INT32_TYPE, idx_off, files),
+            ],
+            &store,
+        );
+        assert!(main.len() < 64 * 1024, "a small header: {}", main.len());
+        assert!(files as usize * 20 * 1024 < RPM_MAX_MATERIALIZED_BYTES + 4 * 1024 * 1024);
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        assert_eq!(materialization_budget(40_000), 1024 * 1024 + 160_000);
+        assert_eq!(
+            materialization_budget(usize::MAX),
+            RPM_MAX_MATERIALIZED_BYTES
+        );
+        assert!(RpmHandler::parse_rpm_repodata_info(DEPS_RPM).is_ok());
+    }
+
+    /// Charged in rendered bytes: an invalid UTF-8 byte becomes a 3-byte
+    /// U+FFFD, and `&` becomes `&amp;` in the XML.
+    #[test]
+    fn test_budget_charges_rendered_bytes() {
+        assert_eq!(rendered_len(b"abc"), 3);
+        assert_eq!(rendered_len(b"a&b"), 7);
+        assert_eq!(rendered_len(b"\"'<>"), 6 + 6 + 4 + 4);
+        assert_eq!(rendered_len(&[0x80]), 3);
+        assert_eq!(rendered_len(&[b'a', 0xff, 0xfe, b'b']), 1 + 3 + 3 + 1);
+        assert_eq!(rendered_len("é".as_bytes()), 2);
+        // 30 files naming one 10 KB dirname: 300 KB raw fits the ~1.09 MB
+        // budget of this ~10 KB header, but as '&' it renders 5x (1.5 MB).
+        let package = |fill: u8, files: u32| {
+            let mut store = Vec::new();
+            for _ in 0..files {
+                store.extend_from_slice(b"a\0");
+            }
+            let dir_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(fill, 10 * 1024));
+            store.push(0);
+            let idx_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+            hostile_package(&hostile_header(
+                &[
+                    (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, files),
+                    (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, dir_off, 1),
+                    (RPMTAG_DIRINDEXES, RPM_INT32_TYPE, idx_off, files),
+                ],
+                &store,
+            ))
+        };
+        assert!(RpmHandler::parse_rpm_repodata_info(&package(b'x', 30)).is_ok());
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&package(b'&', 30)),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        // Invalid UTF-8 renders 3x: 50 files x 10 KB is 500 KB raw (fits,
+        // as the 'x' control shows) but 1.5 MB once converted.
+        assert!(RpmHandler::parse_rpm_repodata_info(&package(b'x', 50)).is_ok());
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&package(0x80, 50)),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
     }
 
     /// 11 name tags and 8 version tags each covering the whole 32 MiB store

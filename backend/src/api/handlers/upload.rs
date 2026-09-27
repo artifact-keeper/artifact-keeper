@@ -1148,7 +1148,7 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 /// need ([`crate::formats::rpm::RPM_HEADER_READ_MAX`]). Reading the whole
 /// header lets every over-limit case be answered with 400 at upload (#3801)
 /// rather than being discovered later by the repodata heal.
-async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+pub(crate) async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let mut prefix = read_file_prefix(path, 64 * 1024).await?;
     for _ in 0..3 {
         match crate::formats::rpm::RpmHandler::header_bytes_needed(&prefix) {
@@ -1171,7 +1171,7 @@ async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::Result<Vec<u
 /// extracted (#2588): the target repo is RPM-format and the object is an
 /// actual `.rpm` package. Companion objects (checksum sidecars, `.repo`
 /// snippets, `.drpm` deltas) are left alone.
-fn rpm_header_metadata_eligible(
+pub(crate) fn rpm_header_metadata_eligible(
     format: &crate::models::repository::RepositoryFormat,
     artifact_path: &str,
 ) -> bool {
@@ -3663,6 +3663,118 @@ mod tests {
         cleanup_created_session(&f.pool, &body).await;
         delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
+    }
+
+    /// #3801: an `.rpm` whose header the server refuses to index (here:
+    /// 3,300 files all naming one 20 KB dirname — a ~40 KB header expanding
+    /// to ~64 MiB of paths) is rejected with 400 at chunked completion,
+    /// BEFORE the reassembled bytes are stored: no object at the content
+    /// key, no artifact row.
+    #[tokio::test]
+    async fn complete_rejects_over_limit_rpm_before_storing() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let payload = {
+            let files = 3_300u32;
+            let mut store = Vec::new();
+            for _ in 0..files {
+                store.extend_from_slice(b"a\0");
+            }
+            let dir_off = store.len() as u32;
+            store.extend_from_slice(b"/usr/bin/");
+            store.extend(std::iter::repeat_n(b'd', 20 * 1024));
+            store.push(0);
+            let idx_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+            let entries: [(u32, u32, u32, u32); 3] = [
+                (1117, 8, 0, files),       // BASENAMES
+                (1118, 8, dir_off, 1),     // DIRNAMES
+                (1116, 4, idx_off, files), // DIRINDEXES
+            ];
+            let mut p = vec![0u8; 96];
+            p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+            p[4] = 3;
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+            p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            p.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            for (tag, ty, off, count) in entries {
+                for v in [tag, ty, off, count] {
+                    p.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            p.extend_from_slice(&store);
+            p
+        };
+        use sha2::{Digest, Sha256};
+        let checksum = hex::encode(Sha256::digest(&payload));
+
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, body) = tdh::send(
+            app,
+            create_session_req(&serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": "hostile-1.0-1.noarch.rpm",
+                "total_size": payload.len() as i64,
+                "checksum_sha256": checksum,
+                "chunk_size": 1024 * 1024_i64,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"].clone(),
+        )
+        .unwrap();
+
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", session_id))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.clone()))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &checksum,
+        );
+        let stored = f.storage_dir.join(&key).exists();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "over-limit RPM must be refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!stored, "nothing may be stored for a refused RPM");
+        assert_eq!(rows, 0, "no artifact row for a refused RPM");
     }
 
     #[tokio::test]

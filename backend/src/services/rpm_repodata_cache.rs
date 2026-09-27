@@ -100,6 +100,11 @@ pub struct RenderedRepodata {
     /// only for [`INCOMPLETE_RENDER_TTL`], so coalesced waiters and the
     /// requests of the next minute share it, and a later request retries.
     pub cacheable: bool,
+    /// When set, the render is not served after this instant even though the
+    /// repository has not changed: it describes a package whose repodata is
+    /// due for a retry at that time (#3801), and a stable repository would
+    /// otherwise never re-render to pick it up.
+    pub valid_until: Option<Instant>,
 }
 
 impl RenderedRepodata {
@@ -173,7 +178,12 @@ impl RpmRepodataCache {
     ) -> Option<Arc<RenderedRepodata>> {
         let entries = self.entries.read().await;
         let entry = entries.get(&repo_id)?;
-        let fresh = entry.rendered.cacheable || entry.rendered_at.elapsed() < INCOMPLETE_RENDER_TTL;
+        let fresh = (entry.rendered.cacheable
+            || entry.rendered_at.elapsed() < INCOMPLETE_RENDER_TTL)
+            && entry
+                .rendered
+                .valid_until
+                .is_none_or(|t| Instant::now() < t);
         if entry.fingerprint == *fingerprint && fresh {
             Some(entry.rendered.clone())
         } else {
@@ -285,7 +295,48 @@ mod tests {
             filelists_gz: Bytes::copy_from_slice(format!("filelists-{tag}").as_bytes()),
             other_gz: Bytes::copy_from_slice(format!("other-{tag}").as_bytes()),
             cacheable: true,
+            valid_until: None,
         }
+    }
+
+    /// A render carrying a retry deadline is re-rendered once it passes,
+    /// even though the fingerprint never moved (#3801).
+    #[tokio::test]
+    async fn render_is_not_served_past_its_valid_until() {
+        let cache = RpmRepodataCache::new();
+        let repo = Uuid::new_v4();
+        let calls = AtomicUsize::new(0);
+        let render = |until: Option<Instant>| {
+            let calls = &calls;
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut r = rendered("r");
+                r.valid_until = until;
+                Ok::<_, ()>(r)
+            }
+        };
+        let future = Instant::now() + std::time::Duration::from_secs(3600);
+        for _ in 0..2 {
+            cache
+                .get_or_render(repo, fp(1, 1, vec![repo]), render(Some(future)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "served until the deadline");
+        cache.entries.write().await.get_mut(&repo).unwrap().rendered = Arc::new({
+            let mut r = rendered("r");
+            r.valid_until = Some(Instant::now());
+            r
+        });
+        cache
+            .get_or_render(repo, fp(1, 1, vec![repo]), render(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "re-rendered past the deadline"
+        );
     }
 
     /// A render flagged incomplete (#3801: a package's header could not be
