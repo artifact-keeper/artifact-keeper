@@ -671,7 +671,7 @@ async fn complete_session_commit(
     let rpm_upload_metadata = if session.artifact_metadata_format.is_none()
         && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
     {
-        match read_file_prefix(temp_path, FORMAT_HEADER_PREFIX_LIMIT).await {
+        match read_rpm_header_prefix(temp_path).await {
             Ok(prefix) => {
                 let filename = artifact_name_from_path(&session.artifact_path).to_string();
                 match tokio::task::spawn_blocking(move || {
@@ -865,15 +865,14 @@ async fn complete_session_commit(
     } else if let Some(metadata) = &rpm_upload_metadata {
         // #2588: record the RPM header metadata parsed above, mirroring what
         // the native RPM upload route records. Unparseable or non-package
-        // objects simply record no metadata; they never fail the upload.
-        crate::api::handlers::proxy_helpers::record_artifact_metadata(
-            &state.db,
-            artifact_id,
-            session.repository_id,
-            "rpm",
-            metadata,
-        )
-        .await;
+        // objects simply record no metadata; they never fail the upload. A
+        // value too large to store is recorded with an unparseable marker.
+        if let Err(e) =
+            super::rpm::record_rpm_metadata(&state.db, artifact_id, session.repository_id, metadata)
+                .await
+        {
+            tracing::warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
+        }
     }
 
     if let Some((package_name, package_version)) =
@@ -1143,11 +1142,30 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 }
 
 /// Extract a simple artifact name from its path (last path component without extension).
-/// Upper bound on how much of a completed upload is read back for format
-/// header parsing (#2588). RPM signature+main headers live at the front of
-/// the file and are far smaller than this in practice; anything whose header
-/// does not fit simply records no metadata.
-const FORMAT_HEADER_PREFIX_LIMIT: u64 = 16 * 1024 * 1024;
+/// Read the leading bytes of an uploaded `.rpm` that hold its lead,
+/// signature header and main header (#2588): a 64 KiB read grown to the
+/// size the headers declare, never past what a within-limits package can
+/// need ([`crate::formats::rpm::RPM_HEADER_READ_MAX`]). Reading the whole
+/// header lets every over-limit case be answered with 400 at upload (#3801)
+/// rather than being discovered later by the repodata heal.
+async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut prefix = read_file_prefix(path, 64 * 1024).await?;
+    for _ in 0..3 {
+        match crate::formats::rpm::RpmHandler::header_bytes_needed(&prefix) {
+            Some(needed)
+                if needed > prefix.len() && needed <= crate::formats::rpm::RPM_HEADER_READ_MAX =>
+            {
+                let grown = read_file_prefix(path, needed as u64).await?;
+                if grown.len() <= prefix.len() {
+                    break; // the file ends inside the header
+                }
+                prefix = grown;
+            }
+            _ => break,
+        }
+    }
+    Ok(prefix)
+}
 
 /// Whether a completed generic upload should get RPM header metadata
 /// extracted (#2588): the target repo is RPM-format and the object is an

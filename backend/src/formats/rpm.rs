@@ -268,7 +268,7 @@ impl RpmHandler {
         let get_string = |tag: u32| -> String { h.string(tag).unwrap_or_default() };
         let get_optional = |tag: u32| -> Option<String> { h.string(tag) };
 
-        Ok(RpmMetadata {
+        let metadata = RpmMetadata {
             name: get_string(RPMTAG_NAME),
             version: get_string(RPMTAG_VERSION),
             release: get_string(RPMTAG_RELEASE),
@@ -290,7 +290,10 @@ impl RpmHandler {
             post_install_prog: get_optional(RPMTAG_POSTINPROG),
             pre_uninstall_prog: get_optional(RPMTAG_PREUNPROG),
             post_uninstall_prog: get_optional(RPMTAG_POSTUNPROG),
-        })
+        };
+        h.budget_result()
+            .map_err(|e| AppError::Validation(e.to_string()))?;
+        Ok(metadata)
     }
 
     /// Byte offset of the main header structure: past the 96-byte lead and
@@ -417,7 +420,7 @@ impl RpmHandler {
             .or_else(|| sig.as_ref().and_then(|s| s.int(RPMSIGTAG_LONGARCHIVESIZE)))
             .or_else(|| sig.as_ref().and_then(|s| s.int(RPMSIGTAG_PAYLOADSIZE)));
 
-        Ok(RpmRepodataInfo {
+        let info = RpmRepodataInfo {
             epoch: h.int(RPMTAG_EPOCH),
             packager: h.string(RPMTAG_PACKAGER),
             vendor: h.string(RPMTAG_VENDOR),
@@ -460,7 +463,15 @@ impl RpmHandler {
             provides: plain_entries(provides_raw),
             requires,
             files,
-        })
+        };
+        // The text fields the upload also records (and the scriptlets it
+        // analyzes) share the budget, so every parse of this header answers
+        // the same over-limit question.
+        for tag in BUDGETED_TEXT_TAGS {
+            h.charge_string(tag)?;
+        }
+        h.budget_result()?;
+        Ok(info)
     }
 }
 
@@ -500,6 +511,43 @@ pub const RPM_HEADER_DATA_MAX: usize = 32 * 1024 * 1024;
 /// above real packages (the largest distribution packages list tens of
 /// thousands of files).
 pub const RPM_MAX_LIST_ELEMENTS: usize = 262_144;
+/// Total bytes of strings and file paths one header may expand into.
+/// Counting entries is not enough: tags may alias the same bytes and every
+/// file may name the same (long) dirname, so a ~2 MiB package could
+/// otherwise ask for hundreds of GiB. Charged before each allocation. Real
+/// packages expand to a few MiB (a 40k-file package at ~100 bytes a path is
+/// ~4 MiB).
+pub const RPM_MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+/// Most leading bytes needed to read a within-limits package's lead,
+/// signature header and main header (two headers of at most
+/// [`RPM_HEADER_TAGS_MAX`] entries and [`RPM_HEADER_DATA_MAX`] data each,
+/// plus the lead and padding). Readers of stored/uploaded packages grow
+/// their prefix up to this, never further.
+pub const RPM_HEADER_READ_MAX: usize =
+    96 + 2 * (16 + 16 * RPM_HEADER_TAGS_MAX + RPM_HEADER_DATA_MAX) + 8;
+
+/// Single-string tags the upload path materializes elsewhere
+/// ([`RpmHandler::parse_rpm_header`]); charged against the same budget.
+const BUDGETED_TEXT_TAGS: [u32; 18] = [
+    RPMTAG_NAME,
+    RPMTAG_VERSION,
+    RPMTAG_RELEASE,
+    RPMTAG_ARCH,
+    RPMTAG_SUMMARY,
+    RPMTAG_DESCRIPTION,
+    RPMTAG_LICENSE,
+    RPMTAG_GROUP,
+    RPMTAG_URL,
+    RPMTAG_SOURCERPM,
+    RPMTAG_PREIN,
+    RPMTAG_POSTIN,
+    RPMTAG_PREUN,
+    RPMTAG_POSTUN,
+    RPMTAG_PREINPROG,
+    RPMTAG_POSTINPROG,
+    RPMTAG_PREUNPROG,
+    RPMTAG_POSTUNPROG,
+];
 
 /// Every string-array tag [`RpmHandler::parse_rpm_repodata_info`]
 /// materializes as a list; their declared counts share one budget.
@@ -544,6 +592,13 @@ struct HeaderIndex<'a> {
     entries: HashMap<u32, HeaderEntry>,
     /// Total byte length of the header structure (intro + index + store).
     len: usize,
+    /// Bytes of strings still allowed to be materialized from this header
+    /// ([`RPM_MAX_MATERIALIZED_BYTES`]). Charged BEFORE each allocation:
+    /// tags and file paths may reuse the same store bytes any number of
+    /// times, so the store size alone does not bound what gets built.
+    bytes_left: std::cell::Cell<usize>,
+    /// Set once any charge failed; the parse then reports OverLimit.
+    over_budget: std::cell::Cell<bool>,
 }
 
 /// Minimum bytes one element of `data_type` occupies in the store; `None`
@@ -621,7 +676,45 @@ impl<'a> HeaderIndex<'a> {
             store,
             entries,
             len,
+            bytes_left: std::cell::Cell::new(RPM_MAX_MATERIALIZED_BYTES),
+            over_budget: std::cell::Cell::new(false),
         })
+    }
+
+    /// Reserve `n` bytes of the materialization budget, or fail (and
+    /// remember the failure) when that would exceed it.
+    fn charge(&self, n: usize) -> std::result::Result<(), RpmHeaderError> {
+        let left = self.bytes_left.get();
+        if n > left {
+            self.over_budget.set(true);
+            return Err(RpmHeaderError::OverLimit(format!(
+                "RPM header expands to more than {RPM_MAX_MATERIALIZED_BYTES} bytes of \
+                 strings and paths"
+            )));
+        }
+        self.bytes_left.set(left - n);
+        Ok(())
+    }
+
+    /// OverLimit if any charge failed during this parse.
+    fn budget_result(&self) -> std::result::Result<(), RpmHeaderError> {
+        if self.over_budget.get() {
+            return self.charge(usize::MAX);
+        }
+        Ok(())
+    }
+
+    /// The raw bytes of the tag's first string (up to its NUL or the end of
+    /// the store).
+    fn first_string_bytes(&self, tag: u32) -> Option<&'a [u8]> {
+        let e = self.entries.get(&tag)?;
+        self.store[e.offset..].split(|&b| b == 0).next()
+    }
+
+    /// Charge the budget for a string tag without materializing it (used so
+    /// every path that parses a header answers the same over-limit question).
+    fn charge_string(&self, tag: u32) -> std::result::Result<(), RpmHeaderError> {
+        self.charge(self.first_string_bytes(tag).map_or(0, <[u8]>::len))
     }
 
     /// Declared element count of `tag` (0 when absent).
@@ -631,13 +724,12 @@ impl<'a> HeaderIndex<'a> {
 
     /// The tag's (first) string value; `None` when absent or empty. For an
     /// I18N string this is the untranslated (C locale) value.
+    /// Over the byte budget it yields `None` and the parse reports
+    /// OverLimit (see [`Self::budget_result`]).
     fn string(&self, tag: u32) -> Option<String> {
-        let e = self.entries.get(&tag)?;
-        self.store[e.offset..]
-            .split(|&b| b == 0)
-            .next()
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .filter(|s| !s.is_empty())
+        let bytes = self.first_string_bytes(tag)?;
+        self.charge(bytes.len()).ok()?;
+        Some(String::from_utf8_lossy(bytes).into_owned()).filter(|s| !s.is_empty())
     }
 
     /// Every string of a STRING_ARRAY/I18NSTRING tag (a plain STRING yields
@@ -665,6 +757,7 @@ impl<'a> HeaderIndex<'a> {
                     "string array runs past the header store".into(),
                 ));
             };
+            self.charge(nul)?;
             out.push(String::from_utf8_lossy(&rest[..nul]).into_owned());
             rest = &rest[nul + 1..];
         }
@@ -721,8 +814,10 @@ const RPMSENSE_PRE_MASK: u64 = RPMSENSE_PREREQ
     | RPMSENSE_POSTTRANS;
 
 /// `createrepo_c`'s `cr_flag_to_str` over the comparison bits.
+/// It masks the low FOUR bits (`flags &= 0xf`), so bit 0 (RPMSENSE_ANY's
+/// neighbour, unused by rpm) set alongside a comparison yields no flag.
 fn sense_flag_str(flags: u64) -> Option<&'static str> {
-    match flags & (RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL) {
+    match flags & 0xf {
         f if f == RPMSENSE_LESS => Some("LT"),
         f if f == RPMSENSE_GREATER => Some("GT"),
         f if f == RPMSENSE_EQUAL => Some("EQ"),
@@ -741,8 +836,10 @@ fn sense_flag_str(flags: u64) -> Option<&'static str> {
 fn split_evr(evr: &str) -> Option<(String, Option<String>, Option<String>)> {
     let (epoch, rest) = match evr.split_once(':') {
         Some((e, rest)) => {
-            // strtol semantics: optional leading whitespace and sign.
-            let digits = e.trim_start().trim_start_matches(['+', '-']);
+            // strtol semantics (`p == ptr`): optional C-locale whitespace,
+            // at most ONE sign, then digits running exactly up to the ':'.
+            let unspaced = e.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+            let digits = unspaced.strip_prefix(['+', '-']).unwrap_or(unspaced);
             if !e.is_empty() && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())) {
                 return None;
             }
@@ -811,18 +908,27 @@ fn raw_deps(
     flags_tag: u32,
     version_tag: u32,
 ) -> std::result::Result<Vec<RawDep>, RpmHeaderError> {
-    let names = h.string_array(name_tag)?;
-    let flags = h.ints_n(flags_tag, names.len());
-    let versions = h.string_array_n(version_tag, names.len())?;
+    // createrepo_c reads a dependency type only when all three parallel
+    // tags are present, and walks them in lockstep (stopping at the
+    // shortest).
+    if h.count(name_tag) == 0 || h.count(flags_tag) == 0 || h.count(version_tag) == 0 {
+        return Ok(Vec::new());
+    }
+    let n = h
+        .count(name_tag)
+        .min(h.count(flags_tag))
+        .min(h.count(version_tag));
+    let names = h.string_array_n(name_tag, n)?;
+    let flags = h.ints_n(flags_tag, n);
+    let versions = h.string_array_n(version_tag, n)?;
+    let n = names.len().min(flags.len()).min(versions.len());
     Ok(names
         .into_iter()
-        .enumerate()
-        .filter(|(_, name)| !name.is_empty())
-        .map(|(i, name)| RawDep {
-            name,
-            flags: flags.get(i).copied().unwrap_or(0),
-            evr: versions.get(i).cloned().unwrap_or_default(),
-        })
+        .zip(flags)
+        .zip(versions)
+        .take(n)
+        .filter(|((name, _), _)| !name.is_empty())
+        .map(|((name, flags), evr)| RawDep { name, flags, evr })
         .collect())
 }
 
@@ -898,21 +1004,23 @@ fn file_entries(h: &HeaderIndex<'_>) -> std::result::Result<Vec<RpmFileEntry>, R
         n = basenames.len();
         let dirnames = h.string_array(RPMTAG_DIRNAMES)?;
         let dirindexes = h.ints_n(RPMTAG_DIRINDEXES, n);
-        basenames
-            .into_iter()
-            .enumerate()
-            .map(|(i, base)| {
-                if base.is_empty() {
-                    return None;
-                }
-                let dir = dirindexes
-                    .get(i)
-                    .and_then(|&d| dirnames.get(d as usize))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                Some(format!("{dir}{base}"))
-            })
-            .collect()
+        let mut paths = Vec::with_capacity(n);
+        for (i, base) in basenames.into_iter().enumerate() {
+            if base.is_empty() {
+                paths.push(None);
+                continue;
+            }
+            let dir = dirindexes
+                .get(i)
+                .and_then(|&d| dirnames.get(d as usize))
+                .map(String::as_str)
+                .unwrap_or("");
+            // Every basename may name the same (long) dirname: charge the
+            // joined path before building it.
+            h.charge(dir.len() + base.len())?;
+            paths.push(Some(format!("{dir}{base}")));
+        }
+        paths
     };
     let modes = h.ints_n(RPMTAG_FILEMODES, n);
     let fflags = h.ints_n(RPMTAG_FILEFLAGS, n);
@@ -2089,18 +2197,131 @@ mod tests {
         assert!(meta.provides.is_empty() && meta.requires.is_empty());
     }
 
+    /// Every file names ONE long dirname: a ~2 MiB package whose paths
+    /// would expand to ~200 GiB. The byte budget stops it after ~64 paths,
+    /// before the allocation that would abort the process.
+    #[test]
+    fn test_hostile_dirname_reuse_hits_the_byte_budget() {
+        let files = 200_000u32;
+        let mut store = Vec::new();
+        for _ in 0..files {
+            store.extend_from_slice(b"a\0");
+        }
+        let dir_off = store.len() as u32;
+        store.extend(std::iter::repeat_n(b'd', 1024 * 1024));
+        store.push(0);
+        let idx_off = store.len() as u32;
+        store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+        let pkg = hostile_package(&hostile_header(
+            &[
+                (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, files),
+                (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, dir_off, 1),
+                (RPMTAG_DIRINDEXES, RPM_INT32_TYPE, idx_off, files),
+            ],
+            &store,
+        ));
+        assert!(
+            files as usize <= RPM_MAX_LIST_ELEMENTS,
+            "passes the count budget"
+        );
+        match RpmHandler::parse_rpm_repodata_info(&pkg) {
+            Err(RpmHeaderError::OverLimit(m)) => assert!(m.contains("bytes"), "{m}"),
+            other => panic!("expected the byte budget to reject, got {other:?}"),
+        }
+    }
+
+    /// 11 name tags and 8 version tags each covering the whole 32 MiB store
+    /// (~600 MiB of strings from 32 MiB of bytes), and every text tag
+    /// aliasing one 32 MiB string: both stop at the byte budget.
+    #[test]
+    fn test_hostile_aliased_strings_hit_the_byte_budget() {
+        let (count, len) = (12u32, 2_700_000usize);
+        let mut store = Vec::with_capacity(count as usize * (len + 1));
+        for _ in 0..count {
+            store.extend(std::iter::repeat_n(b'x', len));
+            store.push(0);
+        }
+        assert!(store.len() <= RPM_HEADER_DATA_MAX);
+        let mut entries: Vec<(u32, u32, u32, u32)> = REPODATA_LIST_TAGS
+            .iter()
+            .map(|&t| (t, RPM_STRING_ARRAY_TYPE, 0, count))
+            .collect();
+        for (flags, version) in [
+            (RPMTAG_PROVIDEFLAGS, RPMTAG_PROVIDEVERSION),
+            (RPMTAG_REQUIREFLAGS, RPMTAG_REQUIREVERSION),
+            (RPMTAG_CONFLICTFLAGS, RPMTAG_CONFLICTVERSION),
+            (RPMTAG_OBSOLETEFLAGS, RPMTAG_OBSOLETEVERSION),
+            (RPMTAG_SUGGESTFLAGS, RPMTAG_SUGGESTVERSION),
+            (RPMTAG_ENHANCEFLAGS, RPMTAG_ENHANCEVERSION),
+            (RPMTAG_RECOMMENDFLAGS, RPMTAG_RECOMMENDVERSION),
+            (RPMTAG_SUPPLEMENTFLAGS, RPMTAG_SUPPLEMENTVERSION),
+        ] {
+            entries.push((flags, RPM_INT32_TYPE, 0, count));
+            entries.push((version, RPM_STRING_ARRAY_TYPE, 0, count));
+        }
+        let pkg = hostile_package(&hostile_header(&entries, &store));
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+
+        // Text tags only: one 32 MiB string aliased by every text tag.
+        let mut one = vec![b'y'; RPM_HEADER_DATA_MAX - 1];
+        one.push(0);
+        let text: Vec<(u32, u32, u32, u32)> =
+            BUDGETED_TEXT_TAGS.iter().map(|&t| (t, 6, 0, 1)).collect();
+        let pkg = hostile_package(&hostile_header(&text, &one));
+        assert!(matches!(
+            RpmHandler::parse_rpm_repodata_info(&pkg),
+            Err(RpmHeaderError::OverLimit(_))
+        ));
+        let err = RpmHandler::parse_rpm_header(&pkg).expect_err("over the byte budget");
+        assert!(err.to_string().contains("over limit"), "{err}");
+    }
+
+    #[test]
+    fn test_createrepo_c_flag_and_epoch_edge_parity() {
+        // cr_flag_to_str masks 0xf: bit 0 set with EQ is no flag at all.
+        assert_eq!(sense_flag_str(RPMSENSE_EQUAL | 1), None);
+        assert_eq!(sense_flag_str(RPMSENSE_EQUAL | (1 << 24)), Some("EQ"));
+        // strtol: one sign at most, optional leading whitespace.
+        assert_eq!(split_evr("--5:1"), None);
+        assert_eq!(split_evr("+-5:1"), None);
+        assert!(split_evr("+5:1").is_some());
+        assert_eq!(split_evr(" 5:1").map(|e| e.0), Some(" 5".to_string()));
+        assert_eq!(split_evr("-:1"), None);
+    }
+
+    /// createrepo_c reads a dependency type only when the name, flags and
+    /// version tags are all present.
+    #[test]
+    fn test_dependency_type_without_parallel_tags_is_skipped() {
+        let store = b"dep\0";
+        let pkg = hostile_package(&hostile_header(
+            &[(RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 1)],
+            store,
+        ));
+        let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
+        assert!(info.requires.is_empty());
+    }
+
     /// Within budget, empty names and basenames are dropped rather than
     /// emitted as `<rpm:entry name=""/>` / `<file></file>`.
     #[test]
     fn test_empty_names_and_basenames_are_dropped() {
-        let store = b"\0\0real\0/d/\0";
+        // Names/basenames "", "", "real"; dirname "/d/"; 12 zero bytes of
+        // flags.
+        let mut store = b"\0\0real\0/d/\0".to_vec();
+        store.extend_from_slice(&[0u8; 12]);
         let pkg = hostile_package(&hostile_header(
             &[
                 (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 3),
+                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 11, 3),
+                (RPMTAG_REQUIREVERSION, RPM_STRING_ARRAY_TYPE, 0, 3),
                 (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, 3),
                 (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, 7, 1),
             ],
-            store,
+            &store,
         ));
         let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
         assert_eq!(info.requires, vec![entry("real")]);
@@ -2145,13 +2366,17 @@ mod tests {
         let pkg = hostile_package(&hostile_header(
             &[
                 (RPMTAG_PROVIDENAME, RPM_STRING_ARRAY_TYPE, 0, n),
+                (RPMTAG_PROVIDEFLAGS, RPM_INT32_TYPE, 0, n),
+                (RPMTAG_PROVIDEVERSION, RPM_STRING_ARRAY_TYPE, 0, n),
                 (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, n),
+                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 0, n),
+                (RPMTAG_REQUIREVERSION, RPM_STRING_ARRAY_TYPE, 0, n),
             ],
             &store,
         ));
         let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
         assert_eq!(info.provides.len(), n as usize);
-        assert!(info.requires.is_empty());
+        assert!(info.requires.is_empty(), "every require is self-provided");
     }
 
     #[test]
@@ -2180,7 +2405,9 @@ mod tests {
         let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)).unwrap();
         assert_eq!(info.epoch, None);
         assert_eq!(info.installed_size, None);
-        assert_eq!(info.provides, vec![entry("abc")]);
+        // Unreadable flags (BIN) and no version tag: like createrepo_c, the
+        // dependency type is not read at all.
+        assert!(info.provides.is_empty());
     }
 
     #[test]

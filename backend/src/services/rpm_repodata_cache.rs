@@ -96,8 +96,9 @@ pub struct RenderedRepodata {
     pub filelists_gz: Bytes,
     pub other_gz: Bytes,
     /// False when the render is known to be incomplete for a transient
-    /// reason (an RPM header could not be read back, #3801): it is served
-    /// but not cached, so the next request renders again.
+    /// reason (an RPM header could not be read back, #3801): it is cached
+    /// only for [`INCOMPLETE_RENDER_TTL`], so coalesced waiters and the
+    /// requests of the next minute share it, and a later request retries.
     pub cacheable: bool,
 }
 
@@ -115,6 +116,12 @@ struct CacheEntry {
     rendered: Arc<RenderedRepodata>,
     rendered_at: Instant,
 }
+
+/// How long an incomplete (non-`cacheable`) render is served before the
+/// next request renders again (#3801). Long enough that a burst of clients
+/// (or waiters queued on the render lock) costs one render, short enough
+/// that a transient storage failure heals within a minute.
+pub const INCOMPLETE_RENDER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Fingerprint-validated, single-flight cache of rendered RPM repodata sets,
 /// keyed by the serving repository's id.
@@ -166,7 +173,8 @@ impl RpmRepodataCache {
     ) -> Option<Arc<RenderedRepodata>> {
         let entries = self.entries.read().await;
         let entry = entries.get(&repo_id)?;
-        if entry.fingerprint == *fingerprint {
+        let fresh = entry.rendered.cacheable || entry.rendered_at.elapsed() < INCOMPLETE_RENDER_TTL;
+        if entry.fingerprint == *fingerprint && fresh {
             Some(entry.rendered.clone())
         } else {
             None
@@ -203,9 +211,7 @@ impl RpmRepodataCache {
         }
         let rendered = Arc::new(render().await?);
         self.renders.fetch_add(1, Ordering::Relaxed);
-        if rendered.cacheable {
-            self.insert(repo_id, fingerprint, rendered.clone()).await;
-        }
+        self.insert(repo_id, fingerprint, rendered.clone()).await;
         Ok(rendered)
     }
 
@@ -283,39 +289,61 @@ mod tests {
     }
 
     /// A render flagged incomplete (#3801: a package's header could not be
-    /// read back) is served but never cached, so the next request retries
-    /// instead of pinning the gap until the repository next changes.
+    /// read back) is shared with the requests that follow — no render per
+    /// request — but only until [`INCOMPLETE_RENDER_TTL`] runs out; then the
+    /// next request renders again instead of pinning the gap.
     #[tokio::test]
-    async fn non_cacheable_render_is_served_but_not_cached() {
+    async fn incomplete_render_is_shared_until_its_ttl() {
         let cache = RpmRepodataCache::new();
         let repo = Uuid::new_v4();
         let calls = AtomicUsize::new(0);
+        let render = |tag: &'static str, cacheable: bool| {
+            let calls = &calls;
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut r = rendered(tag);
+                r.cacheable = cacheable;
+                Ok::<_, ()>(r)
+            }
+        };
 
         for _ in 0..3 {
             let out = cache
-                .get_or_render::<(), _, _>(repo, fp(3, 100, vec![repo]), || async {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    let mut r = rendered("partial");
-                    r.cacheable = false;
-                    Ok(r)
-                })
+                .get_or_render(repo, fp(3, 100, vec![repo]), render("partial", false))
                 .await
                 .unwrap();
             assert_eq!(out.repomd_xml, Bytes::from_static(b"repomd-partial"));
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "every request re-renders");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "shared within the TTL");
 
-        // Once complete, it is cached as usual.
-        for _ in 0..2 {
-            cache
-                .get_or_render::<(), _, _>(repo, fp(3, 100, vec![repo]), || async {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(rendered("full"))
-                })
-                .await
-                .unwrap();
+        // Age the entry past the TTL: the next request renders again.
+        {
+            let mut entries = cache.entries.write().await;
+            let e = entries.get_mut(&repo).unwrap();
+            e.rendered_at = Instant::now()
+                .checked_sub(INCOMPLETE_RENDER_TTL + std::time::Duration::from_secs(1))
+                .expect("monotonic clock past the TTL");
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let out = cache
+            .get_or_render(repo, fp(3, 100, vec![repo]), render("full", true))
+            .await
+            .unwrap();
+        assert_eq!(out.repomd_xml, Bytes::from_static(b"repomd-full"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A complete render never expires by age.
+        {
+            let mut entries = cache.entries.write().await;
+            let e = entries.get_mut(&repo).unwrap();
+            e.rendered_at = Instant::now()
+                .checked_sub(INCOMPLETE_RENDER_TTL * 2)
+                .expect("monotonic clock past the TTL");
+        }
+        cache
+            .get_or_render(repo, fp(3, 100, vec![repo]), render("again", true))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -937,23 +937,46 @@ async fn cached_repodata(
 }
 
 /// Upper bound on the header prefix read back from storage when healing a
-/// package's repodata block: the same cap the parser puts on a header's data
-/// store, so a hostile size field cannot turn a render into a large read.
-const RPM_HEAL_HEADER_LIMIT: usize = crate::formats::rpm::RPM_HEADER_DATA_MAX;
+/// package's repodata block: the most a within-limits package's headers can
+/// span, so a hostile size field cannot turn a render into a larger read.
+const RPM_HEAL_HEADER_LIMIT: usize = crate::formats::rpm::RPM_HEADER_READ_MAX;
 /// Storage reads in flight while healing one render.
 const RPM_HEAL_CONCURRENCY: usize = 8;
 
 /// Whether `artifact` still needs its repodata block derived: no block of
 /// the current version, neither real nor an "unparseable" marker.
 fn needs_repodata_heal(artifact: &RpmArtifact) -> bool {
-    artifact
+    needs_repodata_heal_at(artifact, chrono::Utc::now().timestamp())
+}
+
+fn needs_repodata_heal_at(artifact: &RpmArtifact, now: i64) -> bool {
+    let Some(block) = artifact
         .metadata
         .as_ref()
         .and_then(|m| m.get(RPM_REPODATA_KEY))
-        .and_then(|b| b.get("v"))
-        .and_then(|v| v.as_u64())
-        != Some(RPM_REPODATA_INFO_VERSION)
+    else {
+        return true;
+    };
+    if block.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION) {
+        return true;
+    }
+    // A marker written after repeated TRANSIENT failures (storage down,
+    // object unreadable) is retried once it is old enough; a deterministic
+    // one (the header itself is unusable) never is.
+    block
+        .get("retry_after")
+        .and_then(|t| t.as_i64())
+        .is_some_and(|t| now >= t)
 }
+
+/// Consecutive transient heal failures after which a package is settled
+/// with a retryable marker (retried after [`RPM_HEAL_RETRY_SECS`]) instead
+/// of keeping its repository's renders uncacheable.
+const RPM_HEAL_MAX_TRANSIENT_FAILURES: i64 = 5;
+/// Delay before a package settled by transient failures is retried.
+const RPM_HEAL_RETRY_SECS: i64 = 24 * 60 * 60;
+/// Metadata key counting consecutive transient heal failures.
+const RPM_HEAL_FAILURES_KEY: &str = "repodata_heal_failures";
 
 /// Packages stored before #3801 (or pushed through a path that could not see
 /// the whole header) carry no current [`RPM_REPODATA_KEY`] block, so their
@@ -1099,10 +1122,14 @@ async fn heal_one(state: &SharedState, job: HealJob) -> (usize, Option<serde_jso
             .ok()
         }
         Err(HeaderRead::Permanent(reason)) => Some((unparseable_block(&reason), None)),
-        Err(HeaderRead::Transient) => None,
+        Err(HeaderRead::Transient(reason)) => {
+            warn!(artifact_id = %job.artifact_id, %reason, "RPM repodata heal: header read failed");
+            None
+        }
     };
     let Some((block, base)) = block_and_base else {
-        return (job.index, None, false);
+        let settled = record_transient_heal_failure(&state.db, job.artifact_id).await;
+        return (job.index, None, settled);
     };
 
     let mut metadata = job
@@ -1110,36 +1137,142 @@ async fn heal_one(state: &SharedState, job: HealJob) -> (usize, Option<serde_jso
         .or(base)
         .unwrap_or_else(|| serde_json::json!({ "filename": job.filename }));
     metadata[RPM_REPODATA_KEY] = block;
-    // Merge only the block into an existing row: a concurrent writer of any
-    // other key is not overwritten with this render's stale copy.
-    let persisted = sqlx::query(
+    match persist_repodata_block(&state.db, job.artifact_id, &metadata).await {
+        Ok(()) => (job.index, Some(metadata), true),
+        Err(e) if is_size_limit_error(&e) => {
+            // Too large to store: settle it as unparseable rather than
+            // re-deriving (and rendering) the oversized block every time.
+            let reason = format!("repodata block too large to store: {e}");
+            metadata[RPM_REPODATA_KEY] = unparseable_block(&reason);
+            let settled = persist_repodata_block(&state.db, job.artifact_id, &metadata)
+                .await
+                .is_ok();
+            (job.index, Some(metadata), settled)
+        }
+        Err(e) => {
+            warn!(artifact_id = %job.artifact_id, error = %e, "RPM repodata heal: persist failed");
+            (job.index, Some(metadata), false)
+        }
+    }
+}
+
+/// Merge `metadata`'s repodata block into the artifact's row (inserting the
+/// whole value when there is no row): a concurrent writer of any other key
+/// is not overwritten with this render's stale copy, and the transient
+/// failure counter is cleared.
+async fn persist_repodata_block(
+    db: &sqlx::PgPool,
+    artifact_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
          VALUES ($1, 'rpm', $2) \
          ON CONFLICT (artifact_id) DO UPDATE SET metadata = CASE \
              WHEN jsonb_typeof(artifact_metadata.metadata) = 'object' \
-             THEN artifact_metadata.metadata \
+             THEN (artifact_metadata.metadata - $4::text) \
                   || jsonb_build_object($3::text, EXCLUDED.metadata -> $3::text) \
              ELSE EXCLUDED.metadata END",
     )
-    .bind(job.artifact_id)
-    .bind(&metadata)
+    .bind(artifact_id)
+    .bind(metadata)
     .bind(RPM_REPODATA_KEY)
-    .execute(&state.db)
+    .bind(RPM_HEAL_FAILURES_KEY)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Postgres refusing a value for its size (SQLSTATE class 54, "program
+/// limit exceeded": e.g. a jsonb object over ~256 MB). Retrying cannot help.
+fn is_size_limit_error(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().is_some_and(|c| c.starts_with("54")))
+}
+
+/// Count one transient heal failure for `artifact_id`. After
+/// [`RPM_HEAL_MAX_TRANSIENT_FAILURES`] in a row the package is settled with
+/// a marker that is retried after [`RPM_HEAL_RETRY_SECS`], so one unreadable
+/// object cannot keep its repository (and every virtual repository over
+/// it) re-rendering. Returns whether the package is now settled.
+async fn record_transient_heal_failure(db: &sqlx::PgPool, artifact_id: uuid::Uuid) -> bool {
+    let failures: Result<i64, sqlx::Error> = sqlx::query_scalar(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'rpm', jsonb_build_object($2::text, 1)) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = CASE \
+             WHEN jsonb_typeof(artifact_metadata.metadata) = 'object' \
+             THEN artifact_metadata.metadata || jsonb_build_object($2::text, \
+                  COALESCE((artifact_metadata.metadata ->> $2::text)::bigint, 0) + 1) \
+             ELSE jsonb_build_object($2::text, 1) END \
+         RETURNING (metadata ->> $2::text)::bigint",
+    )
+    .bind(artifact_id)
+    .bind(RPM_HEAL_FAILURES_KEY)
+    .fetch_one(db)
     .await;
-    if let Err(e) = &persisted {
-        warn!(artifact_id = %job.artifact_id, error = %e, "RPM repodata heal: persist failed");
+    let Ok(failures) = failures else {
+        return false;
+    };
+    if failures < RPM_HEAL_MAX_TRANSIENT_FAILURES {
+        return false;
     }
-    (job.index, Some(metadata), persisted.is_ok())
+    let mut marker = unparseable_block(&format!(
+        "stored package unreadable after {failures} attempts"
+    ));
+    marker["retry_after"] = serde_json::json!(chrono::Utc::now().timestamp() + RPM_HEAL_RETRY_SECS);
+    let metadata = serde_json::json!({ RPM_REPODATA_KEY: marker });
+    persist_repodata_block(db, artifact_id, &metadata)
+        .await
+        .is_ok()
+}
+
+/// Record an RPM artifact's metadata at upload. The artifact row already
+/// exists, so a write the database refuses is not silently dropped (#3801):
+/// a value too large to store is recorded with an "unparseable" repodata
+/// marker instead, so the heal does not re-derive it on every render.
+pub(crate) async fn record_rpm_metadata(
+    db: &sqlx::PgPool,
+    artifact_id: uuid::Uuid,
+    repo_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    let write = |value: serde_json::Value| async move {
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'rpm', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+        )
+        .bind(artifact_id)
+        .bind(&value)
+        .execute(db)
+        .await
+        .map(|_| ())
+    };
+    let result = match write(metadata.clone()).await {
+        Err(e) if is_size_limit_error(&e) => {
+            let mut smaller = metadata.clone();
+            smaller[RPM_REPODATA_KEY] =
+                unparseable_block(&format!("repodata block too large to store: {e}"));
+            write(smaller).await
+        }
+        other => other,
+    };
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(db)
+        .await;
+    result
 }
 
 /// Why a stored package's header could not be read back.
 #[derive(Debug)]
 enum HeaderRead {
-    /// Retrying cannot help (object missing, corrupt size, a header that
-    /// keeps growing): record the package as unparseable.
+    /// Retrying cannot help (corrupt size, a header that keeps growing):
+    /// record the package as unparseable.
     Permanent(String),
-    /// Storage unavailable or erroring: retry on a later render.
-    Transient,
+    /// Storage unavailable, erroring, or the object missing (a mount blip or
+    /// a storage migration looks exactly like that): retry on a later
+    /// render, up to [`RPM_HEAL_MAX_TRANSIENT_FAILURES`] times in a row.
+    Transient(String),
 }
 
 /// Read just enough of a stored package to cover its lead, signature header
@@ -1152,7 +1285,7 @@ async fn read_rpm_header_prefix(
 ) -> Result<Bytes, HeaderRead> {
     let storage = state
         .storage_for_repo(location)
-        .map_err(|_| HeaderRead::Transient)?;
+        .map_err(|e| HeaderRead::Transient(e.to_string()))?;
     read_rpm_header_prefix_from(storage.as_ref(), key, size_bytes).await
 }
 
@@ -1168,12 +1301,10 @@ async fn read_rpm_header_prefix_from(
         .map_err(|_| HeaderRead::Permanent("negative recorded package size".into()))?;
     let mut want = size.min(64 * 1024);
     for _ in 0..4 {
-        let bytes = storage.get_range(key, 0, want).await.map_err(|e| match e {
-            crate::error::AppError::NotFound(_) => {
-                HeaderRead::Permanent("stored package not found".into())
-            }
-            _ => HeaderRead::Transient,
-        })?;
+        let bytes = storage
+            .get_range(key, 0, want)
+            .await
+            .map_err(|e| HeaderRead::Transient(e.to_string()))?;
         match RpmHandler::header_bytes_needed(&bytes) {
             Some(needed)
                 if needed > bytes.len()
@@ -2012,19 +2143,27 @@ async fn store_rpm(
     // the indexing limits, or with XML-forbidden control characters, is
     // refused with 400 (#3801). The parse runs on the blocking pool — it is
     // linear, but proportional to the uploaded header.
-    let parsed_metadata = {
+    let (parsed_metadata, (scripts, unanalyzed, completeness)) = {
         let (name, bytes) = (filename.to_string(), content.clone());
-        tokio::task::spawn_blocking(move || build_rpm_artifact_metadata(&name, &bytes))
-            .await
-            .map_err(|e| {
-                error!(error = %e, "RPM header parse task failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to parse RPM header",
-                )
-                    .into_response()
-            })?
-            .map_err(|rejected| (StatusCode::BAD_REQUEST, rejected.0).into_response())?
+        let (metadata, scriptlets) = tokio::task::spawn_blocking(move || {
+            (
+                build_rpm_artifact_metadata(&name, &bytes),
+                extract_rpm_scriptlets(&bytes),
+            )
+        })
+        .await
+        .map_err(|e| {
+            error!(error = %e, "RPM header parse task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to parse RPM header",
+            )
+                .into_response()
+        })?;
+        (
+            metadata.map_err(|rejected| (StatusCode::BAD_REQUEST, rejected.0).into_response())?,
+            scriptlets,
+        )
     };
 
     proxy_helpers::ensure_unique_artifact_path(
@@ -2064,14 +2203,14 @@ async fn store_rpm(
     let rpm_metadata = parsed_metadata
         .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
 
-    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
-        .await;
+    if let Err(e) = record_rpm_metadata(&state.db, artifact_id, repo.id, &rpm_metadata).await {
+        warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
+    }
 
     // `%pre`/`%post`/`%preun`/`%postun` run as root on `dnf install` (#4033).
     // Best-effort: the artifact row is already committed, and a package with
     // no scriptlets still records a row so "none present" stays
     // distinguishable from "never looked".
-    let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&content);
     debug_assert!(
         scripts
             .iter()
@@ -6203,6 +6342,15 @@ mod repodata_deps_tests {
             store.extend_from_slice(r.as_bytes());
             store.push(0);
         }
+        // REQUIREFLAGS (all 0) and REQUIREVERSION (all empty): createrepo_c
+        // reads a dependency type only with all three tags present.
+        while store.len() % 4 != 0 {
+            store.push(0);
+        }
+        entries.push((1048, 4, store.len() as u32, requires.len() as u32));
+        store.extend(std::iter::repeat_n(0u8, requires.len() * 4));
+        entries.push((1050, 8, store.len() as u32, requires.len() as u32));
+        store.extend(std::iter::repeat_n(0u8, requires.len()));
         if basenames > 0 {
             entries.push((1117, 8, store.len() as u32, basenames));
             store.resize(store.len() + basenames as usize, 0);
@@ -6396,5 +6544,59 @@ mod repodata_deps_tests {
             deps_row["written_concurrently"], true,
             "the heal must merge its block, not overwrite the row: {deps_row}"
         );
+    }
+    /// An unreadable stored package (object missing: a mount blip looks the
+    /// same) is retried, not settled on the first failure; after
+    /// RPM_HEAL_MAX_TRANSIENT_FAILURES in a row it gets a marker that is
+    /// retried a day later, so the repository's renders become cacheable.
+    #[tokio::test]
+    async fn heal_promotes_repeated_transient_failures_to_a_retryable_marker() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let key = format!("rpm/{}/{DEPS_FILENAME}", f.repo_id);
+        let id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &key,
+            &format!("packages/{DEPS_FILENAME}"),
+            "ak-deps-test",
+            "1.5-3",
+            "application/x-rpm",
+            bytes::Bytes::from_static(DEPS_RPM),
+            f.user_id,
+        )
+        .await;
+        let storage = f.state.storage_for_repo(&repo.storage_location()).unwrap();
+        storage.delete(&key).await.unwrap();
+
+        let mut outcomes = Vec::new();
+        let mut artifacts = Vec::new();
+        for _ in 0..RPM_HEAL_MAX_TRANSIENT_FAILURES {
+            artifacts = collect_repodata_artifacts(&f.pool, &[f.repo_id])
+                .await
+                .unwrap();
+            outcomes.push(heal_rpm_repodata_info(&f.state, &mut artifacts).await);
+        }
+        let after = collect_repodata_artifacts(&f.pool, &[f.repo_id])
+            .await
+            .unwrap();
+        f.teardown().await;
+        let _ = (id, artifacts);
+
+        let (last, earlier) = outcomes.split_last().unwrap();
+        assert!(
+            earlier.iter().all(|c| !c),
+            "transient failures keep renders uncacheable: {outcomes:?}"
+        );
+        assert!(last, "the last failure settles the package: {outcomes:?}");
+        let a = &after[0];
+        let block = &a.metadata.as_ref().unwrap()[RPM_REPODATA_KEY];
+        assert_eq!(block["unparseable"], true, "{block}");
+        let retry_after = block["retry_after"].as_i64().expect("retryable marker");
+        assert!(!needs_repodata_heal_at(a, retry_after - 1));
+        assert!(needs_repodata_heal_at(a, retry_after), "retried once due");
     }
 }
