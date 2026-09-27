@@ -465,7 +465,7 @@ pub struct AgeGateReview {
     pub reviewed_by_username: Option<String>,
     #[sqlx(default)]
     pub reviewed_by_is_service_account: Option<bool>,
-    /// An instance administrator has decided this review (migration 240): a
+    /// An instance administrator has decided this review (migration 244): a
     /// repository administrator may still reject it, but not approve or reopen
     /// it. See [`require_may_relax_review`].
     #[sqlx(default)]
