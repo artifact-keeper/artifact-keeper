@@ -395,6 +395,50 @@ async fn repository_visibility_flip_emits_changed_but_package_activity_does_not(
     cleanup_repo(&pool, repo_id).await;
 }
 
+/// Migration 245: `internal` <-> `private` changes only `visibility` -- the
+/// `is_public` mirror stays `false` on both sides -- so the notify trigger
+/// must key off `visibility` itself. Narrowing `internal` to `private` is the
+/// security-critical direction: without the event every replica keeps serving
+/// the old, wider decision until the cache TTL.
+#[tokio::test]
+#[ignore]
+async fn repository_visibility_only_change_emits_changed() {
+    let pool = require_db_pool().await;
+    let key = unique("trg-repo-vis-only");
+    let repo_id = insert_repo(&pool, &key, false).await;
+
+    let mut listener = subscribe(&pool).await;
+
+    for to in ["internal", "private"] {
+        sqlx::query(
+            "UPDATE repositories SET visibility = $2::repository_visibility, \
+             updated_at = NOW() WHERE id = $1",
+        )
+        .bind(repo_id)
+        .bind(to)
+        .execute(&pool)
+        .await
+        .expect("visibility-only change failed");
+        let event = expect_event(
+            &mut listener,
+            5,
+            "repository_changed",
+            |e| matches!(e, InvalidationEvent::RepositoryChanged { old_key, .. } if *old_key == key),
+        )
+        .await;
+        assert_eq!(
+            event,
+            InvalidationEvent::RepositoryChanged {
+                old_key: key.clone(),
+                new_key: key.clone(),
+            },
+            "a visibility-only change to {to} must notify"
+        );
+    }
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn repository_rename_emits_changed_with_both_keys() {
