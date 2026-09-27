@@ -24,15 +24,27 @@
 -- repositories; they are recovered by a documented operator review step, not
 -- here.
 
-CREATE TYPE repository_visibility AS ENUM ('public', 'internal', 'private');
+-- Every statement below is re-run safe: a database that already applied this
+-- file under an earlier number (it was 212, 217 and 235 while in review) must
+-- be able to apply it again without error and without changing any row.
+DO $$
+BEGIN
+    CREATE TYPE repository_visibility AS ENUM ('public', 'internal', 'private');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 ALTER TABLE repositories
-    ADD COLUMN visibility repository_visibility;
+    ADD COLUMN IF NOT EXISTS visibility repository_visibility;
 
+-- Only rows not yet backfilled: on a re-run the column is already filled, and
+-- recomputing it from `is_public` would narrow every `internal` repository.
 UPDATE repositories
 SET visibility = CASE WHEN is_public THEN 'public'::repository_visibility
                       ELSE 'private'::repository_visibility
-                 END;
+                 END
+WHERE visibility IS NULL;
 
 -- NOT NULL, but deliberately NO DEFAULT. The column is filled by the BEFORE
 -- INSERT trigger below, which runs before constraints are checked, so an INSERT
@@ -171,9 +183,19 @@ CREATE TRIGGER ak_repositories_sync_visibility
 -- columns, so this can only fire if the trigger is dropped or its logic breaks
 -- -- which is exactly when a silent divergence between the authorization field
 -- and the field legacy clients read would be most dangerous.
-ALTER TABLE repositories
-    ADD CONSTRAINT repositories_is_public_mirrors_visibility
-    CHECK (is_public = (visibility = 'public'));
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'repositories_is_public_mirrors_visibility'
+          AND conrelid = 'repositories'::regclass
+    ) THEN
+        ALTER TABLE repositories
+            ADD CONSTRAINT repositories_is_public_mirrors_visibility
+            CHECK (is_public = (visibility = 'public'));
+    END IF;
+END
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Cache invalidation must fire on a visibility change.
