@@ -17143,25 +17143,38 @@ mod tests {
         let private = svc.get_by_id(private_id).await.expect("load private");
         let auth_opt = Some(auth.clone());
 
-        // -- internal: both surfaces must say yes.
         let direct_internal =
             check_artifact_visibility(&auth_opt, artifact_ids[0], &pool, "read").await;
         let parent_internal =
             caller_can_read_member(&pool, Some(&auth), virtual_id, &internal).await;
+        let direct_private =
+            check_artifact_visibility(&auth_opt, artifact_ids[1], &pool, "read").await;
+        let parent_private = caller_can_read_member(&pool, Some(&auth), virtual_id, &private).await;
+
+        // Clean up before asserting so a failure does not leak the fixture.
+        for id in [internal_id, private_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        for d in [internal_dir, private_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        // -- internal: both surfaces must say yes.
         assert!(
             direct_internal.is_ok(),
-            "baseline: a direct fetch of an internal member's artifact must succeed              for an authenticated grant-less caller"
+            "baseline: a direct fetch of an internal member's artifact must succeed \
+             for an authenticated grant-less caller"
         );
         assert_eq!(
             direct_internal.is_ok(),
             parent_internal,
-            "the virtual-parent fan-out must give the SAME answer as a direct              fetch for an internal member; refusing the bytes here while the              direct URL serves them makes the ceiling bypassable rather than              enforced"
+            "the virtual-parent fan-out must give the SAME answer as a direct \
+             fetch for an internal member; refusing the bytes here while the \
+             direct URL serves them makes the ceiling bypassable rather than \
+             enforced"
         );
 
         // -- private: both surfaces must still say no.
-        let direct_private =
-            check_artifact_visibility(&auth_opt, artifact_ids[1], &pool, "read").await;
-        let parent_private = caller_can_read_member(&pool, Some(&auth), virtual_id, &private).await;
         assert!(
             direct_private.is_err(),
             "a private member must stay refused on a direct fetch without a grant"
@@ -17169,15 +17182,9 @@ mod tests {
         assert_eq!(
             direct_private.is_err(),
             !parent_private,
-            "the fan-out must not widen a private member; a fix that returns              true unconditionally passes the internal half and fails here"
+            "the fan-out must not widen a private member; a fix that returns \
+             true unconditionally passes the internal half and fails here"
         );
-
-        for id in [internal_id, private_id] {
-            tdh::cleanup(&pool, id, user_id).await;
-        }
-        for d in [internal_dir, private_dir] {
-            let _ = std::fs::remove_dir_all(d);
-        }
     }
 
     #[test]
