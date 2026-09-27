@@ -363,6 +363,38 @@ const SELECT_APPROVAL: &str = r#"
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// The grant bar for filing an approval request against `source`.
+///
+/// A public source keeps its long-standing behaviour (any signed-in caller that
+/// passed `require_visible`). Any other source -- `private` or `internal` --
+/// requires an admin or a grant carrying `read` on the repository. For a
+/// `private` source this repeats what `require_visible` already decided; for an
+/// `internal` one it is the whole point, because `require_visible` admits every
+/// authenticated principal there and filing a request is a write.
+async fn require_source_grant_for_request(
+    source: &crate::models::repository::Repository,
+    auth: &AuthExtension,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    if source.visibility.allows_anonymous_read() || auth.is_admin {
+        return Ok(());
+    }
+    if repo_service
+        .user_can_access_repo(
+            source.id,
+            auth.user_id,
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+    Err(AppError::NotFound(format!(
+        "Repository '{}' not found",
+        source.key
+    )))
+}
+
 /// Request approval for promoting an artifact from staging to release.
 #[utoipa::path(
     post,
@@ -396,6 +428,16 @@ pub async fn request_approval(
     // gate from is_public + per-repo role-assignment membership (NotFound on a
     // private repo the caller cannot see), so the denial happens BEFORE the probe.
     require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
+
+    // Filing a request WRITES a promotion_approvals row (and holds the single
+    // pending slot for this artifact/source/target), so the read baseline that
+    // `require_visible` honours is not enough on its own: an `internal`
+    // repository is readable by every signed-in principal, but `internal`
+    // never satisfies a mutation (#3812). Unless the source is anonymously
+    // readable -- the long-standing public case -- the caller needs an explicit
+    // READ grant on it, exactly as for a `private` source. Same
+    // existence-hiding 404 as the visibility gate.
+    require_source_grant_for_request(&source_repo, &auth, &repo_service).await?;
 
     // Verify the artifact exists in the source repo
     let artifact_exists: Option<(Uuid,)> = sqlx::query_as(
@@ -2529,6 +2571,95 @@ mod tests {
             cleanup(&pool, &[src, tgt], requester).await;
             cleanup_user(&pool, member).await;
             cleanup_user(&pool, outsider).await;
+        }
+
+        /// #3812: `internal` is a READ tier and never satisfies a mutation.
+        /// Filing an approval request writes a `promotion_approvals` row, so a
+        /// signed-in caller with NO grant on an internal source gets the same
+        /// existence-hiding 404 as for a private one -- and nothing is written --
+        /// while a `reader` member of the source can file it.
+        #[tokio::test]
+        async fn test_request_approval_internal_source_requires_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr3812-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr3812-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s3812", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t3812", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+                .bind(src)
+                .execute(&pool)
+                .await
+                .expect("make source internal");
+            let outsider = make_requester(&pool, "3812o").await;
+            let reader = make_requester(&pool, "3812r").await;
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'reader'",
+            )
+            .bind(reader)
+            .bind(src)
+            .execute(&pool)
+            .await
+            .expect("grant per-repo reader role");
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg3812").await;
+            let req = || ApprovalRequest {
+                source_repository: src_key.clone(),
+                target_repository: tgt_key.clone(),
+                artifact_id: artifact,
+                skip_policy_check: false,
+                notes: Some("pr3812".to_string()),
+            };
+            async fn pending(pool: &PgPool, src: Uuid) -> i64 {
+                let (n,): (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM promotion_approvals WHERE source_repo_id = $1",
+                )
+                .bind(src)
+                .fetch_one(pool)
+                .await
+                .expect("count approvals");
+                n
+            }
+
+            // The internal read baseline admits the outsider to READ the
+            // source, but not to file a request against it.
+            let denied = request_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(outsider, "o3812")),
+                Json(req()),
+            )
+            .await;
+            assert!(
+                matches!(denied, Err(AppError::NotFound(_))),
+                "no-grant caller on an internal source must 404: {denied:?}"
+            );
+            assert_eq!(
+                pending(&pool, src).await,
+                0,
+                "a refused request wrote a row"
+            );
+
+            let filed = request_approval(
+                State(state),
+                Extension(tdh::make_auth(reader, "r3812")),
+                Json(req()),
+            )
+            .await;
+            match filed {
+                Ok((status, _)) => assert_eq!(status, axum::http::StatusCode::CREATED),
+                Err(e) => panic!("reader member of the internal source must file: {e:?}"),
+            }
+            assert_eq!(pending(&pool, src).await, 1);
+
+            cleanup(&pool, &[src, tgt], outsider).await;
+            cleanup_user(&pool, reader).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
         }
 
         /// #2443: the unfiltered pending-approvals aggregate is admin-only; a

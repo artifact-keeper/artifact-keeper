@@ -428,9 +428,14 @@ pub(crate) fn member_passes_token_scope(
 ///   used by curation, promotion-rule, approval, signing and quarantine reads);
 /// * `approval.rs`, `curation.rs`, `promotion_rules.rs`, `security.rs`,
 ///   `signing.rs`, `quality_gates.rs`, `repository_labels.rs`, `wasm_proxy.rs`
-///   — all `GET`s, plus three `POST`s that are read-only in effect
-///   (`request_approval` probes the SOURCE repo, `evaluate_rule` enumerates the
-///   source repo, `check_license_compliance` reads the repo's policy);
+///   — all `GET`s, plus two `POST`s that are read-only in effect
+///   (`evaluate_rule` enumerates the source repo, `check_license_compliance`
+///   reads the repo's policy). `request_approval` also calls this on the SOURCE
+///   repo, but only as the existence-hiding READ gate in front of its artifact
+///   probe: filing a request writes a `promotion_approvals` row, so it layers
+///   `require_source_grant_for_request` on top, which demands an explicit
+///   grant on any non-public source. `internal` must never satisfy that write
+///   (#3812);
 /// * `require_member_attachable` — attaching a member to a virtual is a
 ///   mutation, but the capability it confers (and the #3177 escalation it
 ///   closes) is READING the member back out through the virtual, so `read` is
@@ -20460,7 +20465,9 @@ mod tests {
             require_public_visibility_allowed(requested.allows_anonymous_read(), false).is_err()
         );
         // `internal` is never a contradiction, so it survives a guest disable.
-        assert!(require_public_visibility_allowed(V::Internal.allows_anonymous_read(), false).is_ok());
+        assert!(
+            require_public_visibility_allowed(V::Internal.allows_anonymous_read(), false).is_ok()
+        );
     }
 
     /// The other half, and the one that protects an existing `internal`
