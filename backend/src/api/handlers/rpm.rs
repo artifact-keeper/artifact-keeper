@@ -652,7 +652,7 @@ pub(crate) struct RpmUploadRejected(pub(crate) String);
 
 /// Key of the header-derived repodata block inside an RPM artifact's
 /// `artifact_metadata` (#3801).
-const RPM_REPODATA_KEY: &str = "repodata";
+pub(crate) const RPM_REPODATA_KEY: &str = "repodata";
 /// Shape version of that block. Bump it when the extraction changes in a way
 /// already-stored packages must pick up: blocks with any other version are
 /// ignored by the renderer and re-derived by [`heal_rpm_repodata_info`].
@@ -959,6 +959,9 @@ fn earliest_retry_deadline(artifacts: &[RpmArtifact]) -> Option<std::time::Insta
                 .get("retry_after")?
                 .as_i64()
         })
+        // Only deadlines still ahead: an expired marker whose re-heal failed
+        // again must not pin the render's validity to "now".
+        .filter(|&due| due > now)
         .min()
         .map(|due| {
             std::time::Instant::now()

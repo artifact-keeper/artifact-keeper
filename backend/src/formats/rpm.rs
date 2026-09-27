@@ -520,21 +520,36 @@ pub const RPM_MAX_LIST_ELEMENTS: usize = 262_144;
 /// bytes.
 pub const RPM_MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
 /// Fixed allowance of the proportional budget.
-const RPM_MATERIALIZED_BASE_BYTES: usize = 1024 * 1024;
+///
+/// Real packages never need it (the per-header-byte term covers them); it
+/// only keeps tiny headers workable. It is kept small because it is paid per
+/// PACKAGE whatever the uploader stored: 1 MiB let a ~3.7 KB header expand
+/// ~1,000x.
+const RPM_MATERIALIZED_BASE_BYTES: usize = 64 * 1024;
+/// Budget charged per dependency, file or string-array element on top of
+/// its string bytes: what one entry costs beyond its text once it is an
+/// `RpmEntry`/`RpmFileEntry`, a serde_json object in the stored block and an
+/// `<rpm:entry>`/`<file>` element in the XML. Without it a header of
+/// one-byte names (8 tags x 32,768 "a\0", ~66 KB) expanded to ~260k entries
+/// and ~240 MB of in-memory JSON. Real packages spend 47 (kernel-core) to
+/// 388 (glibc) header bytes per file+provide+require, i.e. a 188-1552 byte
+/// allowance at 4x, well above 64 plus the entry's own text.
+pub const RPM_ENTRY_COST: usize = 64;
 /// Rendered bytes allowed per byte of main header, on top of the base.
 ///
 /// Real packages expand far less than their header: measured as file-path
 /// bytes / main-header bytes on a Fedora host, kernel-devel 0.55,
 /// breeze-icon-theme 0.54, kernel-modules 0.19, glibc-devel 0.09 (paths are
-/// the bulk of what is materialized). 4x plus 1 MiB leaves ample headroom
+/// the bulk of what is materialized). 4x plus 64 KiB leaves ample headroom
 /// for those while making what an uploader can make the server build
 /// linear in the bytes they actually store — a ~40 KB header whose 3,300
 /// files all name one 20 KB dirname would otherwise expand to 64 MiB, and
-/// every render holds each package's expansion in memory.
+/// every render holds each package's expansion in memory. Entries are
+/// charged [`RPM_ENTRY_COST`] each on top of their bytes.
 const RPM_MATERIALIZED_PER_HEADER_BYTE: usize = 4;
 
 /// The materialization budget for a main header of `header_len` bytes:
-/// `min(64 MiB, 1 MiB + 4 x header_len)`.
+/// `min(64 MiB, 64 KiB + 4 x header_len)`.
 fn materialization_budget(header_len: usize) -> usize {
     RPM_MAX_MATERIALIZED_BYTES.min(
         RPM_MATERIALIZED_BASE_BYTES
@@ -784,10 +799,15 @@ impl<'a> HeaderIndex<'a> {
     /// one element), at most `max`. Empty when absent. Every returned string
     /// must be NUL-terminated inside the store — as rpm's `dataLength`
     /// demands — or the header is malformed.
+    ///
+    /// Each element is charged its rendered bytes plus `per_element`
+    /// ([`RPM_ENTRY_COST`] for arrays that become entries; 0 for the
+    /// version arrays read in lockstep with an already-charged name array).
     fn string_array_n(
         &self,
         tag: u32,
         max: usize,
+        per_element: usize,
     ) -> std::result::Result<Vec<String>, RpmHeaderError> {
         let Some(e) = self.entries.get(&tag) else {
             return Ok(Vec::new());
@@ -797,7 +817,7 @@ impl<'a> HeaderIndex<'a> {
             _ => 1,
         }
         .min(max);
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(4096));
         let mut rest = &self.store[e.offset..];
         while out.len() < n {
             let Some(nul) = rest.iter().position(|&b| b == 0) else {
@@ -805,7 +825,7 @@ impl<'a> HeaderIndex<'a> {
                     "string array runs past the header store".into(),
                 ));
             };
-            self.charge(rendered_len(&rest[..nul]))?;
+            self.charge(rendered_len(&rest[..nul]).saturating_add(per_element))?;
             out.push(String::from_utf8_lossy(&rest[..nul]).into_owned());
             rest = &rest[nul + 1..];
         }
@@ -813,7 +833,7 @@ impl<'a> HeaderIndex<'a> {
     }
 
     fn string_array(&self, tag: u32) -> std::result::Result<Vec<String>, RpmHeaderError> {
-        self.string_array_n(tag, usize::MAX)
+        self.string_array_n(tag, usize::MAX, RPM_ENTRY_COST)
     }
 
     /// Up to `max` values of an integer tag, widened to u64. Empty when
@@ -966,9 +986,9 @@ fn raw_deps(
         .count(name_tag)
         .min(h.count(flags_tag))
         .min(h.count(version_tag));
-    let names = h.string_array_n(name_tag, n)?;
+    let names = h.string_array_n(name_tag, n, RPM_ENTRY_COST)?;
     let flags = h.ints_n(flags_tag, n);
-    let versions = h.string_array_n(version_tag, n)?;
+    let versions = h.string_array_n(version_tag, n, 0)?;
     let n = names.len().min(flags.len()).min(versions.len());
     Ok(names
         .into_iter()
@@ -2291,7 +2311,7 @@ mod tests {
 
     /// The reviewer's case: ~3,300 files all naming one 20 KB dirname fit
     /// a ~40 KB header yet expand to ~64 MiB of paths. The proportional
-    /// budget (1 MiB + 4 x header) refuses it — and the real fixtures, far
+    /// budget (64 KiB + 4 x header) refuses it — and the real fixtures, far
     /// below 4x, still parse.
     #[test]
     fn test_budget_is_proportional_to_the_header() {
@@ -2320,7 +2340,7 @@ mod tests {
             RpmHandler::parse_rpm_repodata_info(&hostile_package(&main)),
             Err(RpmHeaderError::OverLimit(_))
         ));
-        assert_eq!(materialization_budget(40_000), 1024 * 1024 + 160_000);
+        assert_eq!(materialization_budget(40_000), 64 * 1024 + 160_000);
         assert_eq!(
             materialization_budget(usize::MAX),
             RPM_MAX_MATERIALIZED_BYTES
@@ -2338,8 +2358,9 @@ mod tests {
         assert_eq!(rendered_len(&[0x80]), 3);
         assert_eq!(rendered_len(&[b'a', 0xff, 0xfe, b'b']), 1 + 3 + 3 + 1);
         assert_eq!(rendered_len("é".as_bytes()), 2);
-        // 30 files naming one 10 KB dirname: 300 KB raw fits the ~1.09 MB
-        // budget of this ~10 KB header, but as '&' it renders 5x (1.5 MB).
+        // 8 files naming one 10 KB dirname: ~90 KB raw fits the ~105 KB
+        // budget of this ~10 KB header, but as '&' it renders 5x (~450 KB)
+        // and as invalid UTF-8 3x (~270 KB).
         let package = |fill: u8, files: u32| {
             let mut store = Vec::new();
             for _ in 0..files {
@@ -2359,16 +2380,14 @@ mod tests {
                 &store,
             ))
         };
-        assert!(RpmHandler::parse_rpm_repodata_info(&package(b'x', 30)).is_ok());
+        assert!(RpmHandler::parse_rpm_repodata_info(&package(b'x', 8)).is_ok());
         assert!(matches!(
-            RpmHandler::parse_rpm_repodata_info(&package(b'&', 30)),
+            RpmHandler::parse_rpm_repodata_info(&package(b'&', 8)),
             Err(RpmHeaderError::OverLimit(_))
         ));
-        // Invalid UTF-8 renders 3x: 50 files x 10 KB is 500 KB raw (fits,
-        // as the 'x' control shows) but 1.5 MB once converted.
-        assert!(RpmHandler::parse_rpm_repodata_info(&package(b'x', 50)).is_ok());
+        // Invalid UTF-8 renders 3x.
         assert!(matches!(
-            RpmHandler::parse_rpm_repodata_info(&package(0x80, 50)),
+            RpmHandler::parse_rpm_repodata_info(&package(0x80, 8)),
             Err(RpmHeaderError::OverLimit(_))
         ));
     }
@@ -2501,25 +2520,170 @@ mod tests {
     /// satisfied by the identical provide and dropped.
     #[test]
     fn test_aliased_requires_and_provides_dedup_linearly() {
-        let mut store = Vec::new();
+        // 100k requires, each identical to a provide: hashed lookups keep
+        // this linear. Every list has its own bytes (aliasing one list for
+        // all four is now refused by the per-entry charge).
         let n = 100_000u32;
+        let mut names = Vec::new();
         for i in 0..n {
-            store.extend_from_slice(format!("{i:07}\0").as_bytes());
+            names.extend_from_slice(format!("dep-{i:011}\0").as_bytes());
         }
+        let mut store = Vec::new();
+        let off = |store: &mut Vec<u8>, bytes: &[u8]| {
+            let o = store.len() as u32;
+            store.extend_from_slice(bytes);
+            o
+        };
+        let flags = vec![0u8; n as usize * 4];
+        let (pn, pv, pf) = (
+            off(&mut store, &names),
+            off(&mut store, &names),
+            off(&mut store, &flags),
+        );
+        let (rn, rv, rf) = (
+            off(&mut store, &names),
+            off(&mut store, &names),
+            off(&mut store, &flags),
+        );
         let pkg = hostile_package(&hostile_header(
             &[
-                (RPMTAG_PROVIDENAME, RPM_STRING_ARRAY_TYPE, 0, n),
-                (RPMTAG_PROVIDEFLAGS, RPM_INT32_TYPE, 0, n),
-                (RPMTAG_PROVIDEVERSION, RPM_STRING_ARRAY_TYPE, 0, n),
-                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, n),
-                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 0, n),
-                (RPMTAG_REQUIREVERSION, RPM_STRING_ARRAY_TYPE, 0, n),
+                (RPMTAG_PROVIDENAME, RPM_STRING_ARRAY_TYPE, pn, n),
+                (RPMTAG_PROVIDEFLAGS, RPM_INT32_TYPE, pf, n),
+                (RPMTAG_PROVIDEVERSION, RPM_STRING_ARRAY_TYPE, pv, n),
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, rn, n),
+                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, rf, n),
+                (RPMTAG_REQUIREVERSION, RPM_STRING_ARRAY_TYPE, rv, n),
             ],
             &store,
         ));
         let info = RpmHandler::parse_rpm_repodata_info(&pkg).unwrap();
         assert_eq!(info.provides.len(), n as usize);
         assert!(info.requires.is_empty(), "every require is self-provided");
+    }
+
+    /// Review 4's element-amplification header: a 64 KiB store of "a\0" x
+    /// 32,768 aliased by 7 name tags (with version and INT8 flag tags) and
+    /// BASENAMES — 262,144 declared entries, at the count cap, and only
+    /// ~0.5 MB of string bytes. The per-entry charge refuses it.
+    #[test]
+    fn test_hostile_aliased_one_byte_entries_hit_the_entry_charge() {
+        let n = 32_768u32;
+        let store: Vec<u8> = std::iter::repeat_n(*b"a\0", n as usize).flatten().collect();
+        let mut entries = vec![(RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, 0, n)];
+        for (name, flags, version) in [
+            (
+                RPMTAG_PROVIDENAME,
+                RPMTAG_PROVIDEFLAGS,
+                RPMTAG_PROVIDEVERSION,
+            ),
+            (
+                RPMTAG_CONFLICTNAME,
+                RPMTAG_CONFLICTFLAGS,
+                RPMTAG_CONFLICTVERSION,
+            ),
+            (
+                RPMTAG_OBSOLETENAME,
+                RPMTAG_OBSOLETEFLAGS,
+                RPMTAG_OBSOLETEVERSION,
+            ),
+            (
+                RPMTAG_SUGGESTNAME,
+                RPMTAG_SUGGESTFLAGS,
+                RPMTAG_SUGGESTVERSION,
+            ),
+            (
+                RPMTAG_ENHANCENAME,
+                RPMTAG_ENHANCEFLAGS,
+                RPMTAG_ENHANCEVERSION,
+            ),
+            (
+                RPMTAG_RECOMMENDNAME,
+                RPMTAG_RECOMMENDFLAGS,
+                RPMTAG_RECOMMENDVERSION,
+            ),
+            (
+                RPMTAG_SUPPLEMENTNAME,
+                RPMTAG_SUPPLEMENTFLAGS,
+                RPMTAG_SUPPLEMENTVERSION,
+            ),
+        ] {
+            entries.push((name, RPM_STRING_ARRAY_TYPE, 0, n));
+            entries.push((flags, RPM_INT8_TYPE, 0, n));
+            entries.push((version, RPM_STRING_ARRAY_TYPE, 0, n));
+        }
+        let pkg = hostile_package(&hostile_header(&entries, &store));
+        assert_eq!(
+            8 * n as usize,
+            RPM_MAX_LIST_ELEMENTS,
+            "exactly at the count cap, so only the entry charge can refuse it"
+        );
+        match RpmHandler::parse_rpm_repodata_info(&pkg) {
+            Err(RpmHeaderError::OverLimit(_)) => {}
+            other => panic!("expected OverLimit, got {other:?}"),
+        }
+    }
+
+    /// A kernel-core-shaped header (~42 header bytes per entry, kernel-core
+    /// measures 47): 12,000 versioned provides and 2,000 files with SHA-256
+    /// digests under one module directory. It must fit the budget with the
+    /// per-entry charge.
+    #[test]
+    fn test_kernel_core_shaped_header_fits_the_budget() {
+        const RPMTAG_FILEDIGESTS: u32 = 1035;
+        let (provides, files) = (12_000u32, 2_000u32);
+        let mut store = Vec::new();
+        let add = |store: &mut Vec<u8>, bytes: Vec<u8>| {
+            let o = store.len() as u32;
+            store.extend_from_slice(&bytes);
+            o
+        };
+        let strings = |f: &dyn Fn(u32) -> String, n: u32| -> Vec<u8> {
+            (0..n)
+                .flat_map(|i| format!("{}\0", f(i)).into_bytes())
+                .collect()
+        };
+        let be32 = |v: u32, n: u32| -> Vec<u8> { (0..n).flat_map(|_| v.to_be_bytes()).collect() };
+        let pn = add(
+            &mut store,
+            strings(&|i| format!("kmod(mod_{i:05}.ko)"), provides),
+        );
+        let pv = add(&mut store, strings(&|i| format!("0x{i:08x}"), provides));
+        let pf = add(&mut store, be32(RPMSENSE_EQUAL as u32, provides));
+        let bn = add(&mut store, strings(&|i| format!("mod_{i:05}.ko.xz"), files));
+        let dn = add(
+            &mut store,
+            b"/lib/modules/6.11.0-200.fc40.x86_64/kernel/drivers/net/\0".to_vec(),
+        );
+        let di = add(&mut store, be32(0, files));
+        let ff = add(&mut store, be32(0, files));
+        let fd = add(&mut store, strings(&|i| format!("{i:064x}"), files));
+        let fm = add(
+            &mut store,
+            (0..files).flat_map(|_| 0o100644u16.to_be_bytes()).collect(),
+        );
+        let main = hostile_header(
+            &[
+                (RPMTAG_PROVIDENAME, RPM_STRING_ARRAY_TYPE, pn, provides),
+                (RPMTAG_PROVIDEVERSION, RPM_STRING_ARRAY_TYPE, pv, provides),
+                (RPMTAG_PROVIDEFLAGS, RPM_INT32_TYPE, pf, provides),
+                (RPMTAG_BASENAMES, RPM_STRING_ARRAY_TYPE, bn, files),
+                (RPMTAG_DIRNAMES, RPM_STRING_ARRAY_TYPE, dn, 1),
+                (RPMTAG_DIRINDEXES, RPM_INT32_TYPE, di, files),
+                (RPMTAG_FILEFLAGS, RPM_INT32_TYPE, ff, files),
+                (RPMTAG_FILEDIGESTS, RPM_STRING_ARRAY_TYPE, fd, files),
+                (RPMTAG_FILEMODES, RPM_INT16_TYPE, fm, files),
+            ],
+            &store,
+        );
+        let per_entry = main.len() / (provides + files) as usize;
+        assert!(
+            (35..=50).contains(&per_entry),
+            "kernel-core-shaped: {per_entry} B/entry"
+        );
+        let info = RpmHandler::parse_rpm_repodata_info(&hostile_package(&main))
+            .expect("a kernel-core-shaped header must fit");
+        assert_eq!(info.provides.len(), provides as usize);
+        assert_eq!(info.files.len(), files as usize);
     }
 
     #[test]

@@ -8189,11 +8189,15 @@ async fn persist_generic_staged_upload(
     // on the blocking pool, BEFORE anything is stored — so a header over the
     // indexing limits (or with XML-forbidden control characters) is refused
     // with 400 here too, and the package's repodata block is recorded at
-    // upload instead of being derived later by the heal. Replication pushes
-    // are peer-trusted and skip it, as on the chunked path.
+    // upload instead of being derived later by the heal. Only a TRUSTED
+    // replication push (admin or service account, `replication_exemption_
+    // trusted`) skips it: the replication header alone is client-set.
     let rpm_metadata = if super::upload::rpm_header_metadata_eligible(&repo.format, &path)
-        && !is_replication_request(headers)
-    {
+        && !replication_exemption_trusted(
+            is_replication_request(headers),
+            auth.is_admin,
+            auth.is_service_account,
+        ) {
         match super::upload::read_rpm_header_prefix(staged.path()).await {
             Ok(prefix) => {
                 let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -9380,7 +9384,7 @@ fn delete_blocked_by_immutability(
 /// an admin or a service account — which an ordinary human-user token cannot
 /// assert. Genuine peer replication runs under such a token, so legitimate
 /// mirroring of upstream immutable-artifact deletes is preserved.
-fn replication_exemption_trusted(
+pub(crate) fn replication_exemption_trusted(
     is_replication: bool,
     is_admin: bool,
     is_service_account: bool,
@@ -23028,9 +23032,26 @@ mod tests {
             p.extend_from_slice(&store);
             p
         };
+        // A plain writer (not admin, not a service account) cannot opt out of
+        // the parse by claiming to be replication: the header is client-set.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        assert!(!auth.is_admin && !auth.is_service_account);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let replicated = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth.clone())),
+            Path((fx.repo_key.clone(), "hostile-1.0-1.noarch.rpm".to_string())),
+            headers,
+            Body::from(payload.clone()),
+        )
+        .await;
         let result = upload_artifact(
             State(fx.state.clone()),
-            Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            Extension(Some(auth)),
             Path((fx.repo_key.clone(), "hostile-1.0-1.noarch.rpm".to_string())),
             HeaderMap::new(),
             Body::from(payload),
@@ -23045,6 +23066,8 @@ mod tests {
         fx.teardown().await;
 
         let err = result.expect_err("an over-limit RPM must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let err = replicated.expect_err("an untrusted replication header is still parsed");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(rows, 0, "nothing stored for a refused RPM");
     }

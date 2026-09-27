@@ -668,7 +668,15 @@ async fn complete_session_commit(
     // blocking pool: it is linear but proportional to an untrusted header.
     // Replication sessions carry the source row's metadata instead, so
     // nothing is read for them.
-    let rpm_upload_metadata = if session.artifact_metadata_format.is_none()
+    // Only a TRUSTED replication session (admin or service account) may
+    // bring its own metadata instead: the replication header is client-set.
+    let replication_trusted = super::repositories::replication_exemption_trusted(
+        is_replication_request || session.is_replication,
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    let rpm_upload_metadata = if !(replication_trusted
+        && session.artifact_metadata_format.is_some())
         && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
     {
         match read_rpm_header_prefix(temp_path).await {
@@ -841,10 +849,27 @@ async fn complete_session_commit(
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
 
-    if let (Some(format), Some(metadata)) = (
+    if let (Some(format), Some(mut metadata)) = (
         session.artifact_metadata_format.as_deref(),
         session.artifact_metadata.clone(),
     ) {
+        // #3801: a repodata block renders verbatim and bypasses every header
+        // budget, so one supplied by an UNTRUSTED client is dropped; the
+        // block parsed from the uploaded bytes above (if any) replaces it,
+        // and otherwise the repodata heal derives it from the stored object.
+        if !replication_trusted
+            && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+        {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.remove(super::rpm::RPM_REPODATA_KEY);
+                if let Some(block) = rpm_upload_metadata
+                    .as_ref()
+                    .and_then(|m| m.get(super::rpm::RPM_REPODATA_KEY))
+                {
+                    obj.insert(super::rpm::RPM_REPODATA_KEY.to_string(), block.clone());
+                }
+            }
+        }
         let properties = session
             .artifact_metadata_properties
             .clone()
@@ -3665,17 +3690,10 @@ mod tests {
         f.teardown().await;
     }
 
-    /// #3801: an `.rpm` whose header the server refuses to index (here:
-    /// 3,300 files all naming one 20 KB dirname — a ~40 KB header expanding
-    /// to ~64 MiB of paths) is rejected with 400 at chunked completion,
-    /// BEFORE the reassembled bytes are stored: no object at the content
-    /// key, no artifact row.
-    #[tokio::test]
-    async fn complete_rejects_over_limit_rpm_before_storing() {
-        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
-            return;
-        };
-        let payload = {
+    /// An `.rpm` whose header the server refuses to index: 3,300 files all
+    /// naming one 20 KB dirname (a ~40 KB header expanding to ~64 MiB).
+    fn over_limit_rpm() -> Vec<u8> {
+        {
             let files = 3_300u32;
             let mut store = Vec::new();
             for _ in 0..files {
@@ -3706,30 +3724,46 @@ mod tests {
             }
             p.extend_from_slice(&store);
             p
-        };
-        use sha2::{Digest, Sha256};
-        let checksum = hex::encode(Sha256::digest(&payload));
+        }
+    }
 
+    /// Drive create (optionally as a replication session carrying its own
+    /// metadata), one chunk and complete for `payload`; returns the
+    /// completion status/body, whether the content key exists afterwards and
+    /// the repository's artifact row count.
+    async fn chunked_rpm_upload(
+        f: &tdh::Fixture,
+        payload: &[u8],
+        path: &str,
+        replication_metadata: Option<serde_json::Value>,
+    ) -> (StatusCode, bytes::Bytes, bool, i64) {
+        use sha2::{Digest, Sha256};
+        let checksum = hex::encode(Sha256::digest(payload));
+        let mut body = serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": checksum,
+            "chunk_size": 1024 * 1024_i64,
+        });
+        let req = match &replication_metadata {
+            Some(metadata) => {
+                body["artifact_metadata_format"] = serde_json::json!("rpm");
+                body["artifact_metadata"] = metadata.clone();
+                create_replication_session_req(&body)
+            }
+            None => create_session_req(&body),
+        };
         let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
-        let (status, body) = tdh::send(
-            app,
-            create_session_req(&serde_json::json!({
-                "repository_key": f.repo_key,
-                "artifact_path": "hostile-1.0-1.noarch.rpm",
-                "total_size": payload.len() as i64,
-                "checksum_sha256": checksum,
-                "chunk_size": 1024 * 1024_i64,
-            })),
-        )
-        .await;
+        let (status, resp) = tdh::send(app, req).await;
         assert_eq!(
             status,
             StatusCode::CREATED,
             "{}",
-            String::from_utf8_lossy(&body)
+            String::from_utf8_lossy(&resp)
         );
         let session_id: Uuid = serde_json::from_value(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"].clone(),
+            serde_json::from_slice::<serde_json::Value>(&resp).unwrap()["session_id"].clone(),
         )
         .unwrap();
 
@@ -3742,19 +3776,24 @@ mod tests {
                 format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
             )
             .header("content-type", "application/octet-stream")
-            .body(axum::body::Body::from(payload.clone()))
+            .body(axum::body::Body::from(payload.to_vec()))
             .unwrap();
-        let (status, body) = tdh::send(app, req).await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, resp) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
 
         let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
-        let req = axum::http::Request::builder()
+        let mut req = axum::http::Request::builder()
             .method("PUT")
             .uri(format!("/{}/complete", session_id))
             .body(axum::body::Body::empty())
             .unwrap();
-        let (status, body) = tdh::send(app, req).await;
-
+        if replication_metadata.is_some() {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+        let (status, resp) = tdh::send(app, req).await;
         let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
             &checksum,
         );
@@ -3765,8 +3804,20 @@ mod tests {
                 .fetch_one(&f.pool)
                 .await
                 .unwrap();
-        f.teardown().await;
+        (status, resp, stored, rows)
+    }
 
+    /// #3801: an over-limit `.rpm` is rejected with 400 at chunked
+    /// completion, BEFORE the reassembled bytes are stored: no object at the
+    /// content key, no artifact row.
+    #[tokio::test]
+    async fn complete_rejects_over_limit_rpm_before_storing() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let (status, body, stored, rows) =
+            chunked_rpm_upload(&f, &over_limit_rpm(), "hostile-1.0-1.noarch.rpm", None).await;
+        f.teardown().await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -3775,6 +3826,38 @@ mod tests {
         );
         assert!(!stored, "nothing may be stored for a refused RPM");
         assert_eq!(rows, 0, "no artifact row for a refused RPM");
+    }
+
+    /// A plain writer (not admin, not a service account) cannot skip the
+    /// parse by sending the client-set replication header with its own
+    /// metadata — including a forged repodata block, which would otherwise
+    /// render verbatim past every budget.
+    #[tokio::test]
+    async fn complete_parses_untrusted_replication_sessions() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let forged = serde_json::json!({
+            "name": "hostile",
+            "repodata": {"v": 1, "header_start": 0, "header_end": 0,
+                         "provides": [{"name": "forged"}]},
+        });
+        let (status, body, stored, rows) = chunked_rpm_upload(
+            &f,
+            &over_limit_rpm(),
+            "hostile-1.0-1.noarch.rpm",
+            Some(forged),
+        )
+        .await;
+        f.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an untrusted replication session is still parsed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!stored);
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]
