@@ -4021,7 +4021,7 @@ mod tests {
             upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
             storage_path: "/cache/maven".to_string(),
             storage_backend: "filesystem".to_string(),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             index_upstream_url: None,
             promotion_only: true,
             age_gate_enabled: true,

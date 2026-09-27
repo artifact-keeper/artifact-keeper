@@ -3459,7 +3459,7 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
         r.id, r.key, r.name, r.description,
         r.format, r.repo_type,
         r.storage_backend, r.storage_path, r.upstream_url,
-        r.is_public, r.quota_bytes, r.promotion_only,
+        r.visibility, r.is_public, r.quota_bytes, r.promotion_only,
         r.replication_priority,
         r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
         r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
