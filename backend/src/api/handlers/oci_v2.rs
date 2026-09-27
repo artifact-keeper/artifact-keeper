@@ -27390,6 +27390,64 @@ mod cross_repo_session_regression_tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #3812: the anonymous `/v2` read gate keys off `allows_anonymous_read`,
+    /// so an `internal` repository answers an anonymous pull with the same
+    /// 401 challenge as a private one, while the identical request on a public
+    /// repository (the test above) is served. Drives the real router rather
+    /// than the enum, so reverting the gate to `!is_anon || <any visibility>`
+    /// fails here.
+    #[tokio::test]
+    async fn handle_tags_list_challenges_anon_on_internal_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "anonint").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo internal");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let digest = format!("sha256:{}", "b".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'myimage', 'int1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("seed tag");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/myimage/tags/list", repo_key))
+            .header("Authorization", "Bearer anonymous")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(router(None).with_state(state), req).await;
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous tags/list on an internal repo must be challenged"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("int1"),
+            "the challenge must not carry the tag list"
+        );
+    }
+
     /// #3275: `GET /v2/<name>/blobs/uploads/<uuid>` is the upload-status
     /// probe. The distribution spec requires `204 No Content` with `Location`
     /// and `Range` headers so a client can resume a chunked upload after a
