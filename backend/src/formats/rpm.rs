@@ -2110,9 +2110,18 @@ mod tests {
         ));
         // A string array whose declared strings are not all NUL-terminated
         // inside the store (count fits the byte bound, strings do not).
+        // 12 zero bytes serve as the (all-0) flags and (all-empty)
+        // versions; the names at offset 12 are "ab" and an unterminated
+        // "cd".
+        let mut store = vec![0u8; 12];
+        store.extend_from_slice(b"ab\0cd");
         let pkg = hostile_package(&hostile_header(
-            &[(RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 0, 3)],
-            b"ab\0cd",
+            &[
+                (RPMTAG_REQUIRENAME, RPM_STRING_ARRAY_TYPE, 12, 3),
+                (RPMTAG_REQUIREFLAGS, RPM_INT32_TYPE, 0, 3),
+                (RPMTAG_REQUIREVERSION, RPM_STRING_ARRAY_TYPE, 0, 3),
+            ],
+            &store,
         ));
         assert!(matches!(
             RpmHandler::parse_rpm_repodata_info(&pkg),

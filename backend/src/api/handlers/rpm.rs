@@ -6277,13 +6277,15 @@ mod repodata_deps_tests {
         ));
     }
 
-    /// A missing object is permanent (marked unparseable), not retried.
+    /// A missing object is transient: retried, not marked unparseable.
     #[tokio::test]
-    async fn header_prefix_missing_object_is_permanent() {
+    async fn header_prefix_missing_object_is_transient() {
+        // A mount blip or an in-progress storage migration looks exactly
+        // like a missing object: never settle a package on it alone.
         let (_dir, fs) = stored(b"x").await;
         assert!(matches!(
             read_rpm_header_prefix_from(&fs, "absent.rpm", 4096).await,
-            Err(HeaderRead::Permanent(_))
+            Err(HeaderRead::Transient(_))
         ));
     }
 
