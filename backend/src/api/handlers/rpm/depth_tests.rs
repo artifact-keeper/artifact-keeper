@@ -173,7 +173,7 @@ async fn roots_isolate_identical_nevra_bytes_and_all_metadata_4216() {
         );
     }
     let (_, special) = get(&f, &format!("{base}/a%20%26%25_/repodata/primary.xml.gz")).await;
-    assert!(text(&special).contains("special%20%26%25%3F%23-1-1.noarch.rpm"));
+    assert!(text(&special).contains("special%20&amp;%25%3F%23-1-1.noarch.rpm"));
     let (_, before) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
     let (_, again) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
     assert_eq!(before, again);
@@ -698,6 +698,34 @@ async fn production_router_loopback_http_contract_4216() {
         .await
         .unwrap()
         .contains("repodata/primary.xml.gz"));
+    // The repository is private: without credentials neither the per-root
+    // metadata nor the package is served, and nothing can be written.
+    for url in [
+        path.clone(),
+        format!("{base}/rpm/{}/build-a/repodata/repomd.xml", f.repo_key),
+        format!("{base}/rpm/{}/build-a/repodata/primary.xml.gz", f.repo_key),
+        format!("{base}/rpm/{}/build-a/repodata/repomd.xml.asc", f.repo_key),
+        format!("{base}/rpm/{}/other/repodata/repomd.xml", f.repo_key),
+    ] {
+        let anonymous = client.get(&url).send().await.unwrap();
+        assert!(
+            matches!(anonymous.status().as_u16(), 401 | 403 | 404),
+            "anonymous GET {url} -> {}",
+            anonymous.status()
+        );
+        let body = anonymous.text().await.unwrap();
+        assert!(
+            !body.contains("over TCP") && !body.contains("<repomd"),
+            "{url}: {body}"
+        );
+    }
+    let anonymous_put = client
+        .put(format!("{base}/rpm/{}/build-b/{RPM}", f.repo_key))
+        .body("anonymous")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous_put.status(), StatusCode::UNAUTHORIZED);
 
     // Optional task-local browser smoke: no production main, scheduler, or gRPC.
     if let Ok(info_path) = std::env::var("AK_RPM_DEPTH_LIVE_INFO") {
@@ -817,5 +845,120 @@ async fn resending_the_current_depth_does_not_contend_with_uploads_4216() {
     assert_eq!(depth(&f, 2, StatusCode::CONFLICT).await["code"], "CONFLICT");
     upload.rollback().await.unwrap();
     assert_eq!(depth(&f, 2, StatusCode::OK).await["repodata_depth"], 2);
+    f.teardown().await;
+}
+
+#[tokio::test]
+async fn special_filename_characters_are_listed_like_createrepo_c_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    let base = format!("/rpm/{}", f.repo_key);
+    let packages = [
+        ("gcc-c++-11.4.1-3.el9.x86_64.rpm", "plus"),
+        ("pkg-1.0~rc1^20240101-1.noarch.rpm", "tilde-caret"),
+    ];
+    for (file, content) in packages {
+        upload(&f, &format!("el9/{file}"), content).await;
+    }
+    let (status, primary) = get(&f, &format!("{base}/el9/repodata/primary.xml.gz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let primary = text(&primary);
+    for (file, content) in packages {
+        // Verbatim, as createrepo_c writes it: dnf/librepo/reposync name the
+        // local file after the href, so `+` must not become `%2B`.
+        assert!(
+            primary.contains(&format!("<location href=\"{file}\"/>")),
+            "{file} not listed verbatim:\n{primary}"
+        );
+        let (status, body, headers) = tdh::send_with_headers(
+            app(&f),
+            Request::builder()
+                .uri(format!("{base}/el9/{file}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "download via the href {file}");
+        assert_eq!(body, content.as_bytes());
+        assert_eq!(
+            headers[axum::http::header::CONTENT_DISPOSITION],
+            format!("attachment; filename=\"{file}\"").as_str(),
+            "the disposition names the stored file, not its URL form"
+        );
+    }
+    f.teardown().await;
+}
+
+#[tokio::test]
+async fn transient_heal_failures_do_not_rotate_a_depth_root_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    let path = format!("a/{RPM}");
+    upload(&f, &path, "heal-me").await;
+    // A package without a current repodata block whose stored object cannot
+    // be read: every heal attempt is a transient failure (#3801).
+    let (id, storage_key): (uuid::Uuid, String) =
+        sqlx::query_as("SELECT id, storage_key FROM artifacts WHERE repository_id=$1 AND path=$2")
+            .bind(f.repo_id)
+            .bind(&path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = metadata - 'repodata' WHERE artifact_id=$1",
+    )
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let repo = resolve_rpm_repo(&f.pool, &f.repo_key).await.unwrap();
+    f.state
+        .storage_for_repo(&repo.storage_location())
+        .unwrap()
+        .delete(&storage_key)
+        .await
+        .unwrap();
+    let base = format!("/rpm/{}", f.repo_key);
+    let (status, first) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
+    assert_eq!(status, StatusCode::OK);
+    let renders = f.state.rpm_repodata_cache.renders();
+    let failures = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT (metadata ->> 'repodata_heal_failures')::bigint FROM artifact_metadata \
+             WHERE artifact_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        failures(f.pool.clone()).await,
+        Some(1),
+        "the heal failed once"
+    );
+    for _ in 0..3 {
+        let (status, again) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again, first);
+    }
+    assert_eq!(
+        f.state.rpm_repodata_cache.renders(),
+        renders,
+        "within the incomplete-render TTL the failed render is served, not redone"
+    );
+    assert_eq!(failures(f.pool.clone()).await, Some(1));
+    // A real metadata change still moves the root.
+    sqlx::query("UPDATE artifact_metadata SET metadata = metadata || '{\"summary\":\"changed\"}'::jsonb WHERE artifact_id=$1")
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
+    assert_eq!(f.state.rpm_repodata_cache.renders(), renders + 1);
     f.teardown().await;
 }

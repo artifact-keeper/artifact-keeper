@@ -73,12 +73,24 @@ pub fn validate_root(root: &str, depth: u32) -> Result<()> {
     Ok(())
 }
 
-/// Encode each segment, not the separators. Literal '%' must be encoded too.
+/// The `<location href>` for a root-relative package path, written the way
+/// createrepo_c writes it: verbatim, except for what cannot stand in a URL
+/// path. dnf, librepo and reposync name local files after the href, so
+/// escaping ordinary filename characters (`gcc-c++` -> `gcc-c%2B%2B`) would
+/// leak into client filenames. Encoded: `%` (so the href decodes back to the
+/// stored path), `?` and `#` (they would end the path), space, controls and
+/// non-ASCII bytes. `&`, `"`, `<` are left to the XML escaping of the
+/// attribute; `/` separators are kept.
 pub fn location_href(path: &str) -> String {
-    path.split('/')
-        .map(|part| urlencoding::encode(part).into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut href = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'%' | b'?' | b'#' => href.push_str(&format!("%{byte:02X}")),
+            0x21..=0x7e => href.push(byte as char),
+            _ => href.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    href
 }
 
 pub async fn depth(db: &PgPool, repo_id: Uuid) -> Result<u32> {

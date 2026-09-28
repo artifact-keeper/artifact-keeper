@@ -187,6 +187,23 @@ BEFORE INSERT OR UPDATE OF curation_enabled, curation_source_repo_id, curation_t
     active_publication_id, repo_type, format, format_key ON repositories
 FOR EACH ROW EXECUTE FUNCTION ak_rpm_depth_repository_guard();
 
+-- The repodata heal (#3801) runs inside a render and persists only its own
+-- bookkeeping: the `repodata` block it derived (already in that render) and
+-- the `repodata_heal_failures` counter. Those writes must not move the
+-- root's fingerprint, exactly as at depth zero; otherwise every transient
+-- heal failure would force a re-render on the next request instead of being
+-- served for the incomplete-render TTL.
+CREATE FUNCTION ak_rpm_depth_heal_bookkeeping_only(old_md jsonb, new_md jsonb) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE
+        WHEN jsonb_typeof(new_md) <> 'object' THEN false
+        WHEN old_md IS NULL THEN (new_md - 'repodata_heal_failures') = '{}'::jsonb
+        WHEN jsonb_typeof(old_md) <> 'object' THEN false
+        ELSE (old_md - 'repodata' - 'repodata_heal_failures')
+           = (new_md - 'repodata' - 'repodata_heal_failures')
+    END
+$$;
+
 CREATE FUNCTION ak_rpm_depth_metadata_changed() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -194,6 +211,15 @@ DECLARE
 BEGIN
     IF TG_OP = 'DELETE' THEN artifact := OLD.artifact_id;
     ELSE artifact := NEW.artifact_id;
+    END IF;
+    IF TG_OP = 'INSERT' AND ak_rpm_depth_heal_bookkeeping_only(NULL, NEW.metadata) THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.artifact_id = OLD.artifact_id
+       AND NEW.format IS NOT DISTINCT FROM OLD.format
+       AND NEW.properties IS NOT DISTINCT FROM OLD.properties
+       AND ak_rpm_depth_heal_bookkeeping_only(OLD.metadata, NEW.metadata) THEN
+        RETURN NULL;
     END IF;
     UPDATE artifacts SET updated_at = clock_timestamp()
         WHERE id = artifact AND ak_rpm_repodata_depth(repository_id) > 0;

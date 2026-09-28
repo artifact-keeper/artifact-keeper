@@ -103,7 +103,9 @@ segments, or disguise traversal with encoded separators/dots. Leading or
 trailing segment whitespace, the `repodata` segment, and a first `@N` segment
 are reserved. `packages` and `upload` are allowed as normal root names.
 Percent-encode each URL segment when uploading/downloading special characters.
-Metadata locations encode each segment and are relative to the selected root.
+Metadata locations are relative to the selected root and are written like
+createrepo_c writes them: verbatim (`gcc-c++-...rpm` stays `gcc-c++-...rpm`),
+percent-encoding only `%`, `?`, `#`, spaces, control and non-ASCII bytes.
 
 Exact paths identify content. Positive-depth downloads never search by basename
 or filename suffix. Positive-depth writes use content-addressed storage, so

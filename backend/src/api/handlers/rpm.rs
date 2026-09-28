@@ -162,12 +162,19 @@ async fn depth_response(
         .await
         .map_err(IntoResponse::into_response)?;
     crate::services::artifact_service::record_download(&state.db, id, ctx).await;
-    Ok(build_rpm_package_response(
-        Body::from_stream(stream),
-        &rpm_layout::location_href(path.rsplit('/').next().unwrap_or(path)),
-        size_bytes,
-        &checksum,
-    ))
+    let mut response =
+        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum);
+    // The stored basename, not its URL form; the shared helper keeps any
+    // name a valid header (quoted-string escapes, RFC 5987 for non-ASCII).
+    let disposition = crate::api::download_response::content_disposition_attachment(
+        path.rsplit('/').next().unwrap_or(path),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&disposition) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
 }
 // ---------------------------------------------------------------------------
 // Repository resolution
@@ -1141,7 +1148,9 @@ const RPM_HEAL_FAILURES_KEY: &str = "repodata_heal_failures";
 /// package could not be settled for a transient reason (storage or database
 /// error): that render still serves, but must not be cached, so the next
 /// request retries instead of pinning dependency-less metadata. Persisting
-/// does not touch `artifacts.updated_at`, so the fingerprint does not move.
+/// does not touch `artifacts.updated_at`, so the fingerprint does not move
+/// (at positive depth, migration 247's metadata trigger ignores exactly these
+/// bookkeeping writes, #4216).
 async fn heal_rpm_repodata_info(state: &SharedState, artifacts: &mut [RpmArtifact]) -> bool {
     use futures::StreamExt;
 
@@ -6734,6 +6743,52 @@ mod repodata_deps_tests {
         f.teardown().await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(rows, 0, "a refused upload must not create an artifact");
+    }
+
+    /// #4216: the full-path PUT of a depth-enabled repository goes through
+    /// the same parse-before-write as the `packages/` route: an over-limit
+    /// header is refused with 400 before the content-addressed object or any
+    /// row is written.
+    #[tokio::test]
+    async fn depth_full_path_upload_rejects_over_limit_header_before_storing() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let mut conn = f.pool.acquire().await.unwrap();
+        crate::services::rpm_layout::set_depth(&mut conn, f.repo_id, 1)
+            .await
+            .unwrap();
+        drop(conn);
+        let pkg = rpm_with_requires(
+            &["x"],
+            crate::formats::rpm::RPM_MAX_LIST_ELEMENTS as u32 + 1,
+        );
+        let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha256_hex(&pkg),
+        );
+        let (status, _) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/build-a/hostile-1.0-1.noarch.rpm", f.repo_key),
+                bytes::Bytes::from(pkg),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        let storage = f
+            .state
+            .storage_for_repo(&f.repo_info("local", None).storage_location())
+            .unwrap();
+        let stored = storage.exists(&key).await.unwrap();
+        f.teardown().await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rows, 0, "a refused upload must not create an artifact");
+        assert!(!stored, "a refused upload must not store its bytes");
     }
 
     /// A stored package whose header cannot be indexed gets a persisted

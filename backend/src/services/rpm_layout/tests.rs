@@ -52,7 +52,17 @@ fn depth_path_bound_and_canonical_roots() {
 fn hrefs_encode_segments_without_changing_separators() {
     assert_eq!(
         location_href("nested/pkg &\"%?#é-1-1.noarch.rpm"),
-        "nested/pkg%20%26%22%25%3F%23%C3%A9-1-1.noarch.rpm"
+        "nested/pkg%20&\"%25%3F%23%C3%A9-1-1.noarch.rpm"
+    );
+    // createrepo_c writes ordinary filename punctuation verbatim; clients
+    // name their local files after the href.
+    assert_eq!(
+        location_href("el9/gcc-c++-11.4.1-3.el9.x86_64.rpm"),
+        "el9/gcc-c++-11.4.1-3.el9.x86_64.rpm"
+    );
+    assert_eq!(
+        location_href("a/pkg-1.0~rc1^20240101-1.noarch.rpm"),
+        "a/pkg-1.0~rc1^20240101-1.noarch.rpm"
     );
 }
 
