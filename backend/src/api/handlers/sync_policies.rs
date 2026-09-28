@@ -204,8 +204,16 @@ pub struct RepoSelectorSchema {
     pub match_pattern: Option<String>,
     #[serde(default)]
     pub match_repos: Vec<Uuid>,
-    /// Add the members of every matched virtual repository to the match
-    /// (#4130). Not a filter: on its own it matches nothing.
+    /// Also replicate the members of every matched virtual repository
+    /// (#4130). A virtual repository holds no content of its own, so syncing
+    /// one alone replicates nothing; this is how a policy names "what this
+    /// virtual serves". Membership is re-read on every run, so whoever edits
+    /// the virtual's members changes what this policy replicates. Not a
+    /// filter: on its own it matches nothing.
+    ///
+    /// The same field on an API token's `repo_selector` adds the members for
+    /// reads only; here there is no read/write split, because a sync policy
+    /// only reads from its source repositories.
     #[serde(default)]
     pub include_virtual_members: bool,
 }

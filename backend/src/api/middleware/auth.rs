@@ -1963,9 +1963,6 @@ pub(crate) fn should_allow_repo_access(is_public: bool, has_auth: bool) -> bool 
     is_public || has_auth
 }
 
-/// Return true when the HTTP method is a write operation (POST, PUT, PATCH,
-/// DELETE). Used by [`repo_visibility_middleware`] to require authentication
-/// for uploads and mutations even on public repositories.
 /// Whether a request only reads, for deciding whether a token's
 /// `include_virtual_members` expansion joins its scope (#4213 review).
 ///
@@ -1974,6 +1971,14 @@ pub(crate) fn should_allow_repo_access(is_public: bool, has_auth: bool) -> bool 
 /// XML-RPC). Anything else counts as a write and the expansion is withheld,
 /// so the failure mode of a wrong answer here is a refused read, never a
 /// permitted write.
+///
+/// **A request that hands out a credential is never a read**, whatever its
+/// method. A credential outlives the request, so one minted from a scope that
+/// already holds the expansion would carry the members into its
+/// action-independent ceiling, where a later write would pass. That is how a
+/// GET to Conan's `users/authenticate` escaped the rule (#4213 review). Such
+/// an exchange sees only the base scope, and passes the expansion on as its
+/// own claim if it needs to (see `/v2/token` and Conan's authenticate).
 ///
 /// The path comes from `OriginalUri` when present, so the answer does not
 /// depend on which nested router the middleware runs under.
@@ -1988,10 +1993,41 @@ pub(crate) fn request_is_read(request: &Request) -> bool {
 
 /// [`request_is_read`] on its parts, so the rule is unit-testable.
 pub(crate) fn is_read_request(method: &Method, path: &str) -> bool {
+    if is_credential_exchange(path) {
+        return false;
+    }
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
         || (*method == Method::POST && is_anonymous_readable_format_post(path))
 }
 
+/// Endpoints that exchange the presented credential for a new one, served on
+/// GET as well as POST (#4213 review). See [`request_is_read`].
+///
+/// `/v2/token` builds its JWT from a re-validated credential rather than from
+/// the principal, so it is listed for the invariant, not because it leaks.
+fn is_credential_exchange(path: &str) -> bool {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let mut segments = trimmed.split('/');
+    match segments.next() {
+        // /conan/<repo_key>/v2/users/authenticate
+        Some("conan") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("v2")
+                && segments.next() == Some("users")
+                && segments.next() == Some("authenticate")
+                && matches!(segments.next(), None | Some(""))
+        }
+        // /v2/token
+        Some("v2") => {
+            segments.next() == Some("token") && matches!(segments.next(), None | Some(""))
+        }
+        _ => false,
+    }
+}
+
+/// Return true when the HTTP method is a write operation (POST, PUT, PATCH,
+/// DELETE). Used by [`repo_visibility_middleware`] to require authentication
+/// for uploads and mutations even on public repositories.
 fn is_write_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -3897,6 +3933,26 @@ mod tests {
             &Method::POST,
             "/conan/team/v1/users/authenticate"
         ));
+        // A credential exchange is never a read, on ANY method: its output
+        // outlives the request (#4213 review, the Conan GET).
+        for m in [Method::GET, Method::HEAD, Method::POST] {
+            assert!(
+                !is_read_request(&m, "/conan/team/v2/users/authenticate"),
+                "{m}"
+            );
+            assert!(
+                !is_read_request(&m, "/conan/team/v2/users/authenticate/"),
+                "{m}"
+            );
+            assert!(!is_read_request(&m, "/v2/token"), "{m}");
+        }
+        // ...and only those: neighbouring Conan and OCI reads still read.
+        assert!(is_read_request(
+            &Method::GET,
+            "/conan/team/v2/users/check_credentials"
+        ));
+        assert!(is_read_request(&Method::GET, "/v2/team/manifests/latest"));
+        assert!(is_read_request(&Method::GET, "/v2/"));
     }
 
     /// The merge: members join the scope for a read, never for a write, and
