@@ -283,3 +283,166 @@ fn archived_depth_values_are_strict_and_legacy_absence_means_zero_4216() {
     valid["repo_type"] = "virtual".into();
     assert!(archive_repository_layouts(&entries(valid)).is_err());
 }
+
+/// The layout lock an in-flight artifact write holds on `repo_id`.
+async fn hold_shared_layout_lock(
+    pool: &sqlx::PgPool,
+    repo_id: Uuid,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('rpm-depth:' || $1::text, 0))",
+    )
+    .bind(repo_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx
+}
+
+#[tokio::test]
+async fn legacy_archive_restores_row_by_row_without_layout_locks_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let storage = Arc::new(StorageService::new(Arc::new(
+        crate::services::storage_service::FilesystemBackend::new(f.storage_dir.clone()),
+    )));
+    let service = BackupService::new(f.pool.clone(), storage);
+    let mut conn = f.pool.acquire().await.unwrap();
+    let exported = BackupService::export_table(&mut conn, "repositories")
+        .await
+        .unwrap();
+    drop(conn);
+    let repositories = serde_json::json!([exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == f.repo_id.to_string())
+        .unwrap()
+        .clone()]);
+    assert!(repositories[0].get("repodata_depth").is_none());
+    let legacy = archive(&service, &repositories, &serde_json::json!([]), &[]).await;
+    // A depth-zero archive installs no layout, so an upload in flight on one
+    // of its repositories must not make the whole restore fail (it did while
+    // every restore ran in one transaction holding exclusive layout locks).
+    let upload = hold_shared_layout_lock(&f.pool, f.repo_id).await;
+    let restored = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.restore(legacy, options()),
+    )
+    .await
+    .expect("restore must not wait on the layout lock")
+    .expect("legacy restore succeeds while an upload is in flight");
+    assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+    upload.rollback().await.unwrap();
+    sqlx::query("DELETE FROM backups WHERE id=$1")
+        .bind(legacy)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.teardown().await;
+}
+
+#[tokio::test]
+async fn strict_restore_adds_no_subtransaction_per_row_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let mut conn = f.pool.acquire().await.unwrap();
+    let exported = BackupService::export_table(&mut conn, "repositories")
+        .await
+        .unwrap();
+    drop(conn);
+    let template = exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == f.repo_id.to_string())
+        .unwrap()
+        .clone();
+    // More rows than PostgreSQL's per-backend subtransaction cache (64).
+    let rows: Vec<serde_json::Value> = (0..80)
+        .map(|i| {
+            let mut row = template.clone();
+            row["id"] = serde_json::json!(Uuid::new_v4());
+            row["key"] = serde_json::json!(format!("{}-strict-{i}", f.repo_key));
+            row
+        })
+        .collect();
+    let content = serde_json::to_vec(&rows).unwrap();
+    let mut tx = f.pool.begin().await.unwrap();
+    let restored = BackupService::restore_table_in(&mut tx, "repositories", &content, true)
+        .await
+        .unwrap();
+    assert_eq!(restored, rows.len());
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let (subxacts, overflowed): (i32, bool) = sqlx::query_as(
+        "SELECT s.subxact_count, s.subxact_overflowed \
+         FROM pg_stat_get_backend_idset() b, LATERAL pg_stat_get_backend_subxact(b) s \
+         WHERE pg_stat_get_backend_pid(b) = pg_backend_pid()",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        subxacts, 0,
+        "strict restore must not open a savepoint per row"
+    );
+    assert!(!overflowed);
+    tx.rollback().await.unwrap();
+    f.teardown().await;
+}
+
+#[tokio::test]
+async fn bytes_only_restore_is_not_refused_over_a_layout_it_does_not_install_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let storage = Arc::new(StorageService::new(Arc::new(
+        crate::services::storage_service::FilesystemBackend::new(f.storage_dir.clone()),
+    )));
+    let service = BackupService::new(f.pool.clone(), storage);
+    let mut conn = f.pool.acquire().await.unwrap();
+    let exported = BackupService::export_table(&mut conn, "repositories")
+        .await
+        .unwrap();
+    let repositories = serde_json::json!([exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == f.repo_id.to_string())
+        .unwrap()
+        .clone()]);
+    let legacy = archive(&service, &repositories, &serde_json::json!([]), &[]).await;
+    // The repository gains a layout after the (depth-zero) backup was taken.
+    rpm_layout::set_depth(&mut conn, f.repo_id, 1)
+        .await
+        .unwrap();
+    drop(conn);
+    let bytes_only = RestoreOptions {
+        restore_database: false,
+        ..options()
+    };
+    let restored = service
+        .restore(legacy, bytes_only)
+        .await
+        .expect("a bytes-only restore installs no layout and must not be refused over one");
+    assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+    // Restoring the rows is still refused: the legacy record would describe
+    // the repository at depth zero.
+    assert!(matches!(
+        service.restore(legacy, options()).await,
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(rpm_layout::depth(&f.pool, f.repo_id).await.unwrap(), 1);
+    sqlx::query("DELETE FROM backups WHERE id=$1")
+        .bind(legacy)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.teardown().await;
+}

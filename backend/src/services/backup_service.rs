@@ -1673,12 +1673,13 @@ impl BackupService {
             options.allow_unverified_archive,
         )
         .map_err(AppError::Validation)?;
+        // Layout values are validated up front (a malformed archive is refused
+        // before anything is written); they are compared with the live
+        // repositories only when rows are restored below. A bytes-only restore
+        // (`restore_database: false`) installs no layout, so it must not be
+        // refused over one.
         let layouts = archive_repository_layouts(&entries)?;
         let strict_layout_restore = layouts.values().any(|depth| *depth > 0);
-        {
-            let mut conn = self.db.acquire().await?;
-            validate_restore_layouts(&mut conn, &layouts, false).await?;
-        }
 
         // Phase 2: Async restore from extracted data
         let mut result = RestoreResult {
@@ -1752,44 +1753,24 @@ impl BackupService {
         // the allowlist (GHSA-95fx-g94v-8jqg), so unknown entries are ignored
         // rather than inserted into attacker-chosen tables.
         if options.restore_database {
-            let mut tx = self.db.begin().await?;
-            validate_restore_layouts(&mut tx, &layouts, true).await?;
-            for table_name in RESTORE_TABLE_ORDER {
-                if let Some(content) = backup_table(&entries, table_name) {
-                    match Self::restore_table_in(
-                        &mut tx,
-                        table_name,
-                        content,
-                        strict_layout_restore,
-                    )
-                    .await
-                    {
-                        Ok(rows) => {
-                            tracing::info!("Restored {} rows into table '{}'", rows, table_name);
-                            result.tables_restored.push(table_name.to_string());
-                        }
-                        Err(e) => {
-                            if strict_layout_restore
-                                || crate::services::rpm_layout::database_error(&e.to_string())
-                                    .is_some()
-                            {
-                                return Err(e);
-                            }
-                            result
-                                .errors
-                                .push(format!("Failed to restore {}: {}", table_name, e));
-                        }
-                    }
-                    if *table_name == "repositories" {
-                        for (&id, &depth) in &layouts {
-                            if depth > 0 {
-                                crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
-                            }
-                        }
-                    }
-                }
+            if strict_layout_restore {
+                // A depth-bearing archive restores atomically: the layout is
+                // installed before the artifacts it admits, and any failure
+                // rolls back every table (#4216).
+                let mut tx = self.db.begin().await?;
+                validate_restore_layouts(&mut tx, &layouts, true).await?;
+                Self::restore_tables(&mut tx, &entries, &layouts, true, &mut result).await?;
+                tx.commit().await?;
+            } else {
+                // A depth-zero (legacy) archive restores exactly as before
+                // #4216: row by row in autocommit, collecting failures. One
+                // transaction with a savepoint per row would hold every table
+                // for the whole restore and overflow the subtransaction cache
+                // on large archives, slowing every other session.
+                let mut conn = self.db.acquire().await?;
+                validate_restore_layouts(&mut conn, &layouts, false).await?;
+                Self::restore_tables(&mut conn, &entries, &layouts, false, &mut result).await?;
             }
-            tx.commit().await?;
         }
 
         // Restore artifact files
@@ -1927,17 +1908,58 @@ impl BackupService {
         Ok(entries)
     }
 
+    /// Restore the allowlisted tables of `entries` in dependency order over
+    /// `conn`. `strict` (a depth-bearing archive, `conn` inside one
+    /// transaction) turns any failure into an error; otherwise failures are
+    /// collected into `result` and the restore continues.
+    async fn restore_tables(
+        conn: &mut sqlx::PgConnection,
+        entries: &[(std::path::PathBuf, Vec<u8>)],
+        layouts: &std::collections::BTreeMap<Uuid, u32>,
+        strict: bool,
+        result: &mut RestoreResult,
+    ) -> Result<()> {
+        for table_name in RESTORE_TABLE_ORDER {
+            let Some(content) = backup_table(entries, table_name) else {
+                continue;
+            };
+            match Self::restore_table_in(&mut *conn, table_name, content, strict).await {
+                Ok(rows) => {
+                    tracing::info!("Restored {} rows into table '{}'", rows, table_name);
+                    result.tables_restored.push(table_name.to_string());
+                }
+                Err(e) => {
+                    if strict
+                        || crate::services::rpm_layout::database_error(&e.to_string()).is_some()
+                    {
+                        return Err(e);
+                    }
+                    result
+                        .errors
+                        .push(format!("Failed to restore {}: {}", table_name, e));
+                }
+            }
+            if *table_name == "repositories" {
+                for (&id, &depth) in layouts {
+                    if depth > 0 {
+                        crate::services::rpm_layout::set_depth(&mut *conn, id, depth).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Restore a single database table from JSON data.
     /// Uses jsonb_populate_record for proper type coercion.
     #[cfg(test)]
     async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
+        // Validate (allowlist, JSON) before touching the pool.
         if validated_restore_rows(table, content)?.is_empty() {
             return Ok(0);
         }
-        let mut tx = self.db.begin().await?;
-        let restored = Self::restore_table_in(&mut tx, table, content, false).await?;
-        tx.commit().await?;
-        Ok(restored)
+        let mut conn = self.db.acquire().await?;
+        Self::restore_table_in(&mut conn, table, content, false).await
     }
 
     async fn restore_table_in(
@@ -1955,21 +1977,21 @@ impl BackupService {
                 "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
             );
 
-            let mut row_tx = sqlx::Connection::begin(&mut *conn).await?;
-            match sqlx::query(sqlx::AssertSqlSafe(&*query))
-                .bind(row)
-                .execute(&mut *row_tx)
-                .await
-            {
+            let insert = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(row);
+            if strict {
+                // `conn` is the restore's one transaction and any failure
+                // aborts all of it, so a per-row savepoint would only add a
+                // subtransaction per row.
+                restored += insert.execute(&mut *conn).await?.rows_affected() as usize;
+                continue;
+            }
+            // `conn` is not in a transaction: each row commits on its own.
+            match insert.execute(&mut *conn).await {
                 Ok(result) => {
                     restored += result.rows_affected() as usize;
-                    row_tx.commit().await?;
                 }
                 Err(e) => {
-                    row_tx.rollback().await?;
-                    if strict
-                        || crate::services::rpm_layout::database_error(&e.to_string()).is_some()
-                    {
+                    if crate::services::rpm_layout::database_error(&e.to_string()).is_some() {
                         return Err(e.into());
                     }
                     tracing::warn!(
