@@ -171,6 +171,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::storage_gc::StorageGcApiDoc::openapi(),
         ),
         (
+            "storage_integrity",
+            handlers::storage_integrity::StorageIntegrityApiDoc::openapi(),
+        ),
+        (
             "monitoring",
             handlers::monitoring::MonitoringApiDoc::openapi(),
         ),
@@ -781,6 +785,7 @@ mod tests {
                 vec![
                     include_str!("handlers/admin.rs"),
                     include_str!("handlers/health.rs"),
+                    include_str!("handlers/storage_integrity.rs"),
                     include_str!("routes.rs"),
                 ],
             ),

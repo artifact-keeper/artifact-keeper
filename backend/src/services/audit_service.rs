@@ -136,6 +136,11 @@ pub enum AuditAction {
     // Appended at the END of the enum to keep the additive change
     // conflict-free with in-flight taxonomy work.
     CiOidcGroupBindingReconciled,
+
+    // Storage integrity (#3910). Recorded when an admin runs the storage
+    // scrub, with the run's mode, scope, and counts. Appended at the END of
+    // the enum to keep the additive change conflict-free.
+    StorageScrubRun,
 }
 
 impl AuditAction {
@@ -197,6 +202,7 @@ impl AuditAction {
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
             AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
             AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
+            AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
         }
     }
 }

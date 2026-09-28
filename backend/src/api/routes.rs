@@ -957,6 +957,9 @@ fn api_v1_routes(
             .nest("/analytics", handlers::analytics::router())
             .nest("/lifecycle", handlers::lifecycle::router())
             .nest("/storage-gc", handlers::storage_gc::router())
+            // Storage scrub (#3910): admin-only, gated by this block's
+            // admin_middleware.
+            .merge(handlers::storage_integrity::router())
             .nest("/search", handlers::search::admin_router())
             // Blast-radius reports expose download attribution (who pulled a
             // vulnerable artifact) — this nest MUST stay inside the /admin

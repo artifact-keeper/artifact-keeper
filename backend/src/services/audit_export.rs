@@ -133,7 +133,8 @@ impl AuditAction {
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished
             | AuditAction::ProxyScanVerdictDeleted
-            | AuditAction::CiOidcGroupBindingReconciled => Outcome::Success,
+            | AuditAction::CiOidcGroupBindingReconciled
+            | AuditAction::StorageScrubRun => Outcome::Success,
         }
     }
 }

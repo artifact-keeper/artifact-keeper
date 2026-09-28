@@ -382,6 +382,7 @@ pub mod smtp;
 pub mod sso;
 pub mod sso_admin;
 pub mod storage_gc;
+pub mod storage_integrity;
 pub mod swift;
 pub mod sync_policies;
 pub mod system_config;

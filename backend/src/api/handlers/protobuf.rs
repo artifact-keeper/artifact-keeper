@@ -2868,4 +2868,36 @@ pub(crate) mod integrity_tests {
         use sha2::Digest;
         assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
     }
+
+    /// #3910 review (B1): the scrub must not flag protobuf commit bundles as
+    /// corrupt (their row records the commit digest, not the bundle's).
+    #[tokio::test]
+    async fn scrub_reports_nothing_for_protobuf_commit_bundles() {
+        use crate::services::storage_scrub_service::{ScrubOptions, StorageScrubService};
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_module(&fx).await;
+        let res = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run(&ScrubOptions {
+                max_objects: 100,
+                max_bytes: 1 << 30,
+                repair: true,
+                repository_id: Some(fx.repo_id),
+            })
+            .await
+            .expect("scrub run");
+        let findings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_scrub_findings WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count findings");
+        fx.teardown().await;
+
+        assert_eq!(res.corrupt + res.missing + res.repaired, 0, "{res:?}");
+        assert!(res.unverifiable >= 1, "{res:?}");
+        assert_eq!(findings, 0);
+    }
 }

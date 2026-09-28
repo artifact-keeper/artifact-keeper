@@ -541,6 +541,47 @@ pub fn spawn_all(
         });
     }
 
+    // Storage scrub (#3910): opt-in (`STORAGE_SCRUB_INTERVAL_SECS` > 0),
+    // report-only, bounded per pass by `STORAGE_SCRUB_MAX_OBJECTS` /
+    // `STORAGE_SCRUB_MAX_BYTES`, resuming from the persisted cursor. The
+    // service's cluster-wide advisory lock keeps replicas (and a concurrent
+    // admin-triggered run) from scrubbing at the same time; a tick that loses
+    // the lock is skipped.
+    if config.storage_scrub_interval_secs > 0 {
+        let db = db.clone();
+        let registry = storage_registry.clone();
+        let every = config.storage_scrub_interval_secs.max(60);
+        let opts = crate::services::storage_scrub_service::ScrubOptions {
+            max_objects: config.storage_scrub_max_objects.max(1),
+            max_bytes: config.storage_scrub_max_bytes.max(1),
+            repair: false,
+            repository_id: None,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(300)).await;
+            let service =
+                crate::services::storage_scrub_service::StorageScrubService::new(db, registry);
+            let mut ticker = interval(Duration::from_secs(every));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match service.run(&opts).await {
+                    Ok(r) if r.corrupt + r.missing > 0 => tracing::error!(
+                        corrupt = r.corrupt,
+                        missing = r.missing,
+                        checked = r.objects_checked,
+                        "Storage scrub found damaged objects; see GET /api/v1/admin/storage-scrub/findings"
+                    ),
+                    Ok(r) => tracing::debug!(checked = r.objects_checked, "Storage scrub pass clean"),
+                    Err(crate::error::AppError::Conflict(_)) => {
+                        tracing::debug!("Storage scrub already running elsewhere; skipping tick")
+                    }
+                    Err(e) => tracing::warn!("Storage scrub pass failed: {}", e),
+                }
+            }
+        });
+    }
+
     // Storage garbage collection (cron-based, default: hourly)
     {
         let db = db.clone();
