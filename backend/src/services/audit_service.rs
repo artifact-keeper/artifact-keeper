@@ -141,6 +141,9 @@ pub enum AuditAction {
     // scrub, with the run's mode, scope, and counts. Appended at the END of
     // the enum to keep the additive change conflict-free.
     StorageScrubRun,
+    /// An admin reconciled a repository's stored objects with its artifact
+    /// rows (#1570), registering ghost objects.
+    StorageReindexRun,
 }
 
 impl AuditAction {
@@ -203,6 +206,7 @@ impl AuditAction {
             AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
             AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
             AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
+            AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
         }
     }
 }

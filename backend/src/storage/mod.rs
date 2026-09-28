@@ -138,6 +138,14 @@ pub enum PresignedUrlSource {
     Gcs,
 }
 
+/// One object returned by [`StorageBackend::list_keys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedKey {
+    pub key: String,
+    /// Last-modified time when the listing reports it.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Storage backend trait
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
@@ -347,6 +355,16 @@ pub trait StorageBackend: Send + Sync {
         key: &str,
         stream: BoxStream<'static, Result<Bytes>>,
     ) -> Result<PutStreamResult>;
+
+    /// Enumerate the keys stored under `prefix` (a key prefix such as
+    /// `maven/`), for the admin storage reindex (#1570).
+    ///
+    /// `Ok(None)` means the backend cannot enumerate its objects; callers must
+    /// report that instead of treating it as an empty namespace. Keys are
+    /// returned in the same form `get`/`put` accept.
+    async fn list_keys(&self, _prefix: &str) -> Result<Option<Vec<ListedKey>>> {
+        Ok(None)
+    }
 
     /// Perform a lightweight connectivity probe against the storage backend.
     ///

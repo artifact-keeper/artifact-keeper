@@ -924,7 +924,14 @@ enum ChecksumType {
     Sha512,
 }
 
-fn content_type_for_path(path: &str) -> &'static str {
+/// Whether a hosted Maven `path` is stored WITHOUT an artifact row: checksum
+/// sidecars and `maven-metadata.xml` are row-less puts (see `upload`). The
+/// storage reindex (#1570) must never register these as artifacts.
+pub(crate) fn is_rowless_maven_path(path: &str) -> bool {
+    parse_checksum_path(path).is_some() || MavenHandler::is_metadata(path)
+}
+
+pub(crate) fn content_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".pom") || path.ends_with(".xml") {
         "text/xml"
     } else if path.ends_with(".jar") || path.ends_with(".war") || path.ends_with(".ear") {

@@ -1,10 +1,11 @@
-//! Admin storage-integrity endpoints: the storage scrub (#3910).
+//! Admin storage-integrity endpoints: the storage scrub (#3910) and the
+//! per-repository storage reindex that registers ghost objects (#1570).
 //!
 //! Mounted inside the `/api/v1/admin` block (routes.rs), so `admin_middleware`
 //! gates every route; each handler re-checks `is_admin` as defense in depth,
 //! like the storage-GC endpoints.
 
-use axum::extract::{Extension, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::{
     routing::{get, post},
     Json, Router,
@@ -20,14 +21,26 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::repository_service::RepositoryService;
+use crate::services::storage_reindex_service::{StorageReindexResult, StorageReindexService};
 use crate::services::storage_scrub_service::{
     ScrubFinding, ScrubObjectKind, ScrubOptions, ScrubResult, StorageScrubService,
 };
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(run_storage_scrub, list_storage_scrub_findings),
-    components(schemas(StorageScrubRequest, ScrubResult, ScrubFinding, ScrubObjectKind))
+    paths(
+        run_storage_scrub,
+        list_storage_scrub_findings,
+        reindex_repository_storage
+    ),
+    components(schemas(
+        StorageScrubRequest,
+        ScrubResult,
+        ScrubFinding,
+        ScrubObjectKind,
+        StorageReindexRequest,
+        StorageReindexResult,
+    ))
 )]
 pub struct StorageIntegrityApiDoc;
 
@@ -35,6 +48,10 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/storage-scrub", post(run_storage_scrub))
         .route("/storage-scrub/findings", get(list_storage_scrub_findings))
+        .route(
+            "/repositories/:key/reindex-storage",
+            post(reindex_repository_storage),
+        )
 }
 
 /// Hard ceilings on one admin-triggered scrub, whatever the request asks for.
@@ -294,6 +311,94 @@ pub async fn list_storage_scrub_findings(
     Ok(Json(findings))
 }
 
+/// Default and ceiling for ghosts registered per reindex call.
+const DEFAULT_REINDEX_LIMIT: u64 = 1_000;
+const MAX_REINDEX_LIMIT: u64 = 10_000;
+
+/// Request body for a storage reindex. `dry_run` is required and unknown
+/// fields are rejected (the #3501 contract for write-capable admin calls).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageReindexRequest {
+    /// Report what would be registered without writing any row.
+    pub dry_run: bool,
+    /// Register at most this many ghost objects in this call (default 1000,
+    /// max 10000). `truncated` in the result says when more remain.
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+/// POST /api/v1/admin/repositories/{key}/reindex-storage
+///
+/// Registers artifact rows for objects stored in the repository's own key
+/// namespace that have no row ("ghost artifacts", #1570), and reports live
+/// rows whose object is missing. Maven and Gradle repositories only. Safe on
+/// a live repository and idempotent: existing rows (live or soft-deleted) are
+/// never touched.
+#[utoipa::path(
+    post,
+    path = "/repositories/{key}/reindex-storage",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    operation_id = "reindex_repository_storage",
+    params(("key" = String, Path, description = "Repository key")),
+    request_body = StorageReindexRequest,
+    responses(
+        (status = 200, description = "Reindex summary", body = StorageReindexResult),
+        (status = 404, description = "Repository not found"),
+        (status = 409, description = "A reindex of this repository is already running"),
+        (status = 422, description = "Format or storage backend not supported"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn reindex_repository_storage(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key): Path<String>,
+    Json(payload): Json<StorageReindexRequest>,
+) -> Result<Json<StorageReindexResult>> {
+    require_admin(auth.is_admin)?;
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await?;
+    let limit = scrub_budget(payload.limit, DEFAULT_REINDEX_LIMIT, MAX_REINDEX_LIMIT);
+    let outcome = StorageReindexService::new(state.db.clone(), state.storage_registry.clone())
+        .reindex(&repo, payload.dry_run, limit, Some(auth.user_id))
+        .await;
+
+    // Audited on success and on refusal/failure (409 lock held, 422 format or
+    // backend unsupported, storage/DB errors).
+    let details = match &outcome {
+        Ok(result) => serde_json::json!({
+            "repository": key,
+            "dry_run": payload.dry_run,
+            "scanned": result.scanned,
+            "registered": result.registered,
+            "skipped": result.skipped,
+            "skipped_recent": result.skipped_recent,
+            "skipped_unknown_age": result.skipped_unknown_age,
+            "missing_objects": result.missing_objects,
+            "errors": result.errors.len(),
+        }),
+        Err(e) => serde_json::json!({
+            "repository": key,
+            "dry_run": payload.dry_run,
+            "error": e.to_string(),
+        }),
+    };
+    let mut entry = AuditEntry::new(AuditAction::StorageReindexRun, ResourceType::Repository)
+        .user(auth.user_id)
+        .resource(repo.id)
+        .actor_name(&auth.username)
+        .details(details);
+    if outcome.is_err() {
+        entry = entry.outcome(Outcome::Failure);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
+
+    outcome.map(Json)
+}
+
 fn require_admin(is_admin: bool) -> Result<()> {
     if is_admin {
         Ok(())
@@ -446,6 +551,25 @@ mod tests {
         audit.finish(&Err(AppError::Conflict("busy".into())));
         let phases = scrub_audit_phases(&pool, run_id, 2).await;
         assert_eq!(phases, vec!["started".to_string(), "failed".to_string()]);
+    }
+
+    #[test]
+    fn reindex_request_requires_dry_run() {
+        assert!(serde_json::from_str::<StorageReindexRequest>("{}").is_err());
+        assert!(serde_json::from_str::<StorageReindexRequest>(r#"{"dryRun":true}"#).is_err());
+        let r: StorageReindexRequest =
+            serde_json::from_str(r#"{"dry_run":false,"limit":3}"#).unwrap();
+        assert!(!r.dry_run);
+        assert_eq!(r.limit, Some(3));
+    }
+
+    #[test]
+    fn openapi_doc_registers_reindex_path() {
+        let doc = StorageIntegrityApiDoc::openapi();
+        assert!(doc
+            .paths
+            .paths
+            .contains_key("/api/v1/admin/repositories/{key}/reindex-storage"));
     }
 
     #[test]

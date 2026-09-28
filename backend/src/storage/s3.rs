@@ -599,6 +599,10 @@ fn list_response_is_unparsable(message: &str) -> bool {
 struct ListBucketPage {
     /// `<Contents><Key>` values, in document order, exactly as sent.
     keys: Vec<String>,
+    /// `<Contents><LastModified>` of each key (parallel to `keys`), `None`
+    /// when absent or unparsable (#1570 review: the storage reindex needs
+    /// object age on the REST fallback too).
+    last_modified: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     /// `<IsTruncated>`.
     is_truncated: bool,
     /// `<NextContinuationToken>`, absent when empty.
@@ -636,6 +640,10 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<String> = None;
     let mut text = String::new();
+    // Per-`<Contents>` accumulators: `<Key>` and `<LastModified>` may come in
+    // either order, so the entry is recorded when `</Contents>` closes.
+    let mut entry_key: Option<String> = None;
+    let mut entry_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     loop {
         match reader.read_event() {
@@ -682,7 +690,19 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                     .unwrap_or_else(|| local(e.local_name().as_ref()));
                 let parent = stack.last().map(String::as_str).unwrap_or("");
                 match (parent, closed.as_str()) {
-                    ("Contents", "Key") => page.keys.push(std::mem::take(&mut text)),
+                    ("Contents", "Key") => entry_key = Some(std::mem::take(&mut text)),
+                    ("Contents", "LastModified") => {
+                        entry_modified = chrono::DateTime::parse_from_rfc3339(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc));
+                    }
+                    ("ListBucketResult", "Contents") => {
+                        if let Some(key) = entry_key.take() {
+                            page.keys.push(key);
+                            page.last_modified.push(entry_modified.take());
+                        }
+                        entry_modified = None;
+                    }
                     ("ListBucketResult", "IsTruncated") => {
                         page.is_truncated = text.trim().eq_ignore_ascii_case("true");
                     }
@@ -695,7 +715,14 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // A truncated body may end inside `<Contents>`: keep the key.
+                if let Some(key) = entry_key.take() {
+                    page.keys.push(key);
+                    page.last_modified.push(entry_modified.take());
+                }
+                break;
+            }
             // Decl, Comment, PI, DocType, and self-closing elements carry no
             // value we read.
             Ok(_) => {}
@@ -2164,6 +2191,10 @@ impl super::StorageBackend for S3Backend {
         }))
     }
 
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
     #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         let path: ObjectPath = ".health-probe".into();
@@ -2453,6 +2484,17 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's last-modified time
+    /// when the listing reports it (`None` on the #3593 REST fallback).
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         // Compose the search prefix through `make_full_key` so a listing
         // resolves the same physical location a `get`/`put` of a key under it
         // would (#3368).
@@ -2488,9 +2530,12 @@ impl S3Backend {
                 .await
             {
                 Ok(objects) => {
-                    let keys: Vec<String> = objects
+                    let keys: Vec<super::ListedKey> = objects
                         .into_iter()
-                        .map(|meta| self.strip_prefix(meta.location.as_ref()))
+                        .map(|meta| super::ListedKey {
+                            key: self.strip_prefix(meta.location.as_ref()),
+                            last_modified: Some(meta.last_modified),
+                        })
                         .collect();
                     tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
                     return Ok(keys);
@@ -2513,7 +2558,13 @@ impl S3Backend {
         }
 
         let full_keys = self.rest_list_objects(&search_prefix).await?;
-        let keys: Vec<String> = full_keys.iter().map(|key| self.strip_prefix(key)).collect();
+        let keys: Vec<super::ListedKey> = full_keys
+            .iter()
+            .map(|(key, last_modified)| super::ListedKey {
+                key: self.strip_prefix(key),
+                last_modified: *last_modified,
+            })
+            .collect();
 
         tracing::debug!(
             prefix = ?prefix,
@@ -2532,7 +2583,10 @@ impl S3Backend {
     /// [`AwsAuthorizer`] against the store's own credential chain (so IRSA and
     /// container credentials keep working), and it rides [`Self::raw_http`].
     /// Returns FULL keys — the caller strips the configured prefix.
-    async fn rest_list_objects(&self, search_prefix: &str) -> Result<Vec<String>> {
+    async fn rest_list_objects(
+        &self,
+        search_prefix: &str,
+    ) -> Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
         use object_store::signer::Signer;
 
         // Both `signed_url` and `credentials()` resolve credentials
@@ -2576,7 +2630,7 @@ impl S3Backend {
                 ))
             })?;
 
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut url = root.clone();
@@ -2626,7 +2680,7 @@ impl S3Backend {
             }
 
             let page = parse_list_bucket_result(&body)?;
-            keys.extend(page.keys);
+            keys.extend(page.keys.into_iter().zip(page.last_modified));
 
             match page.next_continuation_token {
                 Some(token) if page.is_truncated => {
@@ -6287,6 +6341,31 @@ mod tests {
         );
         assert!(!page.is_truncated);
         assert!(page.next_continuation_token.is_none());
+    }
+
+    /// #1570 review: the REST fallback must carry `<LastModified>` so the
+    /// storage reindex can tell settled ghosts from in-flight uploads on
+    /// endpoints (Alibaba OSS) that always use it.
+    #[test]
+    fn test_parse_list_response_carries_last_modified_1570() {
+        let page = parse_list_bucket_result(OSS_LIST_RESPONSE).expect("OSS sample must parse");
+        assert_eq!(page.last_modified.len(), page.keys.len());
+        assert!(page.last_modified.iter().all(Option::is_some), "{page:?}");
+
+        // Either element order, and a missing/garbled value is `None`.
+        let xml = r#"<ListBucketResult>
+            <Contents><LastModified>2020-06-22T11:42:35.000Z</LastModified><Key>a</Key></Contents>
+            <Contents><Key>b</Key></Contents>
+            <Contents><Key>c</Key><LastModified>not a date</LastModified></Contents>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("must parse");
+        assert_eq!(page.keys, vec!["a", "b", "c"]);
+        assert_eq!(
+            page.last_modified[0].map(|d| d.to_rfc3339()),
+            Some("2020-06-22T11:42:35+00:00".to_string())
+        );
+        assert_eq!(page.last_modified[1], None);
+        assert_eq!(page.last_modified[2], None);
     }
 
     #[test]
