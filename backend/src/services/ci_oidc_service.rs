@@ -117,7 +117,7 @@ pub struct CiOidcProvider {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-    /// [`KEY_SOURCE_DISCOVERY`] or [`KEY_SOURCE_STATIC`] (migration 236).
+    /// [`KEY_SOURCE_DISCOVERY`] or [`KEY_SOURCE_STATIC`] (migration 248).
     pub key_source: String,
     /// The JWKS a `static` provider verifies against; `None` otherwise.
     pub static_jwks: Option<serde_json::Value>,
