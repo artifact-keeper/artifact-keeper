@@ -8544,6 +8544,126 @@ mod tests {
         assert!(matches!(result, Err(ProxyScanInconclusive::NoScanner)));
     }
 
+    /// Leaf scanner whose single finding names the bytes it was handed, so a
+    /// finding recorded under the wrong digest is visible (#3868).
+    struct ContentEchoScanner;
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for ContentEchoScanner {
+        fn name(&self) -> &str {
+            "content-echo"
+        }
+
+        fn scan_type(&self) -> &str {
+            "content-echo"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &crate::models::artifact::Artifact,
+            _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+            content: &Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            // Hold the scan open briefly so the two scans below overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(crate::services::scanner_service::ScanOutput {
+                findings: vec![crate::models::security::RawFinding {
+                    severity: crate::models::security::Severity::High,
+                    title: "echo".to_string(),
+                    description: None,
+                    cve_id: Some("CVE-3868-0001".to_string()),
+                    affected_component: Some(String::from_utf8_lossy(content).into_owned()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: None,
+                    source_url: None,
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    /// #3868 regression: two DIFFERENT artifacts scanned concurrently through
+    /// the proxy path must each record only their own findings under their
+    /// own digest. (The reported psycopg2 findings were not cross-attributed:
+    /// `psycopg2-2.9.12.tar.gz` ships `doc/requirements.txt` pinning
+    /// requests/urllib3/idna/pygments, and 2.9.13 ships the same file -- see
+    /// the #3868 handoff. This pins the digest/finding association the report
+    /// suspected.)
+    #[tokio::test]
+    async fn proxy_scan_records_each_artifacts_findings_under_its_own_digest_3868() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(ContentEchoScanner)],
+        );
+        let a = Bytes::from(format!("alpha-{}", Uuid::new_v4()));
+        let b = Bytes::from(format!("bravo-{}", Uuid::new_v4()));
+        let (da, db) = (sha256_hex(&a), sha256_hex(&b));
+        let scan = |bytes: Bytes, digest: String, file: &'static str| {
+            let state = state.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                let synthetic = proxy_rescan_synthetic_artifact(
+                    repo_id,
+                    file,
+                    &digest,
+                    bytes.len() as i64,
+                    None,
+                );
+                proxy_scan_and_record(
+                    &state,
+                    repo_id,
+                    &digest,
+                    &synthetic,
+                    &bytes,
+                    None,
+                    &ProxyScanMode::File,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .is_ok()
+            }
+        };
+        let (ok_a, ok_b) = tokio::join!(
+            scan(a.clone(), da.clone(), "alpha-1.0.tar.gz"),
+            scan(b.clone(), db.clone(), "bravo-1.0.tar.gz"),
+        );
+        assert!(ok_a && ok_b, "both proxy scans must complete");
+
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        for (digest, own) in [(&da, &a), (&db, &b)] {
+            let names: Vec<Option<String>> = pss
+                .fetch_findings(digest, PROXY_SCAN_TYPE, 50)
+                .await
+                .expect("fetch findings")
+                .into_iter()
+                .map(|f| f.package_name)
+                .collect();
+            assert_eq!(
+                names,
+                vec![Some(String::from_utf8_lossy(own).into_owned())],
+                "digest {digest} must carry only its own artifact's findings"
+            );
+        }
+        for digest in [&da, &db] {
+            let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
     /// Drive [`gate_proxy_scan_serve`] once with a fresh (unseeded) digest so
     /// `decide_serve` always lands on `ScanInline` / `ServePendingScanAsync`
     /// for the given `action`, and return its outcome. Shared by the three
