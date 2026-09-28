@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE ($1::uuid IS NULL OR repository_id = $1)\n              AND ($2::uuid IS NULL OR artifact_id = $2)\n              AND ($3::text IS NULL OR status = $3)\n              AND ($4::text IS NULL OR scan_type = $4)\n            ORDER BY created_at DESC\n            LIMIT $5 OFFSET $6\n            ",
+  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status,\n                                      findings_count, critical_count, high_count,\n                                      medium_count, low_count, info_count,\n                                      scanner_version, started_at, completed_at)\n            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason\n            ",
   "describe": {
     "columns": [
       {
@@ -200,16 +200,42 @@
             "name": "source_scan_id"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "scan_completeness",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "scan_completeness_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness_reason"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
         "Uuid",
-        "Text",
-        "Text",
-        "Int8",
-        "Int8"
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -230,8 +256,10 @@
       true,
       false,
       false,
+      true,
+      false,
       true
     ]
   },
-  "hash": "9343187efe1bffbb8edb8ccbde22cc74af436893f13f4954ccca460de4057aba"
+  "hash": "caf7132beea0cca3898029e4fccaa5f6a8c542396dd610f5e586763b3d1b0095"
 }

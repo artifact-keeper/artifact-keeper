@@ -2224,10 +2224,17 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
 /// nothing remains `not_cataloged` — that fail-closed signal is exactly
 /// what materializing a conda pin file would suppress, which is why the
 /// conda pin writes nothing (see [`ComponentEcosystem::Conda`]).
-/// Generic/raw blobs return false: a plain text
-/// file legitimately catalogs nothing, so only `Some(vec![])` results for
-/// an expecting format trigger the `NotCataloged` downgrade, and `None`
-/// (a scanner that reports no catalog at all) never does.
+/// In a GENERIC repository an archive the scan workspace extracts expects a
+/// catalog too (#4154, see [`generic_archive_expects_catalog`]); a
+/// non-archive generic blob (a plain text file) legitimately catalogs
+/// nothing and returns false, as does every non-package file in a typed
+/// repository.
+///
+/// For an expecting artifact, `not_cataloged` is recorded two ways: per
+/// scanner, when a catalog-reporting engine returns `Some(vec![])` with no
+/// findings or packages (#4036/#4094), and for the whole scan set, when no
+/// scanner at all -- including those that report no catalog (`None`) --
+/// found a finding, a package or a component (#4154, [`CatalogSetTally`]).
 pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) -> bool {
     let Some(format) = crate::models::repository::RepositoryFormat::ALL
         .iter()
@@ -2246,7 +2253,133 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
         "maven" | "gradle" => lower.ends_with(".jar"),
         "debian" => lower.ends_with(".deb"),
         "rpm" => lower.ends_with(".rpm"),
+        "generic" => generic_archive_expects_catalog(&lower),
         _ => false,
+    }
+}
+
+/// Whether an archive in a GENERIC repository expects a catalog (#4154, grace
+/// A3). It is exactly as inventoriable as one in a typed repository -- the
+/// scan workspace extracts it -- so an empty result means "nothing was
+/// assessed", not "clean". Scoped to generic only: typed formats whose
+/// archives legitimately ship no packages (a Helm chart `.tgz`, a Terraform
+/// module `.zip`) keep their prior behavior.
+///
+/// Every such archive is scanned and gets a `not_cataloged` row (with its
+/// reason, surfacing as `has_uncataloged_scan`) when nothing catalogs it. Only
+/// package-shaped ones also floor the repository grade; see
+/// [`uncataloged_floors_grade`].
+fn generic_archive_expects_catalog(lower_filename: &str) -> bool {
+    ScanWorkspace::is_archive(lower_filename)
+}
+
+/// Package-shaped archive extensions: files that are packages by
+/// construction, so an empty catalog means a package nobody could read.
+const PACKAGE_SHAPED_ARCHIVE_SUFFIXES: &[&str] = &[
+    ".whl", ".jar", ".war", ".ear", ".gem", ".crate", ".nupkg", ".egg", ".conda",
+];
+
+/// Whether an unsuperseded `not_cataloged` scan of this artifact floors its
+/// repository's grade letter to F (#4036/#4091, narrowed by #4154).
+///
+/// Typed repositories keep the #4091 behaviour: every catalog-expecting
+/// artifact there is a package. In a GENERIC repository only package-shaped
+/// archives floor; a plain `.zip`/`.tar.gz`/`.tgz`/`.tar.bz2` (docs bundles,
+/// build outputs, installers, firmware) is flagged -- the row stays
+/// `not_cataloged` with its reason and the repository reports
+/// `has_uncataloged_scan` -- without changing the grade. Replacing these
+/// floors with an explicit incomplete/unrated status is #4336.
+pub(crate) fn uncataloged_floors_grade(repository_format: &str, filename: &str) -> bool {
+    if repository_format != "generic" {
+        return true;
+    }
+    let lower = filename.to_ascii_lowercase();
+    PACKAGE_SHAPED_ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// The reason recorded on a row the #4154 set-level gate marks `not_cataloged`.
+pub(crate) const SET_NOT_CATALOGED_REASON: &str =
+    "no scanner cataloged any component; artifact contents were not recognized";
+
+/// What the whole scan SET (every applicable scanner for one artifact) said
+/// about the artifact's contents (#4154).
+///
+/// The per-scanner #4036 check only fires on a scanner that REPORTS a catalog
+/// (`cataloged: Some(..)`), and grype is the only one that does. Without grype
+/// -- or with grype failed -- the remaining scanners (Trivy filesystem,
+/// dependency) complete with zero findings and zero packages over an archive
+/// nobody inventoried, and the artifact read as clean. The set-level gate
+/// derives the same signal from what the set actually produced:
+///
+/// * A completed scanner that contributed nothing (no finding, no package, no
+///   cataloged component) for a catalog-expecting artifact is written
+///   `not_cataloged` straight away -- PROVISIONALLY -- rather than `complete`
+///   or `partial`. Writing the pessimistic value first means the row is never
+///   visible (to the dedup reuse path, or to a concurrent score recompute) as
+///   an authoritative clean while the rest of the set is still running.
+/// * When the set finishes, if ANY scanner assessed something, the provisional
+///   rows get back `complete`. If nothing in the set assessed anything they
+///   stay `not_cataloged`. A #3604 pin `partial` row is never written
+///   provisionally and keeps `partial` either way.
+/// * A row reused from an earlier scan counts by its copied completeness:
+///   `complete`/`partial` were decided by a finished set that assessed the
+///   bytes. `not_cataloged` rows are never reused (see
+///   `ScanResultService::find_reusable_scan`).
+#[derive(Debug, Default)]
+pub(crate) struct CatalogSetTally {
+    provisional: Vec<(Uuid, ScanCompleteness, Option<String>)>,
+    assessed_something: bool,
+}
+
+impl CatalogSetTally {
+    /// Whether a completed row must be written `not_cataloged` provisionally.
+    pub(crate) fn is_provisional(
+        expects_catalog: bool,
+        contributed: bool,
+        effective: ScanCompleteness,
+    ) -> bool {
+        // Only a would-be `complete` row is written provisionally. A #3604 pin
+        // `partial` keeps its own verdict even when nothing else in the set
+        // assessed the bytes: escalating it would floor more grades to F, which
+        // #4336 is redesigning.
+        expects_catalog && !contributed && effective == ScanCompleteness::Complete
+    }
+
+    /// Record a completed scanner. `restore_to` is the completeness (and
+    /// reason) the row gets back if the set turns out to have assessed
+    /// something; `Some` exactly when the row was written provisionally.
+    pub(crate) fn record_completed(
+        &mut self,
+        scan_id: Uuid,
+        contributed: bool,
+        restore_to: Option<(ScanCompleteness, Option<String>)>,
+    ) {
+        if contributed {
+            self.assessed_something = true;
+        }
+        if let Some((completeness, reason)) = restore_to {
+            self.provisional.push((scan_id, completeness, reason));
+        }
+    }
+
+    /// Record a scan whose result was copied from (or already exists as) an
+    /// earlier scan of the same bytes, by its stored completeness.
+    pub(crate) fn record_reused(&mut self, completeness: &str) {
+        if completeness != ScanCompleteness::NotCataloged.as_str() {
+            self.assessed_something = true;
+        }
+    }
+
+    /// The provisional rows to restore once the set has finished: all of them
+    /// when something was assessed, none when nothing was.
+    pub(crate) fn rows_to_restore(&self) -> &[(Uuid, ScanCompleteness, Option<String>)] {
+        if self.assessed_something {
+            &self.provisional
+        } else {
+            &[]
+        }
     }
 }
 
@@ -7375,6 +7508,8 @@ impl ScannerService {
             expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
         };
+        let mut catalog_set = CatalogSetTally::default();
+        let expects_catalog = format_expects_catalog(&repository_format, upload_filename);
 
         for scanner in &self.scanners {
             // Take any pre-allocated row id committed by the trigger handler.
@@ -7556,6 +7691,7 @@ impl ScannerService {
                             artifact_id, e
                         );
                     }
+                    catalog_set.record_reused(&source_scan.scan_completeness);
                     continue;
                 }
 
@@ -7595,6 +7731,7 @@ impl ScannerService {
                             scanner.name(),
                             checksum_log_prefix(checksum),
                         );
+                        catalog_set.record_reused(&reused.scan_completeness);
                         // Update quarantine status based on copied findings
                         self.update_quarantine_status(artifact_id, reused.findings_count)
                             .await?;
@@ -7669,6 +7806,11 @@ impl ScannerService {
                         && matches!(&cataloged, Some(c) if c.is_empty())
                         && findings.is_empty()
                         && packages.is_empty();
+                    // #4154: what this scanner contributed to the set-level
+                    // tally, captured before dedup/persistence consume the vecs.
+                    let contributed = !findings.is_empty()
+                        || !packages.is_empty()
+                        || matches!(&cataloged, Some(c) if !c.is_empty());
                     // Dedup ONLY when this upload carried a component pin
                     // (#3442). The inflation is caused by the pin itself:
                     // `prepare_pinned` writes a synthetic `package-lock.json`
@@ -7934,6 +8076,20 @@ impl ScannerService {
                     } else {
                         (scan_completeness, None)
                     };
+                    // #4154: provisional pessimistic write, see CatalogSetTally.
+                    let provisional = CatalogSetTally::is_provisional(
+                        expects_catalog,
+                        contributed,
+                        effective_completeness,
+                    );
+                    let (written_completeness, written_reason) = if provisional {
+                        (
+                            ScanCompleteness::NotCataloged,
+                            Some(SET_NOT_CATALOGED_REASON.to_string()),
+                        )
+                    } else {
+                        (effective_completeness, completeness_reason.clone())
+                    };
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -7945,13 +8101,18 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
-                            effective_completeness.as_str(),
+                            written_completeness.as_str(),
                             // #3604: persist the pin identity that produced this
                             // verdict so future reuse can require a match.
                             pin_identity.as_deref(),
-                            completeness_reason.as_deref(),
+                            written_reason.as_deref(),
                         )
                         .await?;
+                    catalog_set.record_completed(
+                        scan_result.id,
+                        contributed,
+                        provisional.then_some((effective_completeness, completeness_reason)),
+                    );
 
                     // #4036: `uncataloged` now implies zero `packages` rows
                     // (#4094's corroboration guard), which skips the
@@ -7961,7 +8122,7 @@ impl ScannerService {
                     // attestation consumers do not read the artifact as fully
                     // inventoried. The scan row itself still completes
                     // normally (status='completed', real counts).
-                    if uncataloged {
+                    if uncataloged || provisional {
                         if let Err(set_err) = self
                             .scan_result_service
                             .set_inventory_status(
@@ -7985,7 +8146,7 @@ impl ScannerService {
                         critical,
                         high,
                         scanner_version,
-                        effective_completeness.as_str(),
+                        written_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -8097,6 +8258,20 @@ impl ScannerService {
                     // update_quarantine_status (#2912).
                     self.enforce_policy_after_failed_scan(artifact_id).await;
                 }
+            }
+        }
+
+        // #4154: the set has finished. If anything in it assessed the
+        // artifact, the provisionally `not_cataloged` rows get their own
+        // completeness back; otherwise they stay `not_cataloged` (see
+        // CatalogSetTally). Must run before the score is recalculated.
+        for (scan_id, completeness, reason) in catalog_set.rows_to_restore() {
+            if let Err(e) = self
+                .scan_result_service
+                .restore_completeness(*scan_id, completeness.as_str(), reason.as_deref())
+                .await
+            {
+                error!("Failed to restore completeness on scan {}: {}", scan_id, e);
             }
         }
 
@@ -12384,6 +12559,11 @@ mod tests {
             ("gradle", "commons-collections-3.2.1.jar"),
             ("debian", "openssl_3.0.2-0ubuntu1_amd64.deb"),
             ("rpm", "openssl-3.0.7-18.el9.x86_64.rpm"),
+            // #4154 (grace A3): an archive in a GENERIC repository is extracted
+            // and inventoried like any other, so it expects a catalog too.
+            ("generic", "bundle.tar.gz"),
+            ("generic", "bundle.zip"),
+            ("generic", "numpy-1.26.0-py311_0.tar.bz2"),
         ] {
             assert!(
                 format_expects_catalog(f, filename),
@@ -12391,11 +12571,11 @@ mod tests {
             );
         }
 
-        // Extension-gated per format, and false for generic/raw repositories
+        // Extension-gated per format, and false for non-archive generic blobs
         // and non-package artifacts — those legitimately catalog nothing.
         for (f, filename) in [
             ("generic", "blob.bin"),
-            ("generic", "numpy-1.26.0-py311_0.tar.bz2"),
+            ("generic", "notes.txt"),
             ("conda", "notes.txt"),
             ("npm", "notes.txt"),
             ("npm", "left-pad-1.3.0.tar.gz"),
@@ -12414,6 +12594,70 @@ mod tests {
         // Filename matching is case-insensitive.
         assert!(format_expects_catalog("cargo", "SMALLVEC-1.6.0.CRATE"));
         assert!(format_expects_catalog("conda", "NUMPY-1.26.0.TAR.BZ2"));
+    }
+
+    /// #4154: which uncataloged artifacts floor the repository grade. Every
+    /// catalog-expecting artifact in a typed repository does (#4091); in a
+    /// generic repository only package-shaped archives do.
+    #[test]
+    fn test_uncataloged_floors_grade_only_for_packages() {
+        assert!(uncataloged_floors_grade("maven", "commons-1.0.jar"));
+        assert!(uncataloged_floors_grade("npm", "left-pad-1.3.0.tgz"));
+        assert!(uncataloged_floors_grade("pypi", "pkg-1.0.tar.gz"));
+        for name in [
+            "a.whl", "b.JAR", "c.war", "d.ear", "e.gem", "f.crate", "g.nupkg", "h.egg", "i.conda",
+        ] {
+            assert!(uncataloged_floors_grade("generic", name), "{name} floors");
+        }
+        for name in [
+            "docs.zip",
+            "site.tar.gz",
+            "chart.tgz",
+            "fw.tar.bz2",
+            "BUILD.ZIP",
+        ] {
+            assert!(
+                !uncataloged_floors_grade("generic", name),
+                "{name} must not floor"
+            );
+        }
+    }
+
+    /// #4154: a row is written `not_cataloged` provisionally only when the
+    /// format expects a catalog, the scanner contributed nothing, and the row
+    /// is not already `not_cataloged`; the finished set restores provisional
+    /// rows only if something in it assessed the artifact.
+    #[test]
+    fn test_catalog_set_tally_restores_only_when_the_set_assessed_something() {
+        use ScanCompleteness::{Complete, NotCataloged, Partial};
+        assert!(CatalogSetTally::is_provisional(true, false, Complete));
+        // A pin `partial` keeps its verdict; it is never written provisionally.
+        assert!(!CatalogSetTally::is_provisional(true, false, Partial));
+        assert!(!CatalogSetTally::is_provisional(true, false, NotCataloged));
+        assert!(!CatalogSetTally::is_provisional(true, true, Complete));
+        assert!(!CatalogSetTally::is_provisional(false, false, Complete));
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+        // Nothing assessed: provisional rows stay not_cataloged.
+        let mut empty = CatalogSetTally::default();
+        empty.record_completed(a, false, Some((Complete, None)));
+        empty.record_completed(b, false, Some((Complete, None)));
+        assert!(empty.rows_to_restore().is_empty());
+
+        // Something assessed: every provisional row gets `complete` back.
+        let mut assessed = CatalogSetTally::default();
+        assessed.record_completed(a, false, Some((Complete, None)));
+        assessed.record_completed(b, true, None);
+        assert_eq!(assessed.rows_to_restore(), &[(a, Complete, None)]);
+
+        // A reused row counts by its copied completeness.
+        let mut reused = CatalogSetTally::default();
+        reused.record_completed(a, false, Some((Complete, None)));
+        reused.record_reused("not_cataloged");
+        assert!(reused.rows_to_restore().is_empty());
+        reused.record_reused("complete");
+        assert_eq!(reused.rows_to_restore().len(), 1);
     }
 
     /// #4036: the persisted strings must match the `scan_completeness` CHECK
@@ -24090,7 +24334,21 @@ tonic-build = "0.12"
                 .lock()
                 .unwrap()
                 .push(target.expected_component.cloned());
-            Ok(ScanOutput::findings_only(self.findings.clone()))
+            // Inventory the artifact itself, as a real engine does for a real
+            // package (from the pin file or the package's own metadata). A
+            // scan set that inventories nothing is `not_cataloged` (#4154),
+            // which is not what these pin tests are about.
+            Ok(ScanOutput {
+                findings: self.findings.clone(),
+                packages: vec![RawPackage {
+                    name: target.artifact.name.clone(),
+                    version: target.artifact.version.clone(),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                }],
+                ..Default::default()
+            })
         }
     }
 
@@ -26323,8 +26581,17 @@ tonic-build = "0.12"
         /// repository format (via the fixture) and the artifact filename,
         /// which is what `format_expects_catalog` keys on.
         async fn seed_named_scannable_artifact(fx: &tdh::Fixture, name: &str) -> Uuid {
+            seed_named_artifact_with_checksum(fx, name, &fresh_checksum()).await
+        }
+
+        /// [`seed_named_scannable_artifact`] with a caller-chosen checksum, so
+        /// two artifacts can share bytes for the dedup-reuse path.
+        async fn seed_named_artifact_with_checksum(
+            fx: &tdh::Fixture,
+            name: &str,
+            checksum: &str,
+        ) -> Uuid {
             let artifact_id = Uuid::new_v4();
-            let checksum = fresh_checksum();
             let storage_key = format!("catalog/{artifact_id}/{name}");
             fx.state
                 .storage
@@ -26344,7 +26611,7 @@ tonic-build = "0.12"
             .bind(artifact_id)
             .bind(fx.repo_id)
             .bind(name)
-            .bind(&checksum)
+            .bind(checksum)
             .bind(&storage_key)
             .execute(&fx.pool)
             .await
@@ -26511,6 +26778,193 @@ tonic-build = "0.12"
             finish(fx).await;
         }
 
+        /// Scan `name` in a fresh `format` repository with `scanners`, and
+        /// return the fixture, the artifact id and the repo's score row.
+        async fn scan_named_with(
+            format: &str,
+            name: &str,
+            scanners: Vec<Arc<dyn Scanner>>,
+        ) -> Option<(
+            tdh::Fixture,
+            Uuid,
+            crate::models::security::RepoSecurityScore,
+        )> {
+            let fx = tdh::Fixture::setup("local", format).await?;
+            let artifact_id = seed_named_scannable_artifact(&fx, name).await;
+            make_scanner_service_with(&fx, scanners, None)
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            Some((fx, artifact_id, score))
+        }
+
+        /// #4154: the not-cataloged gate must not depend on grype. A package
+        /// archive scanned ONLY by scanners that report no catalog (Trivy
+        /// filesystem / dependency, `cataloged: None`) and that together found
+        /// nothing at all was never assessed -- before the set-level tally it
+        /// completed `complete` with grade A.
+        #[tokio::test]
+        async fn test_not_cataloged_without_grype_floors_repo_grade() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "maven",
+                "commons-collections-3.2.1.jar",
+                vec![
+                    FakeScanner::completed("filesystem", vec![], vec![]),
+                    FakeScanner::completed("dependency", vec![], vec![]),
+                ],
+            )
+            .await
+            else {
+                return;
+            };
+            for scan_type in ["filesystem", "dependency"] {
+                let row = latest_scan_row(&fx.pool, artifact_id, scan_type).await;
+                assert_eq!(row.status, "completed");
+                assert_eq!(
+                    row.scan_completeness, "not_cataloged",
+                    "{scan_type}: a set that cataloged nothing is not_cataloged without grype"
+                );
+                assert_eq!(row.inventory_status, "partial");
+            }
+            assert_eq!(score.grade, "F");
+            assert!(score.has_uncataloged_scan);
+            finish(fx).await;
+        }
+
+        /// #4154 negative control: one scanner in the set inventoried the
+        /// artifact, so another scanner's zero row is a real clean result.
+        #[tokio::test]
+        async fn test_set_with_inventory_is_not_flagged_not_cataloged() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "maven",
+                "commons-collections-3.2.1.jar",
+                vec![
+                    FakeScanner::completed("filesystem", vec![], two_packages()),
+                    FakeScanner::completed("dependency", vec![], vec![]),
+                ],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "dependency").await;
+            assert_eq!(row.scan_completeness, "complete");
+            assert!(!score.has_uncataloged_scan);
+            assert_eq!(score.grade, "A");
+            finish(fx).await;
+        }
+
+        /// #4154 / grace A3: an empty `tar.gz` in a GENERIC repository scanned
+        /// `completed, 0 findings, 0 components, 0 cataloged` and silently read
+        /// as clean because `format_expects_catalog` excluded generic. It is now
+        /// recorded `not_cataloged` and flags the repository, but a plain
+        /// archive does not floor the grade (only package-shaped ones do, see
+        /// `test_empty_package_shaped_generic_archive_floors_grade`).
+        #[tokio::test]
+        async fn test_empty_generic_archive_is_not_cataloged() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "generic",
+                "bundle.tar.gz",
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.scan_completeness, "not_cataloged");
+            assert!(
+                row.scan_completeness_reason.is_some(),
+                "the not_cataloged row must say why"
+            );
+            assert!(
+                score.has_uncataloged_scan,
+                "a plain generic archive nobody could inventory flags the repository"
+            );
+            assert_eq!(
+                score.grade, "A",
+                "a plain generic archive must not floor the repository grade"
+            );
+            finish(fx).await;
+        }
+
+        /// #4154: a package-shaped archive in a GENERIC repository (here an
+        /// empty wheel) that no scanner could inventory floors the grade, as
+        /// the same package does in a typed repository (#4091).
+        #[tokio::test]
+        async fn test_empty_package_shaped_generic_archive_floors_grade() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "generic",
+                "tool-1.0-py3-none-any.whl",
+                vec![FakeScanner::completed("filesystem", vec![], vec![])],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "filesystem").await;
+            assert_eq!(row.scan_completeness, "not_cataloged");
+            assert!(score.has_uncataloged_scan);
+            assert_eq!(score.grade, "F");
+            finish(fx).await;
+        }
+
+        /// #4154 dedup fail-open: the SAME empty package archive pushed to
+        /// generic repo X (floored F) and then to repo Y inside the zero-findings
+        /// reuse TTL used to copy X's rows into Y as `complete` -> grade A. A
+        /// not_cataloged row is never reused, so Y scans for itself and is F.
+        #[tokio::test]
+        async fn test_not_cataloged_is_not_reused_across_repositories() {
+            let _serial = tdh::scan_dedup_serial_lock().await;
+            let Some(x) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let Some(y) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let checksum = fresh_checksum();
+            let mut grades = Vec::new();
+            for fx in [&x, &y] {
+                let artifact_id =
+                    seed_named_artifact_with_checksum(fx, "bundle-1.0-py3-none-any.whl", &checksum)
+                        .await;
+                make_scanner_service_with(
+                    fx,
+                    vec![FakeScanner::completed("filesystem", vec![], vec![])],
+                    None,
+                )
+                // bypass_dedup = false: the reuse path is what is under test.
+                .scan_artifact_with_options(artifact_id, true, false)
+                .await
+                .expect("scan orchestration must return Ok");
+                let row = latest_scan_row(&fx.pool, artifact_id, "filesystem").await;
+                assert_eq!(row.scan_completeness, "not_cataloged");
+                let score = ScanResultService::new(fx.pool.clone())
+                    .get_score(fx.repo_id)
+                    .await
+                    .expect("score query")
+                    .expect("score row");
+                grades.push((score.grade, score.has_uncataloged_scan));
+            }
+            assert_eq!(
+                grades,
+                vec![("F".to_string(), true), ("F".to_string(), true)],
+                "repo Y must not inherit a clean grade from X's not-cataloged scan"
+            );
+            finish(y).await;
+            finish(x).await;
+        }
+
         /// #4094 false-positive regression, the xz case: an empty `library`
         /// catalog with a REAL finding means "no libraries", not "never
         /// read" — verified live against grype 0.118, which catalogs an xz
@@ -26639,7 +27093,11 @@ tonic-build = "0.12"
 
         /// Negative control 2: `cataloged: None` means "this scanner reports
         /// no catalog" (the trivy family, OCI registry mode) and NEVER
-        /// triggers the downgrade — only `Some(vec![])` does. The seeded
+        /// triggers the per-scanner downgrade — only `Some(vec![])` does. The
+        /// scanner here still inventories packages, so the #4154 set-level
+        /// tally sees an assessed artifact too (a `None` scanner that
+        /// inventories NOTHING is covered by
+        /// `test_not_cataloged_without_grype_floors_repo_grade`). The seeded
         /// bytes are a real minimal conda package whose `info/index.json`
         /// agrees with the registry coordinate, so the #4039 hosted-upload
         /// pin is produced and the pin path stays out of the way of the
@@ -26662,7 +27120,7 @@ tonic-build = "0.12"
                 vec![FakeScanner::completed_with_catalog(
                     "grype",
                     vec![],
-                    vec![],
+                    two_packages(),
                     None,
                 )],
                 None,
