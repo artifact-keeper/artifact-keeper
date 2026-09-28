@@ -227,6 +227,12 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // forever; hosted and future metadata paths stay mutable by default.
         RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
 
+        // Go module proxy protocol: a canonical version under `@v/` names a
+        // `.info`/`.mod`/`.zip` the checksum database pins forever, while
+        // `@v/list`, `@latest` and a non-canonical query (`@v/master.info`)
+        // resolve afresh on every request.
+        RepositoryFormat::Go => classify_go(&lower),
+
         // GitHub release files can be replaced under the same tag and name.
         // Only the explicit mirror formats get a long, finite cache lifetime.
         RepositoryFormat::Github | RepositoryFormat::Mise | RepositoryFormat::Aqua => {
@@ -501,6 +507,35 @@ fn classify_oci(lower: &str) -> Mutability {
     // `/v2/<name>/manifests/<tag>` (no digest) and `/v2/<name>/tags/list` are
     // mutable pointers.
     Mutability::mutable_default()
+}
+
+/// Go module proxy: `<module>/@v/<version>.{info,mod,zip}` is immutable only
+/// for a canonical `vMAJOR.MINOR.PATCH[-pre][+build]` version (pseudo-versions
+/// and `+incompatible` included). `@v/list`, `@latest` and a query such as
+/// `@v/master.info` or `@v/v1.2.info` stay mutable.
+fn classify_go(lower: &str) -> Mutability {
+    let version = lower.rsplit_once("/@v/").and_then(|(_, leaf)| {
+        [".info", ".mod", ".zip"]
+            .iter()
+            .find_map(|ext| leaf.strip_suffix(ext))
+    });
+    let canonical = version
+        .and_then(|v| v.strip_prefix('v'))
+        .and_then(|v| v.split(['-', '+']).next())
+        .is_some_and(|core| {
+            let parts: Vec<&str> = core.split('.').collect();
+            parts.len() == 3
+                && parts.iter().all(|p| {
+                    !p.is_empty()
+                        && p.bytes().all(|b| b.is_ascii_digit())
+                        && (p.len() == 1 || !p.starts_with('0'))
+                })
+        });
+    if canonical {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
 }
 
 /// Cargo §2.1: the registry index is mutable; `.crate` downloads are immutable.
@@ -1055,7 +1090,24 @@ mod tests {
             ),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
-            (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
+            // Go: canonical versions under `@v/` are pinned by the checksum
+            // database; the list, `@latest` and non-canonical queries are not.
+            (Go, "github.com/foo/bar/@v/v1.0.0.zip", true),
+            (Go, "github.com/foo/bar/@v/v1.0.0.mod", true),
+            (Go, "github.com/foo/bar/@v/v1.0.0.info", true),
+            (
+                Go,
+                "go.opencensus.io/@v/v0.1.1-0.20171103154506-982329095285.mod",
+                true,
+            ),
+            (Go, "github.com/foo/bar/@v/v2.0.0+incompatible.zip", true),
+            (Go, "github.com/!burnt!sushi/toml/@v/v1.3.2.zip", true),
+            (Go, "github.com/foo/bar/@v/list", false),
+            (Go, "github.com/foo/bar/@latest", false),
+            (Go, "github.com/foo/bar/@v/master.info", false),
+            (Go, "github.com/foo/bar/@v/v1.2.info", false),
+            (Go, "github.com/foo/bar/@v/v1.02.3.mod", false),
+            (Go, "github.com/foo/bar/@v/v1.0.0.txt", false),
         ]
     }
 

@@ -712,6 +712,30 @@ pub async fn proxy_fetch_capped_encoded(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_capped_encoded`] (#4120).
+///
+/// Identical except that the synthesized [`Repository`] carries the caller's
+/// REAL format, so `cache_classifier::classify` reaches its per-format arm.
+/// The same caution as [`proxy_fetch_capped_with_format`] applies: pass a real
+/// format only when `path` is the format-relative path that format's
+/// classifier rules were written against.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_encoded_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_capped_with_encoding(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Build the 200 response for buffered upstream metadata that is forwarded
 /// VERBATIM (#3260, the shared form of Maven's #3211 `forward_root_verbatim`).
 ///
@@ -15142,7 +15166,8 @@ mod tests {
     /// `proxy_fetch_streaming` (no buffering), plus the repository's REAL
     /// format, so `cache_classifier::classify` can reach its per-format arm
     /// instead of the `Generic` stand-in `build_remote_repo` synthesizes. The
-    /// Maven and sbt artifact downloads moved to this helper in #3459 — with
+    /// Maven and sbt artifact downloads moved to this helper in #3459 (the Go
+    /// module `.zip` followed in #4120) — with
     /// `Generic` every released coordinate was stamped with the conservative
     /// 5-minute mutable TTL and re-fetched from upstream after it — so their
     /// pins assert this token. A revert to the buffered `proxy_fetch` OR to
@@ -15187,7 +15212,7 @@ mod tests {
     streaming_pin_test!(
         test_goproxy_remote_fetch_uses_streaming_helper_1183,
         "goproxy.rs",
-        STREAMING_CALL_TOKEN,
+        FORMAT_STREAMING_CALL_TOKEN,
         "the remote `@v/<ver>.zip` download"
     );
     streaming_pin_test!(
@@ -20624,6 +20649,8 @@ mod proxy_download_recording_tests {
                 "conda.rs",
                 "proxy_fetch_streaming_with_disposition_and_format(",
             ),
+            // #4120 moved the Go module `.zip` download the same way.
+            ("goproxy.rs", "proxy_fetch_streaming_with_format("),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()
