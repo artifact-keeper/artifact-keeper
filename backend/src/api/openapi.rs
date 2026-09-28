@@ -597,6 +597,33 @@ mod tests {
         }
     }
 
+    /// #3812: `visibility` is the authoritative field; the legacy boolean and
+    /// its alias stay accepted and returned but are flagged deprecated in the
+    /// spec so generated SDKs surface it.
+    #[test]
+    fn test_repository_legacy_visibility_booleans_are_deprecated_in_spec() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        for schema in [
+            "CreateRepositoryRequest",
+            "UpdateRepositoryRequest",
+            "RepositoryResponse",
+        ] {
+            let props = &spec["components"]["schemas"][schema]["properties"];
+            assert!(props.is_object(), "schema {schema} missing from the spec");
+            for field in ["is_public", "allow_anonymous_access"] {
+                assert_eq!(
+                    props[field]["deprecated"],
+                    serde_json::Value::Bool(true),
+                    "{schema}.{field} must be marked deprecated"
+                );
+            }
+            assert!(
+                props["visibility"]["deprecated"].is_null(),
+                "{schema}.visibility must not be deprecated"
+            );
+        }
+    }
+
     /// #3924 added a second 409 to chunked-upload completion (immutable path
     /// occupied) alongside the checksum mismatch, and clients that mapped every
     /// 409 there to a checksum error misreported it. The documented 409 must

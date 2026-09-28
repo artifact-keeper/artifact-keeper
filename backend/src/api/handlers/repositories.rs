@@ -849,12 +849,14 @@ pub struct CreateRepositoryRequest {
     /// cannot express `internal`. Supplying both is accepted only when they
     /// agree -- a contradiction is a 400 rather than one silently winning.
     pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    #[schema(deprecated)]
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts from this repository without authentication. Useful for remote
     /// (pull-through cache) repositories that proxy public upstream registries.
     /// If both `is_public` and `allow_anonymous_access` are provided,
     /// `allow_anonymous_access` takes precedence.
+    #[schema(deprecated)]
     pub allow_anonymous_access: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
@@ -1065,6 +1067,7 @@ pub struct UpdateRepositoryRequest {
     /// cannot express `internal`. Supplying both is accepted only when they
     /// agree -- a contradiction is a 400 rather than one silently winning.
     pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    #[schema(deprecated)]
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts without authentication. Useful for remote (pull-through cache)
@@ -1072,6 +1075,7 @@ pub struct UpdateRepositoryRequest {
     /// (upload, delete) still require authentication regardless of this setting.
     /// If both `is_public` and `allow_anonymous_access` are provided,
     /// `allow_anonymous_access` takes precedence.
+    #[schema(deprecated)]
     pub allow_anonymous_access: Option<bool>,
     pub quota_bytes: Option<i64>,
     /// When provided, enables/disables the `promotion_only` policy for this
@@ -1227,10 +1231,12 @@ pub struct RepositoryResponse {
     /// DEPRECATED. Always equal to `visibility == "public"`. An `internal`
     /// repository reads as `false` here, which is correct -- it is not
     /// anonymously readable -- but indistinguishable from `private`.
+    #[schema(deprecated)]
     pub is_public: bool,
     /// Whether anonymous (unauthenticated) downloads are allowed. This is
     /// always equal to `is_public` and provided as a convenience alias so
     /// the semantics are clear for remote (pull-through cache) repositories.
+    #[schema(deprecated)]
     pub allow_anonymous_access: bool,
     /// When true, direct user uploads are rejected; artifacts must be promoted.
     pub promotion_only: bool,
