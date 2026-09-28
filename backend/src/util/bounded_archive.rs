@@ -525,6 +525,14 @@ pub fn with_registry_extraction<T>(decode: impl FnOnce() -> T) -> Result<T> {
     with_ingest_extraction_from(registry_extraction_semaphore(), decode)
 }
 
+/// Reserve one registry/read-path decompression slot as a guard, FAST-FAIL to
+/// the 503 [`AppError::ServiceUnavailable`] on saturation. For a read path whose
+/// decode spans `.await`s (upstream fetches, `spawn_blocking` hops) and must
+/// hold ONE slot for the whole build rather than one per decode step.
+pub fn acquire_registry_extraction() -> Result<IngestExtractionGuard> {
+    acquire_ingest_extraction_from(registry_extraction_semaphore())
+}
+
 /// Test-only scaffolding for suites that manipulate the process-wide extraction
 /// semaphores.
 #[cfg(test)]
