@@ -1757,7 +1757,9 @@ fn read_index_capped<R: Read>(reader: R) -> Option<String> {
 /// (#2561), which sheds the request with a retryable 503 before any upstream
 /// fetch or cache write — the resolve fails cleanly, no partial state.
 async fn resolve_pool_expected_checksum(
+    db: &PgPool,
     proxy: &ProxyService,
+    repo_id: uuid::Uuid,
     repo_key: &str,
     component: &str,
     artifact_path: &str,
@@ -1768,7 +1770,22 @@ async fn resolve_pool_expected_checksum(
     let Ok((_, _, arch)) = DebianHandler::parse_deb_filename(filename) else {
         return Ok(None);
     };
-    for cache_path in proxy.list_cached_paths(repo_key).await {
+    let cached_paths = if crate::services::proxy_catalog::has_rows(db, repo_id)
+        .await
+        .unwrap_or(false)
+    {
+        crate::services::proxy_catalog::paths_under_prefixes(
+            db,
+            repo_id,
+            &["dists/".to_string()],
+            i64::MAX,
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        proxy.list_cached_paths(repo_key).await
+    };
+    for cache_path in cached_paths {
         if !is_matching_packages_index(&cache_path, component, &arch) {
             continue;
         }
@@ -2919,7 +2936,9 @@ async fn pool_download(
                     // never buffered (#1608). `None` (no covering Packages
                     // index cached) preserves the prior cache behaviour.
                     let expected_checksum = resolve_pool_expected_checksum(
+                        &state.db,
                         proxy,
+                        repo.id,
                         &repo_key,
                         &component,
                         &artifact_path,
@@ -6206,6 +6225,100 @@ mod virtual_dists_cap_tests {
             decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &too_big),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn tier_b_reads_index_paths_from_catalog() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let index_path = "dists/noble/main/binary-amd64/Packages";
+        let deb = "pool/main/h/hello/hello_1.0_amd64.deb";
+        let sha = "a".repeat(64);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{index_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "Package: hello\nFilename: {deb}\nSize: 4\nSHA256: {sha}\n"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/dists/noble/InRelease"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("release"))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-tierb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let repo_id = insert_remote_debian_member(&pool, root, &server.uri()).await;
+        let repo_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("repo key");
+        let repo = proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &server.uri(),
+            RepositoryFormat::Debian,
+        );
+        proxy
+            .fetch_artifact(&repo, index_path)
+            .await
+            .expect("cache index");
+        proxy
+            .fetch_artifact(&repo, "dists/noble/InRelease")
+            .await
+            .expect("cache release");
+
+        let listed = resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+            .await
+            .expect("listed");
+        let unlisted = resolve_pool_expected_checksum(
+            &pool,
+            &proxy,
+            repo_id,
+            &repo_key,
+            "main",
+            "pool/main/h/hello/hello_2.0_amd64.deb",
+        )
+        .await
+        .expect("unlisted");
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2")
+            .bind(repo_id)
+            .bind(index_path)
+            .execute(&pool)
+            .await
+            .expect("drop index row");
+        let not_in_catalog =
+            resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+                .await
+                .expect("not in catalog");
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("drop catalog");
+        let pre_catalog =
+            resolve_pool_expected_checksum(&pool, &proxy, repo_id, &repo_key, "main", deb)
+                .await
+                .expect("pre-catalog cache");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(listed, Some(sha.clone()));
+        assert_eq!(unlisted, None);
+        assert_eq!(not_in_catalog, None);
+        assert_eq!(pre_catalog, Some(sha));
     }
 }
 
