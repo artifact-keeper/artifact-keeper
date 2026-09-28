@@ -7,6 +7,7 @@ pub mod keys;
 pub mod path_format;
 pub mod registry;
 pub mod s3;
+pub mod verify;
 
 pub use keys::StorageKeyScheme;
 pub use path_format::StoragePathFormat;

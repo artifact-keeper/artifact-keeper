@@ -149,6 +149,7 @@ fn test_config(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        download_verify_checksums: true,
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,

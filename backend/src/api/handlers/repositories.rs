@@ -9193,6 +9193,49 @@ pub(crate) fn ranged_stream_response(
     body: futures::stream::BoxStream<'static, Result<Bytes>>,
     base_headers: Vec<(header::HeaderName, String)>,
 ) -> Result<Response> {
+    ranged_stream_response_verified(range_header, total, body, base_headers, None)
+}
+
+/// What a full-body (`200`) serve should verify the streamed bytes against
+/// (#3919): the recorded SHA-256, and a label for the corruption log line.
+pub(crate) struct ServeVerification {
+    pub expected_sha256: [u8; 32],
+    pub label: String,
+}
+
+/// Build the verification for an artifact row's recorded checksum, or `None`
+/// when verification is disabled or the recorded value is not a SHA-256 hex
+/// digest (nothing to verify against; served exactly as before).
+pub(crate) fn serve_verification(
+    enabled: bool,
+    recorded_sha256: &str,
+    label: impl FnOnce() -> String,
+) -> Option<ServeVerification> {
+    if !enabled {
+        return None;
+    }
+    crate::storage::verify::parse_sha256_hex(recorded_sha256).map(|expected_sha256| {
+        ServeVerification {
+            expected_sha256,
+            label: label(),
+        }
+    })
+}
+
+/// [`ranged_stream_response`] that, on the full-body `200` path, verifies the
+/// streamed bytes against `verify` (#3919). The digest header has already been
+/// sent by the time the body is known to be bad, so a mismatch aborts the
+/// body before its final chunk: the client never receives `Content-Length`
+/// bytes carrying the original checksum. A `206` whose range covers the whole
+/// object is verified the same way; a proper sub-range is not (a byte window
+/// cannot be checked against a whole-object digest).
+pub(crate) fn ranged_stream_response_verified(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+    verify: Option<ServeVerification>,
+) -> Result<Response> {
     let build_base = || {
         let mut b = Response::builder().header(header::ACCEPT_RANGES, "bytes");
         for (name, value) in &base_headers {
@@ -9202,7 +9245,25 @@ pub(crate) fn ranged_stream_response(
     };
     let mk_err =
         |e: axum::http::Error| AppError::Internal(format!("failed to build response: {e}"));
-    let response = match parse_byte_range(range_header, total) {
+    let outcome = parse_byte_range(range_header, total);
+    // A 206 whose window is the WHOLE object (`bytes=0-`, `0-(N-1)`, a
+    // suffix >= N) delivers every byte under the whole-object digest header,
+    // so it is verified exactly like the 200 path.
+    let whole_object = match &outcome {
+        RangeOutcome::Full => true,
+        RangeOutcome::Satisfiable { start, end } => *start == 0 && *end + 1 == total,
+        RangeOutcome::Unsatisfiable => false,
+    };
+    let body = match verify {
+        Some(v) if whole_object => crate::storage::verify::verify_sha256_stream(
+            body,
+            v.expected_sha256,
+            Some(total),
+            v.label,
+        ),
+        _ => body,
+    };
+    let response = match outcome {
         RangeOutcome::Satisfiable { start, end } => {
             let len = end - start + 1;
             build_base()
@@ -9242,6 +9303,7 @@ async fn download_artifact_version(
     selector: &str,
     range_header: Option<&str>,
     is_head: bool,
+    verify_checksums: bool,
 ) -> Result<Response> {
     let stored = artifact_service
         .get_version(repo_id, path, Some(selector))
@@ -9283,8 +9345,11 @@ async fn download_artifact_version(
             .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")));
     }
 
+    let verify = serve_verification(verify_checksums, &stored.checksum_sha256, || {
+        format!("{repo_id}/{path}@{}", stored.revision)
+    });
     let body = artifact_service.download_version_stream(&stored).await?;
-    ranged_stream_response(range_header, total, body, base_headers)
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
 /// Download artifact
@@ -9416,6 +9481,11 @@ pub async fn download_artifact(
                 selector,
                 range_header.as_deref(),
                 is_head,
+                state.config.download_verify_checksums
+                    && crate::storage::verify::checksum_is_content_digest(
+                        repo.format.as_key(),
+                        &path,
+                    ),
             )
             .await;
         }
@@ -9549,7 +9619,17 @@ pub async fn download_artifact(
                     "proxy".to_string(),
                 ),
             ];
-            let response = ranged_stream_response(range_header, total, body, base_headers)?;
+            let verify = serve_verification(
+                state.config.download_verify_checksums
+                    && crate::storage::verify::checksum_is_content_digest(
+                        repo.format.as_key(),
+                        &path,
+                    ),
+                &artifact.checksum_sha256,
+                || format!("{key}/{path}"),
+            );
+            let response =
+                ranged_stream_response_verified(range_header, total, body, base_headers, verify)?;
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -21434,6 +21514,205 @@ mod tests {
              path is no longer a format coordinate and must keep the conservative \
              classification; got {routed_ttl}s"
         );
+    }
+
+    /// Seed a local artifact whose row records `recorded` as its SHA-256 while
+    /// the stored object holds `stored` bytes, then GET it through the real
+    /// download router. Returns (status, checksum header, collected body).
+    async fn download_with_recorded_sha_3919(
+        recorded: &[u8],
+        stored: &'static [u8],
+    ) -> Option<(
+        axum::http::StatusCode,
+        Option<String>,
+        std::result::Result<Bytes, axum::Error>,
+    )> {
+        download_with_recorded_sha_range_3919(recorded, stored, None).await
+    }
+
+    async fn download_with_recorded_sha_range_3919(
+        recorded: &[u8],
+        stored: &'static [u8],
+        range: Option<&str>,
+    ) -> Option<(
+        axum::http::StatusCode,
+        Option<String>,
+        std::result::Result<Bytes, axum::Error>,
+    )> {
+        use sha2::Digest;
+        let fx = tdh::Fixture::setup("local", "generic").await?;
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "corrupt/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(stored),
+            fx.user_id,
+        )
+        .await;
+        let recorded_hex = hex::encode(sha2::Sha256::digest(recorded));
+        // The row records the ORIGINAL bytes' digest and length; the stored
+        // object may differ in content or in size.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1, size_bytes = $2 WHERE id = $3")
+            .bind(&recorded_hex)
+            .bind(recorded.len() as i64)
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("record checksum");
+
+        use tower::ServiceExt;
+        let resp = fx
+            .router_with_auth(download_router())
+            .oneshot({
+                let mut req = tdh::get(format!("/{}/download/corrupt/blob.bin", fx.repo_key));
+                if let Some(r) = range {
+                    req.headers_mut()
+                        .insert(header::RANGE, header::HeaderValue::from_str(r).unwrap());
+                }
+                req
+            })
+            .await
+            .expect("download must respond");
+        let status = resp.status();
+        let checksum = resp
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        fx.teardown().await;
+        Some((status, checksum, body))
+    }
+
+    /// #3919: a stored object whose bytes no longer match the recorded
+    /// SHA-256 (one byte flipped on disk) must not be delivered as a complete
+    /// body under the original `X-Checksum-Sha256`. The header is already on
+    /// the wire, so the body is aborted instead of completing.
+    #[tokio::test]
+    async fn test_download_corrupted_blob_is_not_served_complete_3919() {
+        let Some((status, checksum, body)) =
+            download_with_recorded_sha_3919(b"original-artifact-bytes", b"original-artifact-bytEs")
+                .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(checksum.is_some());
+        assert!(
+            body.is_err(),
+            "a corrupted object must abort the body, not serve it complete: {body:?}"
+        );
+    }
+
+    /// #3919 companion: an intact object with a real recorded SHA-256 still
+    /// streams in full (verification must not break the happy path).
+    #[tokio::test]
+    async fn test_download_intact_blob_verifies_and_streams_3919() {
+        let Some((status, checksum, body)) =
+            download_with_recorded_sha_3919(b"intact-artifact-bytes", b"intact-artifact-bytes")
+                .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        use sha2::Digest;
+        assert_eq!(
+            checksum.as_deref(),
+            Some(hex::encode(sha2::Sha256::digest(b"intact-artifact-bytes")).as_str())
+        );
+        assert_eq!(&body.expect("intact body")[..], b"intact-artifact-bytes");
+    }
+
+    /// #3919 review: a `Range` covering the whole object (`bytes=0-`, a
+    /// suffix >= N, `0-(N-1)`) delivers every byte under the whole-object
+    /// digest header, so it must be verified like the 200 path; a proper
+    /// sub-range is served unverified.
+    #[tokio::test]
+    async fn test_download_whole_object_range_is_verified_3919() {
+        for range in ["bytes=0-", "bytes=-1000", "bytes=0-22"] {
+            let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+                b"original-artifact-bytes",
+                b"original-artifact-bytEs",
+                Some(range),
+            )
+            .await
+            else {
+                return;
+            };
+            assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT, "{range}");
+            assert!(
+                body.is_err(),
+                "{range}: whole-object 206 must abort: {body:?}"
+            );
+        }
+        let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+            b"original-artifact-bytes",
+            b"original-artifact-bytEs",
+            Some("bytes=0-3"),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body.expect("sub-range is not verified")[..], b"orig");
+    }
+
+    /// #3919 review (S-a): a stored object LONGER than its record is cut to
+    /// the recorded Content-Length by the transport, so the end-of-stream
+    /// digest check would never run and a clean 200 of the first N bytes
+    /// would be served. It must abort instead — with a corrupt prefix and
+    /// with a correct one.
+    #[tokio::test]
+    async fn test_download_oversized_stored_object_is_not_served_3919() {
+        for stored in [
+            &b"original-artifact-bytEs-and-then-more"[..],
+            &b"original-artifact-bytes-and-then-more"[..],
+        ] {
+            let stored: &'static [u8] = stored;
+            let Some((status, _, body)) =
+                download_with_recorded_sha_3919(b"original-artifact-bytes", stored).await
+            else {
+                return;
+            };
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert!(
+                body.is_err(),
+                "an oversized object must abort, not serve a clean prefix: {body:?}"
+            );
+        }
+    }
+
+    /// Whole-object range of an oversized object: the range slice would stop
+    /// at the recorded length too.
+    #[tokio::test]
+    async fn test_download_oversized_whole_range_is_not_served_3919() {
+        let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+            b"original-artifact-bytes",
+            b"original-artifact-bytes-and-then-more",
+            Some("bytes=0-"),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert!(body.is_err(), "{body:?}");
+    }
+
+    #[test]
+    fn test_serve_verification_gates_3919() {
+        let hex64 = "0f".repeat(32);
+        assert!(serve_verification(true, &hex64, || "x".into()).is_some());
+        assert!(serve_verification(false, &hex64, || "x".into()).is_none());
+        assert!(serve_verification(true, "test-seed", || "x".into()).is_none());
     }
 
     // ---------------------------------------------------------------------
