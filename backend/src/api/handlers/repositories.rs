@@ -8336,12 +8336,27 @@ pub async fn upload_artifact(
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
-    // Stream the request body straight to a bounded scratch file, computing
-    // SHA-256/SHA-1/MD5 in a single pass — the whole artifact is never buffered
-    // in memory (#2517). The stager enforces `max_upload_size_bytes` mid-stream
-    // (413 on breach) instead of relying on a request-body-limit layer.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
+    // single pass — the whole artifact is never buffered in memory (#2517).
+    // The stager enforces `max_upload_size_bytes` mid-stream (413 on breach)
+    // instead of relying on a request-body-limit layer. An object-storage
+    // repository stages on its own backend rather than local disk (#3916),
+    // unless something downstream needs the body as a local file.
+    let stage_on_backend = repo.storage_backend != "filesystem"
+        && !generic_upload_needs_local_body(&state, &repo_service, &repo, &path).await?;
+    let (staged, digests) = if stage_on_backend {
+        let (staged, digests) = proxy_helpers::stage_stream_on_backend(
+            &state,
+            &repo.storage_location(),
+            body.into_data_stream(),
+        )
+        .await?;
+        (GenericStagedBody::Backend(staged), digests)
+    } else {
+        let (staged, digests) =
+            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        (GenericStagedBody::Local(staged), digests)
+    };
 
     persist_generic_staged_upload(
         &state,
@@ -8355,6 +8370,82 @@ pub async fn upload_artifact(
         digests,
     )
     .await
+}
+
+/// A generic upload body after staging: a local scratch file, or an object on
+/// the repository's own backend (#3916).
+enum GenericStagedBody {
+    Local(proxy_helpers::StagedUpload),
+    Backend(proxy_helpers::BackendStagedUpload),
+}
+
+impl GenericStagedBody {
+    fn size_bytes(&self) -> i64 {
+        match self {
+            Self::Local(staged) => staged.size_bytes(),
+            Self::Backend(staged) => staged.size_bytes(),
+        }
+    }
+
+    /// The staged body as a local file, for the consumers that read one (RPM
+    /// header parse, WASM plugins). [`generic_upload_needs_local_body`] keeps
+    /// those uploads on local scratch, so a backend-staged body never gets
+    /// here; it reads as an I/O error rather than a panic if it ever does.
+    fn local_path(&self) -> std::io::Result<&std::path::Path> {
+        match self {
+            Self::Local(staged) => Ok(staged.path()),
+            Self::Backend(_) => Err(std::io::Error::other(
+                "upload body is staged on the storage backend, not local disk",
+            )),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn upload_content(
+        &self,
+    ) -> std::result::Result<crate::services::artifact_service::UploadContent, Response> {
+        use crate::services::artifact_service::UploadContent;
+        Ok(match self {
+            Self::Local(staged) => {
+                UploadContent::Stream(proxy_helpers::open_staged_upload_stream(staged).await?)
+            }
+            Self::Backend(staged) => UploadContent::StagedObject(staged.key().to_string()),
+        })
+    }
+
+    /// Release the staging copy once the service has consumed it.
+    async fn discard(self) {
+        match self {
+            Self::Local(staged) => drop(staged),
+            Self::Backend(staged) => staged.discard().await,
+        }
+    }
+}
+
+/// Whether a generic upload's body must be staged as a local file because a
+/// downstream consumer reads it from disk: the RPM header parse (#3801) or a
+/// WASM format plugin (#2517 plugin-input decision).
+#[allow(clippy::result_large_err)]
+async fn generic_upload_needs_local_body(
+    state: &SharedState,
+    repo_service: &RepositoryService,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> std::result::Result<bool, Response> {
+    if super::upload::rpm_header_metadata_eligible(&repo.format, path) {
+        return Ok(true);
+    }
+    let Some(registry) = &state.plugin_registry else {
+        return Ok(false);
+    };
+    let format_key = repo_service
+        .get_format_key(repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(match format_key {
+        Some(fk) => registry.has_format(&fk).await,
+        None => false,
+    })
 }
 
 /// Authorize a generic artifact write: resolve the repository and enforce the
@@ -8443,7 +8534,7 @@ async fn persist_generic_staged_upload(
     key: String,
     path: String,
     headers: &HeaderMap,
-    staged: proxy_helpers::StagedUpload,
+    staged: GenericStagedBody,
     digests: crate::services::artifact_service::ContentDigests,
 ) -> std::result::Result<Response, Response> {
     // Verify declared checksums against the digests computed while staging —
@@ -8476,7 +8567,11 @@ async fn persist_generic_staged_upload(
             auth.is_admin,
             auth.is_service_account,
         ) {
-        match super::upload::read_rpm_header_prefix(staged.path()).await {
+        let prefix = match staged.local_path() {
+            Ok(local) => super::upload::read_rpm_header_prefix(local).await,
+            Err(e) => Err(e),
+        };
+        match prefix {
             Ok(prefix) => {
                 let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
                 tokio::task::spawn_blocking(move || {
@@ -8519,9 +8614,11 @@ async fn persist_generic_staged_upload(
             // off-heap — is a separate product/ABI decision, deliberately left
             // out of this streaming conversion. The common (non-plugin) generic
             // upload never reaches this branch and streams end-to-end.
-            let plugin_body = tokio::fs::read(staged.path())
-                .await
-                .map_err(|e| proxy_helpers::internal_error("Reading staged upload", e))?;
+            let plugin_body = match staged.local_path() {
+                Ok(local) => tokio::fs::read(local).await,
+                Err(e) => Err(e),
+            }
+            .map_err(|e| proxy_helpers::internal_error("Reading staged upload", e))?;
             match registry.execute_validate(fk, &path, &plugin_body).await {
                 Ok(Ok(())) => {}
                 Ok(Err(validation_err)) => {
@@ -8598,25 +8695,26 @@ async fn persist_generic_staged_upload(
     // manual purge.
 
     let size_bytes = staged.size_bytes();
-    let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_stream_with_sync_options(
+        .upload_content_with_sync_options(
             repo.id,
             &path,
             &name,
             version.as_deref(),
             &content_type,
-            content_stream,
+            content,
             digests,
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
             None,
         )
-        .await
-        .map_err(|e| e.into_response())?;
-    // Scratch file no longer needed once the service has consumed the stream.
-    drop(staged);
+        .await;
+    // The staging copy is no longer needed once the service has consumed it,
+    // whether or not the upload succeeded.
+    staged.discard().await;
+    let artifact = artifact.map_err(|e| e.into_response())?;
     if let Some(metadata) = &rpm_metadata {
         if let Err(e) =
             super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
@@ -8739,7 +8837,7 @@ async fn upload_artifact_multipart_with_path(
         key,
         artifact_path,
         &headers,
-        staged,
+        GenericStagedBody::Local(staged),
         digests,
     )
     .await
@@ -8782,7 +8880,7 @@ async fn upload_artifact_multipart(
         key,
         artifact_path,
         &headers,
-        staged,
+        GenericStagedBody::Local(staged),
         digests,
     )
     .await
@@ -17109,6 +17207,172 @@ mod tests {
         tdh::cleanup(&pool, local_id, user_id).await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
             .bind(vec![maven_id, npm_id])
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3916: a raw `PUT` into an object-storage repository streams its body
+    /// into a staging object on that repository's backend instead of a local
+    /// scratch file under STORAGE_PATH. Proven by making local scratch
+    /// unusable (STORAGE_PATH sits under a regular file, so no directory can
+    /// be created there): before the fix the upload failed with 500 on the
+    /// scratch spool; now it lands at its content-addressed key and leaves no
+    /// staging object behind.
+    #[tokio::test]
+    async fn generic_put_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::admin_auth(user_id, &username));
+
+        let body = Bytes::from_static(b"object-storage upload body for #3916");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{repo_key}/artifacts/tool/1.0/tool.bin"),
+                body.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "an upload into an S3-backed repository must not need local scratch: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let (storage_key, sha256): (String, String) = sqlx::query_as(
+            "SELECT storage_key, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = 'tool/1.0/tool.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(sha256, format!("{:x}", Sha256::digest(&body)));
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(
+                objects.get(&storage_key),
+                Some(&body),
+                "the bytes must land at the content-addressed key"
+            );
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "the staging object must be deleted once promoted, got {:?}",
+                objects.keys().collect::<Vec<_>>()
+            );
+        }
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(
+            tracked, 0,
+            "the staging tracking row must go with the object"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: a generic staging object whose upload died before promoting or
+    /// deleting it (crash, eviction, shutdown) is reclaimed by the hourly
+    /// sweep once older than the threshold; a young one (possibly a live
+    /// upload) is left alone.
+    #[tokio::test]
+    async fn stale_generic_upload_staging_is_swept_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let backend = format!("s3-sweep-{}", Uuid::new_v4().simple());
+        let mem = std::sync::Arc::new(tdh::MemStorage::default());
+        let mut backends: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn crate::storage::StorageBackend>,
+        > = std::collections::HashMap::new();
+        backends.insert(backend.clone(), mem.clone());
+        let registry = crate::storage::StorageRegistry::new(backends, backend.clone());
+
+        let prefix = proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX;
+        let stale = format!("{prefix}{}", Uuid::new_v4());
+        let young = format!("{prefix}{}", Uuid::new_v4());
+        for (key, age_hours) in [(&stale, 48), (&young, 1)] {
+            mem.objects
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Bytes::from_static(b"partial upload"));
+            sqlx::query(
+                "INSERT INTO generic_upload_staging \
+                 (storage_key, storage_backend, storage_path, created_at) \
+                 VALUES ($1, $2, 'repo', NOW() - make_interval(hours => $3))",
+            )
+            .bind(key)
+            .bind(&backend)
+            .bind(age_hours)
+            .execute(&pool)
+            .await
+            .expect("seed staging row");
+        }
+
+        let reclaimed = proxy_helpers::sweep_stale_generic_upload_staging(
+            &pool,
+            &registry,
+            proxy_helpers::GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS,
+        )
+        .await;
+        assert!(reclaimed >= 1, "the stale staging object must be reclaimed");
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM generic_upload_staging WHERE storage_backend = $1",
+        )
+        .bind(&backend)
+        .fetch_all(&pool)
+        .await
+        .expect("remaining rows");
+        assert_eq!(
+            remaining,
+            vec![young.clone()],
+            "only the young row survives"
+        );
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert!(!objects.contains_key(&stale), "the stale object is deleted");
+            assert!(
+                objects.contains_key(&young),
+                "a young (maybe live) upload is kept"
+            );
+        }
+        let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_backend = $1")
+            .bind(&backend)
             .execute(&pool)
             .await;
     }

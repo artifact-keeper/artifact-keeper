@@ -6606,27 +6606,10 @@ where
 
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            match (&e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
-                Some(multer::Error::StreamSizeExceeded { limit }) => (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    payload_too_large_message(*limit),
-                )
-                    .into_response(),
-                _ => (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read upload body: {e}"),
-                )
-                    .into_response(),
-            }
-        })?;
+        let chunk = chunk.map_err(|e| upload_body_error_response(&e))?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                payload_too_large_message(max),
-            )
-                .into_response());
+            return Err(upload_too_large_response(max));
         }
         hasher.update(&chunk);
         file.write_all(&chunk)
@@ -6674,6 +6657,267 @@ pub async fn open_staged_upload_stream(
     staged: &StagedUpload,
 ) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
     open_staged_stream(staged.path()).await
+}
+
+/// Map an upload-body read error to its response: 413 when a multipart
+/// stream hit its size cap, 400 for any other read failure.
+fn upload_body_error_response<E: std::fmt::Display + 'static>(e: &E) -> Response {
+    match (e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
+        Some(multer::Error::StreamSizeExceeded { limit }) => upload_too_large_response(*limit),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload body: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+fn upload_too_large_response(max: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        payload_too_large_message(max),
+    )
+        .into_response()
+}
+
+/// Key namespace for generic upload bodies staged directly on a repository's
+/// object-storage backend instead of local scratch (#3916). Deliberately
+/// distinct from the chunked-session namespace
+/// ([`crate::services::upload_service::STAGING_KEY_PREFIX`]) so the two
+/// reapers can never claim each other's objects.
+pub const GENERIC_UPLOAD_STAGING_PREFIX: &str = "generic-upload-staging/";
+
+/// Age after which a tracked generic staging object has no live owner: the
+/// upload that wrote it was killed (crash, eviction, shutdown) before it could
+/// promote or delete it. Generous, so no in-flight multi-GiB upload is reaped.
+pub const GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS: i64 = 24;
+
+/// Rows reaped per sweep pass, so one pass stays bounded.
+const GENERIC_UPLOAD_STAGING_SWEEP_BATCH: i64 = 500;
+
+/// An upload body staged as an object on the repository's own storage backend
+/// (#3916) -- the object-storage counterpart of [`StagedUpload`].
+///
+/// Every staged object is also tracked in `generic_upload_staging` so
+/// [`sweep_stale_generic_upload_staging`] can reclaim one whose upload died
+/// before cleaning up. Promote it with
+/// [`UploadContent::StagedObject`](crate::services::artifact_service::UploadContent::StagedObject),
+/// then [`BackendStagedUpload::discard`] it. Dropping it without discarding
+/// (an early error return) cleans up in the background.
+pub struct BackendStagedUpload {
+    db: PgPool,
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    key: String,
+    size_bytes: i64,
+    armed: bool,
+}
+
+impl BackendStagedUpload {
+    /// Storage key of the staged object on the repository's backend.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Number of bytes staged (== the eventual artifact size).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// Delete the staged object and its tracking row now.
+    pub async fn discard(mut self) {
+        self.armed = false;
+        delete_generic_staging(&self.db, self.storage.as_ref(), &self.key).await;
+    }
+}
+
+impl Drop for BackendStagedUpload {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let db = self.db.clone();
+        let storage = self.storage.clone();
+        let key = std::mem::take(&mut self.key);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                delete_generic_staging(&db, storage.as_ref(), &key).await;
+            });
+        }
+    }
+}
+
+/// Delete one generic staging object, then its tracking row. The row is kept
+/// when the object delete fails so the sweep retries it.
+async fn delete_generic_staging(
+    db: &PgPool,
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> bool {
+    match storage.delete(key).await {
+        Ok(()) | Err(AppError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "Failed to delete staged upload object");
+            return false;
+        }
+    }
+    let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_key = $1")
+        .bind(key)
+        .execute(db)
+        .await;
+    true
+}
+
+/// Reclaim generic staging objects (#3916) whose upload died before it could
+/// promote or delete them: every tracked object older than `max_age_hours`,
+/// oldest first, at most one bounded batch per call. A row whose backend is no
+/// longer registered is dropped (nothing can reach its object). Returns how
+/// many objects were reclaimed.
+pub async fn sweep_stale_generic_upload_staging(
+    db: &PgPool,
+    registry: &crate::storage::StorageRegistry,
+    max_age_hours: i64,
+) -> usize {
+    let rows: Vec<(String, String, String)> = match sqlx::query_as(
+        "SELECT storage_key, storage_backend, storage_path FROM generic_upload_staging \
+         WHERE created_at < NOW() - make_interval(hours => $1::int) \
+         ORDER BY created_at LIMIT $2",
+    )
+    .bind(max_age_hours as i32)
+    .bind(GENERIC_UPLOAD_STAGING_SWEEP_BATCH)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "Generic upload staging sweep query failed");
+            return 0;
+        }
+    };
+    let mut reclaimed = 0;
+    for (key, backend, path) in rows {
+        match registry.backend_for(&StorageLocation { backend, path }) {
+            Ok(storage) => {
+                if delete_generic_staging(db, storage.as_ref(), &key).await {
+                    reclaimed += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "Dropping generic staging row for an unregistered backend");
+                let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_key = $1")
+                    .bind(&key)
+                    .execute(db)
+                    .await;
+            }
+        }
+    }
+    reclaimed
+}
+
+/// Object-storage counterpart of [`stage_stream_content_addressed`] (#3916):
+/// stream an upload body straight into `generic-upload-staging/<uuid>` on the
+/// repository's own backend while computing SHA-256 / SHA-1 / MD5 and enforcing
+/// `max_upload_size_bytes`, so an upload into an S3/GCS/Azure repository never
+/// needs local disk proportional to its size. The backend's `put_stream`
+/// bounds memory (multipart / block uploads). The object is recorded in
+/// `generic_upload_staging` BEFORE the first byte is written, so a crash at any
+/// point leaves a row the sweep can reclaim it from.
+#[allow(clippy::result_large_err)]
+pub async fn stage_stream_on_backend<S, E>(
+    state: &crate::api::SharedState,
+    location: &StorageLocation,
+    stream: S,
+) -> Result<
+    (
+        BackendStagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + 'static,
+{
+    use crate::services::artifact_service::MultiHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    let key = format!("{}{}", GENERIC_UPLOAD_STAGING_PREFIX, Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO generic_upload_staging (storage_key, storage_backend, storage_path) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&key)
+    .bind(&location.backend)
+    .bind(&location.path)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    let mut staged = BackendStagedUpload {
+        db: state.db.clone(),
+        storage: storage.clone(),
+        key,
+        size_bytes: 0,
+        armed: true,
+    };
+
+    let max = state.config.max_upload_size_bytes;
+    let hasher = Arc::new(Mutex::new(MultiHasher::new()));
+    let counted = Arc::new(AtomicU64::new(0));
+    let rejection: Arc<Mutex<Option<Response>>> = Arc::new(Mutex::new(None));
+    let body = {
+        let hasher = hasher.clone();
+        let counted = counted.clone();
+        let rejection = rejection.clone();
+        stream
+            .map(move |chunk| {
+                let refuse = |response: Response| -> crate::error::Result<Bytes> {
+                    *rejection.lock().unwrap_or_else(|p| p.into_inner()) = Some(response);
+                    Err(AppError::Validation("upload body rejected".to_string()))
+                };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => return refuse(upload_body_error_response(&e)),
+                };
+                let written = counted
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                    .saturating_add(chunk.len() as u64);
+                if max != 0 && written > max {
+                    return refuse(upload_too_large_response(max));
+                }
+                hasher
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .update(&chunk);
+                Ok(chunk)
+            })
+            .boxed()
+    };
+
+    let put = match storage.put_stream(&staged.key, body).await {
+        Ok(put) => put,
+        Err(e) => {
+            staged.discard().await;
+            let rejected = rejection.lock().unwrap_or_else(|p| p.into_inner()).take();
+            return Err(rejected.unwrap_or_else(|| map_storage_err(e)));
+        }
+    };
+    let digests = std::mem::take(&mut *hasher.lock().unwrap_or_else(|p| p.into_inner())).finalize();
+    // The promotion copies this object to the key named by `digests`, so the
+    // backend's own account of what it stored must agree with ours.
+    let counted = counted.load(Ordering::Relaxed);
+    if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) || put.bytes_written != counted {
+        staged.discard().await;
+        return Err(map_storage_err(format!(
+            "staged upload mismatch: backend stored {} bytes with SHA-256 {}, \
+             received {} bytes with SHA-256 {}",
+            put.bytes_written, put.checksum_sha256, counted, digests.sha256
+        )));
+    }
+    staged.size_bytes = put.bytes_written as i64;
+    Ok((staged, digests))
 }
 
 /// Borrowed handle to the columns required to insert a new artifact row.

@@ -891,6 +891,22 @@ pub fn spawn_all(
                     );
                 }
 
+                // #3916: generic uploads staged on object storage by a
+                // replica that died before promoting or deleting them.
+                let stale_staging =
+                    crate::api::handlers::proxy_helpers::sweep_stale_generic_upload_staging(
+                        &db,
+                        &upload_registry,
+                        crate::api::handlers::proxy_helpers::GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS,
+                    )
+                    .await;
+                if stale_staging > 0 {
+                    tracing::info!(
+                        "Removed {} orphaned generic upload staging object(s)",
+                        stale_staging
+                    );
+                }
+
                 let swept =
                     crate::api::handlers::incus::sweep_orphan_staging_files(&storage_path, 24)
                         .await;

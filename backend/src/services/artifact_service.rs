@@ -78,6 +78,15 @@ pub struct ContentDigests {
     pub md5: String,
 }
 
+/// Where the body of a streaming upload comes from (#3916).
+pub enum UploadContent {
+    /// Bytes still to be written, e.g. re-read from a local scratch file.
+    Stream(BoxStream<'static, Result<Bytes>>),
+    /// An object already written to the upload's own storage backend under
+    /// this key (e.g. `generic-upload-staging/<uuid>`); promoted with `copy`.
+    StagedObject(String),
+}
+
 /// Incremental SHA-256 + SHA-1 + MD5 accumulator.
 ///
 /// Feed chunks with [`MultiHasher::update`], then [`MultiHasher::finalize`] into
@@ -695,6 +704,43 @@ impl ArtifactService {
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
     ) -> Result<Artifact> {
+        self.upload_content_with_sync_options(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            UploadContent::Stream(stream),
+            digests,
+            size_bytes,
+            uploaded_by,
+            enqueue_sync_tasks,
+            catalog_name,
+        )
+        .await
+    }
+
+    /// [`Self::upload_stream_with_sync_options`] generalised over where the
+    /// body comes from (#3916): a byte stream written with `put_stream`, or an
+    /// object the caller already staged on THIS service's backend, promoted to
+    /// the content-addressed key with a backend `copy` (server-side on S3 and
+    /// GCS) so the body never touches local disk. Every other semantic --
+    /// preflight, dedup-first, finalize -- is shared.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_content_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        content: UploadContent,
+        digests: ContentDigests,
+        size_bytes: i64,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
+    ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
         self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
@@ -706,15 +752,25 @@ impl ArtifactService {
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
-            let put = self.storage.put_stream(&storage_key, stream).await?;
-            // `put_stream` computes only SHA-256; guard the content-addressed
-            // invariant that the streamed bytes hash to the key we stored them
-            // under (SHA-1 / MD5 for the row come from `digests`).
-            if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
-                return Err(AppError::Validation(format!(
-                    "Streamed content SHA-256 {} does not match staged digest {}",
-                    put.checksum_sha256, digests.sha256
-                )));
+            match content {
+                UploadContent::Stream(stream) => {
+                    let put = self.storage.put_stream(&storage_key, stream).await?;
+                    // `put_stream` computes only SHA-256; guard the
+                    // content-addressed invariant that the streamed bytes hash
+                    // to the key we stored them under (SHA-1 / MD5 for the row
+                    // come from `digests`).
+                    if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
+                        return Err(AppError::Validation(format!(
+                            "Streamed content SHA-256 {} does not match staged digest {}",
+                            put.checksum_sha256, digests.sha256
+                        )));
+                    }
+                }
+                // The stager hashed these exact bytes on their way into the
+                // staged object, so `digests` already describes them.
+                UploadContent::StagedObject(staged_key) => {
+                    self.storage.copy(&staged_key, &storage_key).await?;
+                }
             }
         }
 
