@@ -4125,6 +4125,8 @@ async fn cache_manifest_reference_locally(
             .unwrap_or(cached_reference.as_str());
         let artifact_name = format!("{}:{}", repo.image, row_key);
 
+        // NO-SCAN-ON-UPLOAD: a pull-side listing row for a proxied manifest,
+        // not an upload; proxied content is gated by the digest-keyed proxy scan.
         if let Err(e) = sqlx::query(
             r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -10679,6 +10681,13 @@ async fn handle_put_manifest(
         Ok(artifact_id) => {
             crate::services::quarantine_service::apply_upload_hold_hosted(
                 &state.db,
+                repo_id,
+                artifact_id,
+            )
+            .await;
+            crate::services::scanner_service::trigger_scan_on_upload(
+                &state.db,
+                state.scanner_service.clone(),
                 repo_id,
                 artifact_id,
             )

@@ -5361,6 +5361,13 @@ async fn store_npm_version(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo_id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let npm_metadata = serde_json::json!({

@@ -918,6 +918,8 @@ pub async fn approve_promotion(
 
     // Insert artifact in target repo
     let new_artifact_id = Uuid::new_v4();
+    // NO-SCAN-ON-UPLOAD: an approved promotion copies an artifact whose own
+    // scans gated the approval; it is not an upload (#4166 scope).
     sqlx::query(
         r#"
         INSERT INTO artifacts (

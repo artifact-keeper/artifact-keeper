@@ -1165,31 +1165,15 @@ impl ArtifactService {
             });
         }
 
-        // Trigger scan-on-upload if scanner service is configured
-        if let Some(ref scanner) = self.scanner_service {
-            let scanner = scanner.clone();
-            let artifact_id = artifact.id;
-            let repo_id = artifact.repository_id;
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                // Check if scan_on_upload is enabled for this repository
-                let should_scan = sqlx::query_scalar!(
-                    "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-                    repo_id
-                )
-                .fetch_optional(&db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-
-                if should_scan {
-                    if let Err(e) = scanner.scan_artifact(artifact_id).await {
-                        tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
-                    }
-                }
-            });
-        }
+        // Trigger scan-on-upload if scanner service is configured. The same
+        // gate every format-native upload handler goes through (#4166).
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &self.db,
+            self.scanner_service.clone(),
+            artifact.repository_id,
+            artifact.id,
+        )
+        .await;
 
         // Trigger quality checks on upload (non-blocking)
         if let Some(ref qc) = self.quality_check_service {

@@ -394,6 +394,13 @@ async fn upload_package(
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "cran", &pkg_metadata)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     info!(
         "CRAN upload: {} {} ({}) to repo {}",
@@ -832,6 +839,33 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"fake-r-pkg");
         f.teardown().await;
+    }
+
+    /// #4166: CRAN inserts through `proxy_helpers::insert_artifact`, which
+    /// never triggered scan-on-upload. A native upload into a
+    /// `scan_on_upload` repository must now enqueue a scan.
+    #[tokio::test]
+    async fn test_cran_upload_triggers_scan_on_upload_4166() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let req = tdh::put(
+            format!("/{}/src/contrib/scanme_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"fake-r-pkg"),
+        );
+        let scans = tdh::native_upload_probe_scans(
+            &f,
+            super::router(),
+            req,
+            true,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        f.teardown().await;
+        assert!(
+            scans > 0,
+            "a native CRAN upload must enqueue a scan (#4166)"
+        );
     }
 
     #[tokio::test]

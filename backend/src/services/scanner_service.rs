@@ -9429,6 +9429,51 @@ where
     true
 }
 
+/// Whether `repository_id` has scanning enabled with `scan_on_upload` on.
+/// A missing config row or a read error is "no" -- the same default
+/// `ArtifactService::finalize_upload` applies.
+pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
+    sqlx::query_scalar!(
+        "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+        repository_id
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// The scan-on-upload trigger for every upload path that inserts its own
+/// `artifacts` row instead of going through `ArtifactService::finalize_upload`
+/// (#4159 for conda, #4166 for the other format-native handlers).
+///
+/// Mirrors finalize_upload's gate: no scanner configured, scanning disabled,
+/// or `scan_on_upload = false` is a no-op. Otherwise the scan is spawned so
+/// the upload response is not delayed. Call it AFTER the row is committed
+/// (and after format metadata is written, where the handler writes any), so
+/// the scan sees the finished artifact. Returns whether a scan was spawned.
+///
+/// The `every_format_upload_triggers_scan_on_upload` ratchet test in
+/// `api::handlers::proxy_helpers` requires every handler that inserts an
+/// artifact to reach this function.
+pub async fn trigger_scan_on_upload(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
+    let Some(scanner) = scanner else {
+        return false;
+    };
+    let should_scan = scan_on_upload_enabled(db, repository_id).await;
+    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+        if let Err(e) = scanner.scan_artifact(aid).await {
+            tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
+        }
+    })
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {

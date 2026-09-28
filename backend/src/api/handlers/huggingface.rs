@@ -1189,6 +1189,13 @@ async fn upload_file_impl(
         &metadata,
     )
     .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Surface the model revision on the Packages page (#3659), keyed on the
     // model id and revision. A model revision is many files; they collapse

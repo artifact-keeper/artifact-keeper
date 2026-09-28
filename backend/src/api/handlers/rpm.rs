@@ -2438,7 +2438,7 @@ async fn store_rpm(
     } else {
         let storage_key = build_rpm_storage_key(&repo.id, filename);
         proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
-        proxy_helpers::insert_artifact(
+        let id = proxy_helpers::insert_artifact(
             &state.db,
             proxy_helpers::NewArtifact {
                 repository_id: repo.id,
@@ -2452,7 +2452,17 @@ async fn store_rpm(
                 uploaded_by: user_id,
             },
         )
-        .await?
+        .await?;
+        // #4166: the ArtifactService branch above scans via finalize_upload;
+        // this direct insert has to trigger scan-on-upload itself.
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
+            repo.id,
+            id,
+        )
+        .await;
+        id
     };
 
     // Store RPM-specific metadata: filename-derived NEVRA enriched with the

@@ -919,6 +919,16 @@ async fn complete_session_commit(
             .await;
     }
 
+    // #4166: this path inserts its own row, so it mirrors finalize_upload's
+    // scan-on-upload gate itself (metadata is written above).
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        session.repository_id,
+        artifact_id,
+    )
+    .await;
+
     // Terminal transition, token-guarded. A lost lease here means the commit
     // took longer than the 6h staleness window and a newer complete request
     // reclaimed the session — the artifact upsert above is idempotent, so

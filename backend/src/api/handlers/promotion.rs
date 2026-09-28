@@ -830,6 +830,8 @@ async fn insert_promoted_artifact_row(
     uploaded_by: Uuid,
     origin: Option<serde_json::Value>,
 ) -> std::result::Result<(), sqlx::Error> {
+    // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
+    // gated the promotion; it is not an upload (#4166 scope).
     sqlx::query!(
         r#"
         INSERT INTO artifacts (

@@ -708,6 +708,9 @@ async fn save_label_index(
         None => {
             crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
             // Create label index artifact
+            // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
+            // JSON document, not uploaded content; the module upload itself
+            // triggers the scan (#4166).
             let row = sqlx::query(
                 r#"INSERT INTO artifacts (
                     repository_id, path, name, version, size_bytes,
@@ -1188,6 +1191,13 @@ async fn upload(
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
+            repo.id,
+            artifact_id,
+        )
+        .await;
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
             repo.id,
             artifact_id,
         )

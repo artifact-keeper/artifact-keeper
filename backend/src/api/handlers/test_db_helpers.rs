@@ -2257,6 +2257,82 @@ pub fn build_scan_state_with_leaf_scanners(
     build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
 }
 
+/// Leaf scanner for the #4166 scan-on-upload handler tests: applies to
+/// everything and completes clean. Its rows use scan_type `malware` -- allowed
+/// by the `scan_results_scan_type_check` constraint and used by no real
+/// scanner -- so the tests count only its rows.
+struct UploadProbeScanner;
+
+#[async_trait::async_trait]
+impl crate::services::scanner_service::Scanner for UploadProbeScanner {
+    fn name(&self) -> &str {
+        "upload-probe"
+    }
+
+    fn scan_type(&self) -> &str {
+        "malware"
+    }
+
+    async fn scan(
+        &self,
+        _artifact: &crate::models::artifact::Artifact,
+        _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+        Ok(crate::services::scanner_service::ScanOutput::default())
+    }
+}
+
+/// #4166: send one native upload `req` through `router` for `fx`'s repository
+/// with scanning enabled and `scan_on_upload = on_upload`, then return how many
+/// probe (`malware`) scan rows the repository has once `budget` elapses or the
+/// first row lands. Shared by the per-format scan-on-upload tests.
+pub async fn native_upload_probe_scans(
+    fx: &Fixture,
+    router: Router<SharedState>,
+    req: Request<Body>,
+    on_upload: bool,
+    budget: std::time::Duration,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold) \
+         VALUES ($1, true, $2, false, false, 'high')",
+    )
+    .bind(fx.repo_id)
+    .bind(on_upload)
+    .execute(&fx.pool)
+    .await
+    .expect("seed scan_configs");
+
+    let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+    let state =
+        build_scan_state_with_leaf_scanners(fx, &storage_path, vec![Arc::new(UploadProbeScanner)]);
+    let app = router_with_auth(router, state, make_auth(fx.user_id, &fx.username));
+    let (status, body) = send(app, req).await;
+    assert!(
+        status.is_success(),
+        "native upload failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results \
+             WHERE repository_id = $1 AND scan_type = 'malware'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count scan_results");
+        if n > 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
 /// state so handler tests can exercise the download age gate end-to-end
 /// (`serve_file` / `serve_tarball` only enforce the gate when the service is

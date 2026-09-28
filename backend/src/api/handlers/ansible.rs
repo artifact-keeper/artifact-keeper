@@ -1635,6 +1635,13 @@ async fn upload_collection(
         &ansible_metadata,
     )
     .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     info!(
         "Ansible upload: {}-{} {} ({}) to repo {}",

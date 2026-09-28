@@ -18740,6 +18740,276 @@ mod virtual_read_authz_tests {
     }
 }
 
+/// Scan-on-upload coverage gate (#4166).
+///
+/// `scan_on_upload` used to be honored only where an upload went through
+/// `ArtifactService::finalize_upload`; 30 format-native handlers persisted the
+/// artifact row themselves and never scanned, so the setting silently did
+/// nothing for npm, Maven, Cargo, Go, docker push and most other formats. The
+/// gate below is structural: it reads EVERY handler source and requires each
+/// production `artifacts` insert to be one of
+///
+/// * inside a function that calls
+///   [`crate::services::scanner_service::trigger_scan_on_upload`], or one call
+///   hop from such a function (the insert lives in a shared primitive such as
+///   `upsert_manifest_artifact`, the trigger in the handler that calls it); or
+/// * directly under a `NO-SCAN-ON-UPLOAD:` comment (in the comment block right
+///   above the statement holding the insert) saying why the row is not an
+///   upload (a promotion copy, a registry-generated index, a pull-side cache
+///   listing, a provenance signature).
+///
+/// Each trigger call covers ONE insert: a function with two unmarked inserts
+/// and one trigger fails, so a second row cannot ride on the first's scan.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_upload_coverage_tests {
+    use super::proxy_download_recording_tests::{test_spans, top_level_fns};
+
+    /// Raw SQL inserts, tolerant of case, line breaks and a schema prefix.
+    const INSERT_SQL: &str = r"(?i)INSERT\s+INTO\s+(public\.)?artifacts\b";
+    /// Calls of the shared insert primitives.
+    const INSERT_CALLS: &[&str] = &["insert_artifact(", "insert_artifact_row("];
+    const TRIGGER: &str = "trigger_scan_on_upload(";
+    const MARKER: &str = "NO-SCAN-ON-UPLOAD:";
+    /// The shared insert primitives in this file: their callers are checked.
+    const PRIMITIVES: &[&str] = &["insert_artifact", "insert_artifact_row"];
+    /// Test-fixture-only sources.
+    const EXEMPT_FILES: &[&str] = &["test_db_helpers.rs"];
+
+    /// The 30 handlers #4166 enumerated, as `(file, function holding the
+    /// insert)`. Pinned so a rename or a matcher regression fails loudly
+    /// instead of silently dropping a handler out of the gate.
+    const ISSUE_4166_HANDLERS: &[(&str, &str)] = &[
+        ("alpine.rs", "store_apk"),
+        ("cargo.rs", "store_crate_artifact"),
+        ("chef.rs", "upload_cookbook"),
+        ("cocoapods.rs", "push_pod"),
+        ("composer.rs", "upload"),
+        ("conan.rs", "recipe_file_upload"),
+        ("conan.rs", "package_file_upload"),
+        ("gitlfs.rs", "upload_object"),
+        ("goproxy.rs", "upload_zip"),
+        ("goproxy.rs", "upload_mod"),
+        ("jetbrains.rs", "upload_plugin"),
+        ("maven.rs", "upload"),
+        ("npm.rs", "store_npm_version"),
+        ("protobuf.rs", "upload"),
+        ("pub_registry.rs", "upload_package"),
+        ("sbt.rs", "upload_artifact"),
+        ("swift.rs", "publish_release"),
+        ("terraform.rs", "upload_module"),
+        ("terraform.rs", "upload_provider"),
+        ("vscode.rs", "publish_extension"),
+        ("oci_v2.rs", "upsert_manifest_artifact"),
+        ("upload.rs", "complete_session_commit"),
+        ("helm.rs", "upload_chart"),
+        ("hex.rs", "publish_package"),
+        ("cran.rs", "upload_package"),
+        ("ansible.rs", "upload_collection"),
+        ("puppet.rs", "publish_module"),
+        ("rubygems.rs", "push_gem"),
+        ("rpm.rs", "store_rpm"),
+        ("huggingface.rs", "upload_file_impl"),
+    ];
+
+    /// Every handler source, read from disk so a NEW handler file is covered
+    /// without anyone remembering to list it.
+    fn handler_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("read src/api/handlers")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                let src = std::fs::read_to_string(&p).expect("read handler source");
+                (name, src)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One production insert site: the enclosing function and whether the
+    /// gate considers it covered.
+    #[derive(Debug)]
+    struct Site {
+        func: String,
+        covered: bool,
+    }
+
+    /// Source text of the `i`th top-level function (up to the next one).
+    fn body_of<'a>(src: &'a str, fns: &[(usize, String)], i: usize) -> &'a str {
+        let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
+        &src[fns[i].0..end]
+    }
+
+    /// Byte offsets of every insert site (SQL or primitive call) in `src`.
+    fn insert_offsets(src: &str) -> Vec<usize> {
+        let sql = regex::Regex::new(INSERT_SQL).expect("valid insert regex");
+        let mut out: Vec<usize> = sql.find_iter(src).map(|m| m.start()).collect();
+        for needle in INSERT_CALLS {
+            out.extend(src.match_indices(needle).map(|(at, _)| at));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether the comment block directly above the statement holding the
+    /// insert at `at` carries the marker. Walks up from the insert's line
+    /// through the statement's own code lines; a line ending a previous
+    /// statement or block (`;`, `{`, `}`) or a blank line ends the search.
+    fn marker_above(src: &str, at: usize) -> bool {
+        let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let mut in_comment = false;
+        for line in src[..line_start].lines().rev().take(12) {
+            let t = line.trim();
+            if t.starts_with("//") {
+                in_comment = true;
+                if t.contains(MARKER) {
+                    return true;
+                }
+            } else if in_comment
+                || t.is_empty()
+                || t.ends_with(';')
+                || t.ends_with('{')
+                || t.ends_with('}')
+            {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// `TRIGGER` calls on code (not comment) lines of `body`.
+    fn trigger_calls(body: &str) -> usize {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains(TRIGGER))
+            .count()
+    }
+
+    /// Classify every production insert site in one source file.
+    fn insert_sites(file: &str, src: &str) -> Vec<Site> {
+        let spans = test_spans(src);
+        let fns = top_level_fns(src, &spans);
+        let mut out = Vec::new();
+        // Unmarked sites already charged against each function's triggers.
+        let mut charged: std::collections::HashMap<usize, usize> = Default::default();
+        for at in insert_offsets(src) {
+            if spans.iter().any(|(a, b)| *a <= at && at < *b) {
+                continue;
+            }
+            let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            if src[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            let Some(idx) = fns.iter().rposition(|(off, _)| *off <= at) else {
+                continue;
+            };
+            let func = fns[idx].1.clone();
+            if file == "proxy_helpers.rs" && PRIMITIVES.contains(&func.as_str()) {
+                continue;
+            }
+            if marker_above(src, at) {
+                out.push(Site {
+                    func,
+                    covered: true,
+                });
+                continue;
+            }
+            let call = format!("{func}(");
+            let caller_triggers = (0..fns.len()).any(|j| {
+                let caller = body_of(src, &fns, j);
+                j != idx && caller.contains(&call) && trigger_calls(caller) > 0
+            });
+            let budget = trigger_calls(body_of(src, &fns, idx)) + usize::from(caller_triggers);
+            let used = charged.entry(idx).or_default();
+            *used += 1;
+            out.push(Site {
+                func,
+                covered: *used <= budget,
+            });
+        }
+        out
+    }
+
+    /// THE gate: no production `artifacts` insert escapes scan-on-upload.
+    #[test]
+    fn every_format_upload_triggers_scan_on_upload() {
+        let mut uncovered = Vec::new();
+        let mut scanned = 0usize;
+        let mut found: std::collections::HashSet<(String, String)> = Default::default();
+        for (file, src) in handler_sources() {
+            if EXEMPT_FILES.contains(&file.as_str()) {
+                continue;
+            }
+            for site in insert_sites(&file, &src) {
+                scanned += 1;
+                if !site.covered {
+                    uncovered.push(format!("{file}::{}", site.func));
+                }
+                found.insert((file.clone(), site.func));
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `artifacts` row without reaching \
+             scanner_service::trigger_scan_on_upload (add the call after the \
+             row commits, or a `{MARKER}` comment saying why the row is not an \
+             upload): {uncovered:?}"
+        );
+        for (file, func) in ISSUE_4166_HANDLERS {
+            assert!(
+                found.contains(&(file.to_string(), func.to_string())),
+                "#4166 handler {file}::{func} no longer has an insert site the gate \
+                 can see; update ISSUE_4166_HANDLERS or the matcher"
+            );
+        }
+        assert!(
+            scanned >= ISSUE_4166_HANDLERS.len(),
+            "scanned only {scanned} sites"
+        );
+    }
+
+    /// The matcher itself: a handler that inserts without the trigger fails;
+    /// the trigger (in the function, or in a caller for a primitive) or a
+    /// marker directly above the insert passes; a marker elsewhere in the
+    /// function does not; a second insert on one trigger fails; SQL split
+    /// across lines or lower-cased is still an insert; test modules are
+    /// ignored.
+    #[test]
+    fn scan_on_upload_gate_classifies_sites() {
+        let src = "async fn bad() {\n    q(\"insert into\n  artifacts (a) VALUES ($1)\");\n}\n\
+                   async fn good() {\n    let id = insert_artifact(db, a).await;\n    \
+                   trigger_scan_on_upload(db, s, r, id).await;\n}\n\
+                   async fn marked() {\n    let x = 1;\n    // NO-SCAN-ON-UPLOAD: generated index\n    \
+                   q(\n        \"INSERT INTO artifacts\");\n}\n\
+                   async fn far() {\n    // NO-SCAN-ON-UPLOAD: too far away\n    let x = 1;\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn two() {\n    insert_artifact_row(a);\n    insert_artifact_row(b);\n    \
+                   trigger_scan_on_upload(a);\n}\n\
+                   fn prim() {\n    q(\"INSERT INTO public.artifacts\");\n}\n\
+                   async fn caller() {\n    let id = prim();\n    trigger_scan_on_upload(id);\n}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { q(\"INSERT INTO artifacts\"); }\n}\n";
+        let sites: Vec<(String, bool)> = insert_sites("x.rs", src)
+            .into_iter()
+            .map(|s| (s.func, s.covered))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![
+                ("bad".to_string(), false),
+                ("good".to_string(), true),
+                ("marked".to_string(), true),
+                ("far".to_string(), false),
+                ("two".to_string(), true),
+                ("two".to_string(), false),
+                ("prim".to_string(), true),
+            ]
+        );
+    }
+}
+
 /// #3446: proxy/remote download RECORDING across every format handler.
 ///
 /// Two functions count a download and they are not interchangeable.
@@ -18856,7 +19126,7 @@ mod proxy_download_recording_tests {
     /// A top-level `#[cfg(test)]` item ends at the next line that is exactly
     /// `}` in column 0 — rustfmt guarantees that for a top-level item, and the
     /// handlers are all rustfmt-clean (CI enforces `cargo fmt --check`).
-    fn test_spans(src: &str) -> Vec<(usize, usize)> {
+    pub(super) fn test_spans(src: &str) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
         let mut from = 0usize;
         while let Some(rel) = src[from..].find("\n#[cfg(test)]") {
@@ -18874,7 +19144,7 @@ mod proxy_download_recording_tests {
     /// Byte offsets and names of the top-level `fn` items outside test spans.
     /// A top-level item starts in column 0, so a line beginning with an
     /// optional `pub`/`pub(..)`, an optional `async`, then `fn ` is one.
-    fn top_level_fns(src: &str, spans: &[(usize, usize)]) -> Vec<(usize, String)> {
+    pub(super) fn top_level_fns(src: &str, spans: &[(usize, usize)]) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         let mut at = 0usize;
         for line in src.split_inclusive('\n') {
