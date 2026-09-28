@@ -37,6 +37,23 @@ easy to assume the other way round:
   all route through the repository action check, deny-by-default, exactly as they
   do for a private repository.
 
+**"Any resolved principal" is wider than "every employee with a login".** It is
+every identity the instance authenticates, including:
+
+- **CI workloads signing in through OIDC** (`/api/v1/auth/ci`) whose trust
+  mapping sets no repository list. Such a workload is unrestricted by repository,
+  so it reads every `internal` repository. A mapping that does set a repository
+  list confines the workload exactly as a repository-scoped token does.
+- **SSO users provisioned just-in-time** on their first OIDC, SAML or LDAP login
+  when the provider's "Auto Create Users" switch is on.
+  An identity provider that admits anyone in a large directory, or a broad
+  trust policy on a CI issuer, makes `internal` effectively public to that
+  population.
+
+Before marking a repository `internal`, check who your identity providers and CI
+trust mappings admit. Use `private` plus a group grant when the audience should
+be narrower than that.
+
 An anonymous caller cannot distinguish `internal` from `private`. Both answer the
 same status codes on every surface and neither appears in an unauthenticated
 listing or search.
@@ -137,3 +154,15 @@ Repositories that were *meant* to be internal but were coerced to
 `is_public = false` by the pre-#3855 guest-access coercion cannot be recovered
 from the data: they are indistinguishable from ordinary private repositories. See
 the upgrade note in the release's `CHANGELOG.md` entry for the review query.
+
+During a rolling deploy, pods still running the previous release do not know
+`internal`: they read the repository's `is_public = false` mirror and serve it
+as `private`, so an authenticated caller without a grant gets a 404 from those
+pods until they are replaced. This is narrower than the new behaviour, never
+wider, so it is safe; it is only visible as inconsistent answers while the
+rollout is in progress.
+
+Change a repository's visibility through the API rather than with a raw SQL
+`UPDATE`. Both propagate to every serving instance (the database trigger emits
+the cache-invalidation event either way), but only the API records the change in
+the audit log.
