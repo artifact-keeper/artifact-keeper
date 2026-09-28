@@ -121,6 +121,8 @@ hide the catalog coordinate even while another root contains different bytes.
 Use the artifact path/tree or native root metadata when selecting an exact build.
 
 Metadata caches and render locks are bounded and keyed by repository plus root.
+Empty roots are rendered per request and never cached, so requests for made-up
+roots cannot evict the metadata of populated ones.
 Uploads, metadata changes, deletes, restores, and lifecycle cleanup invalidate
 the affected root through its artifact fingerprint without including siblings.
 
@@ -134,10 +136,12 @@ artifact exports use the same database snapshot.
 
 Restore validates all layout values before inserting rows, installs positive
 depth before restoring artifacts, and rolls back database changes on any failure
-in a depth-bearing archive. Restoring into an existing repository requires an
-exact depth match, even if that repository is empty. A legacy record with no
-depth cannot silently overwrite a positive-depth layout. To restore into an
-empty repository with a different setting, explicitly change its depth first.
+in a depth-bearing archive. Archives without positive depth restore row by row,
+as before, collecting failures instead of aborting. Restoring into an existing
+repository requires an exact depth match, even if that repository is empty. A
+legacy record with no depth cannot silently overwrite a positive-depth layout.
+To restore into an empty repository with a different setting, explicitly
+change its depth first.
 The existing `restore_database: false` option restores bytes only, not layout.
 
 **Upgrade every backend node before enabling positive depth.** Mixed old/new

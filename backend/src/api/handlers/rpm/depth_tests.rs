@@ -733,3 +733,89 @@ async fn production_router_loopback_http_contract_4216() {
     server.await.unwrap();
     f.teardown().await;
 }
+
+#[test]
+fn only_populated_or_root_renders_are_cacheable_4216() {
+    let fp = |live_rpm_count| RepodataFingerprint {
+        repo_ids: vec![uuid::Uuid::nil()],
+        live_rpm_count,
+        latest_update: None,
+    };
+    assert!(
+        cache_root_render("", &fp(0)),
+        "depth-zero root keeps caching"
+    );
+    assert!(cache_root_render("", &fp(3)));
+    assert!(cache_root_render("build-a", &fp(1)));
+    assert!(
+        !cache_root_render("made-up", &fp(0)),
+        "an empty positive-depth root must not take a cache slot"
+    );
+}
+
+#[tokio::test]
+async fn made_up_empty_roots_do_not_evict_populated_roots_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    upload(&f, &format!("a/{RPM}"), "root-a").await;
+    let base = format!("/rpm/{}", f.repo_key);
+    let (status, warm) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
+    assert_eq!(status, StatusCode::OK);
+    let renders = f.state.rpm_repodata_cache.renders();
+    // More distinct roots than the cache has entries: each must still get
+    // (empty) metadata, without displacing root `a`.
+    for i in 0..(crate::services::rpm_repodata_cache::RPM_REPODATA_CACHE_MAX_ENTRIES + 8) {
+        let (status, body) = get(&f, &format!("{base}/nope-{i}/repodata/primary.xml.gz")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text(&body).contains("packages=\"0\""));
+    }
+    assert_eq!(
+        f.state.rpm_repodata_cache.renders(),
+        renders,
+        "empty roots are rendered per request, never cached"
+    );
+    let (status, again) = get(&f, &format!("{base}/a/repodata/repomd.xml")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again, warm);
+    assert_eq!(
+        f.state.rpm_repodata_cache.renders(),
+        renders,
+        "the populated root is still served from the cache"
+    );
+    f.teardown().await;
+}
+
+#[tokio::test]
+async fn resending_the_current_depth_does_not_contend_with_uploads_4216() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    // An in-flight artifact write holds the shared layout lock until commit.
+    let mut upload = f.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('rpm-depth:' || $1::text, 0))",
+    )
+    .bind(f.repo_id)
+    .execute(&mut *upload)
+    .await
+    .unwrap();
+    let unchanged = depth(&f, 1, StatusCode::OK).await;
+    assert_eq!(unchanged["repodata_depth"], 1);
+    let (status, body) = request(
+        &f,
+        "PATCH",
+        &format!("/api/v1/repositories/{}", f.repo_key),
+        "application/json",
+        r#"{"description":"edited while uploading","repodata_depth":1}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    // A real change still needs the exclusive lock and is refused, not queued.
+    assert_eq!(depth(&f, 2, StatusCode::CONFLICT).await["code"], "CONFLICT");
+    upload.rollback().await.unwrap();
+    assert_eq!(depth(&f, 2, StatusCode::OK).await["repodata_depth"], 2);
+    f.teardown().await;
+}

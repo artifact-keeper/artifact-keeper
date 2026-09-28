@@ -1586,7 +1586,13 @@ impl RepositoryService {
 
         let mut tx = self.db.begin().await?;
         if let Some(depth) = repodata_depth {
-            crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
+            // Re-sending the current depth is a no-op and must stay one: the
+            // config write takes the exclusive layout lock, which would refuse
+            // an unrelated edit (409) while an upload holds the shared lock,
+            // and make that upload fail in turn.
+            if crate::services::rpm_layout::depth_change_requested(&mut tx, id, depth).await? {
+                crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
+            }
         }
         let repo = sqlx::query_as!(
             Repository,

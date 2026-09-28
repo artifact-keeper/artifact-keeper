@@ -128,6 +128,22 @@ pub async fn validate_copy(
     Ok(())
 }
 
+/// Whether writing `depth` for `repo_id` would change its stored layout.
+/// Read on the writer's connection; a concurrent real change is still
+/// serialized by the config trigger's exclusive lock.
+pub async fn depth_change_requested(
+    conn: &mut PgConnection,
+    repo_id: Uuid,
+    depth: u32,
+) -> Result<bool> {
+    validate_depth(depth)?;
+    let current: i32 = sqlx::query_scalar("SELECT ak_rpm_repodata_depth($1)")
+        .bind(repo_id)
+        .fetch_one(conn)
+        .await?;
+    Ok(i64::from(current) != i64::from(depth))
+}
+
 /// Exclusive config lock uses the same namespace as the shared persistence
 /// guards. Take it before UPDATE repositories; never hold a usage-ledger lock.
 pub async fn set_depth(conn: &mut PgConnection, repo_id: Uuid, depth: u32) -> Result<()> {
@@ -146,9 +162,14 @@ pub async fn set_depth(conn: &mut PgConnection, repo_id: Uuid, depth: u32) -> Re
 
 pub async fn settings(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, (u32, bool)>> {
     let rows: Vec<(Uuid, i32, bool)> = sqlx::query_as(
+        // Only local RPM repositories can be eligible; the CASE keeps list
+        // pages of other formats from paying the eligibility subqueries
+        // (which scan `repositories` for curation links) once per row.
         "SELECT id, ak_rpm_repodata_depth(id), \
-            ak_rpm_depth_eligible(id) AND NOT EXISTS \
-                (SELECT 1 FROM artifacts WHERE repository_id = r.id) \
+            CASE WHEN r.format = 'rpm' AND r.repo_type = 'local' THEN \
+                ak_rpm_depth_eligible(id) AND NOT EXISTS \
+                    (SELECT 1 FROM artifacts WHERE repository_id = r.id) \
+            ELSE false END \
          FROM repositories r WHERE id = ANY($1)",
     )
     .bind(ids)

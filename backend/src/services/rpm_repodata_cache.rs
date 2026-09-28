@@ -381,7 +381,13 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "served until the deadline");
-        cache.entries.write().await.get_mut(&repo).unwrap().rendered = Arc::new({
+        cache
+            .entries
+            .write()
+            .await
+            .get_mut(&(repo, String::new()))
+            .unwrap()
+            .rendered = Arc::new({
             let mut r = rendered("r");
             r.valid_until = Some(Instant::now());
             r
@@ -428,7 +434,7 @@ mod tests {
         // Age the entry past the TTL: the next request renders again.
         {
             let mut entries = cache.entries.write().await;
-            let e = entries.get_mut(&repo).unwrap();
+            let e = entries.get_mut(&(repo, String::new())).unwrap();
             e.rendered_at = Instant::now()
                 .checked_sub(INCOMPLETE_RENDER_TTL + std::time::Duration::from_secs(1))
                 .expect("monotonic clock past the TTL");
@@ -443,7 +449,7 @@ mod tests {
         // A complete render never expires by age.
         {
             let mut entries = cache.entries.write().await;
-            let e = entries.get_mut(&repo).unwrap();
+            let e = entries.get_mut(&(repo, String::new())).unwrap();
             e.rendered_at = Instant::now()
                 .checked_sub(INCOMPLETE_RENDER_TTL * 2)
                 .expect("monotonic clock past the TTL");

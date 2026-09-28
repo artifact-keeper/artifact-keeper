@@ -1016,6 +1016,10 @@ async fn cached_repodata_at(
     // render can only make the stored entry look older than its content, so
     // the next request re-renders — never serves stale bytes as fresh.
     let fingerprint = repodata_fingerprint(&state.db, repo_ids, &prefix).await?;
+    if !cache_root_render(root, &fingerprint) {
+        // Rendering no packages is trivial; see `cache_root_render`.
+        return Ok(std::sync::Arc::new(render_repodata_at(&[], &prefix)));
+    }
     let render_state = state.clone();
     let ids = fingerprint.repo_ids.clone();
     state
@@ -1027,15 +1031,15 @@ async fn cached_repodata_at(
             let valid_until = earliest_retry_deadline(&artifacts);
             let mut rendered =
                 tokio::task::spawn_blocking(move || render_repodata_at(&artifacts, &prefix))
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "RPM repodata render task failed");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to render repository metadata",
-                    )
-                        .into_response()
-                })?;
+                    .await
+                    .map_err(|e| {
+                        error!(error = %e, "RPM repodata render task failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to render repository metadata",
+                        )
+                            .into_response()
+                    })?;
             // A render missing some packages' dependency data (transient heal
             // failure) is served but not cached: the fingerprint would not
             // move again, so caching it would pin the gap (#3801).
@@ -1044,6 +1048,17 @@ async fn cached_repodata_at(
             Ok(rendered)
         })
         .await
+}
+
+/// Whether a render of `root` may take a slot in the shared, bounded
+/// repodata cache (#4216). At positive depth any reader can name any
+/// syntactically valid root, and an empty one renders empty metadata; caching
+/// those would let a stream of made-up roots evict the populated roots and
+/// make every real client pay a full re-render. An empty positive-depth root
+/// is therefore rendered per request (it has no packages to describe) and
+/// never cached. The depth-zero repository root keeps today's behaviour.
+fn cache_root_render(root: &str, fingerprint: &RepodataFingerprint) -> bool {
+    root.is_empty() || fingerprint.live_rpm_count > 0
 }
 
 /// Upper bound on the header prefix read back from storage when healing a
