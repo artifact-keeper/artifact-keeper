@@ -146,7 +146,7 @@ full repository catalog, and older write handlers do not implement subtree
 routing. UI capability detection is not fleet-wide protection.
 
 The minimum restoring backend is a build containing the #4216 implementation
-(migration 234 and `rpm_repodata_depth.supported: true`). Restore depth-bearing
+(migration 247 and `rpm_repodata_depth.supported: true`). Restore depth-bearing
 archives only on such a build or newer. Older restore code ignores the extra
 field, and the legacy archive version field does not enforce this compatibility
 boundary. Downgrading a running instance or restoring its depth-bearing backup

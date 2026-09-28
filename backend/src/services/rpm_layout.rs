@@ -1,5 +1,6 @@
-//! Hosted RPM subtree layout (#4216). Persistence is guarded by migration 234.
+//! Hosted RPM subtree layout (#4216). Persistence is guarded by migration 247.
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests;
 

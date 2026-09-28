@@ -36,6 +36,28 @@ async fn request(
     .await
 }
 
+/// Mint a GPG signing key and attach it to the fixture repo for metadata
+/// signing. Local to this module so it does not depend on `rpm::tests`,
+/// which is compiled in a different test shard.
+async fn attach_signing_key(f: &tdh::Fixture) {
+    let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+    let key = svc
+        .create_key(crate::services::signing_service::CreateKeyRequest {
+            repository_id: Some(f.repo_id),
+            name: format!("rpm-sign-{}", f.repo_key),
+            key_type: "gpg".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: Some("AK RPM".to_string()),
+            uid_email: Some("rpm@example.com".to_string()),
+            created_by: None,
+        })
+        .await
+        .expect("create signing key");
+    svc.update_signing_config(f.repo_id, Some(key.id), true, false, false)
+        .await
+        .expect("attach signing key");
+}
+
 async fn get(f: &tdh::Fixture, path: &str) -> (StatusCode, Bytes) {
     request(f, "GET", path, "application/octet-stream", Body::empty()).await
 }
@@ -383,7 +405,7 @@ async fn each_root_signature_verifies_only_its_own_cached_manifest_4216() {
         return;
     };
     depth(&f, 1, StatusCode::OK).await;
-    super::tests::attach_signing_key(&f, "gpg").await;
+    attach_signing_key(&f).await;
     upload(&f, &format!("a/{RPM}"), "a").await;
     upload(&f, &format!("b/{RPM}"), "b").await;
     let base = format!("/rpm/{}", f.repo_key);

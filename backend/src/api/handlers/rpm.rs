@@ -45,6 +45,7 @@ use crate::services::rpm_layout;
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod depth_tests;
 
@@ -5481,7 +5482,7 @@ mod tests {
 
     /// Mint a signing key of `key_type` and attach it to the fixture repo for
     /// metadata signing. Returns the armored public key the repo will serve.
-    pub(super) async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
+    async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
         let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
         let key = svc
             .create_key(CreateKeyRequest {

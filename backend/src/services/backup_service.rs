@@ -2137,6 +2137,7 @@ pub struct RestoreResult {
 #[cfg(test)]
 mod rpm_depth_tests;
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
