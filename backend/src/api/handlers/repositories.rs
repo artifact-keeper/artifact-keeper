@@ -3161,6 +3161,14 @@ pub async fn create_repository(
 
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
+        // #3923: a remote repository that does not name a backend lands on the
+        // one the deployment's proxy cache actually uses (the filesystem
+        // fallback on an Azure default), so clients that omit the field keep
+        // working; only an explicit unservable choice is refused below.
+        None if repo_type == RepositoryType::Remote => {
+            crate::services::storage_service::proxy_cache_backend_for(&state.config.storage_backend)
+                .to_string()
+        }
         None => state.config.storage_backend.clone(),
         Some(requested) if requested == &state.config.storage_backend => {
             state.config.storage_backend.clone()
@@ -3182,6 +3190,18 @@ pub async fn create_repository(
             requested.clone()
         }
     };
+
+    // #3923: a remote repository must sit on a backend the deployment's proxy
+    // cache can serve. Reject it here (400) instead of accepting a repository
+    // whose upstream traffic the deployment cannot cache where its rows point.
+    if repo_type == RepositoryType::Remote {
+        if let Some(message) = crate::services::storage_service::remote_repository_backend_error(
+            &state.config.storage_backend,
+            &storage_backend,
+        ) {
+            return Err(AppError::Validation(message));
+        }
+    }
 
     // Compute storage path: filesystem uses a subdirectory, cloud backends use the key directly
     let storage_path = if storage_backend == "filesystem" {
@@ -17091,6 +17111,124 @@ mod tests {
             .bind(vec![maven_id, npm_id])
             .execute(&pool)
             .await;
+    }
+
+    /// #3923: on a deployment whose default backend has no proxy-cache arm
+    /// (Azure), creating a remote repository on that default must be rejected
+    /// up front (400, no row) -- before this it was accepted and the next
+    /// restart refused to boot -- while a remote repository pinned to
+    /// `filesystem`, which the fallback proxy cache serves, is accepted.
+    #[tokio::test]
+    async fn remote_create_on_azure_default_is_checked_per_repository_backend_3923_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ak-3923-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |c| {
+            c.storage_backend = "azure".to_string();
+        });
+        let admin = admin_auth(user_id, &username);
+
+        // Omitting the field (web UI, most API clients) must keep working: the
+        // repository lands on the backend the proxy cache uses.
+        let omitted_key = format!("pypi-remote-default-{}", Uuid::new_v4().simple());
+        let Json(omitted) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &omitted_key,
+                "pypi remote, backend omitted",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple"
+                }),
+            ),
+        )
+        .await
+        .expect("a remote create that omits storage_backend must succeed (#3923)");
+        assert_eq!(
+            omitted.storage_backend, "filesystem",
+            "an omitted backend resolves to the proxy cache's backend"
+        );
+
+        // An EXPLICIT unservable backend is refused up front.
+        let rejected_key = format!("pypi-remote-az-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &rejected_key,
+                "pypi remote on azure",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple",
+                    "storage_backend": "azure"
+                }),
+            ),
+        )
+        .await
+        .expect_err("a remote repository on the azure default cannot be served (#3923)");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("filesystem")),
+            "expected an actionable 400, got {err:?}"
+        );
+        let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&rejected_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(orphan, 0, "a rejected create must not leave a row behind");
+
+        let pinned_key = format!("pypi-remote-fs-{}", Uuid::new_v4().simple());
+        let Json(pinned) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &pinned_key,
+                "pypi remote on filesystem",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple",
+                    "storage_backend": "filesystem"
+                }),
+            ),
+        )
+        .await
+        .expect("a filesystem-pinned remote repository is served on an azure default (#3923)");
+        assert_eq!(pinned.storage_backend, "filesystem");
+
+        // A hosted repository on the azure default is unaffected.
+        let local_key = format!("pypi-local-az-{}", Uuid::new_v4().simple());
+        let Json(local) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "pypi local on azure",
+                "pypi",
+                serde_json::json!({ "repo_type": "local" }),
+            ),
+        )
+        .await
+        .expect("hosted repositories never depend on the proxy cache");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![omitted.id, pinned.id, local.id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// #3299: released web UIs (<= 1.8.0) attach the npm scope-policy fields to

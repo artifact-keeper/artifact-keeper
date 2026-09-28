@@ -837,8 +837,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         proxy_cache_scope.root()
     );
 
-    // Initialize proxy service for remote repository caching
-    match StorageService::from_config(&config).await {
+    // Initialize proxy service for remote repository caching. A default
+    // backend without a proxy-cache arm (Azure) gets a filesystem facade under
+    // STORAGE_PATH instead of no proxy service at all (#3923): remote
+    // repositories pinned to `storage_backend: "filesystem"` are served, and
+    // repository creation rejects remote repositories the facade cannot serve
+    // (`remote_repository_backend_error`), so a single create can no longer
+    // turn the next restart into an outage.
+    let proxy_cache_backend =
+        artifact_keeper_backend::services::storage_service::proxy_cache_backend_for(
+            &config.storage_backend,
+        )
+        .to_string();
+    match StorageService::proxy_cache_from_config(&config).await {
         Ok(storage_svc) => {
             let proxy_service = Arc::new(ProxyService::new(
                 db_pool.clone(),
@@ -846,56 +857,37 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 proxy_cache_scope,
             ));
             app_state.set_proxy_service(proxy_service);
-            tracing::info!("Proxy service initialized for remote repositories");
+            tracing::info!(
+                proxy_cache_backend = %proxy_cache_backend,
+                "Proxy service initialized for remote repositories"
+            );
+            if proxy_cache_backend != config.storage_backend {
+                warn_unservable_remote_repositories(&db_pool, &config.storage_backend).await?;
+            }
         }
         Err(e) => {
-            if artifact_keeper_backend::services::storage_service::backend_supports_proxy_cache(
-                &config.storage_backend,
-            ) {
-                // A backend that *can* back the proxy facade failed for a
-                // transient/optional reason (e.g. missing S3 credentials on a
-                // hosted-only deployment). Preserve the historical graceful
-                // degrade: remote repositories are simply disabled.
-                tracing::warn!(
-                    "Failed to initialize proxy service, remote repositories disabled: {}",
-                    e
-                );
-            } else {
-                // Structural gap (#2670/#1555): this backend has no proxy-cache
-                // StorageService arm (Azure). Booting green here silently
-                // black-holes every remote/proxy repository — the format
-                // handlers skip the upstream fetch when the proxy service is
-                // absent, so requests just fail to find packages with no error.
-                // Fail closed if any remote repository is already configured;
-                // otherwise log loudly so the gap is visible rather than silent.
-                let remote_repo_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM repositories \
-                     WHERE repo_type = 'remote'::repository_type",
-                )
-                .fetch_one(&db_pool)
-                .await?;
-
+            // Historical graceful degrade (e.g. missing S3 credentials on a
+            // hosted-only deployment): remote repositories are disabled. The
+            // one exception is the filesystem fallback of a default without a
+            // proxy arm failing while remote repositories exist: booting
+            // without a proxy service would silently black-hole them, so
+            // startup stays fail-closed there (the #2670 guard).
+            if proxy_cache_backend != config.storage_backend {
+                let remote_repo_count = count_remote_repositories(&db_pool).await?;
                 if remote_repo_count > 0 {
                     return Err(artifact_keeper_backend::error::AppError::Config(format!(
-                        "STORAGE_BACKEND={} cannot serve remote/proxy repositories \
-                         (proxy StorageService unavailable: {}), but {} remote \
-                         repository(ies) are configured. Refusing to start rather than \
-                         boot healthy and silently black-hole their upstream traffic. \
-                         See #1555 for Azure proxy-cache support.",
+                        "STORAGE_BACKEND={} keeps the proxy cache on the local filesystem \
+                         under STORAGE_PATH, but that proxy cache could not be initialized \
+                         ({}), and {} remote repository(ies) are configured. Refusing to \
+                         start rather than silently black-hole their upstream traffic.",
                         config.storage_backend, e, remote_repo_count
                     )));
                 }
-
-                tracing::error!(
-                    backend = %config.storage_backend,
-                    error = %e,
-                    "Remote/proxy repositories are NOT supported on this storage \
-                     backend: the proxy StorageService has no arm for it (#1555). No \
-                     remote repositories are configured yet, so startup continues, \
-                     but any remote repository created later will silently fail to \
-                     proxy upstream content until #1555 is resolved."
-                );
             }
+            tracing::warn!(
+                "Failed to initialize proxy service, remote repositories disabled: {}",
+                e
+            );
         }
     }
 
@@ -2649,6 +2641,61 @@ async fn load_active_plugins(
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     Ok(plugins)
+}
+
+/// Number of remote/proxy repositories configured on this instance.
+async fn count_remote_repositories(db_pool: &sqlx::PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repositories WHERE repo_type = 'remote'::repository_type",
+    )
+    .fetch_one(db_pool)
+    .await?)
+}
+
+/// Log, at error level, the remote repositories a proxy-cache fallback facade
+/// cannot serve faithfully (#3923).
+///
+/// When the default backend has no proxy-cache arm the facade is the
+/// filesystem under `STORAGE_PATH` (see
+/// `storage_service::proxy_cache_backend_for`), which matches only remote
+/// repositories pinned to `filesystem`. Creation rejects any other pin, so
+/// such rows predate that check. They are reported rather than made fatal:
+/// the proxy service is up and still fetches upstream for them, so there is
+/// no silent black hole to fail closed on, and refusing to start took the
+/// whole instance down over one repository.
+async fn warn_unservable_remote_repositories(
+    db_pool: &sqlx::PgPool,
+    default_backend: &str,
+) -> Result<()> {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT key FROM repositories \
+         WHERE repo_type = 'remote'::repository_type AND storage_backend <> 'filesystem' \
+         ORDER BY key",
+    )
+    .fetch_all(db_pool)
+    .await?;
+    if count_remote_repositories(db_pool).await? > 0 {
+        tracing::warn!(
+            backend = %default_backend,
+            "Remote repositories cache upstream content on the local filesystem under \
+             STORAGE_PATH because STORAGE_BACKEND={default_backend} has no proxy-cache \
+             support. With more than one replica, STORAGE_PATH must be shared storage \
+             (e.g. a ReadWriteMany volume): otherwise each replica keeps its own cache while \
+             cache records are shared, so purges, quarantine and scans reach only one \
+             replica's copy (#3923)."
+        );
+    }
+    if !keys.is_empty() {
+        tracing::error!(
+            backend = %default_backend,
+            repositories = ?keys,
+            "Remote repositories are pinned to a storage backend the proxy cache cannot use \
+             (STORAGE_BACKEND={default_backend} has no proxy-cache support, so the cache is kept \
+             under STORAGE_PATH). Their upstream content is still proxied, but cached copies are \
+             written to the local filesystem; recreate them with storage_backend \"filesystem\" (#3923)."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(ak_test_shard = "services-2")]
