@@ -138,6 +138,10 @@ pub struct AgeGateConfigResponse {
     pub min_age_days: i32,
     /// Age-source mode: `upstream_publish_time` or `first_seen` (#2264).
     pub mode: String,
+    /// An instance administrator set this policy, so a repository
+    /// administrator may tighten it but not relax it (#4238). Returned on the
+    /// read too, so a client can explain a refused write before attempting it.
+    pub instance_locked: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -148,6 +152,13 @@ pub struct UpdateAgeGateConfigRequest {
     /// pre-mode clients that PUT `{enabled, min_age_days}` stay valid.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Instance administrators only (#4238): `false` hands the policy back to
+    /// the repository's administrators, `true` locks it. Omitted from an
+    /// instance administrator locks it — an instance write is an instance
+    /// decision unless it says otherwise. Any value from a repository
+    /// administrator is refused.
+    #[serde(default)]
+    pub instance_locked: Option<bool>,
 }
 
 fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
@@ -301,6 +312,46 @@ fn actor_tier_label(tier: ActorTier) -> &'static str {
     }
 }
 
+/// The audit action for a lock moving from `was` to `now`, if it moved
+/// (#4238). Setting and releasing are distinct actions so a SIEM can alert on
+/// a release — every hand-back is a relaxation — without parsing details.
+fn lock_transition_action(was: bool, now: bool) -> Option<AuditAction> {
+    match (was, now) {
+        (false, true) => Some(AuditAction::AgeGateLockSet),
+        (true, false) => Some(AuditAction::AgeGateLockReleased),
+        _ => None,
+    }
+}
+
+/// Emit `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` when an action moved a
+/// policy or review lock (#4238), naming the actor, its tier, the repository
+/// and the state at that moment (`subject`). Nothing is emitted when the lock
+/// did not move.
+async fn log_lock_transition(
+    state: &SharedState,
+    auth: &AuthExtension,
+    tier: ActorTier,
+    repository_id: Uuid,
+    repository_key: Option<String>,
+    (was, now): (bool, bool),
+    mut subject: serde_json::Value,
+) {
+    let Some(action) = lock_transition_action(was, now) else {
+        return;
+    };
+    subject["actor_tier"] = serde_json::json!(actor_tier_label(tier));
+    subject["repository_key"] = serde_json::json!(repository_key);
+    let mut entry = AuditEntry::new(action, ResourceType::Repository)
+        .user(auth.user_id)
+        .resource(repository_id)
+        .actor_name(auth.username.clone())
+        .details(subject);
+    if let Some(key) = repository_key {
+        entry = entry.resource_name(key);
+    }
+    let _ = AuditService::new(state.db.clone()).log(entry).await;
+}
+
 /// The audit record of one age-gate policy change (#4238): the policy it
 /// replaced, the actor's tier, and whether it weakened the gate — so a
 /// repository administrator relaxing a policy they set is visible in the
@@ -354,7 +405,7 @@ async fn apply_review_decision(
     scope: Option<Uuid>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     let svc = age_gate_service(state)?;
-    load_review_in_scope(&svc, id, scope).await?;
+    let was_locked = load_review_in_scope(&svc, id, scope).await?.instance_locked;
 
     // The actor's TIER, not the route, decides what it may relax: an instance
     // admin acting through a repository route is still an instance admin, and
@@ -379,6 +430,22 @@ async fn apply_review_decision(
         }
     };
     details["actor_tier"] = serde_json::json!(actor_tier_label(tier));
+    log_lock_transition(
+        state,
+        auth,
+        tier,
+        review.repository_id,
+        review.repository_key.clone(),
+        (was_locked, review.instance_locked),
+        serde_json::json!({
+            "lock": "review",
+            "review_id": review.id,
+            "package": review.package_name,
+            "version": review.package_version,
+            "status": review.status,
+        }),
+    )
+    .await;
 
     Ok(log_review_action(state, auth, decision.audit_action(), review, details).await)
 }
@@ -586,12 +653,15 @@ pub async fn get_repo_age_gate(
     // `age_gate_mode` is deliberately not on the Repository model; read the
     // full policy from the source of truth.
     let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id).await?;
+    let instance_locked =
+        crate::services::age_gate_service::repo_policy_locked(&state.db, repo.id).await?;
 
     Ok(Json(AgeGateConfigResponse {
         repository_key: key,
         enabled: params.age_gate_enabled,
         min_age_days: params.age_gate_min_age_days,
         mode: params.age_gate_mode.as_str().to_string(),
+        instance_locked,
     }))
 }
 
@@ -658,7 +728,10 @@ pub async fn update_repo_age_gate(
     // A repository admin may tighten a policy an instance admin set, but not
     // relax it (#4238); the service decides that under the row lock.
     let tier = ActorTier::of(auth.is_admin);
-    let previous = svc.update_repo_config_as(repo.id, next, tier).await?;
+    let write = svc
+        .update_repo_config_as(repo.id, next, tier, body.instance_locked)
+        .await?;
+    let previous = write.previous;
 
     let audit = AuditService::new(state.db.clone());
     let _ = audit
@@ -685,12 +758,28 @@ pub async fn update_repo_age_gate(
                 }),
         )
         .await;
+    log_lock_transition(
+        &state,
+        &auth,
+        tier,
+        repo.id,
+        Some(repo.key.clone()),
+        (write.was_locked, write.now_locked),
+        serde_json::json!({
+            "lock": "policy",
+            "age_gate_enabled": next.enabled,
+            "age_gate_min_age_days": next.min_age_days,
+            "age_gate_mode": next.mode.as_str(),
+        }),
+    )
+    .await;
 
     Ok(Json(AgeGateConfigResponse {
         repository_key: key,
         enabled: body.enabled,
         min_age_days: body.min_age_days,
         mode: mode.as_str().to_string(),
+        instance_locked: write.now_locked,
     }))
 }
 
@@ -1916,5 +2005,176 @@ mod tests {
         let details = age_gate_change_details(before, tighter, ActorTier::Instance);
         assert_eq!(details.actor_tier, "instance_admin");
         assert!(!details.relaxed);
+    }
+    // -----------------------------------------------------------------------
+    // #4238 owner decision: tighten-only, with an explicit hand-back.
+    // -----------------------------------------------------------------------
+
+    async fn audit_rows(pool: &sqlx::PgPool, repo_id: Uuid, action: AuditAction) -> i64 {
+        tdh::audit_count_eventually(pool, repo_id, action.as_str(), 1).await
+    }
+
+    fn put_policy_locking(
+        key: &str,
+        days: i32,
+        lock: bool,
+    ) -> axum::http::Request<axum::body::Body> {
+        let body = serde_json::json!({
+            "enabled": true, "min_age_days": days, "mode": "first_seen", "instance_locked": lock
+        });
+        tdh::put_json(
+            format!("/{key}/age-gate"),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+    }
+
+    /// Only an instance admin can hand a locked policy back, the lock is
+    /// visible on the policy read, and setting and releasing it are distinct
+    /// audit actions. Once handed back, the repository admin may relax it.
+    #[tokio::test]
+    async fn an_instance_admin_can_hand_a_locked_policy_back_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        let instance = tdh::admin_auth(admin_id, &admin_name);
+        let repo_admin = tdh::make_auth(user_id, &username);
+        let read_lock = || async {
+            let (status, body) = tdh::send(
+                config_app(state.clone(), repo_admin.clone()),
+                tdh::get(format!("/{key}/age-gate")),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            serde_json::from_slice::<AgeGateConfigResponse>(&body)
+                .unwrap()
+                .instance_locked
+        };
+
+        assert!(!read_lock().await, "an unconfigured policy is unlocked");
+        let (status, body) = tdh::send(
+            config_app(state.clone(), instance.clone()),
+            put_policy(&key, true, 30, "first_seen"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).unwrap();
+        assert!(cfg.instance_locked, "an instance write locks by default");
+        assert!(read_lock().await, "the read shows the lock");
+        assert_eq!(
+            audit_rows(&pool, repo_id, AuditAction::AgeGateLockSet).await,
+            1
+        );
+
+        for lock in [false, true] {
+            let (status, _) = tdh::send(
+                config_app(state.clone(), repo_admin.clone()),
+                put_policy_locking(&key, 30, lock),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "a repository admin must not touch the lock (instance_locked={lock})"
+            );
+        }
+
+        let (status, body) = tdh::send(
+            config_app(state.clone(), instance.clone()),
+            put_policy_locking(&key, 30, false),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!cfg.instance_locked, "handed back");
+        assert!(!read_lock().await);
+        assert_eq!(
+            audit_rows(&pool, repo_id, AuditAction::AgeGateLockReleased).await,
+            1
+        );
+
+        let (status, _) = tdh::send(
+            config_app(state, repo_admin),
+            put_policy(&key, false, 30, "first_seen"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a handed-back policy is the repository admin's to relax"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    /// An instance admin's reopen releases the review lock: a reopened review
+    /// is undecided, so the repository's admins may decide it. The lock set
+    /// by the rejection and its release are both audited.
+    #[tokio::test]
+    async fn an_instance_admins_reopen_releases_the_review_lock_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let review_id = seed_review(&pool, repo_id, "reopened-pkg").await;
+        let state = gated_state(pool.clone(), &dir);
+        let instance = tdh::admin_auth(admin_id, &admin_name);
+        let repo_admin = tdh::make_auth(user_id, &username);
+        let send = |caller: &AuthExtension, decision| {
+            tdh::send(
+                review_app(state.clone(), caller.clone()),
+                decide(&key, review_id, decision),
+            )
+        };
+
+        let (status, _) = send(&instance, "reject").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            audit_rows(&pool, repo_id, AuditAction::AgeGateLockSet).await,
+            1
+        );
+
+        let (status, body) = send(&instance, "reopen").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["instance_locked"], false,
+            "a reopened review is undecided"
+        );
+        assert_eq!(
+            audit_rows(&pool, repo_id, AuditAction::AgeGateLockReleased).await,
+            1
+        );
+
+        let (status, _) = send(&repo_admin, "approve").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(review_status(&pool, review_id).await, "approved");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    #[test]
+    fn a_lock_transition_maps_to_its_own_audit_action() {
+        assert_eq!(
+            lock_transition_action(false, true).map(|a| a.as_str()),
+            Some("AGE_GATE_LOCK_SET")
+        );
+        assert_eq!(
+            lock_transition_action(true, false).map(|a| a.as_str()),
+            Some("AGE_GATE_LOCK_RELEASED")
+        );
+        assert!(lock_transition_action(true, true).is_none());
+        assert!(lock_transition_action(false, false).is_none());
     }
 }

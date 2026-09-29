@@ -525,6 +525,27 @@ pub struct AgeGatePolicy {
     pub mode: AgeGateMode,
 }
 
+/// What [`AgeGateService::update_repo_config_as`] replaced, and how the
+/// policy lock moved (#4238).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyWrite {
+    pub previous: AgeGatePolicy,
+    pub was_locked: bool,
+    pub now_locked: bool,
+}
+
+/// Whether an instance administrator's lock currently holds a repository's
+/// age-gate policy (#4238). Read on the policy GET so a client can explain a
+/// refused write before attempting it.
+pub async fn repo_policy_locked(db: &PgPool, repository_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar("SELECT age_gate_instance_locked FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("Repository {repository_id} not found")))
+}
+
 impl AgeGatePolicy {
     /// Whether replacing `self` with `next` makes the gate LESS strict:
     /// disabling it, lowering the minimum age, or switching the age source.
@@ -1342,6 +1363,11 @@ impl AgeGateService {
     /// Reopen as `tier` (#4238). Refused for a repository-tier actor on an
     /// instance-locked review, with the lock also a compare-and-set
     /// predicate — see [`Self::approve_as`].
+    ///
+    /// An instance administrator's reopen RELEASES the lock: a reopened review
+    /// is undecided, so it is no longer an instance decision, and the
+    /// repository's admins may decide it. A repository-tier reopen never
+    /// changes the lock (it can only reach an unlocked review).
     pub async fn reopen_as(
         &self,
         id: Uuid,
@@ -1358,7 +1384,7 @@ impl AgeGateService {
             "UPDATE age_gate_reviews
              SET status = 'pending', reviewed_by = $2, reviewed_at = NOW(),
                  review_reason = $3,
-                 instance_locked = instance_locked OR $5
+                 instance_locked = instance_locked AND NOT $5
              WHERE id = $1 AND status = $4 AND ($5 OR NOT instance_locked)",
         )
         .bind(id)
@@ -1401,25 +1427,39 @@ impl AgeGateService {
             min_age_days,
             mode,
         };
-        self.update_repo_config_as(repo_id, next, ActorTier::Instance)
+        self.update_repo_config_as(repo_id, next, ActorTier::Instance, None)
             .await
-            .map(|_previous| ())
+            .map(|_write| ())
     }
 
-    /// Set a repository's policy as `tier` and return the policy it replaced,
-    /// so the audit entry can show what changed (#4238).
+    /// Set a repository's policy as `tier` and report what it replaced and
+    /// how the lock moved, so the audit trail can show both (#4238).
     ///
     /// A repository-tier actor may not RELAX a policy an instance admin set
     /// ([`AgeGatePolicy::is_relaxed_by`]); it may still tighten it. The check
     /// runs under the `FOR UPDATE` row lock that already serialises policy
-    /// writes, so it cannot race an instance admin's change. Only an instance
-    /// admin's write sets the lock, and none clears it.
+    /// writes, so it cannot race an instance admin's change.
+    ///
+    /// `lock` is the instance administrator's explicit choice for the policy
+    /// lock: `Some(false)` hands the policy back to the repository's admins,
+    /// `Some(true)` or `None` locks it (an instance write is an instance
+    /// decision unless it says otherwise). A repository-tier write may not
+    /// touch the lock at all, so `Some(_)` from that tier is refused, and its
+    /// write leaves the lock exactly as it was.
     pub async fn update_repo_config_as(
         &self,
         repo_id: Uuid,
         next: AgeGatePolicy,
         tier: ActorTier,
-    ) -> Result<AgeGatePolicy> {
+        lock: Option<bool>,
+    ) -> Result<PolicyWrite> {
+        if tier == ActorTier::Repository && lock.is_some() {
+            return Err(AppError::Authorization(
+                "Only an instance administrator can lock an age-gate policy or hand it \
+                 back to the repository's administrators."
+                    .to_string(),
+            ));
+        }
         validate_min_age_days(next.min_age_days)?;
         let AgeGatePolicy {
             enabled,
@@ -1450,6 +1490,10 @@ impl AgeGateService {
             min_age_days: current_min_age_days,
             mode: AgeGateMode::parse(&current_mode)?,
         };
+        let now_locked = match tier {
+            ActorTier::Instance => lock.unwrap_or(true),
+            ActorTier::Repository => locked,
+        };
         if locked && tier == ActorTier::Repository && current.is_relaxed_by(next) {
             return Err(AppError::Authorization(
                 "This repository's age gate was set by an instance administrator. A \
@@ -1463,14 +1507,14 @@ impl AgeGateService {
             "UPDATE repositories
              SET age_gate_enabled = $2, age_gate_min_age_days = $3,
                  age_gate_mode = $4, updated_at = NOW(),
-                 age_gate_instance_locked = age_gate_instance_locked OR $5
+                 age_gate_instance_locked = $5
              WHERE id = $1",
         )
         .bind(repo_id)
         .bind(enabled)
         .bind(min_age_days)
         .bind(mode.as_str())
-        .bind(tier.is_instance())
+        .bind(now_locked)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1493,7 +1537,11 @@ impl AgeGateService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         invalidate_decision_memos(repo_id);
-        Ok(current)
+        Ok(PolicyWrite {
+            previous: current,
+            was_locked: locked,
+            now_locked,
+        })
     }
 
     pub async fn find_last_known_good(

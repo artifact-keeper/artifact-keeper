@@ -129,6 +129,8 @@ impl AuditAction {
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
+            | AuditAction::AgeGateLockSet
+            | AuditAction::AgeGateLockReleased
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished
