@@ -369,7 +369,7 @@ pub(crate) async fn require_and_consume_approval(
 ///
 /// Only an instance administrator or an administrator of that repository. The
 /// read paths are gated by the source repository's visibility alone, so on a
-/// public source repository any signed-in user can read its approvals; showing
+/// public or `internal` source repository any signed-in user can read its approvals; showing
 /// them usernames would let them enumerate the instance's admin and CI
 /// accounts, where they previously saw only ids. Everyone else still gets the
 /// ids, exactly as before. `None` is the unfiltered listing, which is already
