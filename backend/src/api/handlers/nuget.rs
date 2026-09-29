@@ -1788,15 +1788,20 @@ async fn remote_member_v2_entries(
     query: &str,
     ak_base: &str,
 ) -> Result<Vec<V2Entry>, Response> {
-    match discover_upstream_protocol(proxy, member.id, &member.key, upstream_url).await? {
-        UpstreamProtocol::V2 { base } => {
+    // Only a positive V3 answer translates, exactly as for a standalone remote:
+    // a probe that errors (a V2 server answering `index.json` with 400, 401,
+    // 403 or 5xx) keeps the member's own V2 feed instead of dropping the
+    // member from the virtual feed.
+    match discover_upstream_protocol(proxy, member.id, &member.key, upstream_url).await {
+        Ok(UpstreamProtocol::V2 { .. }) | Err(_) => {
+            let base = v2_feed_base(upstream_url);
             let verb = match query.is_empty() {
                 true => odata.to_string(),
                 false => format!("{}?{}", odata, query),
             };
             fetch_v2_entries(proxy, member.id, &member.key, upstream_url, &base, &verb).await
         }
-        UpstreamProtocol::V3(_) => {
+        Ok(UpstreamProtocol::V3(_)) => {
             v2_entries_from_v3_upstream(
                 proxy,
                 member.id,
@@ -2983,6 +2988,77 @@ fn json_versions_response(versions: &[String]) -> Response {
 // GET /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{filename} — Download
 // ---------------------------------------------------------------------------
 
+/// Which protocol surface a virtual download answers (#4126 follow-up). The
+/// two treat a failed V3 probe on a REMOTE member differently, exactly as they
+/// do for a standalone remote.
+#[derive(Clone, Copy)]
+enum DownloadSurface<'a> {
+    /// The V3 flat container. A probe error skips the member: a transient
+    /// failure of a real V3 feed must not be answered from V2 paths.
+    V3,
+    /// The legacy V2 `package/` route. A probe error keeps the member's V2
+    /// path, so a V2 server that answers `index.json` with 400, 401, 403 or 5xx
+    /// still serves. Carries the id as the client sent it.
+    V2 { id: &'a str },
+}
+
+/// Serve a V2 client's `.nupkg` from a remote upstream: the repository itself,
+/// or a remote member of a virtual repository (#4122, and its #4126 follow-up).
+///
+/// A V3 upstream is fetched from its PackageBaseAddress and shares the V3
+/// client's cached body. Anything else — a V2 upstream, or a probe that errors
+/// because a V2 server answers `index.json` with 400, 401, 403 or 5xx — keeps
+/// the `package/{id}/{v}` URL and the cache key this route has always written,
+/// so a V2-to-V2 upstream does not depend on the probe. One function for both
+/// callers, so a standalone remote and the same upstream as a member cannot
+/// drift apart again.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_v2_download(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    id: &str,
+    version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let (fetch_url, cache_path) =
+        match discover_upstream_protocol(proxy, repo_id, repo_key, upstream_url).await {
+            Ok(UpstreamProtocol::V3(resources)) => {
+                let id_lower = id.to_lowercase();
+                let sub_path = format!(
+                    "{}/{}/{}",
+                    id_lower,
+                    version,
+                    build_nupkg_filename(&id_lower, version)
+                );
+                v3_flatcontainer_target(&resources, upstream_url, &sub_path)?
+            }
+            Ok(UpstreamProtocol::V2 { .. }) | Err(_) => (
+                format!("{}/package/{}/{}", v2_feed_base(upstream_url), id, version),
+                format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version),
+            ),
+        };
+    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+        "application/octet-stream",
+        RepositoryFormat::Nuget,
+    )
+    .await?;
+    // #3446: the legacy V2 / Chocolatey download seam counts too. It caches
+    // under its own `v2/package/...` key rather than the V3 flat-container key,
+    // so it records against that key — the row a V2-only client's downloads
+    // actually accumulate on. For a member, that is the MEMBER's row.
+    proxy_helpers::record_proxy_download(state, repo_id, repo_key, &cache_path, ctx).await;
+    Ok(response)
+}
+
 /// Serve one package coordinate from a virtual repository's members.
 ///
 /// One walk in CONFIGURED priority order (#3980). Hosted members used to
@@ -2997,7 +3073,9 @@ fn json_versions_response(versions: &[String]) -> Response {
 ///
 /// Shared by the V3 flat-container route and the legacy V2 `package/` route
 /// (#4021), so both honour the same member priority, the same
-/// caller-authorized member set, and the same terminal-policy rule.
+/// caller-authorized member set, and the same terminal-policy rule. They
+/// differ only in how a REMOTE member is fetched; see [`DownloadSurface`].
+#[allow(clippy::too_many_arguments)]
 async fn virtual_member_download(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -3005,6 +3083,7 @@ async fn virtual_member_download(
     package_id_lower: &str,
     version: &str,
     filename: &str,
+    surface: DownloadSurface<'_>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Caller-authorized member walk (#3323): a private member's upstream —
@@ -3044,18 +3123,35 @@ async fn virtual_member_download(
             ) else {
                 continue;
             };
-            if let Ok(resp) = proxy_v3_flatcontainer(
-                state,
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                &sub_path,
-                true,
-                Some(ctx),
-            )
-            .await
-            {
+            let fetched = match surface {
+                DownloadSurface::V3 => {
+                    proxy_v3_flatcontainer(
+                        state,
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &sub_path,
+                        true,
+                        Some(ctx),
+                    )
+                    .await
+                }
+                DownloadSurface::V2 { id } => {
+                    proxy_v2_download(
+                        state,
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        id,
+                        version,
+                        ctx,
+                    )
+                    .await
+                }
+            };
+            if let Ok(resp) = fetched {
                 return Ok(resp);
             }
             continue;
@@ -3158,6 +3254,7 @@ async fn flatcontainer_download(
                     &package_id_lower,
                     &version,
                     &filename,
+                    DownloadSurface::V3,
                     &ctx,
                 )
                 .await;
@@ -3946,46 +4043,17 @@ async fn v2_download(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            // A V3 upstream is fetched from its PackageBaseAddress and shares
-            // the V3 client's cached body (#4122). Anything else — a V2
-            // upstream, or a probe that errors because a V2 server answers
-            // `index.json` with 400, 401, 403 or 5xx — keeps the
-            // `package/{id}/{v}` URL and the cache key this route has always
-            // written, so a V2-to-V2 remote does not depend on the probe.
-            let (fetch_url, cache_path) =
-                match discover_upstream_protocol(proxy, repo.id, repo_key, upstream_url).await {
-                    Ok(UpstreamProtocol::V3(resources)) => {
-                        let id_lower = id.to_lowercase();
-                        let sub_path = format!(
-                            "{}/{}/{}",
-                            id_lower,
-                            version,
-                            build_nupkg_filename(&id_lower, version)
-                        );
-                        v3_flatcontainer_target(&resources, upstream_url, &sub_path)?
-                    }
-                    Ok(UpstreamProtocol::V2 { .. }) | Err(_) => (
-                        format!("{}/package/{}/{}", v2_feed_base(upstream_url), id, version),
-                        format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version),
-                    ),
-                };
-            let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            return proxy_v2_download(
+                state,
                 proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
-                &fetch_url,
-                &cache_path,
-                "application/octet-stream",
-                RepositoryFormat::Nuget,
+                id,
+                version,
+                ctx,
             )
-            .await?;
-            // #3446: the legacy V2 / Chocolatey download seam counts too. It
-            // caches under its own `v2/package/...` key rather than the V3
-            // flat-container key, so it records against that key — the row a
-            // V2-only client's downloads actually accumulate on.
-            proxy_helpers::record_proxy_download(state, repo.id, repo_key, &cache_path, ctx).await;
-            return Ok(response);
+            .await;
         }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
@@ -4026,6 +4094,7 @@ async fn v2_download(
                 &id_lower,
                 version,
                 &build_nupkg_filename(&id_lower, version),
+                DownloadSurface::V2 { id },
                 ctx,
             )
             .await;
@@ -8414,6 +8483,131 @@ mod virtual_federation_tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(&body[..], b"remote member bytes");
+    }
+
+    /// A V2-only upstream whose `index.json` answers `status` instead of 404,
+    /// the way many real V2 servers do (400, 401, 403, 5xx).
+    async fn v2_upstream_whose_index_errors(
+        package_id: &str,
+        version: &str,
+        status: u16,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = v2_only_upstream(package_id, version).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/index.json"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    /// Follow-up to #4126: a standalone V2 remote keeps working when its V3
+    /// probe errors, but the SAME upstream as a virtual repository's member was
+    /// skipped: `remote_member_v2_entries` propagated the probe error, so the
+    /// member vanished from the virtual's V2 feed.
+    #[tokio::test]
+    async fn v2_feed_of_a_virtual_repo_lists_a_v2_member_whose_index_errors() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = v2_upstream_whose_index_errors("erroringpkg", "2.0.0", 503).await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/Search()?searchTerm=''", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let feed = String::from_utf8_lossy(&body);
+        assert!(
+            feed.contains("erroringpkg"),
+            "a V2 member whose index.json answers 503 must still be listed: {feed}"
+        );
+    }
+
+    /// The download half: a V2 client that sees the package must be able to
+    /// fetch it. `virtual_member_download` fetched remote members the V3 way,
+    /// so the same probe error skipped the member and the download 404'd.
+    #[tokio::test]
+    async fn v2_download_from_a_virtual_repo_reaches_a_v2_member_whose_index_errors() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = v2_upstream_whose_index_errors("erroringpkg", "2.0.0", 403).await;
+        mount_v2_package_bytes(&upstream, "erroringpkg", "2.0.0", b"v2 member bytes").await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/package/erroringpkg/2.0.0", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the V2 download must reach the member: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], b"v2 member bytes");
+    }
+
+    /// The V3 surface keeps refusing to downgrade on a probe error (#4126): a
+    /// transient failure of a real V3 feed must not be answered from V2 paths
+    /// it does not serve. Pinned so the V2 fix cannot widen it.
+    #[tokio::test]
+    async fn v3_download_from_a_virtual_repo_does_not_downgrade_on_a_probe_error() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = v2_upstream_whose_index_errors("erroringpkg", "2.0.0", 503).await;
+        mount_v2_package_bytes(&upstream, "erroringpkg", "2.0.0", b"v2 member bytes").await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/erroringpkg/2.0.0/erroringpkg.2.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the V3 surface must not fall back to V2 on a probe error: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// A V2-only REMOTE repository (not a member): every V3 leg must answer.
