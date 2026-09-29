@@ -428,6 +428,47 @@ async fn discover_upstream_protocol(
     }
 }
 
+/// How long a failed V3 probe may take before a virtual repository's member
+/// counts as UNREACHABLE rather than as a V2 server that answered with an
+/// error (#4327).
+///
+/// The proxy reports "the upstream answered 403" and "the upstream never
+/// answered" the same way, so the time is the signal: a server that answers
+/// 400, 401, 403 or 5xx does so quickly, while a host that does not answer
+/// costs the full upstream timeout (60 s). Falling back to the V2 feed after
+/// that would pay the timeout a second time, and members are walked one after
+/// another, so one dead member would push a virtual feed past a NuGet client's
+/// own timeout (100 s) where it used to answer, only without that member.
+/// Heuristic on purpose: the precise fix is a proxy that reports "no answer"
+/// separately, which is a change to a helper every format shares.
+#[cfg(not(test))]
+const MEMBER_PROBE_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Lowered for tests so the slow-probe cases do not add a long sleep to CI;
+/// still far above a local mock's fast answer.
+#[cfg(test)]
+const MEMBER_PROBE_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether a failed V3 probe still lets the V2 path be tried (#4327).
+#[derive(Clone, Copy)]
+enum ProbeFallback {
+    /// A standalone remote: always, as since #4126. Before it this route never
+    /// probed at all, so a slow probe must not start failing a V2 remote that
+    /// works today.
+    Always,
+    /// A virtual repository's member: only if the upstream answered quickly.
+    /// A member that does not answer is skipped, as it always was.
+    IfAnsweredQuickly,
+}
+
+impl ProbeFallback {
+    fn allows(self, probe_took: std::time::Duration) -> bool {
+        match self {
+            ProbeFallback::Always => true,
+            ProbeFallback::IfAnsweredQuickly => probe_took < MEMBER_PROBE_ANSWER_BUDGET,
+        }
+    }
+}
+
 /// Fetch + parse the upstream service index for a Remote NuGet V3 repo.
 async fn discover_upstream_resources(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -1792,7 +1833,18 @@ async fn remote_member_v2_entries(
     // a probe that errors (a V2 server answering `index.json` with 400, 401,
     // 403 or 5xx) keeps the member's own V2 feed instead of dropping the
     // member from the virtual feed.
-    match discover_upstream_protocol(proxy, member.id, &member.key, upstream_url).await {
+    //
+    // A member whose probe fails SLOWLY did not answer at all; it is skipped as
+    // before rather than asked again. See `MEMBER_PROBE_ANSWER_BUDGET`.
+    let started = std::time::Instant::now();
+    let probe = discover_upstream_protocol(proxy, member.id, &member.key, upstream_url).await;
+    let probe = match probe {
+        Err(resp) if !ProbeFallback::IfAnsweredQuickly.allows(started.elapsed()) => {
+            return Err(resp);
+        }
+        other => other,
+    };
+    match probe {
         Ok(UpstreamProtocol::V2 { .. }) | Err(_) => {
             let base = v2_feed_base(upstream_url);
             let verb = match query.is_empty() {
@@ -3021,10 +3073,14 @@ async fn proxy_v2_download(
     upstream_url: &str,
     id: &str,
     version: &str,
+    fallback: ProbeFallback,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    let started = std::time::Instant::now();
     let (fetch_url, cache_path) =
         match discover_upstream_protocol(proxy, repo_id, repo_key, upstream_url).await {
+            // An upstream that did not answer in time is not asked again.
+            Err(resp) if !fallback.allows(started.elapsed()) => return Err(resp),
             Ok(UpstreamProtocol::V3(resources)) => {
                 let id_lower = id.to_lowercase();
                 let sub_path = format!(
@@ -3050,7 +3106,13 @@ async fn proxy_v2_download(
         "application/octet-stream",
         RepositoryFormat::Nuget,
     )
-    .await?;
+    .await
+    .inspect_err(upstream_failure(
+        "v2_package",
+        repo_key,
+        upstream_url,
+        &fetch_url,
+    ))?;
     // #3446: the legacy V2 / Chocolatey download seam counts too. It caches
     // under its own `v2/package/...` key rather than the V3 flat-container key,
     // so it records against that key — the row a V2-only client's downloads
@@ -3146,6 +3208,7 @@ async fn virtual_member_download(
                         upstream_url,
                         id,
                         version,
+                        ProbeFallback::IfAnsweredQuickly,
                         ctx,
                     )
                     .await
@@ -4051,6 +4114,7 @@ async fn v2_download(
                 upstream_url,
                 id,
                 version,
+                ProbeFallback::Always,
                 ctx,
             )
             .await;
@@ -8571,6 +8635,148 @@ mod virtual_federation_tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(&body[..], b"v2 member bytes");
+    }
+
+    /// A V2 upstream whose `index.json` errors only after `delay`, i.e. a host
+    /// that is slow to answer or does not answer before the proxy gives up.
+    async fn v2_upstream_whose_index_errors_slowly(
+        package_id: &str,
+        version: &str,
+        status: u16,
+        delay: std::time::Duration,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = v2_only_upstream(package_id, version).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/index.json"))
+            .respond_with(ResponseTemplate::new(status).set_delay(delay))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    /// Well past `MEMBER_PROBE_ANSWER_BUDGET`'s test value.
+    const SLOW_PROBE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+    /// Every path the upstream was asked for, in order.
+    async fn requested_paths(upstream: &wiremock::MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    /// #4327, how it could break: the proxy reports "never answered" the same
+    /// way as "answered 403", and it waits 60 s before giving up. Falling back
+    /// after a probe that failed SLOWLY would pay that wait a second time for
+    /// every V2 request through the virtual repository, since members are
+    /// asked one after another. A slowly failing member is skipped as before,
+    /// and its upstream is not asked again.
+    #[tokio::test]
+    async fn v2_feed_skips_a_member_whose_index_fails_slowly_without_asking_again() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream =
+            v2_upstream_whose_index_errors_slowly("slowpkg", "2.0.0", 503, SLOW_PROBE).await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/Search()?searchTerm=''", fx.repo_key)),
+        )
+        .await;
+        let paths = requested_paths(&upstream).await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the feed still answers");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("slowpkg"),
+            "a member that did not answer in time is skipped"
+        );
+        assert_eq!(
+            paths,
+            vec!["/api/v2/index.json".to_string()],
+            "the upstream must not be asked a second time"
+        );
+    }
+
+    /// The download half of the same rule.
+    #[tokio::test]
+    async fn v2_download_skips_a_member_whose_index_fails_slowly_without_asking_again() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream =
+            v2_upstream_whose_index_errors_slowly("slowpkg", "2.0.0", 403, SLOW_PROBE).await;
+        mount_v2_package_bytes(&upstream, "slowpkg", "2.0.0", b"slow member bytes").await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, _body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/package/slowpkg/2.0.0", fx.repo_key)),
+        )
+        .await;
+        let paths = requested_paths(&upstream).await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(status, StatusCode::OK, "the member is skipped");
+        assert_eq!(
+            paths,
+            vec!["/api/v2/index.json".to_string()],
+            "the upstream must not be asked a second time"
+        );
+    }
+
+    /// The budget applies to virtual members ONLY. A standalone V2 remote
+    /// keeps falling back after a slow probe too: before #4126 it never probed
+    /// at all, so a slow `index.json` must not start failing it.
+    #[tokio::test]
+    async fn standalone_v2_remote_still_falls_back_after_a_slow_probe() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream =
+            v2_upstream_whose_index_errors_slowly("slowpkg", "2.0.0", 503, SLOW_PROBE).await;
+        mount_v2_package_bytes(&upstream, "slowpkg", "2.0.0", b"standalone bytes").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/api/v2", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/v2/package/slowpkg/2.0.0", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "standalone keeps its pass-through");
+        assert_eq!(&body[..], b"standalone bytes");
     }
 
     /// The V3 surface keeps refusing to downgrade on a probe error (#4126): a
