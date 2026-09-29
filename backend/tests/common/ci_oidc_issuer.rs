@@ -109,6 +109,8 @@ fn new_rsa_key() -> RsaPrivateKey {
 /// A running HTTPS OIDC issuer and the key it signs with.
 pub struct MockCiIssuer {
     issuer: String,
+    /// The JWKS it publishes, for a `static` provider to store instead.
+    jwks: Value,
     signing_key: EncodingKey,
     /// Never published in the JWKS: a token signed with it must be refused.
     foreign_key: EncodingKey,
@@ -154,7 +156,10 @@ impl MockCiIssuer {
                 "/.well-known/openid-configuration",
                 get(move || async move { Json(discovery) }),
             )
-            .route("/jwks", get(move || async move { Json(jwks) }));
+            .route("/jwks", {
+                let jwks = jwks.clone();
+                get(move || async move { Json(jwks) })
+            });
 
         let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config(ip));
         let server = tokio::spawn(async move {
@@ -182,6 +187,7 @@ impl MockCiIssuer {
 
         Some(Self {
             issuer,
+            jwks,
             signing_key: rsa_encoding_key(&key),
             foreign_key: rsa_encoding_key(&new_rsa_key()),
             server,
@@ -219,9 +225,23 @@ impl MockCiIssuer {
         })
     }
 
+    /// The JWKS this issuer publishes, as `kubectl get --raw
+    /// /openid/v1/jwks` would return a cluster's.
+    pub fn jwks(&self) -> &Value {
+        &self.jwks
+    }
+
     /// RS256-sign `claims` with the published key.
     pub fn sign(&self, claims: &Value) -> String {
         sign_rs256(&self.signing_key, claims)
+    }
+
+    /// RS256-sign `claims` with the published key under another `kid`, as a
+    /// cluster does after rotating to a key the verifier has not been given.
+    pub fn sign_with_kid(&self, claims: &Value, kid: &str) -> String {
+        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        encode(&header, claims, &self.signing_key).expect("sign CI ID token")
     }
 
     /// RS256-sign `claims` with a key the JWKS does not publish, under the

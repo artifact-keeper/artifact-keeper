@@ -357,6 +357,52 @@ pub async fn try_isolated_pool() -> Option<IsolatedDb> {
     })
 }
 
+/// Capture the formatted `tracing` output of a unit test, for asserting on a
+/// `security` log line. Install it with
+/// `let _guard = tracing::subscriber::set_default(capture.subscriber());`,
+/// which is thread-local, so it also covers `.await`s on the current-thread
+/// runtime `#[tokio::test]` uses.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl LogCapture {
+    /// A subscriber writing every event at INFO and above into this capture.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish()
+    }
+
+    pub fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {

@@ -36,9 +36,9 @@ use crate::error::Result;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::auth_service::AuthService;
 use crate::services::ci_oidc_service::{
-    CiOidcMappingResponse, CiOidcProviderResponse, CiOidcService, CiOidcToggleRequest,
-    CreateCiOidcMappingRequest, CreateCiOidcProviderRequest, GroupBindingReconcileReport,
-    UpdateCiOidcMappingRequest, UpdateCiOidcProviderRequest,
+    log_key_source_change, CiOidcMappingResponse, CiOidcProviderResponse, CiOidcService,
+    CiOidcToggleRequest, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
+    GroupBindingReconcileReport, UpdateCiOidcMappingRequest, UpdateCiOidcProviderRequest,
 };
 
 /// Create CI OIDC admin routes (auth enforced by the outer admin_middleware).
@@ -217,7 +217,10 @@ pub async fn create_provider(
 ) -> Result<Json<CiOidcProviderResponse>> {
     require_admin(&auth)?;
     let svc = CiOidcService::new(state.db.clone());
-    Ok(Json(svc.create(req).await?))
+    let created = svc.create(req).await?;
+    // Every create sets a key source, even if only the `discovery` default.
+    log_key_source_change(&created, auth.user_id, &auth.username);
+    Ok(Json(created))
 }
 
 #[utoipa::path(
@@ -244,7 +247,11 @@ pub async fn update_provider(
 ) -> Result<Json<CiOidcProviderResponse>> {
     require_admin(&auth)?;
     let svc = CiOidcService::new(state.db.clone());
-    Ok(Json(svc.update(id, req).await?))
+    let updated = svc.update(id, req).await?;
+    if updated.key_material_changed {
+        log_key_source_change(&updated.provider, auth.user_id, &auth.username);
+    }
+    Ok(Json(updated.provider))
 }
 
 #[utoipa::path(
@@ -589,6 +596,8 @@ mod tests {
                     issuer_url: "https://issuer.example.com".to_string(),
                     audience: Some("artifact-keeper".to_string()),
                     is_enabled: Some(true),
+                    key_source: None,
+                    static_jwks: None,
                 }),
             )
             .await,
@@ -605,6 +614,8 @@ mod tests {
                     issuer_url: Some("https://issuer.example.com".to_string()),
                     audience: Some("artifact-keeper".to_string()),
                     is_enabled: Some(false),
+                    key_source: None,
+                    static_jwks: None,
                 }),
             )
             .await,
@@ -714,6 +725,8 @@ mod tests {
                 issuer_url: "https://issuer.example.com".to_string(),
                 audience: Some("artifact-keeper".to_string()),
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             }),
         )
         .await
@@ -746,6 +759,8 @@ mod tests {
                 issuer_url: Some("https://issuer2.example.com".to_string()),
                 audience: Some("artifact-keeper-ci".to_string()),
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             }),
         )
         .await
@@ -932,6 +947,144 @@ mod tests {
         }
     }
 
+    /// The provider schemas publish the key source and static JWKS on both
+    /// sides, and name `kubernetes` among the provider types (5.1).
+    #[test]
+    fn openapi_provider_schemas_carry_the_key_source() {
+        use utoipa::OpenApi as _;
+        let spec = serde_json::to_value(super::CiAuthAdminApiDoc::openapi()).unwrap();
+        for schema in [
+            "CreateCiOidcProviderRequest",
+            "UpdateCiOidcProviderRequest",
+            "CiOidcProviderResponse",
+        ] {
+            let props = &spec["components"]["schemas"][schema]["properties"];
+            for field in ["key_source", "static_jwks"] {
+                assert!(
+                    props.get(field).is_some(),
+                    "{field} missing from {schema}: {props}"
+                );
+            }
+        }
+        let provider_type = spec["components"]["schemas"]["CreateCiOidcProviderRequest"]
+            ["properties"]["provider_type"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(provider_type.contains("kubernetes"), "{provider_type}");
+    }
+
+    /// 2.4 — setting or changing a key source or static JWKS emits a
+    /// `security` line naming the provider, the admin, the key source and the
+    /// resulting kid set; an update that leaves them alone emits none.
+    #[tokio::test]
+    async fn key_source_changes_are_logged_with_the_admin_and_kids() {
+        use crate::services::ci_oidc_service::test_public_jwk;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-admin-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let state = tdh::build_state(pool, &storage_path);
+        let auth = auth_with_admin(true);
+        let update = |static_jwks: Option<serde_json::Value>, name: Option<String>| {
+            UpdateCiOidcProviderRequest {
+                name,
+                provider_type: None,
+                issuer_url: None,
+                audience: None,
+                is_enabled: None,
+                key_source: None,
+                static_jwks,
+            }
+        };
+
+        let capture = crate::testing::LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+
+        let provider = create_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(CreateCiOidcProviderRequest {
+                name: format!("k8s-log-{}", Uuid::new_v4()),
+                provider_type: Some("kubernetes".to_string()),
+                issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
+                audience: None,
+                is_enabled: None,
+                key_source: Some("static".to_string()),
+                static_jwks: Some(serde_json::json!({"keys": [test_public_jwk("k1")]})),
+            }),
+        )
+        .await
+        .expect("create static provider")
+        .0;
+        let created_line = capture.contents();
+        assert!(
+            created_line.contains("key_source=static") && created_line.contains("kids=k1"),
+            "{created_line}"
+        );
+
+        let replaced = update_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(update(
+                Some(serde_json::json!({"keys": [test_public_jwk("k1"), test_public_jwk("k2")]})),
+                None,
+            )),
+        )
+        .await
+        .expect("replace the JWKS")
+        .0;
+        assert_eq!(replaced.key_source, "static");
+        let logs = capture.contents();
+        let line = logs
+            .lines()
+            .rfind(|l| l.contains("CI OIDC: provider key source set"))
+            .expect("a security line for the replacement");
+        for needle in [
+            format!("provider_id={}", provider.id),
+            format!("admin_id={}", auth.user_id),
+            "admin=ci-admin-test".to_string(),
+            "key_source=static".to_string(),
+            "kids=k1, k2".to_string(),
+        ] {
+            assert!(line.contains(&needle), "missing {needle} in: {line}");
+        }
+        assert!(line.contains("security"), "target is security: {line}");
+
+        let before = capture
+            .contents()
+            .matches("provider key source set")
+            .count();
+        let renamed = update_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(update(
+                None,
+                Some(format!("k8s-renamed-{}", Uuid::new_v4())),
+            )),
+        )
+        .await
+        .expect("rename")
+        .0;
+        assert!(renamed.name.starts_with("k8s-renamed-"));
+        assert_eq!(
+            capture
+                .contents()
+                .matches("provider key source set")
+                .count(),
+            before,
+            "an update that leaves key material alone logs no key-source line"
+        );
+
+        delete_provider(State(state), Extension(auth), Path(provider.id))
+            .await
+            .expect("delete provider");
+    }
+
     #[tokio::test]
     async fn admin_get_provider_not_found_propagates() {
         let Some(pool) = tdh::try_pool().await else {
@@ -1011,6 +1164,8 @@ mod tests {
                 issuer_url: "https://gitlab.example.com".to_string(),
                 audience: None,
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             }),
         )
         .await
