@@ -2813,16 +2813,17 @@ fn build_scanned_gallery_response(
         .expect("valid scanned VSIX response")
 }
 
-/// Inline scan-and-block for a proxied VSIX (#3254).
+/// Inline scan-and-block for a proxied VSIX (#3254), on the generic gate
+/// ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled; the caller keeps the untouched
-/// streaming path otherwise. Flow mirrors npm and PyPI exactly: buffered capped
-/// fetch (cache-first, so a repeat pull is answered from the proxy cache with
-/// no upstream hit) -> content digest -> the shared digest-keyed verdict gate
-/// -> serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
+/// streaming path otherwise. Same flow as npm and PyPI: buffered capped fetch
+/// (cache-first) -> content digest -> the shared digest-keyed verdict gate ->
+/// serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
 ///
-/// The identity is [`ProxyScanIdentity::NotApplicable`]: a VSIX is a zip whose
-/// contents the CVE engine catalogs directly, and there is no
+/// The identity is [`proxy_helpers::ProxyScanIdentity::NotApplicable`]: a
+/// VSIX is a zip whose contents the CVE engine catalogs
+/// directly, and there is no
 /// [`crate::services::scanner_service::ComponentEcosystem`] to pin a
 /// `publisher.extension@version` coordinate to, so this format supplies no
 /// component to grade. That is the pre-#3003 posture the gate already
@@ -2839,141 +2840,93 @@ async fn serve_scanned_gallery_package(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let filename = build_vsix_filename(coordinate.publisher, coordinate.name, coordinate.version);
-    let gated_repo = proxy_helpers::build_remote_repo_with_format(
-        repo.id,
-        coordinate.repo_key,
-        source.upstream_url,
-        RepositoryFormat::Vscode,
-    );
-    let (bytes, content_type, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &gated_repo,
-            source.upstream_url,
-            source.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok(triple) => triple,
-        Err(error) if proxy_helpers::is_over_cap_error(&error) => {
-            // Over the byte cap: never buffer unbounded. Fail-closed withholds;
-            // fail-open falls back to the streaming path, loudly.
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(proxy_helpers::scan_pending_locked_response(&filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let mut response =
-                        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
-                            proxy,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.upstream_url,
-                            source.upstream_url,
-                            source.cache_path,
-                            source.default_content_type,
-                            RepositoryFormat::Vscode,
-                        )
-                        .await?;
-                    if let Some(ctx) = ctx {
-                        proxy_helpers::record_proxy_download(
-                            state,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.cache_path,
-                            ctx,
-                        )
-                        .await;
-                    }
-                    response
-                        .headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(response)
-                }
-            };
-        }
-        Err(error) => return Err(error.into_response()),
-    };
-
-    let digest = proxy_helpers::sha256_hex(&bytes);
-    let synthetic = vscode_synthetic_artifact(repo.id, &filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo.id,
-        &filename,
-        &digest,
-        synthetic,
-        &bytes,
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id: repo.id,
+        repo_key: coordinate.repo_key,
+        fetch_base: source.upstream_url,
+        format: RepositoryFormat::Vscode,
+        source_path: source.upstream_url,
+        cache_path: source.cache_path,
+        filename: &filename,
         action,
         severity_gate,
-        proxy_helpers::ProxyScanIdentity::NotApplicable,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(response) => Err(response),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            if let Some(ctx) = ctx {
-                proxy_helpers::record_proxy_download(
-                    state,
-                    repo.id,
-                    coordinate.repo_key,
-                    source.cache_path,
-                    ctx,
-                )
-                .await;
-            }
-            Ok(build_scanned_gallery_response(
-                &filename,
-                bytes,
-                content_type,
-                content_encoding.as_deref(),
-                source.default_content_type,
-                &digest,
-                pending,
-            ))
-        }
-    }
+        ctx,
+    };
+    let package = VscodeScannedPackage {
+        proxy,
+        default_content_type: source.default_content_type,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &package).await
 }
 
-/// The scan identity for buffered VSIX bytes. The filename already encodes the
-/// full `publisher.extension-version.vsix` coordinate, which is what the
-/// proxy-scan listing renders; `version` stays `None` for the same reason npm's
-/// synthetic artifact leaves it unset, and the storage key is empty because
-/// nothing local owns these bytes.
-fn vscode_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: "application/vsix".to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
+/// The VS Code half of the generic proxy scan gate. The wrapper records the
+/// download on both serve arms, including
+/// [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct VscodeScannedPackage<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    default_content_type: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for VscodeScannedPackage<'_> {
+    const LABEL: &'static str = "vsix";
+
+    /// The filename already encodes the full `publisher.extension-version.vsix`
+    /// coordinate, which is what the proxy-scan listing renders; the version
+    /// stays `None` for the same reason npm's synthetic artifact leaves it
+    /// unset.
+    fn synthetic_content_type(_filename: &str) -> String {
+        "application/vsix".to_string()
+    }
+
+    /// No coordinate to pin: a VSIX is a zip the CVE engine catalogs directly,
+    /// and no `ComponentEcosystem` names a `publisher.extension@version`.
+    fn identity(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        proxy_helpers::ProxyScanIdentity::NotApplicable
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // fail-open fallback after it resolves (#4098). Needed because the
+        // #3446 gate attributes this call to the impl method around it.
+        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            req.fetch_base,
+            req.source_path,
+            req.cache_path,
+            self.default_content_type,
+            RepositoryFormat::Vscode,
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_gallery_response(
+            req.filename,
+            body.bytes,
+            body.content_type,
+            body.content_encoding.as_deref(),
+            self.default_content_type,
+            &body.digest,
+            pending,
+        )
     }
 }
 

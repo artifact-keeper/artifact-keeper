@@ -3885,44 +3885,10 @@ fn build_streaming_file_response(
 // block/lock response shapes, and the scan-and-record orchestration — were
 // lifted into `proxy_helpers` (#3003) so npm (and later OCI) share ONE
 // implementation of the #2954 fail-closed gate and the #2976 freshness gate.
-// This module keeps only the PyPI-specific glue: index-target resolution, the
+// The serve sequence itself is the generic `serve_scanned_proxy_file` (#4098);
+// this module keeps only the PyPI-specific glue: index-target resolution, the
 // synthetic-artifact shape, and the PyPI response builders.
 // ---------------------------------------------------------------------------
-
-use super::proxy_helpers::{is_over_cap_error, scan_pending_locked_response, sha256_hex};
-
-/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
-/// that [`ScannerService::scan_content`] runs the leaf scanners over. There is
-/// NO `artifacts` row: proxy-cached bytes are deliberately not persisted as
-/// artifacts (#1278/#1280). The filename drives per-scanner applicability +
-/// workspace naming exactly as for a hosted wheel.
-fn pypi_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: version_from_pypi_filename(filename),
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: pypi_content_type(filename).to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
-    }
-}
 
 /// Build a buffered 200 response for scanned bytes. `pending` adds the loud
 /// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
@@ -3963,13 +3929,14 @@ fn build_scanned_file_response(
     builder.body(Body::from(bytes)).unwrap()
 }
 
-/// Inline scan-and-block for a PyPI proxy file download (#2954).
+/// Inline scan-and-block for a PyPI proxy file download (#2954), on the
+/// generic gate ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled for the repo; the caller falls back
 /// to the untouched streaming path otherwise, so repos that have not opted in
-/// see NO change. Flow: buffered capped fetch (cache-first, so a repeat pull is
-/// served from cache with no upstream hit) → content digest → verdict lookup →
-/// serve / block / scan-inline per the fail-open/closed action.
+/// see NO change. The file is fetched from the target the simple index
+/// resolves (often a different host, e.g. files.pythonhosted.org) and cached
+/// under the stable `simple/{project}/{filename}` key.
 #[allow(clippy::too_many_arguments)]
 async fn serve_scanned_pypi_file(
     state: &SharedState,
@@ -3994,141 +3961,123 @@ async fn serve_scanned_pypi_file(
         &index_path,
     )
     .await?;
-
-    // Buffered capped fetch (cache-first). The proxy caches the bytes under
-    // cache_path, so a repeat pull returns from cache with NO upstream fetch.
-    let repo = proxy_helpers::build_remote_repo_with_format(
+    let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
-        &target.fetch_base,
-        RepositoryFormat::Pypi,
-    );
-    // `content_encoding` is the coding these exact bytes arrived under. It has
-    // to travel with them to `build_scanned_file_response` below: this arm
-    // forwards the buffered body VERBATIM, so dropping the coding here is the
-    // #3149 bug (#3184).
-    let (bytes, content_type, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &repo,
-            &target.fetch_path,
-            &target.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok(triple) => triple,
-        Err(e) if is_over_cap_error(&e) => {
-            // Over the byte cap: never buffer unbounded (#895 OOM).
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "proxy object exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(scan_pending_locked_response(filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    // Fail-open oversized: serve via the untouched streaming path
-                    // (loud: X-AK-Scan pending header carried on the stream).
-                    warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let result = fetch_from_pypi_remote_streaming(
-                        proxy,
-                        repo_id,
-                        repo_key,
-                        upstream_url,
-                        project,
-                        filename,
-                        &index_path,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await?;
-                    proxy_helpers::record_proxy_download(
-                        state,
-                        repo_id,
-                        repo_key,
-                        &target.cache_path,
-                        ctx,
-                    )
-                    .await;
-                    let mut resp = build_streaming_file_response(filename, result);
-                    resp.headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(resp)
-                }
-            };
-        }
-        Err(e) => return Err(e.into_response()),
-    };
-
-    let digest = sha256_hex(&bytes);
-
-    // #3003: the identity these bytes are being served as. `project` is the
-    // requested distribution and the version comes from the filename, so the
-    // coordinate is request-derived, never upstream-controlled.
-    //
-    // This is what finally grades an SDIST. syft/grype catalog a wheel from its
-    // `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`, which
-    // syft does not catalog — so a vulnerable sdist scanned with zero cataloged
-    // components, reported zero findings, and served 200 "clean" while the same
-    // release's wheel was correctly blocked. Pinning the coordinate gives the
-    // CVE engine the component to grade, and the shared assessment gate refuses
-    // to call the result clean unless it actually graded it.
-    //
-    // Filenames we cannot parse a version from keep the prior behavior (no
-    // pin, no assessment gate) rather than newly withholding an odd-but-legit
-    // artifact.
-    let identity = match version_from_pypi_filename(filename) {
-        Some(version) => proxy_helpers::ProxyScanIdentity::Established(
-            crate::services::scanner_service::ExpectedComponent::new(
-                crate::services::scanner_service::ComponentEcosystem::Python,
-                // The canonical name. The scan gate grades a component by
-                // name+version, so before #3186 it could grade `acme sdk`
-                // while the fetch resolved `acme-sdk` -- the same divergence,
-                // in the component identity the verdict is keyed on.
-                project.as_str(),
-                &version,
-            ),
-        ),
-        // An unparseable filename keeps the pre-#3003 behavior rather than
-        // newly withholding an odd-but-legitimate artifact.
-        None => proxy_helpers::ProxyScanIdentity::NotApplicable,
-    };
-
-    // Digest-keyed verdict gate, shared with every proxy format (#3003):
-    // lookup → `decide_serve` (freshness incl. the #2976 unknown-live-version
-    // fail-closed tightening) → inline scan / async scan per the action, with
-    // the #2954 fail-closed contract enforced inside the shared scanner loop.
-    let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo_id,
+        fetch_base: &target.fetch_base,
+        format: RepositoryFormat::Pypi,
+        source_path: &target.fetch_path,
+        cache_path: &target.cache_path,
         filename,
-        &digest,
-        synthetic,
-        &bytes,
         action,
         severity_gate,
-        identity,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
-                .await;
-            Ok(build_scanned_file_response(
-                filename,
-                bytes,
-                content_type,
-                content_encoding.as_deref(),
-                Some(&digest),
-                pending,
-            ))
+        ctx: Some(ctx),
+    };
+    let file = PypiScannedFile {
+        proxy,
+        upstream_url,
+        project,
+        index_path: &index_path,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The PyPI half of the generic proxy scan gate. The wrapper records the download on
+/// both serve arms, including [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct PypiScannedFile<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    /// The repository's configured upstream (the index host), which the
+    /// streaming fallback resolves the file target from again.
+    upstream_url: &'a str,
+    project: &'a NormalizedProjectName,
+    index_path: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for PypiScannedFile<'_> {
+    const LABEL: &'static str = "pypi file";
+
+    /// The filename drives per-scanner applicability + workspace naming
+    /// exactly as for a hosted wheel.
+    fn synthetic_content_type(filename: &str) -> String {
+        pypi_content_type(filename).to_string()
+    }
+
+    fn synthetic_version(filename: &str) -> Option<String> {
+        version_from_pypi_filename(filename)
+    }
+
+    /// #3003: the identity these bytes are being served as. `project` is the
+    /// requested distribution and the version comes from the filename, so the
+    /// coordinate is request-derived, never upstream-controlled.
+    ///
+    /// This is what finally grades an SDIST. syft/grype catalog a wheel from
+    /// its `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`,
+    /// which syft does not catalog — so a vulnerable sdist scanned with zero
+    /// cataloged components, reported zero findings, and served 200 "clean"
+    /// while the same release's wheel was correctly blocked. Pinning the
+    /// coordinate gives the CVE engine the component to grade, and the shared
+    /// assessment gate refuses to call the result clean unless it actually
+    /// graded it.
+    fn identity(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        match version_from_pypi_filename(req.filename) {
+            Some(version) => proxy_helpers::ProxyScanIdentity::Established(
+                crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::Python,
+                    // The canonical name. The scan gate grades a component by
+                    // name+version, so before #3186 it could grade `acme sdk`
+                    // while the fetch resolved `acme-sdk` -- the same
+                    // divergence, in the component identity the verdict is
+                    // keyed on.
+                    self.project.as_str(),
+                    &version,
+                ),
+            ),
+            // An unparseable filename keeps the pre-#3003 behavior (no pin, no
+            // assessment gate) rather than newly withholding an
+            // odd-but-legitimate artifact.
+            None => proxy_helpers::ProxyScanIdentity::NotApplicable,
         }
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        let result = fetch_from_pypi_remote_streaming(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            self.upstream_url,
+            self.project,
+            req.filename,
+            self.index_path,
+            RepositoryFormat::Pypi,
+        )
+        .await?;
+        Ok(build_streaming_file_response(req.filename, result))
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_file_response(
+            req.filename,
+            body.bytes,
+            body.content_type,
+            body.content_encoding.as_deref(),
+            Some(&body.digest),
+            pending,
+        )
     }
 }
 
@@ -7838,7 +7787,9 @@ impl PypiOwnershipGuard {
 mod tests {
     use super::*;
     use crate::api::handlers::cache_headers::{DEFAULT_CACHE_CONTROL, PRIVATE_CACHE_CONTROL};
-    use crate::api::handlers::proxy_helpers::scan_blocked_response;
+    use crate::api::handlers::proxy_helpers::{
+        is_over_cap_error, scan_blocked_response, scan_pending_locked_response, sha256_hex,
+    };
     use sha2::{Digest, Sha256};
 
     /// #3290: the sibling mapping between the two content-negotiated cache
@@ -17673,7 +17624,9 @@ mod tests {
         let repo_id = uuid::Uuid::new_v4();
         let filename = "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl";
         let digest = "deadbeef".repeat(8);
-        let art = pypi_synthetic_artifact(repo_id, filename, &digest, 1234);
+        let art = <PypiScannedFile<'_> as proxy_helpers::ScannedProxyFile>::synthetic_artifact(
+            repo_id, filename, &digest, 1234,
+        );
 
         // The synthetic artifact drives scanner applicability + workspace
         // naming exactly as a hosted wheel would.
@@ -17690,7 +17643,12 @@ mod tests {
         assert_eq!(art.quarantine_status, None);
 
         // sdist naming resolves version + gzip content type too.
-        let sdist = pypi_synthetic_artifact(repo_id, "requests-2.31.0.tar.gz", &digest, 1);
+        let sdist = <PypiScannedFile<'_> as proxy_helpers::ScannedProxyFile>::synthetic_artifact(
+            repo_id,
+            "requests-2.31.0.tar.gz",
+            &digest,
+            1,
+        );
         assert_eq!(sdist.version.as_deref(), Some("2.31.0"));
         assert_eq!(sdist.content_type, "application/gzip");
     }

@@ -7935,9 +7935,8 @@ pub(crate) fn cache_path_filename(path: &str) -> Option<&str> {
 /// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
 /// for an on-demand rescan of already-cached bytes (#3396).
 ///
-/// The per-format serve paths build their own (`pypi_synthetic_artifact`,
-/// `npm_synthetic_artifact`, ...) because they know the coordinate the client
-/// asked for. A rescan has only a stored path and the content type recorded at
+/// The serve paths build theirs through [`ScannedProxyFile::synthetic_artifact`]
+/// because they know the coordinate the client asked for. A rescan has only a stored path and the content type recorded at
 /// cache time, so it reconstructs the minimum the scanners actually consume:
 /// filename (applicability + archive extraction) and content type.
 ///
@@ -7952,29 +7951,14 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
     size: i64,
     content_type: Option<&str>,
 ) -> crate::models::artifact::Artifact {
-    let filename = cache_path_filename(path).unwrap_or(path).to_string();
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.clone(),
-        name: filename,
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: content_type
-            .unwrap_or("application/octet-stream")
-            .to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
-    }
+    proxy_synthetic_artifact(
+        repo_id,
+        cache_path_filename(path).unwrap_or(path),
+        digest,
+        size,
+        None,
+        content_type.unwrap_or("application/octet-stream"),
+    )
 }
 
 /// Why [`proxy_scan_and_record`] could not produce a verdict (#3455).
@@ -8392,6 +8376,656 @@ pub(crate) async fn gate_proxy_scan_serve(
             });
             ProxyScanServeOutcome::Serve { pending: true }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4098: the generic scan-on-proxy serve wrapper.
+//
+// Every format that scans on proxy runs the same sequence: buffered capped
+// fetch (cache-first) → over-cap handling per fail-open/closed → content
+// digest → the digest-keyed verdict gate above → record the download → serve
+// the buffered bytes or return the 403/423. npm, PyPI and VS Code each carried
+// a ~150-line copy of that sequence; [`serve_scanned_proxy_file`] is the one
+// copy, and a format supplies only what genuinely differs through
+// [`ScannedProxyFile`]: the synthetic artifact's content type and version, the
+// request-derived identity, the unscanned streaming fallback for an oversized
+// object, and the 200 response shape.
+//
+// Adopting the gate in a new format (#4100 Maven, #4101 Cargo, #4102 NuGet, …)
+// is: implement `ScannedProxyFile` on a small struct holding the request's
+// coordinate, and at the Remote download arm, when
+// `ScanConfigService::is_proxy_scan_enabled` is true, call
+// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from
+// `direct_scan_policy` (or `effective_virtual_scan_policy` per virtual member)
+// instead of streaming.
+// ---------------------------------------------------------------------------
+
+/// The synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// the leaf scanners run over for buffered proxy bytes. There is NO
+/// `artifacts` row: proxy-cached bytes are deliberately not persisted as
+/// artifacts (#1278/#1280), so the storage key stays empty. The filename and
+/// content type drive scanner applicability and archive extraction exactly as
+/// for a hosted artifact; `version` names the coordinate when the format can
+/// derive one from the request.
+pub(crate) fn proxy_synthetic_artifact(
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+    version: Option<String>,
+    content_type: &str,
+) -> crate::models::artifact::Artifact {
+    let now = Utc::now();
+    crate::models::artifact::Artifact {
+        id: Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: content_type.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Where and how one scanned proxy download is fetched, gated and recorded.
+pub(crate) struct ScannedProxyRequest<'a> {
+    /// The Remote repository (a virtual's MEMBER on the virtual path) whose
+    /// upstream serves the bytes and whose verdicts/downloads they count to.
+    pub repo_id: Uuid,
+    pub repo_key: &'a str,
+    /// Base URL of the synthesized remote repo the capped fetch runs against.
+    pub fetch_base: &'a str,
+    /// The repository's real format, so the proxy cache classifier picks the
+    /// right TTL arm (see [`build_remote_repo_with_format`]).
+    pub format: RepositoryFormat,
+    /// Upstream path (relative to `fetch_base`, or absolute) of the file.
+    pub source_path: &'a str,
+    /// Proxy-cache key. The download is recorded under this path too, so the
+    /// buffered and streaming arms keep one cache entry and one catalog row.
+    pub cache_path: &'a str,
+    /// The file name the client receives; names the scan target and the
+    /// block/lock bodies.
+    pub filename: &'a str,
+    pub action: crate::services::proxy_scan_service::ProxyScanAction,
+    pub severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    /// `None` skips download recording (a caller with no telemetry context).
+    pub ctx: Option<&'a crate::api::middleware::download_telemetry::DownloadContext>,
+}
+
+/// The buffered bytes that passed the gate, with what the upstream declared
+/// about them.
+pub(crate) struct ScannedProxyBody {
+    pub bytes: Bytes,
+    /// Upstream `Content-Type`, when it sent one. Formats with a fixed media
+    /// type ignore it.
+    pub content_type: Option<String>,
+    /// The coding these exact bytes arrived under. A buffered body is
+    /// forwarded verbatim, so the response MUST declare it (#3149/#3184).
+    pub content_encoding: Option<String>,
+    /// SHA-256 of `bytes`, computed here, never taken from upstream.
+    pub digest: String,
+}
+
+/// The per-format half of [`serve_scanned_proxy_file`] (#4098).
+#[async_trait::async_trait]
+pub(crate) trait ScannedProxyFile: Send + Sync {
+    /// Short name for log lines, e.g. `"npm tarball"`.
+    const LABEL: &'static str;
+
+    /// Content type of the synthetic scan artifact for `filename`.
+    fn synthetic_content_type(filename: &str) -> String;
+
+    /// Version stamped on the synthetic scan artifact. `None` unless the
+    /// format derives it from the requested file name.
+    fn synthetic_version(_filename: &str) -> Option<String> {
+        None
+    }
+
+    /// The synthetic scan artifact for these bytes.
+    fn synthetic_artifact(
+        repo_id: Uuid,
+        filename: &str,
+        digest: &str,
+        size: i64,
+    ) -> crate::models::artifact::Artifact
+    where
+        Self: Sized,
+    {
+        proxy_synthetic_artifact(
+            repo_id,
+            filename,
+            digest,
+            size,
+            Self::synthetic_version(filename),
+            &Self::synthetic_content_type(filename),
+        )
+    }
+
+    /// What these bytes are served as, derived from the REQUEST (#3003). Only
+    /// consulted when the gate has to scan.
+    ///
+    /// Deliberately required, with no default: `NotApplicable` skips the
+    /// assessment gate, so a format that expects a coordinate must say so
+    /// (`Established` / `Unestablished`), and one that returns
+    /// `NotApplicable` has to state it in code rather than inherit it.
+    fn identity(
+        &self,
+        req: &ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        digest: &str,
+    ) -> ProxyScanIdentity;
+
+    /// Runs once the buffered fetch has the bytes (cache hit or fill), before
+    /// the gate. Formats that fix up the cached record hook in here.
+    async fn after_buffered_fetch(
+        &self,
+        _state: &crate::api::SharedState,
+        _req: &ScannedProxyRequest<'_>,
+    ) {
+    }
+
+    /// Fail-open over the scan byte cap: serve the object UNSCANNED through
+    /// the format's streaming path. The wrapper records the download and adds
+    /// `X-AK-Scan: pending`; this only fetches and shapes the response.
+    async fn serve_unscanned_stream(
+        &self,
+        state: &crate::api::SharedState,
+        req: &ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response>;
+
+    /// The 200 for bytes the gate let through. `pending` is the fail-open
+    /// serve-before-verdict case. The wrapper stamps `X-AK-Scan`
+    /// (`pending` / `clean`) on the result itself, so the header holds on
+    /// every arm whatever the builder sets.
+    fn scanned_response(
+        &self,
+        req: &ScannedProxyRequest<'_>,
+        body: ScannedProxyBody,
+        pending: bool,
+    ) -> Response;
+}
+
+/// Inline scan-and-block for one proxied file (#2954/#3003, generic since
+/// #4098).
+///
+/// The caller takes this path ONLY when scan-on-proxy is enabled for the
+/// repository; a repository that has not opted in keeps its streaming path.
+/// Flow: buffered capped fetch (cache-first, so a repeat pull is answered from
+/// the proxy cache with no upstream hit) → over the byte cap, 423 under
+/// fail-closed or the format's streaming path, loudly pending, under fail-open
+/// (never buffer unbounded, #895) → content digest → the shared digest-keyed
+/// verdict gate ([`gate_proxy_scan_serve`]) → record + 200, or the 403/423 as
+/// built. Any other fetch error (an upstream 404) is returned as-is, so a
+/// virtual member walk can fall through to the next member.
+pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    proxy: &ProxyService,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    let remote = build_remote_repo_with_format(
+        req.repo_id,
+        req.repo_key,
+        req.fetch_base,
+        req.format.clone(),
+    );
+    let (bytes, content_type, content_encoding) = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &remote,
+            req.source_path,
+            req.cache_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) if is_over_cap_error(&e) => {
+            return serve_oversized_proxy_file(state, req, file).await
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+    file.after_buffered_fetch(state, req).await;
+
+    let digest = sha256_hex(&bytes);
+    let identity = file.identity(req, &bytes, &digest);
+    let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
+    match gate_proxy_scan_serve(
+        state,
+        req.repo_id,
+        req.filename,
+        &digest,
+        synthetic,
+        &bytes,
+        req.action,
+        req.severity_gate,
+        identity,
+        ProxyScanMode::File,
+    )
+    .await
+    {
+        ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        ProxyScanServeOutcome::Serve { pending } => {
+            record_scanned_proxy_download(state, req).await;
+            let body = ScannedProxyBody {
+                bytes,
+                content_type,
+                content_encoding,
+                digest,
+            };
+            let mut resp = file.scanned_response(req, body, pending);
+            resp.headers_mut().insert(
+                "X-AK-Scan",
+                axum::http::HeaderValue::from_static(if pending { "pending" } else { "clean" }),
+            );
+            Ok(resp)
+        }
+    }
+}
+
+/// The over-cap branch of [`serve_scanned_proxy_file`]: the object is too
+/// large to buffer for an inline scan, which is inconclusive.
+async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    use crate::services::proxy_scan_service::{decide_inconclusive, InconclusiveOutcome};
+    match decide_inconclusive(req.action) {
+        InconclusiveOutcome::Locked => {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
+                "proxy object exceeds scan byte cap; fail-closed -> 423"
+            );
+            Err(scan_pending_locked_response(req.filename))
+        }
+        InconclusiveOutcome::ServePending => {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
+                "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+            );
+            let mut resp = file.serve_unscanned_stream(state, req).await?;
+            record_scanned_proxy_download(state, req).await;
+            resp.headers_mut()
+                .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+            Ok(resp)
+        }
+    }
+}
+
+/// Record a download served by [`serve_scanned_proxy_file`], on either arm.
+async fn record_scanned_proxy_download(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+) {
+    if let Some(ctx) = req.ctx {
+        record_proxy_download(state, req.repo_id, req.repo_key, req.cache_path, ctx).await;
+    }
+}
+
+/// #4098: the generic scan-on-proxy wrapper, driven through a fake format so
+/// the shared sequence is pinned independently of npm / PyPI / VS Code (whose
+/// own end-to-end suites prove the ports kept their behaviour).
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scanned_proxy_file_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A format whose hooks count their calls and whose 200 names what the
+    /// wrapper handed it.
+    #[derive(Default)]
+    struct FakeFormat {
+        after_fetch: AtomicUsize,
+        streamed: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScannedProxyFile for FakeFormat {
+        const LABEL: &'static str = "fake";
+
+        fn synthetic_content_type(_filename: &str) -> String {
+            "application/x-fake".to_string()
+        }
+
+        fn synthetic_version(filename: &str) -> Option<String> {
+            filename.strip_suffix(".fake").map(str::to_string)
+        }
+
+        fn identity(
+            &self,
+            _req: &ScannedProxyRequest<'_>,
+            _bytes: &Bytes,
+            _digest: &str,
+        ) -> ProxyScanIdentity {
+            ProxyScanIdentity::NotApplicable
+        }
+
+        async fn after_buffered_fetch(
+            &self,
+            _state: &crate::api::SharedState,
+            _req: &ScannedProxyRequest<'_>,
+        ) {
+            self.after_fetch.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn serve_unscanned_stream(
+            &self,
+            _state: &crate::api::SharedState,
+            _req: &ScannedProxyRequest<'_>,
+        ) -> Result<Response, Response> {
+            self.streamed.fetch_add(1, Ordering::SeqCst);
+            Ok((StatusCode::OK, "streamed").into_response())
+        }
+
+        fn scanned_response(
+            &self,
+            req: &ScannedProxyRequest<'_>,
+            body: ScannedProxyBody,
+            pending: bool,
+        ) -> Response {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("X-Fake-File", req.filename)
+                .header("X-Fake-Digest", body.digest)
+                .header("X-Fake-Pending", pending.to_string())
+                .body(axum::body::Body::from(body.bytes))
+                .unwrap()
+        }
+    }
+
+    fn request<'a>(
+        repo_id: Uuid,
+        repo_key: &'a str,
+        fetch_base: &'a str,
+        action: ProxyScanAction,
+    ) -> ScannedProxyRequest<'a> {
+        ScannedProxyRequest {
+            repo_id,
+            repo_key,
+            fetch_base,
+            format: RepositoryFormat::Generic,
+            source_path: "files/pkg-1.0.fake",
+            cache_path: "files/pkg-1.0.fake",
+            filename: "pkg-1.0.fake",
+            action,
+            severity_gate: ProxySeverityGate::BlockOnAny,
+            ctx: None,
+        }
+    }
+
+    /// Proxy downloads recorded for the request's cache path (#3446).
+    async fn recorded(fx: &tdh::Fixture) -> i64 {
+        crate::services::proxy_catalog::download_counts_by_paths(
+            &fx.pool,
+            fx.repo_id,
+            &["files/pkg-1.0.fake".to_string()],
+        )
+        .await
+        .unwrap()
+        .get("files/pkg-1.0.fake")
+        .copied()
+        .unwrap_or(0)
+    }
+
+    async fn body_of(resp: Response) -> Bytes {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// A DB-backed Remote repo, a proxy over its storage, and an upstream
+    /// serving `bytes` at the request's source path (`None` = 404).
+    async fn rig(
+        bytes: Option<Vec<u8>>,
+    ) -> Option<(
+        tdh::Fixture,
+        crate::api::SharedState,
+        Arc<ProxyService>,
+        wiremock::MockServer,
+    )> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy.clone());
+        let upstream = wiremock::MockServer::start().await;
+        let template = match bytes {
+            Some(b) => ResponseTemplate::new(200).set_body_bytes(b),
+            None => ResponseTemplate::new(404),
+        };
+        Mock::given(method("GET"))
+            .and(path("/files/pkg-1.0.fake"))
+            .respond_with(template)
+            .mount(&upstream)
+            .await;
+        Some((fx, state, proxy, upstream))
+    }
+
+    #[test]
+    fn synthetic_artifact_takes_the_format_bits() {
+        let repo_id = Uuid::new_v4();
+        let a = FakeFormat::synthetic_artifact(repo_id, "pkg-1.0.fake", "ab12", 7);
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.name, "pkg-1.0.fake");
+        assert_eq!(a.path, "pkg-1.0.fake");
+        assert_eq!(a.version.as_deref(), Some("pkg-1.0"));
+        assert_eq!(a.content_type, "application/x-fake");
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 7);
+        assert!(a.storage_key.is_empty());
+        assert!(a.quarantine_status.is_none());
+    }
+
+    /// The rescan builder shares the same constructor: the filename is the
+    /// cache path's last segment and an unknown content type is octet-stream.
+    #[test]
+    fn rescan_synthetic_artifact_uses_the_shared_builder() {
+        let a = proxy_rescan_synthetic_artifact(Uuid::new_v4(), "a/b/c.whl", "d", 1, None);
+        assert_eq!(a.name, "c.whl");
+        assert_eq!(a.path, "c.whl");
+        assert_eq!(a.version, None);
+        assert_eq!(a.content_type, "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn oversized_fail_closed_locks_without_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = FakeFormat::default();
+        let req = request(
+            Uuid::new_v4(),
+            "r",
+            "http://unused",
+            ProxyScanAction::FailClosed,
+        );
+        let resp = serve_oversized_proxy_file(&state, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        let body: serde_json::Value = serde_json::from_slice(&body_of(resp).await).unwrap();
+        assert_eq!(body["error"], "scan_pending");
+        assert_eq!(body["file"], "pkg-1.0.fake");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_fail_open_streams_loudly_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = FakeFormat::default();
+        let req = request(
+            Uuid::new_v4(),
+            "r",
+            "http://unused",
+            ProxyScanAction::FailOpen,
+        );
+        let resp = serve_oversized_proxy_file(&state, &req, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(&body_of(resp).await[..], b"streamed");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 1);
+    }
+
+    /// Fail-open first pull of an unknown digest: the BUFFERED bytes are
+    /// served through the format's builder, loudly pending, digest computed
+    /// over exactly those bytes.
+    #[tokio::test]
+    async fn fail_open_first_pull_serves_buffered_bytes_through_the_format() {
+        let bytes = format!("fake-4098-open-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Stamped by the wrapper; the fake builder does not set it.
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(resp.headers()["X-Fake-Pending"], "true");
+        assert_eq!(resp.headers()["X-Fake-File"], "pkg-1.0.fake");
+        assert_eq!(
+            resp.headers()["X-Fake-Digest"].to_str().unwrap(),
+            sha256_hex(&Bytes::from(bytes.clone()))
+        );
+        assert_eq!(&body_of(resp).await[..], &bytes[..]);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 1);
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+        assert_eq!(recorded(&fx).await, 1, "a scanned 200 records exactly once");
+        fx.teardown().await;
+    }
+
+    /// Fail-closed first pull with no scanner configured: the inline scan is
+    /// inconclusive, so the wrapper withholds (423) and never builds a 200.
+    #[tokio::test]
+    async fn fail_closed_unscannable_first_pull_is_locked() {
+        let bytes = format!("fake-4098-closed-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
+        fx.teardown().await;
+    }
+
+    /// A cached vulnerable verdict for the content digest blocks with the
+    /// neutral 403, before any scan.
+    #[tokio::test]
+    async fn cached_vulnerable_digest_is_blocked() {
+        let bytes = format!("fake-4098-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-4098-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body_of(resp).await).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], "pkg-1.0.fake");
+        assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
+        fx.teardown().await;
+    }
+
+    /// Over the cap, the fail-open stream is recorded exactly once and the
+    /// fail-closed lock records nothing (#3446 on both inconclusive arms).
+    #[tokio::test]
+    async fn oversized_arms_record_exactly_what_they_serve() {
+        let Some((fx, state, _proxy, upstream)) = rig(None).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let file = FakeFormat::default();
+
+        let mut locked = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        locked.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &locked, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert_eq!(recorded(&fx).await, 0);
+
+        let mut open = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        open.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &open, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(recorded(&fx).await, 1);
+        fx.teardown().await;
+    }
+
+    /// An upstream miss is passed through as-is (a virtual member walk falls
+    /// through to the next member on it) and never reaches the format hooks.
+    #[tokio::test]
+    async fn upstream_miss_passes_through_untouched() {
+        let Some((fx, state, proxy, upstream)) = rig(None).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 0);
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+        fx.teardown().await;
     }
 }
 
@@ -19235,6 +19869,9 @@ mod proxy_download_recording_tests {
         "record_proxy_download(",
         "record_proxy_download_deferred(",
         "try_remote_or_virtual_download(",
+        // #4098: the generic scan-on-proxy wrapper records on both of its serve
+        // arms (the scanned 200 and the over-cap fail-open stream).
+        "serve_scanned_proxy_file(",
     ];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
@@ -19576,6 +20213,10 @@ mod proxy_download_recording_tests {
                     // `try_remote_or_virtual_download(` is a route, not a
                     // recorder call owned by the handler — this pin is about
                     // the handler itself carrying the recording call.
+                    //
+                    // #4098's `serve_scanned_proxy_file(` stays counted: it is
+                    // the handler's own scanned serve, and npm's only recording
+                    // call lived in that arm before the wrapper absorbed it.
                     .filter(|r| **r != "try_remote_or_virtual_download(")
                     .any(|r| src.contains(r))
             })

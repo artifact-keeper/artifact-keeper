@@ -4802,41 +4802,6 @@ fn npm_identity_agrees(
     claimed.0.eq_ignore_ascii_case(requested_name) && claimed.1 == requested_version
 }
 
-/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
-/// the leaf scanners run over for a proxied npm tarball. There is NO
-/// `artifacts` row (proxy-cached bytes are deliberately not persisted as
-/// artifacts, #1278/#1280). The `.tgz` filename plus the `application/gzip`
-/// content type drive scanner applicability and archive extraction exactly as
-/// for a hosted npm tarball (see [`correct_cached_tarball_content_type`] for
-/// why the content type must be gzip).
-fn npm_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = chrono::Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: NPM_TARBALL_CONTENT_TYPE.to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
-    }
-}
-
 /// Build a buffered 200 response for scanned npm tarball bytes. `pending`
 /// selects the loud `X-AK-Scan: pending` header for the fail-open
 /// serve-before-verdict path so a served-unscanned byte is observable.
@@ -4954,17 +4919,17 @@ async fn npm_cached_tarball_source(
     npm_tarball_source_for_filename(&packument, filename, upstream_url)
 }
 
-/// Inline scan-and-block for an npm proxy tarball download (#3003).
+/// Inline scan-and-block for an npm proxy tarball download (#3003), on the
+/// generic gate ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled for the repo; the caller keeps the
-/// untouched streaming path otherwise. Flow mirrors `serve_scanned_pypi_file`:
-/// buffered capped fetch (cache-first, so a repeat pull is served from cache
-/// with no upstream hit) → content digest over the TARBALL bytes (never the
-/// packument or anything the upstream index controls) → shared digest-keyed
-/// verdict gate → serve / block (403) / lock (423) per the repo's
-/// fail-open/closed action. Scoped packages need no special-casing: the
-/// concrete `@scope/pkg/-/file.tgz` fetch path is the single seam every
-/// `npm install` byte passes through, and the verdict is keyed on content.
+/// untouched streaming path otherwise. The buffered capped fetch runs under the
+/// SAME cache key as the streaming path (`fetch_path`), so the cache stays warm
+/// across the two paths, and the digest is over the TARBALL bytes (never the
+/// packument or anything the upstream index controls). Scoped packages need no
+/// special-casing: the concrete `@scope/pkg/-/file.tgz` fetch path is the
+/// single seam every `npm install` byte passes through, and the verdict is
+/// keyed on content.
 #[allow(clippy::too_many_arguments)]
 async fn serve_scanned_npm_tarball(
     state: &SharedState,
@@ -4980,96 +4945,71 @@ async fn serve_scanned_npm_tarball(
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    // Buffered capped fetch (cache-first) under the SAME cache key as the
-    // streaming path (`fetch_path`), so the cache stays warm across the two
-    // paths and a repeat pull returns from cache with NO upstream fetch.
-    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+    let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
-        upstream_url,
-        RepositoryFormat::Npm,
-    );
-    // The upstream content-type is discarded on purpose (the tarball type is
-    // fixed by the format), but the upstream CODING is not: this arm forwards
-    // the buffered body verbatim, so it must declare what the bytes are coded
-    // with or reproduce #3149 (#3184).
-    let (bytes, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &remote_repo,
-            source_path,
-            fetch_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok((bytes, _upstream_content_type, content_encoding)) => (bytes, content_encoding),
-        Err(e) if proxy_helpers::is_over_cap_error(&e) => {
-            // Over the byte cap: never buffer unbounded (#895 OOM).
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    tracing::warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "npm proxy tarball exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(proxy_helpers::scan_pending_locked_response(filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    // Fail-open oversized: serve via the untouched streaming
-                    // path (loud: X-AK-Scan pending header on the stream).
-                    tracing::warn!(
-                        repo_id = %repo_id, file = %filename,
-                        "npm proxy tarball exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
-                        proxy,
-                        repo_id,
-                        repo_key,
-                        upstream_url,
-                        source_path,
-                        fetch_path,
-                        RepositoryFormat::Npm,
-                    )
-                    .await?;
-                    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
-                    proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx)
-                        .await;
-                    let mut resp = build_tarball_response_stream(
-                        result.body,
-                        filename,
-                        npm_virtual_tarball_content_type(result.content_type),
-                        result.content_length,
-                        result.content_encoding,
-                    );
-                    resp.headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(resp)
-                }
-            };
-        }
-        Err(e) => return Err(e.into_response()),
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Npm,
+        source_path,
+        cache_path: fetch_path,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
     };
+    let tarball = NpmScannedTarball {
+        proxy,
+        package_name,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &tarball).await
+}
 
-    // The upstream registry may return application/octet-stream; correct the
-    // cached record so SBOM generation / background scanners see gzip (same
-    // as the streaming path).
-    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+/// The npm half of the generic proxy scan gate. The wrapper records the download on
+/// both serve arms, including [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct NpmScannedTarball<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    package_name: &'a str,
+}
 
-    let digest = proxy_helpers::sha256_hex(&bytes);
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
+    const LABEL: &'static str = "npm tarball";
 
-    // #3003: establish WHAT these bytes are being served as.
-    //
-    // The coordinate comes from the REQUEST (route package name + the
-    // registry's invariant `{basename}-{version}.tgz` filename), never from
-    // bytes the upstream controls, and the tarball's own `package/package.json`
-    // must agree with it. A tarball that states a different identity, states
-    // none, or states an unusable one (missing/empty/non-string version) is
-    // unassessable: any scan of it would grade something other than the package
-    // the consumer is about to install under this coordinate.
-    //
-    // This is only consulted when the shared gate actually needs to SCAN — a
-    // cached vulnerable verdict for this digest still blocks first, from cache.
-    let identity = match npm_version_from_tarball_filename(package_name, filename) {
-        Some(version) => match npm_claimed_identity(&bytes) {
+    /// `.tgz` + `application/gzip` drive scanner applicability and archive
+    /// extraction exactly as for a hosted npm tarball (see
+    /// [`correct_cached_tarball_content_type`] for why it must be gzip).
+    fn synthetic_content_type(_filename: &str) -> String {
+        NPM_TARBALL_CONTENT_TYPE.to_string()
+    }
+
+    /// #3003: establish WHAT these bytes are being served as.
+    ///
+    /// The coordinate comes from the REQUEST (route package name + the
+    /// registry's invariant `{basename}-{version}.tgz` filename), never from
+    /// bytes the upstream controls, and the tarball's own `package/package.json`
+    /// must agree with it. A tarball that states a different identity, states
+    /// none, or states an unusable one (missing/empty/non-string version) is
+    /// unassessable: any scan of it would grade something other than the
+    /// package the consumer is about to install under this coordinate.
+    ///
+    /// This is only consulted when the shared gate actually needs to SCAN — a
+    /// cached vulnerable verdict for this digest still blocks first, from cache.
+    fn identity(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        let package_name = self.package_name;
+        let Some(version) = npm_version_from_tarball_filename(package_name, req.filename) else {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+                package = %package_name,
+                "npm proxy tarball filename does not encode a version for this package"
+            );
+            return proxy_helpers::ProxyScanIdentity::Unestablished;
+        };
+        match npm_claimed_identity(bytes) {
             Some(claimed) if npm_identity_agrees(package_name, &version, &claimed) => {
                 proxy_helpers::ProxyScanIdentity::Established(
                     crate::services::scanner_service::ExpectedComponent::new(
@@ -5081,50 +5021,71 @@ async fn serve_scanned_npm_tarball(
             }
             other => {
                 tracing::warn!(
-                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    repo_id = %req.repo_id, file = %req.filename, digest = %digest,
                     requested = %format!("{package_name}@{version}"),
                     claimed = ?other,
                     "npm proxy tarball does not state the identity it is served as"
                 );
                 proxy_helpers::ProxyScanIdentity::Unestablished
             }
-        },
-        None => {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, digest = %digest,
-                package = %package_name,
-                "npm proxy tarball filename does not encode a version for this package"
-            );
-            proxy_helpers::ProxyScanIdentity::Unestablished
         }
-    };
+    }
 
-    let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo_id,
-        filename,
-        &digest,
-        synthetic,
-        &bytes,
-        action,
-        severity_gate,
-        identity,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx).await;
-            Ok(build_scanned_tarball_response(
-                filename,
-                bytes,
-                content_encoding.as_deref(),
-                &digest,
-                pending,
-            ))
-        }
+    /// The upstream registry may return application/octet-stream; correct the
+    /// cached record so SBOM generation / background scanners see gzip (same
+    /// as the streaming path).
+    async fn after_buffered_fetch(
+        &self,
+        state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) {
+        correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // fail-open fallback after it resolves (#4098). Needed because the
+        // #3446 gate attributes this call to the impl method around it.
+        let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            req.fetch_base,
+            req.source_path,
+            req.cache_path,
+            RepositoryFormat::Npm,
+        )
+        .await?;
+        correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
+        Ok(build_tarball_response_stream(
+            result.body,
+            req.filename,
+            npm_virtual_tarball_content_type(result.content_type),
+            result.content_length,
+            result.content_encoding,
+        ))
+    }
+
+    /// The upstream content-type is discarded on purpose (the tarball type is
+    /// fixed by the format), but the upstream CODING is not (#3184).
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_tarball_response(
+            req.filename,
+            body.bytes,
+            body.content_encoding.as_deref(),
+            &body.digest,
+            pending,
+        )
     }
 }
 
@@ -15671,7 +15632,12 @@ mod proxy_scan_block_tests {
     #[test]
     fn test_npm_synthetic_artifact_shape() {
         let repo_id = uuid::Uuid::new_v4();
-        let a = npm_synthetic_artifact(repo_id, "widget-1.0.0.tgz", "ab12", 42);
+        let a = <NpmScannedTarball<'_> as proxy_helpers::ScannedProxyFile>::synthetic_artifact(
+            repo_id,
+            "widget-1.0.0.tgz",
+            "ab12",
+            42,
+        );
         assert_eq!(a.repository_id, repo_id);
         assert_eq!(a.name, "widget-1.0.0.tgz");
         assert_eq!(a.path, "widget-1.0.0.tgz");
