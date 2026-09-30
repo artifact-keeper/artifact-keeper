@@ -344,10 +344,43 @@ impl LdapService {
 
         let user_info = tokio::time::timeout(Self::AUTH_TIMEOUT, async {
             if self.config.bind_dn.is_some() && self.config.bind_password.is_some() {
-                let user_info = self.search_user_entry(username).await?;
-                self.validate_ldap_credentials(&user_info.dn, password)
-                    .await?;
-                Ok(user_info)
+                // #3371 made an absent username and a wrong password answer
+                // with the same body, but the absent arm returned straight
+                // after the search while the found arm paid a second connect
+                // plus a simple bind. Against a directory with real RTT, or
+                // STARTTLS, or an AD that delays rejected binds, that extra
+                // round-trip is a timing oracle for "this username exists"
+                // (#3505). A miss now binds against a DN that cannot exist,
+                // with the submitted password, so both arms do exactly one
+                // service bind + search and then one bind on a fresh
+                // connection, and fail with the same error. The decoy's
+                // outcome is ignored: a miss always fails.
+                //
+                // Cost: a sweep of absent names now costs the directory the
+                // same extra bind per attempt that a sweep of present names
+                // (or a wrong-password sweep) already costs, so it adds no new
+                // amplification class.
+                //
+                // Residual, outside the app: a directory may still do
+                // different work for a bind to a DN that does not exist than
+                // for a real account with a wrong password (Active Directory
+                // updates badPwdCount / lockout state for the real account).
+                // Equalising that is the directory's concern; what this code
+                // controls -- the operations it sends and the error it
+                // returns -- is now identical on both arms.
+                match self.lookup_user(username).await? {
+                    Some(user_info) => {
+                        self.validate_ldap_credentials(&user_info.dn, password)
+                            .await?;
+                        Ok(user_info)
+                    }
+                    None => {
+                        let _ = self
+                            .validate_ldap_credentials(&self.decoy_bind_dn(), password)
+                            .await;
+                        Err(Self::user_not_found(username, &self.config.base_dn))
+                    }
+                }
             } else {
                 tracing::debug!(username = %username, "Using direct-bind fallback (no service account configured)");
                 self.validate_ldap_credentials(username, password).await?;
@@ -731,6 +764,35 @@ impl LdapService {
     /// forms keeps the runtime behaviour aligned with the configured provider
     /// and avoids silent mismatches during user lookup.
     async fn search_user_entry(&self, username: &str) -> Result<LdapUserInfo> {
+        self.lookup_user(username)
+            .await?
+            .ok_or_else(|| Self::user_not_found(username, &self.config.base_dn))
+    }
+
+    /// A directory miss, reported exactly like a rejected bind.
+    ///
+    /// A miss must be indistinguishable from a rejected bind to an
+    /// unauthenticated caller (#3371). It used to answer "User not found in
+    /// LDAP" while a wrong password answered "Invalid credentials", which is a
+    /// user-enumeration oracle on a public endpoint. The username and the base
+    /// DN that produced the miss stay in the server log, where operators
+    /// debugging a filter still need them.
+    fn user_not_found(username: &str, base_dn: &str) -> AppError {
+        tracing::warn!(
+            target: "security",
+            username = %username,
+            base_dn = %base_dn,
+            "LDAP user search matched no directory entry"
+        );
+        AppError::Authentication(LDAP_AUTH_FAILURE_MESSAGE.into())
+    }
+
+    /// Look a user up with the service account: `Ok(None)` when the search
+    /// succeeded and matched no entry, `Err` when the directory could not be
+    /// asked (connection, service bind or search failure). Callers that act
+    /// on absence -- the reconcile job deactivating users (#3830) -- must
+    /// only treat `Ok(None)` as "gone".
+    pub async fn lookup_user(&self, username: &str) -> Result<Option<LdapUserInfo>> {
         use ldap3::{Scope, SearchEntry};
 
         tracing::debug!(username = %username, "Searching for user in LDAP");
@@ -758,28 +820,27 @@ impl LdapService {
 
         ldap.unbind().await.ok();
 
-        let entry = results.into_iter().next().ok_or_else(|| {
-            // A directory miss must be indistinguishable from a rejected bind
-            // to an unauthenticated caller (#3371). It used to answer "User
-            // not found in LDAP" while a wrong password answered "Invalid
-            // credentials", which is a user-enumeration oracle on a public
-            // endpoint. The username and the base DN that produced the miss
-            // stay in the server log, where operators debugging a filter still
-            // need them.
-            tracing::warn!(
-                target: "security",
-                username = %username,
-                base_dn = %self.config.base_dn,
-                "LDAP user search matched no directory entry"
-            );
-            AppError::Authentication(LDAP_AUTH_FAILURE_MESSAGE.into())
-        })?;
+        let Some(entry) = results.into_iter().next() else {
+            return Ok(None);
+        };
 
         let entry = SearchEntry::construct(entry);
 
         tracing::debug!(username = %username, dn = %entry.dn, "LDAP user found");
 
-        Ok(self.extract_user_from_entry(entry, username))
+        Ok(Some(self.extract_user_from_entry(entry, username)))
+    }
+
+    /// A bind DN that cannot exist in the directory, for the decoy bind a
+    /// search miss pays (#3505). Random per call so it can never collide with
+    /// (or lock out) a real entry, and never derived from the submitted
+    /// username.
+    fn decoy_bind_dn(&self) -> String {
+        format!(
+            "cn=ak-login-decoy-{},{}",
+            Uuid::new_v4().simple(),
+            self.config.base_dn
+        )
     }
 
     /// Validate LDAP credentials via real LDAP simple bind.
@@ -3110,6 +3171,9 @@ mod tests {
         entry: Option<(String, String, String)>,
         /// resultCode for the second (user) bind: 0 accept, 49 reject.
         user_bind_rc: u8,
+        /// Directory operations observed, in order (#3505): `connect`,
+        /// `bind-service`, `search`, `bind`.
+        ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     /// Encode one BER tag-length-value.
@@ -3211,6 +3275,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                dir.ops.lock().unwrap().push("connect");
                 loop {
                     use tokio::io::AsyncWriteExt;
                     let Some(frame) = read_ldap_frame(&mut sock).await else {
@@ -3232,13 +3297,16 @@ mod tests {
                                 ber_next_tlv(&op_body[after_version..]).expect("bind dn");
                             let dn = String::from_utf8_lossy(dn_bytes).to_string();
                             let rc = if dn == dir.service_dn {
+                                dir.ops.lock().unwrap().push("bind-service");
                                 0x00
                             } else {
+                                dir.ops.lock().unwrap().push("bind");
                                 dir.user_bind_rc
                             };
                             ber_ldap_message(msgid, ber_ldap_result(LDAP_OP_BIND_RESPONSE, rc))
                         }
                         LDAP_OP_SEARCH_REQUEST => {
+                            dir.ops.lock().unwrap().push("search");
                             let mut out = Vec::new();
                             if let Some((dn, uid, mail)) = &dir.entry {
                                 let mut attrs = Vec::new();
@@ -3299,22 +3367,39 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
-    /// A username with no directory entry.
-    async fn authenticate_unknown_user() -> AppError {
+    /// Operations log shared with a [`MockDirectory`].
+    type OpsLog = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    /// A username with no directory entry, plus the directory operations the
+    /// attempt performed.
+    async fn authenticate_unknown_user_ops() -> (AppError, Vec<&'static str>) {
+        let ops = OpsLog::default();
         let port = spawn_mock_directory(MockDirectory {
             service_dn: MOCK_SERVICE_DN.to_string(),
             entry: None,
+            // Accept every non-service bind: even a directory that would
+            // accept the decoy bind must not turn a miss into a login.
             user_bind_rc: 0x00,
+            ops: ops.clone(),
         })
         .await;
-        make_search_then_bind_service(port)
+        let err = make_search_then_bind_service(port)
             .authenticate("ghost", "any-password")
             .await
-            .expect_err("a username with no directory entry must not authenticate")
+            .expect_err("a username with no directory entry must not authenticate");
+        let seen = ops.lock().unwrap().clone();
+        (err, seen)
     }
 
-    /// A username that exists, presenting the wrong password.
-    async fn authenticate_wrong_password() -> AppError {
+    /// A username with no directory entry.
+    async fn authenticate_unknown_user() -> AppError {
+        authenticate_unknown_user_ops().await.0
+    }
+
+    /// A username that exists, presenting the wrong password, plus the
+    /// directory operations the attempt performed.
+    async fn authenticate_wrong_password_ops() -> (AppError, Vec<&'static str>) {
+        let ops = OpsLog::default();
         let port = spawn_mock_directory(MockDirectory {
             service_dn: MOCK_SERVICE_DN.to_string(),
             entry: Some((
@@ -3323,12 +3408,57 @@ mod tests {
                 "alice@example.com".to_string(),
             )),
             user_bind_rc: 0x31, // invalidCredentials
+            ops: ops.clone(),
         })
         .await;
-        make_search_then_bind_service(port)
+        let err = make_search_then_bind_service(port)
             .authenticate("alice", "wrong-password")
             .await
-            .expect_err("a rejected bind must not authenticate")
+            .expect_err("a rejected bind must not authenticate");
+        let seen = ops.lock().unwrap().clone();
+        (err, seen)
+    }
+
+    /// A username that exists, presenting the wrong password.
+    async fn authenticate_wrong_password() -> AppError {
+        authenticate_wrong_password_ops().await.0
+    }
+
+    /// #3505: the residual timing channel #3371 left was structural -- an
+    /// absent username returned after the search, a present one paid a second
+    /// connect plus a bind. Wall-clock sampling cannot pin that reliably, so
+    /// this pins the *work*: both arms must drive the directory through the
+    /// same operations, in the same order, and fail with the same bytes.
+    #[tokio::test]
+    async fn test_absent_user_and_wrong_password_do_the_same_directory_work() {
+        let (absent_err, absent_ops) = authenticate_unknown_user_ops().await;
+        let (wrong_err, wrong_ops) = authenticate_wrong_password_ops().await;
+        assert_eq!(
+            wrong_ops,
+            vec!["connect", "bind-service", "search", "connect", "bind"],
+            "baseline: a present user is searched, then bound on a fresh connection"
+        );
+        assert_eq!(
+            absent_ops, wrong_ops,
+            "an absent username must pay the same directory round-trips as a \
+             wrong password, or response time reveals which usernames exist (#3505)"
+        );
+        assert_eq!(
+            client_visible(absent_err).await,
+            client_visible(wrong_err).await
+        );
+    }
+
+    /// The decoy bind a miss pays must never target a real entry: it is not
+    /// derived from the username and is fresh per attempt.
+    #[tokio::test]
+    async fn test_decoy_bind_dn_is_unguessable_and_not_username_derived() {
+        let svc = make_search_then_bind_service(1);
+        let a = svc.decoy_bind_dn();
+        let b = svc.decoy_bind_dn();
+        assert_ne!(a, b, "decoy DN must be fresh per attempt");
+        assert!(a.starts_with("cn=ak-login-decoy-"), "{a}");
+        assert!(a.ends_with(&format!(",{}", svc.config.base_dn)), "{a}");
     }
 
     #[tokio::test]
