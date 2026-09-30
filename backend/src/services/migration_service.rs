@@ -352,7 +352,12 @@ impl MigrationService {
             // a re-publish (#2525).
             "maven" | "npm" | "docker" | "pypi" | "helm" | "nuget" | "cargo" | "go" | "generic"
             | "rubygems" | "cran" => FormatCompatibility::Full,
-            "conan" | "conda" | "debian" | "rpm" => FormatCompatibility::Partial,
+            // RPM is Full: repodata is rendered at request time from the
+            // repository's `.rpm` rows, and the importer records each
+            // package's header metadata (requires/provides/summary) exactly as
+            // a native or generic upload does (#3925).
+            "rpm" => FormatCompatibility::Full,
+            "conan" | "conda" | "debian" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
     }
@@ -396,11 +401,6 @@ impl MigrationService {
                 "the APT index (Packages/Release) stays empty, so \
                  `apt-get update` sees no packages",
                 "re-upload the .deb files to /debian/<repo>",
-            ),
-            "rpm" => (
-                "the YUM/DNF metadata (repodata) stays empty, so `dnf install` \
-                 finds no packages",
-                "re-upload the .rpm files to /rpm/<repo>",
             ),
             _ => (
                 "the package index stays empty",
@@ -2536,7 +2536,7 @@ mod tests {
 
     #[test]
     fn test_format_compatibility_all_partial() {
-        let partial_formats = ["conan", "conda", "debian", "rpm"];
+        let partial_formats = ["conan", "conda", "debian"];
         for fmt in &partial_formats {
             assert_eq!(
                 MigrationService::get_format_compatibility(fmt),
@@ -2629,10 +2629,10 @@ mod tests {
             FormatCompatibility::Full
         );
 
-        // Yum repositories map to AK's rpm format (partial support).
+        // Yum repositories map to AK's rpm format, indexed natively (#3925).
         assert_eq!(
             MigrationService::get_format_compatibility("yum"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
 
         // #2784: Nexus `apt` repositories map to AK's `debian` (partial
@@ -2715,7 +2715,7 @@ mod tests {
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "rpm");
-        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
     }
 
     #[test]
@@ -2819,7 +2819,7 @@ mod tests {
         );
         assert_eq!(
             MigrationService::get_format_compatibility("RPM"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
     }
 
@@ -4111,14 +4111,14 @@ mod tests {
     // `generic` behind the operator's back.
     // -----------------------------------------------------------------------
 
-    /// The four formats the migration copies byte-for-byte without building
+    /// The formats the migration copies byte-for-byte without building
     /// their package index, paired with the AK `repository_format` each one
-    /// must be provisioned as.
-    const INDEX_GAP_FORMATS: [(&str, &str); 4] = [
+    /// must be provisioned as. RPM left this list when the importer started
+    /// recording header metadata for the dynamically rendered repodata.
+    const INDEX_GAP_FORMATS: [(&str, &str); 3] = [
         ("conan", "conan"),
         ("conda", "conda_native"),
         ("debian", "debian"),
-        ("rpm", "rpm"),
     ];
 
     /// The limitation text has to name the format, the index that stays
@@ -4144,7 +4144,7 @@ mod tests {
         }
 
         // Source-specific aliases resolve to the same statement.
-        for alias in ["yum", "apt", "CONAN"] {
+        for alias in ["apt", "CONAN"] {
             assert!(
                 MigrationService::index_limitation(alias).is_some(),
                 "{alias} normalizes onto a file-copy-only format"
@@ -4152,7 +4152,9 @@ mod tests {
         }
 
         // Natively-indexed and unsupported formats say nothing.
-        for quiet in ["maven", "npm", "docker", "pypi", "generic", "cargo", "wat"] {
+        for quiet in [
+            "maven", "npm", "docker", "pypi", "generic", "cargo", "rpm", "yum", "wat",
+        ] {
             assert!(
                 MigrationService::index_limitation(quiet).is_none(),
                 "{quiet} must not claim an index gap"
@@ -4672,8 +4674,8 @@ mod tests {
 
         // The operator pre-created the destination natively and routed the
         // migration at it; the bytes land, the index does not.
-        seed_migrated_repo(&pool, &target_key, "rpm").await;
-        seed_completed_item(&pool, job_id, &format!("{source_key}/pkg-1.0-1.x86_64.rpm")).await;
+        seed_migrated_repo(&pool, &target_key, "debian").await;
+        seed_completed_item(&pool, job_id, &format!("{source_key}/pkg_1.0-1_amd64.deb")).await;
 
         let warnings_text = generated_report_warnings(&pool, job_id).await.to_string();
         assert!(

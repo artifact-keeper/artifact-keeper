@@ -1405,6 +1405,54 @@ impl MigrationWorker {
         Ok(())
     }
 
+    /// The `artifact_metadata` document the RPM upload paths record for a
+    /// `.rpm`, read from the migrated file's header (#3925). `None` for other
+    /// formats and files, for an unreadable header, and for a header over the
+    /// repodata indexing limits (which a native upload would refuse; here the
+    /// package is still migrated and listed from its filename).
+    async fn migration_rpm_metadata(
+        &self,
+        package_type: &str,
+        artifact_path: &str,
+        temp_path: &std::path::Path,
+    ) -> Option<serde_json::Value> {
+        if !package_type.eq_ignore_ascii_case("rpm") || !artifact_path.ends_with(".rpm") {
+            return None;
+        }
+        let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+        let prefix = crate::api::handlers::upload::read_rpm_header_prefix(temp_path)
+            .await
+            .ok()?;
+        // Parsing an untrusted header (up to `RPM_HEADER_READ_MAX`) is CPU
+        // work; keep it off the async runtime, as the upload paths do.
+        let filename = filename.to_string();
+        match tokio::task::spawn_blocking(move || {
+            crate::api::handlers::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+        })
+        .await
+        {
+            Ok(Ok(meta)) => meta,
+            // Unlike an upload, which refuses an over-limit header with 400,
+            // the migration still moves the bytes: the package is listed from
+            // its filename, and the repodata heal marks it unparseable.
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    "RPM header exceeds the repodata indexing limits; migrated without header metadata"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    error = %e,
+                    "RPM header parse task failed; migrated without header metadata"
+                );
+                None
+            }
+        }
+    }
+
     /// Give an already-imported Maven file the `artifact_metadata` row that
     /// `maven-metadata.xml` generation reads, when it has none (#3927).
     ///
@@ -2186,6 +2234,14 @@ impl MigrationWorker {
         // so LATEST/RELEASE resolution fell through to another repository.
         .or_else(|| migration_maven_metadata(package_type, artifact_path));
 
+        // #3925: an RPM's header metadata (summary, requires/provides, the
+        // #3801 repodata block) is what repodata renders beyond the filename.
+        // Read the same bounded header prefix the generic upload path reads,
+        // from the spilled temp file, and record it after the row commits.
+        let rpm_metadata = self
+            .migration_rpm_metadata(package_type, artifact_path, &temp_path)
+            .await;
+
         // Get metadata if requested
         let metadata = if include_metadata {
             match client.get_properties(repo_key, artifact_path).await {
@@ -2587,6 +2643,27 @@ impl MigrationWorker {
                 }
 
                 tx.commit().await?;
+
+                // #3925: record the RPM header metadata through the helper the
+                // native and generic upload paths share (it also bumps the
+                // repository so the repodata cache re-renders). Best-effort:
+                // without it the package is still listed, from its filename.
+                if let (Some(id), Some(meta)) = (artifact_id, &rpm_metadata) {
+                    if let Err(e) = crate::api::handlers::rpm::record_rpm_metadata(
+                        &self.db,
+                        id,
+                        repository_id,
+                        meta,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            path = %artifact_path,
+                            error = %e,
+                            "could not record RPM header metadata for a migrated package"
+                        );
+                    }
+                }
 
                 // #3927: a GET of this GA's `maven-metadata.xml` during the
                 // migration cached the version set as it stood then; drop it so
@@ -11184,6 +11261,48 @@ mod tests {
         assert_eq!(
             single_catalog_row(&pool, repo_id).await,
             Some(("dplyr".to_string(), "1.1.3".to_string()))
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #3925: a migrated `.rpm` must carry the header metadata the native and
+    /// generic upload paths record, so the dynamically rendered repodata
+    /// advertises its summary and dependencies, not just a filename.
+    #[tokio::test]
+    async fn test_rpm_import_records_header_metadata_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3925-rpm", "rpm").await;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ak-meta-test-1.0-1.noarch.rpm");
+        let bytes = std::fs::read(&fixture).expect("read rpm fixture");
+        let path = "Packages/a/ak-meta-test-1.0-1.noarch.rpm";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from(bytes));
+        transfer_one(&worker, &storage, &files, &repo_key, "rpm", path)
+            .await
+            .expect("rpm transfer must succeed");
+
+        let meta: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND am.format = 'rpm'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query rpm metadata");
+        let meta = meta.expect("the migrated .rpm must have a header-metadata row");
+        assert_eq!(meta["name"], "ak-meta-test", "{meta}");
+        assert!(
+            meta.get(crate::api::handlers::rpm::RPM_REPODATA_KEY)
+                .is_some(),
+            "the repodata block is recorded: {meta}"
         );
 
         cleanup_repo(&pool, repo_id).await;
