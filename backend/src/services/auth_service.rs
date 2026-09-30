@@ -3568,7 +3568,46 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        for user_id in &deactivated_ids {
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids.len() as u64)
+    }
+
+    /// Deactivate specific federated users the directory reconcile found
+    /// gone (#3830), with the same credential revocation as
+    /// [`Self::deactivate_missing_users`]. Only rows still active and still
+    /// owned by `provider` are touched; returns the ids actually deactivated.
+    pub async fn deactivate_federated_users(
+        &self,
+        provider: AuthProvider,
+        user_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deactivated_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE users
+            SET is_active = false, updated_at = NOW()
+            WHERE id = ANY($1) AND auth_provider = $2 AND is_active = true
+            RETURNING id
+            "#,
+        )
+        .bind(user_ids)
+        .bind(provider)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids)
+    }
+
+    /// Revoke every credential of freshly deactivated federated users: the
+    /// API-token cache, access tokens, and refresh-token families.
+    async fn revoke_deactivated_federated_users(&self, deactivated_ids: &[Uuid]) {
+        for user_id in deactivated_ids {
             invalidate_user_token_cache_entries(*user_id);
             invalidate_user_tokens(*user_id);
 
@@ -3583,8 +3622,6 @@ impl AuthService {
                 );
             }
         }
-
-        Ok(deactivated_ids.len() as u64)
     }
 
     /// Reactivate a previously deactivated federated user.

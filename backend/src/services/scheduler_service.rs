@@ -582,6 +582,41 @@ pub fn spawn_all(
         });
     }
 
+    // LDAP directory reconcile (#3830): every `LDAP_SYNC_INTERVAL` seconds
+    // (default 3600, `0` disables) re-read each active LDAP user, re-sync
+    // their LDAP group memberships and admin status, and -- only with
+    // `LDAP_SYNC_DEACTIVATE=true` -- deactivate users the directory no
+    // longer has. One replica runs a pass at a time (advisory lock); the
+    // pass logs its own summary. A pass with no enabled LDAP provider costs
+    // two queries.
+    if let Some(every) = crate::services::ldap_sync_service::sync_interval_from_env() {
+        let db = db.clone();
+        let auth = Arc::new(crate::services::auth_service::AuthService::new(
+            db.clone(),
+            Arc::new(config.clone()),
+        ));
+        let settings = Arc::new(crate::services::ldap_sync_service::settings_from_env());
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(600)).await;
+            let mut ticker = interval(every);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // Each pass runs as its own task so a panic inside it is
+                // reported here instead of ending this loop for good.
+                let (db, auth, settings) = (db.clone(), auth.clone(), settings.clone());
+                let pass = tokio::spawn(async move {
+                    crate::services::ldap_sync_service::run_ldap_sync(&db, &auth, &settings).await
+                });
+                match pass.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("LDAP directory reconcile pass failed: {}", e),
+                    Err(e) => tracing::error!("LDAP directory reconcile pass panicked: {}", e),
+                }
+            }
+        });
+    }
+
     // Storage garbage collection (cron-based, default: hourly)
     {
         let db = db.clone();

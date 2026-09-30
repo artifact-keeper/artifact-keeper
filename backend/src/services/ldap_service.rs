@@ -174,6 +174,22 @@ pub struct LdapUserInfo {
 /// being reported to every user as a bad password.
 pub(crate) const LDAP_AUTH_FAILURE_MESSAGE: &str = "Invalid credentials";
 
+/// RFC 4511 `noSuchObject`: the base DN of a search does not exist.
+const LDAP_RC_NO_SUCH_OBJECT: u32 = 32;
+/// RFC 4511 `referral`.
+const LDAP_RC_REFERRAL: u32 = 10;
+
+/// What re-reading a known DN found (#3830).
+#[derive(Debug, Clone)]
+pub enum DnLookup {
+    /// The entry exists and still matches the provider's user filter.
+    Found(LdapUserInfo),
+    /// The entry exists but no longer matches the user filter.
+    FilteredOut,
+    /// No entry at that DN (rc 32). It may have moved: not proof of absence.
+    NoSuchObject,
+}
+
 /// LDAP authentication service
 ///
 /// Uses ldap3 for real LDAP/LDAPS bind and search operations.
@@ -831,6 +847,129 @@ impl LdapService {
         Ok(Some(self.extract_user_from_entry(entry, username)))
     }
 
+    /// Open a connection bound as the provider's service account, for the
+    /// periodic directory reconcile (#3830) to reuse across a whole pass.
+    pub async fn service_session(&self) -> Result<ldap3::Ldap> {
+        match (&self.config.bind_dn, &self.config.bind_password) {
+            (Some(dn), Some(pw)) => self.connect_and_bind(dn, pw).await,
+            _ => Err(AppError::Internal(
+                "LDAP service account not configured for directory reconcile".into(),
+            )),
+        }
+    }
+
+    /// Run one search on an open connection and return its entries and
+    /// result code. Search result references (referrals) are never followed:
+    /// a search that yields only references, or answers `referral` (rc 10),
+    /// is an error, so the reconcile treats the user as unknown rather than
+    /// absent.
+    async fn search_entries(
+        ldap: &mut ldap3::Ldap,
+        base: &str,
+        scope: ldap3::Scope,
+        filter: &str,
+        attrs: Vec<&str>,
+    ) -> Result<(Vec<ldap3::SearchEntry>, u32)> {
+        let mut stream = ldap
+            .streaming_search(base, scope, filter, attrs)
+            .await
+            .map_err(Self::search_error)?;
+        let mut entries = Vec::new();
+        let mut references = 0usize;
+        loop {
+            match stream.next().await {
+                Ok(Some(entry)) if entry.is_ref() => references += 1,
+                Ok(Some(entry)) if entry.is_intermediate() => {}
+                Ok(Some(entry)) => entries.push(ldap3::SearchEntry::construct(entry)),
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = stream.finish().await;
+                    return Err(Self::search_error(e));
+                }
+            }
+        }
+        let result = stream.finish().await;
+        if result.rc == LDAP_RC_REFERRAL || (references > 0 && entries.is_empty()) {
+            return Err(Self::search_error(format!(
+                "directory answered with a referral for '{base}'; referrals are not followed"
+            )));
+        }
+        Ok((entries, result.rc))
+    }
+
+    /// Re-read a known user's entry by its DN on an open service connection
+    /// (#3830): a base-scope search on `dn`, filtered by the provider's
+    /// `user_filter` with the username placeholder widened to `*`.
+    ///
+    /// [`DnLookup::FilteredOut`] means the entry exists but this provider no
+    /// longer admits it -- so an Active Directory filter that excludes
+    /// disabled accounts (`(!(userAccountControl:1.2.840.113556.1.4.803:=2))`)
+    /// reports a disabled account that way. [`DnLookup::NoSuchObject`] is
+    /// *not* proof of absence: the entry may have moved (OU reorg). `Err`
+    /// means the directory could not be asked.
+    pub async fn lookup_dn_on(
+        &self,
+        ldap: &mut ldap3::Ldap,
+        dn: &str,
+        username: &str,
+    ) -> Result<DnLookup> {
+        let filter = Self::reconcile_filter(&self.config.user_filter);
+        let (entries, rc) = Self::search_entries(
+            ldap,
+            dn,
+            ldap3::Scope::Base,
+            &filter,
+            self.user_search_attrs(),
+        )
+        .await?;
+        match rc {
+            0 => Ok(match entries.into_iter().next() {
+                Some(entry) => DnLookup::Found(self.extract_user_from_entry(entry, username)),
+                None => DnLookup::FilteredOut,
+            }),
+            LDAP_RC_NO_SUCH_OBJECT => Ok(DnLookup::NoSuchObject),
+            rc => Err(Self::search_error(format!("result code {rc}"))),
+        }
+    }
+
+    /// Search for `username` under the provider's base with its user filter
+    /// on an open service connection: how the reconcile tells a moved entry
+    /// from a deleted one. More than one match is an error (ambiguous).
+    pub async fn find_username_on(
+        &self,
+        ldap: &mut ldap3::Ldap,
+        username: &str,
+    ) -> Result<Option<LdapUserInfo>> {
+        let filter = self.build_search_filter(username);
+        let (mut entries, rc) = Self::search_entries(
+            ldap,
+            &self.config.base_dn,
+            ldap3::Scope::Subtree,
+            &filter,
+            self.user_search_attrs(),
+        )
+        .await?;
+        if rc != 0 {
+            return Err(Self::search_error(format!("result code {rc}")));
+        }
+        match entries.len() {
+            0 => Ok(None),
+            1 => Ok(Some(
+                self.extract_user_from_entry(entries.remove(0), username),
+            )),
+            n => Err(Self::search_error(format!(
+                "{n} directory entries match username '{username}'"
+            ))),
+        }
+    }
+
+    /// The provider's user filter with the username placeholder widened to
+    /// a presence match, so a base-scope search on a known DN checks "still
+    /// a user this provider admits" without knowing the directory username.
+    fn reconcile_filter(user_filter: &str) -> String {
+        user_filter.replace("{0}", "*").replace("{username}", "*")
+    }
+
     /// A bind DN that cannot exist in the directory, for the decoy bind a
     /// search miss pays (#3505). Random per call so it can never collide with
     /// (or lock out) a real entry, and never derived from the submitted
@@ -952,18 +1091,7 @@ impl LdapService {
         username: &str,
         member_of: &[String],
     ) -> Vec<String> {
-        let mut names = std::collections::BTreeSet::new();
-
-        for group_dn in member_of {
-            if let Some(base) = &self.config.group_base_dn {
-                if !Self::dn_under_base(group_dn, base) {
-                    continue;
-                }
-            }
-            if let Some(name) = Self::dn_first_rdn_value(group_dn) {
-                names.insert(name);
-            }
-        }
+        let mut names = self.member_of_group_names(member_of);
 
         if self.config.bind_dn.is_some() && self.config.bind_password.is_some() {
             match self.search_group_names(user_dn, username).await {
@@ -981,6 +1109,39 @@ impl LdapService {
         names.into_iter().collect()
     }
 
+    /// Group names from the user's own `memberOf` values (DNs), limited to
+    /// `group_base_dn` when one is configured.
+    fn member_of_group_names(&self, member_of: &[String]) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for group_dn in member_of {
+            if let Some(base) = &self.config.group_base_dn {
+                if !Self::dn_under_base(group_dn, base) {
+                    continue;
+                }
+            }
+            if let Some(name) = Self::dn_first_rdn_value(group_dn) {
+                names.insert(name);
+            }
+        }
+        names
+    }
+
+    /// [`Self::resolve_group_names`] on an open service connection, for the
+    /// periodic reconcile (#3830). Unlike the login path, a group-search
+    /// failure is an error: the reconcile must skip the re-sync rather than
+    /// prune memberships on a transient directory hiccup.
+    pub async fn resolve_group_names_on(
+        &self,
+        ldap: &mut ldap3::Ldap,
+        user_dn: &str,
+        username: &str,
+        member_of: &[String],
+    ) -> Result<Vec<String>> {
+        let mut names = self.member_of_group_names(member_of);
+        names.extend(self.search_group_names_on(ldap, user_dn, username).await?);
+        Ok(names.into_iter().collect())
+    }
+
     /// Search group entries the user is a member of and return their names.
     ///
     /// Only the group name attribute is requested — never `member` — so
@@ -988,12 +1149,28 @@ impl LdapService {
     /// result. Entries missing the name attribute fall back to the first RDN
     /// value of their DN.
     async fn search_group_names(&self, user_dn: &str, username: &str) -> Result<Vec<String>> {
-        use ldap3::{Scope, SearchEntry};
-
         let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
             (Some(dn), Some(pw)) => (dn, pw),
             _ => return Ok(Vec::new()),
         };
+
+        let mut ldap = self.connect_and_bind(bind_dn, bind_pw).await?;
+        let names = self
+            .search_group_names_on(&mut ldap, user_dn, username)
+            .await;
+        ldap.unbind().await.ok();
+        names
+    }
+
+    /// The group search of [`Self::search_group_names`] on an open
+    /// connection.
+    async fn search_group_names_on(
+        &self,
+        ldap: &mut ldap3::Ldap,
+        user_dn: &str,
+        username: &str,
+    ) -> Result<Vec<String>> {
+        use ldap3::{Scope, SearchEntry};
 
         let search_base = self
             .config
@@ -1002,7 +1179,6 @@ impl LdapService {
             .unwrap_or(&self.config.base_dn);
         let filter = self.build_group_filter(user_dn, username);
 
-        let mut ldap = self.connect_and_bind(bind_dn, bind_pw).await?;
         let (results, _) = ldap
             .search(
                 search_base,
@@ -1014,7 +1190,6 @@ impl LdapService {
             .map_err(Self::search_error)?
             .success()
             .map_err(Self::search_error)?;
-        ldap.unbind().await.ok();
 
         let entries: Vec<SearchEntry> = results.into_iter().map(SearchEntry::construct).collect();
         Ok(Self::group_names_from_entries(
@@ -1102,7 +1277,7 @@ impl LdapService {
 
     /// Whether `dn` sits under `base` (case-insensitive, tolerant of
     /// whitespace around RDN separators). An empty base matches everything.
-    fn dn_under_base(dn: &str, base: &str) -> bool {
+    pub(crate) fn dn_under_base(dn: &str, base: &str) -> bool {
         fn normalize(s: &str) -> String {
             s.split(',')
                 .map(|part| part.trim().to_ascii_lowercase())
@@ -1181,7 +1356,7 @@ impl LdapService {
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Mutex to serialize tests that read/write shared environment variables.
@@ -3164,16 +3339,16 @@ mod tests {
     const LDAP_OP_SEARCH_RES_DONE: u8 = 0x65;
 
     /// How the scripted directory answers one login attempt.
-    struct MockDirectory {
+    pub(crate) struct MockDirectory {
         /// DN the service account binds with; that bind always succeeds.
-        service_dn: String,
+        pub(crate) service_dn: String,
         /// Entry the user search returns, if any: `(dn, uid, mail)`.
-        entry: Option<(String, String, String)>,
+        pub(crate) entry: Option<(String, String, String)>,
         /// resultCode for the second (user) bind: 0 accept, 49 reject.
-        user_bind_rc: u8,
+        pub(crate) user_bind_rc: u8,
         /// Directory operations observed, in order (#3505): `connect`,
         /// `bind-service`, `search`, `bind`.
-        ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        pub(crate) ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     /// Encode one BER tag-length-value.
@@ -3268,7 +3443,7 @@ mod tests {
     /// answers the user search with zero or one entry, and accepts or rejects
     /// the subsequent user bind. `authenticate()` opens a fresh connection for
     /// each bind, so the listener serves connections in a loop.
-    async fn spawn_mock_directory(dir: MockDirectory) -> u16 {
+    pub(crate) async fn spawn_mock_directory(dir: MockDirectory) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock directory");
@@ -3341,8 +3516,8 @@ mod tests {
         port
     }
 
-    const MOCK_SERVICE_DN: &str = "cn=svc,dc=example,dc=com";
-    const MOCK_USER_DN: &str = "uid=alice,ou=people,dc=example,dc=com";
+    pub(crate) const MOCK_SERVICE_DN: &str = "cn=svc,dc=example,dc=com";
+    pub(crate) const MOCK_USER_DN: &str = "uid=alice,ou=people,dc=example,dc=com";
 
     /// Build a search-then-bind service pointed at a scripted directory port.
     fn make_search_then_bind_service(port: u16) -> LdapService {
@@ -3368,7 +3543,7 @@ mod tests {
     }
 
     /// Operations log shared with a [`MockDirectory`].
-    type OpsLog = Arc<std::sync::Mutex<Vec<&'static str>>>;
+    pub(crate) type OpsLog = Arc<std::sync::Mutex<Vec<&'static str>>>;
 
     /// A username with no directory entry, plus the directory operations the
     /// attempt performed.
@@ -3446,6 +3621,320 @@ mod tests {
         assert_eq!(
             client_visible(absent_err).await,
             client_visible(wrong_err).await
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripted directory that honours base / scope / filter (#3830)
+    // -----------------------------------------------------------------------
+
+    /// One entry in a [`ScriptedDirectory`].
+    #[derive(Clone, Debug)]
+    pub(crate) struct MockEntry {
+        pub(crate) dn: String,
+        pub(crate) attrs: Vec<(String, Vec<String>)>,
+    }
+
+    impl MockEntry {
+        /// A user entry with `uid`, `mail` and any extra `(attr, value)`s.
+        pub(crate) fn user(dn: &str, uid: &str, extra: &[(&str, &str)]) -> Self {
+            let mut attrs = vec![
+                ("uid".to_string(), vec![uid.to_string()]),
+                ("mail".to_string(), vec![format!("{uid}@example.com")]),
+            ];
+            for (name, value) in extra {
+                match attrs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                    Some((_, values)) => values.push(value.to_string()),
+                    None => attrs.push((name.to_string(), vec![value.to_string()])),
+                }
+            }
+            MockEntry {
+                dn: dn.to_string(),
+                attrs,
+            }
+        }
+
+        fn values(&self, attr: &str) -> Option<&Vec<String>> {
+            self.attrs
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(attr))
+                .map(|(_, v)| v)
+        }
+    }
+
+    /// A directory that answers searches by actually applying their base,
+    /// scope and filter to a fixed set of entries: a base-scope search on a
+    /// DN with no entry answers rc 32 (noSuchObject), and subtree searches
+    /// also return `references` as search result references.
+    pub(crate) struct ScriptedDirectory {
+        pub(crate) service_dn: String,
+        pub(crate) entries: Vec<MockEntry>,
+        pub(crate) references: Vec<String>,
+    }
+
+    fn dn_eq(a: &str, b: &str) -> bool {
+        a.eq_ignore_ascii_case(b)
+    }
+
+    fn dn_within(dn: &str, base: &str) -> bool {
+        dn_eq(dn, base)
+            || dn
+                .to_lowercase()
+                .ends_with(&format!(",{}", base.to_lowercase()))
+    }
+
+    /// Evaluate one BER-encoded LDAP filter against an entry. Supports
+    /// and / or / not / equalityMatch / present; anything else (substrings,
+    /// extensible match) is false.
+    fn filter_matches(tag: u8, body: &[u8], entry: &MockEntry) -> bool {
+        let children = |body: &[u8]| {
+            let mut out = Vec::new();
+            let mut rest = body;
+            while let Some((t, v, used)) = ber_next_tlv(rest) {
+                out.push((t, v.to_vec()));
+                rest = &rest[used..];
+            }
+            out
+        };
+        match tag {
+            0xa0 => children(body)
+                .iter()
+                .all(|(t, v)| filter_matches(*t, v, entry)),
+            0xa1 => children(body)
+                .iter()
+                .any(|(t, v)| filter_matches(*t, v, entry)),
+            0xa2 => children(body)
+                .first()
+                .is_some_and(|(t, v)| !filter_matches(*t, v, entry)),
+            0xa3 => {
+                let parts = children(body);
+                let (Some((_, attr)), Some((_, value))) = (parts.first(), parts.get(1)) else {
+                    return false;
+                };
+                let attr = String::from_utf8_lossy(attr).to_string();
+                let value = String::from_utf8_lossy(value).to_string();
+                entry
+                    .values(&attr)
+                    .is_some_and(|vs| vs.iter().any(|v| v.eq_ignore_ascii_case(&value)))
+            }
+            0x87 => {
+                let attr = String::from_utf8_lossy(body).to_string();
+                attr.eq_ignore_ascii_case("objectClass") || entry.values(&attr).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    fn encode_entry(msgid: u32, entry: &MockEntry) -> Vec<u8> {
+        let mut attrs = Vec::new();
+        for (name, values) in &entry.attrs {
+            let mut attr = ber_tlv(0x04, name.as_bytes());
+            let mut set = Vec::new();
+            for v in values {
+                set.extend(ber_tlv(0x04, v.as_bytes()));
+            }
+            attr.extend(ber_tlv(0x31, &set));
+            attrs.extend(ber_tlv(0x30, &attr));
+        }
+        let mut body = ber_tlv(0x04, entry.dn.as_bytes());
+        body.extend(ber_tlv(0x30, &attrs));
+        ber_ldap_message(msgid, ber_tlv(LDAP_OP_SEARCH_RES_ENTRY, &body))
+    }
+
+    /// Answer one searchRequest body.
+    fn answer_search(dir: &ScriptedDirectory, msgid: u32, op_body: &[u8]) -> Vec<u8> {
+        // searchRequest ::= { baseObject, scope, derefAliases, sizeLimit,
+        //                     timeLimit, typesOnly, filter, attributes }
+        let mut fields = Vec::new();
+        let mut rest = op_body;
+        while let Some((t, v, used)) = ber_next_tlv(rest) {
+            fields.push((t, v.to_vec()));
+            rest = &rest[used..];
+        }
+        let base = String::from_utf8_lossy(&fields[0].1).to_string();
+        let scope = fields[1].1.first().copied().unwrap_or(0);
+        let (ftag, fbody) = (fields[6].0, fields[6].1.clone());
+
+        let mut out = Vec::new();
+        let rc = if scope == 0 {
+            match dir.entries.iter().find(|e| dn_eq(&e.dn, &base)) {
+                Some(e) => {
+                    if filter_matches(ftag, &fbody, e) {
+                        out.extend(encode_entry(msgid, e));
+                    }
+                    0x00
+                }
+                None => 32, // noSuchObject
+            }
+        } else {
+            for e in dir.entries.iter().filter(|e| dn_within(&e.dn, &base)) {
+                if filter_matches(ftag, &fbody, e) {
+                    out.extend(encode_entry(msgid, e));
+                }
+            }
+            for uri in &dir.references {
+                out.extend(ber_ldap_message(
+                    msgid,
+                    ber_tlv(0x73, &ber_tlv(0x04, uri.as_bytes())),
+                ));
+            }
+            0x00
+        };
+        out.extend(ber_ldap_message(
+            msgid,
+            ber_ldap_result(LDAP_OP_SEARCH_RES_DONE, rc),
+        ));
+        out
+    }
+
+    /// Spawn a [`ScriptedDirectory`] on 127.0.0.1 and return its port. The
+    /// service account bind succeeds; every other bind is rejected (49).
+    pub(crate) async fn spawn_scripted_directory(dir: ScriptedDirectory) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted directory");
+        let port = listener.local_addr().expect("local addr").port();
+        let dir = Arc::new(dir);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let dir = dir.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    loop {
+                        let Some(frame) = read_ldap_frame(&mut sock).await else {
+                            break;
+                        };
+                        let Some((_, msgid_bytes, used)) = ber_next_tlv(&frame) else {
+                            break;
+                        };
+                        let msgid = msgid_bytes.iter().fold(0u32, |a, b| (a << 8) | *b as u32);
+                        let Some((op_tag, op_body, _)) = ber_next_tlv(&frame[used..]) else {
+                            break;
+                        };
+                        let reply = match op_tag {
+                            LDAP_OP_BIND_REQUEST => {
+                                let (_, _, after_version) =
+                                    ber_next_tlv(op_body).expect("bind version");
+                                let (_, dn_bytes, _) =
+                                    ber_next_tlv(&op_body[after_version..]).expect("bind dn");
+                                let rc = if String::from_utf8_lossy(dn_bytes) == dir.service_dn {
+                                    0x00
+                                } else {
+                                    0x31
+                                };
+                                ber_ldap_message(msgid, ber_ldap_result(LDAP_OP_BIND_RESPONSE, rc))
+                            }
+                            LDAP_OP_SEARCH_REQUEST => answer_search(&dir, msgid, op_body),
+                            _ => break,
+                        };
+                        if sock.write_all(&reply).await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn alice() -> MockEntry {
+        MockEntry::user(MOCK_USER_DN, "alice", &[])
+    }
+
+    async fn scripted_service(entries: Vec<MockEntry>, references: Vec<String>) -> LdapService {
+        let port = spawn_scripted_directory(ScriptedDirectory {
+            service_dn: MOCK_SERVICE_DN.to_string(),
+            entries,
+            references,
+        })
+        .await;
+        make_search_then_bind_service(port)
+    }
+
+    /// #3830: the reconcile re-reads a known DN; a present entry comes back.
+    #[tokio::test]
+    async fn test_lookup_dn_on_present_entry() {
+        let svc = scripted_service(vec![alice()], vec![]).await;
+        let mut ldap = svc.service_session().await.expect("service bind");
+        match svc.lookup_dn_on(&mut ldap, MOCK_USER_DN, "alice").await {
+            Ok(DnLookup::Found(info)) => assert_eq!(info.dn, MOCK_USER_DN),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    /// An entry that exists but fails the provider's user filter.
+    #[tokio::test]
+    async fn test_lookup_dn_on_filtered_out_entry() {
+        let mut svc = scripted_service(
+            vec![MockEntry::user(
+                MOCK_USER_DN,
+                "alice",
+                &[("ou", "contractors")],
+            )],
+            vec![],
+        )
+        .await;
+        svc.config.user_filter = "(&(uid={0})(ou=eng))".to_string();
+        let mut ldap = svc.service_session().await.expect("service bind");
+        let res = svc.lookup_dn_on(&mut ldap, MOCK_USER_DN, "alice").await;
+        assert!(matches!(res, Ok(DnLookup::FilteredOut)), "{res:?}");
+    }
+
+    /// rc 32 surfaces as NoSuchObject, and the username search finds the
+    /// entry at its new DN (moved, not gone).
+    #[tokio::test]
+    async fn test_moved_entry_is_no_such_object_then_found_by_username() {
+        let moved = "uid=alice,ou=moved,dc=example,dc=com";
+        let svc = scripted_service(vec![MockEntry::user(moved, "alice", &[])], vec![]).await;
+        let mut ldap = svc.service_session().await.expect("service bind");
+        let res = svc.lookup_dn_on(&mut ldap, MOCK_USER_DN, "alice").await;
+        assert!(matches!(res, Ok(DnLookup::NoSuchObject)), "{res:?}");
+        let found = svc
+            .find_username_on(&mut ldap, "alice")
+            .await
+            .expect("search")
+            .expect("moved entry found");
+        assert_eq!(found.dn, moved);
+        assert!(svc
+            .find_username_on(&mut ldap, "bob")
+            .await
+            .expect("search")
+            .is_none());
+    }
+
+    /// A username search answered only with a referral is an error (never
+    /// "not found"), so the reconcile cannot deactivate on it.
+    #[tokio::test]
+    async fn test_referral_only_search_is_error() {
+        let svc = scripted_service(
+            vec![],
+            vec!["ldap://other.example.com/dc=example,dc=com".to_string()],
+        )
+        .await;
+        let mut ldap = svc.service_session().await.expect("service bind");
+        let res = svc.find_username_on(&mut ldap, "alice").await;
+        assert!(res.is_err(), "{res:?}");
+    }
+
+    /// Fail-safe: an unreachable directory is an error, never absence.
+    #[tokio::test]
+    async fn test_service_session_unreachable_directory_is_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let res = make_search_then_bind_service(port).service_session().await;
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_reconcile_filter_widens_username_placeholder() {
+        assert_eq!(LdapService::reconcile_filter("(uid={0})"), "(uid=*)");
+        assert_eq!(
+            LdapService::reconcile_filter(
+                "(&(sAMAccountName={username})(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            ),
+            "(&(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
         );
     }
 
