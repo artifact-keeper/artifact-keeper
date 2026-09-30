@@ -139,6 +139,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::repositories::RepositoriesApiDoc::openapi(),
         ),
         ("artifacts", handlers::artifacts::ArtifactsApiDoc::openapi()),
+        (
+            "package_analysis",
+            handlers::package_analysis::PackageAnalysisApiDoc::openapi(),
+        ),
         ("users", handlers::users::UsersApiDoc::openapi()),
         ("groups", handlers::groups::GroupsApiDoc::openapi()),
         ("packages", handlers::packages::PackagesApiDoc::openapi()),
@@ -921,6 +925,143 @@ mod tests {
         assert!(
             missing.is_empty(),
             "The following OpenAPI-documented endpoints appear to be missing route registrations:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// Regression (#4095): every handler carrying a `#[utoipa::path]` must be
+    /// listed in its module's `#[openapi(paths(...))]` AND that module doc must
+    /// be merged in [`module_docs`]. Without this, an annotated and mounted
+    /// route silently drops out of the exported spec and every generated SDK
+    /// (`get_proxy_sbom` shipped that way in 1.10.0, as did the whole
+    /// `PackageAnalysisApiDoc`). `test_all_openapi_paths_have_handlers` checks
+    /// the other direction (documented => routed); this one checks
+    /// annotated => documented, by operationId (utoipa defaults it to the fn
+    /// name unless `operation_id = "..."` overrides it).
+    #[test]
+    fn test_every_annotated_handler_is_in_the_openapi_spec() {
+        use std::collections::HashSet;
+
+        // Handlers annotated on purpose but deliberately left out of the spec.
+        // Each entry needs a reason; do not add to this list to silence a
+        // handler that is simply missing from its ApiDoc.
+        const NOT_DOCUMENTED: &[&str] = &[
+            // SSE stream: no ApiDoc in events.rs and no generated-SDK support
+            // for text/event-stream; the web UI consumes it via EventSource.
+            "event_stream",
+        ];
+
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read handlers dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let spec = build_openapi();
+        let mut documented: HashSet<String> = HashSet::new();
+        for item in spec.paths.paths.values() {
+            let ops = [
+                &item.get,
+                &item.put,
+                &item.post,
+                &item.delete,
+                &item.patch,
+                &item.head,
+            ];
+            for op in ops.into_iter().flatten() {
+                if let Some(id) = &op.operation_id {
+                    documented.insert(id.clone());
+                }
+            }
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let handlers_dir = manifest_dir.join("src/api/handlers");
+        let mut files = Vec::new();
+        collect_rs(&handlers_dir, &mut files);
+        files.sort();
+
+        let marker = "#[utoipa::path(";
+        let mut annotated = 0usize;
+        let mut missing = Vec::new();
+        // Every annotated handler, by the operationId it resolves to. Two
+        // same-named handlers in different files resolve to ONE operationId,
+        // and the spec (whose ids are unique) can hold only one of them, so a
+        // presence check alone would let the registered one mask the other.
+        let mut by_op_id: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("read handler source");
+            let mut cursor = 0usize;
+            while let Some(rel) = src[cursor..].find(marker) {
+                let start = cursor + rel;
+                // Every annotation in the handlers closes with `)]` on its own
+                // line; the handler fn follows (possibly after other attributes
+                // or comments).
+                let Some(attr_len) = src[start..].find("\n)]") else {
+                    panic!("unterminated utoipa::path in {file:?}");
+                };
+                let end = start + attr_len;
+                let attr = &src[start..end];
+                let after = &src[end..];
+                let Some(fn_pos) = after.find("fn ") else {
+                    panic!("no fn after utoipa::path in {file:?}");
+                };
+                let fn_name: String = after[fn_pos + 3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let op_id_key = "operation_id = \"";
+                let op_id = match attr.find(op_id_key) {
+                    Some(i) => {
+                        let rest = &attr[i + op_id_key.len()..];
+                        rest[..rest.find('"').expect("closing quote")].to_string()
+                    }
+                    None => fn_name.clone(),
+                };
+                annotated += 1;
+                let exempt = NOT_DOCUMENTED.contains(&fn_name.as_str());
+                let rel = file.strip_prefix(manifest_dir).unwrap_or(file).display();
+                if !exempt {
+                    by_op_id
+                        .entry(op_id.clone())
+                        .or_default()
+                        .push(format!("{rel} :: {fn_name}"));
+                }
+                if !exempt && !documented.contains(&op_id) {
+                    missing.push(format!("{rel} :: {fn_name} (operationId {op_id})"));
+                }
+                cursor = end;
+            }
+        }
+
+        for (op_id, sites) in &by_op_id {
+            if sites.len() > 1 {
+                missing.push(format!(
+                    "operationId {op_id} is claimed by {} handlers ({}); only one can be in \
+                     the spec, so give each an explicit `operation_id = \"...\"`",
+                    sites.len(),
+                    sites.join(", ")
+                ));
+            }
+        }
+
+        // Guard the scanner itself: if the marker or layout changes and nothing
+        // is found, this test must not pass vacuously.
+        assert!(
+            annotated >= 250,
+            "found only {annotated} #[utoipa::path] annotations; the source scan is broken"
+        );
+        assert!(
+            missing.is_empty(),
+            "Handlers annotated with #[utoipa::path] but absent from the merged OpenAPI spec. \
+             Add each to its module's `#[openapi(paths(...))]`, and make sure that ApiDoc is \
+             listed in `module_docs()`:\n{}",
             missing.join("\n")
         );
     }

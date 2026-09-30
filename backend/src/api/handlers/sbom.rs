@@ -2197,6 +2197,7 @@ async fn ensure_sbom_repo_action(
         delete_license_policy,
         check_license_compliance,
         generate_environment_sbom,
+        get_proxy_sbom,
     ),
     components(schemas(
         GenerateSbomRequest,
