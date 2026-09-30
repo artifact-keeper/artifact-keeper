@@ -8126,15 +8126,37 @@ pub(crate) async fn proxy_scan_and_record(
     // vulnerable artifact from being recorded as vulnerable. The worst case
     // is that this digest has no SBOM until it is pulled again.
     if !verdict.packages.is_empty() {
-        if let Err(e) = pss
+        match pss
             .record_packages(digest, PROXY_SCAN_TYPE, &verdict.packages)
             .await
         {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, error = %e,
-                "failed to persist proxy scan package inventory; SBOM will be \
-                 unavailable for this digest until it is pulled again"
-            );
+            // #4096: record whether THIS inventory is complete, so the proxy
+            // SBOM can carry the partial-inventory marker. Only after the
+            // inventory itself landed, so the marker describes the packages
+            // the SBOM is generated from.
+            Ok(()) => {
+                if let Err(e) = pss
+                    .record_inventory_completeness(
+                        digest,
+                        PROXY_SCAN_TYPE,
+                        verdict.scan_completeness.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename, error = %e,
+                        "failed to persist proxy scan inventory completeness; \
+                         the SBOM for this digest will carry no completeness marker"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, error = %e,
+                    "failed to persist proxy scan package inventory; SBOM will be \
+                     unavailable for this digest until it is pulled again"
+                );
+            }
         }
     }
 

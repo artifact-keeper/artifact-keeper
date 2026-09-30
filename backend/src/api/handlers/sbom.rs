@@ -227,8 +227,35 @@ async fn get_proxy_sbom(
         })
         .collect();
 
-    let document =
-        SbomService::new(state.db.clone()).generate_ephemeral(format, &dependencies, None)?;
+    // #4096: carry the recorded inventory completeness into the document, so
+    // a partial inventory is marked as such rather than rendered as
+    // authoritative. `None` (complete, or recorded before migration 252)
+    // emits no marker.
+    //
+    // Best-effort: the inventory itself was read, so a failure here degrades
+    // to a document without the marker (logged) rather than failing the
+    // whole request.
+    let completeness = match pss
+        .fetch_inventory_completeness(
+            &digest,
+            crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                repository = %key,
+                error = %e,
+                "could not read the proxy inventory completeness; serving the SBOM \
+                 without a completeness marker"
+            );
+            None
+        }
+    };
+
+    let service = SbomService::new(state.db.clone());
+    let document = service.generate_ephemeral(format, &dependencies, completeness.as_deref())?;
 
     Ok(Json(document))
 }
@@ -2538,6 +2565,171 @@ package:
             auth_at < visible_at,
             "authentication must be enforced BEFORE require_visible, which \
              returns early for public repositories"
+        );
+    }
+
+    /// Seed one proxy-cached path with a recorded grype verdict, inventory and
+    /// inventory completeness, the way the inline proxy scan persists them.
+    async fn seed_proxy_inventory(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        path: &str,
+        completeness: Option<&str>,
+    ) -> String {
+        use crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE;
+        use crate::services::proxy_scan_service::{ProxyScanService, VERDICT_CLEAN};
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+             (repository_id, path, storage_key, metadata_key, size_bytes, checksum_sha256) \
+             VALUES ($1, $2, $3, $4, 1024, $5)",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .bind(format!("proxy-cache/{}/{path}/__content__", fx.repo_key))
+        .bind(format!(
+            "proxy-cache/{}/{path}/__cache_meta__.json",
+            fx.repo_key
+        ))
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("seed proxy_cache_artifacts");
+
+        let pss = ProxyScanService::new(fx.pool.clone());
+        pss.record_verdict(
+            &digest,
+            PROXY_SCAN_TYPE,
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("seed verdict");
+        let packages = vec![crate::models::security::RawPackage {
+            name: "requests".to_string(),
+            version: Some("2.31.0".to_string()),
+            purl: Some("pkg:pypi/requests@2.31.0".to_string()),
+            license: Some("Apache-2.0".to_string()),
+            source_target: None,
+        }];
+        pss.record_packages(&digest, PROXY_SCAN_TYPE, &packages)
+            .await
+            .expect("seed inventory");
+        pss.record_inventory_completeness(&digest, PROXY_SCAN_TYPE, completeness)
+            .await
+            .expect("seed completeness");
+        digest
+    }
+
+    async fn teardown_proxy_inventory(pool: &sqlx::PgPool, digest: &str) {
+        let _ = sqlx::query("DELETE FROM proxy_scan_packages WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await;
+    }
+
+    async fn call_proxy_sbom(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        path: &str,
+        format: Option<&str>,
+    ) -> serde_json::Value {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Json(doc) = get_proxy_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            axum::extract::Path(fx.repo_key.clone()),
+            Query(ProxySbomQuery {
+                path: path.to_string(),
+                format: format.map(str::to_string),
+            }),
+        )
+        .await
+        .expect("proxy sbom renders");
+        doc
+    }
+
+    /// #4096: the one place the inline proxy scan persists its inventory must
+    /// also persist that inventory's completeness, or the proxy SBOM marker
+    /// can never light up in production however the read path is wired.
+    #[test]
+    fn proxy_inventory_writer_records_its_completeness() {
+        let source = include_str!("proxy_helpers.rs");
+        let write_at = source
+            .find(".record_packages(digest, PROXY_SCAN_TYPE, &verdict.packages)")
+            .expect("proxy inventory write not found");
+        let after = &source[write_at..];
+        let completeness_at = after
+            .find(".record_inventory_completeness(")
+            .expect("the inventory write must be followed by its completeness");
+        assert!(
+            after[completeness_at..].contains("verdict.scan_completeness.as_deref()"),
+            "the completeness recorded must be the verdict's own"
+        );
+        assert!(
+            completeness_at < after.find("\n}\n").unwrap_or(after.len()),
+            "completeness must be recorded in the same function as the inventory"
+        );
+    }
+
+    /// #4096: a partial proxy scan inventory must surface the completeness
+    /// marker in the regenerated SBOM (CycloneDX `metadata.properties`, SPDX
+    /// `creationInfo.comment`), and a complete one must not. Before the fix the
+    /// handler hardcoded `None`, so the partial case rendered as authoritative.
+    #[tokio::test]
+    async fn proxy_sbom_carries_partial_inventory_marker() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let partial_path = "packages/requests-2.31.0-py3-none-any.whl";
+        let complete_path = "packages/requests-2.31.0.tar.gz";
+        let partial = seed_proxy_inventory(&fx, partial_path, Some("partial")).await;
+        let complete = seed_proxy_inventory(&fx, complete_path, None).await;
+
+        let cdx_partial = call_proxy_sbom(&fx, partial_path, None).await;
+        let spdx_partial = call_proxy_sbom(&fx, partial_path, Some("spdx")).await;
+        let cdx_complete = call_proxy_sbom(&fx, complete_path, None).await;
+        let spdx_complete = call_proxy_sbom(&fx, complete_path, Some("spdx")).await;
+
+        teardown_proxy_inventory(&fx.pool, &partial).await;
+        teardown_proxy_inventory(&fx.pool, &complete).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            cdx_partial["metadata"]["properties"],
+            serde_json::json!([{
+                "name": "artifact-keeper:scan-completeness",
+                "value": "partial"
+            }]),
+            "partial inventory must carry the CycloneDX completeness marker: {cdx_partial}"
+        );
+        assert_eq!(
+            cdx_partial["components"].as_array().map(Vec::len),
+            Some(1),
+            "the marker annotates the inventory, it does not replace it"
+        );
+        assert_eq!(
+            spdx_partial["creationInfo"]["comment"],
+            serde_json::json!("artifact-keeper scan-completeness: partial"),
+            "partial inventory must carry the SPDX completeness comment: {spdx_partial}"
+        );
+        assert!(
+            cdx_complete["metadata"].get("properties").is_none(),
+            "a complete inventory carries no marker: {cdx_complete}"
+        );
+        assert!(
+            spdx_complete["creationInfo"].get("comment").is_none(),
+            "a complete inventory carries no SPDX comment: {spdx_complete}"
         );
     }
 
