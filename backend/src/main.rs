@@ -1760,80 +1760,62 @@ fn build_oidc_bootstrap_request(
 /// The provider named by LDAP_NAME (default `default`) is reconciled on every
 /// boot. If providers already exist but none carries that name, bootstrap skips
 /// creation and warns rather than duplicating a pre-existing provider (#1887).
+/// The reconcile writes only the fields the environment owns and preserves
+/// admin-API-set values for the rest (#3904); the rule lives in
+/// `services::ldap_env_bootstrap`.
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::{
-        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        reconcile_ldap_from_env, warn_discarded_fields, LdapEnvOutcome,
     };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
+    let wanted = req.name.clone();
 
-    // Reconcile the env-managed provider (matched by name) on every boot so
-    // changing LDAP_* env and redeploying takes effect. Other (UI-created)
-    // providers are left untouched.
-    let existing = AuthConfigService::list_ldap(db).await?;
-    let pairs: Vec<(uuid::Uuid, String)> =
-        existing.iter().map(|c| (c.id, c.name.clone())).collect();
-
-    match plan_provider_reconcile(&req.name, &pairs) {
-        ReconcileAction::Create => {
-            let config = AuthConfigService::create_ldap(db, req).await?;
-            tracing::info!(
-                "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
-                config.name,
-                config.id
-            );
-        }
-        ReconcileAction::Update(id) => {
-            let name = req.name.clone();
-            let cfg = AuthConfigService::update_ldap(db, id, req.into()).await?;
+    match reconcile_ldap_from_env(db, req).await? {
+        LdapEnvOutcome::Created { id, name } => tracing::info!(
+            "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+            name,
+            id
+        ),
+        LdapEnvOutcome::Reconciled {
+            id,
+            name,
+            discarded,
+        } => {
+            warn_discarded_fields(&name, &discarded);
             tracing::info!(
                 "Reconciled env-managed LDAP provider '{}' (id={}) from environment variables",
                 name,
-                cfg.id
+                id
             );
         }
-        ReconcileAction::Skip(existing_name) => {
-            tracing::warn!(
-                "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
-                 '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
-                 existing provider's name (or rename it to '{}') to let env vars manage it, or \
-                 unset LDAP_*.",
-                existing_name,
-                req.name,
-                req.name
-            );
-        }
+        LdapEnvOutcome::Skipped { existing_name } => tracing::warn!(
+            "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
+             '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
+             existing provider's name (or rename it to '{}') to let env vars manage it, or \
+             unset LDAP_*.",
+            existing_name,
+            wanted,
+            wanted
+        ),
     }
 
     Ok(())
 }
 
-/// Raw LDAP environment variable values for bootstrap.
-#[derive(Default)]
-struct LdapEnvVars {
-    name: Option<String>,
-    url: Option<String>,
-    base_dn: Option<String>,
-    bind_dn: Option<String>,
-    bind_password: Option<String>,
-    user_filter: Option<String>,
-    username_attr: Option<String>,
-    email_attr: Option<String>,
-    display_name_attr: Option<String>,
-    groups_attr: Option<String>,
-    group_base_dn: Option<String>,
-    group_filter: Option<String>,
-    admin_group_dn: Option<String>,
-    use_starttls: Option<String>,
-}
-
 /// Build a CreateLdapConfigRequest from LDAP_* environment variables.
-/// Returns None if any of the required env vars are missing or empty.
+/// Returns None if any of the required env vars are missing or empty. The
+/// assembly itself lives in `services::ldap_env_bootstrap` so the library's
+/// unit-test target covers it.
 fn build_ldap_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        build_ldap_request_from_values, LdapEnvVars,
+    };
+
     build_ldap_request_from_values(LdapEnvVars {
         name: std::env::var("LDAP_NAME").ok(),
         url: std::env::var("LDAP_URL").ok(),
@@ -1849,52 +1831,6 @@ fn build_ldap_bootstrap_request(
         group_filter: std::env::var("LDAP_GROUP_FILTER").ok(),
         admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
         use_starttls: std::env::var("LDAP_USE_STARTTLS").ok(),
-    })
-}
-
-/// Pure function that assembles a CreateLdapConfigRequest from optional values.
-/// Returns None if the LDAP server URL or base DN are missing or empty: both
-/// are required to bind and search the directory.
-fn build_ldap_request_from_values(
-    env: LdapEnvVars,
-) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
-    use artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest;
-
-    let server_url = env.url.filter(|v| !v.is_empty())?;
-    let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
-
-    let name = env
-        .name
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-
-    let use_starttls = env
-        .use_starttls
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    Some(CreateLdapConfigRequest {
-        name,
-        server_url,
-        bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
-        bind_password: env.bind_password.filter(|v| !v.is_empty()),
-        user_base_dn,
-        user_filter: env.user_filter.filter(|v| !v.is_empty()),
-        group_base_dn: env.group_base_dn.filter(|v| !v.is_empty()),
-        group_filter: env.group_filter.filter(|v| !v.is_empty()),
-        email_attribute: env.email_attr.filter(|v| !v.is_empty()),
-        display_name_attribute: env.display_name_attr.filter(|v| !v.is_empty()),
-        username_attribute: env.username_attr.filter(|v| !v.is_empty()),
-        groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
-        admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
-        use_starttls: Some(use_starttls),
-        // TLS trust for the env-bootstrapped provider stays governed by the
-        // global LDAP_INSECURE_TLS / LDAP_CA_CERT_PATH env fallback (#2782);
-        // the per-provider overrides are set via the admin SSO API.
-        insecure_skip_verify: None,
-        ca_certificate: None,
-        is_enabled: Some(true),
-        priority: Some(0),
     })
 }
 
@@ -3428,160 +3364,6 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_ldap_request_from_values (issue #1434)
-    // -----------------------------------------------------------------------
-
-    fn ldap_env(url: Option<&str>, base_dn: Option<&str>) -> LdapEnvVars {
-        LdapEnvVars {
-            url: url.map(String::from),
-            base_dn: base_dn.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_required_fields() {
-        let req = build_ldap_request_from_values(ldap_env(
-            Some("ldap://dc.local:389"),
-            Some("DC=domain,DC=local"),
-        ))
-        .unwrap();
-
-        assert_eq!(req.name, "default");
-        assert_eq!(req.server_url, "ldap://dc.local:389");
-        assert_eq!(req.user_base_dn, "DC=domain,DC=local");
-        // Bootstrapped providers are enabled so they show up in the SSO list.
-        assert_eq!(req.is_enabled, Some(true));
-        assert_eq!(req.priority, Some(0));
-        assert_eq!(req.use_starttls, Some(false));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_name_override() {
-        // LDAP_NAME lets operators point the env-managed provider at an
-        // existing one, mirroring OIDC_NAME (#1887).
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("Corporate AD".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "Corporate AD");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_name_defaults() {
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "default");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_url() {
-        let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), None));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_url() {
-        let req = build_ldap_request_from_values(ldap_env(Some(""), Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), Some("")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_full_active_directory_config() {
-        // Mirrors the Active Directory example from issue #1434.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: None,
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("user@domain".to_string()),
-            bind_password: Some("superPassword".to_string()),
-            user_filter: Some("(sAMAccountName={0})".to_string()),
-            username_attr: Some("sAMAccountName".to_string()),
-            email_attr: None,
-            display_name_attr: None,
-            groups_attr: None,
-            group_base_dn: Some("OU=Groups,DC=domain,DC=local".to_string()),
-            group_filter: Some("(memberUid={0})".to_string()),
-            admin_group_dn: Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local".to_string()),
-            use_starttls: Some("false".to_string()),
-        })
-        .unwrap();
-
-        assert_eq!(req.bind_dn.as_deref(), Some("user@domain"));
-        assert_eq!(req.bind_password.as_deref(), Some("superPassword"));
-        assert_eq!(req.user_filter.as_deref(), Some("(sAMAccountName={0})"));
-        assert_eq!(req.username_attribute.as_deref(), Some("sAMAccountName"));
-        assert_eq!(
-            req.group_base_dn.as_deref(),
-            Some("OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.group_filter.as_deref(), Some("(memberUid={0})"));
-        assert_eq!(
-            req.admin_group_dn.as_deref(),
-            Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.use_starttls, Some(false));
-        assert_eq!(req.is_enabled, Some(true));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_starttls_truthy_values() {
-        for v in ["true", "1"] {
-            let req = build_ldap_request_from_values(LdapEnvVars {
-                url: Some("ldap://dc.local:389".to_string()),
-                base_dn: Some("DC=domain,DC=local".to_string()),
-                use_starttls: Some(v.to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-            assert_eq!(
-                req.use_starttls,
-                Some(true),
-                "value {v} should enable STARTTLS"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_optional_fields_become_none() {
-        // Empty strings (e.g. unset compose interpolations) must not produce
-        // empty bind DNs or filters that would break directory binds.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("".to_string()),
-            bind_password: Some("".to_string()),
-            user_filter: Some("".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-
-        assert!(req.bind_dn.is_none());
-        assert!(req.bind_password.is_none());
-        assert!(req.user_filter.is_none());
     }
 }
 // warm cache benchmark

@@ -44,6 +44,7 @@ pub mod http_client;
 pub mod image_build_service;
 pub mod image_scanner;
 pub mod incus_scanner;
+pub mod ldap_env_bootstrap;
 pub mod ldap_service;
 pub mod manifest_blob_refs_backfill;
 pub mod maven_flat_attribution;
