@@ -11,6 +11,7 @@ use crate::services::artifactory_client::{
 use crate::services::artifactory_import::{
     ArtifactoryImporter, ImportProgress, ImportedRepository,
 };
+use crate::services::source_registry::SourceRegistry;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -555,22 +556,29 @@ async fn run_assess(
 
     let mut selected_repos = Vec::new();
     let mut total_artifacts = 0i64;
+    let mut total_artifacts_exact = true;
 
     for repo in &repositories {
         if !repo_passes_filters(&repo.key, include, exclude) {
             continue;
         }
 
-        // Get artifact count for this repo
-        let aql_result = client.list_artifacts(&repo.key, 0, 1).await;
-        let artifact_count = aql_result.map(|r| r.range.total).unwrap_or(0);
+        // Count by a bounded listing walk; a page's `range.total` is not the
+        // repository's size (#3928).
+        let (artifact_count, artifact_count_exact) =
+            match SourceRegistry::count_artifacts(&client, &repo.key).await {
+                Ok(count) => (count.counted, count.exact),
+                Err(_) => (0, false),
+            };
         total_artifacts += artifact_count;
+        total_artifacts_exact &= artifact_count_exact;
 
         selected_repos.push(serde_json::json!({
             "key": repo.key,
             "type": repo.repo_type,
             "package_type": repo.package_type,
-            "artifact_count": artifact_count
+            "artifact_count": artifact_count,
+            "artifact_count_exact": artifact_count_exact
         }));
     }
 
@@ -578,6 +586,7 @@ async fn run_assess(
         "source_url": url,
         "total_repositories": selected_repos.len(),
         "total_artifacts": total_artifacts,
+        "total_artifacts_exact": total_artifacts_exact,
         "repositories": selected_repos
     });
 
@@ -593,8 +602,13 @@ async fn run_assess(
         output(
             format,
             &format!(
-                "Assessment: {} repositories, {} artifacts",
+                "Assessment: {} repositories, {}{} artifacts",
                 selected_repos.len(),
+                if total_artifacts_exact {
+                    ""
+                } else {
+                    "at least "
+                },
                 total_artifacts
             ),
             Some(assessment),

@@ -1687,7 +1687,15 @@ pub struct RepositoryAssessment {
     pub key: String,
     pub repo_type: String,
     pub package_type: String,
+    /// Artifacts in the source repository: the exact count when
+    /// `artifact_count_exact`, otherwise only a lower bound (#3928).
     pub artifact_count: i64,
+    /// Whether `artifact_count` is the repository's real size. `false` when
+    /// the bounded listing walk ran out of budget, or the listing failed.
+    /// Assessments saved before #3928 read back `false`: their count was the
+    /// size of a one-row page, not of the repository.
+    #[serde(default)]
+    pub artifact_count_exact: bool,
     pub total_size_bytes: i64,
     pub compatibility: String,
     pub warnings: Vec<String>,
@@ -1712,7 +1720,12 @@ pub struct RepositoryAssessment {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssessmentResult {
     pub repositories: Vec<RepositoryAssessment>,
+    /// Sum of the per-repository counts: exact only when
+    /// `total_artifacts_exact`, otherwise a lower bound (#3928).
     pub total_artifacts: i64,
+    /// Whether every repository was counted exactly.
+    #[serde(default)]
+    pub total_artifacts_exact: bool,
     pub total_size_bytes: i64,
     pub users_count: i64,
     pub groups_count: i64,
@@ -1731,6 +1744,7 @@ impl MigrationService {
     ) -> Result<AssessmentResult, MigrationError> {
         let mut repositories = Vec::new();
         let mut total_artifacts = 0i64;
+        let mut total_artifacts_exact = true;
         let mut total_size = 0i64;
         let mut warnings = Vec::new();
         let mut blockers = Vec::new();
@@ -1751,14 +1765,31 @@ impl MigrationService {
                 FormatCompatibility::Unsupported => "unsupported",
             };
 
-            // Get artifact counts
-            let artifacts = client.list_artifacts(&repo.key, 0, 1).await;
-            let (artifact_count, repo_size) = match artifacts {
-                Ok(aql_response) => (aql_response.range.total, 0i64),
-                Err(_) => (0, 0),
-            };
-
+            // Count by a bounded listing walk. Neither source reports a
+            // repository total; the old read of `range.total` from a one-row
+            // page reported every repository as holding one artifact (#3928).
+            let repo_size = 0i64;
             let mut repo_warnings = Vec::new();
+            let (artifact_count, artifact_count_exact) =
+                match client.count_artifacts(&repo.key).await {
+                    Ok(count) => {
+                        if !count.exact {
+                            repo_warnings.push(format!(
+                                "Holds at least {} artifacts; the exact count is \
+                                 determined while the migration job runs",
+                                count.counted
+                            ));
+                        }
+                        (count.counted, count.exact)
+                    }
+                    Err(e) => {
+                        repo_warnings.push(format!(
+                            "Could not count artifacts ({e}); the count is \
+                             determined while the migration job runs"
+                        ));
+                        (0, false)
+                    }
+                };
 
             // The limitation a user has to know BEFORE the job runs. The old
             // text here ("will be migrated as generic format") described the
@@ -1788,6 +1819,7 @@ impl MigrationService {
                 repo_type: repo.repo_type.clone(),
                 package_type: repo.package_type.clone(),
                 artifact_count,
+                artifact_count_exact,
                 total_size_bytes: repo_size,
                 compatibility: compat_str.to_string(),
                 warnings: repo_warnings,
@@ -1795,6 +1827,7 @@ impl MigrationService {
             });
 
             total_artifacts += artifact_count;
+            total_artifacts_exact &= artifact_count_exact;
             total_size += repo_size;
         }
 
@@ -1836,6 +1869,7 @@ impl MigrationService {
         Ok(AssessmentResult {
             repositories,
             total_artifacts,
+            total_artifacts_exact,
             total_size_bytes: total_size,
             users_count,
             groups_count,
@@ -1869,20 +1903,24 @@ impl MigrationService {
         sqlx::query(
             r#"
             UPDATE migration_jobs
-            SET total_items = $1,
+            SET total_items = CASE WHEN $5 THEN $1 ELSE total_items END,
                 total_bytes = $2,
                 status = 'ready',
                 config = config || $3
             WHERE id = $4
             "#,
         )
-        .bind(result.total_artifacts as i32)
+        // #3928: seed the job's denominator only from an exact count. A lower
+        // bound would publish a too-small denominator that the running job
+        // then overtakes; the worker publishes the enumerated total anyway.
+        .bind(result.total_artifacts.min(i32::MAX as i64) as i32)
         .bind(result.total_size_bytes)
         .bind(serde_json::json!({
             "assessment": summary,
             "assessed_at": chrono::Utc::now().to_rfc3339(),
         }))
         .bind(job_id)
+        .bind(result.total_artifacts_exact)
         .execute(&self.db)
         .await?;
 
@@ -3558,6 +3596,7 @@ mod tests {
             repo_type: "local".to_string(),
             package_type: "maven".to_string(),
             artifact_count: 100,
+            artifact_count_exact: true,
             total_size_bytes: 1_000_000,
             compatibility: "full".to_string(),
             warnings: vec!["warning1".to_string()],
@@ -3575,6 +3614,7 @@ mod tests {
         let result = AssessmentResult {
             repositories: vec![],
             total_artifacts: 500,
+            total_artifacts_exact: true,
             total_size_bytes: 5_000_000,
             users_count: 10,
             groups_count: 3,
@@ -3629,12 +3669,14 @@ mod tests {
                 repo_type: "local".to_string(),
                 package_type: "maven".to_string(),
                 artifact_count: 42,
+                artifact_count_exact: true,
                 total_size_bytes: 1024000,
                 compatibility: "full".to_string(),
                 warnings: vec![],
                 index_gap: None,
             }],
             total_artifacts: 42,
+            total_artifacts_exact: true,
             total_size_bytes: 1024000,
             users_count: 5,
             groups_count: 3,
@@ -3665,6 +3707,7 @@ mod tests {
         let result = AssessmentResult {
             repositories: vec![],
             total_artifacts: 0,
+            total_artifacts_exact: true,
             total_size_bytes: 0,
             users_count: 0,
             groups_count: 0,
@@ -4276,6 +4319,41 @@ mod tests {
         fn source_type(&self) -> &'static str {
             "artifactory"
         }
+    }
+
+    /// #3928: the assessment's per-repository count must come from what the
+    /// listing actually returns, not from a page's `range.total`. The mock
+    /// below lists no artifacts while its `range.total` claims 7 — the shape
+    /// of a source whose page figure describes something other than the
+    /// repository. Pre-fix the assessment reported 7 per repository (and
+    /// seeded the job's denominator from it); the walk reports 0, exactly.
+    #[tokio::test]
+    async fn test_assessment_counts_by_listing_not_range_total_3928() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let listing = vec![
+            ("libs-release".to_string(), "maven".to_string()),
+            ("npm-local".to_string(), "npm".to_string()),
+        ];
+        let svc = MigrationService::new(pool.clone());
+        let result = svc
+            .run_assessment(Uuid::new_v4(), &ListingSource(listing))
+            .await
+            .expect("assessment runs");
+
+        for repo in &result.repositories {
+            assert_eq!(repo.artifact_count, 0, "{}: counted rows", repo.key);
+            assert!(
+                repo.artifact_count_exact,
+                "{}: walk reached the end",
+                repo.key
+            );
+        }
+        assert_eq!(result.total_artifacts, 0);
+        assert!(result.total_artifacts_exact);
     }
 
     /// The pre-migration assessment must name the limitation per repository,
