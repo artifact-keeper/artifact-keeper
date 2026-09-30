@@ -5297,6 +5297,8 @@ pub struct AdvisoryClient {
     /// scanning works without environment re-evaluation wired (tests, and
     /// deployments before main connects the sink).
     delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
+    /// Wall-clock budget for fetching full OSV records after a batch (#4150).
+    osv_hydrate_budget: Duration,
 }
 
 struct CachedAdvisory {
@@ -5430,6 +5432,16 @@ pub struct Dependency {
 
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const OSV_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
+/// Default wall-clock budget for hydrating one OSV batch's matches from their
+/// full records (#4150). Kept well inside `PROXY_SCAN_INLINE_BUDGET`, since
+/// the dependency scan runs within it on the inline proxy path. Overridable
+/// with `OSV_RECORD_FETCH_BUDGET_SECS`.
+const OSV_HYDRATE_BUDGET: Duration = Duration::from_secs(5);
+/// Consecutive record-fetch failures after which hydration stops for the
+/// batch: a feed that has failed this many times in a row is down or does
+/// not serve `/v1/vulns`, and asking about every remaining id only adds
+/// latency.
+const OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES: usize = 5;
 const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 
 impl AdvisoryClient {
@@ -5446,6 +5458,10 @@ impl AdvisoryClient {
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: CACHE_TTL,
             delta_sink: None,
+            osv_hydrate_budget: std::env::var("OSV_RECORD_FETCH_BUDGET_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(OSV_HYDRATE_BUDGET, Duration::from_secs),
         }
     }
 
@@ -5477,6 +5493,7 @@ impl AdvisoryClient {
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         }
     }
 
@@ -5618,7 +5635,7 @@ impl AdvisoryClient {
                 }
             };
 
-            let Some((grouped, answered)) = parsed else {
+            let Some((mut grouped, answered)) = parsed else {
                 // Nothing recorded and nothing cached. An unanswered query has
                 // to stay unanswered: writing an empty result here would cache
                 // "clean" for an hour and hand the caller a list it cannot
@@ -5626,6 +5643,11 @@ impl AdvisoryClient {
                 out.degraded = true;
                 continue;
             };
+
+            // #4150: the batch endpoint returns bare ids; fetch the records
+            // so matches carry their CVE alias, fixed version and summary.
+            // Before the cache write, so the cached answer is the full one.
+            self.hydrate_osv_matches(&mut grouped, &batch).await;
 
             if answered < batch.len() {
                 // A short response answered a PREFIX of the batch. The queries
@@ -5869,81 +5891,348 @@ impl AdvisoryClient {
             };
 
             for vuln in vulns {
-                let id = vuln
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("UNKNOWN")
-                    .to_string();
-
-                let summary = vuln
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                let details = vuln
-                    .get("details")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                // Extract severity from database_specific or severity array
-                let severity = vuln
-                    .get("database_specific")
-                    .and_then(|d| d.get("severity"))
-                    .and_then(|s| s.as_str())
-                    .or_else(|| {
-                        vuln.get("severity")
-                            .and_then(|s| s.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|s| s.get("type"))
-                            .and_then(|t| t.as_str())
-                    })
-                    .unwrap_or("medium")
-                    .to_lowercase();
-
-                // Extract aliases (CVE IDs)
-                let aliases: Vec<String> = vuln
-                    .get("aliases")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Extract fixed version from affected ranges
-                let fixed_version = vuln
-                    .get("affected")
-                    .and_then(|a| a.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|a| a.get("ranges"))
-                    .and_then(|r| r.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|r| r.get("events"))
-                    .and_then(|e| e.as_array())
-                    .and_then(|events| {
-                        events
-                            .iter()
-                            .find_map(|e| e.get("fixed").and_then(|f| f.as_str().map(String::from)))
-                    });
-
-                let dep = deps.get(i);
-
-                grouped[i].push(AdvisoryMatch {
-                    id: id.clone(),
-                    summary,
-                    details,
-                    severity,
-                    aliases,
-                    affected_version: dep.and_then(|d| d.version.clone()),
-                    fixed_version,
-                    source: "osv.dev".to_string(),
-                    source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
-                });
+                grouped[i].push(Self::parse_osv_vuln(vuln, deps.get(i)));
             }
         }
 
         grouped
+    }
+
+    /// Parse one OSV vulnerability record into a match for `dep`.
+    ///
+    /// Shared by the batch parse and by
+    /// [`hydrate_osv_matches`](Self::hydrate_osv_matches), which re-parses the
+    /// FULL record fetched from `/v1/vulns/{id}`: `/v1/querybatch` answers with only `id` and
+    /// `modified` per vulnerability, so a batch-parsed match carries no CVE
+    /// alias, no fixed version and no summary until it is hydrated (#4150).
+    fn parse_osv_vuln(vuln: &serde_json::Value, dep: Option<&Dependency>) -> AdvisoryMatch {
+        let id = vuln
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
+        let details = vuln
+            .get("details")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // The record's own summary; failing that, the first line of its
+        // details, which is what a GHSA/PYSEC record without a summary leads
+        // with. Only a record with neither falls back to the bare id (#4150).
+        let summary = vuln
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| details.as_deref().and_then(Self::summary_from_details));
+
+        // Extract severity from database_specific or severity array
+        let severity = vuln
+            .get("database_specific")
+            .and_then(|d| d.get("severity"))
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                vuln.get("severity")
+                    .and_then(|s| s.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|s| s.get("type"))
+                    .and_then(|t| t.as_str())
+            })
+            .unwrap_or("medium")
+            .to_lowercase();
+
+        // Extract aliases (CVE IDs)
+        let aliases: Vec<String> = vuln
+            .get("aliases")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let fixed_version = Self::osv_fixed_version(vuln, dep);
+
+        AdvisoryMatch {
+            id: id.clone(),
+            summary,
+            details,
+            severity,
+            aliases,
+            affected_version: dep.and_then(|d| d.version.clone()),
+            fixed_version,
+            source: "osv.dev".to_string(),
+            source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
+        }
+    }
+
+    /// First prose line of an advisory's `details`, bounded, as a stand-in
+    /// title. GHSA details usually open with a markdown heading (`### Impact`),
+    /// which says nothing about the vulnerability, so headings are skipped.
+    fn summary_from_details(details: &str) -> Option<String> {
+        const MAX_CHARS: usize = 200;
+        let line = details
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+        Some(line.chars().take(MAX_CHARS).collect())
+    }
+
+    /// The `fixed` event of the `affected` entry that describes `dep`.
+    ///
+    /// A full OSV record lists every package the advisory touches, often
+    /// across ecosystems (a PyPI package and its conda or Debian rebuilds), so
+    /// taking the first entry reports another package's fix. The entry whose
+    /// package name matches `dep` (PEP 503-style normalized, and in the same
+    /// ecosystem when both sides name one) wins; with no such entry, or no
+    /// `dep`, the first entry is used, which is also the only one a
+    /// single-package record has.
+    ///
+    /// Within the entry, `GIT` ranges are skipped (their events are commit
+    /// SHAs, not versions). When the installed version is known, the fix that
+    /// closes the `[introduced, fixed)` interval containing it wins, so a
+    /// split advisory (`0..1.2`, `2.0..2.3`) reports `2.3` for `2.1`. Otherwise
+    /// the first fix event is reported.
+    fn osv_fixed_version(vuln: &serde_json::Value, dep: Option<&Dependency>) -> Option<String> {
+        let affected = vuln.get("affected")?.as_array()?;
+        let matching = dep.and_then(|d| {
+            let want = Self::normalize_package_name(&d.name);
+            affected.iter().find(|a| {
+                let pkg = a.get("package");
+                let name = pkg.and_then(|p| p.get("name")).and_then(|n| n.as_str());
+                let eco = pkg
+                    .and_then(|p| p.get("ecosystem"))
+                    .and_then(|e| e.as_str());
+                let same_eco = match eco {
+                    Some(e) if d.ecosystem != ECOSYSTEM_UNSCOPED => {
+                        e.eq_ignore_ascii_case(&d.ecosystem)
+                    }
+                    _ => true,
+                };
+                name.is_some_and(|n| Self::normalize_package_name(n) == want) && same_eco
+            })
+        });
+        let entry = matching.or_else(|| affected.first())?;
+        let ranges: Vec<&Vec<serde_json::Value>> = entry
+            .get("ranges")?
+            .as_array()?
+            .iter()
+            .filter(|r| {
+                r.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|t| !t.eq_ignore_ascii_case("GIT"))
+            })
+            .filter_map(|r| r.get("events").and_then(|e| e.as_array()))
+            .collect();
+
+        let installed = dep.and_then(|d| d.version.as_deref());
+        if let Some(installed) = installed {
+            use crate::services::cpe_candidates::compare_versions;
+            use std::cmp::Ordering;
+            for events in &ranges {
+                let mut introduced: Option<&str> = None;
+                for event in events.iter() {
+                    if let Some(i) = event.get("introduced").and_then(|v| v.as_str()) {
+                        introduced = Some(i);
+                    } else if let Some(fixed) = event.get("fixed").and_then(|v| v.as_str()) {
+                        let at_or_after_start = match introduced {
+                            None | Some("0") => true,
+                            Some(i) => compare_versions(installed, i) != Ordering::Less,
+                        };
+                        if at_or_after_start && compare_versions(installed, fixed) == Ordering::Less
+                        {
+                            return Some(fixed.to_string());
+                        }
+                        introduced = None;
+                    }
+                }
+            }
+        }
+
+        ranges
+            .iter()
+            .flat_map(|events| events.iter())
+            .find_map(|e| e.get("fixed").and_then(|f| f.as_str()).map(String::from))
+    }
+
+    /// PEP 503 name normalization: lowercase, runs of `-`, `_` and `.`
+    /// collapsed to a single `-`.
+    fn normalize_package_name(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut in_separator_run = false;
+        for c in name.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !in_separator_run {
+                    out.push('-');
+                }
+                in_separator_run = true;
+            } else {
+                out.push(c.to_ascii_lowercase());
+                in_separator_run = false;
+            }
+        }
+        out
+    }
+
+    /// Whether a match came from a bare batch entry (`id` + `modified` only)
+    /// and so still needs its full record.
+    fn osv_match_is_skeletal(m: &AdvisoryMatch) -> bool {
+        m.summary.is_none()
+            && m.details.is_none()
+            && m.aliases.is_empty()
+            && m.fixed_version.is_none()
+    }
+
+    /// An OSV identifier safe to put in a URL path (`GHSA-xxxx-xxxx-xxxx`,
+    /// `PYSEC-2023-1`, `CVE-2024-1`, ...). The ids come from the feed's own
+    /// response, so anything else is skipped rather than escaped.
+    fn is_plain_osv_id(id: &str) -> bool {
+        // `UNKNOWN` is what `parse_osv_vuln` substitutes for a missing id;
+        // `.` and `..` are path segments, not identifiers.
+        !matches!(id, "" | "." | ".." | "UNKNOWN")
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    }
+
+    /// `/v1/vulns` beside the configured `/v1/querybatch`. `None` for a batch
+    /// URL of any other shape, in which case matches stay unhydrated.
+    fn osv_vulns_url(&self) -> Option<String> {
+        self.osv_batch_url()
+            .strip_suffix("/querybatch")
+            .map(|base| format!("{base}/vulns"))
+    }
+
+    /// Fetch one full OSV record. A failure yields the reason instead: a
+    /// finding without its detail is still a finding, so hydration never
+    /// degrades or drops a match. Failures are summarized once per batch by
+    /// the caller rather than logged per id, so a mirror that lacks the
+    /// records endpoint does not produce one warning per advisory.
+    async fn fetch_osv_vuln(
+        &self,
+        vulns_url: &str,
+        id: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let url = format!("{vulns_url}/{id}");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status()));
+        }
+        let record = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("unparseable body: {e}"))?;
+        // The record must be the one asked for: a body naming another id
+        // would attach a different advisory's CVE and fix to this finding.
+        if record.get("id").and_then(|v| v.as_str()) != Some(id) {
+            return Err("record names a different id".to_string());
+        }
+        Ok(record)
+    }
+
+    /// Replace every skeletal batch match with its full record (#4150).
+    ///
+    /// Without this, every OSV-sourced finding (declared, vendored and conda
+    /// alias alike) is stored with no CVE id, no fixed version and the
+    /// placeholder title `Vulnerability <id>`, which also defeats the
+    /// CVE-keyed dedup against the cataloging scanner's rows
+    /// ([`crate::services::component_dedup`]). Each distinct id is fetched
+    /// once per batch, with bounded concurrency; ids that are not a plain
+    /// OSV identifier are never interpolated into a URL.
+    ///
+    /// Bounded in time as well as concurrency: the dependency scan runs
+    /// inside the inline proxy scan budget, where a slow records endpoint
+    /// must not turn a pull inconclusive. Fetching stops at the
+    /// `osv_hydrate_budget` deadline or after
+    /// [`OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES`] failures in a row; whatever
+    /// was not fetched by then keeps its bare match, and the lookup is not
+    /// degraded (the feed did answer the question that decides cleanliness).
+    async fn hydrate_osv_matches(&self, grouped: &mut [Vec<AdvisoryMatch>], deps: &[Dependency]) {
+        const CONCURRENCY: usize = 8;
+        let Some(vulns_url) = self.osv_vulns_url() else {
+            return;
+        };
+        let ids: BTreeSet<String> = grouped
+            .iter()
+            .flatten()
+            .filter(|m| Self::osv_match_is_skeletal(m))
+            .map(|m| m.id.clone())
+            .filter(|id| Self::is_plain_osv_id(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        let requested = ids.len();
+        let vulns_url = vulns_url.as_str();
+        let deadline = tokio::time::Instant::now() + self.osv_hydrate_budget;
+        let mut fetches = futures::stream::iter(ids)
+            .map(|id| async move {
+                let record = self.fetch_osv_vuln(vulns_url, &id).await;
+                (id, record)
+            })
+            .buffer_unordered(CONCURRENCY);
+        let mut records: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut failures = 0usize;
+        let mut consecutive_failures = 0usize;
+        let mut last_failure: Option<String> = None;
+        let mut stopped_early: Option<&str> = None;
+        loop {
+            match tokio::time::timeout_at(deadline, fetches.next()).await {
+                Err(_) => {
+                    stopped_early = Some("time budget exhausted");
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some((id, Ok(record)))) => {
+                    consecutive_failures = 0;
+                    records.insert(id, record);
+                }
+                Ok(Some((id, Err(reason)))) => {
+                    tracing::debug!(osv_id = %id, reason = %reason, "OSV record fetch failed");
+                    failures += 1;
+                    consecutive_failures += 1;
+                    last_failure = Some(format!("{id}: {reason}"));
+                    if consecutive_failures >= OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES {
+                        stopped_early = Some("too many consecutive failures");
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping the stream cancels any fetch still in flight.
+        drop(fetches);
+
+        if failures > 0 || stopped_early.is_some() {
+            warn!(
+                requested,
+                hydrated = records.len(),
+                failed = failures,
+                stopped_early = stopped_early.unwrap_or("no"),
+                last_failure = last_failure.as_deref().unwrap_or("none"),
+                "OSV.dev records could not all be fetched; the affected findings keep \
+                 their bare advisory id (no CVE, fixed version or summary)"
+            );
+        }
+
+        for (i, matches) in grouped.iter_mut().enumerate() {
+            for m in matches.iter_mut() {
+                if !Self::osv_match_is_skeletal(m) {
+                    continue;
+                }
+                if let Some(record) = records.get(&m.id) {
+                    *m = Self::parse_osv_vuln(record, deps.get(i));
+                }
+            }
+        }
     }
 
     fn parse_github_advisory(adv: &serde_json::Value, dep: &Dependency) -> Option<AdvisoryMatch> {
@@ -6068,6 +6357,17 @@ struct CondaCoverageGap {
 }
 
 impl DependencyScanner {
+    /// The CVE an advisory is about: its first `CVE-` alias, or its own id
+    /// when that is a CVE.
+    fn cve_of(advisory: &AdvisoryMatch) -> Option<String> {
+        advisory
+            .aliases
+            .iter()
+            .find(|a| a.starts_with("CVE-"))
+            .cloned()
+            .or_else(|| advisory.id.starts_with("CVE-").then(|| advisory.id.clone()))
+    }
+
     pub fn new(advisory: Arc<AdvisoryClient>) -> Self {
         Self { advisory, db: None }
     }
@@ -6738,9 +7038,17 @@ impl Scanner for DependencyScanner {
             );
         }
 
-        // Merge and deduplicate by CVE/GHSA ID
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut findings = Vec::new();
+        // Merge and deduplicate by advisory id and alias, PER DEPENDENCY: the
+        // same CVE reached through different advisory ids for the SAME
+        // package is one finding, but the same CVE in two different packages
+        // (libwebp's CVE-2023-4863 in both pillow and opencv-python) is two,
+        // and a batch-wide set would silently drop the second (#4150).
+        //
+        // Value: index of the surviving finding, so a collapsed duplicate can
+        // still raise its severity (GHSA grades explicitly; a PYSEC record
+        // for the same CVE often carries no grade and falls back to Medium).
+        let mut seen_ids: HashMap<(String, Option<String>, String), usize> = HashMap::new();
+        let mut findings: Vec<RawFinding> = Vec::new();
 
         let mut osv_by_dep = osv_results.per_dep.into_iter();
         let mut gh_by_dep = gh_results.per_dep.into_iter();
@@ -6749,17 +7057,8 @@ impl Scanner for DependencyScanner {
             let osv = osv_by_dep.next().unwrap_or_default();
             let gh = gh_by_dep.next().unwrap_or_default();
 
+            let dep_key = |id: &str| (dep.name.clone(), dep.version.clone(), id.to_string());
             for advisory_match in osv.into_iter().chain(gh) {
-                // Skip if we have already seen this advisory or any of its aliases
-                let dominated = seen_ids.contains(&advisory_match.id)
-                    || advisory_match.aliases.iter().any(|a| seen_ids.contains(a));
-                if dominated {
-                    continue;
-                }
-
-                seen_ids.insert(advisory_match.id.clone());
-                seen_ids.extend(advisory_match.aliases.iter().cloned());
-
                 // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
                 // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
                 // rarely omits severity, so `Medium` is a neutral guess for a
@@ -6768,18 +7067,33 @@ impl Scanner for DependencyScanner {
                 let severity =
                     Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
 
-                let cve_id = advisory_match
-                    .aliases
-                    .iter()
-                    .find(|a| a.starts_with("CVE-"))
-                    .cloned()
-                    .or_else(|| {
-                        if advisory_match.id.starts_with("CVE-") {
-                            Some(advisory_match.id.clone())
-                        } else {
-                            None
-                        }
-                    });
+                // Already reported for this dependency under this id or one of
+                // its aliases: keep the existing finding, but never let the
+                // collapse lower the grade (`Severity` orders most severe
+                // first) or lose a fix the survivor did not know.
+                let existing = std::iter::once(&advisory_match.id)
+                    .chain(advisory_match.aliases.iter())
+                    .find_map(|id| seen_ids.get(&dep_key(id)).copied());
+                if let Some(idx) = existing {
+                    let survivor = &mut findings[idx];
+                    survivor.severity = survivor.severity.min(severity);
+                    if survivor.fixed_version.is_none() {
+                        survivor.fixed_version = advisory_match.fixed_version.clone();
+                    }
+                    if survivor.cve_id.is_none() {
+                        survivor.cve_id = Self::cve_of(&advisory_match);
+                    }
+                    for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
+                        seen_ids.entry(dep_key(id)).or_insert(idx);
+                    }
+                    continue;
+                }
+                let idx = findings.len();
+                for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
+                    seen_ids.insert(dep_key(id), idx);
+                }
+
+                let cve_id = Self::cve_of(&advisory_match);
 
                 let title = advisory_match
                     .summary
@@ -15570,6 +15884,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
 
         let deps: Vec<_> = (0..1001)
@@ -15661,6 +15976,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
 
         let deps = vec![Dependency {
@@ -15766,6 +16082,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: Some(sink.clone()),
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
         (server, client, sink)
     }
@@ -15833,6 +16150,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: Duration::from_secs(3600),
             delta_sink: Some(sink.clone()),
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
         let deps = vec![Dependency {
             name: "never-seen-pkg".to_string(),
@@ -15889,6 +16207,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -18979,7 +19298,12 @@ tonic-build = "0.12"
         });
         let matches = AdvisoryClient::parse_osv_response(&body, &deps);
         assert_eq!(matches.len(), 1);
-        assert!(matches[0].summary.is_none());
+        // #4150: a record with no `summary` takes the first prose line of its
+        // `details` as its title, so the finding is never untitled.
+        assert_eq!(
+            matches[0].summary.as_deref(),
+            Some("A detailed description without summary")
+        );
         assert_eq!(
             matches[0].details.as_deref(),
             Some("A detailed description without summary")
@@ -28071,6 +28395,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -28564,6 +28889,65 @@ tonic-build = "0.12"
             fx.teardown().await;
         }
 
+        /// #4150: OSV's batch endpoint answers with bare ids. A vendored
+        /// finding built from that alone is stored with no CVE, no fix and the
+        /// title `Vulnerability <id>`; the full record has all three.
+        #[tokio::test]
+        async fn test_vendored_finding_is_hydrated_from_the_full_osv_record() {
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", "pypi").await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            let id = "OSV-2023-libwebp";
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{ "id": id, "modified": "2024-01-01T00:00:00Z" }] }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(libwebp_advisory()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let artifact = artifact_with_components(
+                &fx,
+                "vend-hydrate",
+                &[("libwebp", Some("1.3.1"), Some("pkg:generic/libwebp@1.3.1"))],
+            )
+            .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(fx.pool.clone());
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("scan");
+            fx.teardown().await;
+
+            assert_eq!(out.findings.len(), 1);
+            let finding = &out.findings[0];
+            assert_eq!(finding.source.as_deref(), Some("osv.dev (vendored)"));
+            assert_eq!(finding.cve_id.as_deref(), Some("CVE-2023-4863"));
+            assert_eq!(finding.fixed_version.as_deref(), Some("1.3.2"));
+            assert_eq!(finding.title, "Heap buffer overflow in libwebp");
+            assert_eq!(finding.severity, Severity::Critical);
+        }
+
         /// A version-less component must never reach the feed. A query without
         /// a version matches every advisory ever filed against the name,
         /// regardless of whether this build is affected -- confident findings
@@ -28860,6 +29244,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -29449,6 +29834,438 @@ tonic-build = "0.12"
                  `analysis_degraded` has fallen out of the `feeds_degraded` \
                  disjunction and #4080 is back"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // #4150: OSV batch answers are bare ids; findings need the record
+        // -------------------------------------------------------------------
+
+        /// What `/v1/querybatch` really returns per vulnerability: the id and
+        /// a timestamp, nothing else.
+        fn skeletal_batch(ids: &[&str]) -> serde_json::Value {
+            let vulns: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({ "id": id, "modified": "2024-01-01T00:00:00Z" }))
+                .collect();
+            serde_json::json!({ "results": [{ "vulns": vulns }] })
+        }
+
+        /// A full `/v1/vulns/{id}` record for an opencv advisory. The FIRST
+        /// `affected` entry is a sibling distribution with a different fix,
+        /// so reading `affected[0]` would report the wrong fixed version.
+        fn opencv_record(id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "modified": "2024-01-01T00:00:00Z",
+                "summary": "opencv-python bundles a vulnerable libwebp",
+                "details": "The bundled libwebp is affected by CVE-2023-4863.",
+                "aliases": ["PYSEC-2023-0001", "CVE-2023-4863"],
+                "database_specific": { "severity": "HIGH" },
+                "affected": [
+                    {
+                        "package": { "name": "opencv-contrib-python", "ecosystem": "PyPI" },
+                        "ranges": [{ "type": "ECOSYSTEM", "events": [
+                            { "introduced": "0" }, { "fixed": "9.9.9" }
+                        ]}]
+                    },
+                    {
+                        "package": { "name": "opencv-python", "ecosystem": "PyPI" },
+                        "ranges": [{ "type": "ECOSYSTEM", "events": [
+                            { "introduced": "0" }, { "fixed": "4.8.1.78" }
+                        ]}]
+                    }
+                ]
+            })
+        }
+
+        async fn mount_skeletal_batch(server: &MockServer, ids: &[&str]) {
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(skeletal_batch(ids)))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        /// The issue as reported: a conda-alias finding stored with no CVE id,
+        /// no fixed version and the title `Vulnerability <id>`, because the
+        /// batch answer carries none of them. After hydration the finding
+        /// carries the record's CVE alias, the fix for the matching package,
+        /// its summary and its graded severity.
+        #[tokio::test]
+        async fn test_conda_alias_finding_is_hydrated_from_the_full_osv_record() {
+            let server = MockServer::start().await;
+            let id = "GHSA-cv41-0000-0001";
+            mount_skeletal_batch(&server, &[id]).await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(opencv_record(id)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+
+            let out = scan_conda(&scanner, "py-opencv", "4.9.0", &Bytes::new()).await;
+
+            assert_eq!(out.findings.len(), 1);
+            let finding = &out.findings[0];
+            assert_eq!(
+                finding.cve_id.as_deref(),
+                Some("CVE-2023-4863"),
+                "the CVE comes from the record's aliases"
+            );
+            assert_eq!(
+                finding.fixed_version.as_deref(),
+                Some("4.8.1.78"),
+                "the fix of the affected entry for the queried package, not affected[0]"
+            );
+            assert_eq!(finding.title, "opencv-python bundles a vulnerable libwebp");
+            assert_ne!(finding.title, format!("Vulnerability {id}"));
+            assert_eq!(finding.severity, Severity::High);
+            assert_eq!(finding.source.as_deref(), Some("osv.dev (conda alias)"));
+            assert_eq!(finding.affected_component.as_deref(), Some("py-opencv"));
+            assert!(finding
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("CVE-2023-4863")));
+        }
+
+        /// A record that cannot be fetched leaves the match as the batch gave
+        /// it. The finding is still reported, and the lookup is NOT degraded:
+        /// the feed answered the question that decides whether the artifact is
+        /// clean; only the decoration is missing.
+        #[tokio::test]
+        async fn test_unfetchable_osv_record_keeps_the_bare_match() {
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &["GHSA-gone-0000-0001"]).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-gone-0000-0001"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(!lookup.degraded, "the batch itself was answered");
+            assert_eq!(lookup.per_dep[0].len(), 1, "the match is never dropped");
+            let m = &lookup.per_dep[0][0];
+            assert_eq!(m.id, "GHSA-gone-0000-0001");
+            assert!(m.aliases.is_empty() && m.summary.is_none());
+        }
+
+        /// Each distinct advisory is fetched once per batch however many
+        /// dependencies it matched, and a record answering with a different
+        /// id is not attached to the match.
+        #[tokio::test]
+        async fn test_osv_records_are_fetched_once_and_must_match_the_id() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [
+                            { "id": "GHSA-same-0000-0001" },
+                            { "id": "GHSA-lies-0000-0001" }
+                        ] },
+                        { "vulns": [{ "id": "GHSA-same-0000-0001" }] }
+                    ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-same-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(opencv_record("GHSA-same-0000-0001")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-lies-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(opencv_record("GHSA-other-0000-0001")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[
+                    dep("opencv-python", "4.9.0", "PyPI"),
+                    dep("opencv-contrib-python", "4.9.0", "PyPI"),
+                ])
+                .await;
+
+            let first = &lookup.per_dep[0];
+            assert_eq!(first[0].fixed_version.as_deref(), Some("4.8.1.78"));
+            assert!(
+                first[1].aliases.is_empty(),
+                "a record for another id must not decorate this match"
+            );
+            // Same advisory, other dependency: its own affected entry's fix.
+            assert_eq!(lookup.per_dep[1][0].fixed_version.as_deref(), Some("9.9.9"));
+        }
+
+        /// A full OSV record for `id`, reaching CVE-2023-4863, affecting `pkg`.
+        fn cve_record(id: &str, pkg: &str, severity: Option<&str>) -> serde_json::Value {
+            let mut record = serde_json::json!({
+                "id": id,
+                "summary": format!("{pkg} bundles a vulnerable libwebp"),
+                "aliases": ["CVE-2023-4863"],
+                "severity": [{ "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H" }],
+                "affected": [{
+                    "package": { "name": pkg, "ecosystem": "PyPI" },
+                    "ranges": [{ "type": "ECOSYSTEM", "events": [
+                        { "introduced": "0" }, { "fixed": "99.0" }
+                    ]}]
+                }]
+            });
+            if let Some(sev) = severity {
+                record["database_specific"] = serde_json::json!({ "severity": sev });
+            }
+            record
+        }
+
+        async fn scan_requirements(
+            results: serde_json::Value,
+            content: &'static [u8],
+        ) -> ScanOutput {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(results))
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            scanner
+                .scan(&artifact, None, &Bytes::from_static(content))
+                .await
+                .expect("scan")
+        }
+
+        /// The same CVE in two DIFFERENT packages is two findings. Once
+        /// hydration gives every OSV match its CVE alias, a batch-wide
+        /// seen-set would report libwebp's CVE for pillow and silently drop
+        /// it for opencv-python.
+        #[tokio::test]
+        async fn test_same_cve_in_two_packages_is_reported_for_each() {
+            let out = scan_requirements(
+                serde_json::json!({ "results": [
+                    { "vulns": [cve_record("GHSA-pill-0000-0001", "pillow", Some("HIGH"))] },
+                    { "vulns": [cve_record("GHSA-ocv0-0000-0001", "opencv-python", Some("HIGH"))] }
+                ]}),
+                b"pillow==9.4.0\nopencv-python==4.6.0\n",
+            )
+            .await;
+
+            let mut components: Vec<&str> = out
+                .findings
+                .iter()
+                .filter(|f| f.cve_id.as_deref() == Some("CVE-2023-4863"))
+                .filter_map(|f| f.affected_component.as_deref())
+                .collect();
+            components.sort_unstable();
+            assert_eq!(components, vec!["opencv-python", "pillow"]);
+        }
+
+        /// GHSA and PYSEC records for one CVE in one package collapse to one
+        /// finding, and the collapse keeps the HIGHER grade: the PYSEC record
+        /// has no `database_specific.severity` and reads as Medium, so whichever
+        /// arrives first must not pin the finding there.
+        #[tokio::test]
+        async fn test_collapsed_aliases_keep_the_higher_severity() {
+            let mut pysec = cve_record("PYSEC-2023-0099", "pillow", None);
+            pysec["aliases"] = serde_json::json!(["CVE-2023-4863", "GHSA-pill-0000-0001"]);
+            let out = scan_requirements(
+                serde_json::json!({ "results": [{ "vulns": [
+                    pysec,
+                    cve_record("GHSA-pill-0000-0001", "pillow", Some("CRITICAL"))
+                ]}]}),
+                b"pillow==9.4.0\n",
+            )
+            .await;
+
+            assert_eq!(out.findings.len(), 1, "one CVE, one package, one finding");
+            assert_eq!(out.findings[0].severity, Severity::Critical);
+            assert_eq!(out.findings[0].cve_id.as_deref(), Some("CVE-2023-4863"));
+        }
+
+        /// A records endpoint slower than the hydration budget must not hold
+        /// the scan: on the inline proxy path it runs inside a 30 s budget,
+        /// and blowing it turns a pull inconclusive. The bare match survives
+        /// and the lookup is not degraded.
+        #[tokio::test]
+        async fn test_slow_osv_records_endpoint_is_bounded_by_the_budget() {
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &["GHSA-slow-0000-0001"]).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-slow-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(opencv_record("GHSA-slow-0000-0001"))
+                        .set_delay(Duration::from_secs(4)),
+                )
+                .mount(&server)
+                .await;
+            let mut client = AdvisoryClient::for_test(
+                format!("{}/v1/querybatch", server.uri()),
+                Duration::from_secs(3600),
+            );
+            client.osv_hydrate_budget = Duration::from_millis(300);
+
+            let started = Instant::now();
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "hydration must stop at its budget, took {:?}",
+                started.elapsed()
+            );
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.per_dep[0].len(), 1);
+            assert!(lookup.per_dep[0][0].aliases.is_empty(), "left bare");
+        }
+
+        /// A records endpoint that fails every request stops being asked after
+        /// a few consecutive failures instead of once per advisory.
+        #[tokio::test]
+        async fn test_failing_osv_records_endpoint_trips_the_breaker() {
+            let ids: Vec<String> = (0..30).map(|i| format!("GHSA-down-0000-{i:04}")).collect();
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &id_refs).await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.per_dep[0].len(), 30, "every match is kept");
+            let gets = server
+                .received_requests()
+                .await
+                .expect("mock records requests")
+                .iter()
+                .filter(|r| r.method == wiremock::http::Method::GET)
+                .count();
+            assert!(
+                gets < 30,
+                "the breaker must stop asking after consecutive failures, sent {gets}"
+            );
+        }
+
+        fn ranged(pkg: &str, ranges: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "id": "GHSA-rang-0000-0001",
+                "affected": [{ "package": { "name": pkg, "ecosystem": "PyPI" }, "ranges": ranges }]
+            })
+        }
+
+        /// A split advisory reports the fix that closes the interval holding
+        /// the installed version, not the first fix listed.
+        #[test]
+        fn test_fixed_version_comes_from_the_interval_holding_the_installed_version() {
+            let record = ranged(
+                "pillow",
+                serde_json::json!([{ "type": "ECOSYSTEM", "events": [
+                    { "introduced": "0" }, { "fixed": "1.2" },
+                    { "introduced": "2.0" }, { "fixed": "2.3" }
+                ]}]),
+            );
+            let fixed = |v: &str| {
+                AdvisoryClient::osv_fixed_version(&record, Some(&dep("pillow", v, "PyPI")))
+            };
+            assert_eq!(fixed("2.1").as_deref(), Some("2.3"));
+            assert_eq!(fixed("1.0").as_deref(), Some("1.2"));
+            // Outside every interval: fall back to the first fix listed.
+            assert_eq!(fixed("1.5").as_deref(), Some("1.2"));
+            assert_eq!(
+                AdvisoryClient::osv_fixed_version(&record, None).as_deref(),
+                Some("1.2")
+            );
+        }
+
+        /// GIT ranges carry commit SHAs, which are not versions anyone can
+        /// upgrade to.
+        #[test]
+        fn test_fixed_version_skips_git_ranges() {
+            let record = ranged(
+                "pillow",
+                serde_json::json!([
+                    { "type": "GIT", "repo": "https://github.com/python-pillow/Pillow",
+                      "events": [{ "introduced": "0" }, { "fixed": "0123456789abcdef0123456789abcdef01234567" }] },
+                    { "type": "ECOSYSTEM", "events": [{ "introduced": "0" }, { "fixed": "10.0.1" }] }
+                ]),
+            );
+            assert_eq!(
+                AdvisoryClient::osv_fixed_version(&record, Some(&dep("pillow", "9.4.0", "PyPI")))
+                    .as_deref(),
+                Some("10.0.1")
+            );
+            let git_only = ranged(
+                "pillow",
+                serde_json::json!([{ "type": "GIT", "events": [{ "fixed": "deadbeef" }] }]),
+            );
+            assert_eq!(AdvisoryClient::osv_fixed_version(&git_only, None), None);
+        }
+
+        #[test]
+        fn test_package_names_normalize_per_pep_503() {
+            assert_eq!(
+                AdvisoryClient::normalize_package_name("Opencv__Contrib.-Python"),
+                "opencv-contrib-python"
+            );
+        }
+
+        #[test]
+        fn test_osv_ids_that_are_not_identifiers_are_never_fetched() {
+            for id in ["", ".", "..", "UNKNOWN", "GHSA-x/../y", "a b"] {
+                assert!(!AdvisoryClient::is_plain_osv_id(id), "{id:?}");
+            }
+            for id in [
+                "GHSA-abcd-1234-efgh",
+                "PYSEC-2023-1",
+                "CVE-2024-1",
+                "OSV-2023-libwebp",
+            ] {
+                assert!(AdvisoryClient::is_plain_osv_id(id), "{id:?}");
+            }
+        }
+
+        /// The first line of `details` stands in for a missing summary, so a
+        /// record without one still gets a readable title.
+        #[test]
+        fn test_osv_details_stand_in_for_a_missing_summary() {
+            let record = serde_json::json!({
+                "id": "PYSEC-2023-0002",
+                "details": "\n### Impact\nHeap overflow in the bundled decoder.\n\nMore text.",
+            });
+            let m = AdvisoryClient::parse_osv_vuln(&record, None);
+            assert_eq!(
+                m.summary.as_deref(),
+                Some("Heap overflow in the bundled decoder.")
+            );
+            let bare = AdvisoryClient::parse_osv_vuln(&serde_json::json!({ "id": "X-1" }), None);
+            assert!(bare.summary.is_none(), "no details, no invented title");
         }
 
         fn dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
