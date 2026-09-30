@@ -331,6 +331,9 @@ impl MigrationService {
             "golang" => "go".to_string(),
             // RubyGems is sometimes reported as `gems` or `rubygems`
             "gems" => "rubygems".to_string(),
+            // Nexus names its R/CRAN format `r`; Artifactory and Artifact
+            // Keeper call it `cran` (#2525).
+            "r" => "cran".to_string(),
             _ => lower,
         }
     }
@@ -343,8 +346,12 @@ impl MigrationService {
     pub fn get_format_compatibility(package_type: &str) -> FormatCompatibility {
         let normalized = Self::normalize_package_type(package_type);
         match normalized.as_str() {
+            // CRAN is Full: the PACKAGES index is built at request time from
+            // the repository's `artifacts` rows (by `{name}_{version}.tar.gz`
+            // filename), so migrated source packages are installable without
+            // a re-publish (#2525).
             "maven" | "npm" | "docker" | "pypi" | "helm" | "nuget" | "cargo" | "go" | "generic"
-            | "rubygems" => FormatCompatibility::Full,
+            | "rubygems" | "cran" => FormatCompatibility::Full,
             "conan" | "conda" | "debian" | "rpm" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
@@ -2537,6 +2544,23 @@ mod tests {
                 "Expected Partial for '{}'",
                 fmt
             );
+        }
+    }
+
+    /// #2525: R/CRAN repositories migrate from both source vocabularies —
+    /// Artifactory's `cran` and Nexus's `r` — as native CRAN repositories.
+    #[test]
+    fn test_cran_and_nexus_r_are_full_2525() {
+        assert_eq!(MigrationService::normalize_package_type("r"), "cran");
+        assert_eq!(MigrationService::normalize_package_type("R"), "cran");
+        assert_eq!(MigrationService::target_repository_format("r"), "cran");
+        for source in ["cran", "CRAN", "r", "R"] {
+            assert_eq!(
+                MigrationService::get_format_compatibility(source),
+                FormatCompatibility::Full,
+                "{source}"
+            );
+            assert_eq!(MigrationService::index_limitation(source), None, "{source}");
         }
     }
 

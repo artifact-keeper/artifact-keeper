@@ -1097,6 +1097,19 @@ impl MigrationWorker {
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
 
+                // The source's own generated index is not content: AK builds
+                // it from the imported rows, and a copied one would be listed
+                // as a bogus package (#2525).
+                if is_source_generated_index(package_type, &artifact_path) {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Skipping the source's generated package index"
+                    );
+                    *skipped += 1;
+                    continue;
+                }
+
                 // Dry run: report what would move and stop here. First branch
                 // in the body on purpose, ahead of every DB read/write, the
                 // download, and the storage put.
@@ -3722,6 +3735,25 @@ pub(crate) fn migration_catalog_entry(
             })
         }
     }
+}
+
+/// Whether `artifact_path` is an index the source registry generates for a
+/// format whose index Artifact Keeper builds itself from the imported rows.
+///
+/// CRAN only today (#2525): `PACKAGES`, `PACKAGES.gz`, `PACKAGES.rds` and
+/// `PACKAGES.json` under `src/contrib/` or `bin/.../contrib/<r-version>/`. AK's
+/// CRAN handler lists every `artifacts` row of the repository, so a copied
+/// `PACKAGES` file would appear in the served index as a package called
+/// `PACKAGES` with no version.
+pub(crate) fn is_source_generated_index(package_type: &str, artifact_path: &str) -> bool {
+    if !package_type.eq_ignore_ascii_case("cran") {
+        return false;
+    }
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    matches!(
+        filename,
+        "PACKAGES" | "PACKAGES.gz" | "PACKAGES.rds" | "PACKAGES.json"
+    )
 }
 
 /// The `artifact_metadata` document a live `mvn deploy` stores for a Maven
@@ -10735,6 +10767,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_is_source_generated_index_cran_2525() {
+        for path in [
+            "src/contrib/PACKAGES",
+            "src/contrib/PACKAGES.gz",
+            "src/contrib/PACKAGES.rds",
+            "bin/windows/contrib/4.3/PACKAGES",
+        ] {
+            assert!(is_source_generated_index("cran", path), "{path}");
+        }
+        assert!(!is_source_generated_index(
+            "cran",
+            "src/contrib/dplyr_1.1.4.tar.gz"
+        ));
+        // Only CRAN: a generic repository's file called PACKAGES is content.
+        assert!(!is_source_generated_index(
+            "generic",
+            "src/contrib/PACKAGES"
+        ));
+    }
+
+    #[test]
     fn test_migration_maven_metadata_shape_3927() {
         let meta = migration_maven_metadata("maven", "com/example/lib/1.2.0/lib-1.2.0-sources.jar")
             .expect("a Maven artifact path yields coordinates");
@@ -11083,6 +11136,55 @@ mod tests {
         .await
         .expect("count metadata rows");
         assert_eq!(rows, 1);
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #2525: a migrated CRAN source package lands at the native
+    /// `<name>/<version>/<name>_<version>.tar.gz` path with its coordinates,
+    /// in the packages catalog; a binary keeps its source path.
+    #[tokio::test]
+    async fn test_cran_import_uses_native_layout_2525() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2525-cran", "cran").await;
+
+        let src = "src/contrib/Archive/dplyr/dplyr_1.1.3.tar.gz";
+        let bin = "bin/windows/contrib/4.3/dplyr_1.1.3.zip";
+        let mut files = std::collections::HashMap::new();
+        files.insert(src.to_string(), bytes::Bytes::from_static(b"src tarball"));
+        files.insert(bin.to_string(), bytes::Bytes::from_static(b"win binary"));
+        for p in [src, bin] {
+            transfer_one(&worker, &storage, &files, &repo_key, "cran", p)
+                .await
+                .unwrap_or_else(|e| panic!("cran transfer of {p} must succeed: {e}"));
+        }
+
+        let mut rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT path, name, version FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("query rows");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (bin.to_string(), "dplyr_1.1.3.zip".to_string(), None),
+                (
+                    "dplyr/1.1.3/dplyr_1.1.3.tar.gz".to_string(),
+                    "dplyr".to_string(),
+                    Some("1.1.3".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("dplyr".to_string(), "1.1.3".to_string()))
+        );
 
         cleanup_repo(&pool, repo_id).await;
     }
