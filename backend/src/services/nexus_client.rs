@@ -9,8 +9,11 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::services::artifactory_client::{
-    AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse, RepositoryListItem,
-    RetryConfig, SystemVersionResponse,
+    migration_timeout_secs_from_env, AqlRange, AqlResponse, AqlResult, ArtifactoryError,
+    PropertiesResponse, RepositoryListItem, RetryConfig, SystemVersionResponse,
+    DEFAULT_BUFFERED_TIMEOUT_SECS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS,
+    MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV, MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV,
+    MIGRATION_SOURCE_READ_TIMEOUT_ENV,
 };
 use crate::services::proxy_service::redact_url_for_diagnostics;
 
@@ -54,11 +57,22 @@ impl Default for NexusClientConfig {
                 username: String::new(),
                 password: String::new(),
             },
-            timeout_secs: 30,
-            connect_timeout_secs: 10,
+            // Operator-tunable through the same env overrides as the
+            // Artifactory client (#3926).
+            timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_READ_TIMEOUT_ENV,
+                DEFAULT_READ_TIMEOUT_SECS,
+            ),
+            connect_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV,
+                DEFAULT_CONNECT_TIMEOUT_SECS,
+            ),
             // Generous: it exists to stop a stalled buffered read, not to cap
             // how long a legitimately slow metadata call or download may take.
-            buffered_timeout_secs: 300,
+            buffered_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV,
+                DEFAULT_BUFFERED_TIMEOUT_SECS,
+            ),
             throttle_delay_ms: 100,
             retry_config: RetryConfig::default(),
             cancel_token: CancellationToken::new(),
