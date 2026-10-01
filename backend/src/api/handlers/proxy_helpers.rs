@@ -19317,9 +19317,12 @@ mod virtual_read_authz_tests {
     ///   within [`AUTHZ_WINDOW`] bytes (the content-serving shape — most sites
     ///   now call [`authorized_virtual_members`], which is the pair fused into
     ///   one call and matches this substring too); or
-    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` or
-    ///   `UNFILTERED-DEFERRED` marker, which forces the author to state in the
-    ///   source WHY this walk must not be narrowed.
+    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` marker, which forces
+    ///   the author to state in the source WHY this walk must not be narrowed.
+    ///
+    /// The deferral escape is gone: its only user, the RPM virtual repodata
+    /// walk, is caller-authorized since #4346, so a content-serving walk can no
+    /// longer be parked as "fix later".
     ///
     /// The marker exists because filtering is not universally correct: a walk
     /// that computes a DENY-set (OCI's scan-verdict blocklist) or a shadowing
@@ -19360,9 +19363,7 @@ mod virtual_read_authz_tests {
                 // multi-byte characters (em dashes in the comments), and slicing
                 // mid-codepoint would panic.
                 let before = &src[floor_boundary(src, at.saturating_sub(MARKER_WINDOW))..at];
-                if before.contains("UNFILTERED-ENFORCEMENT")
-                    || before.contains("UNFILTERED-DEFERRED")
-                {
+                if before.contains("UNFILTERED-ENFORCEMENT") {
                     continue;
                 }
 
@@ -19380,11 +19381,28 @@ mod virtual_read_authz_tests {
         assert!(
             unguarded.is_empty(),
             "#3323: these virtual-repo member walks neither authorize the member set \
-             against the caller nor carry an UNFILTERED-ENFORCEMENT / \
-             UNFILTERED-DEFERRED marker explaining why they must not: {unguarded:?}. \
+             against the caller nor carry an UNFILTERED-ENFORCEMENT marker \
+             explaining why they must not: {unguarded:?}. \
              A content-serving path must use `proxy_helpers::authorized_virtual_members`; \
              an enforcement path (deny-set, shadowing guard, cache invalidation) must \
              say so in a comment immediately above the call."
+        );
+    }
+
+    /// #4346: no content-serving member walk is parked behind a deferral
+    /// marker any more. The RPM repodata walk was the last one (#3323); a new
+    /// deferral marker would reopen the class, so the count is pinned at zero.
+    #[test]
+    fn no_virtual_member_walk_is_deferred_4346() {
+        let deferred: Vec<&str> = HANDLER_SOURCES
+            .iter()
+            .filter(|(_, src)| src.contains(concat!("UNFILTERED", "-DEFERRED")))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "#4346: content-serving virtual member walks must be caller-authorized, \
+             not deferred: {deferred:?}"
         );
     }
 

@@ -584,6 +584,14 @@ fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
 /// member is the open question raised in #3177; raising the bar further is a
 /// product decision, and this change deliberately closes the escalation without
 /// making it.
+///
+/// One exception raises the bar (#4346): an `internal` member needs the same
+/// explicit `read` grant (or instance admin) as a `private` one. `internal`
+/// means "readable by any authenticated principal", but a virtual's own
+/// visibility decides who reaches it, so a delegated admin of a virtual could
+/// otherwise re-export any internal repository without anyone having granted
+/// it to them. The denial is a 403, not the existence-hiding 404: the caller
+/// can already see the internal repository.
 async fn require_member_attachable(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
@@ -604,6 +612,31 @@ async fn require_member_attachable(
             "denied virtual-member mutation: member repository is not visible to the caller"
         );
         return Err(e);
+    }
+    if member_repo.visibility == crate::models::repository::RepositoryVisibility::Internal
+        && !auth.is_admin
+        && !service
+            .user_can_access_repo(
+                member_repo.id,
+                auth.user_id,
+                crate::services::repository_service::RepoAccess::READ,
+            )
+            .await?
+    {
+        tracing::warn!(
+            actor_user_id = %auth.user_id,
+            actor_username = %auth.username,
+            virtual_repo_id = %virtual_repo.id,
+            virtual_repo_key = %virtual_repo.key,
+            member_repo_id = %member_repo.id,
+            member_repo_key = %member_repo.key,
+            action = action,
+            "denied virtual-member mutation: attaching an internal repository requires a read grant on it"
+        );
+        return Err(AppError::Authorization(format!(
+            "Attaching internal repository '{}' as a virtual member requires a read grant on it",
+            member_repo.key
+        )));
     }
     Ok(())
 }
@@ -29978,5 +30011,116 @@ mod virtual_member_authz_tests {
         let _ = std::fs::remove_dir_all(&own_dir);
         let _ = std::fs::remove_dir_all(&granted_dir);
         fx.teardown().await;
+    }
+
+    /// #4346: since #3813 an `internal` repository is readable by any
+    /// authenticated principal, and `require_visible` alone let a delegated
+    /// admin of a virtual attach one without any grant, re-exporting it to
+    /// whoever the virtual's own visibility admits (anonymous, for a public
+    /// virtual). Attaching an internal repository now needs the same read
+    /// grant as a private one; a grant holder and an instance admin still
+    /// attach it.
+    #[tokio::test]
+    async fn test_4346_member_attach_internal_requires_read_grant() {
+        let Some(fx) = Fx::setup().await else {
+            return;
+        };
+        let (own_id, own_key, own_dir) = tdh::create_repo(&fx.pool, "virtual", "generic").await;
+        tdh::grant_repo_access(&fx.pool, own_id, fx.outsider.0).await;
+        tdh::grant_repo_admin(&fx.pool, own_id, fx.outsider.0).await;
+        let (internal_id, internal_key, internal_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(internal_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set internal");
+
+        let attach = |auth: AuthExtension| {
+            let state = fx.state.clone();
+            let own_key = own_key.clone();
+            let internal_key = internal_key.clone();
+            async move {
+                let router = tdh::router_with_auth(super::router(), state, auth);
+                tdh::send(
+                    router,
+                    tdh::post(
+                        format!("/{own_key}/members"),
+                        "application/json",
+                        Bytes::from(format!(r#"{{"member_key":"{internal_key}"}}"#)),
+                    ),
+                )
+                .await
+            }
+        };
+        let attached = || {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM virtual_repo_members \
+                     WHERE virtual_repo_id = $1 AND member_repo_id = $2",
+                )
+                .bind(own_id)
+                .bind(internal_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count membership rows")
+                    > 0
+            }
+        };
+        let detach = || {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                    .bind(own_id)
+                    .execute(&pool)
+                    .await
+                    .expect("detach");
+            }
+        };
+
+        // No grant on the internal repository: refused, nothing persisted.
+        let (denied, denied_body) = attach(fx.session(&fx.outsider)).await;
+        let denied_row = attached().await;
+
+        // Instance admin: unaffected.
+        let (admin, admin_body) = attach(fx.admin_session()).await;
+        let admin_row = attached().await;
+        detach().await;
+
+        // With a read grant on the internal repository: attaches.
+        tdh::grant_repo_access(&fx.pool, internal_id, fx.outsider.0).await;
+        let (granted, granted_body) = attach(fx.session(&fx.outsider)).await;
+        let granted_row = attached().await;
+        detach().await;
+
+        tdh::cleanup(&fx.pool, own_id, fx.outsider.0).await;
+        tdh::cleanup(&fx.pool, internal_id, fx.outsider.0).await;
+        let _ = std::fs::remove_dir_all(&own_dir);
+        let _ = std::fs::remove_dir_all(&internal_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            denied,
+            StatusCode::FORBIDDEN,
+            "#4346: a delegated virtual admin attached an internal repository without a \
+             read grant: {}",
+            String::from_utf8_lossy(&denied_body)
+        );
+        assert!(!denied_row, "#4346: the membership row was persisted");
+        assert_eq!(
+            admin,
+            StatusCode::OK,
+            "control: an instance admin attaches internal repositories: {}",
+            String::from_utf8_lossy(&admin_body)
+        );
+        assert!(admin_row);
+        assert_eq!(
+            granted,
+            StatusCode::OK,
+            "control: a read grant on the internal repository admits the attach: {}",
+            String::from_utf8_lossy(&granted_body)
+        );
+        assert!(granted_row);
     }
 }

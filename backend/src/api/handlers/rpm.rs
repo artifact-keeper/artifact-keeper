@@ -72,6 +72,7 @@ pub fn router() -> Router<SharedState> {
 
 async fn root_repodata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -86,19 +87,59 @@ async fn root_repodata(
         )
             .into_response());
     }
+    // A virtual's generated repodata depends on the caller (#4346).
+    let caller_dependent = repo.repo_type == RepositoryType::Virtual;
+    let auth = auth.as_ref();
+    let generated = match path.as_str() {
+        "repomd.xml" => repomd_xml(State(state), auth, Path(repo_key)).await,
+        "primary.xml.gz" => primary_xml_gz(State(state), auth, Path(repo_key)).await,
+        "filelists.xml.gz" => filelists_xml_gz(State(state), auth, Path(repo_key)).await,
+        "other.xml.gz" => other_xml_gz(State(state), auth, Path(repo_key)).await,
+        "repomd.xml.asc" => repomd_xml_asc(State(state), auth, Path(repo_key)).await,
+        _ => return root_repodata_static(state, repo_key, path).await,
+    };
+    generated.map(|resp| {
+        if caller_dependent {
+            mark_caller_dependent(resp)
+        } else {
+            resp
+        }
+    })
+}
+
+/// A virtual repository's repodata lists only the members the caller may
+/// read (#4346), so one URL serves different bodies to different callers: a
+/// shared cache must not store it, and any cache must key it by credential.
+/// Hosted repositories are unchanged.
+fn mark_caller_dependent(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private"),
+    );
+    headers.insert(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("Authorization, Cookie"),
+    );
+    resp
+}
+
+/// The caller-independent `/repodata/` entries: update advisories, the public
+/// key, and proxied hash-prefixed files.
+async fn root_repodata_static(
+    state: SharedState,
+    repo_key: String,
+    path: String,
+) -> Result<Response, Response> {
     match path.as_str() {
-        "repomd.xml" => repomd_xml(State(state), Path(repo_key)).await,
-        "primary.xml.gz" => primary_xml_gz(State(state), Path(repo_key)).await,
-        "filelists.xml.gz" => filelists_xml_gz(State(state), Path(repo_key)).await,
-        "other.xml.gz" => other_xml_gz(State(state), Path(repo_key)).await,
         "updateinfo.xml.gz" => updateinfo_xml_gz(State(state), Path(repo_key)).await,
-        "repomd.xml.asc" => repomd_xml_asc(State(state), Path(repo_key)).await,
         "repomd.xml.key" => repomd_xml_key(State(state), Path(repo_key)).await,
         _ => repodata_proxy(State(state), Path((repo_key, path))).await,
     }
 }
 async fn depth_response(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     path: &str,
     depth: u32,
@@ -122,7 +163,7 @@ async fn depth_response(
         ) {
             return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
         }
-        let rendered = cached_repodata_at(state, repo, root).await?;
+        let rendered = cached_repodata_at(state, auth, repo, root).await?;
         let bytes = match file {
             "repomd.xml" => rendered.repomd_xml.clone(),
             "repomd.xml.asc" => return sign_repomd(state, repo, rendered.repomd_xml.clone()).await,
@@ -892,6 +933,14 @@ pub(crate) struct RpmArtifact {
 /// `packages="0"` and `dnf` treats the aggregate repo as empty even though
 /// the members hold packages (#1780).
 ///
+/// For a virtual repo the members are narrowed to the ones the CALLER may
+/// read (#4346, the item #3323 deferred): the document lists package names,
+/// versions, digests and file lists, so a member the caller cannot read must
+/// not appear in it. A virtual whose members are all hidden renders the same
+/// empty document as one with no members. The render cache and the detached
+/// `repomd.xml.asc` are keyed by this set (see `rpm_repodata_cache`), so
+/// callers with different visibility never share a render.
+///
 /// Sorted so the id set is canonical: `fetch_virtual_members` orders by
 /// `vrm.priority`, which is not a total order, and both the fingerprint
 /// comparison (#2521) and the render must not depend on member visit order
@@ -899,23 +948,16 @@ pub(crate) struct RpmArtifact {
 /// (#2636).
 async fn repodata_repo_ids(
     db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
 ) -> Result<Vec<uuid::Uuid>, Response> {
     if repo.repo_type != RepositoryType::Virtual {
         return Ok(vec![repo.id]);
     }
-    // UNFILTERED-DEFERRED (#3323): this walk IS content-serving and must
-    // eventually be caller-authorized like every other format's. It is not,
-    // yet, because the repodata document it feeds is rendered once and cached
-    // per VIRTUAL repo id (`state.rpm_repodata_cache.get_or_render(repo.id,
-    // ..)`) and `repomd.xml.asc` is a detached signature OVER THE RENDERED
-    // BYTES (#2636). Making the document caller-dependent without first
-    // re-keying that cache by the authorized member-id set would break both the
-    // shared cache and the reproducible-signature invariant — a design decision
-    // deliberately kept out of the mechanical filter pass. Tracked on #3323.
-    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let members = proxy_helpers::authorized_virtual_members(db, auth, repo.id).await?;
     let mut ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     ids.sort_unstable();
+    ids.dedup();
     Ok(ids)
 }
 
@@ -995,15 +1037,21 @@ async fn repodata_fingerprint(
 /// once (concurrent misses coalesce on a per-repo single-flight lock). The
 /// O(repo) generation itself runs on the blocking pool so large renders do
 /// not stall the async runtime.
+///
+/// `auth` is the caller: a virtual repository's document describes only the
+/// members that caller may read (#4346), and the cache keys each render by
+/// that authorized member set.
 async fn cached_repodata(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
 ) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
-    cached_repodata_at(state, repo, "").await
+    cached_repodata_at(state, auth, repo, "").await
 }
 
 async fn cached_repodata_at(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     root: &str,
 ) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
@@ -1018,7 +1066,7 @@ async fn cached_repodata_at(
     } else {
         format!("{root}/")
     };
-    let repo_ids = repodata_repo_ids(&state.db, repo).await?;
+    let repo_ids = repodata_repo_ids(&state.db, auth, repo).await?;
     // Captured BEFORE the artifact rows are fetched: a write racing the
     // render can only make the stored entry look older than its content, so
     // the next request re-renders — never serves stale bytes as fresh.
@@ -1624,6 +1672,7 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
 
 async fn repomd_xml(
     State(state): State<SharedState>,
+    auth: Option<&AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -1642,7 +1691,7 @@ async fn repomd_xml(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, &repo).await?;
+    let rendered = cached_repodata(&state, auth, &repo).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1657,6 +1706,7 @@ async fn repomd_xml(
 
 async fn repomd_xml_asc(
     State(state): State<SharedState>,
+    auth: Option<&AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -1685,7 +1735,7 @@ async fn repomd_xml_asc(
     // document are two requests, and both must render identically from
     // unchanged state (#2636). The shared cache entry makes that literal —
     // one render, one byte sequence, two endpoints.
-    let rendered = cached_repodata(&state, &repo).await?;
+    let rendered = cached_repodata(&state, auth, &repo).await?;
     let repomd_content = rendered.repomd_xml.clone();
 
     sign_repomd(&state, &repo, repomd_content).await
@@ -1840,6 +1890,7 @@ async fn updateinfo_xml_gz(
 
 async fn primary_xml_gz(
     State(state): State<SharedState>,
+    auth: Option<&AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -1856,7 +1907,7 @@ async fn primary_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, &repo).await?;
+    let rendered = cached_repodata(&state, auth, &repo).await?;
     let gz = rendered.primary_gz.clone();
 
     Ok(Response::builder()
@@ -1873,6 +1924,7 @@ async fn primary_xml_gz(
 
 async fn filelists_xml_gz(
     State(state): State<SharedState>,
+    auth: Option<&AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -1894,7 +1946,7 @@ async fn filelists_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, &repo).await?;
+    let rendered = cached_repodata(&state, auth, &repo).await?;
     let gz = rendered.filelists_gz.clone();
 
     Ok(Response::builder()
@@ -1911,6 +1963,7 @@ async fn filelists_xml_gz(
 
 async fn other_xml_gz(
     State(state): State<SharedState>,
+    auth: Option<&AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -1926,7 +1979,7 @@ async fn other_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, &repo).await?;
+    let rendered = cached_repodata(&state, auth, &repo).await?;
     let gz = rendered.other_gz.clone();
 
     Ok(Response::builder()
@@ -2007,7 +2060,7 @@ async fn upstream_proxy(
         .await
         .map_err(IntoResponse::into_response)?;
     if depth > 0 {
-        return depth_response(&state, &repo, &upstream_path, depth, &ctx).await;
+        return depth_response(&state, auth.as_ref(), &repo, &upstream_path, depth, &ctx).await;
     }
 
     // #2358: a leading `@<digits>` segment selects a published, immutable
@@ -2180,7 +2233,15 @@ async fn download_package(
         .await
         .map_err(IntoResponse::into_response)?;
     if depth > 0 {
-        return depth_response(&state, &repo, &format!("packages/{pkg_path}"), depth, &ctx).await;
+        return depth_response(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &format!("packages/{pkg_path}"),
+            depth,
+            &ctx,
+        )
+        .await;
     }
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
@@ -5249,6 +5310,10 @@ mod tests {
 
         // Create a hosted member repo and seed an RPM artifact into it.
         let (member_id, _member_key, _member_dir) = tdh::create_repo(&f.pool, "local", "rpm").await;
+        // The probe is anonymous and the subject is aggregation, not
+        // authorization: since #4346 the repodata lists only members the
+        // caller may read.
+        tdh::publish_repo(&f.pool, member_id).await;
         let member_repo =
             tdh::make_repo_info(member_id, "rpm-virt-member", &f.storage_dir, "local", None);
         tdh::seed_artifact(
@@ -5312,6 +5377,273 @@ mod tests {
             .await
             .ok();
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4346 (the #3323 deferred item): a virtual's repodata describes only the
+    // members the CALLER may read, the render cache never hands one caller
+    // another's document, and the detached signature covers the document the
+    // same caller is served.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_4346_virtual_repodata_lists_only_members_the_caller_can_read() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+        let pubkey_armor = attach_signing_key(&f, "gpg").await;
+
+        // Three members: public, private, internal, one package each.
+        let mut members = Vec::new();
+        let mut member_keys = Vec::new();
+        for (label, visibility) in [
+            ("pubpkg", "public"),
+            ("privpkg", "private"),
+            ("intpkg", "internal"),
+        ] {
+            let (member_id, member_key, _dir) = tdh::create_repo(&f.pool, "local", "rpm").await;
+            sqlx::query(
+                "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+            )
+            .bind(member_id)
+            .bind(visibility)
+            .execute(&f.pool)
+            .await
+            .expect("set member visibility");
+            let info = tdh::make_repo_info(member_id, &member_key, &f.storage_dir, "local", None);
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &info,
+                &format!("rpm/{label}/{label}-1.0-1.x86_64.rpm"),
+                &format!("packages/{label}-1.0-1.x86_64.rpm"),
+                label,
+                "1.0-1",
+                "application/x-rpm",
+                bytes::Bytes::from(format!("{label}-bytes")),
+                f.user_id,
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 0)",
+            )
+            .bind(f.repo_id)
+            .bind(member_id)
+            .execute(&f.pool)
+            .await
+            .expect("insert virtual member");
+            members.push(member_id);
+            member_keys.push(member_key);
+        }
+        let private_id = members[1];
+        // The fixture user holds a read grant on the private member; a second
+        // authenticated user holds nothing.
+        tdh::grant_repo_access(&f.pool, private_id, f.user_id).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&f.pool).await;
+
+        #[derive(Clone, Copy)]
+        enum Caller {
+            Anonymous,
+            Outsider,
+            Insider,
+            // The fixture user through a repository-scoped token that covers
+            // the virtual and the public member only.
+            Scoped,
+        }
+        let public_id = members[0];
+        let fetch = |caller: Caller, file: &'static str| {
+            let router = match caller {
+                Caller::Anonymous => f.router_anon(super::router()),
+                Caller::Outsider => tdh::router_with_auth(
+                    super::router(),
+                    f.state.clone(),
+                    tdh::make_auth(outsider_id, &outsider_name),
+                ),
+                Caller::Insider => f.router_with_auth(super::router()),
+                Caller::Scoped => {
+                    let mut auth = tdh::make_auth(f.user_id, &f.username);
+                    auth.allowed_repo_ids =
+                        crate::models::access_scope::AccessScope::Restricted(vec![
+                            f.repo_id, public_id,
+                        ]);
+                    tdh::router_with_auth(super::router(), f.state.clone(), auth)
+                }
+            };
+            let uri = format!("/{}/repodata/{file}", f.repo_key);
+            async move {
+                let (status, body) = tdh::send(router, tdh::get(uri)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{file}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                body
+            }
+        };
+        let gunzip = |body: Bytes| {
+            let mut out = String::new();
+            GzDecoder::new(&body[..])
+                .read_to_string(&mut out)
+                .expect("gunzip");
+            out
+        };
+        struct Docs {
+            repomd: Bytes,
+            asc: Bytes,
+            primary: String,
+            filelists: String,
+        }
+        let docs = |caller: Caller| async move {
+            Docs {
+                repomd: fetch(caller, "repomd.xml").await,
+                asc: fetch(caller, "repomd.xml.asc").await,
+                primary: gunzip(fetch(caller, "primary.xml.gz").await),
+                filelists: gunzip(fetch(caller, "filelists.xml.gz").await),
+            }
+        };
+
+        // The widest caller renders first, so a cache keyed only by the
+        // virtual would hand its document to everyone after it.
+        let insider = docs(Caller::Insider).await;
+        let anon = docs(Caller::Anonymous).await;
+        let outsider = docs(Caller::Outsider).await;
+        // Again, in another order: each caller's set renders byte-identical.
+        let anon_again = docs(Caller::Anonymous).await;
+        let insider_again = docs(Caller::Insider).await;
+        let pubkey_served = fetch(Caller::Anonymous, "repomd.xml.key").await;
+        // A repository-scoped token narrows the set below the user's grants.
+        let scoped = docs(Caller::Scoped).await;
+        // Revoking the private grant: the caller no longer gets the old set's
+        // cached render.
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+            .bind(f.user_id)
+            .bind(private_id)
+            .execute(&f.pool)
+            .await
+            .expect("revoke private grant");
+        let revoked = docs(Caller::Insider).await;
+        // Response headers: the virtual's documents are caller-dependent, a
+        // hosted repository's are not.
+        let (_, _, virtual_headers) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            tdh::get(format!("/{}/repodata/repomd.xml", f.repo_key)),
+        )
+        .await;
+        let (_, _, hosted_headers) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            tdh::get(format!("/{}/repodata/repomd.xml", member_keys[0])),
+        )
+        .await;
+
+        // Clean up before asserting.
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .ok();
+        for id in &members {
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(&f.pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&f.pool)
+                .await
+                .ok();
+        }
+        tdh::cleanup_user(&f.pool, outsider_id).await;
+        f.teardown().await;
+
+        let names = |d: &Docs| {
+            ["pubpkg", "privpkg", "intpkg"].map(|n| {
+                let in_primary = d.primary.contains(&format!("<name>{n}</name>"));
+                let in_filelists = d.filelists.contains(&format!("name=\"{n}\""));
+                assert_eq!(
+                    in_primary, in_filelists,
+                    "{n}: primary and filelists must describe the same packages"
+                );
+                in_primary
+            })
+        };
+        assert_eq!(
+            names(&anon),
+            [true, false, false],
+            "#4346: an anonymous caller of a public virtual must see only the public \
+             member's package; primary:\n{}",
+            anon.primary
+        );
+        assert!(anon.primary.contains("packages=\"1\""));
+        assert_eq!(
+            names(&outsider),
+            [true, false, true],
+            "an authenticated caller without grants sees public + internal members"
+        );
+        assert_eq!(
+            names(&insider),
+            [true, true, true],
+            "a caller with a grant on the private member sees every member"
+        );
+        assert_ne!(anon.repomd, insider.repomd);
+        assert_ne!(anon.repomd, outsider.repomd);
+        assert_ne!(outsider.repomd, insider.repomd);
+
+        // Byte-reproducible per member set, and never the other caller's.
+        assert_eq!(anon.repomd, anon_again.repomd);
+        assert_eq!(anon.primary, anon_again.primary);
+        assert_eq!(insider.repomd, insider_again.repomd);
+        assert_eq!(insider.primary, insider_again.primary);
+
+        // Each caller's signature verifies over that caller's repomd.xml, and
+        // not over another caller's.
+        let pubkey = String::from_utf8(pubkey_served.to_vec()).expect("armored key");
+        assert_eq!(pubkey, pubkey_armor);
+        for d in [&anon, &outsider, &insider, &anon_again, &insider_again] {
+            let asc = String::from_utf8(d.asc.to_vec()).expect("armored signature");
+            verify_detached(&pubkey, &d.repomd, &asc)
+                .expect("repomd.xml.asc must verify over the caller's own repomd.xml");
+        }
+        assert_eq!(
+            names(&scoped),
+            [true, false, false],
+            "a repository-scoped token must narrow the member set to its ceiling"
+        );
+        assert_eq!(
+            names(&revoked),
+            [true, false, true],
+            "after the private grant is revoked the caller must not get the old set's render"
+        );
+        assert_eq!(revoked.repomd, outsider.repomd, "same set, same document");
+        for d in [&scoped, &revoked] {
+            let asc = String::from_utf8(d.asc.to_vec()).expect("armored signature");
+            verify_detached(&pubkey, &d.repomd, &asc).expect("own signature verifies");
+        }
+        assert_eq!(
+            virtual_headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "private"
+        );
+        assert_eq!(
+            virtual_headers.get(axum::http::header::VARY).unwrap(),
+            "Authorization, Cookie"
+        );
+        assert!(hosted_headers.get(axum::http::header::VARY).is_none());
+        assert!(hosted_headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .is_none());
+        let anon_asc = String::from_utf8(anon.asc.to_vec()).unwrap();
+        assert!(
+            verify_detached(&pubkey, &insider.repomd, &anon_asc).is_err(),
+            "the anonymous signature must not cover the insider's document"
+        );
     }
 
     // -----------------------------------------------------------------------

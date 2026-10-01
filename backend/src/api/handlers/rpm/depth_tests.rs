@@ -962,3 +962,66 @@ async fn transient_heal_failures_do_not_rotate_a_depth_root_4216() {
     assert_eq!(f.state.rpm_repodata_cache.renders(), renders + 1);
     f.teardown().await;
 }
+
+/// #4346: the caller now reaches the depth path. A hosted depth root is not
+/// caller-dependent: an anonymous caller, a grant-holding non-admin and an
+/// admin get the same bytes for every generated document, from one render,
+/// with no caller-dependent cache headers.
+#[tokio::test]
+async fn depth_root_repodata_is_caller_independent_4346() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    upload(&f, &format!("a/{RPM}"), "a").await;
+    let base = format!("/rpm/{}", f.repo_key);
+    let routers = || {
+        [
+            tdh::router_anon(Router::new().nest("/rpm", super::router()), f.state.clone()),
+            tdh::router_with_auth(
+                Router::new().nest("/rpm", super::router()),
+                f.state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            ),
+            app(&f),
+        ]
+    };
+    let renders = f.state.rpm_repodata_cache.renders();
+    for file in [
+        "repomd.xml",
+        "primary.xml.gz",
+        "filelists.xml.gz",
+        "other.xml.gz",
+    ] {
+        let mut bodies = Vec::new();
+        for router in routers() {
+            let (status, body, headers) = tdh::send_with_headers(
+                router,
+                Request::builder()
+                    .uri(format!("{base}/a/repodata/{file}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{file}");
+            assert!(headers.get(axum::http::header::VARY).is_none(), "{file}");
+            bodies.push(body);
+        }
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "{file}: every caller gets the same hosted document"
+        );
+    }
+    assert_eq!(
+        f.state.rpm_repodata_cache.renders(),
+        renders + 1,
+        "one render serves every caller of a hosted root"
+    );
+    assert!(text(
+        &get(&f, &format!("{base}/a/repodata/primary.xml.gz"))
+            .await
+            .1
+    )
+    .contains("<name>pkg</name>"));
+    f.teardown().await;
+}
