@@ -36094,6 +36094,48 @@ mod oci_read_authz_tests {
         assert_eq!(outsider_tags, StatusCode::OK, "public tags/list unchanged");
     }
 
+    /// #3813 follow-up: an `internal` repository is pullable over `/v2` by an
+    /// authenticated principal holding no grant on it (manifest, blob and
+    /// tags), through the real router, while the anonymous pull token is
+    /// still refused.
+    #[tokio::test]
+    async fn internal_repo_reads_allowed_for_ungranted_authenticated_principal() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("make repo internal");
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+
+        let (manifest, manifest_body) = f.call("GET", f.manifest_path(), &outsider_bearer).await;
+        let (blob, blob_body) = f.call("GET", f.blob_path(), &outsider_bearer).await;
+        let (tags, _) = f.call("GET", f.tags_path(), &outsider_bearer).await;
+        let (anon_manifest, anon_body) = f.call("GET", f.manifest_path(), &anon).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            manifest,
+            StatusCode::OK,
+            "an authenticated grant-less principal must pull an internal manifest"
+        );
+        assert!(String::from_utf8_lossy(&manifest_body).contains(MANIFEST_MARKER));
+        assert_eq!(blob, StatusCode::OK, "and its layer blob");
+        assert_eq!(blob_body.as_ref(), LAYER_BODY);
+        assert_eq!(tags, StatusCode::OK, "and list its tags");
+        assert_ne!(
+            anon_manifest,
+            StatusCode::OK,
+            "the anonymous pull token must not reach an internal repository"
+        );
+        assert!(!String::from_utf8_lossy(&anon_body).contains(MANIFEST_MARKER));
+    }
+
     /// When fine-grained `permissions` rules exist for the repository, the
     /// read decision is the rule — matching `repo_visibility_middleware`'s read
     /// branch. A principal holding `write` but not `read` is refused with the

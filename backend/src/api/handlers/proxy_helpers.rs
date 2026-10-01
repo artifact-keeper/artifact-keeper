@@ -18214,6 +18214,60 @@ mod tests {
         );
     }
 
+    /// #3813 follow-up: an ANONYMOUS caller of a PUBLIC virtual must not
+    /// reach an `internal` member through it. `internal` is the
+    /// authenticated baseline; a public parent must not launder it down to
+    /// anonymous. A public member is the positive control.
+    #[tokio::test]
+    async fn anonymous_caller_of_public_virtual_cannot_read_internal_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vk, virtual_dir) =
+            db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (internal_id, _ik, internal_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (public_id, _pk, public_dir) = db_helpers::create_repo(&pool, "local", "generic").await;
+        for (id, visibility) in [
+            (virtual_id, "public"),
+            (internal_id, "internal"),
+            (public_id, "public"),
+        ] {
+            sqlx::query(
+                "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+            )
+            .bind(id)
+            .bind(visibility)
+            .execute(&pool)
+            .await
+            .expect("set visibility");
+        }
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let internal = svc.get_by_id(internal_id).await.expect("load internal");
+        let public = svc.get_by_id(public_id).await.expect("load public");
+
+        let anon_internal = caller_can_read_member(&pool, None, virtual_id, &internal).await;
+        let anon_public = caller_can_read_member(&pool, None, virtual_id, &public).await;
+
+        for (id, dir) in [
+            (virtual_id, virtual_dir),
+            (internal_id, internal_dir),
+            (public_id, public_dir),
+        ] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert!(
+            !anon_internal,
+            "an anonymous caller of a public virtual must not read an internal member"
+        );
+        assert!(anon_public, "control: a public member stays readable");
+    }
+
     #[test]
     fn age_gate_params_maps_remote_npm_repo() {
         let info = RepoInfo {

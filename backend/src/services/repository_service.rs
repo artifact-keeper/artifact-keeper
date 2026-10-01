@@ -7733,4 +7733,90 @@ mod tests {
             );
         }
     }
+
+    /// #3813 follow-up: migration 245's backfill is exactly access-preserving
+    /// (`is_public = true` -> `public`, `false` -> `private`) and re-running
+    /// it (it shipped under earlier numbers in review) leaves a repository
+    /// that has since become `internal` untouched. Runs in an isolated schema
+    /// inside a rolled-back transaction, so it never touches real rows.
+    #[tokio::test]
+    async fn migration_245_backfills_from_is_public_and_rerun_keeps_internal() {
+        const MIGRATION: &str = include_str!("../../migrations/245_repository_visibility.sql");
+        let Some(pool) = crate::testing::try_pool_with(2).await else {
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let schema = format!("visibility_245_{}", Uuid::new_v4().simple());
+        // The pre-245 shape: every column the migration's triggers name, and
+        // no `visibility` column yet. `public` stays on the path for the
+        // existing `ak_notify_repository_changed()` trigger function.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, public; \
+             CREATE TABLE repositories(id UUID PRIMARY KEY, key TEXT, format TEXT, \
+             repo_type TEXT, upstream_url TEXT, storage_backend TEXT, storage_path TEXT, \
+             is_public BOOLEAN NOT NULL DEFAULT false, promotion_only BOOLEAN, \
+             age_gate_enabled BOOLEAN, age_gate_min_age_days INT, age_gate_mode TEXT, \
+             curation_enabled BOOLEAN, curation_default_action TEXT);"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let (public_id, private_id, later_internal_id) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, is_public) in [
+            (public_id, true),
+            (private_id, false),
+            (later_internal_id, false),
+        ] {
+            sqlx::query("INSERT INTO repositories (id, is_public) VALUES ($1, $2)")
+                .bind(id)
+                .bind(is_public)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        let visibility = |id: Uuid| {
+            sqlx::query_as::<_, (String, bool)>(
+                "SELECT visibility::text, is_public FROM repositories WHERE id = $1",
+            )
+            .bind(id)
+        };
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+
+        // An operator narrows one repository to `internal`, then the migration
+        // is applied again: nothing moves.
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(later_internal_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            visibility(later_internal_id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            ("internal".to_string(), false),
+            "a re-run of migration 245 must not recompute an internal repository \
+             from is_public"
+        );
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+        tx.rollback().await.unwrap();
+    }
 }
