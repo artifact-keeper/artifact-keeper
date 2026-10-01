@@ -45,6 +45,7 @@ use crate::services::repository_service::{
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::rpm_layout;
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 
@@ -53,34 +54,33 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// Coerce the requested `is_public` value against the server-wide guest-access
-/// policy (issue #850).
+/// Refuse a request that asks for a public repository while guest access is
+/// disabled server-wide (#3855).
 ///
-/// When guest access is disabled, public repositories are meaningless: anonymous
-/// users will never reach them. We therefore silently coerce `true` to `false`
-/// on create/update so the persisted state matches the runtime policy. Returns
-/// the value to persist, plus a flag indicating whether coercion happened so
-/// the caller can emit a structured `tracing::warn!` log.
-fn coerce_is_public_for_create(requested: bool, guest_access_enabled: bool) -> (bool, bool) {
+/// `AK_GUEST_ACCESS_ENABLED=false` is a deliberate operator decision, and a
+/// create/update asking for `is_public = true` contradicts it — a
+/// configuration mistake on one side or the other. Historically the request
+/// was silently rewritten to private (issue #850): the caller got a `201`/
+/// `200` for a repository shaped differently from the one it asked for,
+/// which produced perpetual Terraform drift ("is_public flips on every
+/// plan") and late "why can nobody pull this anonymously" surprises with no
+/// connection to the create call. Reject the contradiction instead (400),
+/// matching how the neighbouring `visibility`/`is_public` conflict is
+/// already a 400 rather than a silent resolution.
+///
+/// `requested` is the payload's effective `is_public` (`allow_anonymous_access`
+/// already folded in). For updates, pass `false` when the field is absent —
+/// leaving visibility unchanged is never a contradiction.
+fn require_public_visibility_allowed(requested: bool, guest_access_enabled: bool) -> Result<()> {
     if requested && !guest_access_enabled {
-        (false, true)
-    } else {
-        (requested, false)
+        return Err(AppError::Validation(
+            "guest access is disabled on this instance (AK_GUEST_ACCESS_ENABLED=false); \
+             repositories cannot be public. Enable guest access, or choose a non-public \
+             visibility."
+                .to_string(),
+        ));
     }
-}
-
-/// Update-side counterpart of [`coerce_is_public_for_create`]. The update
-/// payload uses `Option<bool>` because callers can leave the flag unchanged;
-/// only an explicit `Some(true)` is coerced.
-fn coerce_is_public_for_update(
-    requested: Option<bool>,
-    guest_access_enabled: bool,
-) -> (Option<bool>, bool) {
-    if matches!(requested, Some(true)) && !guest_access_enabled {
-        (Some(false), true)
-    } else {
-        (requested, false)
-    }
+    Ok(())
 }
 
 /// Check that the authenticated user can access a specific repository.
@@ -114,7 +114,19 @@ pub(crate) async fn require_repo_write_access(
     repo_service: &RepositoryService,
 ) -> Result<()> {
     require_repo_access(auth, repo.id)?;
-    if repo.is_public || auth.is_admin {
+    // `internal` behaves EXACTLY as `private` here -- this is the one place the
+    // shorthand `visibility != Private` would be actively wrong, and the reason
+    // `RepositoryVisibility` deliberately exposes no such helper.
+    //
+    // The short-circuit below is the ANONYMOUS-readable case: a repository the
+    // whole world can already read has no tenant boundary left to enforce. An
+    // `internal` repository does have one -- it is readable by principals of
+    // this instance, not by anyone -- and it will be the common state on a
+    // corporate deployment, where `public` was rare. Widening this to
+    // `internal` would therefore switch the tenant pre-gate off across most of
+    // the instance, leaving `require_repo_action` as the only remaining check
+    // on every path that pairs the two.
+    if repo.visibility.allows_anonymous_read() || auth.is_admin {
         return Ok(());
     }
     // TENANT-GATE-ONLY (#3331). Deliberately action-blind: this is the tenant
@@ -246,20 +258,24 @@ pub(crate) async fn require_repo_admin(
 /// own ACLs — must use [`member_read_visibility`] instead.
 ///
 /// * anonymous              -> public repositories only
+/// * repo-scoped API token  -> exactly the token's allowed set. This arm is
+///   checked BEFORE the admin arm (#3901): token scope is confinement, not
+///   a privilege boundary, so an admin holding a repository-scoped token is
+///   narrowed to the token's set exactly as
+///   `search::intersect_token_scope` and the webhook reads already do
+///   (#1803, #3715)
 /// * global admin           -> everything
-/// * repo-scoped API token  -> exactly the token's allowed set (checked before
-///   the general user arm; admin tokens are handled above and bypass scope)
 /// * any other principal    -> public repositories plus their own grants
 pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibility {
     match auth {
         None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
             a.allowed_repo_ids
                 .as_allowed_repo_ids()
                 .unwrap_or_default()
                 .to_vec(),
         ),
+        Some(a) if a.is_admin => RepoVisibility::All,
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -272,7 +288,7 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 /// half on its own. `require_visible` is
 ///
 /// ```text
-/// is_public OR (in_scope AND (is_admin OR grants))
+/// public OR (in_scope AND (internal OR is_admin OR grants))
 /// ```
 ///
 /// and BOTH conjuncts have to survive:
@@ -331,10 +347,10 @@ pub(crate) fn member_read_visibility(auth: Option<&AuthExtension>) -> MemberVisi
 /// because `require_visible` is
 ///
 /// ```text
-/// is_public OR (in_scope AND (is_admin OR grants))
+/// public OR (in_scope AND (internal OR is_admin OR grants))
 /// ```
 ///
-/// and the `Ids` arm is `in_scope` alone. It drops the `is_public` arm — so an
+/// and the `Ids` arm is `in_scope` alone. It drops the `public` arm — so an
 /// authenticated scoped caller saw LESS than an anonymous one — and it drops
 /// the grant conjunct, so a token kept working against a member after its
 /// owner's grant was revoked. Scope is a mint-time snapshot; entitlement is not.
@@ -371,12 +387,19 @@ pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
     parent_repo_id: Uuid,
     member_id: Uuid,
-    member_is_public: bool,
+    member_visibility: crate::models::repository::RepositoryVisibility,
 ) -> bool {
     let _ = parent_repo_id;
+    // `internal` behaves as `private` here, deliberately. The escape hatch this
+    // helper grants past the token scope exists only because an ANONYMOUS
+    // caller is served a public member anyway, so a scoped credential must not
+    // be worse off than none (#3704). An internal member gives an anonymous
+    // caller nothing, so there is no such baseline and the scope stays a
+    // ceiling -- which is also what the spec requires: a repository-scoped
+    // token whose allowed set excludes an internal repository is refused.
     match auth {
-        None => member_is_public,
-        Some(a) => member_is_public || a.can_access_repo(member_id),
+        None => member_visibility.allows_anonymous_read(),
+        Some(a) => member_visibility.allows_anonymous_read() || a.can_access_repo(member_id),
     }
 }
 
@@ -405,9 +428,14 @@ pub(crate) fn member_passes_token_scope(
 ///   used by curation, promotion-rule, approval, signing and quarantine reads);
 /// * `approval.rs`, `curation.rs`, `promotion_rules.rs`, `security.rs`,
 ///   `signing.rs`, `quality_gates.rs`, `repository_labels.rs`, `wasm_proxy.rs`
-///   — all `GET`s, plus three `POST`s that are read-only in effect
-///   (`request_approval` probes the SOURCE repo, `evaluate_rule` enumerates the
-///   source repo, `check_license_compliance` reads the repo's policy);
+///   — all `GET`s, plus two `POST`s that are read-only in effect
+///   (`evaluate_rule` enumerates the source repo, `check_license_compliance`
+///   reads the repo's policy). `request_approval` also calls this on the SOURCE
+///   repo, but only as the existence-hiding READ gate in front of its artifact
+///   probe: filing a request writes a `promotion_approvals` row, so it layers
+///   `require_source_grant_for_request` on top, which demands an explicit
+///   grant on any non-public source. `internal` must never satisfy that write
+///   (#3812);
 /// * `require_member_attachable` — attaching a member to a virtual is a
 ///   mutation, but the capability it confers (and the #3177 escalation it
 ///   closes) is READING the member back out through the virtual, so `read` is
@@ -427,7 +455,7 @@ pub(crate) async fn require_visible(
     auth: &Option<AuthExtension>,
     repo_service: &RepositoryService,
 ) -> Result<()> {
-    if repo.is_public {
+    if repo.visibility.allows_anonymous_read() {
         return Ok(());
     }
     let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo.key));
@@ -436,6 +464,17 @@ pub(crate) async fn require_visible(
             // Repository-scoped API tokens must still allow this repo.
             if !a.can_access_repo(repo.id) {
                 return Err(not_found());
+            }
+            // An `internal` repository is readable by any resolved principal
+            // with no grant at all -- the one respect in which it differs from
+            // `private`. This sits AFTER the token-scope check above, not
+            // before it like the anonymous arm: an anonymous caller is refused
+            // an internal repository outright, so a repository-scoped token has
+            // no credential-free baseline to have fallen below and the ceiling
+            // must keep confining it. A scoped token still gets the
+            // existence-hiding 404 above.
+            if repo.visibility.allows_authenticated_read() {
+                return Ok(());
             }
             // Per-repo authorization: admins bypass; everyone else needs a
             // grant on this repo (or a global assignment) that carries `read`.
@@ -462,7 +501,25 @@ pub(crate) async fn require_visible(
                 Err(not_found())
             }
         }
-        None => Err(not_found()),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // non-public repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial
+        // collapses to the same existence-hiding 404 as before, so a caller
+        // outside the CIDRs cannot tell a conditioned repo from a rules-less
+        // or nonexistent one; a lookup error fails CLOSED (denied, not
+        // served), matching the anonymous arms in the native-format
+        // middleware and the OCI read resolver.
+        None => {
+            let granted = repo_service
+                .anonymous_can_read_repo(repo.id)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(())
+            } else {
+                Err(not_found())
+            }
+        }
     }
 }
 
@@ -516,7 +573,7 @@ fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
 /// private repository in the instance and read it straight back out.
 ///
 /// The gate is [`require_visible`] — the canonical
-/// `is_public OR (in_scope AND (is_admin OR grants))` — applied to the member
+/// `public OR (in_scope AND (internal OR is_admin OR grants))` — applied to the member
 /// repository the handler has already loaded. A member the caller may not see
 /// therefore collapses to the same existence-hiding 404 as a direct `GET`,
 /// rather than the 403 the old token-scope wrapper produced, which confirmed
@@ -679,6 +736,7 @@ pub fn router() -> Router<SharedState> {
     use axum::routing::{delete, post, put};
 
     Router::new()
+        .route("/_/capabilities", get(repository_capabilities))
         .route("/", get(list_repositories).post(create_repository))
         .route(
             "/:key",
@@ -772,6 +830,10 @@ pub struct ListRepositoriesQuery {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepositoryRequest {
+    /// Metadata root directory depth for local RPM repositories. Omit for 0.
+    #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
+    #[schema(minimum = 0, maximum = 1023, nullable = false)]
+    pub repodata_depth: Option<u32>,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
@@ -779,12 +841,22 @@ pub struct CreateRepositoryRequest {
     /// One of `local`, `remote`, `virtual`, `staging`. `hosted` is accepted as
     /// an alias of `local` (#4157), which is what the docs call the same thing.
     pub repo_type: String,
+    /// Baseline read audience: `public`, `internal`, or `private`.
+    ///
+    /// This is the authoritative field. `is_public` and its alias
+    /// `allow_anonymous_access` remain accepted for compatibility and mean
+    /// exactly `visibility == "public"`; a client sending only the boolean
+    /// cannot express `internal`. Supplying both is accepted only when they
+    /// agree -- a contradiction is a 400 rather than one silently winning.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    #[schema(deprecated)]
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts from this repository without authentication. Useful for remote
     /// (pull-through cache) repositories that proxy public upstream registries.
     /// If both `is_public` and `allow_anonymous_access` are provided,
     /// `allow_anonymous_access` takes precedence.
+    #[schema(deprecated)]
     pub allow_anonymous_access: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
@@ -881,13 +953,89 @@ pub struct CreateRepositoryRequest {
     pub debian: Option<DebianRepositoryConfig>,
 }
 
+/// What an update request asks to change about a repository's audience.
+///
+/// Exists because a legacy client clearing the boolean does NOT mean the same
+/// thing as setting `visibility: "private"`, and collapsing the two loses an
+/// `internal` repository. See [`UpdateRepositoryRequest::visibility_update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityUpdate {
+    /// Leave the repository's audience exactly as it is.
+    Unchanged,
+    /// Set it to this state.
+    Set(crate::models::repository::RepositoryVisibility),
+    /// A legacy client sent the boolean as `false`, meaning only "not public".
+    /// That narrows a `public` repository to `private` and leaves an
+    /// `internal` or `private` one alone.
+    ClearPublic,
+}
+
+impl VisibilityUpdate {
+    /// Lower to the `(visibility, is_public)` pair the service layer binds.
+    ///
+    /// `ClearPublic` writes only the boolean: the database trigger derives
+    /// `visibility` from whichever column actually CHANGED, so writing
+    /// `is_public = false` narrows a `public` repository and is a no-op on one
+    /// that is already `internal` or `private`. Writing `visibility` here
+    /// instead would take the trigger's "visibility wins" branch and destroy
+    /// the internal state -- which is exactly what a Terraform apply sends on
+    /// every run, since the provider declares the boolean and cannot express
+    /// `internal`.
+    pub fn binds(
+        self,
+    ) -> (
+        Option<crate::models::repository::RepositoryVisibility>,
+        Option<bool>,
+    ) {
+        match self {
+            Self::Unchanged => (None, None),
+            Self::Set(v) => (Some(v), None),
+            Self::ClearPublic => (None, Some(false)),
+        }
+    }
+}
+
+/// Reject a request that supplies `visibility` and the legacy boolean with
+/// contradictory values.
+///
+/// Resolving it silently in either direction is how an operator ends up with a
+/// repository whose audience is the opposite of what their configuration says,
+/// with nothing in the response to tell them.
+fn reject_contradictory_visibility(
+    visibility: Option<crate::models::repository::RepositoryVisibility>,
+    legacy_is_public: Option<bool>,
+) -> Result<()> {
+    match (visibility, legacy_is_public) {
+        (Some(v), Some(b)) if v.allows_anonymous_read() != b => Err(AppError::Validation(format!(
+            "visibility '{}' contradicts is_public={}; send one or the other, \
+             or make them agree",
+            v.as_str(),
+            b
+        ))),
+        _ => Ok(()),
+    }
+}
+
 impl CreateRepositoryRequest {
-    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
-    /// precedence over `is_public` when both are provided.
-    pub fn effective_is_public(&self) -> bool {
-        self.allow_anonymous_access
-            .or(self.is_public)
-            .unwrap_or(false)
+    /// Resolve the legacy boolean. `allow_anonymous_access` takes precedence
+    /// over `is_public` when both are provided.
+    fn legacy_is_public(&self) -> Option<bool> {
+        self.allow_anonymous_access.or(self.is_public)
+    }
+
+    /// Resolve the effective visibility for a create.
+    ///
+    /// `visibility` wins when supplied; otherwise the legacy boolean maps to
+    /// `public`/`private`. A repository created with neither is `private`,
+    /// unchanged from before this field existed. Contradictory input is a 400.
+    pub fn effective_visibility(&self) -> Result<crate::models::repository::RepositoryVisibility> {
+        let legacy = self.legacy_is_public();
+        reject_contradictory_visibility(self.visibility, legacy)?;
+        Ok(match (self.visibility, legacy) {
+            (Some(v), _) => v,
+            (None, Some(true)) => crate::models::repository::RepositoryVisibility::Public,
+            (None, _) => crate::models::repository::RepositoryVisibility::Private,
+        })
     }
 }
 
@@ -904,9 +1052,22 @@ fn default_priority() -> i32 {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepositoryRequest {
+    /// Omit to retain the RPM metadata root depth. Changes require an empty repository.
+    #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
+    #[schema(minimum = 0, maximum = 1023, nullable = false)]
+    pub repodata_depth: Option<u32>,
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Baseline read audience: `public`, `internal`, or `private`.
+    ///
+    /// This is the authoritative field. `is_public` and its alias
+    /// `allow_anonymous_access` remain accepted for compatibility and mean
+    /// exactly `visibility == "public"`; a client sending only the boolean
+    /// cannot express `internal`. Supplying both is accepted only when they
+    /// agree -- a contradiction is a 400 rather than one silently winning.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    #[schema(deprecated)]
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts without authentication. Useful for remote (pull-through cache)
@@ -914,6 +1075,7 @@ pub struct UpdateRepositoryRequest {
     /// (upload, delete) still require authentication regardless of this setting.
     /// If both `is_public` and `allow_anonymous_access` are provided,
     /// `allow_anonymous_access` takes precedence.
+    #[schema(deprecated)]
     pub allow_anonymous_access: Option<bool>,
     pub quota_bytes: Option<i64>,
     /// When provided, enables/disables the `promotion_only` policy for this
@@ -1017,25 +1179,64 @@ pub struct UpdateRepositoryRequest {
 }
 
 impl UpdateRepositoryRequest {
-    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
-    /// precedence over `is_public` when both are provided.
-    pub fn effective_is_public(&self) -> Option<bool> {
+    /// Resolve the legacy boolean. `allow_anonymous_access` takes precedence
+    /// over `is_public` when both are provided.
+    fn legacy_is_public(&self) -> Option<bool> {
         self.allow_anonymous_access.or(self.is_public)
+    }
+
+    /// Resolve what this request asks to change about the repository's audience.
+    ///
+    /// Note the asymmetry between the two legacy cases, which is the whole
+    /// point of [`VisibilityUpdate`]:
+    ///
+    /// * `is_public: true` is unambiguous -- it can only mean `public`.
+    /// * `is_public: false` means only "not public". It must NOT be read as
+    ///   "private", because a client that can only speak the boolean sends
+    ///   `false` for an `internal` repository too, on every request. Treating
+    ///   that as `private` would narrow every internal repository managed by
+    ///   such a client, silently, on each apply -- and the drift would be
+    ///   invisible to the client, whose next read still shows `false`.
+    pub fn visibility_update(&self) -> Result<VisibilityUpdate> {
+        let legacy = self.legacy_is_public();
+        reject_contradictory_visibility(self.visibility, legacy)?;
+        Ok(match (self.visibility, legacy) {
+            (Some(v), _) => VisibilityUpdate::Set(v),
+            (None, Some(true)) => {
+                VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+            }
+            (None, Some(false)) => VisibilityUpdate::ClearPublic,
+            (None, None) => VisibilityUpdate::Unchanged,
+        })
     }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryResponse {
+    /// Always present; 0 preserves the legacy repository-root metadata layout.
+    #[schema(minimum = 0, maximum = 1023)]
+    pub repodata_depth: u32,
+    /// Structural eligibility and emptiness only, not an authorization grant.
+    pub repodata_depth_editable: bool,
     pub id: Uuid,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
     pub format: String,
     pub repo_type: String,
+    /// Baseline read audience: `public`, `internal`, or `private`. This is the
+    /// authoritative field; read it rather than `is_public`, which cannot
+    /// distinguish `internal` from `private`.
+    pub visibility: crate::models::repository::RepositoryVisibility,
+    /// DEPRECATED. Always equal to `visibility == "public"`. An `internal`
+    /// repository reads as `false` here, which is correct -- it is not
+    /// anonymously readable -- but indistinguishable from `private`.
+    #[schema(deprecated)]
     pub is_public: bool,
     /// Whether anonymous (unauthenticated) downloads are allowed. This is
     /// always equal to `is_public` and provided as a convenience alias so
     /// the semantics are clear for remote (pull-through cache) repositories.
+    #[schema(deprecated)]
     pub allow_anonymous_access: bool,
     /// When true, direct user uploads are rejected; artifacts must be promoted.
     pub promotion_only: bool,
@@ -1127,18 +1328,64 @@ pub struct RepositoryListResponse {
     pub pagination: Pagination,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RpmRepodataDepthCapability {
+    pub supported: bool,
+    pub min: u32,
+    pub max: u32,
+    pub default: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryCapabilities {
+    pub rpm_repodata_depth: RpmRepodataDepthCapability,
+}
+
+/// Non-mutating feature detection, including on an installation with no repositories.
+#[utoipa::path(
+    get, path = "/_/capabilities", context_path = "/api/v1/repositories",
+    tag = "repositories",
+    responses((status = 200, description = "Repository capabilities", body = RepositoryCapabilities))
+)]
+pub async fn repository_capabilities() -> Json<RepositoryCapabilities> {
+    Json(RepositoryCapabilities {
+        rpm_repodata_depth: RpmRepodataDepthCapability {
+            supported: true,
+            min: 0,
+            max: rpm_layout::MAX_REPODATA_DEPTH,
+            default: 0,
+        },
+    })
+}
+
+async fn with_repodata_depth(
+    db: &sqlx::PgPool,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    let (depth, editable) = rpm_layout::settings(db, &[response.id])
+        .await?
+        .remove(&response.id)
+        .ok_or_else(|| AppError::NotFound("Repository not found".into()))?;
+    response.repodata_depth = depth;
+    response.repodata_depth_editable = editable;
+    Ok(response)
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
     storage_used_bytes: i64,
 ) -> RepositoryResponse {
     RepositoryResponse {
+        repodata_depth: 0,
+        repodata_depth_editable: false,
         id: repo.id,
         key: repo.key,
         name: repo.name,
         description: repo.description,
         format: repo.format.as_key().to_string(),
         repo_type: repo.repo_type.as_str().to_string(),
+        visibility: repo.visibility,
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
@@ -1184,10 +1431,11 @@ async fn with_quarantine_settings(
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
     let (enabled, duration) = quarantine_service::repo_settings(db, repo_id).await;
-    // #3647: a row written before the enable-time gate existed still blocks
-    // every uncached fetch on a proxying repository with no release path. The
-    // stored value is left exactly as the operator set it; reading the repo
-    // just says so out loud, the same audit the startup scan emits.
+    // #3647 / #3912: a row written before the enable-time gate existed is dead
+    // state on a virtual repository (the only type still unsupported — the
+    // policy belongs on its member remotes). The stored value is left exactly
+    // as the operator set it; reading the repo just says so out loud, the
+    // same audit the startup scan emits.
     if enabled == Some(true)
         && !RepositoryType::from_db_str(&response.repo_type)
             .as_ref()
@@ -1196,9 +1444,10 @@ async fn with_quarantine_settings(
         tracing::warn!(
             repository = %response.key,
             repo_type = %response.repo_type,
-            "repository has quarantine enabled but is a {} repository; the hold blocks all \
-             uncached content and has no release path (#3647). Set \
-             `quarantine_enabled: false` on this repository.",
+            "repository has quarantine enabled but is a {} repository; a virtual has no \
+             cache of its own, so the setting is never consulted (#3647, #3912). Enable the \
+             Package Age Policy on the member remote repositories and set \
+             `quarantine_enabled: false` here.",
             response.repo_type
         );
     }
@@ -1293,6 +1542,41 @@ async fn with_apt_settings(
 /// which the P2 dist/component/arch filter is meaningful.
 fn is_debian_remote(repo_type: &RepositoryType, format: &RepositoryFormat) -> bool {
     *repo_type == RepositoryType::Remote && matches!(format, RepositoryFormat::Debian)
+}
+
+/// Classify an inline `debian` proxy-filter payload against its target
+/// repository (#2460): `Ok(true)` = apply it, `Ok(false)` = it configures
+/// nothing here, so skip it, `Err(_)` = it asks for something this target
+/// cannot consume.
+///
+/// Only a Debian *Remote* can carry the filter. On every other type an
+/// all-*default* payload is skipped rather than rejected: released web UIs
+/// attach exactly that for an untouched Debian form — the create dialog sends
+/// `debian: {distribution_paths: [], components: [], architectures: []}` for
+/// **every** Debian-format repository, local ones included — so a present but
+/// empty object made creating a local Debian repository impossible. The
+/// payload configures nothing (the backend's own default is "no filter
+/// stored"), so skipping it loses nothing. A payload that *sets* anything on
+/// an unconsumable target is still rejected, preserving the dead-state guard
+/// (#2460).
+///
+/// `sets_nothing` is the payload-shape-specific "configures nothing" test:
+/// `*cfg == DebianRepositoryConfig::default()` on create, `*patch ==
+/// DebianConfigPatch::default()` on update.
+fn classify_debian_payload(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    sets_nothing: bool,
+) -> Result<bool> {
+    if is_debian_remote(repo_type, format) {
+        return Ok(true);
+    }
+    if sets_nothing {
+        return Ok(false);
+    }
+    Err(AppError::Validation(
+        "debian filter config is only valid for Debian remote (proxy) repositories".to_string(),
+    ))
 }
 
 /// Validate a `DebianRepositoryConfig` for the 1.6.0 passthrough-only feature
@@ -1597,13 +1881,16 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 }
 
 /// Reject `quarantine_enabled = true` on repositories that serve proxied
-/// content (#3647).
+/// content without a quarantine identity of their own (#3647, #3912).
 ///
-/// Quarantine state is keyed on `artifacts`; a Remote or Virtual repository
-/// records what it serves in `proxy_cache_artifacts`, which has no quarantine
-/// columns, so the hold has no release path and degrades into a total block on
-/// all uncached content. Refusing the write surfaces that at configuration time
-/// instead of at first pull. The explicit
+/// Hosted and Remote repositories qualify: hosted content carries
+/// `artifacts.quarantine_*`, and remote (proxy) content got its quarantine
+/// identity in #3912 (`proxy_cache_artifacts.quarantine_until`, the
+/// release-date window on both fetch paths, and the
+/// `POST /api/v1/quarantine/proxy-cache/{key}/release` endpoint). A Virtual
+/// repository caches nothing itself — its members' Remote legs do — so
+/// enabling the policy on it would be dead state. Refusing the write surfaces
+/// that at configuration time instead of at first pull. The explicit
 /// `quarantine_service::supports_quarantine` call is what the structural
 /// regression test below greps for.
 ///
@@ -1612,7 +1899,7 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
 fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
     if !quarantine_service::supports_quarantine(repo_type) {
         return Err(AppError::Validation(
-            quarantine_service::PROXY_QUARANTINE_UNSUPPORTED.to_string(),
+            quarantine_service::VIRTUAL_QUARANTINE_UNSUPPORTED.to_string(),
         ));
     }
     Ok(())
@@ -1654,7 +1941,7 @@ pub async fn set_cache_ttl(
     Json(payload): Json<SetCacheTtlRequest>,
 ) -> Result<Json<CacheTtlResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2042,7 +2329,7 @@ pub async fn set_npm_scope_policy(
     Json(payload): Json<SetNpmScopePolicyRequest>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2114,7 +2401,7 @@ pub async fn get_npm_scope_policy(
     Path(key): Path<String>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2191,7 +2478,7 @@ pub async fn invalidate_cache(
     Query(query): Query<InvalidateCacheQuery>,
 ) -> Result<Json<InvalidateCacheResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2368,7 +2655,7 @@ pub async fn put_pypi_track(
     Json(payload): Json<PypiTrackRequest>,
 ) -> Result<Json<PypiTrackResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2434,7 +2721,7 @@ pub async fn delete_pypi_track(
     Path((key, project)): Path<(String, String)>,
 ) -> Result<axum::http::StatusCode> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2688,6 +2975,7 @@ pub async fn list_repositories(
         std::collections::HashSet::new()
     };
 
+    let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -2695,6 +2983,10 @@ pub async fn list_repositories(
             let has_gpg = gpg_key_ids.contains(&r.id);
             let mut resp = repo_to_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
+            if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
+                resp.repodata_depth = depth;
+                resp.repodata_depth_editable = editable;
+            }
             resp
         })
         .collect();
@@ -2720,9 +3012,11 @@ pub async fn list_repositories(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
+        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 409, description = "Repository key already exists"),
+        (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
 pub async fn create_repository(
@@ -2735,7 +3029,7 @@ pub async fn create_repository(
     // unauth requests carrying a payload the schema didn't recognize with
     // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
@@ -2850,18 +3144,31 @@ pub async fn create_repository(
     // unsupported strategy/inconsistent filter) cannot leave an orphaned
     // repository behind, mirroring the apt_* and npm guards above. Persistence
     // happens after `service.create(...)`, once `repo.id` exists.
+    //
+    // An all-default payload on a repository the filter is not configurable on
+    // is the released web UI's untouched-form artifact, not a configuration
+    // attempt: it configures nothing, so `classify_debian_payload` skips it
+    // instead of failing the whole create.
     if let Some(ref cfg) = payload.debian {
-        if !is_debian_remote(&repo_type, &format) {
-            return Err(AppError::Validation(
-                "debian filter config is only valid for Debian remote (proxy) repositories"
-                    .to_string(),
-            ));
+        if classify_debian_payload(
+            &repo_type,
+            &format,
+            *cfg == DebianRepositoryConfig::default(),
+        )? {
+            validate_debian_config(cfg)?;
         }
-        validate_debian_config(cfg)?;
     }
 
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
+        // #3923: a remote repository that does not name a backend lands on the
+        // one the deployment's proxy cache actually uses (the filesystem
+        // fallback on an Azure default), so clients that omit the field keep
+        // working; only an explicit unservable choice is refused below.
+        None if repo_type == RepositoryType::Remote => {
+            crate::services::storage_service::proxy_cache_backend_for(&state.config.storage_backend)
+                .to_string()
+        }
         None => state.config.storage_backend.clone(),
         Some(requested) if requested == &state.config.storage_backend => {
             state.config.storage_backend.clone()
@@ -2883,6 +3190,18 @@ pub async fn create_repository(
             requested.clone()
         }
     };
+
+    // #3923: a remote repository must sit on a backend the deployment's proxy
+    // cache can serve. Reject it here (400) instead of accepting a repository
+    // whose upstream traffic the deployment cannot cache where its rows point.
+    if repo_type == RepositoryType::Remote {
+        if let Some(message) = crate::services::storage_service::remote_repository_backend_error(
+            &state.config.storage_backend,
+            &storage_backend,
+        ) {
+            return Err(AppError::Validation(message));
+        }
+    }
 
     // Compute storage path: filesystem uses a subdirectory, cloud backends use the key directly
     let storage_path = if storage_backend == "filesystem" {
@@ -2908,48 +3227,48 @@ pub async fn create_repository(
         }
     }
 
-    // Issue #850: silently coerce `is_public` to false when guest access is
-    // disabled server-wide so the persisted state matches the runtime policy.
-    let (is_public, coerced) = coerce_is_public_for_create(
-        payload.effective_is_public(),
+    // #3855: a public repository contradicts a server-wide guest-access
+    // disable; refuse it explicitly rather than silently creating a
+    // repository the caller never asked for. `internal` and `private` never
+    // ask for anonymous access, so they are never a contradiction.
+    let visibility = payload.effective_visibility()?;
+    require_public_visibility_allowed(
+        visibility.allows_anonymous_read(),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %payload.key,
-            "Coercing repository to private: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
 
     let repo = service
-        .create(ServiceCreateRepoReq {
-            key: payload.key,
-            name: payload.name,
-            description: payload.description,
-            format,
-            repo_type: repo_type.clone(),
-            storage_backend,
-            storage_path,
-            upstream_url: payload.upstream_url,
-            is_public,
-            quota_bytes: payload.quota_bytes,
-            promotion_only: payload.promotion_only.unwrap_or(false),
-            versioning_enabled: payload.versioning_enabled.unwrap_or(false),
-            // Plugin format key takes precedence over any explicit format_key
-            // in the payload: when a WASM plugin format was resolved above,
-            // `plugin_format_key` carries the canonical handler name.
-            format_key: plugin_format_key.or(payload.format_key),
-            project_id: payload.project_id,
-            // Trusted upstream GPG key for RPM curation (#2568). Already
-            // validated up-front; the service persists it in the create tx.
-            trusted_gpg_key: payload.trusted_gpg_key,
-            // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
-            // default; only an explicit `true` opts into unverified ingest.
-            curation_allow_unverified: payload.curation_allow_unverified,
-            // Owner auto-grant: record the creator and grant them per-repo
-            // access so they retain access under per-repo authorization.
-            created_by: Some(auth.user_id),
-        })
+        .create_with_repodata_depth(
+            ServiceCreateRepoReq {
+                key: payload.key,
+                name: payload.name,
+                description: payload.description,
+                format,
+                repo_type: repo_type.clone(),
+                storage_backend,
+                storage_path,
+                upstream_url: payload.upstream_url,
+                visibility,
+                quota_bytes: payload.quota_bytes,
+                promotion_only: payload.promotion_only.unwrap_or(false),
+                versioning_enabled: payload.versioning_enabled.unwrap_or(false),
+                // Plugin format key takes precedence over any explicit format_key
+                // in the payload: when a WASM plugin format was resolved above,
+                // `plugin_format_key` carries the canonical handler name.
+                format_key: plugin_format_key.or(payload.format_key),
+                project_id: payload.project_id,
+                // Trusted upstream GPG key for RPM curation (#2568). Already
+                // validated up-front; the service persists it in the create tx.
+                trusted_gpg_key: payload.trusted_gpg_key,
+                // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
+                // default; only an explicit `true` opts into unverified ingest.
+                curation_allow_unverified: payload.curation_allow_unverified,
+                // Owner auto-grant: record the creator and grant them per-repo
+                // access so they retain access under per-repo authorization.
+                created_by: Some(auth.user_id),
+            },
+            payload.repodata_depth.unwrap_or(0),
+        )
         .await?;
 
     // Provision the hex registry signing key (#2641). A hosted hex repository is
@@ -3050,9 +3369,14 @@ pub async fn create_repository(
     }
 
     // Persist the Debian remote proxy filter (#2460). Validation already ran
-    // up-front (before create), so here we only serialize + store it.
+    // up-front (before create), so here we only serialize + store it. An
+    // all-default payload on a non-Debian-remote repo was accepted as a no-op
+    // above — skip persistence too, so it cannot leave a dead config row
+    // behind.
     if let Some(ref cfg) = payload.debian {
-        upsert_debian_config(&state.db, repo.id, cfg).await?;
+        if is_debian_remote(&repo.repo_type, &repo.format) {
+            upsert_debian_config(&state.db, repo.id, cfg).await?;
+        }
     }
 
     // Add virtual repository members. Post-#1444, the validator accepts
@@ -3146,7 +3470,11 @@ pub async fn create_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -3194,6 +3522,7 @@ pub async fn create_repository(
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -3257,6 +3586,7 @@ pub async fn get_repository(
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -3720,10 +4050,12 @@ pub async fn get_repository_storage_tree(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
+        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
-        (status = 409, description = "Repository key already exists"),
+        (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
 pub async fn update_repository(
@@ -3733,7 +4065,7 @@ pub async fn update_repository(
     Json(payload): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
@@ -3796,27 +4128,26 @@ pub async fn update_repository(
         }
     }
 
-    // Issue #850: ignore any attempt to flip a repository back to public when
-    // guest access is disabled. The web UI hides the toggle, but API clients
-    // and stale forms may still send `true`.
-    let (effective_is_public, coerced) = coerce_is_public_for_update(
-        payload.effective_is_public(),
+    // #3855: flipping a repository to public contradicts a server-wide
+    // guest-access disable; refuse it explicitly rather than silently keeping
+    // the repository non-public while answering 200. An absent field, a
+    // legacy `is_public: false`, and `internal`/`private` never ask for
+    // anonymous access and are never a contradiction.
+    let visibility_update = payload.visibility_update()?;
+    require_public_visibility_allowed(
+        matches!(visibility_update, VisibilityUpdate::Set(v) if v.allows_anonymous_read()),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %key,
-            "Ignoring is_public=true on update: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
+    let (effective_visibility, effective_is_public) = visibility_update.binds();
 
     let repo = service
-        .update(
+        .update_with_repodata_depth(
             existing.id,
             ServiceUpdateRepoReq {
                 key: payload.key,
                 name: payload.name,
                 description: payload.description,
+                visibility: effective_visibility,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
@@ -3835,6 +4166,7 @@ pub async fn update_repository(
                 curation_enabled: payload.curation_enabled,
                 curation_default_action: payload.curation_default_action,
             },
+            payload.repodata_depth,
         )
         .await?;
 
@@ -4040,6 +4372,10 @@ pub async fn update_repository(
     //                                    stored config, validate, persist.
     // The gate reads the config live on every request, so no cache
     // invalidation is required for a change to take effect.
+    //
+    // An all-`None` patch on a repository the filter is not configurable on is
+    // the same untouched-form artifact as on create (`"debian": {}`): it
+    // merges nothing, so it is skipped rather than rejected.
     match payload.debian {
         None => {}
         Some(None) => {
@@ -4050,13 +4386,17 @@ pub async fn update_repository(
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
-        Some(Some(ref patch)) => {
-            if !is_debian_remote(&existing.repo_type, &existing.format) {
-                return Err(AppError::Validation(
-                    "debian filter config is only valid for Debian remote (proxy) repositories"
-                        .to_string(),
-                ));
-            }
+        // A patch that sets something is only valid for a Debian Remote. An
+        // all-`None` patch on any other type is the untouched-form artifact
+        // (`"debian": {}`): it merges nothing, so it falls through to the
+        // no-op arm below instead of failing the update.
+        Some(Some(ref patch))
+            if classify_debian_payload(
+                &existing.repo_type,
+                &existing.format,
+                *patch == DebianConfigPatch::default(),
+            )? =>
+        {
             let base = load_debian_config(&state.db, repo.id)
                 .await
                 .unwrap_or_default();
@@ -4064,6 +4404,8 @@ pub async fn update_repository(
             validate_debian_config(&merged)?;
             upsert_debian_config(&state.db, repo.id, &merged).await?;
         }
+        // The skipped untouched-form patch: nothing to merge, nothing stored.
+        Some(Some(_)) => {}
     }
 
     // Invalidate the in-memory repo cache so that visibility changes take
@@ -4106,7 +4448,11 @@ pub async fn update_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -4143,6 +4489,7 @@ pub async fn update_repository(
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
 
@@ -4214,6 +4561,28 @@ async fn collect_repo_oci_upload_temp_keys(state: &SharedState, repo_id: Uuid) -
     keys
 }
 
+/// Filter the journaled keys of a deleted repository down to objects it owned
+/// exclusively (#3851 review B1).
+///
+/// Temp, part and completion keys embed an upload UUID and are always the
+/// repository's own. A final `oci-blobs/<digest>` key is content-addressed:
+/// on a backend whose repositories share one object namespace (S3/GCS/Azure)
+/// another repository may have committed the very same object while this
+/// repository's journal row for it lingered (cleanup-journal rows are per
+/// repository), so deleting it would destroy that repository's blob. Those
+/// keys are recorded as OCI GC candidates instead (`record_oci_gc_candidates`,
+/// before the delete), and the candidate sweep reclaims each one after its
+/// grace window unless something still references it.
+/// A repo-isolated backend (filesystem) gives the repository its own copy.
+fn oci_upload_keys_owned_by_deleted_repo(backend: &str, keys: Vec<String>) -> Vec<String> {
+    if crate::storage::backend_is_repo_isolated(backend) {
+        return keys;
+    }
+    keys.into_iter()
+        .filter(|key| !key.starts_with(crate::api::handlers::oci_v2::OCI_BLOB_KEY_PREFIX))
+        .collect()
+}
+
 /// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
 /// objects from storage, given the keys previously gathered by
 /// [`collect_repo_oci_upload_temp_keys`].
@@ -4229,6 +4598,7 @@ async fn purge_oci_upload_temp_objects(
     location: &crate::storage::StorageLocation,
     keys: Vec<String>,
 ) {
+    let keys = oci_upload_keys_owned_by_deleted_repo(&location.backend, keys);
     if keys.is_empty() {
         return;
     }
@@ -4654,7 +5024,7 @@ pub async fn delete_repository(
     Path(key): Path<String>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -4791,7 +5161,11 @@ pub async fn delete_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -5202,9 +5576,7 @@ pub async fn list_artifacts(
         // appear in the listing.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
 
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Aggregating over
@@ -5221,7 +5593,7 @@ pub async fn list_artifacts(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth.as_ref(), repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth.as_ref(), repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect();
@@ -6337,9 +6709,7 @@ async fn list_artifacts_grouped_by_maven_component(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: same unfiltered member walk as the flat listing — narrow to
         // the members this caller may see before the catalog is queried, so a
         // private member's GAV coordinates are not disclosed through the
@@ -6354,7 +6724,7 @@ async fn list_artifacts_grouped_by_maven_component(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth, repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect()
@@ -7075,9 +7445,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Narrow to the
         // members this caller may see before the tag rows are queried, so a
@@ -7092,7 +7460,7 @@ async fn list_artifacts_grouped_by_docker_tag(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth, repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect()
@@ -7968,12 +8336,27 @@ pub async fn upload_artifact(
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
-    // Stream the request body straight to a bounded scratch file, computing
-    // SHA-256/SHA-1/MD5 in a single pass — the whole artifact is never buffered
-    // in memory (#2517). The stager enforces `max_upload_size_bytes` mid-stream
-    // (413 on breach) instead of relying on a request-body-limit layer.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
+    // single pass — the whole artifact is never buffered in memory (#2517).
+    // The stager enforces `max_upload_size_bytes` mid-stream (413 on breach)
+    // instead of relying on a request-body-limit layer. An object-storage
+    // repository stages on its own backend rather than local disk (#3916),
+    // unless something downstream needs the body as a local file.
+    let stage_on_backend = repo.storage_backend != "filesystem"
+        && !generic_upload_needs_local_body(&state, &repo_service, &repo, &path).await?;
+    let (staged, digests) = if stage_on_backend {
+        let (staged, digests) = proxy_helpers::stage_stream_on_backend(
+            &state,
+            &repo.storage_location(),
+            body.into_data_stream(),
+        )
+        .await?;
+        (GenericStagedBody::Backend(staged), digests)
+    } else {
+        let (staged, digests) =
+            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        (GenericStagedBody::Local(staged), digests)
+    };
 
     persist_generic_staged_upload(
         &state,
@@ -7987,6 +8370,82 @@ pub async fn upload_artifact(
         digests,
     )
     .await
+}
+
+/// A generic upload body after staging: a local scratch file, or an object on
+/// the repository's own backend (#3916).
+enum GenericStagedBody {
+    Local(proxy_helpers::StagedUpload),
+    Backend(proxy_helpers::BackendStagedUpload),
+}
+
+impl GenericStagedBody {
+    fn size_bytes(&self) -> i64 {
+        match self {
+            Self::Local(staged) => staged.size_bytes(),
+            Self::Backend(staged) => staged.size_bytes(),
+        }
+    }
+
+    /// The staged body as a local file, for the consumers that read one (RPM
+    /// header parse, WASM plugins). [`generic_upload_needs_local_body`] keeps
+    /// those uploads on local scratch, so a backend-staged body never gets
+    /// here; it reads as an I/O error rather than a panic if it ever does.
+    fn local_path(&self) -> std::io::Result<&std::path::Path> {
+        match self {
+            Self::Local(staged) => Ok(staged.path()),
+            Self::Backend(_) => Err(std::io::Error::other(
+                "upload body is staged on the storage backend, not local disk",
+            )),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn upload_content(
+        &self,
+    ) -> std::result::Result<crate::services::artifact_service::UploadContent, Response> {
+        use crate::services::artifact_service::UploadContent;
+        Ok(match self {
+            Self::Local(staged) => {
+                UploadContent::Stream(proxy_helpers::open_staged_upload_stream(staged).await?)
+            }
+            Self::Backend(staged) => UploadContent::StagedObject(staged.key().to_string()),
+        })
+    }
+
+    /// Release the staging copy once the service has consumed it.
+    async fn discard(self) {
+        match self {
+            Self::Local(staged) => drop(staged),
+            Self::Backend(staged) => staged.discard().await,
+        }
+    }
+}
+
+/// Whether a generic upload's body must be staged as a local file because a
+/// downstream consumer reads it from disk: the RPM header parse (#3801) or a
+/// WASM format plugin (#2517 plugin-input decision).
+#[allow(clippy::result_large_err)]
+async fn generic_upload_needs_local_body(
+    state: &SharedState,
+    repo_service: &RepositoryService,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> std::result::Result<bool, Response> {
+    if super::upload::rpm_header_metadata_eligible(&repo.format, path) {
+        return Ok(true);
+    }
+    let Some(registry) = &state.plugin_registry else {
+        return Ok(false);
+    };
+    let format_key = repo_service
+        .get_format_key(repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(match format_key {
+        Some(fk) => registry.has_format(&fk).await,
+        None => false,
+    })
 }
 
 /// Authorize a generic artifact write: resolve the repository and enforce the
@@ -8075,7 +8534,7 @@ async fn persist_generic_staged_upload(
     key: String,
     path: String,
     headers: &HeaderMap,
-    staged: proxy_helpers::StagedUpload,
+    staged: GenericStagedBody,
     digests: crate::services::artifact_service::ContentDigests,
 ) -> std::result::Result<Response, Response> {
     // Verify declared checksums against the digests computed while staging —
@@ -8093,6 +8552,40 @@ async fn persist_generic_staged_upload(
         declared_md5,
     )
     .map_err(|e| e.into_response())?;
+
+    // #3801: an `.rpm` pushed into an RPM repository through this generic
+    // endpoint gets the same header parse as the native and chunked paths —
+    // on the blocking pool, BEFORE anything is stored — so a header over the
+    // indexing limits (or with XML-forbidden control characters) is refused
+    // with 400 here too, and the package's repodata block is recorded at
+    // upload instead of being derived later by the heal. Only a TRUSTED
+    // replication push (admin or service account, `replication_exemption_
+    // trusted`) skips it: the replication header alone is client-set.
+    let rpm_metadata = if super::upload::rpm_header_metadata_eligible(&repo.format, &path)
+        && !replication_exemption_trusted(
+            is_replication_request(headers),
+            auth.is_admin,
+            auth.is_service_account,
+        ) {
+        let prefix = match staged.local_path() {
+            Ok(local) => super::upload::read_rpm_header_prefix(local).await,
+            Err(e) => Err(e),
+        };
+        match prefix {
+            Ok(prefix) => {
+                let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
+                tokio::task::spawn_blocking(move || {
+                    super::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+                })
+                .await
+                .map_err(|e| proxy_helpers::internal_error("Parsing RPM header", e))?
+                .map_err(|rejected| (StatusCode::BAD_REQUEST, rejected.0).into_response())?
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
 
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -8121,9 +8614,11 @@ async fn persist_generic_staged_upload(
             // off-heap — is a separate product/ABI decision, deliberately left
             // out of this streaming conversion. The common (non-plugin) generic
             // upload never reaches this branch and streams end-to-end.
-            let plugin_body = tokio::fs::read(staged.path())
-                .await
-                .map_err(|e| proxy_helpers::internal_error("Reading staged upload", e))?;
+            let plugin_body = match staged.local_path() {
+                Ok(local) => tokio::fs::read(local).await,
+                Err(e) => Err(e),
+            }
+            .map_err(|e| proxy_helpers::internal_error("Reading staged upload", e))?;
             match registry.execute_validate(fk, &path, &plugin_body).await {
                 Ok(Ok(())) => {}
                 Ok(Err(validation_err)) => {
@@ -8200,25 +8695,33 @@ async fn persist_generic_staged_upload(
     // manual purge.
 
     let size_bytes = staged.size_bytes();
-    let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_stream_with_sync_options(
+        .upload_content_with_sync_options(
             repo.id,
             &path,
             &name,
             version.as_deref(),
             &content_type,
-            content_stream,
+            content,
             digests,
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
             None,
         )
-        .await
-        .map_err(|e| e.into_response())?;
-    // Scratch file no longer needed once the service has consumed the stream.
-    drop(staged);
+        .await;
+    // The staging copy is no longer needed once the service has consumed it,
+    // whether or not the upload succeeded.
+    staged.discard().await;
+    let artifact = artifact.map_err(|e| e.into_response())?;
+    if let Some(metadata) = &rpm_metadata {
+        if let Err(e) =
+            super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
+        {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "RPM metadata could not be recorded");
+        }
+    }
 
     let downloads = artifact_service
         .get_download_stats(artifact.id)
@@ -8334,7 +8837,7 @@ async fn upload_artifact_multipart_with_path(
         key,
         artifact_path,
         &headers,
-        staged,
+        GenericStagedBody::Local(staged),
         digests,
     )
     .await
@@ -8377,7 +8880,7 @@ async fn upload_artifact_multipart(
         key,
         artifact_path,
         &headers,
-        staged,
+        GenericStagedBody::Local(staged),
         digests,
     )
     .await
@@ -8690,6 +9193,49 @@ pub(crate) fn ranged_stream_response(
     body: futures::stream::BoxStream<'static, Result<Bytes>>,
     base_headers: Vec<(header::HeaderName, String)>,
 ) -> Result<Response> {
+    ranged_stream_response_verified(range_header, total, body, base_headers, None)
+}
+
+/// What a full-body (`200`) serve should verify the streamed bytes against
+/// (#3919): the recorded SHA-256, and a label for the corruption log line.
+pub(crate) struct ServeVerification {
+    pub expected_sha256: [u8; 32],
+    pub label: String,
+}
+
+/// Build the verification for an artifact row's recorded checksum, or `None`
+/// when verification is disabled or the recorded value is not a SHA-256 hex
+/// digest (nothing to verify against; served exactly as before).
+pub(crate) fn serve_verification(
+    enabled: bool,
+    recorded_sha256: &str,
+    label: impl FnOnce() -> String,
+) -> Option<ServeVerification> {
+    if !enabled {
+        return None;
+    }
+    crate::storage::verify::parse_sha256_hex(recorded_sha256).map(|expected_sha256| {
+        ServeVerification {
+            expected_sha256,
+            label: label(),
+        }
+    })
+}
+
+/// [`ranged_stream_response`] that, on the full-body `200` path, verifies the
+/// streamed bytes against `verify` (#3919). The digest header has already been
+/// sent by the time the body is known to be bad, so a mismatch aborts the
+/// body before its final chunk: the client never receives `Content-Length`
+/// bytes carrying the original checksum. A `206` whose range covers the whole
+/// object is verified the same way; a proper sub-range is not (a byte window
+/// cannot be checked against a whole-object digest).
+pub(crate) fn ranged_stream_response_verified(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+    verify: Option<ServeVerification>,
+) -> Result<Response> {
     let build_base = || {
         let mut b = Response::builder().header(header::ACCEPT_RANGES, "bytes");
         for (name, value) in &base_headers {
@@ -8699,7 +9245,25 @@ pub(crate) fn ranged_stream_response(
     };
     let mk_err =
         |e: axum::http::Error| AppError::Internal(format!("failed to build response: {e}"));
-    let response = match parse_byte_range(range_header, total) {
+    let outcome = parse_byte_range(range_header, total);
+    // A 206 whose window is the WHOLE object (`bytes=0-`, `0-(N-1)`, a
+    // suffix >= N) delivers every byte under the whole-object digest header,
+    // so it is verified exactly like the 200 path.
+    let whole_object = match &outcome {
+        RangeOutcome::Full => true,
+        RangeOutcome::Satisfiable { start, end } => *start == 0 && *end + 1 == total,
+        RangeOutcome::Unsatisfiable => false,
+    };
+    let body = match verify {
+        Some(v) if whole_object => crate::storage::verify::verify_sha256_stream(
+            body,
+            v.expected_sha256,
+            Some(total),
+            v.label,
+        ),
+        _ => body,
+    };
+    let response = match outcome {
         RangeOutcome::Satisfiable { start, end } => {
             let len = end - start + 1;
             build_base()
@@ -8739,6 +9303,7 @@ async fn download_artifact_version(
     selector: &str,
     range_header: Option<&str>,
     is_head: bool,
+    verify_checksums: bool,
 ) -> Result<Response> {
     let stored = artifact_service
         .get_version(repo_id, path, Some(selector))
@@ -8780,8 +9345,11 @@ async fn download_artifact_version(
             .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")));
     }
 
+    let verify = serve_verification(verify_checksums, &stored.checksum_sha256, || {
+        format!("{repo_id}/{path}@{}", stored.revision)
+    });
     let body = artifact_service.download_version_stream(&stored).await?;
-    ranged_stream_response(range_header, total, body, base_headers)
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
 /// Download artifact
@@ -8819,6 +9387,26 @@ pub async fn download_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
+
+    // #3873: a Galaxy API read addressed through this route is answered by the
+    // Galaxy handler, not by streaming the upstream's JSON -- whose pagination
+    // links are root-relative to the upstream origin and leave the repository.
+    // So is the `download/{file}.tar.gz` the Galaxy documents advertise on this
+    // mount, which the Galaxy download route resolves by collection filename
+    // (behind the same quarantine / scan-policy gate as every download).
+    // Virtual repositories keep the member walk below: the Galaxy handler has
+    // no virtual resolution to delegate to.
+    if repo.format == RepositoryFormat::Ansible && repo.repo_type != RepositoryType::Virtual {
+        let uri = request
+            .extensions()
+            .get::<axum::extract::OriginalUri>()
+            .map_or_else(|| request.uri().clone(), |o| o.0.clone());
+        if let Some(response) =
+            super::ansible::serve_galaxy_api_path(&state, &key, &path, &uri, &auth, &dl_ctx).await
+        {
+            return Ok(response);
+        }
+    }
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
@@ -8893,6 +9481,11 @@ pub async fn download_artifact(
                 selector,
                 range_header.as_deref(),
                 is_head,
+                state.config.download_verify_checksums
+                    && crate::storage::verify::checksum_is_content_digest(
+                        repo.format.as_key(),
+                        &path,
+                    ),
             )
             .await;
         }
@@ -9026,7 +9619,17 @@ pub async fn download_artifact(
                     "proxy".to_string(),
                 ),
             ];
-            let response = ranged_stream_response(range_header, total, body, base_headers)?;
+            let verify = serve_verification(
+                state.config.download_verify_checksums
+                    && crate::storage::verify::checksum_is_content_digest(
+                        repo.format.as_key(),
+                        &path,
+                    ),
+                &artifact.checksum_sha256,
+                || format!("{key}/{path}"),
+            );
+            let response =
+                ranged_stream_response_verified(range_header, total, body, base_headers, verify)?;
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -9237,7 +9840,7 @@ fn delete_blocked_by_immutability(
 /// an admin or a service account — which an ordinary human-user token cannot
 /// assert. Genuine peer replication runs under such a token, so legitimate
 /// mirroring of upstream immutable-artifact deletes is preserved.
-fn replication_exemption_trusted(
+pub(crate) fn replication_exemption_trusted(
     is_replication: bool,
     is_admin: bool,
     is_service_account: bool,
@@ -9270,7 +9873,7 @@ pub async fn delete_artifact(
     headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:artifacts")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -9529,9 +10132,10 @@ struct VirtualMemberRow {
     member_key: String,
     member_name: String,
     repo_type: RepositoryType,
-    /// Needed by `member_passes_token_scope`: a public member bypasses token
-    /// scope entirely, matching `require_visible`'s early return.
-    is_public: bool,
+    /// Needed by `member_passes_token_scope`: an anonymously-readable member
+    /// bypasses token scope entirely, matching `require_visible`'s early
+    /// return. `internal` does NOT bypass it -- see that helper.
+    visibility: crate::models::repository::RepositoryVisibility,
 }
 
 /// List virtual repository members
@@ -9598,7 +10202,7 @@ pub async fn list_virtual_members(
             r.key as member_key,
             r.name as member_name,
             r.repo_type,
-            r.is_public
+            r.visibility
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1
@@ -9640,7 +10244,7 @@ pub async fn list_virtual_members(
                     Some(&auth),
                     repo.id,
                     row.member_repo_id,
-                    row.is_public,
+                    row.visibility,
                 )
         })
         .map(|row| row.member_repo_id)
@@ -9679,7 +10283,7 @@ pub async fn add_virtual_member(
     Json(payload): Json<AddVirtualMemberRequest>,
 ) -> Result<Json<VirtualMemberResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9712,7 +10316,7 @@ pub async fn add_virtual_member(
             r.key as member_key,
             r.name as member_name,
             r.repo_type,
-            r.is_public
+            r.visibility
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1 AND vrm.member_repo_id = $2
@@ -9759,7 +10363,7 @@ pub async fn remove_virtual_member(
     Path((key, member_key)): Path<(String, String)>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9851,7 +10455,7 @@ pub async fn update_virtual_members(
     Json(payload): Json<UpdateVirtualMembersRequest>,
 ) -> Result<Json<VirtualMembersListResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -10029,7 +10633,7 @@ pub async fn set_upstream_auth(
     Json(payload): Json<UpstreamAuthRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10216,7 +10820,7 @@ pub async fn set_egress_proxy(
     Json(payload): Json<EgressProxyRequest>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10263,7 +10867,7 @@ pub async fn get_egress_proxy(
     Path(key): Path<String>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     // Read is admin-gated too: the redacted URL still discloses the internal
     // proxy host and port, which is infrastructure topology.
@@ -10297,10 +10901,13 @@ pub async fn test_upstream(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
-    let repo_service = RepositoryService::new(state.db.clone());
-    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
+    // Repository-admin gated like `get_egress_proxy` (#4265 follow-up): this
+    // probe sends a request to the upstream WITH the repository's stored
+    // upstream credentials, so its status is a validity oracle for those
+    // credentials and it is a configuration diagnostic, not a content read.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
@@ -10429,7 +11036,7 @@ pub async fn set_routing_rules(
     Json(payload): Json<SetRoutingRulesRequest>,
 ) -> Result<Json<RoutingRulesResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate every rule before persisting
     for (i, rule) in payload.rules.iter().enumerate() {
@@ -10494,7 +11101,7 @@ pub async fn delete_routing_rules(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -10537,6 +11144,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        repository_capabilities,
         list_repositories,
         create_repository,
         get_repository,
@@ -10571,10 +11179,13 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         delete_routing_rules,
     ),
     components(schemas(
+        crate::models::repository::RepositoryVisibility,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
         UpdateRepositoryRequest,
         RepositoryResponse,
+        RepositoryCapabilities,
+        RpmRepodataDepthCapability,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
         StorageTreeQuery,
@@ -11405,6 +12016,120 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Debian proxy-filter payload gate (#2460): an untouched web-UI form on a
+    // non-Remote repository is a no-op, not a validation error.
+    // -----------------------------------------------------------------------
+
+    /// The payload the web UI create dialog attaches to every Debian-format
+    /// repository when its Debian/APT fields are untouched
+    /// (`buildDebianConfigFields` in artifact-keeper-web): three empty
+    /// allowlists and nothing else.
+    fn untouched_web_debian_payload() -> serde_json::Value {
+        serde_json::json!({
+            "distribution_paths": [],
+            "components": [],
+            "architectures": [],
+        })
+    }
+
+    #[test]
+    fn untouched_web_debian_payload_deserializes_to_the_default_config() {
+        // The regression this guards: the object is *present*, so the old
+        // `if let Some(cfg) = payload.debian` gate treated it as a supplied
+        // proxy filter and rejected the create on a local repository.
+        let cfg: DebianRepositoryConfig =
+            serde_json::from_value(untouched_web_debian_payload()).expect("payload deserializes");
+        assert_eq!(cfg, DebianRepositoryConfig::default());
+        assert!(cfg.is_passthrough_all());
+    }
+
+    #[test]
+    fn create_gate_skips_the_untouched_web_payload_on_every_non_remote_type() {
+        for repo_type in [
+            &RepositoryType::Local,
+            &RepositoryType::Virtual,
+            &RepositoryType::Staging,
+        ] {
+            assert!(
+                !classify_debian_payload(repo_type, &RepositoryFormat::Debian, true)
+                    .expect("an untouched-form payload is not an error"),
+                "{repo_type:?} must accept the untouched web-UI Debian payload"
+            );
+        }
+    }
+
+    #[test]
+    fn create_gate_still_rejects_a_configuring_payload_on_non_remote() {
+        // A payload that sets something has no consumer on these types: the
+        // value would be dead state (#2460), so it stays rejected.
+        for repo_type in [
+            &RepositoryType::Local,
+            &RepositoryType::Virtual,
+            &RepositoryType::Staging,
+        ] {
+            assert!(
+                classify_debian_payload(repo_type, &RepositoryFormat::Debian, false).is_err(),
+                "{repo_type:?} must reject a configuring Debian payload"
+            );
+        }
+        // A non-Debian format cannot carry the filter either, even on a Remote.
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Maven, false)
+                .is_err()
+        );
+        assert!(
+            !classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Maven, true)
+                .expect("an untouched-form payload is not an error")
+        );
+    }
+
+    #[test]
+    fn remote_debian_payloads_are_always_applied() {
+        // A Debian Remote is the one target the filter is configurable on, so
+        // both an untouched-form payload (an explicit full-proxy config) and a
+        // configuring one are applied — and the all-default one still
+        // validates, which is what keeps the web UI's remote-create path
+        // working.
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Debian, true)
+                .unwrap()
+        );
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Debian, false)
+                .unwrap()
+        );
+        assert!(validate_debian_config(&DebianRepositoryConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn update_gate_treats_an_empty_debian_object_as_an_untouched_form() {
+        // `"debian": {}` on update deserializes to `Some(Some(default))` (the
+        // three-way semantics) — every field omitted, so it merges nothing and
+        // must be skipped on a non-Debian-remote, not rejected.
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "debian": {} }))
+                .expect("update payload deserializes");
+        let patch = match req.debian {
+            Some(Some(patch)) => patch,
+            other => panic!("expected a present patch, got {other:?}"),
+        };
+        assert_eq!(patch, DebianConfigPatch::default());
+        assert!(!classify_debian_payload(
+            &RepositoryType::Local,
+            &RepositoryFormat::Debian,
+            patch == DebianConfigPatch::default()
+        )
+        .expect("an untouched-form patch is not an error"));
+
+        // An explicit `null` is a *clear*, not an untouched form: it stays on
+        // the `Some(None)` arm, which never reaches the gate.
+        let cleared: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "debian": null }))
+                .expect("clear payload deserializes");
+        assert_eq!(cleared.debian, Some(None));
     }
 
     // -----------------------------------------------------------------------
@@ -13108,6 +13833,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/rpm-curation".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -13484,6 +14210,8 @@ mod tests {
     #[test]
     fn test_repository_response_serialization() {
         let resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -13492,6 +14220,7 @@ mod tests {
             description: Some("desc".to_string()),
             format: "maven".to_string(),
             repo_type: "local".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
@@ -14748,6 +15477,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/maven".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: Some(1073741824),
             promotion_only: false,
@@ -14789,6 +15519,8 @@ mod tests {
         // #1770 B: when the handler populates the quarantine settings from
         // `repository_config`, they appear in the serialized detail response.
         let resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
@@ -14797,6 +15529,7 @@ mod tests {
             description: None,
             format: "npm".to_string(),
             repo_type: "remote".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
@@ -14844,6 +15577,7 @@ mod tests {
             storage_backend: "s3".to_string(),
             storage_path: "/data/npm".to_string(),
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -14890,6 +15624,7 @@ mod tests {
             repo_type: RepositoryType::Virtual,
             storage_path: "/data/docker".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14929,6 +15664,7 @@ mod tests {
             repo_type: RepositoryType::Staging,
             storage_path: "/data/cargo-staging".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: Some(5_000_000_000),
             promotion_only: false,
@@ -15046,6 +15782,7 @@ mod tests {
             repo_type: RepositoryType::Local,
             storage_path: format!("/data/{}", key),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -15217,8 +15954,11 @@ mod tests {
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
-    // short-circuits (token scope, public, admin, anonymous) run everywhere;
-    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // short-circuits (token scope, public, admin) run everywhere; the
+    // anonymous-on-private denial now consults the permissions store for an
+    // anonymous read rule (#1849) and must fail CLOSED when it is
+    // unreachable — the dead pool below drives exactly that. The per-repo
+    // role-assignment branch is exercised by the `*_db` tests,
     // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
     // (the same `try_pool()` convention the virtual-member tests use).
     // -----------------------------------------------------------------------
@@ -15245,6 +15985,56 @@ mod tests {
             res.is_ok(),
             "a public repo is writable past the gate, no DB: {res:?}"
         );
+    }
+
+    /// The load-bearing negative for the whole change: `internal` must NOT
+    /// short-circuit the tenant write gate the way `public` does.
+    ///
+    /// A public repository passes with no DB at all (the test above). If
+    /// `internal` were folded into that arm -- the tempting
+    /// `visibility != Private` shorthand -- this would pass too, and the tenant
+    /// pre-gate would be off for what will be the most common visibility on a
+    /// corporate instance. Instead it must fall through to the grant lookup,
+    /// which with no reachable database can only fail; reaching the database at
+    /// all is the property under test.
+    #[tokio::test]
+    async fn test_require_repo_write_access_internal_does_not_short_circuit_no_db() {
+        let mut repo = make_repo_with_id(Uuid::new_v4(), "globex-internal");
+        repo.visibility = crate::models::repository::RepositoryVisibility::Internal;
+        repo.is_public = false;
+        let res =
+            require_repo_write_access(&make_auth_ext(None), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_err(),
+            "internal must be treated as private by the write gate, not waved \
+             through like public: {res:?}"
+        );
+    }
+
+    /// `internal` confers no write, delete or admin ACTION either. The tenant
+    /// gate above is only half the decision (#2603 G1); this pins the other
+    /// half -- that visibility never satisfies a mutation, in any state.
+    #[test]
+    fn test_internal_visibility_confers_no_mutation() {
+        use crate::api::middleware::auth::{
+            authenticated_read_satisfies_acl, public_read_satisfies_acl,
+        };
+        for action in ["write", "delete", "admin"] {
+            assert!(!public_read_satisfies_acl(
+                crate::models::repository::RepositoryVisibility::Internal,
+                action
+            ));
+            assert!(!authenticated_read_satisfies_acl(
+                crate::models::repository::RepositoryVisibility::Internal,
+                action
+            ));
+        }
+        // ...and it grants the read baseline it is supposed to, so the test
+        // above is not passing vacuously.
+        assert!(authenticated_read_satisfies_acl(
+            crate::models::repository::RepositoryVisibility::Internal,
+            "read"
+        ));
     }
 
     #[tokio::test]
@@ -15457,6 +16247,7 @@ mod tests {
                 10 + i as i64,
                 Some("f00d"),
                 Some("application/x-test"),
+                None,
                 None,
             )
             .await
@@ -15988,7 +16779,13 @@ mod tests {
         // and cannot be what fails -- otherwise a denial here would no longer
         // distinguish the two gates. The member gate has its own coverage in
         // `virtual_member_authz_tests`.
+        // Both fields, and they must agree: the gates read `visibility`, while
+        // `is_public` is the mirror the database keeps equal to it. Setting
+        // only the boolean here produced a repository that claimed to be
+        // public and behaved as private, and the member gate then failed with
+        // a 404 instead of the parent-gate denial this test is measuring.
         let m = crate::models::repository::Repository {
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             ..make_repo_with_id(member_id, "m")
         };
@@ -16060,6 +16857,68 @@ mod tests {
     /// supply-chain control, same tier as delete/update). Granting
     /// `repository:admin` lets the same user through, and a global admin is
     /// always allowed. Skips when no `DATABASE_URL` is configured.
+    /// #3831 end to end (#4265 follow-up): a `write:repositories` API token
+    /// whose user holds `repository:admin` drives a repository-management
+    /// handler successfully, while a `write:artifacts` token on the same
+    /// user is refused at the scope gate before any per-repo check runs.
+    /// The 14-handler pin above only greps the gate text; this exercises it.
+    #[tokio::test]
+    async fn set_cache_ttl_accepts_write_repositories_token_and_refuses_write_artifacts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["admin"]).await;
+        let req = || SetCacheTtlRequest {
+            cache_ttl_seconds: 1,
+        };
+        let token = |scope: &str| AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec![scope.to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_id]),
+            ..tdh::make_auth(user_id, &username)
+        };
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_cache_ttl(
+            State(state),
+            Extension(Some(token("write:repositories"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused = set_cache_ttl(
+            State(state2),
+            Extension(Some(token("write:artifacts"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            allowed.is_ok(),
+            "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
+        match refused {
+            Err(AppError::Authorization(msg)) => assert!(
+                msg.contains("scope"),
+                "the refusal must come from the scope gate: {msg}"
+            ),
+            other => panic!("write:artifacts must be refused at the scope gate, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn set_cache_ttl_requires_repo_admin_grant_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -16432,6 +17291,290 @@ mod tests {
             .await;
     }
 
+    /// #3916: a raw `PUT` into an object-storage repository streams its body
+    /// into a staging object on that repository's backend instead of a local
+    /// scratch file under STORAGE_PATH. Proven by making local scratch
+    /// unusable (STORAGE_PATH sits under a regular file, so no directory can
+    /// be created there): before the fix the upload failed with 500 on the
+    /// scratch spool; now it lands at its content-addressed key and leaves no
+    /// staging object behind.
+    #[tokio::test]
+    async fn generic_put_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::admin_auth(user_id, &username));
+
+        let body = Bytes::from_static(b"object-storage upload body for #3916");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{repo_key}/artifacts/tool/1.0/tool.bin"),
+                body.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "an upload into an S3-backed repository must not need local scratch: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let (storage_key, sha256): (String, String) = sqlx::query_as(
+            "SELECT storage_key, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = 'tool/1.0/tool.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(sha256, format!("{:x}", Sha256::digest(&body)));
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(
+                objects.get(&storage_key),
+                Some(&body),
+                "the bytes must land at the content-addressed key"
+            );
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "the staging object must be deleted once promoted, got {:?}",
+                objects.keys().collect::<Vec<_>>()
+            );
+        }
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(
+            tracked, 0,
+            "the staging tracking row must go with the object"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: a generic staging object whose upload died before promoting or
+    /// deleting it (crash, eviction, shutdown) is reclaimed by the hourly
+    /// sweep once older than the threshold; a young one (possibly a live
+    /// upload) is left alone.
+    #[tokio::test]
+    async fn stale_generic_upload_staging_is_swept_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let backend = format!("s3-sweep-{}", Uuid::new_v4().simple());
+        let mem = std::sync::Arc::new(tdh::MemStorage::default());
+        let mut backends: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn crate::storage::StorageBackend>,
+        > = std::collections::HashMap::new();
+        backends.insert(backend.clone(), mem.clone());
+        let registry = crate::storage::StorageRegistry::new(backends, backend.clone());
+
+        let prefix = proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX;
+        let stale = format!("{prefix}{}", Uuid::new_v4());
+        let young = format!("{prefix}{}", Uuid::new_v4());
+        for (key, age_hours) in [(&stale, 48), (&young, 1)] {
+            mem.objects
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Bytes::from_static(b"partial upload"));
+            sqlx::query(
+                "INSERT INTO generic_upload_staging \
+                 (storage_key, storage_backend, storage_path, created_at) \
+                 VALUES ($1, $2, 'repo', NOW() - make_interval(hours => $3))",
+            )
+            .bind(key)
+            .bind(&backend)
+            .bind(age_hours)
+            .execute(&pool)
+            .await
+            .expect("seed staging row");
+        }
+
+        let reclaimed = proxy_helpers::sweep_stale_generic_upload_staging(
+            &pool,
+            &registry,
+            proxy_helpers::GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS,
+        )
+        .await;
+        assert!(reclaimed >= 1, "the stale staging object must be reclaimed");
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM generic_upload_staging WHERE storage_backend = $1",
+        )
+        .bind(&backend)
+        .fetch_all(&pool)
+        .await
+        .expect("remaining rows");
+        assert_eq!(
+            remaining,
+            vec![young.clone()],
+            "only the young row survives"
+        );
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert!(!objects.contains_key(&stale), "the stale object is deleted");
+            assert!(
+                objects.contains_key(&young),
+                "a young (maybe live) upload is kept"
+            );
+        }
+        let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_backend = $1")
+            .bind(&backend)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3923: on a deployment whose default backend has no proxy-cache arm
+    /// (Azure), creating a remote repository on that default must be rejected
+    /// up front (400, no row) -- before this it was accepted and the next
+    /// restart refused to boot -- while a remote repository pinned to
+    /// `filesystem`, which the fallback proxy cache serves, is accepted.
+    #[tokio::test]
+    async fn remote_create_on_azure_default_is_checked_per_repository_backend_3923_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ak-3923-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |c| {
+            c.storage_backend = "azure".to_string();
+        });
+        let admin = admin_auth(user_id, &username);
+
+        // Omitting the field (web UI, most API clients) must keep working: the
+        // repository lands on the backend the proxy cache uses.
+        let omitted_key = format!("pypi-remote-default-{}", Uuid::new_v4().simple());
+        let Json(omitted) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &omitted_key,
+                "pypi remote, backend omitted",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple"
+                }),
+            ),
+        )
+        .await
+        .expect("a remote create that omits storage_backend must succeed (#3923)");
+        assert_eq!(
+            omitted.storage_backend, "filesystem",
+            "an omitted backend resolves to the proxy cache's backend"
+        );
+
+        // An EXPLICIT unservable backend is refused up front.
+        let rejected_key = format!("pypi-remote-az-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &rejected_key,
+                "pypi remote on azure",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple",
+                    "storage_backend": "azure"
+                }),
+            ),
+        )
+        .await
+        .expect_err("a remote repository on the azure default cannot be served (#3923)");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("filesystem")),
+            "expected an actionable 400, got {err:?}"
+        );
+        let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&rejected_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(orphan, 0, "a rejected create must not leave a row behind");
+
+        let pinned_key = format!("pypi-remote-fs-{}", Uuid::new_v4().simple());
+        let Json(pinned) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &pinned_key,
+                "pypi remote on filesystem",
+                "pypi",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://pypi.org/simple",
+                    "storage_backend": "filesystem"
+                }),
+            ),
+        )
+        .await
+        .expect("a filesystem-pinned remote repository is served on an azure default (#3923)");
+        assert_eq!(pinned.storage_backend, "filesystem");
+
+        // A hosted repository on the azure default is unaffected.
+        let local_key = format!("pypi-local-az-{}", Uuid::new_v4().simple());
+        let Json(local) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "pypi local on azure",
+                "pypi",
+                serde_json::json!({ "repo_type": "local" }),
+            ),
+        )
+        .await
+        .expect("hosted repositories never depend on the proxy cache");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![omitted.id, pinned.id, local.id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     /// #3299: released web UIs (<= 1.8.0) attach the npm scope-policy fields to
     /// every npm create — including Virtual repositories, where the section
     /// should never have been offered (web #745) — and an untouched form
@@ -16604,6 +17747,157 @@ mod tests {
 
         // Cleanup.
         tdh::cleanup(&pool, created.id, user_id).await;
+        tdh::cleanup(&pool, remote.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// The Debian counterpart of the npm gate above (#2460): the create dialog
+    /// attaches `debian: {distribution_paths: [], components: [],
+    /// architectures: []}` to EVERY Debian-format create — local, staging and
+    /// virtual included — and that untouched form used to make a local Debian
+    /// repository impossible to create ("debian filter config is only valid for
+    /// Debian remote (proxy) repositories"). It configures nothing, so it must
+    /// be a no-op on those targets, while a payload that *sets* something stays
+    /// rejected there (#2460 dead-state guard) and a Debian Remote still
+    /// validates and persists its filter.
+    #[tokio::test]
+    async fn debian_untouched_form_create_and_update_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("debian-gate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // 1) The reported bug: the untouched web-UI form on a LOCAL Debian
+        //    create must succeed, and must not leave a dead config row.
+        let local_key = format!("deb-local-{}", Uuid::new_v4().simple());
+        let Json(local) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "local debian",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "debian": {
+                        "distribution_paths": [],
+                        "components": [],
+                        "architectures": []
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("local Debian create with an untouched filter form must succeed");
+        assert_eq!(local.key, local_key);
+        let local_cfg: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repository_config \
+             WHERE repository_id = $1 AND key = 'debian_config'",
+        )
+        .bind(local.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count debian_config");
+        assert_eq!(
+            local_cfg, 0,
+            "an untouched-form payload must not persist dead config rows"
+        );
+
+        // 2) A payload that SETS something on a non-Remote target is still
+        //    rejected (dead-state guard, #2460) — and leaves no orphan row.
+        let bad_key = format!("deb-local-bad-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &bad_key,
+                "local debian filtered",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "debian": { "distribution_paths": ["bookworm"] }
+                }),
+            ),
+        )
+        .await
+        .expect_err("a configuring filter on a local Debian repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("Debian remote")),
+            "expected the remote-only Validation error, got {err:?}",
+        );
+
+        // 3) Positive control: a real filter on a Debian Remote still validates
+        //    AND persists.
+        let remote_key = format!("deb-remote-{}", Uuid::new_v4().simple());
+        let Json(remote) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &remote_key,
+                "debian remote",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://deb.debian.org/debian",
+                    "debian": {
+                        "distribution_paths": ["bookworm"],
+                        "components": ["main"]
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("Debian remote create with a real filter must succeed");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'debian_config'",
+        )
+        .bind(remote.id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query debian_config");
+        let stored = stored.expect("a Debian remote create must persist its filter");
+        assert!(stored.contains("bookworm"), "stored config: {stored}");
+
+        // 4) The update path: `"debian": {}` (an all-`None` patch) on a LOCAL
+        //    repo is the same untouched-form artifact — a no-op, not a 400.
+        let patch: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"debian": {}}"#).expect("deserialize update payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(local_key.clone()),
+            Json(patch),
+        )
+        .await
+        .expect("an untouched-form patch on a local Debian update must succeed");
+
+        // 5) ...while a patch that sets something is still rejected there.
+        let bad_patch: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"debian": {"components": ["main"]}}"#)
+                .expect("deserialize update payload");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(local_key.clone()),
+            Json(bad_patch),
+        )
+        .await
+        .expect_err("a configuring patch on a local Debian repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("Debian remote")),
+            "expected the remote-only Validation error, got {err:?}",
+        );
+
+        // Cleanup.
+        tdh::cleanup(&pool, local.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
@@ -17892,6 +19186,17 @@ mod tests {
     // require_visible
     // -----------------------------------------------------------------------
 
+    /// Visibility-aware fixture. `make_repo(bool)` delegates here so the
+    /// existing public/private cases keep reading the way they did.
+    fn make_repo_with_visibility(
+        visibility: crate::models::repository::RepositoryVisibility,
+    ) -> crate::models::repository::Repository {
+        let mut repo = make_repo(visibility.allows_anonymous_read());
+        repo.visibility = visibility;
+        repo.is_public = visibility.allows_anonymous_read();
+        repo
+    }
+
     fn make_repo(is_public: bool) -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository};
 
@@ -17907,6 +19212,11 @@ mod tests {
             repo_type: RepositoryType::Local,
             storage_path: "/data/test-repo".to_string(),
             upstream_url: None,
+            visibility: if is_public {
+                crate::models::repository::RepositoryVisibility::Public
+            } else {
+                crate::models::repository::RepositoryVisibility::Private
+            },
             is_public,
             quota_bytes: None,
             promotion_only: false,
@@ -17929,15 +19239,61 @@ mod tests {
     // model (role_assignments) for private repositories, so the cases that
     // exercise the DB grant lookup (private + authenticated non-admin) are
     // covered by integration/live verification rather than these pure tests.
-    // The cases below short-circuit BEFORE any DB access (public repos, the
-    // anonymous-on-private denial, and the token-scope mismatch denial) and so
-    // remain DB-free; we drive them with an unused pool handle.
+    // The public-repo and token-scope cases below short-circuit BEFORE any DB
+    // access and so remain DB-free; the anonymous-on-private denial now
+    // CONSULTS the permissions store for an anonymous read rule (#1849) and
+    // fails CLOSED when it is unreachable — which is exactly what the
+    // unused pool handle below drives: the denial must stay the
+    // existence-hiding NotFound, never a 500.
 
     #[tokio::test]
     async fn test_require_visible_public_no_auth() {
         let repo = make_repo(true);
         let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
         assert!(require_visible(&repo, &None, &svc).await.is_ok());
+    }
+
+    /// An `internal` repository is NOT visible to an anonymous caller, and the
+    /// denial is the same existence-hiding `NotFound` a private repository
+    /// gives -- the two must be indistinguishable from outside.
+    #[tokio::test]
+    async fn test_require_visible_internal_anonymous_denied() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let err = require_visible(&repo, &None, &svc).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "internal must hide its existence from anonymous callers, got {err:?}"
+        );
+    }
+
+    /// The case that distinguishes `internal` from `private`: an authenticated
+    /// caller holding NO grant reads it. This short-circuits before any DB
+    /// access, so it needs no pool.
+    #[tokio::test]
+    async fn test_require_visible_internal_authenticated_without_grant_allowed() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let auth = Some(make_auth_ext(None));
+        assert!(require_visible(&repo, &auth, &svc).await.is_ok());
+    }
+
+    /// ...but the repository-scoped token ceiling still confines it. A token
+    /// whose allowed set excludes this repository gets the existence-hiding
+    /// 404, exactly as it would for a private one.
+    #[tokio::test]
+    async fn test_require_visible_internal_out_of_token_scope_denied() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let ext = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let err = require_visible(&repo, &Some(ext), &svc).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "a scoped token must not reach an internal repo outside its scope, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -18981,7 +20337,7 @@ mod tests {
             member_key: "maven-local".to_string(),
             member_name: "Maven Local".to_string(),
             repo_type: RepositoryType::Local,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.id, id);
@@ -19003,7 +20359,7 @@ mod tests {
             member_key: "maven-central".to_string(),
             member_name: "Maven Central".to_string(),
             repo_type: RepositoryType::Remote,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.member_repo_type, "remote");
@@ -19020,7 +20376,7 @@ mod tests {
             member_key: "r".to_string(),
             member_name: "R".to_string(),
             repo_type: RepositoryType::Local,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         assert_eq!(map_member_row(row).priority, 42);
     }
@@ -19253,7 +20609,10 @@ mod tests {
             "repo_type": "remote"
         }))
         .unwrap();
-        assert!(!req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Private
+        );
     }
 
     #[test]
@@ -19266,7 +20625,10 @@ mod tests {
             "is_public": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -19279,7 +20641,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -19293,7 +20658,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -19307,7 +20675,10 @@ mod tests {
             "allow_anonymous_access": false
         }))
         .unwrap();
-        assert!(!req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Private
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -19317,21 +20688,30 @@ mod tests {
     #[test]
     fn test_update_request_effective_is_public_none_when_absent() {
         let req: UpdateRepositoryRequest = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(req.effective_is_public().is_none());
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Unchanged
+        );
     }
 
     #[test]
     fn test_update_request_effective_is_public_from_is_public() {
         let req: UpdateRepositoryRequest =
             serde_json::from_value(serde_json::json!({"is_public": true})).unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     #[test]
     fn test_update_request_effective_is_public_from_allow_anonymous_access() {
         let req: UpdateRepositoryRequest =
             serde_json::from_value(serde_json::json!({"allow_anonymous_access": true})).unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     #[test]
@@ -19341,7 +20721,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -19482,66 +20865,167 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Guest-access coercion (issue #850)
+    // Guest-access public-visibility denial (#3855)
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Contradictory visibility input
+    // -----------------------------------------------------------------------
+
+    /// Supplying `visibility` and the legacy boolean with opposite meanings is
+    /// a 400, not a silent win for either. Silently resolving it is how an
+    /// operator ends up with a repository whose audience is the opposite of
+    /// what their configuration says, with nothing in the response to say so.
     #[test]
-    fn coerce_create_passthrough_when_guests_enabled() {
-        // When guests are enabled (the default), the requested value is
-        // returned unchanged regardless of whether it is true or false.
-        assert_eq!(coerce_is_public_for_create(true, true), (true, false));
-        assert_eq!(coerce_is_public_for_create(false, true), (false, false));
+    fn contradictory_visibility_and_is_public_is_rejected_on_create() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "private", "is_public": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.effective_visibility(),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
-    fn coerce_create_forces_private_when_guests_disabled() {
-        assert_eq!(coerce_is_public_for_create(true, false), (false, true));
+    fn contradictory_visibility_and_is_public_is_rejected_on_update() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"visibility": "public", "is_public": false}))
+                .unwrap();
+        assert!(matches!(
+            req.visibility_update(),
+            Err(AppError::Validation(_))
+        ));
     }
 
+    /// `internal` + `is_public: false` AGREE -- internal is not public -- so
+    /// this must be accepted, not caught by the contradiction check.
     #[test]
-    fn coerce_create_already_private_is_noop_when_guests_disabled() {
-        // No coercion needed when the request is already private; the flag
-        // returned in `.1` must be `false` so the caller does not log a
-        // misleading warning.
-        assert_eq!(coerce_is_public_for_create(false, false), (false, false));
-    }
-
-    #[test]
-    fn coerce_update_passthrough_when_guests_enabled() {
+    fn internal_with_is_public_false_is_consistent() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "internal", "is_public": false
+        }))
+        .unwrap();
         assert_eq!(
-            coerce_is_public_for_update(Some(true), true),
-            (Some(true), false)
-        );
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), true),
-            (Some(false), false)
-        );
-        assert_eq!(coerce_is_public_for_update(None, true), (None, false));
-    }
-
-    #[test]
-    fn coerce_update_forces_private_when_guests_disabled_and_some_true() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), false),
-            (Some(false), true)
-        );
-    }
-
-    #[test]
-    fn coerce_update_some_false_is_noop_when_guests_disabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), false),
-            (Some(false), false)
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Internal
         );
     }
 
+    /// The alias is checked for contradiction too, not just `is_public`.
     #[test]
-    fn coerce_update_none_is_noop_when_guests_disabled() {
-        // An update payload that does not touch the visibility field must
-        // remain `None` so the service layer leaves the existing value
-        // untouched. We never silently flip an existing public repo to
-        // private on unrelated updates.
-        assert_eq!(coerce_is_public_for_update(None, false), (None, false));
+    fn contradictory_visibility_and_allow_anonymous_access_is_rejected() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "internal", "allow_anonymous_access": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.effective_visibility(),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy client behaviour end to end (task 5.6)
+    // -----------------------------------------------------------------------
+
+    /// A client that can only speak the boolean -- the Terraform provider, an
+    /// older SDK -- gets `public` when guests are enabled and a 400 when they
+    /// are not (#3855). It can never express `internal` itself, but it also
+    /// never loses it.
+    #[test]
+    fn legacy_is_public_true_maps_to_public_or_refused_by_guest_policy() {
+        use crate::models::repository::RepositoryVisibility as V;
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "is_public": true
+        }))
+        .unwrap();
+        let requested = req.effective_visibility().unwrap();
+        assert_eq!(requested, V::Public);
+        assert!(require_public_visibility_allowed(requested.allows_anonymous_read(), true).is_ok());
+        // #3855: refused outright, never silently rewritten.
+        assert!(
+            require_public_visibility_allowed(requested.allows_anonymous_read(), false).is_err()
+        );
+        // `internal` is never a contradiction, so it survives a guest disable.
+        assert!(
+            require_public_visibility_allowed(V::Internal.allows_anonymous_read(), false).is_ok()
+        );
+    }
+
+    /// The other half, and the one that protects an existing `internal`
+    /// repository: a legacy client sending `is_public: false` asks only for
+    /// "not public". It must NOT resolve to `Set(Private)`, or every internal
+    /// repository managed by such a client would be narrowed on each apply.
+    #[test]
+    fn legacy_is_public_false_clears_public_rather_than_setting_private() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"is_public": false})).unwrap();
+        let update = req.visibility_update().unwrap();
+        assert_eq!(update, VisibilityUpdate::ClearPublic);
+        // And it lowers to a boolean-only write, leaving `visibility` untouched
+        // so the database trigger can decide from the column that changed.
+        assert_eq!(update.binds(), (None, Some(false)));
+    }
+
+    /// Migration 245 (M1): the update trigger decides from which VALUE
+    /// changed, so a statement writing both columns can widen a repository
+    /// (a same-value `visibility` plus `is_public = true` lands `public`). The
+    /// service layer must therefore never bind both; pin it for every variant.
+    #[test]
+    fn visibility_update_never_binds_both_columns() {
+        use crate::models::repository::RepositoryVisibility as V;
+        for update in [
+            VisibilityUpdate::Unchanged,
+            VisibilityUpdate::ClearPublic,
+            VisibilityUpdate::Set(V::Public),
+            VisibilityUpdate::Set(V::Internal),
+            VisibilityUpdate::Set(V::Private),
+        ] {
+            let (visibility, is_public) = update.binds();
+            assert!(
+                visibility.is_none() || is_public.is_none(),
+                "{update:?} binds both visibility and is_public"
+            );
+        }
+    }
+
+    #[test]
+    fn public_visibility_allowed_when_guests_enabled() {
+        assert!(require_public_visibility_allowed(true, true).is_ok());
+        assert!(require_public_visibility_allowed(false, true).is_ok());
+    }
+
+    #[test]
+    fn public_visibility_rejected_when_guests_disabled() {
+        // The core #3855 contract: asking for public while guest access is
+        // disabled is a 400 naming both resolutions, never a silent rewrite.
+        let err = require_public_visibility_allowed(true, false).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("AK_GUEST_ACCESS_ENABLED=false"),
+                    "message must name the operator switch: {msg}"
+                );
+                assert!(
+                    msg.contains("cannot be public"),
+                    "message must say what was refused: {msg}"
+                );
+            }
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn private_request_is_not_a_contradiction_when_guests_disabled() {
+        // Asking for (or leaving) private visibility never contradicts the
+        // policy — this includes the update path's absent-field `false`.
+        assert!(require_public_visibility_allowed(false, false).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -20030,6 +21514,205 @@ mod tests {
              path is no longer a format coordinate and must keep the conservative \
              classification; got {routed_ttl}s"
         );
+    }
+
+    /// Seed a local artifact whose row records `recorded` as its SHA-256 while
+    /// the stored object holds `stored` bytes, then GET it through the real
+    /// download router. Returns (status, checksum header, collected body).
+    async fn download_with_recorded_sha_3919(
+        recorded: &[u8],
+        stored: &'static [u8],
+    ) -> Option<(
+        axum::http::StatusCode,
+        Option<String>,
+        std::result::Result<Bytes, axum::Error>,
+    )> {
+        download_with_recorded_sha_range_3919(recorded, stored, None).await
+    }
+
+    async fn download_with_recorded_sha_range_3919(
+        recorded: &[u8],
+        stored: &'static [u8],
+        range: Option<&str>,
+    ) -> Option<(
+        axum::http::StatusCode,
+        Option<String>,
+        std::result::Result<Bytes, axum::Error>,
+    )> {
+        use sha2::Digest;
+        let fx = tdh::Fixture::setup("local", "generic").await?;
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "corrupt/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(stored),
+            fx.user_id,
+        )
+        .await;
+        let recorded_hex = hex::encode(sha2::Sha256::digest(recorded));
+        // The row records the ORIGINAL bytes' digest and length; the stored
+        // object may differ in content or in size.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1, size_bytes = $2 WHERE id = $3")
+            .bind(&recorded_hex)
+            .bind(recorded.len() as i64)
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("record checksum");
+
+        use tower::ServiceExt;
+        let resp = fx
+            .router_with_auth(download_router())
+            .oneshot({
+                let mut req = tdh::get(format!("/{}/download/corrupt/blob.bin", fx.repo_key));
+                if let Some(r) = range {
+                    req.headers_mut()
+                        .insert(header::RANGE, header::HeaderValue::from_str(r).unwrap());
+                }
+                req
+            })
+            .await
+            .expect("download must respond");
+        let status = resp.status();
+        let checksum = resp
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        fx.teardown().await;
+        Some((status, checksum, body))
+    }
+
+    /// #3919: a stored object whose bytes no longer match the recorded
+    /// SHA-256 (one byte flipped on disk) must not be delivered as a complete
+    /// body under the original `X-Checksum-Sha256`. The header is already on
+    /// the wire, so the body is aborted instead of completing.
+    #[tokio::test]
+    async fn test_download_corrupted_blob_is_not_served_complete_3919() {
+        let Some((status, checksum, body)) =
+            download_with_recorded_sha_3919(b"original-artifact-bytes", b"original-artifact-bytEs")
+                .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(checksum.is_some());
+        assert!(
+            body.is_err(),
+            "a corrupted object must abort the body, not serve it complete: {body:?}"
+        );
+    }
+
+    /// #3919 companion: an intact object with a real recorded SHA-256 still
+    /// streams in full (verification must not break the happy path).
+    #[tokio::test]
+    async fn test_download_intact_blob_verifies_and_streams_3919() {
+        let Some((status, checksum, body)) =
+            download_with_recorded_sha_3919(b"intact-artifact-bytes", b"intact-artifact-bytes")
+                .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        use sha2::Digest;
+        assert_eq!(
+            checksum.as_deref(),
+            Some(hex::encode(sha2::Sha256::digest(b"intact-artifact-bytes")).as_str())
+        );
+        assert_eq!(&body.expect("intact body")[..], b"intact-artifact-bytes");
+    }
+
+    /// #3919 review: a `Range` covering the whole object (`bytes=0-`, a
+    /// suffix >= N, `0-(N-1)`) delivers every byte under the whole-object
+    /// digest header, so it must be verified like the 200 path; a proper
+    /// sub-range is served unverified.
+    #[tokio::test]
+    async fn test_download_whole_object_range_is_verified_3919() {
+        for range in ["bytes=0-", "bytes=-1000", "bytes=0-22"] {
+            let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+                b"original-artifact-bytes",
+                b"original-artifact-bytEs",
+                Some(range),
+            )
+            .await
+            else {
+                return;
+            };
+            assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT, "{range}");
+            assert!(
+                body.is_err(),
+                "{range}: whole-object 206 must abort: {body:?}"
+            );
+        }
+        let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+            b"original-artifact-bytes",
+            b"original-artifact-bytEs",
+            Some("bytes=0-3"),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body.expect("sub-range is not verified")[..], b"orig");
+    }
+
+    /// #3919 review (S-a): a stored object LONGER than its record is cut to
+    /// the recorded Content-Length by the transport, so the end-of-stream
+    /// digest check would never run and a clean 200 of the first N bytes
+    /// would be served. It must abort instead — with a corrupt prefix and
+    /// with a correct one.
+    #[tokio::test]
+    async fn test_download_oversized_stored_object_is_not_served_3919() {
+        for stored in [
+            &b"original-artifact-bytEs-and-then-more"[..],
+            &b"original-artifact-bytes-and-then-more"[..],
+        ] {
+            let stored: &'static [u8] = stored;
+            let Some((status, _, body)) =
+                download_with_recorded_sha_3919(b"original-artifact-bytes", stored).await
+            else {
+                return;
+            };
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert!(
+                body.is_err(),
+                "an oversized object must abort, not serve a clean prefix: {body:?}"
+            );
+        }
+    }
+
+    /// Whole-object range of an oversized object: the range slice would stop
+    /// at the recorded length too.
+    #[tokio::test]
+    async fn test_download_oversized_whole_range_is_not_served_3919() {
+        let Some((status, _, body)) = download_with_recorded_sha_range_3919(
+            b"original-artifact-bytes",
+            b"original-artifact-bytes-and-then-more",
+            Some("bytes=0-"),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert!(body.is_err(), "{body:?}");
+    }
+
+    #[test]
+    fn test_serve_verification_gates_3919() {
+        let hex64 = "0f".repeat(32);
+        assert!(serve_verification(true, &hex64, || "x".into()).is_some());
+        assert!(serve_verification(false, &hex64, || "x".into()).is_none());
+        assert!(serve_verification(true, "test-seed", || "x".into()).is_none());
     }
 
     // ---------------------------------------------------------------------
@@ -21210,6 +22893,119 @@ mod tests {
             .expect("drop blocking trigger function");
         let _ = storage.delete(&temp_key).await;
         fx.teardown().await;
+    }
+
+    #[test]
+    fn deleted_repo_keeps_shared_namespace_blob_keys_for_gc() {
+        let keys = vec![
+            "oci-uploads/abc".to_string(),
+            "oci-blobs/sha256:dead".to_string(),
+        ];
+        assert_eq!(
+            oci_upload_keys_owned_by_deleted_repo("s3", keys.clone()),
+            vec!["oci-uploads/abc".to_string()],
+            "a shared-namespace backend must not purge a content-addressed blob key"
+        );
+        assert_eq!(
+            oci_upload_keys_owned_by_deleted_repo("filesystem", keys.clone()),
+            keys,
+            "a repo-isolated backend owns its copy outright"
+        );
+    }
+
+    /// #3851 review B1: repositories A and B share one object namespace. A's
+    /// push of blob D left its (per-repository) cleanup-journal row behind; B
+    /// then pushed and committed D. Deleting A must not delete `oci-blobs/D`
+    /// out from under B.
+    #[tokio::test]
+    async fn repo_delete_does_not_purge_a_blob_another_repo_committed_on_a_shared_backend() {
+        let Some(fa) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let Some(fb) = tdh::Fixture::setup("local", "docker").await else {
+            fa.teardown().await;
+            return;
+        };
+        const SHARED: &str = "shared-namespace-test";
+        let shared_dir = std::env::temp_dir().join(format!("ak-shared-ns-{}", Uuid::new_v4()));
+        let shared: std::sync::Arc<dyn crate::storage::StorageBackend> = std::sync::Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&shared_dir),
+        );
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(SHARED.to_string(), shared.clone());
+        let mut state = (*fa.state).clone();
+        state.storage_registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            SHARED.to_string(),
+        ));
+        let state: SharedState = std::sync::Arc::new(state);
+        for repo in [fa.repo_id, fb.repo_id] {
+            sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+                .bind(SHARED)
+                .bind(repo)
+                .execute(&fa.pool)
+                .await
+                .expect("point repo at the shared backend");
+        }
+
+        let digest = format!("sha256:{}", Uuid::new_v4().simple());
+        let blob_key = crate::api::handlers::oci_v2::blob_storage_key(&digest);
+        shared
+            .put(&blob_key, bytes::Bytes::from_static(b"shared blob"))
+            .await
+            .expect("write blob");
+        // A's abandoned push left its journal row; B committed the same blob.
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) VALUES ($1, $2)",
+        )
+        .bind(fa.repo_id)
+        .bind(&blob_key)
+        .execute(&fa.pool)
+        .await
+        .expect("A's lingering journal row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, 11, $3)",
+        )
+        .bind(fb.repo_id)
+        .bind(&digest)
+        .bind(&blob_key)
+        .execute(&fa.pool)
+        .await
+        .expect("B's committed blob");
+
+        // The repository-delete flow: collect, delete the row, purge.
+        let keys = collect_repo_oci_upload_temp_keys(&state, fa.repo_id).await;
+        assert!(
+            keys.contains(&blob_key),
+            "precondition: A journals the blob key"
+        );
+        let location = crate::storage::StorageLocation {
+            backend: SHARED.to_string(),
+            path: fa.storage_dir.to_string_lossy().into_owned(),
+        };
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(fa.repo_id)
+            .execute(&fa.pool)
+            .await
+            .expect("delete repo A");
+        purge_oci_upload_temp_objects(&state, fa.repo_id, &location, keys).await;
+
+        assert!(
+            shared.exists(&blob_key).await.expect("exists"),
+            "deleting repository A must not destroy the blob repository B committed"
+        );
+        let b_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(fb.repo_id)
+                .fetch_one(&fa.pool)
+                .await
+                .expect("count");
+        assert_eq!(b_rows, 1);
+
+        fb.teardown().await;
+        fa.teardown().await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
     }
 
     /// F2 (batching): a cleanup-key backlog larger than one batch must be fully
@@ -22395,8 +24191,8 @@ mod tests {
         assert_eq!(composed, "../etc/passwd");
 
         // `make_auth` builds a JWT-style AuthExtension (is_api_token =
-        // false), so `require_scope("write")` automatically passes - no
-        // need to populate `scopes`.
+        // false), so the handler's `require_scope("write:artifacts")` gate
+        // automatically passes - no need to populate `scopes`.
         let auth = tdh::make_auth(fx.user_id, &fx.username);
 
         let result = upload_artifact(
@@ -22419,6 +24215,86 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #3801: the generic single-shot PUT parses an `.rpm` pushed into an
+    /// RPM repository like the native and chunked paths do: a header over
+    /// the indexing limits (here a byte-budget blowup — 3,300 files naming
+    /// one 20 KB dirname) is refused with 400 before anything is stored.
+    #[tokio::test]
+    async fn test_upload_artifact_rejects_over_limit_rpm_with_400() {
+        let Some(fx) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let payload = {
+            let files = 3_300u32;
+            let mut store = Vec::new();
+            for _ in 0..files {
+                store.extend_from_slice(b"a\0");
+            }
+            let dir_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(b'd', 20 * 1024));
+            store.push(0);
+            let idx_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+            let entries: [(u32, u32, u32, u32); 3] = [
+                (1117, 8, 0, files),
+                (1118, 8, dir_off, 1),
+                (1116, 4, idx_off, files),
+            ];
+            let mut p = vec![0u8; 96];
+            p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+            p[4] = 3;
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+            p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            p.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            for (tag, ty, off, count) in entries {
+                for v in [tag, ty, off, count] {
+                    p.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            p.extend_from_slice(&store);
+            p
+        };
+        // A plain writer (not admin, not a service account) cannot opt out of
+        // the parse by claiming to be replication: the header is client-set.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        assert!(!auth.is_admin && !auth.is_service_account);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let replicated = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth.clone())),
+            Path((fx.repo_key.clone(), "hostile-1.0-1.noarch.rpm".to_string())),
+            headers,
+            Body::from(payload.clone()),
+        )
+        .await;
+        let result = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), "hostile-1.0-1.noarch.rpm".to_string())),
+            HeaderMap::new(),
+            Body::from(payload),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let err = result.expect_err("an over-limit RPM must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let err = replicated.expect_err("an untrusted replication header is still parsed");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rows, 0, "nothing stored for a refused RPM");
     }
 
     #[tokio::test]
@@ -22482,6 +24358,127 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         fx.teardown().await;
+    }
+
+    // -------------------------------------------------------------------
+    // #3831: repository-management handlers must gate on scopes an API
+    // token can actually CARRY. Bare `write`/`read`/`delete` are
+    // deliberately not mintable (#2996) and `scopes_grant_access` is
+    // broad-covers-specific only, so a bare-scope gate admitted session
+    // auth and `admin`/`*` tokens -- and nothing else, not even a
+    // `write:repositories` token held by a global admin.
+    // -------------------------------------------------------------------
+
+    /// Return the source of a single `pub async fn <name>(...)` body from
+    /// this file (the string-grep gate idiom from `upload.rs::handler_body`;
+    /// the handlers need a real DB to execute end to end).
+    fn repo_handler_body(name: &str) -> &'static str {
+        let source = include_str!("repositories.rs");
+        let needle = format!("pub async fn {}(", name);
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{} not found", name));
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn repo_management_handlers_require_mintable_scopes() {
+        // The fourteen write-side handlers that gated on the un-mintable
+        // bare `write` parent now name `write:repositories`.
+        for handler in [
+            "create_repository",
+            "update_repository",
+            "set_cache_ttl",
+            "invalidate_cache",
+            "set_npm_scope_policy",
+            "put_pypi_track",
+            "delete_pypi_track",
+            "add_virtual_member",
+            "update_virtual_members",
+            "remove_virtual_member",
+            "set_upstream_auth",
+            "set_egress_proxy",
+            "set_routing_rules",
+            "delete_routing_rules",
+        ] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"write:repositories\")"),
+                "{handler} must require the mintable `write:repositories` scope (#3831)"
+            );
+        }
+        // The delete pair names the resource-specific mintable scopes.
+        assert!(
+            repo_handler_body("delete_repository")
+                .contains("require_scope(\"delete:repositories\")"),
+            "delete_repository must require `delete:repositories` (#3831)"
+        );
+        assert!(
+            repo_handler_body("delete_artifact").contains("require_scope(\"delete:artifacts\")"),
+            "delete_artifact must require `delete:artifacts` (#3831)"
+        );
+        // The read-side repo-management handlers name `read:repositories`.
+        for handler in ["get_npm_scope_policy", "get_egress_proxy", "test_upstream"] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"read:repositories\")"),
+                "{handler} must require the mintable `read:repositories` scope (#3831)"
+            );
+        }
+    }
+
+    /// Behavioral pin for the gate decision itself: a `write:repositories`
+    /// token passes the repository-management scope gate, a session
+    /// (unscoped) caller is untouched, and an artifact-only token is still
+    /// refused -- the fix widens nothing beyond the intended resource.
+    #[test]
+    fn repo_management_scope_gate_decision() {
+        let uid = Uuid::new_v4();
+        let repo_scoped = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:repositories".to_string()]),
+            ..tdh::make_auth(uid, "repo-writer-3831")
+        };
+        assert!(
+            repo_scoped.require_scope("write:repositories").is_ok(),
+            "write:repositories token must pass the repo-management gate (#3831)"
+        );
+
+        let session = tdh::make_auth(uid, "session-3831");
+        assert!(
+            session.require_scope("write:repositories").is_ok(),
+            "session auth (scopes: None) must keep passing the gate"
+        );
+
+        let artifact_only = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-writer-3831")
+        };
+        assert!(
+            artifact_only.require_scope("write:repositories").is_err(),
+            "write:artifacts must NOT cross resources into repo management"
+        );
+        assert!(
+            artifact_only.require_scope("delete:repositories").is_err(),
+            "write:artifacts must NOT satisfy delete:repositories"
+        );
+
+        let artifact_deleter = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["delete:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-deleter-3831")
+        };
+        assert!(
+            artifact_deleter.require_scope("delete:artifacts").is_ok(),
+            "delete:artifacts token must pass the artifact-delete gate (#3831)"
+        );
+        assert!(
+            artifact_deleter
+                .require_scope("delete:repositories")
+                .is_err(),
+            "delete:artifacts must NOT satisfy the repository-delete gate"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -22705,6 +24702,247 @@ mod tests {
             b.extend(o);
         }
         Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
+    }
+
+    // -----------------------------------------------------------------------
+    // #3855: public create/update while guest access is disabled is an
+    // explicit 400, never a silent rewrite to private.
+    // -----------------------------------------------------------------------
+
+    /// Create with `is_public: true` under `AK_GUEST_ACCESS_ENABLED=false`
+    /// must be rejected with the Validation error naming the switch, and must
+    /// leave NO repository row behind; a private create under the same policy
+    /// succeeds (control).
+    #[tokio::test]
+    async fn public_create_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-c-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        let key = format!("ph-3855-pub-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &key,
+                "public repo",
+                "generic",
+                serde_json::json!({ "is_public": true }),
+            ),
+        )
+        .await
+        .expect_err("public create under AK_GUEST_ACCESS_ENABLED=false must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphaned, 0,
+            "a rejected create must not persist a repository row"
+        );
+
+        // Control: a create that does not ask for public succeeds under the
+        // same policy.
+        let private_key = format!("ph-3855-priv-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &private_key,
+                "private repo",
+                "generic",
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("private create under the disabled policy must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Update flipping `is_public` to true under the disabled policy is a
+    /// 400; an update that leaves the field alone succeeds, and the stored
+    /// visibility never changes under a rejected flip.
+    #[tokio::test]
+    async fn public_update_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-u-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-3855-upd-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(&key, "repo to flip", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let flip: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"is_public": true}"#).expect("deserialize flip payload");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(flip),
+        )
+        .await
+        .expect_err("flipping is_public to true under the disabled policy must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let persisted: bool =
+            sqlx::query_scalar("SELECT is_public FROM repositories WHERE id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read persisted visibility");
+        assert!(
+            !persisted,
+            "a rejected flip must leave the stored visibility untouched"
+        );
+
+        // Control: an update that leaves visibility alone succeeds.
+        let noop: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"description": "still private"}"#)
+                .expect("deserialize noop payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(noop),
+        )
+        .await
+        .expect("an update that does not touch visibility must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: the anonymous arm of `require_visible` — an IP-conditioned
+    // anonymous read rule admits matching anonymous callers to a private
+    // repository; everyone else gets the same existence-hiding 404.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn require_visible_admits_anonymous_callers_with_a_matching_ip_rule() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-1849-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-1849-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin)),
+            make_create_request(&key, "ip gated repo", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let repo_service = RepositoryService::new(pool.clone());
+        let repo = repo_service
+            .get_by_id(created.id)
+            .await
+            .expect("load repository model");
+
+        // No rule yet: even a CI-range anonymous caller gets the
+        // existence-hiding 404 (control — the arm must not fall open).
+        let denied = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "with no anonymous rule, a private repo stays hidden from anonymous callers"
+        );
+
+        // The conditioned anonymous read rule.
+        sqlx::query(
+            "INSERT INTO permissions \
+               (principal_type, principal_id, target_type, target_id, actions, conditions) \
+             VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'], $3)",
+        )
+        .bind(Uuid::nil())
+        .bind(created.id)
+        .bind(serde_json::json!({"allowed_cidrs": ["10.40.0.0/16"]}))
+        .execute(&pool)
+        .await
+        .expect("insert conditioned anonymous rule");
+
+        // Inside the CIDR: admitted.
+        let inside = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            inside.is_ok(),
+            "an anonymous caller inside allowed_cidrs must be admitted"
+        );
+
+        // Outside it: the identical existence-hiding 404 as the rules-less
+        // control above, so the caller cannot tell a conditioned repo from a
+        // rules-less one.
+        let outside = with_client_ip_scope(
+            Some("192.0.2.9".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(outside, Err(AppError::NotFound(_))),
+            "outside allowed_cidrs the denial must be the existence-hiding 404"
+        );
+
+        // No request IP (background): fail closed.
+        assert!(
+            matches!(
+                require_visible(&repo, &None, &repo_service).await,
+                Err(AppError::NotFound(_))
+            ),
+            "with no request IP a conditioned rule must fail closed"
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// When a format string is not a built-in variant but there IS an
@@ -23106,21 +25344,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // quarantine_enabled is refused on proxying repository types (#3647)
+    // quarantine_enabled is refused on virtual repositories only (#3647, #3912)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_quarantine_enableable_rejects_proxy_types() {
+    fn test_is_quarantine_enableable_rejects_only_virtual() {
         assert!(is_quarantine_enableable(&RepositoryType::Local).is_ok());
         assert!(is_quarantine_enableable(&RepositoryType::Staging).is_ok());
-        for proxying in [RepositoryType::Remote, RepositoryType::Virtual] {
-            let err = is_quarantine_enableable(&proxying)
-                .expect_err("quarantine must be refused on a proxying repository");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")),
-                "expected a Validation error naming the reason, got {err:?}",
-            );
-        }
+        // #3912: Remote repositories got a releasable quarantine identity
+        // (proxy_cache_artifacts columns + the proxy-cache release endpoint),
+        // so enabling the policy there is allowed.
+        assert!(is_quarantine_enableable(&RepositoryType::Remote).is_ok());
+        let err = is_quarantine_enableable(&RepositoryType::Virtual)
+            .expect_err("quarantine must still be refused on a virtual repository");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("member remote")),
+            "expected a Validation error naming the alternative, got {err:?}",
+        );
     }
 
     /// Structural regression guard: the update path must keep routing
@@ -23139,11 +25379,13 @@ mod tests {
         );
     }
 
-    /// DB-backed: PATCH `{"quarantine_enabled": true}` is refused with a 400 on
-    /// a Remote and on a Virtual repository, nothing is written, and disabling
-    /// stays allowed so an existing enabled row can still be turned off.
+    /// DB-backed: since #3912, PATCH `{"quarantine_enabled": true}` SUCCEEDS on
+    /// a Remote repository (proxied content carries a releasable quarantine
+    /// identity now) and is still refused with a 400 on a Virtual repository
+    /// (no cache of its own), writing nothing. Disabling stays allowed on both
+    /// so an existing enabled row can always be turned off.
     #[tokio::test]
-    async fn test_quarantine_enable_refused_on_proxy_repositories_db() {
+    async fn test_quarantine_enable_remote_allowed_virtual_refused_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::extract::{Extension, Path, State};
 
@@ -23173,31 +25415,42 @@ mod tests {
             }
         };
 
-        for (repo_id, repo_key) in [(remote_id, &remote_key), (virtual_id, &virtual_key)] {
-            let err = update_repository(
-                State(state.clone()),
-                Extension(Some(admin_auth(user_id, &username))),
-                Path(repo_key.clone()),
-                Json(update(r#"{"quarantine_enabled":true}"#)),
-            )
-            .await
-            .expect_err("enabling quarantine on a proxying repo must be refused");
-            assert!(
-                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")
-                    && msg.contains("release")),
-                "the refusal must say why there is no release path, got {err:?}",
-            );
-            assert_eq!(
-                err.into_response().status(),
-                StatusCode::BAD_REQUEST,
-                "the refusal must surface as a 400"
-            );
-            assert_eq!(
-                stored(repo_id).await,
-                None,
-                "a refused enable must not write the config row"
-            );
-        }
+        // Remote: allowed since #3912 and persisted.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(remote_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect("enabling quarantine on a remote repo must succeed since #3912");
+        assert_eq!(resp.quarantine_enabled, Some(true));
+        assert_eq!(stored(remote_id).await.as_deref(), Some("true"));
+
+        // Virtual: still refused, with a 400 naming the alternative, and
+        // nothing is written.
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(virtual_key.clone()),
+            Json(update(r#"{"quarantine_enabled":true}"#)),
+        )
+        .await
+        .expect_err("enabling quarantine on a virtual repo must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(msg) if msg.contains("virtual") && msg.contains("release")),
+            "the refusal must say where the release path lives, got {err:?}",
+        );
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "the refusal must surface as a 400"
+        );
+        assert_eq!(
+            stored(virtual_id).await,
+            None,
+            "a refused enable must not write the config row"
+        );
 
         // Disabling remains allowed on a proxying repo: that is the escape
         // hatch for a row written before this gate existed.
@@ -23537,6 +25790,8 @@ mod tests {
     #[test]
     fn test_repository_response_serializes_custom_user_agent() {
         let mut resp = RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
             id: Uuid::new_v4(),
             has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),
@@ -23544,6 +25799,7 @@ mod tests {
             description: None,
             format: "maven".to_string(),
             repo_type: "remote".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             allow_anonymous_access: false,
             promotion_only: false,
@@ -24285,8 +26541,10 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // The guard reports the owning local member's priority (2), NOT a
-        // blanket "suppress all remotes".
+        // The guard reports the owning local member's resolution RANK (2 —
+        // for a flat virtual with priorities 1..n the rank equals the
+        // priority, see `virtual_member_ranks`), NOT a blanket "suppress all
+        // remotes".
         let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
             .await
             .expect("isolation query");
@@ -25891,18 +28149,20 @@ mod apt_validation_tests {
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped)),
-            RepoVisibility::Ids(scoped_to)
+            RepoVisibility::Ids(scoped_to.clone())
         );
 
-        // An ADMIN repo-scoped token still resolves to `All`: the admin arm is
-        // matched first, mirroring the listing.
+        // #3901: an ADMIN repo-scoped token is confined to the token's set --
+        // the scope arm is matched ahead of the admin arm, exactly as
+        // `search::intersect_token_scope` and the webhook reads already
+        // narrow an admin's scoped credential.
         let scoped_admin = AuthExtension {
             is_admin: true,
             ..scoped
         };
         assert_eq!(
             visibility_for_auth(Some(&scoped_admin)),
-            RepoVisibility::All
+            RepoVisibility::Ids(scoped_to)
         );
     }
 
@@ -25910,7 +28170,7 @@ mod apt_validation_tests {
     /// principal shape, i.e.
     ///
     /// ```text
-    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// public OR (in_scope AND (internal OR is_admin OR grants))
     /// ```
     ///
     /// Walks all five: anonymous, admin unrestricted, admin + `Restricted`,
@@ -25997,20 +28257,24 @@ mod apt_validation_tests {
         };
 
         let (sql, user_bind, scope_bind) = clause(None);
-        assert_eq!(sql, "is_public = true");
+        assert_eq!(sql, "visibility = 'public'");
         assert_eq!((user_bind, scope_bind), (None, None));
 
         // Admin, unrestricted: both conjuncts collapse to `true`, so the arm
         // is unconditionally satisfied — the pre-#3081 total, unchanged.
         let (sql, user_bind, scope_bind) = clause(Some(&admin));
-        assert_eq!(sql, "( is_public = true OR (true AND true) )");
+        assert_eq!(
+            sql,
+            "( visibility = 'public' OR (true AND (visibility <> 'private' OR true)) )"
+        );
         assert_eq!((user_bind, scope_bind), (None, None));
 
         // Admin + Restricted: the entitlement half is `true`, but the SCOPE
         // conjunct is retained. This is the arm `RepoVisibility::All` loses.
         let (sql, user_bind, scope_bind) = clause(Some(&scoped_admin));
         assert_eq!(
-            sql, "( is_public = true OR (leaf.id = ANY($3) AND true) )",
+            sql,
+            "( visibility = 'public' OR (leaf.id = ANY($3) AND (visibility <> 'private' OR true)) )",
             "admin + Restricted must stay confined to its scope"
         );
         assert_eq!((user_bind, scope_bind), (None, Some(scoped_to.clone())));
@@ -26018,8 +28282,16 @@ mod apt_validation_tests {
         // Non-admin + Restricted: all three pieces survive.
         let (sql, user_bind, scope_bind) = clause(Some(&scoped));
         assert!(
-            sql.starts_with("( is_public = true OR (leaf.id = ANY($3) AND ("),
+            sql.starts_with("( visibility = 'public' OR (leaf.id = ANY($3) AND ("),
             "public arm and scope conjunct survive, in that order: {sql}"
+        );
+
+        // The `internal` baseline sits INSIDE the scope conjunct, never
+        // alongside the public disjunct. If it ever moved out, a repo-scoped
+        // token would reach every internal member on the instance.
+        assert!(
+            sql.contains("(leaf.id = ANY($3) AND (visibility <> 'private'"),
+            "internal must be confined by the token scope: {sql}"
         );
         assert!(
             sql.contains("ra.user_id = $2") && sql.contains("p.principal_id = $2"),
@@ -26107,7 +28379,7 @@ mod apt_validation_tests {
     /// `require_visible` is
     ///
     /// ```text
-    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// public OR (in_scope AND (internal OR is_admin OR grants))
     /// ```
     ///
     /// and it early-returns `Ok` on `is_public` *without ever consulting

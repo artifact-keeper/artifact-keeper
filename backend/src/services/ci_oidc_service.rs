@@ -72,7 +72,7 @@ macro_rules! provider_columns {
 macro_rules! mapping_columns {
     () => {
         "id, provider_id, name, priority, claim_filters, allowed_repo_ids, \
-         is_enabled, created_at, updated_at"
+         is_enabled, created_at, updated_at, group_binding_ids"
     };
 }
 
@@ -152,6 +152,12 @@ pub struct CiOidcIdentityMapping {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The mapping's group binding (design D2 of add-ci-oidc-mapping-grants).
+    /// Three states, not two:
+    /// `None` = absent, the mapping makes no claim and nothing reconciles;
+    /// `Some(vec![])` = empty, declared "no memberships", reconciles and
+    /// strips everything; `Some(ids)` = declared exactly these groups.
+    pub group_binding_ids: Option<Vec<Uuid>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +244,15 @@ pub struct CreateCiOidcMappingRequest {
     pub claim_filters: serde_json::Value,
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: Option<bool>,
+    /// The mapping's group binding: the groups its service account SHALL
+    /// hold membership of (design D1, D2). Omit or send `null` for no
+    /// binding at all — the mapping confers nothing and nothing reconciles,
+    /// exactly today's behaviour. Send `[]` to declare "no memberships"
+    /// (reconciles, strips any hand-wired membership). Send a non-empty list
+    /// to declare exactly those groups. Every id must already exist; an
+    /// unknown id refuses the whole create (design D5, "A binding names
+    /// existing groups only").
+    pub group_binding_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -256,6 +271,17 @@ pub struct UpdateCiOidcMappingRequest {
     #[schema(value_type = Option<Vec<Uuid>>)]
     pub allowed_repo_ids: Option<Option<Vec<Uuid>>>,
     pub is_enabled: Option<bool>,
+    /// Three-way semantics via `Option<Option<Vec<Uuid>>>` (mirrors
+    /// `trusted_gpg_key` in `repositories.rs`): omit the field to leave the
+    /// stored binding unchanged; send `null` to clear it back to absent (the
+    /// mapping stops reconciling); send `[]` or a list of group ids to
+    /// declare that binding (validated the same way as on create).
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<Vec<Uuid>>)]
+    pub group_binding_ids: Option<Option<Vec<Uuid>>>,
 }
 
 #[derive(Debug, Serialize, Clone, ToSchema)]
@@ -279,6 +305,11 @@ pub struct CiOidcMappingResponse {
     /// Username of that service account (`ci-<hex>`), as returned in the
     /// token exchange's `username` field.
     pub service_account_username: Option<String>,
+    /// The mapping's group binding, so what a pipeline may do is answerable
+    /// from the mapping alone. `null` = no binding declared (this mapping
+    /// confers nothing beyond whatever RBAC the account otherwise holds);
+    /// `[]` = binding declared empty; a list = the groups it confers.
+    pub group_binding_ids: Option<Vec<Uuid>>,
 }
 
 impl CiOidcMappingResponse {
@@ -299,8 +330,20 @@ impl CiOidcMappingResponse {
             updated_at: m.updated_at,
             service_account_id,
             service_account_username,
+            group_binding_ids: m.group_binding_ids,
         }
     }
+}
+
+/// Outcome of reconciling one CI service account's group memberships to its
+/// mapping's binding (design D3, D4, D5). Returned for logging and tests;
+/// not part of the public API response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupBindingReconcileReport {
+    pub added: Vec<Uuid>,
+    pub removed: Vec<Uuid>,
+    /// Ids in the binding that no longer exist in `groups`.
+    pub dangling: Vec<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +705,192 @@ impl CiOidcService {
         self.mapping_response(row).await
     }
 
+    /// Refuse a group binding naming a group that does not exist (design D5,
+    /// "A binding names existing groups only"). Called before any write, so a
+    /// bad id creates neither a mapping nor a group.
+    async fn validate_group_binding_ids(&self, ids: &[Uuid]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let existing: std::collections::HashSet<Uuid> =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM groups WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .into_iter()
+                .collect();
+        let missing: Vec<Uuid> = ids
+            .iter()
+            .filter(|id| !existing.contains(id))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            let ids = missing
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::Validation(format!(
+                "Cannot save identity mapping: its group binding names a group id \
+                 that does not exist: {ids}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reconcile a CI service account's `user_group_members` rows to exactly
+    /// its mapping's binding (design D3, D4, D7), in its own transaction.
+    ///
+    /// The token-exchange entry point; mapping writes reconcile inside their
+    /// own transaction through [`Self::reconcile_mapping_binding_in`].
+    pub async fn reconcile_mapping_binding(
+        &self,
+        mapping_id: Uuid,
+        service_account_id: Uuid,
+    ) -> Result<Option<GroupBindingReconcileReport>> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let report =
+            Self::reconcile_mapping_binding_in(&mut tx, mapping_id, service_account_id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(report)
+    }
+
+    /// Reconcile inside the caller's transaction, to the binding as it is
+    /// stored NOW (design D7). Returns `None`, touching nothing, when the
+    /// mapping declares no binding (design D2), and `NotFound` when the
+    /// mapping no longer exists.
+    ///
+    /// The binding is read here under `FOR SHARE` rather than taken from the
+    /// caller: an exchange that resolved the mapping before a concurrent
+    /// narrowing would otherwise restore the memberships the narrowing just
+    /// removed. The share lock waits for the narrowing's row lock and then
+    /// sees the committed binding; exchanges do not block one another.
+    ///
+    /// Dedicated to CI rather than sharing
+    /// `sso.rs::sync_federated_groups_to_local_groups`'s core: see
+    /// design.md D4 for why the two don't separate cleanly (that reconciler
+    /// resolves group NAMES with auto-create and a per-name ownership tag; a
+    /// CI binding names group IDS the mapping already validated at write
+    /// time and never creates a group). A CI mapping's service account
+    /// exists only for that one mapping
+    /// (`fix-ci-oidc-identity-key`), so reconciling its ENTIRE membership set
+    /// — not a tag-scoped subset — is safe: nothing else has a legitimate
+    /// reason to hold membership on it (design D4.1). A membership added by
+    /// any other means does not survive reconciliation.
+    ///
+    /// Performs no writes when the account's memberships already match the
+    /// target set (D3: reconciliation runs on every token exchange, so this
+    /// is the overwhelmingly common case on that hot path). A target id that
+    /// no longer exists in `groups` is skipped and reported rather than
+    /// silently dropped (D5) — the mapping keeps saying what the operator
+    /// wrote even though reconciliation could not reach all of it.
+    pub async fn reconcile_mapping_binding_in(
+        conn: &mut sqlx::PgConnection,
+        mapping_id: Uuid,
+        service_account_id: Uuid,
+    ) -> Result<Option<GroupBindingReconcileReport>> {
+        let binding: Option<Option<Vec<Uuid>>> = sqlx::query_scalar(
+            "SELECT group_binding_ids FROM ci_oidc_identity_mappings WHERE id = $1 FOR SHARE",
+        )
+        .bind(mapping_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some(binding) = binding else {
+            return Err(AppError::NotFound(
+                "CI OIDC identity mapping not found".to_string(),
+            ));
+        };
+        let Some(target_group_ids) = binding else {
+            return Ok(None);
+        };
+
+        let current: std::collections::HashSet<Uuid> =
+            sqlx::query_scalar("SELECT group_id FROM user_group_members WHERE user_id = $1")
+                .bind(service_account_id)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .into_iter()
+                .collect();
+
+        let existing_targets: std::collections::HashSet<Uuid> = if target_group_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM groups WHERE id = ANY($1)")
+                .bind(&target_group_ids)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .into_iter()
+                .collect()
+        };
+        let dangling: Vec<Uuid> = target_group_ids
+            .iter()
+            .filter(|id| !existing_targets.contains(id))
+            .copied()
+            .collect();
+        if !dangling.is_empty() {
+            tracing::warn!(
+                target: "security",
+                service_account_id = %service_account_id,
+                dangling = ?dangling,
+                "CI OIDC: mapping's group binding names a group that no longer \
+                 exists; skipping it rather than silently dropping it from the \
+                 mapping's own declared binding"
+            );
+        }
+
+        // Sorted, so two exchanges writing the same rows take their index
+        // locks in the same order and cannot deadlock on each other.
+        let mut to_add: Vec<Uuid> = existing_targets.difference(&current).copied().collect();
+        let mut to_remove: Vec<Uuid> = current.difference(&existing_targets).copied().collect();
+        to_add.sort_unstable();
+        to_remove.sort_unstable();
+
+        if !to_add.is_empty() {
+            sqlx::query(
+                "INSERT INTO user_group_members (user_id, group_id) \
+                 SELECT $1, g FROM UNNEST($2::uuid[]) AS g \
+                 ON CONFLICT (user_id, group_id) DO NOTHING",
+            )
+            .bind(service_account_id)
+            .bind(&to_add)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        if !to_remove.is_empty() {
+            sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = ANY($2)")
+                .bind(service_account_id)
+                .bind(&to_remove)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        if !to_add.is_empty() || !to_remove.is_empty() {
+            tracing::info!(
+                target: "security",
+                service_account_id = %service_account_id,
+                added = to_add.len(),
+                removed = to_remove.len(),
+                "CI OIDC: reconciled service account's group memberships to its mapping's binding"
+            );
+        }
+        Ok(Some(GroupBindingReconcileReport {
+            added: to_add,
+            removed: to_remove,
+            dangling,
+        }))
+    }
+
     /// Create a mapping together with its service account, in one
     /// transaction: a mapping without an account is never observable, and an
     /// account that cannot be created leaves no mapping behind.
@@ -670,6 +899,17 @@ impl CiOidcService {
         provider_id: Uuid,
         req: CreateCiOidcMappingRequest,
     ) -> Result<CiOidcMappingResponse> {
+        Ok(self.create_mapping_with_report(provider_id, req).await?.0)
+    }
+
+    /// [`Self::create_mapping`], also returning what the binding's
+    /// reconciliation changed (`None` when the mapping declares no binding),
+    /// for the caller to audit and to invalidate cached permissions on.
+    pub async fn create_mapping_with_report(
+        &self,
+        provider_id: Uuid,
+        req: CreateCiOidcMappingRequest,
+    ) -> Result<(CiOidcMappingResponse, Option<GroupBindingReconcileReport>)> {
         self.create_mapping_with_id(provider_id, Uuid::new_v4(), req)
             .await
     }
@@ -682,12 +922,16 @@ impl CiOidcService {
         provider_id: Uuid,
         mapping_id: Uuid,
         req: CreateCiOidcMappingRequest,
-    ) -> Result<CiOidcMappingResponse> {
+    ) -> Result<(CiOidcMappingResponse, Option<GroupBindingReconcileReport>)> {
         let provider = self.get(provider_id).await?;
         let priority = req.priority.unwrap_or(100);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let username = service_account_username(mapping_id);
         let email = service_account_email(&username);
+
+        if let Some(ids) = &req.group_binding_ids {
+            self.validate_group_binding_ids(ids).await?;
+        }
 
         // Refuse here, where the operator can act on it, rather than at the
         // first pipeline run. The INSERT below is still the authority: a
@@ -709,8 +953,8 @@ impl CiOidcService {
 
         let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
             "INSERT INTO ci_oidc_identity_mappings ",
-            "(id, provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled) ",
-            "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ",
+            "(id, provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled, group_binding_ids) ",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ",
             mapping_columns!()
         ))
         .bind(mapping_id)
@@ -720,6 +964,7 @@ impl CiOidcService {
         .bind(req.claim_filters)
         .bind(req.allowed_repo_ids)
         .bind(is_enabled)
+        .bind(req.group_binding_ids)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -750,10 +995,16 @@ impl CiOidcService {
             }
         })?;
 
+        // Reconcile immediately (design D3), in the same transaction (D7): a
+        // mapping created with a binding has an access-conferring account
+        // from the very first read, and a reconcile that fails leaves no
+        // mapping and no account behind for a retry to collide with.
+        let report = Self::reconcile_mapping_binding_in(&mut tx, mapping_id, account.id).await?;
+
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(CiOidcMappingResponse::new(row, Some(account)))
+        Ok((CiOidcMappingResponse::new(row, Some(account)), report))
     }
 
     pub async fn update_mapping(
@@ -762,12 +1013,53 @@ impl CiOidcService {
         mapping_id: Uuid,
         req: UpdateCiOidcMappingRequest,
     ) -> Result<CiOidcMappingResponse> {
+        Ok(self
+            .update_mapping_with_report(provider_id, mapping_id, req)
+            .await?
+            .0)
+    }
+
+    /// [`Self::update_mapping`], also returning what the binding's
+    /// reconciliation changed (`None` when nothing was reconciled).
+    pub async fn update_mapping_with_report(
+        &self,
+        provider_id: Uuid,
+        mapping_id: Uuid,
+        req: UpdateCiOidcMappingRequest,
+    ) -> Result<(CiOidcMappingResponse, Option<GroupBindingReconcileReport>)> {
         let existing = self.fetch_mapping_row(provider_id, mapping_id).await?;
+
+        let group_binding_ids = match req.group_binding_ids {
+            None => existing.group_binding_ids.clone(),
+            Some(None) => None,
+            Some(Some(ids)) => {
+                self.validate_group_binding_ids(&ids).await?;
+                Some(ids)
+            }
+        };
+
+        // The account is keyed on the mapping and never changes, so it is
+        // looked up before the transaction opens.
+        let account = self
+            .fetch_service_accounts(std::slice::from_ref(&service_account_external_id(
+                provider_id,
+                mapping_id,
+            )))
+            .await?
+            .into_iter()
+            .next();
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
             "UPDATE ci_oidc_identity_mappings SET name = $3, priority = $4, ",
             "claim_filters = $5, allowed_repo_ids = $6, is_enabled = $7, ",
-            "updated_at = NOW() WHERE id = $1 AND provider_id = $2 RETURNING ",
+            "group_binding_ids = $8, updated_at = NOW() ",
+            "WHERE id = $1 AND provider_id = $2 RETURNING ",
             mapping_columns!()
         ))
         .bind(mapping_id)
@@ -777,10 +1069,28 @@ impl CiOidcService {
         .bind(req.claim_filters.unwrap_or(existing.claim_filters))
         .bind(req.allowed_repo_ids.unwrap_or(existing.allowed_repo_ids))
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
-        .fetch_one(&self.db)
+        .bind(group_binding_ids)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        self.mapping_response(row).await
+
+        // Reconcile immediately (design D3): narrowing a binding revokes
+        // without waiting for the next pipeline run. In the same transaction
+        // as the row (D7), so a reconcile that fails rolls the row back too
+        // and the stored binding never runs ahead of the memberships. An
+        // absent binding reconciles nothing — an unbound mapping's account
+        // keeps whatever memberships it holds (design D2, D3).
+        let report = match &account {
+            Some(account) => {
+                Self::reconcile_mapping_binding_in(&mut tx, mapping_id, account.id).await?
+            }
+            None => None,
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok((self.mapping_response(row).await?, report))
     }
 
     /// Delete a mapping and deactivate — never delete — its service account,
@@ -1501,6 +1811,7 @@ mod tests {
             is_enabled: true,
             created_at: now,
             updated_at: now,
+            group_binding_ids: None,
         }
     }
 
@@ -1921,6 +2232,7 @@ mod tests {
                     claim_filters: json!({"ref": "refs/heads/main"}),
                     allowed_repo_ids: Some(vec![repo_a]),
                     is_enabled: None,
+                    group_binding_ids: None,
                 },
             )
             .await
@@ -1952,6 +2264,7 @@ mod tests {
                     claim_filters: Some(json!({"ref": ["refs/heads/main", "refs/heads/release"]})),
                     allowed_repo_ids: Some(Some(vec![repo_a, repo_b])),
                     is_enabled: Some(true),
+                    group_binding_ids: None,
                 },
             )
             .await
@@ -1970,6 +2283,7 @@ mod tests {
                     claim_filters: None,
                     allowed_repo_ids: None,
                     is_enabled: Some(true),
+                    group_binding_ids: None,
                 },
             )
             .await
@@ -1986,6 +2300,7 @@ mod tests {
                     claim_filters: None,
                     allowed_repo_ids: Some(Some(vec![])),
                     is_enabled: Some(true),
+                    group_binding_ids: None,
                 },
             )
             .await
@@ -2004,6 +2319,7 @@ mod tests {
                     claim_filters: None,
                     allowed_repo_ids: Some(None),
                     is_enabled: Some(true),
+                    group_binding_ids: None,
                 },
             )
             .await
@@ -2026,6 +2342,7 @@ mod tests {
                 claim_filters: None,
                 allowed_repo_ids: Some(Some(vec![])),
                 is_enabled: Some(true),
+                group_binding_ids: None,
             },
         )
         .await
@@ -2083,6 +2400,7 @@ mod tests {
             claim_filters: json!({"project_path": "group/app"}),
             allowed_repo_ids: None,
             is_enabled: None,
+            group_binding_ids: None,
         }
     }
 
@@ -2181,6 +2499,581 @@ mod tests {
 
         drop_users(&pool, &[squatter]).await;
         svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group bindings (add-ci-oidc-mapping-grants)
+    // -----------------------------------------------------------------------
+
+    async fn seed_group(pool: &sqlx::PgPool) -> Uuid {
+        crate::api::handlers::test_db_helpers::create_group(pool)
+            .await
+            .0
+    }
+
+    async fn drop_groups(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        let _ = sqlx::query("DELETE FROM groups WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(pool)
+            .await;
+    }
+
+    async fn member_group_ids(
+        pool: &sqlx::PgPool,
+        user_id: Uuid,
+    ) -> std::collections::HashSet<Uuid> {
+        sqlx::query_scalar::<_, Uuid>("SELECT group_id FROM user_group_members WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    /// Design D5 / spec "A binding names existing groups only": an unknown
+    /// group id refuses the whole create, naming the offending group, and
+    /// writes neither a mapping nor a group.
+    #[tokio::test]
+    async fn create_mapping_refuses_unknown_group_in_binding() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let ghost = Uuid::new_v4();
+        let mut req = deploy_mapping();
+        req.group_binding_ids = Some(vec![ghost]);
+
+        let err = svc
+            .create_mapping(provider_id, req)
+            .await
+            .expect_err("an unknown group id must refuse the create");
+        assert!(
+            matches!(err, crate::error::AppError::Validation(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&ghost.to_string()),
+            "the error names the offending group: {err}"
+        );
+
+        let mappings = svc.list_mappings(provider_id).await.unwrap();
+        assert!(mappings.is_empty(), "no mapping was written");
+
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// 3.1/3.3 — a mapping created with a binding reads it back unchanged
+    /// and its account is already a member of the bound groups, with no
+    /// token exchange having occurred.
+    #[tokio::test]
+    async fn create_mapping_with_binding_reconciles_immediately() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let group_a = seed_group(&pool).await;
+        let group_b = seed_group(&pool).await;
+        let mut req = deploy_mapping();
+        req.group_binding_ids = Some(vec![group_a, group_b]);
+
+        let created = svc
+            .create_mapping(provider_id, req)
+            .await
+            .expect("mapping with a valid binding should be created");
+        assert_eq!(
+            created.group_binding_ids.as_ref().map(|v| {
+                let mut v = v.clone();
+                v.sort();
+                v
+            }),
+            Some({
+                let mut v = vec![group_a, group_b];
+                v.sort();
+                v
+            })
+        );
+        let account_id = created.service_account_id.expect("account exists");
+        let members = member_group_ids(&pool, account_id).await;
+        assert_eq!(
+            members,
+            [group_a, group_b].into_iter().collect(),
+            "the account is already a member before any exchange"
+        );
+
+        let got = svc.get_mapping(provider_id, created.id).await.unwrap();
+        assert!(
+            got.group_binding_ids.is_some(),
+            "a mapping without a create-time binding would report None; this one must not"
+        );
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_a, group_b]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// Design D2 — absent, empty and non-empty are three states, not two, and
+    /// they round-trip distinctly through create and update: omitting the
+    /// field leaves a stored binding unchanged, `null` clears it back to
+    /// absent, and `[]` is a declared-empty binding, never confused with "no
+    /// claim".
+    #[tokio::test]
+    async fn mapping_binding_round_trips_absent_empty_and_set() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let group_a = seed_group(&pool).await;
+
+        // Created with no binding at all: absent.
+        let created = svc
+            .create_mapping(provider_id, deploy_mapping())
+            .await
+            .unwrap();
+        assert_eq!(created.group_binding_ids, None);
+        let account_id = created.service_account_id.unwrap();
+
+        // Omitted on update: stays absent.
+        let unchanged = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.group_binding_ids, None);
+
+        // Declared empty: reconciles (no-op here, nothing to strip) and is
+        // reported as `Some(vec![])`, distinct from absent.
+        let emptied = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(Some(vec![])),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(emptied.group_binding_ids, Some(vec![]));
+
+        // Declared with a group.
+        let set = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(Some(vec![group_a])),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(set.group_binding_ids, Some(vec![group_a]));
+        assert_eq!(member_group_ids(&pool, account_id).await, [group_a].into());
+
+        // Explicit null clears back to absent, and reconciliation leaves the
+        // account's memberships exactly where they were — clearing the
+        // binding stops reconciling, it does not strip anything itself.
+        let cleared = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.group_binding_ids, None);
+        assert_eq!(
+            member_group_ids(&pool, account_id).await,
+            [group_a].into(),
+            "clearing the binding to absent must not itself touch memberships"
+        );
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_a]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// Store a binding on a mapping row directly, bypassing the write path's
+    /// own reconcile, so a test controls exactly what the reconciler reads.
+    async fn store_binding(pool: &sqlx::PgPool, mapping_id: Uuid, binding: Option<&[Uuid]>) {
+        sqlx::query("UPDATE ci_oidc_identity_mappings SET group_binding_ids = $2 WHERE id = $1")
+            .bind(mapping_id)
+            .bind(binding)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// An unbound mapping with its service account, for reconciler tests.
+    async fn unbound_mapping(svc: &CiOidcService, provider_id: Uuid) -> (Uuid, Uuid) {
+        let created = svc
+            .create_mapping(provider_id, deploy_mapping())
+            .await
+            .expect("create mapping");
+        (
+            created.id,
+            created.service_account_id.expect("account exists"),
+        )
+    }
+
+    /// 4.1 — the reconciler over add-only, remove-only, mixed and dangling
+    /// cases, and 4.4 — an in-sync reconciliation performs no writes. The
+    /// target is always the binding stored on the mapping row (design D7).
+    #[tokio::test]
+    async fn reconcile_mapping_binding_add_remove_mixed_dangling_and_noop() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let (mapping_id, account_id) = unbound_mapping(&svc, provider_id).await;
+        let (group_a, group_b, group_c) = (
+            seed_group(&pool).await,
+            seed_group(&pool).await,
+            seed_group(&pool).await,
+        );
+        let ghost = Uuid::new_v4();
+        let reconcile = || async {
+            svc.reconcile_mapping_binding(mapping_id, account_id)
+                .await
+                .unwrap()
+                .expect("a declared binding reconciles")
+        };
+
+        // Add-only: nothing -> {a, b}.
+        store_binding(&pool, mapping_id, Some(&[group_a, group_b])).await;
+        let report = reconcile().await;
+        assert_eq!(report.added.len(), 2);
+        assert!(report.removed.is_empty());
+        assert!(report.dangling.is_empty());
+        assert_eq!(
+            member_group_ids(&pool, account_id).await,
+            [group_a, group_b].into_iter().collect()
+        );
+
+        // In-sync: same target set again performs no writes.
+        let noop = reconcile().await;
+        assert!(noop.added.is_empty() && noop.removed.is_empty(), "{noop:?}");
+
+        // Mixed: {a, b} -> {b, c} adds c, removes a.
+        store_binding(&pool, mapping_id, Some(&[group_b, group_c])).await;
+        let mixed = reconcile().await;
+        assert_eq!(mixed.added, vec![group_c]);
+        assert_eq!(mixed.removed, vec![group_a]);
+        assert_eq!(
+            member_group_ids(&pool, account_id).await,
+            [group_b, group_c].into_iter().collect()
+        );
+
+        // Remove-only: {b, c} -> {} strips everything.
+        store_binding(&pool, mapping_id, Some(&[])).await;
+        let removed_all = reconcile().await;
+        assert_eq!(
+            removed_all.removed.len(),
+            2,
+            "an empty target set removes every membership"
+        );
+        assert!(member_group_ids(&pool, account_id).await.is_empty());
+
+        // Dangling: a target naming a group that no longer exists is skipped
+        // and reported, not silently dropped from the attempted set, and the
+        // still-valid target alongside it is still applied.
+        store_binding(&pool, mapping_id, Some(&[group_a, ghost])).await;
+        let dangling = reconcile().await;
+        assert_eq!(dangling.added, vec![group_a]);
+        assert_eq!(dangling.dangling, vec![ghost]);
+        assert_eq!(member_group_ids(&pool, account_id).await, [group_a].into());
+
+        // Absent: no binding, no reconcile, the membership stays (D2).
+        store_binding(&pool, mapping_id, None).await;
+        assert_eq!(
+            svc.reconcile_mapping_binding(mapping_id, account_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(member_group_ids(&pool, account_id).await, [group_a].into());
+
+        // A mapping that no longer exists is an error, not an empty binding.
+        let err = svc
+            .reconcile_mapping_binding(Uuid::new_v4(), account_id)
+            .await
+            .expect_err("a missing mapping must not reconcile");
+        assert!(
+            matches!(err, crate::error::AppError::NotFound(_)),
+            "got: {err}"
+        );
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_a, group_b, group_c]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// Design D7, spec "An exchange in flight cannot undo a narrowing": the
+    /// reconciler applies the binding as stored, not the wider one a caller
+    /// resolved earlier. The account holds {a, b} from the old binding; the
+    /// row now says {b}; reconciling leaves {b} and nothing else.
+    #[tokio::test]
+    async fn reconcile_mapping_binding_ignores_a_stale_snapshot() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let (mapping_id, account_id) = unbound_mapping(&svc, provider_id).await;
+        let (group_a, group_b) = (seed_group(&pool).await, seed_group(&pool).await);
+
+        store_binding(&pool, mapping_id, Some(&[group_a, group_b])).await;
+        let stale = svc.get_mapping(provider_id, mapping_id).await.unwrap();
+        svc.reconcile_mapping_binding(mapping_id, account_id)
+            .await
+            .unwrap();
+        store_binding(&pool, mapping_id, Some(&[group_b])).await;
+
+        assert_eq!(
+            stale.group_binding_ids.map(|v| v.len()),
+            Some(2),
+            "the caller's copy still names both groups"
+        );
+        let report = svc
+            .reconcile_mapping_binding(mapping_id, account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.removed, vec![group_a]);
+        assert_eq!(member_group_ids(&pool, account_id).await, [group_b].into());
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_a, group_b]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// Make every membership write naming `group_id` fail, so a reconcile
+    /// that has to touch it errors mid-transaction. Scoped to a group the
+    /// calling test seeded, so concurrent tests are unaffected. Returns the
+    /// trigger's name for [`allow_membership_writes`].
+    async fn fail_membership_writes(pool: &sqlx::PgPool, group_id: Uuid) -> String {
+        let name = format!("ci_test_fail_{}", group_id.simple());
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF COALESCE(NEW.group_id, OLD.group_id) = '{group_id}'::uuid THEN \
+                 RAISE EXCEPTION 'injected membership write failure'; \
+               END IF; \
+               RETURN COALESCE(NEW, OLD); \
+             END $$"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "CREATE TRIGGER {name} BEFORE INSERT OR DELETE ON user_group_members \
+             FOR EACH ROW EXECUTE FUNCTION {name}()"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+        name
+    }
+
+    async fn allow_membership_writes(pool: &sqlx::PgPool, name: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP TRIGGER IF EXISTS {name} ON user_group_members"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {name}()"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Design D7, spec "A mapping update that cannot reconcile changes
+    /// nothing": the row update and the reconcile are one transaction, so
+    /// a failed reconcile leaves the stored binding AND the memberships as
+    /// they were — the binding never claims a narrowing that did not happen.
+    #[tokio::test]
+    async fn update_mapping_that_cannot_reconcile_changes_nothing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let (group_a, group_b) = (seed_group(&pool).await, seed_group(&pool).await);
+        let mut req = deploy_mapping();
+        req.group_binding_ids = Some(vec![group_a, group_b]);
+        let created = svc.create_mapping(provider_id, req).await.unwrap();
+        let account_id = created.service_account_id.expect("account exists");
+
+        let trigger = fail_membership_writes(&pool, group_a).await;
+        let result = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(Some(vec![group_b])),
+                },
+            )
+            .await;
+        allow_membership_writes(&pool, &trigger).await;
+
+        result.expect_err("a narrowing whose reconcile fails must report an error");
+        let mut stored = svc
+            .get_mapping(provider_id, created.id)
+            .await
+            .unwrap()
+            .group_binding_ids
+            .expect("still bound");
+        stored.sort();
+        let mut before = vec![group_a, group_b];
+        before.sort();
+        assert_eq!(stored, before, "the row was rolled back with the reconcile");
+        assert_eq!(
+            member_group_ids(&pool, account_id).await,
+            [group_a, group_b].into_iter().collect(),
+            "the memberships are unchanged"
+        );
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_a, group_b]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// Design D7, spec "A mapping create that cannot reconcile creates
+    /// nothing": mapping, account and reconcile are one transaction, so a
+    /// failed reconcile leaves nothing behind and a retry of the same create
+    /// is not refused as a conflict with its own leftovers.
+    #[tokio::test]
+    async fn create_mapping_that_cannot_reconcile_creates_nothing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let group_id = seed_group(&pool).await;
+        let mapping_id = Uuid::new_v4();
+        let username = super::service_account_username(mapping_id);
+        let bound = || {
+            let mut req = deploy_mapping();
+            req.group_binding_ids = Some(vec![group_id]);
+            req
+        };
+
+        let trigger = fail_membership_writes(&pool, group_id).await;
+        let result = svc
+            .create_mapping_with_id(provider_id, mapping_id, bound())
+            .await;
+        allow_membership_writes(&pool, &trigger).await;
+
+        result.expect_err("a create whose reconcile fails must report an error");
+        assert!(!mapping_exists(&pool, mapping_id).await, "no mapping row");
+        let account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+            .bind(&username)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(account, None, "no service account");
+
+        let (created, report) = svc
+            .create_mapping_with_id(provider_id, mapping_id, bound())
+            .await
+            .expect("retrying the same create succeeds");
+        assert_eq!(report.map(|r| r.added), Some(vec![group_id]));
+        let account_id = created.service_account_id.expect("account exists");
+
+        drop_users(&pool, &[account_id]).await;
+        drop_groups(&pool, &[group_id]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// A mapping created before mappings provisioned their own account has no
+    /// attributed account until its first exchange. Binding it still saves:
+    /// there is nothing to reconcile yet, and the first exchange applies the
+    /// binding (design D3).
+    #[tokio::test]
+    async fn binding_a_mapping_without_an_account_saves_and_reconciles_nothing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let group_id = seed_group(&pool).await;
+        let mapping_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ci_oidc_identity_mappings (id, provider_id, name) \
+             VALUES ($1, $2, 'legacy')",
+        )
+        .bind(mapping_id)
+        .bind(provider_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy mapping");
+
+        let updated = svc
+            .update_mapping(
+                provider_id,
+                mapping_id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: Some(Some(vec![group_id])),
+                },
+            )
+            .await
+            .expect("binding a mapping with no account yet still saves");
+
+        assert_eq!(updated.group_binding_ids, Some(vec![group_id]));
+        assert_eq!(updated.service_account_id, None);
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE group_id = $1")
+                .bind(group_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, 0, "no account exists to reconcile");
+
+        svc.delete(provider_id).await.expect("delete provider");
+        drop_groups(&pool, &[group_id]).await;
     }
 
     // -----------------------------------------------------------------------

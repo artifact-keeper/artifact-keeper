@@ -86,13 +86,21 @@ use std::path::{Path, PathBuf};
 /// body at that site). Phase progress: npm.rs 7 -> 6, total 30 -> 29. This
 /// drift went unnoticed because this gate ran in NO CI job (#3494); it is now
 /// wired into the Tier 1 integration-target step with `--no-tests=fail`.
+///
+/// Reconciliation (#4020): gating the /v2/token password grant on any HTTP
+/// method added a second capped form-body peek in rate_limit.rs
+/// (`TOKEN_FORM_PEEK_LIMIT`, 16 KiB) so the rate-limit decision can read
+/// grant_type/username before the body is re-attached unchanged — the same
+/// shape as the existing login-body peek (`LOGIN_BODY_PEEK_LIMIT`). A
+/// legitimate new metadata buffer site, not an artifact path: rate_limit.rs
+/// 1 -> 2, total 29 -> 30.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
-    ("src/api/middleware/rate_limit.rs", 1),
+    ("src/api/middleware/rate_limit.rs", 2),
     ("src/main.rs", 1),
     ("src/services/artifactory_client.rs", 1),
     ("src/services/nexus_client.rs", 1),
@@ -450,12 +458,13 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 29,
-        "expected 29 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 30,
+        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
-         + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494); \
+         + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494) \
+         + the /v2/token form peek (#4020, rate_limit.rs +1); \
          got {total}"
     );
 }

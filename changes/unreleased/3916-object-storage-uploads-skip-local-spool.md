@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3916]
+---
+- **Raw `PUT` uploads into S3-, GCS- and Azure-backed repositories no longer spool to local disk** (#3916). Every upload was written to a scratch file under `STORAGE_PATH` before reaching the repository's object storage, so each replica needed local disk proportional to concurrent upload volume. `PUT /api/v1/repositories/{key}/artifacts/{path}` into an object-storage repository now streams the body into a staging object (`generic-upload-staging/<uuid>`) on that repository's own backend (bounded-memory multipart/block upload, digests and the size limit computed on the fly), then promotes it to the content-addressed key with a backend copy and deletes the staging object. Each staging object is tracked in a new `generic_upload_staging` table (migration 248), and the hourly upload cleanup deletes any left more than 24 hours old by an upload that was killed mid-flight. Filesystem repositories, RPM packages (header parse) and repositories with a WASM format plugin keep the local spool, as do the multipart, format-native and chunked upload paths.

@@ -170,7 +170,7 @@ async fn put_manifest(
     content_type: &str,
     body: &[u8],
 ) -> StatusCode {
-    let app = oci_v2::router().with_state(state.clone());
+    let app = oci_v2::router(None).with_state(state.clone());
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/{}/{}/manifests/{}", repo_key, image, reference))

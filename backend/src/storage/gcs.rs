@@ -971,9 +971,21 @@ impl GcsBackend {
 
     /// List objects with optional prefix. Handles pagination via `nextPageToken`.
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's `updated` time.
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         #[derive(serde::Deserialize)]
         struct GcsObject {
             name: String,
+            #[serde(default)]
+            updated: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct GcsListResponse {
@@ -1021,7 +1033,16 @@ impl GcsBackend {
                 AppError::Storage(format!("Failed to parse GCS list response: {}", e))
             })?;
 
-            all_keys.extend(list_response.items.into_iter().map(|o| o.name));
+            all_keys.extend(list_response.items.into_iter().map(|o| {
+                super::ListedKey {
+                    key: o.name,
+                    last_modified: o
+                        .updated
+                        .as_deref()
+                        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+                        .map(|d| d.with_timezone(&chrono::Utc)),
+                }
+            }));
 
             match list_response.next_page_token {
                 Some(pt) => page_token = Some(pt),
@@ -1894,6 +1915,10 @@ impl StorageBackend for GcsBackend {
             expires_in,
             source: PresignedUrlSource::Gcs,
         }))
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
     }
 
     #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "health_check"))]

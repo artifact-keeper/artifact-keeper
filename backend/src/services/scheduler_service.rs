@@ -541,6 +541,82 @@ pub fn spawn_all(
         });
     }
 
+    // Storage scrub (#3910): opt-in (`STORAGE_SCRUB_INTERVAL_SECS` > 0),
+    // report-only, bounded per pass by `STORAGE_SCRUB_MAX_OBJECTS` /
+    // `STORAGE_SCRUB_MAX_BYTES`, resuming from the persisted cursor. The
+    // service's cluster-wide advisory lock keeps replicas (and a concurrent
+    // admin-triggered run) from scrubbing at the same time; a tick that loses
+    // the lock is skipped.
+    if config.storage_scrub_interval_secs > 0 {
+        let db = db.clone();
+        let registry = storage_registry.clone();
+        let every = config.storage_scrub_interval_secs.max(60);
+        let opts = crate::services::storage_scrub_service::ScrubOptions {
+            max_objects: config.storage_scrub_max_objects.max(1),
+            max_bytes: config.storage_scrub_max_bytes.max(1),
+            repair: false,
+            repository_id: None,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(300)).await;
+            let service =
+                crate::services::storage_scrub_service::StorageScrubService::new(db, registry);
+            let mut ticker = interval(Duration::from_secs(every));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match service.run(&opts).await {
+                    Ok(r) if r.corrupt + r.missing > 0 => tracing::error!(
+                        corrupt = r.corrupt,
+                        missing = r.missing,
+                        checked = r.objects_checked,
+                        "Storage scrub found damaged objects; see GET /api/v1/admin/storage-scrub/findings"
+                    ),
+                    Ok(r) => tracing::debug!(checked = r.objects_checked, "Storage scrub pass clean"),
+                    Err(crate::error::AppError::Conflict(_)) => {
+                        tracing::debug!("Storage scrub already running elsewhere; skipping tick")
+                    }
+                    Err(e) => tracing::warn!("Storage scrub pass failed: {}", e),
+                }
+            }
+        });
+    }
+
+    // LDAP directory reconcile (#3830): every `LDAP_SYNC_INTERVAL` seconds
+    // (default 3600, `0` disables) re-read each active LDAP user, re-sync
+    // their LDAP group memberships and admin status, and -- only with
+    // `LDAP_SYNC_DEACTIVATE=true` -- deactivate users the directory no
+    // longer has. One replica runs a pass at a time (advisory lock); the
+    // pass logs its own summary. A pass with no enabled LDAP provider costs
+    // two queries.
+    if let Some(every) = crate::services::ldap_sync_service::sync_interval_from_env() {
+        let db = db.clone();
+        let auth = Arc::new(crate::services::auth_service::AuthService::new(
+            db.clone(),
+            Arc::new(config.clone()),
+        ));
+        let settings = Arc::new(crate::services::ldap_sync_service::settings_from_env());
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(600)).await;
+            let mut ticker = interval(every);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // Each pass runs as its own task so a panic inside it is
+                // reported here instead of ending this loop for good.
+                let (db, auth, settings) = (db.clone(), auth.clone(), settings.clone());
+                let pass = tokio::spawn(async move {
+                    crate::services::ldap_sync_service::run_ldap_sync(&db, &auth, &settings).await
+                });
+                match pass.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("LDAP directory reconcile pass failed: {}", e),
+                    Err(e) => tracing::error!("LDAP directory reconcile pass panicked: {}", e),
+                }
+            }
+        });
+    }
+
     // Storage garbage collection (cron-based, default: hourly)
     {
         let db = db.clone();
@@ -854,6 +930,10 @@ pub fn spawn_all(
         // to the manual admin /cleanup endpoint (gap in merged #1622). Run it on
         // the same hourly cadence and 24h threshold as the session reaper.
         let storage_path = config.storage_path.clone();
+        // #3922: the reaper also purges staged chunk objects of failed,
+        // cancelled and expired sessions, which live in each repository's
+        // storage backend.
+        let upload_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
@@ -862,7 +942,12 @@ pub fn spawn_all(
                 ticker.tick().await;
                 tracing::debug!("Cleaning up expired upload sessions");
 
-                match crate::services::upload_service::UploadService::cleanup_expired(&db).await {
+                match crate::services::upload_service::UploadService::cleanup_expired(
+                    &db,
+                    &upload_registry,
+                )
+                .await
+                {
                     Ok(count) if count > 0 => {
                         tracing::info!("Cleaned up {} expired upload sessions", count);
                     }
@@ -870,6 +955,32 @@ pub fn spawn_all(
                         tracing::warn!("Upload session cleanup failed: {}", e);
                     }
                     _ => {}
+                }
+
+                let scratch = std::path::Path::new(&storage_path).join(".uploads");
+                let stale_scratch =
+                    crate::services::upload_service::sweep_stale_assembly_scratch(&scratch).await;
+                if stale_scratch > 0 {
+                    tracing::info!(
+                        "Removed {} stale chunked-upload scratch file(s)",
+                        stale_scratch
+                    );
+                }
+
+                // #3916: generic uploads staged on object storage by a
+                // replica that died before promoting or deleting them.
+                let stale_staging =
+                    crate::api::handlers::proxy_helpers::sweep_stale_generic_upload_staging(
+                        &db,
+                        &upload_registry,
+                        crate::api::handlers::proxy_helpers::GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS,
+                    )
+                    .await;
+                if stale_staging > 0 {
+                    tracing::info!(
+                        "Removed {} orphaned generic upload staging object(s)",
+                        stale_staging
+                    );
                 }
 
                 let swept =

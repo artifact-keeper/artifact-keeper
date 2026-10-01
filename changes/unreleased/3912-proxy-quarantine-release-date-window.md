@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3912]
+---
+- **Quarantine on proxy repositories now honours the release-date window on the streaming download path, and held proxied artifacts can be released individually** (#3912). Package downloads stream, and the streaming leader previously refused to open the upstream fetch at all while the Package Age Policy was enabled — a 2015 release was held exactly like today's. The leader now reads `Last-Modified` from the streaming response headers and applies the same release-date computation the buffered path uses: a package older than the configured window is served on first fetch, while a fresh one is cached under its hold and answered 409 until the window elapses (polls no longer re-fetch upstream). `proxy_cache_artifacts` gains `quarantine_until` / `quarantine_released_at` columns, and a held entry can be released without disabling the policy via `POST /api/v1/quarantine/proxy-cache/{repo_key}/release` (admin only, keyed on repository + path). Enabling quarantine on a remote repository is allowed again; virtual repositories remain refused because they carry no cache of their own — enable the policy on the member remotes.

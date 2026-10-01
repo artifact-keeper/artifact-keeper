@@ -117,18 +117,22 @@ pub struct ScoreResponse {
     pub last_scan_at: Option<chrono::DateTime<chrono::Utc>>,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
     /// True when the latest applicable scan for this repo errored (#2167).
-    /// The `grade` is floored to `F` while this holds, so clients and the
-    /// release-gate must treat the repo as NOT clean regardless of the numeric
-    /// finding counts. Cleared automatically once a `completed` rescan
-    /// supersedes the failed scan.
+    /// The `grade` letter is floored to `F` while this holds. The floor is
+    /// display-only: `score` is unchanged, and quality gates, promotion rules
+    /// and download policies read the numeric score, so clients that must not
+    /// treat the repo as clean should check this flag. Cleared automatically
+    /// once a `completed` rescan supersedes the failed scan.
     pub has_failed_scan: bool,
-    /// True when the latest completed scan for this repo cataloged NO
-    /// components from a package-archive artifact whose format expects a
-    /// catalog (#4036) — its zero findings mean "nothing was assessed", not
-    /// "clean". The `grade` is floored to `F` while this holds, alongside the
-    /// `has_failed_scan` override, so clients and the release-gate must treat
-    /// the repo as NOT clean. Cleared automatically once a `completed` rescan
-    /// supersedes the not-cataloged scan.
+    /// True when the latest completed scan of some artifact in this repo
+    /// cataloged NO components although its format expects a catalog
+    /// (#4036, #4154): its zero findings mean "nothing was assessed", not
+    /// "clean". The scan row's `scan_completeness_reason` says why. The
+    /// `grade` letter is floored to `F` only for package artifacts (typed
+    /// repositories, and package-shaped archives such as `.whl`/`.jar` in a
+    /// generic one); a plain generic `.zip`/`.tar.gz` sets this flag without
+    /// changing the grade. As with `has_failed_scan`, the floor is display-
+    /// only. Cleared automatically once a `completed` rescan supersedes the
+    /// not-cataloged scan.
     pub has_uncataloged_scan: bool,
 }
 
@@ -315,6 +319,14 @@ pub struct ScanResponse {
     /// satisfaction" in release-gate provenance checks. None for original
     /// (non-reused) scans.
     pub source_scan_id: Option<Uuid>,
+    /// `complete`, `partial` or `not_cataloged` (#4154). A `not_cataloged`
+    /// scan graded nothing; it sets the repository's `has_uncataloged_scan`
+    /// (and floors its grade letter for package artifacts). A `partial` scan
+    /// graded less than the whole artifact.
+    pub scan_completeness: String,
+    /// Why the scan is not `complete`, when known (e.g. which scanner
+    /// cataloged nothing). `None` for complete scans.
+    pub scan_completeness_reason: Option<String>,
     /// #2471: number of `not_applicable` scanner rows folded into this row.
     /// `Some(n)` marks a synthetic *summary* row that collapses `n` redundant
     /// "this scanner does not apply" results (e.g. the image-family scanners
@@ -377,6 +389,8 @@ impl ScanResponse {
             created_at: s.created_at,
             is_reused: s.is_reused,
             source_scan_id: s.source_scan_id,
+            scan_completeness: s.scan_completeness,
+            scan_completeness_reason: s.scan_completeness_reason,
             collapsed_not_applicable_count: None,
             collapsed_scan_types: None,
         }
@@ -5139,6 +5153,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         }
     }
 
@@ -5187,6 +5203,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.artifact_name, None);
@@ -5221,6 +5239,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         let resp = scan_result_to_response(scan, Some("lib".to_string()), None);
         assert_eq!(resp.findings_count, 100);
@@ -5253,6 +5273,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: true,
             source_scan_id: Some(source_id),
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         let resp = scan_result_to_response(scan, Some("artifact".into()), None);
         assert!(resp.is_reused);
@@ -5291,6 +5313,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: true,
             source_scan_id: Some(source_id),
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(
@@ -5334,6 +5358,21 @@ mod tests {
 
     /// Build a `ScanResponse` for a given artifact/scan_type/status. Keeps the
     /// collapse tests terse and independent of a DB.
+    /// #4154: the completeness that floors a repository to F is visible on
+    /// the scan DTO, with its reason, so an F grade is explainable.
+    #[test]
+    fn test_scan_response_carries_scan_completeness_and_reason() {
+        let mut scan = make_scan_result();
+        scan.scan_completeness = "not_cataloged".to_string();
+        scan.scan_completeness_reason = Some("grype cataloged no components".to_string());
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["scan_completeness"], "not_cataloged");
+        assert_eq!(
+            json["scan_completeness_reason"],
+            "grype cataloged no components"
+        );
+    }
+
     fn make_scan_response(artifact_id: Uuid, scan_type: &str, status: &str) -> ScanResponse {
         let mut resp = scan_result_to_response(make_scan_result(), None, None);
         resp.artifact_id = artifact_id;

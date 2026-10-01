@@ -378,6 +378,14 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let layout_error = match &self {
+            Self::Database(message) => crate::services::rpm_layout::database_error(message),
+            Self::Sqlx(error) => crate::services::rpm_layout::database_error(&error.to_string()),
+            _ => None,
+        };
+        if let Some(error) = layout_error {
+            return error.into_response();
+        }
         let (status, code) = self.status_and_code();
         let message = self.user_message();
 

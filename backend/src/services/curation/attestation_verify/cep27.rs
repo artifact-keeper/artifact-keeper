@@ -34,7 +34,18 @@
 //! it compares the cert-bound owner against PyPI's self-asserted
 //! `publisher.repository`, and CEP-27 has no claimed-publisher field to compare
 //! against. See [`super::CONDA_CHECKS`].
-
+//!
+//! # Where it runs
+//!
+//! The CEP-27 upload path (`PUT /conda/{repo}/{subdir}/{filename}/attestation`,
+//! `store_attestation` in the conda handler) calls [`verify_conda_bundle`]
+//! with a digest the server streams out of storage and hashes itself, persists
+//! the outcome under [`VERIFICATION_METADATA_KEY`] next to the stored
+//! attestation so [`record_to_verdict`] can read it back, and — when
+//! `CONDA_ATTESTATION_REQUIRE_VERIFIED` is on (the fail-closed default) —
+//! refuses any attestation that does not verify, storing nothing. Only an
+//! explicit operator opt-out accepts an unverified attestation, and then the
+//! failed record is stored with it so the gap stays auditable.
 use serde_json::Value;
 use sha2::Sha256;
 

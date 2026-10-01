@@ -1132,6 +1132,43 @@ impl AzureBackend {
         Ok(())
     }
 
+    /// Whether the blob now committed at `key` is exactly `expected_len`
+    /// bytes hashing to `expected_sha256` (#3920).
+    ///
+    /// Used only after a lost Put Block List race, to decide whether the
+    /// winner committed the same bytes this upload streamed. The size is
+    /// checked with a HEAD first so a different object is rejected without
+    /// being read; a same-size blob is read back and hashed, because a size
+    /// match alone says nothing about content. Any error reads as "no match"
+    /// so the caller surfaces its original commit failure.
+    async fn committed_blob_matches(
+        &self,
+        key: &str,
+        expected_len: u64,
+        expected_sha256: &str,
+    ) -> bool {
+        match self.size(key).await {
+            Ok(len) if len == expected_len => {}
+            _ => return false,
+        }
+        let mut stream = match StorageBackend::get_stream(self, key).await {
+            Ok(stream) => stream,
+            Err(_) => return false,
+        };
+        let mut hasher = Sha256::new();
+        let mut read: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    read += chunk.len() as u64;
+                    hasher.update(&chunk);
+                }
+                Err(_) => return false,
+            }
+        }
+        read == expected_len && format!("{:x}", hasher.finalize()) == expected_sha256
+    }
+
     /// Handle uncommitted blocks left behind by a failed streaming upload.
     ///
     /// We deliberately do NOT mutate the destination blob to "clean up" the
@@ -1205,6 +1242,14 @@ impl AzureBackend {
     pub fn is_rbac(&self) -> bool {
         matches!(self.auth, AzureAuthMode::TokenCredential { .. })
     }
+}
+
+/// True when a streaming commit failed because Azure no longer holds the
+/// blocks it named: `400 InvalidBlockList`, which is what the loser of two
+/// concurrent Put Block List calls on one blob gets once the winner's commit
+/// discarded every uncommitted block (#3920).
+fn commit_lost_to_concurrent_writer(error: &AppError) -> bool {
+    matches!(error, AppError::Storage(message) if message.contains("InvalidBlockList"))
 }
 
 #[async_trait]
@@ -1427,15 +1472,34 @@ impl StorageBackend for AzureBackend {
             }
         }
 
+        let checksum_sha256 = format!("{:x}", hasher.finalize());
         if block_ids.is_empty() {
             self.put(key, Bytes::new()).await?;
         } else if let Err(e) = self.commit_stream_blocks(key, &block_ids).await {
-            self.report_uncommitted_stream_blocks(key, &block_ids).await;
-            return Err(e);
+            // #3920: a concurrent writer of the same key committed first, and
+            // Azure discarded every uncommitted block of the blob -- ours
+            // included -- so our Put Block List names blocks that no longer
+            // exist. When what they committed is byte-identical to what we
+            // streamed (two uploads of the same content-addressed blob), the
+            // key already holds our bytes and the upload succeeded.
+            if !commit_lost_to_concurrent_writer(&e)
+                || !self
+                    .committed_blob_matches(key, total, &checksum_sha256)
+                    .await
+            {
+                self.report_uncommitted_stream_blocks(key, &block_ids).await;
+                return Err(e);
+            }
+            tracing::info!(
+                key = %key,
+                bytes = total,
+                "Azure Put Block List lost a race to a concurrent writer of identical \
+                 content; treating the committed blob as this upload's result (#3920)"
+            );
         }
 
         Ok(PutStreamResult {
-            checksum_sha256: format!("{:x}", hasher.finalize()),
+            checksum_sha256,
             bytes_written: total,
         })
     }
@@ -2507,6 +2571,97 @@ mod tests {
             0,
             "failed upload must not delete the destination blob (a concurrent writer may own it)"
         );
+    }
+
+    /// Stand up an Azure endpoint on which a concurrent writer has just
+    /// committed `committed` to the key: our Put Block succeeds, but our Put
+    /// Block List answers `400 InvalidBlockList` because the winner's commit
+    /// discarded our uncommitted blocks, exactly as Azure does (#3920). HEAD
+    /// and GET then serve the winner's blob.
+    async fn azure_lost_commit_race_server(committed: &'static [u8]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>InvalidBlockList</Code>\
+                 <Message>The specified block list is invalid.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", committed.len().to_string().as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(committed))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_succeeds_when_concurrent_identical_commit_wins_3920() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+
+        const BODY: &[u8] = b"byte-identical content uploaded by two CI jobs";
+        let server = azure_lost_commit_race_server(BODY).await;
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+
+        let result = StorageBackendTrait::put_stream(
+            &backend,
+            "ab/cd/abcdef",
+            Box::pin(stream::iter([Ok(Bytes::from_static(BODY))])),
+        )
+        .await
+        .expect(
+            "losing the Put Block List race to a writer that committed the same bytes \
+             must not fail the upload (#3920)",
+        );
+        assert_eq!(result.bytes_written, BODY.len() as u64);
+        assert_eq!(
+            result.checksum_sha256,
+            format!("{:x}", Sha256::digest(BODY)),
+            "the reported digest is still the one computed over the streamed bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_still_fails_when_concurrent_commit_differs_3920() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+
+        // Same length, different bytes: a size match alone must not be taken
+        // as "the winner stored our content".
+        let server = azure_lost_commit_race_server(b"other writer's bytes!").await;
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+
+        let result = StorageBackendTrait::put_stream(
+            &backend,
+            "streamed/blob.txt",
+            Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"this upload's bytes!!",
+            ))])),
+        )
+        .await;
+        match result {
+            Err(AppError::Storage(message)) => assert!(
+                message.contains("InvalidBlockList"),
+                "the original commit failure must surface, got: {message}"
+            ),
+            other => panic!("a lost commit to DIFFERENT content must fail, got {other:?}"),
+        }
     }
 
     #[tokio::test]

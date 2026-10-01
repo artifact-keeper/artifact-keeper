@@ -642,7 +642,7 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             "#,
             artifact_id,
             repository_id,
@@ -693,7 +693,7 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             "#,
             artifact_id,
             repository_id,
@@ -744,6 +744,11 @@ impl ScanResultService {
     /// served for an unpinned generic request and vice versa. Callers that do
     /// not pin (every non-npm format today) pass `None`, which restores the
     /// pre-#3442 behavior exactly against other unpinned rows.
+    ///
+    /// #4154: a `not_cataloged` row is never reused. It graded nothing, and
+    /// the orchestrator writes it provisionally while a scan set is still
+    /// running, so it is not a verdict another artifact can inherit; the
+    /// requester runs its own scan instead.
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -758,11 +763,12 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE checksum_sha256 = $1
               AND scan_type = $2
               AND status = 'completed'
+              AND scan_completeness <> 'not_cataloged'
               AND pin_identity IS NOT DISTINCT FROM $5
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
@@ -814,7 +820,7 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE artifact_id = $1
               AND checksum_sha256 = $2
@@ -1029,7 +1035,7 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1059,13 +1065,15 @@ impl ScanResultService {
             INSERT INTO scan_results (
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity
+                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity,
+                scan_completeness, scan_completeness_reason, inventory_status
             )
-            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15,
+                    $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14))
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             "#,
             artifact_id,
             repository_id,
@@ -1084,6 +1092,9 @@ impl ScanResultService {
             // #3604: record the CURRENT request's pin on the reused row so it
             // cannot be handed to a byte-identical upload under a different pin.
             pin_identity,
+            // #4154: the copy inherits the source's completeness verdict.
+            source.scan_completeness,
+            source.scan_completeness_reason,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1159,7 +1170,7 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1195,12 +1206,15 @@ impl ScanResultService {
                 is_reused = true,
                 source_scan_id = $8,
                 scanner_version = $9,
-                pin_identity = $10
+                pin_identity = $10,
+                scan_completeness = $11,
+                scan_completeness_reason = $12,
+                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8)
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             "#,
             target_scan_id,
             findings,
@@ -1215,6 +1229,10 @@ impl ScanResultService {
             // row so a later byte-identical upload under a different pin cannot
             // reuse this verdict.
             pin_identity,
+            // #4154: a reused row inherits the source's completeness verdict,
+            // or a `partial` source would read as an authoritative `complete`.
+            source.scan_completeness,
+            source.scan_completeness_reason,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -1413,7 +1431,7 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             "#,
             artifact_id,
             repository_id,
@@ -1436,7 +1454,7 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE id = $1
             "#,
@@ -1472,7 +1490,7 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
             FROM scan_results
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
@@ -1735,6 +1753,34 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))
     }
+
+    /// Put back the completeness a scan row would have had, after the
+    /// orchestrator wrote it `not_cataloged` provisionally and the finished
+    /// scan set turned out to have assessed the artifact (#4154). Resets the
+    /// inventory status the provisional write marked partial. Runtime query
+    /// (not the macro) so it needs no offline query metadata.
+    pub async fn restore_completeness(
+        &self,
+        scan_id: Uuid,
+        scan_completeness: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE scan_results \
+             SET scan_completeness = $2, \
+                 scan_completeness_reason = $3, \
+                 inventory_status = 'complete' \
+             WHERE id = $1 AND status = 'completed'",
+        )
+        .bind(scan_id)
+        .bind(scan_completeness)
+        .bind(reason)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     ///
     /// Called by the scanner orchestrator when `create_packages` returns
     /// an error: the scan itself succeeded, the SBOM is degraded, and the
@@ -2080,13 +2126,53 @@ impl ScanResultService {
         let has_failed_scan = fail_closed.has_failed;
         let has_uncataloged_scan = fail_closed.has_uncataloged;
 
+        // #4154: only some uncataloged artifacts floor the grade (see
+        // `uncataloged_floors_grade`): every one in a typed repository, and
+        // package-shaped archives in a generic one. A plain generic archive
+        // keeps `has_uncataloged_scan` (and its row's reason) without the
+        // floor. Runtime query: it only runs when the flag is already set.
+        let uncataloged_floors = if has_uncataloged_scan {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                r#"
+                WITH latest_status AS (
+                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                           sr.artifact_id, sr.status, sr.scan_completeness
+                    FROM scan_results sr
+                    JOIN artifacts a ON a.id = sr.artifact_id
+                    WHERE a.repository_id = $1
+                      AND NOT a.is_deleted
+                    ORDER BY sr.artifact_id, sr.scan_type,
+                             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+                )
+                SELECT DISTINCT r.format::text, a.path
+                FROM latest_status ls
+                JOIN artifacts a ON a.id = ls.artifact_id
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE ls.status = 'completed'
+                  AND ls.scan_completeness = 'not_cataloged'
+                "#,
+            )
+            .bind(repository_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            rows.iter().any(|(format, path)| {
+                let filename = path.rsplit('/').next().unwrap_or(path);
+                crate::services::scanner_service::uncataloged_floors_grade(format, filename)
+            })
+        } else {
+            false
+        };
+
         // Grade floor: while a failed scan is unsuperseded, the repo must never
-        // present as clean. Force grade F so both the dashboard and the
-        // release-gate treat "scan errored" as NOT clean, regardless of the
-        // (necessarily incomplete) finding counts from the completed rows.
-        // #4036: an unsuperseded not-cataloged scan is floored the same way —
-        // an artifact whose contents were never cataloged is never grade A.
-        let grade_char = if has_failed_scan || has_uncataloged_scan {
+        // present as clean, so its grade LETTER is forced to F regardless of
+        // the (necessarily incomplete) finding counts from the completed rows.
+        // The floor is display-only: `score` is not changed, and the quality
+        // gates, promotion rules and download policies read the numeric score,
+        // not the letter (#4336 replaces the floors with an explicit status).
+        // #4036: an unsuperseded not-cataloged scan is floored the same way,
+        // narrowed by #4154 to `uncataloged_floors`.
+        let grade_char = if has_failed_scan || uncataloged_floors {
             'F'
         } else {
             grade.as_char()
@@ -2478,6 +2564,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         assert_eq!(result.scan_type, "dependency");
         assert_eq!(result.status, "completed");
@@ -2509,6 +2597,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["scan_type"], "image");
@@ -2539,6 +2629,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_message.as_deref(), Some("Scanner timed out"));
@@ -2566,6 +2658,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: true,
             source_scan_id: Some(source_id),
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         };
         assert!(result.is_reused);
         assert_eq!(result.source_scan_id, Some(source_id));
@@ -2736,6 +2830,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_reused: false,
             source_scan_id: None,
+            scan_completeness: "complete".to_string(),
+            scan_completeness_reason: None,
         }
     }
 
@@ -3725,8 +3821,17 @@ mod tests {
             let svc = ScanResultService::new(pool.clone());
 
             // --- A not-cataloged completed scan -> flag + grade F (NOT A) ---
+            // The test repo is generic, so the artifact must be package-shaped
+            // (#4154: a plain generic archive is flagged but not floored; see
+            // `scanner_service::uncataloged_floors_grade`).
             let repo_id = insert_test_repo(&pool).await;
             let (aid, _) = insert_test_artifact(&pool, repo_id, "pkg.tar.bz2").await;
+            sqlx::query("UPDATE artifacts SET path = $2 WHERE id = $1")
+                .bind(aid)
+                .bind(format!("{}/pkg-1.0-0.conda", aid.as_simple()))
+                .execute(&pool)
+                .await
+                .expect("make the artifact package-shaped");
             let scan = svc
                 .create_scan_result(aid, repo_id, "grype")
                 .await

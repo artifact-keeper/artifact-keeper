@@ -38,6 +38,7 @@ use crate::api::handlers::proxy_helpers;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
+use crate::api::middleware::rate_limit::LoginRateLimitState;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -644,9 +645,9 @@ fn enforce_token_repo_scope_on_read(
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
     requested_key: &str,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
 ) -> Result<(), Response> {
-    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+    if crate::api::middleware::auth::public_read_satisfies_acl(visibility, OCI_READ_ACTION) {
         return Ok(());
     }
     // #3717: past the public short-circuit this is a read of a PRIVATE
@@ -841,7 +842,7 @@ async fn require_oci_repo_read_access(
         repo.id,
         &repo.key,
         requested_repo_key(image_name),
-        repo.is_public,
+        repo.visibility,
     )
     .await
 }
@@ -864,7 +865,7 @@ async fn oci_read_permitted(
     repo_id: Uuid,
     repo_key: &str,
     requested_key: &str,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
 ) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
@@ -872,15 +873,16 @@ async fn oci_read_permitted(
     // so a scoped credential is never worse off than no credential at all on a
     // public repository; the scan-pull pin is not relaxed.
     enforce_scan_pull_scope(claims, repo_key)?;
-    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, is_public)?;
+    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, visibility)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
     }
 
-    // #2329: never leave an authenticated caller below the anonymous read
-    // baseline a public repository already grants.
-    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+    // #2329: never leave an authenticated caller below the read baseline
+    // their repository already grants them -- anonymous access on `public`,
+    // being a resolved principal at all on `internal`.
+    if crate::api::middleware::auth::authenticated_read_satisfies_acl(visibility, OCI_READ_ACTION) {
         return Ok(());
     }
 
@@ -942,8 +944,11 @@ fn push_scope(image_name: &str) -> String {
 // Storage helpers
 // ---------------------------------------------------------------------------
 
+/// Prefix of every final, content-addressed OCI blob key.
+pub(crate) const OCI_BLOB_KEY_PREFIX: &str = "oci-blobs/";
+
 pub(crate) fn blob_storage_key(digest: &str) -> String {
-    format!("oci-blobs/{}", digest)
+    format!("{OCI_BLOB_KEY_PREFIX}{digest}")
 }
 
 /// Storage key for an OCI manifest object: [`OCI_MANIFEST_STORAGE_PREFIX`]
@@ -1284,41 +1289,92 @@ async fn delete_storage_key_best_effort(
 /// no-op write chosen over `DO NOTHING` purely because `DO NOTHING` returns no
 /// row on conflict, and a re-push of a digest whose journal row still exists is
 /// the common case.
+///
+/// Rows are unique per (repository, key) since #3851, so concurrent pushes of
+/// one digest to different repositories each own a row and neither can clear
+/// the other's. The registration runs under the per-key lock shared with the
+/// sweep's tombstone ([`lock_cleanup_journal_key`]) and refuses, retryably,
+/// while another repository's row for the key is tombstoned under a live
+/// claim: that sweep is deleting the object right now, and on a shared-
+/// namespace backend it is the same object this push is about to rely on.
+/// (A tombstoned row in *this* repository is returned as before, and the
+/// commit-time claim reports it.)
+///
+/// [`lock_cleanup_journal_key`]: crate::services::storage_gc_service::lock_cleanup_journal_key
 async fn register_oci_upload_cleanup_key(
     db: &PgPool,
     repository_id: Uuid,
     upload_session_id: Option<Uuid>,
     storage_key: &str,
 ) -> Result<i64, Response> {
-    sqlx::query(
-        r#"
-        INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (storage_key) DO UPDATE SET storage_key = EXCLUDED.storage_key
-        RETURNING id
-        "#,
-    )
-    .bind(repository_id)
-    .bind(upload_session_id)
-    .bind(storage_key)
-    .fetch_one(db)
+    let registered = async {
+        let mut tx = db.begin().await?;
+        crate::services::storage_gc_service::lock_cleanup_journal_key(&mut tx, storage_key).await?;
+        let reclaiming = sqlx::query(
+            "SELECT 1 AS present FROM oci_upload_cleanup_keys c \
+             WHERE c.storage_key = $1 AND c.repository_id <> $2 \
+               AND c.pending_delete_at IS NOT NULL AND c.claim_expires_at > NOW() \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM repositories r \
+                 WHERE r.id = $2 AND r.storage_backend = 'filesystem') \
+             LIMIT 1",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if reclaiming.is_some() {
+            return Ok(None);
+        }
+        let id = sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (repository_id, storage_key)
+                DO UPDATE SET last_registered_at = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(repository_id)
+        .bind(upload_session_id)
+        .bind(storage_key)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(Some(id))
+    }
     .await
-    .map_err(|e| oci_internal_error(&e.to_string()))?
-    .try_get::<i64, _>("id")
-    .map_err(|e| oci_internal_error(&e.to_string()))
+    .map_err(|e| oci_internal_error(&e.to_string()))?;
+
+    registered.ok_or_else(|| {
+        warn!(
+            storage_key = %storage_key,
+            "OCI upload refused: another repository's cleanup sweep is deleting this key (#3851)"
+        );
+        oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BLOB_UPLOAD_INVALID",
+            "blob storage was being reclaimed concurrently; retry the upload",
+        )
+    })
 }
 
 async fn mark_oci_upload_cleanup_key_committed(
     db: &PgPool,
+    repository_id: Uuid,
     storage_key: &str,
 ) -> Result<(), Response> {
+    // Scoped to the pushing repository (#3851): another repository's row for
+    // the same key tracks that repository's own push.
     let result = sqlx::query(
         r#"
         UPDATE oci_upload_cleanup_keys
         SET storage_write_completed_at = COALESCE(storage_write_completed_at, NOW())
-        WHERE storage_key = $1
+        WHERE repository_id = $1 AND storage_key = $2
         "#,
     )
+    .bind(repository_id)
     .bind(storage_key)
     .execute(db)
     .await
@@ -2815,7 +2871,7 @@ struct OciRepoInfo {
     location: crate::storage::StorageLocation,
     repo_type: String,
     upstream_url: Option<String>,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     image: String,
 }
 
@@ -2862,7 +2918,7 @@ fn oci_repo_info_from_member(
         location: member.storage_location(),
         repo_type: member.repo_type.as_str().to_string(),
         upstream_url: member.upstream_url.clone(),
-        is_public: member.is_public,
+        visibility: member.visibility,
         image: image.to_string(),
     }
 }
@@ -2938,17 +2994,35 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// configuration, where the deployment deliberately serves arbitrary keys from
 /// upstream and the key space is no longer this registry's (#3759 review).
 async fn resolve_repo_for_anonymous_capable_read(
-    db: &PgPool,
+    state: &SharedState,
     is_anon: bool,
     base_url: &str,
     scope: &str,
     image_name: &str,
 ) -> Result<OciRepoInfo, Response> {
-    let resolved = resolve_repo_inner(db, image_name)
+    let resolved = resolve_repo_inner(&state.db, image_name)
         .await?
         .map(|(repo, _format)| repo);
     match resolved {
-        Some(repo) if !is_anon || repo.is_public => Ok(repo),
+        Some(repo) if !is_anon || repo.visibility.allows_anonymous_read() => Ok(repo),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // private repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial keeps
+        // the identical challenge, so a caller outside the CIDRs cannot tell
+        // a conditioned repo from a rules-less or nonexistent one; a lookup
+        // error fails closed (challenge, not served).
+        Some(repo) if is_anon => {
+            let granted = state
+                .permission_service
+                .check_anonymous_repository_action(repo.id, OCI_READ_ACTION)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(repo)
+            } else {
+                Err(unauthorized_challenge_with_scope(base_url, Some(scope)))
+            }
+        }
         // Anonymous, and either private or no such key: one branch, one answer.
         _ if is_anon => Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
         _ => Err(oci_name_unknown(requested_repo_key(image_name))),
@@ -3046,7 +3120,7 @@ async fn resolve_repo_inner(
     let select_repo_by_key = |key: String| async move {
         sqlx::query(
             "SELECT id, key, storage_backend, storage_path, format::text as format, \
-             repo_type::text as repo_type, upstream_url, is_public \
+             repo_type::text as repo_type, upstream_url, visibility \
              FROM repositories WHERE key = $1",
         )
         .bind(key)
@@ -3108,7 +3182,7 @@ async fn resolve_repo_inner(
             location,
             repo_type: repo.try_get("repo_type").map_err(map_db_err)?,
             upstream_url: repo.try_get("upstream_url").map_err(map_db_err)?,
-            is_public: repo.try_get("is_public").map_err(map_db_err)?,
+            visibility: repo.try_get("visibility").map_err(map_db_err)?,
             image: effective_image,
         },
         format,
@@ -4051,6 +4125,8 @@ async fn cache_manifest_reference_locally(
             .unwrap_or(cached_reference.as_str());
         let artifact_name = format!("{}:{}", repo.image, row_key);
 
+        // NO-SCAN-ON-UPLOAD: a pull-side listing row for a proxied manifest,
+        // not an upload; proxied content is gated by the digest-keyed proxy scan.
         if let Err(e) = sqlx::query(
             r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -5693,14 +5769,13 @@ async fn handle_head_blob(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5719,7 +5794,7 @@ async fn handle_head_blob(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -5908,14 +5983,13 @@ async fn handle_get_blob(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5934,7 +6008,7 @@ async fn handle_get_blob(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -6174,7 +6248,7 @@ async fn try_mount_blob(
     // target. A public repo confers the read baseline; otherwise the caller
     // needs an actual `read` grant. Token repo-scope applies even to admins.
     enforce_token_repo_scope(claims, source.id).ok()?;
-    if !source.is_public {
+    if !source.visibility.allows_authenticated_read() {
         match state
             .permission_service
             .check_repository_action(claims.sub, source.id, "read", claims.is_admin)
@@ -6329,7 +6403,9 @@ async fn handle_start_upload(
             Ok(r) => r,
             Err(resp) => return resp,
         };
-        if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+        if let Err(resp) =
+            mark_oci_upload_cleanup_key_committed(&state.db, repo_id, &temp_key).await
+        {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic cleanup mark failed")
                 .await;
             return resp;
@@ -6555,7 +6631,7 @@ async fn handle_start_upload(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, repo_id, &temp_key).await {
         delete_storage_key_best_effort(&storage, &temp_key, "upload session cleanup mark failed")
             .await;
         return resp;
@@ -6769,7 +6845,7 @@ async fn handle_patch_upload(
     // journaled-but-unreferenced, and the sweep will not reclaim it until the
     // TTL elapses — long after a healthy request has either inserted the part
     // row or compensated by deleting the object on an error path.
-    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &part_key).await {
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, repo.id, &part_key).await {
         delete_storage_key_best_effort(&storage, &part_key, "PATCH cleanup mark failed").await;
         return resp;
     }
@@ -7404,8 +7480,12 @@ async fn handle_complete_upload(
                 None
             }
             Ok(result) => {
-                if let Err(resp) =
-                    mark_oci_upload_cleanup_key_committed(&state.db, &final_part_key).await
+                if let Err(resp) = mark_oci_upload_cleanup_key_committed(
+                    &state.db,
+                    session.repository_id,
+                    &final_part_key,
+                )
+                .await
                 {
                     delete_storage_key_best_effort(
                         &storage,
@@ -7685,8 +7765,12 @@ async fn handle_complete_upload(
             .await
         {
             Ok(result) => {
-                if let Err(resp) =
-                    mark_oci_upload_cleanup_key_committed(&state.db, &completion_temp_key).await
+                if let Err(resp) = mark_oci_upload_cleanup_key_committed(
+                    &state.db,
+                    session.repository_id,
+                    &completion_temp_key,
+                )
+                .await
                 {
                     delete_storage_key_best_effort(
                         &storage,
@@ -8586,14 +8670,13 @@ async fn handle_head_manifest(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -8612,7 +8695,7 @@ async fn handle_head_manifest(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -9858,14 +9941,13 @@ async fn handle_get_manifest(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -9884,7 +9966,7 @@ async fn handle_get_manifest(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -10603,6 +10685,13 @@ async fn handle_put_manifest(
                 artifact_id,
             )
             .await;
+            crate::services::scanner_service::trigger_scan_on_upload(
+                &state.db,
+                state.scanner_service.clone(),
+                repo_id,
+                artifact_id,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!(
@@ -10693,7 +10782,7 @@ async fn authorize_oci_repo_read(
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
     let repo =
-        resolve_repo_for_anonymous_capable_read(&state.db, is_anon, base_url, &scope, image_name)
+        resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
             .await?;
 
     if let Some(claims) = &claims {
@@ -11645,8 +11734,12 @@ async fn authorized_catalog_repo_ids(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
 ) -> Result<Vec<Uuid>, Response> {
-    let candidates: Vec<(Uuid, String, bool)> = sqlx::query_as(
-        "SELECT DISTINCT r.id, r.key, r.is_public \
+    let candidates: Vec<(
+        Uuid,
+        String,
+        crate::models::repository::RepositoryVisibility,
+    )> = sqlx::query_as(
+        "SELECT DISTINCT r.id, r.key, r.visibility \
          FROM oci_tags t \
          JOIN repositories r ON r.id = t.repository_id",
     )
@@ -11662,7 +11755,7 @@ async fn authorized_catalog_repo_ids(
     })?;
 
     let mut ids = Vec::with_capacity(candidates.len());
-    for (repo_id, repo_key, is_public) in candidates {
+    for (repo_id, repo_key, visibility) in candidates {
         // #3704: the public-read exemption `oci_read_permitted` applies to the
         // token repo-scope ceiling is deliberately NOT extended to `_catalog`.
         // That exemption exists because a credential must never grant less than
@@ -11676,7 +11769,7 @@ async fn authorized_catalog_repo_ids(
         if enforce_token_repo_scope(claims, repo_id).is_err() {
             continue;
         }
-        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, is_public)
+        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, visibility)
             .await
             .is_ok()
         {
@@ -12304,19 +12397,32 @@ async fn catch_all(
 /// caller POST arbitrarily large bodies and exhaust worker memory.
 const TOKEN_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024;
 
-pub fn router() -> Router<SharedState> {
+pub fn router(token_rate_limit: Option<LoginRateLimitState>) -> Router<SharedState> {
+    // #4020: /v2/token is unauthenticated by design (it is where OCI clients
+    // exchange credentials) and is mounted outside `api_v1_routes`, so none of
+    // the API rate-limit layers apply to it. Gate its password-verification
+    // exits (Basic header, OAuth2 password-grant form) behind the login
+    // limiter's per-(username, IP) budget; the refresh-grant and bearer-swap
+    // exits present an already-issued credential and stay unlimited.
+    let token_route = get(token)
+        .post(token)
+        .layer(DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES));
+    let token_route = match token_rate_limit {
+        Some(limit_state) => token_route.layer(axum::middleware::from_fn_with_state(
+            limit_state,
+            crate::api::middleware::rate_limit::token_rate_limit_middleware,
+        )),
+        // Tests build the router without the limiter; production
+        // (`routes::create_router`) always passes `Some`.
+        None => token_route,
+    };
     Router::new()
         .route("/", get(version_check))
         // Apply a tight per-route body limit on the token endpoint, BEFORE
         // the router-level `DefaultBodyLimit::disable()` layer below. axum
         // resolves the most-specific limit, so this caps the bytes the
         // form-credential extractor will buffer (#894 review HIGH).
-        .route(
-            "/token",
-            get(token)
-                .post(token)
-                .layer(DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES)),
-        )
+        .route("/token", token_route)
         .route("/_catalog", get(handle_catalog))
         .fallback(catch_all)
         .layer(DefaultBodyLimit::disable())
@@ -15396,7 +15502,7 @@ mod tests {
             },
             repo_type: repo_type.to_string(),
             upstream_url: upstream_url.map(String::from),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         }
     }
@@ -15694,20 +15800,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // OciRepoInfo.is_public field
+    // OciRepoInfo.visibility field
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_oci_repo_info_default_not_public() {
         let info = make_repo_info("docker-local", "local", None, "myapp");
-        assert!(!info.is_public);
+        assert!(!info.visibility.allows_anonymous_read());
     }
 
     #[test]
     fn test_oci_repo_info_public_flag() {
         let mut info = make_repo_info("docker-pub", "local", None, "myapp");
-        info.is_public = true;
-        assert!(info.is_public);
+        info.visibility = crate::models::repository::RepositoryVisibility::Public;
+        assert!(info.visibility.allows_anonymous_read());
+    }
+
+    /// `internal` is NOT anonymously readable -- the property the `/v2` gate
+    /// keys off -- but IS readable by a resolved principal. Getting these two
+    /// the same way round is the whole point of the state.
+    #[test]
+    fn test_oci_repo_info_internal_is_not_anonymously_readable() {
+        let mut info = make_repo_info("docker-int", "local", None, "myapp");
+        info.visibility = crate::models::repository::RepositoryVisibility::Internal;
+        assert!(!info.visibility.allows_anonymous_read());
+        assert!(info.visibility.allows_authenticated_read());
     }
 
     // -----------------------------------------------------------------------
@@ -16648,6 +16765,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/tmp/test-repo".to_string(),
             upstream_url: upstream_url.map(|s| s.to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -16972,7 +17090,7 @@ mod token_claims_isactive_regression_tests {
             .header("Authorization", format!("Bearer {}", tokens.access_token))
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
 
@@ -17044,7 +17162,7 @@ mod blob_pull_streaming_tests {
         .await
         .expect("insert oci_blobs row");
 
-        let app = fx.router_anon(router());
+        let app = fx.router_anon(router(None));
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{}/myimage/blobs/{}", fx.repo_key, digest))
@@ -17101,7 +17219,7 @@ mod remote_blob_streaming_fallback_tests {
             },
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url.to_string()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: image.to_string(),
         }
     }
@@ -17982,7 +18100,7 @@ mod token_lockout_regression_tests {
             .header("Authorization", basic)
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
@@ -18063,7 +18181,7 @@ mod token_lockout_regression_tests {
             .header("Authorization", basic)
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
@@ -19038,7 +19156,7 @@ mod manifest_digest_db_tests {
         let auth = bearer(&fx).await;
 
         let (status, _, body) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/keycloak/manifests/26.7.0", fx.repo_key),
@@ -19076,7 +19194,7 @@ mod manifest_digest_db_tests {
         let ok_auth = bearer(&ok).await;
 
         let (status, _, body) = send(
-            router().with_state(ok.state.clone()),
+            router(None).with_state(ok.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/keycloak/manifests/26.7.0", ok.repo_key),
@@ -19143,7 +19261,7 @@ mod manifest_digest_db_tests {
 
         // 1. Push body A under tag v1, then overwrite v1 with body B.
         let (st, h, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 manifest_uri("v1"),
@@ -19161,7 +19279,7 @@ mod manifest_digest_db_tests {
             .to_string();
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 manifest_uri("v1"),
@@ -19176,7 +19294,7 @@ mod manifest_digest_db_tests {
         // 1a. Tagged pull still works through the refactored resolver: the tag
         //     now serves B with its stored content type.
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(Method::GET, manifest_uri("v1"), &auth, None, Bytes::new()),
         )
         .await;
@@ -19187,7 +19305,7 @@ mod manifest_digest_db_tests {
         // 2. The tag now resolves to B, but A must still be pullable by digest
         //    (previously 404 MANIFEST_UNKNOWN — the bug).
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 manifest_uri(&digest_a),
@@ -19204,7 +19322,7 @@ mod manifest_digest_db_tests {
 
         // 3. HEAD mirrors GET: same Content-Length, no body.
         let (st, h, b) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::HEAD,
                 manifest_uri(&digest_a),
@@ -19224,7 +19342,7 @@ mod manifest_digest_db_tests {
         // 4. A genuinely-absent digest is still 404.
         let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(Method::GET, manifest_uri(absent), &auth, None, Bytes::new()),
         )
         .await;
@@ -19232,7 +19350,7 @@ mod manifest_digest_db_tests {
 
         // 5. DELETE by digest removes the object; the digest then 404s.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::DELETE,
                 manifest_uri(&digest_a),
@@ -19245,7 +19363,7 @@ mod manifest_digest_db_tests {
         assert_eq!(st, StatusCode::ACCEPTED, "DELETE A by digest");
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 manifest_uri(&digest_a),
@@ -19307,7 +19425,7 @@ mod manifest_digest_db_tests {
             br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:abababababababababababababababababababababababababababababababab","size":1},"layers":[]}"#,
         );
         let (st, h, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/image/manifests/v1", fx.repo_key),
@@ -19328,7 +19446,7 @@ mod manifest_digest_db_tests {
         // committed metadata for the digest: pulling through repo B must 404
         // rather than leak repo A's manifest.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", other_key, digest),
@@ -19353,7 +19471,7 @@ mod manifest_digest_db_tests {
             r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{digest}","size":1}}]}}"#
         ));
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::PUT,
                 format!("/{}/image/manifests/latest", other_key),
@@ -19366,7 +19484,7 @@ mod manifest_digest_db_tests {
         assert_eq!(st, StatusCode::CREATED, "PUT index into repo B");
 
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", other_key, digest),
@@ -19384,7 +19502,7 @@ mod manifest_digest_db_tests {
 
         // Sanity: repo A still serves its own digest.
         let (st, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::GET,
                 format!("/{}/image/manifests/{}", fx.repo_key, digest),
@@ -19491,7 +19609,7 @@ mod manifest_digest_db_tests {
         .expect("create failure trigger");
 
         let (status, _, _) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             req(
                 Method::DELETE,
                 format!("/{}/image/manifests/v1", fx.repo_key),
@@ -19635,13 +19753,13 @@ mod oci_blob_upload_streaming_tests {
         }
 
         fn app(&self) -> Router {
-            router().with_state(self.inner.state.clone())
+            router(None).with_state(self.inner.state.clone())
         }
 
         fn app_with_max_upload_size(&self, max_upload_size_bytes: u64) -> Router {
             let mut state = (*self.inner.state).clone();
             state.config.max_upload_size_bytes = max_upload_size_bytes;
-            router().with_state(Arc::new(state))
+            router(None).with_state(Arc::new(state))
         }
 
         fn storage(&self) -> Arc<dyn crate::storage::StorageBackend> {
@@ -21411,7 +21529,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "first-patch-race".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -21539,7 +21657,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -21606,7 +21724,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"copy without row lock");
         let digest = compute_sha256(&content);
 
@@ -21701,7 +21819,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "delete-repo-on-copy".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"monolithic db failure");
         let digest = compute_sha256(&content);
 
@@ -21772,7 +21890,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends, "reject-blob-insert".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, _headers, body) = send(
             app,
@@ -21935,7 +22053,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-ambiguous-start".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, _headers, body) = send(
             app,
@@ -21990,7 +22108,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-ambiguous-patch".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -22400,7 +22518,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "session-aware".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let content = Bytes::from_static(b"commit-before-cleanup");
         let digest = compute_sha256(&content);
 
@@ -22877,7 +22995,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -22966,7 +23084,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let content = Bytes::from_static(b"A");
         let digest = compute_sha256(&content);
@@ -23335,7 +23453,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let digest = compute_sha256(b"hello world");
 
         let (status, headers, body) = send(
@@ -23799,7 +23917,7 @@ mod oci_blob_upload_streaming_tests {
             backends,
             "recording-cancel-faildelete".into(),
         ));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let (status, headers, body) = send(
             app.clone(),
@@ -24076,7 +24194,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let wrong_digest = compute_sha256(b"hello WORLD");
 
         let (status, headers, body) = send(
@@ -24192,7 +24310,7 @@ mod oci_blob_upload_streaming_tests {
         let mut state = (*f.inner.state).clone();
         state.storage_registry =
             Arc::new(StorageRegistry::new(backends.clone(), "recording".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
         let wrong_digest = compute_sha256(b"hello WORLD");
 
         let (status, headers, body) = send(
@@ -24548,7 +24666,7 @@ mod oci_blob_upload_streaming_tests {
 
         let mut state = (*f.inner.state).clone();
         state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
-        let app = router().with_state(Arc::new(state));
+        let app = router(None).with_state(Arc::new(state));
 
         let content = Bytes::from_static(b"A");
         let digest = compute_sha256(&content);
@@ -24974,7 +25092,7 @@ mod token_service_query_validation_tests {
             .uri("/token?service=victim.example.com")
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -25000,7 +25118,7 @@ mod token_service_query_validation_tests {
             .uri(format!("/token?service={OCI_TOKEN_SERVICE}"))
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -25026,7 +25144,7 @@ mod token_service_query_validation_tests {
             .uri("/token")
             .body(Body::empty())
             .unwrap();
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(req).await.expect("oneshot");
         let status = resp.status();
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -25085,7 +25203,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25204,7 +25322,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25329,7 +25447,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25416,7 +25534,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: "library/redis".to_string(),
         };
         let body = Bytes::from_static(br#"{"schemaVersion":2}"#);
@@ -25475,7 +25593,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25575,7 +25693,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -26075,7 +26193,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Local.as_str().to_string(),
             upstream_url: None,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -26168,7 +26286,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -26267,7 +26385,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -26449,7 +26567,7 @@ mod cross_repo_session_regression_tests {
         let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
         let auth = basic_auth(&username, &password);
 
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start under repo A.
         let req = Request::builder()
@@ -26525,7 +26643,7 @@ mod cross_repo_session_regression_tests {
         let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
         let auth = basic_auth(&username, &password);
 
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26625,7 +26743,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mm").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26722,7 +26840,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "nd").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -26775,7 +26893,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mono").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let body = b"monolithic-blob-payload".to_vec();
         let digest = format!("sha256:{}", sha256_hex(&body));
@@ -26824,7 +26942,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "monomm").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let body = b"monolithic-bytes-A".to_vec();
         // Digest of a DIFFERENT payload so verification must fail.
@@ -26901,7 +27019,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/octet-stream")
             .body(Body::from(body.to_vec()))
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -26938,7 +27056,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -27004,7 +27122,7 @@ mod cross_repo_session_regression_tests {
                 .header("Authorization", &auth)
                 .body(Body::empty())
                 .unwrap();
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -27088,7 +27206,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/octet-stream")
             .body(Body::from(body))
             .unwrap();
-        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::METHOD_NOT_ALLOWED,
@@ -27118,7 +27236,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
             .body(Body::from(manifest))
             .unwrap();
-        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::METHOD_NOT_ALLOWED,
@@ -27188,7 +27306,7 @@ mod cross_repo_session_regression_tests {
             .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
             .body(Body::from(body.clone()))
             .unwrap();
-        let status = router()
+        let status = router(None)
             .with_state(state)
             .oneshot(req)
             .await
@@ -27261,7 +27379,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", "Bearer anonymous")
             .body(Body::empty())
             .unwrap();
-        let (status, body) = tdh::send(router().with_state(state), req).await;
+        let (status, body) = tdh::send(router(None).with_state(state), req).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -27281,6 +27399,64 @@ mod cross_repo_session_regression_tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #3812: the anonymous `/v2` read gate keys off `allows_anonymous_read`,
+    /// so an `internal` repository answers an anonymous pull with the same
+    /// 401 challenge as a private one, while the identical request on a public
+    /// repository (the test above) is served. Drives the real router rather
+    /// than the enum, so reverting the gate to `!is_anon || <any visibility>`
+    /// fails here.
+    #[tokio::test]
+    async fn handle_tags_list_challenges_anon_on_internal_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "anonint").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo internal");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let digest = format!("sha256:{}", "b".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'myimage', 'int1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("seed tag");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/myimage/tags/list", repo_key))
+            .header("Authorization", "Bearer anonymous")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(router(None).with_state(state), req).await;
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous tags/list on an internal repo must be challenged"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("int1"),
+            "the challenge must not carry the tag list"
+        );
+    }
+
     /// #3275: `GET /v2/<name>/blobs/uploads/<uuid>` is the upload-status
     /// probe. The distribution spec requires `204 No Content` with `Location`
     /// and `Range` headers so a client can resume a chunked upload after a
@@ -27295,7 +27471,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "upstat").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // Seed an OPEN session with a real offset, as two prior PATCHes
         // totalling 12 bytes would have left it.
@@ -27387,7 +27563,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "refapi").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         let subject_digest = format!("sha256:{}", "5".repeat(64));
         let referrer = serde_json::json!({
@@ -27609,7 +27785,7 @@ mod cross_repo_session_regression_tests {
         let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mc").await;
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let auth = basic_auth(&username, &password);
-        let make_app = || router().with_state(state.clone());
+        let make_app = || router(None).with_state(state.clone());
 
         // POST start.
         let req = Request::builder()
@@ -27745,7 +27921,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state_post_patch.clone())
             .oneshot(req)
             .await
@@ -27773,7 +27949,7 @@ mod cross_repo_session_regression_tests {
                 .header("Authorization", &auth)
                 .body(Body::from((*chunk).clone()))
                 .unwrap();
-            let resp = router()
+            let resp = router(None)
                 .with_state(state_post_patch.clone())
                 .oneshot(req)
                 .await
@@ -27799,7 +27975,7 @@ mod cross_repo_session_regression_tests {
             .header("Authorization", &auth)
             .body(Body::empty())
             .unwrap();
-        let resp = router()
+        let resp = router(None)
             .with_state(state_complete.clone())
             .oneshot(req)
             .await
@@ -27928,7 +28104,7 @@ mod oci_write_authz_and_size_tests {
             .header("Authorization", bearer)
             .body(Body::empty())
             .unwrap();
-        router()
+        router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -28150,7 +28326,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -28178,7 +28354,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(form_post("/token", String::new()))
             .await
@@ -28203,7 +28379,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
             return;
         };
-        let anonymous = router()
+        let anonymous = router(None)
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
@@ -28213,7 +28389,7 @@ mod token_refresh_grant_tests {
             )
             .await
             .unwrap();
-        let bad_bearer = router()
+        let bad_bearer = router(None)
             .with_state(state)
             .oneshot(
                 Request::builder()
@@ -28243,7 +28419,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _, state, _)) = setup_with_guest_access(true).await else {
             return;
         };
-        let get = router()
+        let get = router(None)
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
@@ -28253,7 +28429,7 @@ mod token_refresh_grant_tests {
             )
             .await
             .unwrap();
-        let post = router()
+        let post = router(None)
             .with_state(state)
             .oneshot(form_post("/token", String::new()))
             .await
@@ -28281,7 +28457,7 @@ mod token_refresh_grant_tests {
         };
 
         // `docker login`: password grant with access_type=offline.
-        let login = router()
+        let login = router(None)
             .with_state(state.clone())
             .oneshot(form_post(
                 "/token",
@@ -28299,7 +28475,7 @@ mod token_refresh_grant_tests {
         // `docker pull`: the refresh grant, carrying no Authorization header.
         let pull_token = match refresh.as_deref() {
             Some(rt) => Some(
-                router()
+                router(None)
                     .with_state(state)
                     .oneshot(form_post(
                         "/token",
@@ -28343,7 +28519,7 @@ mod token_refresh_grant_tests {
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
         );
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let body = read_body(resp).await;
@@ -28365,7 +28541,7 @@ mod token_refresh_grant_tests {
             return;
         };
         let body = format!("grant_type=password&username={username}&password=real-test-password");
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let bytes = read_body_bytes(resp).await;
@@ -28395,7 +28571,7 @@ mod token_refresh_grant_tests {
         let body = format!(
             "grant_type=password&username={username}&password={api_token}&access_type=offline"
         );
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app.oneshot(form_post("/token", body)).await.unwrap();
         let status = resp.status();
         let bytes = read_body_bytes(resp).await;
@@ -28421,7 +28597,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28464,7 +28640,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28529,7 +28705,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28568,7 +28744,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, auth_service)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28620,7 +28796,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(form_post(
                 "/token",
@@ -28638,7 +28814,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, _username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         for body in [
             "grant_type=refresh_token".to_string(),
             "grant_type=refresh_token&refresh_token=".to_string(),
@@ -28666,7 +28842,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper&offline_token=true",
@@ -28692,7 +28868,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper",
@@ -28725,7 +28901,7 @@ mod token_refresh_grant_tests {
             .generate_api_token(user_id, "get-offline-test", vec!["*".to_string()], None)
             .await
             .expect("generate API token");
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
         let resp = app
             .oneshot(get_with_basic(
                 "/token?service=artifact-keeper&offline_token=true",
@@ -28761,7 +28937,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28802,7 +28978,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         let body = format!(
             "grant_type=password&username={username}&password=real-test-password&access_type=offline"
@@ -28846,7 +29022,7 @@ mod token_refresh_grant_tests {
         let Some((pool, user_id, username, state, auth_service)) = setup().await else {
             return;
         };
-        let app = router().with_state(state);
+        let app = router(None).with_state(state);
 
         // Interactive login mints a web-session refresh token.
         let (_user, web) = auth_service
@@ -29032,7 +29208,7 @@ mod proxy_scan_block_tests {
 
     /// Anonymous manifest GET through the real router.
     async fn pull_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{repo_key}/app/manifests/{reference}"))
@@ -29785,7 +29961,7 @@ mod proxy_scan_block_tests {
             },
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url.to_string()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: "app".to_string(),
         }
     }
@@ -30035,7 +30211,7 @@ mod proxy_scan_block_tests {
             location,
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream.uri()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: "app".to_string(),
         };
         let tag = try_upstream_fetch_with_accept(&tag_repo, &state, "manifests/v1", None)
@@ -30369,7 +30545,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30489,7 +30665,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method(method)
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30622,7 +30798,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -30770,7 +30946,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -31455,7 +31631,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -31579,7 +31755,7 @@ mod proxy_scan_block_tests {
             let state = fx.state.clone();
             let key = fx.repo_key.clone();
             async move {
-                let app = tdh::router_anon(router(), state);
+                let app = tdh::router_anon(router(None), state);
                 let req = Request::builder()
                     .method("GET")
                     .uri(format!("/{key}/app/blobs/{d}"))
@@ -32110,7 +32286,7 @@ mod proxy_scan_block_tests {
     /// `pull_manifest`). HEAD is deliberately ungated, which is exactly why it
     /// must not publish catalog rows.
     async fn head_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("HEAD")
             .uri(format!("/{repo_key}/app/manifests/{reference}"))
@@ -33772,7 +33948,7 @@ mod virtual_scan_gate_tests {
     }
 
     async fn pull(state: &SharedState, image_name: &str, kind: &str, reference: &str) -> Response {
-        let app = tdh::router_anon(router(), state.clone());
+        let app = tdh::router_anon(router(None), state.clone());
         let req = Request::builder()
             .method("GET")
             .uri(format!("/{image_name}/{kind}/{reference}"))
@@ -33799,6 +33975,7 @@ mod virtual_scan_gate_tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/member".to_string(),
             upstream_url: Some("https://registry.example.test".to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -35758,7 +35935,7 @@ mod oci_read_authz_tests {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            tdh::send(router().with_state(self.state.clone()), req).await
+            tdh::send(router(None).with_state(self.state.clone()), req).await
         }
 
         /// Like [`Self::call`], but also returns the response headers, for the
@@ -35775,7 +35952,7 @@ mod oci_read_authz_tests {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+            tdh::send_with_headers(router(None).with_state(self.state.clone()), req).await
         }
 
         async fn teardown(&self) {
@@ -36518,7 +36695,7 @@ mod oci_read_authz_tests {
             .body(Body::empty())
             .expect("build request");
         let (version_anon, _, version_headers) =
-            tdh::send_with_headers(router().with_state(f.state.clone()), anon_req).await;
+            tdh::send_with_headers(router(None).with_state(f.state.clone()), anon_req).await;
         let (version_member, _) = f.call("GET", "/".to_string(), &member_bearer).await;
         let (token_status, token_body) = f.call("GET", "/token".to_string(), &member_bearer).await;
         let token: serde_json::Value = serde_json::from_slice(&token_body).unwrap_or_default();
@@ -37277,12 +37454,12 @@ mod oci_error_envelope_db_tests {
                 .expect("build request")
         };
         let (rejected_status, rejected_json, rejected_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             get("/token?service=a&service=b"),
         )
         .await;
         let (ok_status, ok_json, ok_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             get("/token?service=artifact-keeper"),
         )
         .await;
@@ -37360,13 +37537,13 @@ mod oci_error_envelope_db_tests {
         };
 
         let (denied_status, denied_json, denied_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             put(read_token, uri.clone()),
         )
         .await;
 
         let (allowed_status, _allowed_json, allowed_raw) = send(
-            router().with_state(fx.state.clone()),
+            router(None).with_state(fx.state.clone()),
             put(full_token, uri.clone()),
         )
         .await;
@@ -37462,9 +37639,9 @@ mod oci_error_envelope_db_tests {
         };
 
         let (blocked_status, blocked_json, blocked_raw) =
-            send(router().with_state(fx.state.clone()), get("blockedimg")).await;
+            send(router(None).with_state(fx.state.clone()), get("blockedimg")).await;
         let (allowed_status, allowed_json, allowed_raw) =
-            send(router().with_state(fx.state.clone()), get("goodimg")).await;
+            send(router(None).with_state(fx.state.clone()), get("goodimg")).await;
 
         let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
             .bind(fx.repo_id)
@@ -37967,7 +38144,7 @@ mod oci_catalog_read_scope_tests {
                 builder = builder.header(AUTHORIZATION, auth);
             }
             let req = builder.body(Body::empty()).expect("build request");
-            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+            tdh::send_with_headers(router(None).with_state(self.state.clone()), req).await
         }
 
         async fn teardown(&self) {
@@ -38472,7 +38649,7 @@ mod read_scope_db_tests {
             .header(AUTHORIZATION, auth)
             .body(Body::empty())
             .expect("build request");
-        let resp = router()
+        let resp = router(None)
             .with_state(fx.state.clone())
             .oneshot(req)
             .await
@@ -38553,7 +38730,7 @@ mod read_scope_db_tests {
                 .header(AUTHORIZATION, &auth)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(fx.state.clone())
                 .oneshot(req)
                 .await
@@ -38821,7 +38998,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39006,7 +39183,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39178,7 +39355,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39226,7 +39403,7 @@ mod public_read_repo_scope_3704 {
                 .header(AUTHORIZATION, &scoped)
                 .body(Body::empty())
                 .expect("build request");
-            let resp = router()
+            let resp = router(None)
                 .with_state(state.clone())
                 .oneshot(req)
                 .await
@@ -39458,7 +39635,7 @@ mod oci_v2_resolution_db_error_leak_3761 {
             .header(AUTHORIZATION, authorization)
             .body(Body::empty())
             .expect("build request");
-        let resp = router()
+        let resp = router(None)
             .with_state(state.clone())
             .oneshot(req)
             .await
@@ -39839,5 +40016,297 @@ mod token_exchange_expiry_cap_3460 {
         );
 
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod cleanup_journal_repository_scope_tests {
+    //! #3851: the OCI upload cleanup journal is scoped per (repository, key).
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::storage_gc_service::{
+        claim_cleanup_journal_row_for_blob_commit, CleanupJournalClaim,
+    };
+
+    /// Point a test repository at a (never resolved) cloud-style backend
+    /// name, so its objects count as sharing one namespace with other repos.
+    async fn set_shared_namespace_backend(pool: &PgPool, repo: Uuid) {
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("set backend");
+    }
+
+    async fn tombstone_live(pool: &PgPool, journal_id: i64) {
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET pending_delete_at = NOW(), claim_token = gen_random_uuid(), \
+                 claim_expires_at = NOW() + INTERVAL '15 minutes' \
+             WHERE id = $1",
+        )
+        .bind(journal_id)
+        .execute(pool)
+        .await
+        .expect("tombstone as a live sweep would");
+    }
+
+    /// Review B2: B registered BEFORE repository A's sweep tombstoned A's row
+    /// for the same object, so registration could not refuse it. B's commit
+    /// must still refuse (the shared object is being deleted) on a shared
+    /// namespace — and must not on a repo-isolated filesystem backend.
+    #[tokio::test]
+    async fn commit_refuses_while_another_repositorys_sweep_deletes_the_shared_object() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _ka, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let digest = format!("sha256:{}", Uuid::new_v4().simple());
+        let key = blob_storage_key(&digest);
+
+        let journal_a = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B");
+        tombstone_live(&pool, journal_a).await;
+
+        // Filesystem: B has its own copy; A's sweep cannot touch it.
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Cleared
+        );
+
+        // Shared namespace: same interleaving, B must be refused.
+        set_shared_namespace_backend(&pool, repo_a).await;
+        set_shared_namespace_backend(&pool, repo_b).await;
+        sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await
+            .expect("reset B");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key).await;
+        // Registration now sees the foreign sweep and refuses outright...
+        assert!(journal_b.is_err(), "registration during a foreign sweep");
+        // ...and a row registered before the tombstone is refused at commit.
+        let journal_b: i64 = sqlx::query_scalar(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(repo_b)
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("B's pre-tombstone row");
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Doomed,
+            "B must not commit an oci_blobs row for an object being deleted"
+        );
+
+        for repo in [repo_a, repo_b] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Re-registering over a lingering row refreshes `last_registered_at`,
+    /// which the sweep's fresh-sibling guard reads (review B2).
+    #[tokio::test]
+    async fn re_registration_refreshes_the_registration_timestamp() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let key = blob_storage_key(&format!("sha256:{}", Uuid::new_v4().simple()));
+        let id = register_oci_upload_cleanup_key(&pool, repo, None, &key)
+            .await
+            .expect("register");
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET created_at = NOW() - INTERVAL '48 hours', \
+                 last_registered_at = NOW() - INTERVAL '48 hours' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("age row");
+        let again = register_oci_upload_cleanup_key(&pool, repo, None, &key)
+            .await
+            .expect("re-register");
+        assert_eq!(id, again);
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT last_registered_at > NOW() - INTERVAL '1 hour' \
+             FROM oci_upload_cleanup_keys WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+        assert!(
+            fresh,
+            "a new push over an aged row must look live to sweeps"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn commit_blob(
+        pool: &PgPool,
+        journal_id: i64,
+        repository_id: Uuid,
+        key: &str,
+        digest: &str,
+    ) -> CleanupJournalClaim {
+        let mut tx = pool.begin().await.expect("begin");
+        let claim =
+            claim_cleanup_journal_row_for_blob_commit(&mut tx, journal_id, repository_id, key)
+                .await
+                .expect("claim");
+        if claim == CleanupJournalClaim::Cleared {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(repository_id)
+            .bind(digest)
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .expect("insert oci_blobs");
+        }
+        tx.commit().await.expect("commit");
+        claim
+    }
+
+    /// The race from the issue: two concurrent pushes of one digest to two
+    /// repositories, the first commits, and its repository is deleted before
+    /// the second commits. Under the global `UNIQUE(storage_key)` both pushes
+    /// shared one journal row; the winner deleted it, the repository deletion
+    /// took the winner's `oci_blobs` proof row with it, and the second push
+    /// was refused with `503 BLOB_UPLOAD_INVALID` although its upload was
+    /// valid. Each push now owns its own row.
+    #[tokio::test]
+    async fn concurrent_cross_repo_pushes_of_one_digest_both_commit_when_one_repo_is_deleted() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(Uuid::new_v4().as_bytes()).repeat(2)
+        );
+        let key = blob_storage_key(&digest);
+
+        let journal_a = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B");
+        assert_ne!(
+            journal_a, journal_b,
+            "concurrent pushes to different repositories must not share a journal row"
+        );
+
+        assert_eq!(
+            commit_blob(&pool, journal_a, repo_a, &key, &digest).await,
+            CleanupJournalClaim::Cleared
+        );
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("delete the winner's repository");
+
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Cleared,
+            "the second push was valid and must commit"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Same-repository pushes still share one row (the dedup the journal
+    /// protects), and a registration while ANOTHER repository's row for the
+    /// key is tombstoned under a live sweep claim is refused retryably: that
+    /// sweep is deleting the object, which a shared-namespace backend would
+    /// also serve to this push.
+    #[tokio::test]
+    async fn registration_dedups_per_repository_and_refuses_during_a_foreign_sweep() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_b] {
+            set_shared_namespace_backend(&pool, repo).await;
+        }
+        let key = blob_storage_key(&format!("sha256:{}", Uuid::new_v4().simple()));
+
+        let first = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let again = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("re-register A");
+        assert_eq!(first, again, "same repository, same key: one row");
+
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET pending_delete_at = NOW(), claim_token = gen_random_uuid(), \
+                 claim_expires_at = NOW() + INTERVAL '15 minutes' \
+             WHERE id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("tombstone A's row as a live sweep would");
+
+        let refused = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect_err("a foreign live tombstone must refuse the registration");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A lapsed claim (crashed sweep) is not binding.
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys SET claim_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("lapse the claim");
+        let b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B after the claim lapsed");
+        assert_ne!(b, first);
+
+        for repo in [repo_a, repo_b] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
     }
 }

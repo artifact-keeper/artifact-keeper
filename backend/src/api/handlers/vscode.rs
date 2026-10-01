@@ -34,7 +34,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::formats::vscode_extensions::{self, VsixMetadata};
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{RepositoryFormat, RepositoryType, RepositoryVisibility};
 use crate::util::bounded_archive;
 
 // ---------------------------------------------------------------------------
@@ -349,15 +349,28 @@ fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
         .into_response()
 }
 
-fn private_gallery_forbidden(repo: &RepoInfo) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        format!(
+/// The gallery routes are anonymous-only, so any repository that is not
+/// `public` is refused here. The message names the repository's ACTUAL
+/// visibility rather than calling everything "private": an `internal`
+/// repository told it is private sends the operator looking for a grant to
+/// add, when the real reason is that a gallery client cannot present a
+/// credential at all and no grant would help.
+fn non_public_gallery_forbidden(repo: &RepoInfo, visibility: RepositoryVisibility) -> Response {
+    let message = match visibility {
+        // Byte-for-byte the long-standing private refusal: only `internal`
+        // gets the new wording.
+        RepositoryVisibility::Private => format!(
             "VS Code gallery routes are public-only: repository {} is private. Gallery clients cannot present a credential, so private galleries are not supported. Make the repository public or use the /vscode/{}/extensions/... routes.",
             repo.key, repo.key
         ),
-    )
-        .into_response()
+        _ => format!(
+            "VS Code gallery routes are public-only: repository {} is {}. Gallery clients cannot present a credential, so only an anonymously readable repository can serve them — `internal` is not enough, because there is no principal to resolve. Make the repository public or use the /vscode/{}/extensions/... routes.",
+            repo.key,
+            visibility.as_str(),
+            repo.key
+        ),
+    };
+    (StatusCode::FORBIDDEN, message).into_response()
 }
 
 /// The gate every gallery route shares: a servable repository type, and public.
@@ -375,15 +388,20 @@ async fn gallery_gate(db: &PgPool, repo: &RepoInfo) -> Result<(), Response> {
     {
         return Err(unsupported_gallery_repo_type(repo));
     }
-    let is_public =
-        sqlx::query_scalar::<_, bool>("SELECT is_public FROM repositories WHERE id = $1")
-            .bind(repo.id)
-            .fetch_optional(db)
-            .await
-            .map_err(crate::api::handlers::db_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-    if !is_public {
-        return Err(private_gallery_forbidden(repo));
+    // The predicate is `allows_anonymous_read`, which is the same decision the
+    // `is_public` mirror produced — `internal` is refused here exactly as
+    // `private` is. Reading `visibility` rather than the boolean is what lets
+    // the refusal say which state the repository is actually in.
+    let visibility = sqlx::query_scalar::<_, RepositoryVisibility>(
+        "SELECT visibility FROM repositories WHERE id = $1",
+    )
+    .bind(repo.id)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+    if !visibility.allows_anonymous_read() {
+        return Err(non_public_gallery_forbidden(repo, visibility));
     }
     Ok(())
 }
@@ -2795,16 +2813,17 @@ fn build_scanned_gallery_response(
         .expect("valid scanned VSIX response")
 }
 
-/// Inline scan-and-block for a proxied VSIX (#3254).
+/// Inline scan-and-block for a proxied VSIX (#3254), on the generic gate
+/// ([`proxy_helpers::serve_scanned_proxy_file`], #4098).
 ///
 /// Runs ONLY when scan-on-proxy is enabled; the caller keeps the untouched
-/// streaming path otherwise. Flow mirrors npm and PyPI exactly: buffered capped
-/// fetch (cache-first, so a repeat pull is answered from the proxy cache with
-/// no upstream hit) -> content digest -> the shared digest-keyed verdict gate
-/// -> serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
+/// streaming path otherwise. Same flow as npm and PyPI: buffered capped fetch
+/// (cache-first) -> content digest -> the shared digest-keyed verdict gate ->
+/// serve / 403 blocked / 423 locked per the repo's fail-open/closed action.
 ///
-/// The identity is [`ProxyScanIdentity::NotApplicable`]: a VSIX is a zip whose
-/// contents the CVE engine catalogs directly, and there is no
+/// The identity is [`proxy_helpers::ProxyScanIdentity::NotApplicable`]: a
+/// VSIX is a zip whose contents the CVE engine catalogs
+/// directly, and there is no
 /// [`crate::services::scanner_service::ComponentEcosystem`] to pin a
 /// `publisher.extension@version` coordinate to, so this format supplies no
 /// component to grade. That is the pre-#3003 posture the gate already
@@ -2821,141 +2840,93 @@ async fn serve_scanned_gallery_package(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let filename = build_vsix_filename(coordinate.publisher, coordinate.name, coordinate.version);
-    let gated_repo = proxy_helpers::build_remote_repo_with_format(
-        repo.id,
-        coordinate.repo_key,
-        source.upstream_url,
-        RepositoryFormat::Vscode,
-    );
-    let (bytes, content_type, content_encoding) = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &gated_repo,
-            source.upstream_url,
-            source.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
-        Ok(triple) => triple,
-        Err(error) if proxy_helpers::is_over_cap_error(&error) => {
-            // Over the byte cap: never buffer unbounded. Fail-closed withholds;
-            // fail-open falls back to the streaming path, loudly.
-            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
-                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-closed -> 423"
-                    );
-                    Err(proxy_helpers::scan_pending_locked_response(&filename))
-                }
-                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
-                    tracing::warn!(
-                        repo_id = %repo.id, file = %filename,
-                        "proxied VSIX exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
-                    );
-                    let mut response =
-                        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
-                            proxy,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.upstream_url,
-                            source.upstream_url,
-                            source.cache_path,
-                            source.default_content_type,
-                            RepositoryFormat::Vscode,
-                        )
-                        .await?;
-                    if let Some(ctx) = ctx {
-                        proxy_helpers::record_proxy_download(
-                            state,
-                            repo.id,
-                            coordinate.repo_key,
-                            source.cache_path,
-                            ctx,
-                        )
-                        .await;
-                    }
-                    response
-                        .headers_mut()
-                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
-                    Ok(response)
-                }
-            };
-        }
-        Err(error) => return Err(error.into_response()),
-    };
-
-    let digest = proxy_helpers::sha256_hex(&bytes);
-    let synthetic = vscode_synthetic_artifact(repo.id, &filename, &digest, bytes.len() as i64);
-    match proxy_helpers::gate_proxy_scan_serve(
-        state,
-        repo.id,
-        &filename,
-        &digest,
-        synthetic,
-        &bytes,
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id: repo.id,
+        repo_key: coordinate.repo_key,
+        fetch_base: source.upstream_url,
+        format: RepositoryFormat::Vscode,
+        source_path: source.upstream_url,
+        cache_path: source.cache_path,
+        filename: &filename,
         action,
         severity_gate,
-        proxy_helpers::ProxyScanIdentity::NotApplicable,
-        proxy_helpers::ProxyScanMode::File,
-    )
-    .await
-    {
-        proxy_helpers::ProxyScanServeOutcome::Deny(response) => Err(response),
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
-            if let Some(ctx) = ctx {
-                proxy_helpers::record_proxy_download(
-                    state,
-                    repo.id,
-                    coordinate.repo_key,
-                    source.cache_path,
-                    ctx,
-                )
-                .await;
-            }
-            Ok(build_scanned_gallery_response(
-                &filename,
-                bytes,
-                content_type,
-                content_encoding.as_deref(),
-                source.default_content_type,
-                &digest,
-                pending,
-            ))
-        }
-    }
+        ctx,
+    };
+    let package = VscodeScannedPackage {
+        proxy,
+        default_content_type: source.default_content_type,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &package).await
 }
 
-/// The scan identity for buffered VSIX bytes. The filename already encodes the
-/// full `publisher.extension-version.vsix` coordinate, which is what the
-/// proxy-scan listing renders; `version` stays `None` for the same reason npm's
-/// synthetic artifact leaves it unset, and the storage key is empty because
-/// nothing local owns these bytes.
-fn vscode_synthetic_artifact(
-    repo_id: uuid::Uuid,
-    filename: &str,
-    digest: &str,
-    size: i64,
-) -> crate::models::artifact::Artifact {
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: uuid::Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.to_string(),
-        name: filename.to_string(),
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: "application/vsix".to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
+/// The VS Code half of the generic proxy scan gate. The wrapper records the
+/// download on both serve arms, including
+/// [`proxy_helpers::ScannedProxyFile::serve_unscanned_stream`].
+struct VscodeScannedPackage<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    default_content_type: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for VscodeScannedPackage<'_> {
+    const LABEL: &'static str = "vsix";
+
+    /// The filename already encodes the full `publisher.extension-version.vsix`
+    /// coordinate, which is what the proxy-scan listing renders; the version
+    /// stays `None` for the same reason npm's synthetic artifact leaves it
+    /// unset.
+    fn synthetic_content_type(_filename: &str) -> String {
+        "application/vsix".to_string()
+    }
+
+    /// No coordinate to pin: a VSIX is a zip the CVE engine catalogs directly,
+    /// and no `ComponentEcosystem` names a `publisher.extension@version`.
+    fn identity(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        proxy_helpers::ProxyScanIdentity::NotApplicable
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // fail-open fallback after it resolves (#4098). Needed because the
+        // #3446 gate attributes this call to the impl method around it.
+        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            req.fetch_base,
+            req.source_path,
+            req.cache_path,
+            self.default_content_type,
+            RepositoryFormat::Vscode,
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        build_scanned_gallery_response(
+            req.filename,
+            body.bytes,
+            body.content_type,
+            body.content_encoding.as_deref(),
+            self.default_content_type,
+            &body.digest,
+            pending,
+        )
     }
 }
 
@@ -3803,6 +3774,180 @@ fn legacy_download_upstream_path(
     ))
 }
 
+/// The coordinate of one legacy `/extensions/.../download` VSIX request.
+struct LegacyVsixRequest<'a> {
+    /// Upstream path, also the proxy-cache key the streaming route uses.
+    upstream_path: &'a str,
+    filename: &'a str,
+    ctx: &'a crate::api::middleware::download_telemetry::DownloadContext,
+}
+
+/// The legacy route's scanned Remote serve (#4099): the gallery's
+/// [`VscodeScannedPackage`] over the legacy upstream path, cached under the
+/// same key the streaming route commits to.
+async fn serve_scanned_legacy_vsix(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    legacy: &LegacyVsixRequest<'_>,
+    (action, severity_gate): (
+        crate::services::proxy_scan_service::ProxyScanAction,
+        crate::services::proxy_scan_service::ProxySeverityGate,
+    ),
+) -> Result<Response, Response> {
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Vscode,
+        source_path: legacy.upstream_path,
+        cache_path: legacy.upstream_path,
+        filename: legacy.filename,
+        action,
+        severity_gate,
+        ctx: Some(legacy.ctx),
+    };
+    let package = VscodeScannedPackage {
+        proxy,
+        default_content_type: "application/octet-stream",
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &package).await
+}
+
+/// The legacy route's Virtual walk with scan-on-proxy (#4099).
+///
+/// `None` when no member the caller may read has scanning enabled under the
+/// stricter-of-two policy: the caller then takes the untouched resolver.
+/// Otherwise members are walked in strict priority order. Runs of members
+/// that do not scan (hosted members, unscanned remotes) go through the shared
+/// resolver exactly as before; each scanning Remote member is served through
+/// the generic gate under its own context, where a 403 (vulnerable), 409
+/// (quarantine hold) or 423 (inconclusive, fail-closed) is definitive and any
+/// other failure falls through to the next member — so neither a
+/// lower-priority remote can shadow a hosted copy nor an unscanned path serve
+/// a scanning member's bytes.
+async fn serve_scanned_legacy_virtual_vsix(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_id: uuid::Uuid,
+    legacy: &LegacyVsixRequest<'_>,
+    extension_id: &str,
+    version: &str,
+) -> Option<Result<Response, Response>> {
+    let proxy = state.proxy_service.as_deref()?;
+    let members = match proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await
+    {
+        Ok(members) => members,
+        Err(resp) => return Some(Err(resp)),
+    };
+    let mut policies = Vec::with_capacity(members.len());
+    for member in &members {
+        let policy = if member.repo_type == RepositoryType::Remote && member.upstream_url.is_some()
+        {
+            let (enabled, action, severity_gate) =
+                proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, member.id)
+                    .await;
+            enabled.then_some((action, severity_gate))
+        } else {
+            None
+        };
+        policies.push(policy);
+    }
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let mut unscanned = Vec::new();
+    for (member, policy) in members.into_iter().zip(policies) {
+        let Some(policy) = policy else {
+            unscanned.push(member);
+            continue;
+        };
+        let run = std::mem::take(&mut unscanned);
+        if let Some(served) =
+            resolve_legacy_vsix_unscanned(state, proxy, run, legacy, extension_id, version).await
+        {
+            return Some(served);
+        }
+        let upstream_url = member.upstream_url.as_deref().unwrap_or_default();
+        match serve_scanned_legacy_vsix(
+            state,
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            legacy,
+            policy,
+        )
+        .await
+        {
+            Ok(resp) => return Some(Ok(resp)),
+            // 403 vulnerable / 409 quarantine hold / 423 inconclusive are this
+            // member's verdict on bytes it holds: final, never a miss.
+            Err(resp)
+                if proxy_helpers::is_member_policy_block_response(&resp)
+                    || resp.status() == StatusCode::LOCKED =>
+            {
+                return Some(Err(resp))
+            }
+            Err(resp) => {
+                tracing::debug!(
+                    member_key = %member.key, status = %resp.status(),
+                    "scanned legacy VSIX member did not serve; trying next member"
+                );
+            }
+        }
+    }
+    Some(
+        resolve_legacy_vsix_unscanned(state, proxy, unscanned, legacy, extension_id, version)
+            .await
+            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
+    )
+}
+
+/// One run of non-scanning members through the shared resolver. `None` is a
+/// miss (try the next member); a hit or a member's own policy block is final.
+async fn resolve_legacy_vsix_unscanned(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    members: Vec<crate::models::repository::Repository>,
+    legacy: &LegacyVsixRequest<'_>,
+    extension_id: &str,
+    version: &str,
+) -> Option<Result<Response, Response>> {
+    if members.is_empty() {
+        return None;
+    }
+    let result = proxy_helpers::resolve_virtual_download_from_members(
+        members,
+        Some(proxy),
+        legacy.upstream_path,
+        |member_id, location| async move {
+            proxy_helpers::local_fetch_by_name_version(
+                &state.db,
+                state,
+                member_id,
+                &location,
+                extension_id,
+                version,
+            )
+            .await
+        },
+    )
+    .await;
+    match result {
+        Ok(result) => Some(proxy_helpers::stream_fetch_result(
+            result,
+            "application/octet-stream",
+            None,
+        )),
+        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
+        Err(_) => None,
+    }
+}
+
 async fn download_vsix(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -3858,6 +4003,35 @@ async fn download_vsix(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    // #4099: the legacy route is a second door to the same
+                    // VSIX, so scan-on-proxy gates it exactly as it gates the
+                    // gallery package route.
+                    if crate::services::scan_config_service::ScanConfigService::new(
+                        state.db.clone(),
+                    )
+                    .is_proxy_scan_enabled(repo.id)
+                    .await
+                    .unwrap_or(false)
+                    {
+                        let (action, severity_gate) =
+                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+                        let filename = build_vsix_filename(&publisher, &name, &version);
+                        let legacy = LegacyVsixRequest {
+                            upstream_path: &upstream_path,
+                            filename: &filename,
+                            ctx: &ctx,
+                        };
+                        return serve_scanned_legacy_vsix(
+                            &state,
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &legacy,
+                            (action, severity_gate),
+                        )
+                        .await;
+                    }
                     // #1608 Phase 4: stream the extension archive (.vsix) to the
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole extension in memory. Single-flight via
@@ -3890,6 +4064,24 @@ async fn download_vsix(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                let filename = build_vsix_filename(&publisher, &name, &version);
+                let legacy = LegacyVsixRequest {
+                    upstream_path: &upstream_path,
+                    filename: &filename,
+                    ctx: &ctx,
+                };
+                if let Some(scanned) = serve_scanned_legacy_virtual_vsix(
+                    &state,
+                    auth.as_ref(),
+                    repo.id,
+                    &legacy,
+                    &extension_id,
+                    &version,
+                )
+                .await
+                {
+                    return scanned;
+                }
                 let db = state.db.clone();
                 let vname = extension_id.clone();
                 let vversion = version.clone();
@@ -4095,6 +4287,13 @@ async fn publish_extension(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     let _ = sqlx::query!(
         r#"
@@ -6063,6 +6262,59 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3813: an `internal` repository is still refused, and the refusal says
+    /// `internal`.
+    ///
+    /// The gate read the deprecated `is_public` mirror, so every non-public
+    /// state was reported as "private". For an internal repository that is
+    /// doubly wrong: it names a state the repository is not in, and it points
+    /// the operator at a remedy that cannot work, since a gallery client
+    /// presents no credential and no grant would help. The decision itself is
+    /// unchanged — `allows_anonymous_read()` refuses `internal` exactly as
+    /// `is_public = false` did — which is why the status assertion below is the
+    /// same one the private test makes.
+    #[tokio::test]
+    async fn gallery_routes_reject_internal_remote_and_name_the_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make Remote gallery repository internal");
+
+        let bearer = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut request = tdh::get(format!("/vscode/{}/gallery/manifest", fx.repo_key));
+        request.headers_mut().insert(
+            "authorization",
+            bearer
+                .parse::<axum::http::HeaderValue>()
+                .expect("valid bearer header"),
+        );
+        let (status, body) = tdh::send(app, request).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "internal must be refused by the public-only gallery contract, \
+             exactly as private is"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("is internal"),
+            "the refusal must name the repository's actual visibility, got: {text}"
+        );
+        assert!(
+            !text.contains("is private"),
+            "an internal repository must not be described as private: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn gallery_routes_reject_percent_decoded_unsafe_coordinates_before_proxying() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7250,6 +7502,196 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// Seed a vulnerable verdict for `bytes` (#4099 legacy-route tests).
+    async fn seed_vulnerable_verdict(
+        pool: &sqlx::PgPool,
+        bytes: &[u8],
+        repo_id: uuid::Uuid,
+    ) -> String {
+        let digest = proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes));
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        digest
+    }
+
+    async fn drop_verdict(pool: &sqlx::PgPool, digest: &str) {
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// #4099: the legacy `/extensions/.../download` route is a second door to
+    /// the same VSIX, so scan-on-proxy must gate it on a Remote exactly as it
+    /// gates the gallery package route.
+    #[tokio::test]
+    async fn legacy_remote_download_honors_scan_on_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let vsix = format!("legacy-vulnerable-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/legacy/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.clone()))
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = seed_vulnerable_verdict(&fx.pool, &vsix, fx.repo_id).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/extensions/acme/legacy/1.0.0/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], "acme.legacy-1.0.0.vsix");
+
+        drop_verdict(&fx.pool, &digest).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// #4099: the legacy route's Virtual branch scans a scanning member's bytes
+    /// instead of streaming them through the shared resolver, and still serves
+    /// a clean extension.
+    #[tokio::test]
+    async fn legacy_virtual_download_honors_member_scan_on_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bad = format!("legacy-virtual-bad-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        let good = format!("legacy-virtual-good-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/bad/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bad.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/extensions/acme/good/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(good.clone()))
+            .mount(&server)
+            .await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "vscode", &server.uri()).await;
+        // Fail-open so the clean (unknown-digest) pull is served, loudly pending.
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_open").await;
+        let digest = seed_vulnerable_verdict(&fx.pool, &bad, remote_id).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+        let get = |name: &str| {
+            tdh::get(format!(
+                "/{virtual_key}/extensions/acme/{name}/1.0.0/download"
+            ))
+        };
+
+        let (status, _) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), get("bad")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "vulnerable member bytes are blocked"
+        );
+
+        let (status, body) = tdh::send(tdh::router_anon(super::router(), state), get("good")).await;
+        assert_eq!(status, StatusCode::OK, "a clean extension still serves");
+        assert_eq!(&body[..], &good[..]);
+
+        drop_verdict(&fx.pool, &digest).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// A scanning member's quarantine hold (409) is that member's verdict on
+    /// bytes it holds: the legacy Virtual walk stops there instead of serving
+    /// the same extension from a lower-priority member.
+    #[tokio::test]
+    async fn legacy_virtual_download_stops_at_a_quarantined_scanning_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        let vsix = format!("legacy-held-vsix-{}", uuid::Uuid::new_v4()).into_bytes();
+        let route = "/extensions/acme/held/1.0.0/download";
+        let held = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.clone()))
+            .mount(&held)
+            .await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix))
+            .expect(0)
+            .mount(&fallback)
+            .await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "vscode", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "vscode", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            tdh::enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage = fx.storage_dir.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}{route}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
+
+        fallback.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn legacy_remote_download_rejects_unsafe_decoded_path_segments() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7947,6 +8389,61 @@ mod tests {
         hasher2.update(data);
         let hash2 = format!("{:x}", hasher2.finalize());
         assert_eq!(hash, hash2);
+    }
+
+    /// #3813: the private refusal body is unchanged from before the
+    /// visibility axis existed; only `internal` gets the new wording.
+    #[tokio::test]
+    async fn non_public_gallery_forbidden_keeps_the_private_body_verbatim() {
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "vsx".to_string(),
+            storage_path: "/data/vsx".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: None,
+            format: "vscode".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        };
+        #[allow(clippy::disallowed_methods)]
+        // streaming-invariant: test helper exempt — buffering a small error body in a test assertion is not an artifact path (#1608)
+        async fn body(resp: Response) -> (StatusCode, String) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        let (status, private) = body(non_public_gallery_forbidden(
+            &repo,
+            RepositoryVisibility::Private,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            private,
+            "VS Code gallery routes are public-only: repository vsx is private. Gallery clients \
+             cannot present a credential, so private galleries are not supported. Make the \
+             repository public or use the /vscode/vsx/extensions/... routes."
+        );
+
+        let (status, internal) = body(non_public_gallery_forbidden(
+            &repo,
+            RepositoryVisibility::Internal,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            internal.contains("repository vsx is internal"),
+            "{internal}"
+        );
+        assert!(!internal.contains("is private"), "{internal}");
     }
 
     // -----------------------------------------------------------------------

@@ -602,6 +602,74 @@ impl ProxyScanService {
         Ok(())
     }
 
+    /// Record how complete the inventory just written by
+    /// [`record_packages`](Self::record_packages) is (#4096), on the verdict row
+    /// for `(checksum_sha256, scan_type)`.
+    ///
+    /// `None` means the CVE-authoritative scanner read every target it found;
+    /// `Some("partial")` means it saw at least one it could not parse (#1153).
+    /// Written unconditionally (a later complete scan clears an earlier
+    /// `partial`), but only by the caller that also wrote the inventory, so the
+    /// marker always describes the scan whose packages the SBOM is built from:
+    /// a rescan that reports no packages leaves both the inventory and its
+    /// completeness alone.
+    ///
+    /// A no-op when no verdict row exists (its upsert failed); the SBOM then
+    /// renders without a marker until the digest is scanned again, exactly as
+    /// for a verdict recorded before migration 252. Runtime query (no macro)
+    /// so this adds no offline sqlx data.
+    pub async fn record_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        scan_completeness: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proxy_scan_results
+            SET scan_completeness = $3
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(scan_completeness)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// The completeness recorded by
+    /// [`record_inventory_completeness`](Self::record_inventory_completeness)
+    /// for a digest's inventory, for the proxy SBOM's completeness marker.
+    ///
+    /// `None` when complete, when no verdict row exists, and for verdicts
+    /// recorded before migration 252. `complete` is also folded to `None` so
+    /// a complete inventory renders byte-identically to the hosted path's
+    /// complete SBOMs (no marker).
+    pub async fn fetch_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<String>> {
+        let value: Option<Option<String>> = sqlx::query_scalar(
+            r#"
+            SELECT scan_completeness
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(value.flatten().filter(|c| c != "complete"))
+    }
+
     /// Read back the inventory for a digest, for SBOM generation.
     ///
     /// Filtered on `scan_type` because the uniqueness key includes it: an
@@ -1144,6 +1212,124 @@ mod tests {
             .await
             .expect("lookup other type")
             .is_none());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// #4096: the inventory completeness round-trips through the verdict row,
+    /// a later complete scan clears an earlier `partial`, `complete` reads back
+    /// as `None` (no marker), and a digest with no verdict row reads `None`
+    /// instead of erroring.
+    #[tokio::test]
+    async fn inventory_completeness_roundtrip_and_clear() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+
+        // No verdict row: the write is a no-op and the read is None.
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("no-op write");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch missing"),
+            None
+        );
+
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.0-test"),
+            None,
+        )
+        .await
+        .expect("record verdict");
+        // A verdict recorded without a completeness (pre-252 shape) is None.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch unset"),
+            None
+        );
+
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("record partial");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch partial")
+                .as_deref(),
+            Some("partial")
+        );
+        // Scoped by scan type like the inventory itself.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "trivy")
+                .await
+                .expect("fetch other type"),
+            None
+        );
+
+        // A re-upserted verdict does not erase it: only the inventory writer
+        // owns this column.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.1-test"),
+            None,
+        )
+        .await
+        .expect("re-record verdict");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch after upsert")
+                .as_deref(),
+            Some("partial")
+        );
+
+        // A later complete inventory clears it; an explicit "complete" also
+        // reads back as None so the SBOM carries no marker.
+        svc.record_inventory_completeness(&digest, "grype", None)
+            .await
+            .expect("record complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch cleared"),
+            None
+        );
+        svc.record_inventory_completeness(&digest, "grype", Some("complete"))
+            .await
+            .expect("record explicit complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch explicit complete"),
+            None
+        );
 
         sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
             .bind(&digest)

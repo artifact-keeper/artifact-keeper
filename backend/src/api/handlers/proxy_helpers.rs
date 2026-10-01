@@ -14,7 +14,7 @@ use crate::api::AppState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 pub use crate::services::proxy_service::StreamingFetchResult;
@@ -258,6 +258,11 @@ pub async fn resolve_repo_by_key(
 /// local_fetch helpers.
 pub(crate) fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
     let text = e.to_string();
+    if label == "Database" {
+        if let Some(error) = crate::services::rpm_layout::database_error(&text) {
+            return error.into_response();
+        }
+    }
     // A saturated sqlx pool is a transient capacity event, not a server fault.
     // Every local/virtual-member artifact-lookup helper funnels DB errors
     // through here, so route pool timeouts via map_db_err to surface 503 +
@@ -922,10 +927,37 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     }
 }
 
+/// Outcome of a capped buffered-metadata GET, keeping the byte-ceiling abort
+/// distinguishable from every other upstream failure — the GET sibling of
+/// [`CappedMetadataPost`] (#4149).
+///
+/// The ceiling abort is a statement about the *size* of what upstream would
+/// have sent, not a fault: a handler with a streaming fallback must be able
+/// to act on it without re-deriving the cause from a rendered response (and
+/// silently reclassifying a genuine upstream 404/503 as "too large"). Every
+/// other failure therefore stays a rendered `Response`.
+pub enum CappedMetadataGet {
+    Buffered {
+        content: Bytes,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        budget_permit: OwnedSemaphorePermit,
+    },
+    /// Upstream exceeded `max`; nothing past the ceiling was ever buffered,
+    /// and no truncated body was persisted (the capped read aborts BEFORE any
+    /// cache write — see `ProxyService::read_upstream_response_capped`).
+    OverCap,
+}
+
 /// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
 /// `Content-Encoding` for handlers that forward the buffered bytes to the client
 /// and must declare the coding — see
 /// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
+///
+/// The byte-ceiling abort is reported as [`CappedMetadataGet::OverCap`] instead
+/// of a rendered 502, so a handler with a streaming fallback for oversized
+/// documents (conda repodata, #4149) can branch on it; a handler without one
+/// renders the same 502 the pre-#4149 helper produced.
 pub async fn proxy_fetch_capped_budgeted_with_encoding(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -933,21 +965,22 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
     upstream_url: &str,
     path: &str,
     max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type, content_encoding) =
-        proxy_fetch_capped_with_cache_key_and_accept_encoded(
-            proxy_service,
-            repo_id,
-            repo_key,
-            upstream_url,
-            path,
-            path,
-            None,
-            max,
-        )
-        .await?;
-    Ok((content, content_type, content_encoding, permit))
+) -> Result<CappedMetadataGet, Response> {
+    let budget_permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    match proxy_service
+        .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
+        .await
+    {
+        Ok((content, content_type, content_encoding)) => Ok(CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            budget_permit,
+        }),
+        Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
+        Err(error) => Err(map_proxy_error(repo_key, path, error)),
+    }
 }
 
 /// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
@@ -2656,7 +2689,43 @@ pub async fn resolve_virtual_download_from_members<F, Fut>(
 ) -> Result<StreamingFetchResult, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_from_members_with_fetch_urls(
+        members,
+        proxy_service,
+        path,
+        &std::collections::HashMap::new(),
+        local_fetch,
+    )
+    .await
+}
+
+/// Per-member-fetch-URL sibling of
+/// [`resolve_virtual_download_from_members`] (#3952). Identical except that a
+/// Remote member whose id appears in `member_fetch_urls` fetches its UPSTREAM
+/// bytes from that absolute URL — the proxy's `build_upstream_url` passes an
+/// absolute `http(s)://` fetch path through unchanged — while the proxy cache
+/// stays keyed on `path`, so the Pass-1 cache probe, the negative cache, the
+/// single-flight lease and TTL classification are all byte-for-byte the same
+/// as an un-overridden member.
+///
+/// This exists for formats whose per-member download URL cannot be derived
+/// from `member.upstream_url` + `path`: a cargo Remote member's own
+/// `config.json` `dl` template names the download host, and on a split-host
+/// registry (index.crates.io vs static.crates.io) the canonical path against
+/// the index host 404s. The caller resolves and SSRF-validates the URLs; this
+/// function only threads them through the two-phase walk.
+pub async fn resolve_virtual_download_from_members_with_fetch_urls<F, Fut>(
+    members: Vec<Repository>,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    local_fetch: F,
+) -> Result<StreamingFetchResult, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
     if members.is_empty() {
         return Err(no_accessible_members_response());
@@ -2722,11 +2791,24 @@ where
             // Only reached for Remote members the strategy resolved as Proxy, so
             // a proxy service is guaranteed present.
             match proxy_service {
-                Some(proxy) => classify_stream_upstream(
-                    proxy.fetch_artifact_streaming(member, path).await,
-                    &member.key,
-                    path,
-                ),
+                // #3952: a member with a resolved fetch URL (e.g. a cargo
+                // member's `dl`-template download host) fetches upstream bytes
+                // from that absolute URL while the cache stays keyed on `path`.
+                Some(proxy) => {
+                    let fetch = match member_fetch_urls.get(&member.id) {
+                        Some(absolute_url) => {
+                            proxy
+                                .fetch_artifact_streaming_with_cache_path(
+                                    member,
+                                    absolute_url,
+                                    path,
+                                )
+                                .await
+                        }
+                        None => proxy.fetch_artifact_streaming(member, path).await,
+                    };
+                    classify_stream_upstream(fetch, &member.key, path)
+                }
                 None => MemberResolveOutcome::Miss,
             }
         },
@@ -3342,37 +3424,404 @@ pub async fn direct_scan_policy(
     (action, gate)
 }
 
-/// Fetch virtual repository member repos sorted by priority.
+/// Edges of the membership subgraph reachable from a virtual repository root,
+/// with the member's full `repositories` row attached.
+///
+/// `UNION` (not `UNION ALL`) de-duplicates by edge
+/// `(virtual_repo_id, member_repo_id, priority)`, so the recursion stops the
+/// moment no NEW edge appears: a cycle (`A -> B -> A`) contributes its edges
+/// once and terminates in O(edges) with no depth parameter, and a diamond
+/// (two virtuals sharing a member) expands the shared edge once. The
+/// recursive term only follows edges whose SOURCE is itself a virtual
+/// repository, matching the write-time invariant that only virtuals have
+/// members; garbage rows keyed at a non-virtual parent never enter the walk.
+///
+/// Dynamic query API (not the `query!` macro) so this graph walk does not
+/// depend on an updated offline SQLx cache — the convention the
+/// cycle-detection and storage-aggregation walks already use.
+const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
+    WITH RECURSIVE reach AS (
+        SELECT vrm.virtual_repo_id, vrm.member_repo_id, vrm.priority
+          FROM virtual_repo_members vrm
+         WHERE vrm.virtual_repo_id = $1
+        UNION
+        SELECT vrm.virtual_repo_id, vrm.member_repo_id, vrm.priority
+          FROM reach
+          JOIN repositories parent
+            ON parent.id = reach.member_repo_id
+           AND parent.repo_type = 'virtual'
+          JOIN virtual_repo_members vrm
+            ON vrm.virtual_repo_id = reach.member_repo_id
+    )
+    SELECT
+        reach.virtual_repo_id AS parent_id,
+        reach.priority AS member_priority,
+        r.id, r.key, r.name, r.description,
+        r.format, r.repo_type,
+        r.storage_backend, r.storage_path, r.upstream_url,
+        r.visibility, r.is_public, r.quota_bytes, r.promotion_only,
+        r.replication_priority,
+        r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
+        r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
+        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
+        r.project_id, r.created_at, r.updated_at
+      FROM reach
+      JOIN repositories r ON r.id = reach.member_repo_id
+    "#;
+
+/// One leaf of a recursive membership expansion: the repository plus the
+/// chain of `virtual_repo_members.priority` values along the path the walk
+/// FIRST reached it by, root's direct-member slot first. A leaf directly
+/// under the root has a one-element path; a leaf inside a nested virtual at
+/// the root's slot 2, sitting at the nested virtual's slot 1, has `[2, 1]`.
+/// Equal-priority siblings share a path prefix element, so the path preserves
+/// the "tie" a caller comparing priorities must see (#2311); the dense rank
+/// [`virtual_member_ranks`] derives from it is what those callers consume.
+#[derive(Debug)]
+pub(crate) struct ExpandedMember {
+    pub repo: Repository,
+    pub priority_path: Vec<i32>,
+}
+
+/// Result of recursively expanding a virtual repository's membership; see
+/// [`fetch_virtual_members`] for the semantics. Carries the two guard flags
+/// alongside the member list so the wrapper can log them and tests can assert
+/// them directly.
+#[derive(Debug)]
+pub(crate) struct VirtualMemberExpansion {
+    /// Leaf (non-virtual) members, de-duplicated, in DFS pre-order priority.
+    pub members: Vec<ExpandedMember>,
+    /// At least one membership edge was skipped because following it would
+    /// have re-entered a repository already on the current path — the stored
+    /// graph contains a cycle. Unreachable through the API (the write-time
+    /// guard in `RepositoryService::add_virtual_member` refuses cycle-closing
+    /// inserts), so a set flag signals direct table manipulation or a guard
+    /// bug.
+    pub cycle_edge_skipped: bool,
+    /// At least one repository beyond `MAX_VIRTUAL_DEPTH` was not expanded
+    /// (virtual) or not listed (leaf), so the result is truncated.
+    pub depth_limit_reached: bool,
+}
+
+/// Recursive expansion behind [`fetch_virtual_members`].
+///
+/// The edge rows come from [`VIRTUAL_MEMBER_EDGES_SQL`]; the traversal itself
+/// runs in Rust as an iterative depth-first pre-order walk:
+///
+/// * each virtual is EXPANDED at most once and each leaf EMITTED at most
+///   once, so the walk is O(V + E) even on heavily shared (diamond) graphs;
+///   because children are visited in priority order, the first visit to a
+///   repository is always via the lexicographically smallest priority path,
+///   which is exactly the rank the resolution callers expect;
+/// * an edge whose target is already on the current path closes a CYCLE: it
+///   is skipped and [`VirtualMemberExpansion::cycle_edge_skipped`] is set —
+///   defence in depth behind the write-time guard, never a hang;
+/// * repositories deeper than
+///   [`MAX_VIRTUAL_DEPTH`](crate::services::repository_service::MAX_VIRTUAL_DEPTH)
+///   — the same bound the write-time cycle guard enforces — are dropped and
+///   [`VirtualMemberExpansion::depth_limit_reached`] is set.
+pub(crate) async fn expand_virtual_members(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<VirtualMemberExpansion, Response> {
+    use sqlx::Row as _;
+
+    let rows = sqlx::query(VIRTUAL_MEMBER_EDGES_SQL)
+        .bind(virtual_repo_id)
+        .fetch_all(db)
+        .await
+        // Route through map_db_err so pool saturation surfaces as 503 (capacity
+        // shed) instead of 500, and to avoid leaking raw DB error text (#1437).
+        .map_err(map_db_err)?;
+
+    // Adjacency: parent virtual id -> its direct members in priority order
+    // (ties broken by key so equal priorities still resolve deterministically).
+    let mut children: std::collections::HashMap<Uuid, Vec<(i32, Repository)>> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let parent_id: Uuid = row.try_get("parent_id").map_err(map_db_err)?;
+        let priority: i32 = row.try_get("member_priority").map_err(map_db_err)?;
+        let member: Repository = sqlx::FromRow::from_row(row).map_err(map_db_err)?;
+        children
+            .entry(parent_id)
+            .or_default()
+            .push((priority, member));
+    }
+    for members in children.values_mut() {
+        members.sort_by(|(pa, a), (pb, b)| pa.cmp(pb).then_with(|| a.key.cmp(&b.key)));
+    }
+
+    // Everything goes through the stack — leaves as `Emit` events, virtuals
+    // as `Enter` — pushed in reverse priority order so the LIFO pop visits
+    // children highest-priority first. Emitting leaves inline while their
+    // parent is processed would interleave them behind a higher-priority
+    // sibling virtual's subtree. Each event carries the priority path from
+    // the root to the node it names.
+    enum Event {
+        Enter(Uuid, usize, Vec<i32>),
+        // Boxed: `Repository` is ~300 bytes against `Enter`'s 24, and the
+        // enum would size every event to the largest variant.
+        Emit(Box<ExpandedMember>),
+        Exit(Uuid),
+    }
+
+    const MAX_DEPTH: usize = crate::services::repository_service::MAX_VIRTUAL_DEPTH;
+
+    let mut members: Vec<ExpandedMember> = Vec::new();
+    let mut expanded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut on_path: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::from([virtual_repo_id]);
+    let mut cycle_edge_skipped = false;
+    let mut depth_limit_reached = false;
+    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new())];
+
+    while let Some(event) = stack.pop() {
+        match event {
+            Event::Exit(id) => {
+                on_path.remove(&id);
+            }
+            Event::Emit(child) => {
+                if emitted.insert(child.repo.id) {
+                    members.push(*child);
+                }
+            }
+            Event::Enter(id, depth, path) => {
+                // The depth cap is applied BEFORE the node is marked expanded:
+                // a virtual first reached too deep (down the long side of a
+                // diamond) must still expand when a later, shallower path
+                // reaches it, otherwise its leaves would vanish from the
+                // listing even though they sit well within the cap.
+                if depth > MAX_DEPTH {
+                    depth_limit_reached = true;
+                    continue;
+                }
+                if !expanded.insert(id) {
+                    // Already expanded via an earlier (better-ranked) path.
+                    continue;
+                }
+                on_path.insert(id);
+                stack.push(Event::Exit(id));
+                let Some(kids) = children.get(&id) else {
+                    continue;
+                };
+                // The parent's whole ancestor chain (parent included) is on
+                // `on_path` here — its Exit pops only after its subtree — so
+                // an edge back onto the chain is exactly a cycle.
+                for (priority, child) in kids.iter().rev() {
+                    if on_path.contains(&child.id) {
+                        cycle_edge_skipped = true;
+                        continue;
+                    }
+                    let mut child_path = Vec::with_capacity(path.len() + 1);
+                    child_path.extend_from_slice(&path);
+                    child_path.push(*priority);
+                    if child.repo_type == RepositoryType::Virtual {
+                        stack.push(Event::Enter(child.id, depth + 1, child_path));
+                    } else if depth + 1 > MAX_DEPTH {
+                        depth_limit_reached = true;
+                    } else {
+                        stack.push(Event::Emit(Box::new(ExpandedMember {
+                            repo: child.clone(),
+                            priority_path: child_path,
+                        })));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(VirtualMemberExpansion {
+        members,
+        cycle_edge_skipped,
+        depth_limit_reached,
+    })
+}
+
+/// Fetch a virtual repository's content-owning members in resolution order
+/// (#3840).
+///
+/// Membership is expanded RECURSIVELY: a member that is itself a virtual
+/// repository contributes its own members, inlined at the slot the nested
+/// virtual occupies in its parent's priority order (depth-first pre-order —
+/// the ordering rule every resolution and listing caller shares, so "which
+/// member wins a duplicate coordinate" is decided identically everywhere by
+/// construction). Only LEAF repositories (local, remote, staging) are
+/// returned: a virtual owns no artifacts, so the intermediate nodes could
+/// never serve content and only confused the single-level walk into listing
+/// nothing. A repository reachable through several paths (a diamond) appears
+/// once, at its best (lexicographically smallest) priority rank.
+///
+/// Guards (the invariants the issue calls out):
+///
+/// * **Cycles terminate and are reported.** The write-time guard refuses
+///   cycle-closing inserts, so a cycle can only arrive through direct table
+///   manipulation; the read walk then skips the cycle-closing edge and logs a
+///   warning rather than hanging or silently truncating.
+/// * **Depth is capped** at `MAX_VIRTUAL_DEPTH` (32), the same bound the
+///   write-time guard enforces; deeper members are omitted and a warning is
+///   logged.
+///
+/// This helper applies NO access predicate: every caller must narrow the
+/// result against the CALLER (see [`authorize_virtual_members`]) unless it is
+/// an enforcement walk that deliberately needs the unfiltered set. Visibility
+/// is decided by the LEAF's ACL alone — intermediate virtuals are transparent
+/// grouping, the same convention `get_virtual_storage_usage` documents for
+/// the storage aggregate.
 pub async fn fetch_virtual_members(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<Vec<Repository>, Response> {
-    sqlx::query_as!(
-        Repository,
-        r#"
-        SELECT
-            r.id, r.key, r.name, r.description,
-            r.format as "format: RepositoryFormat",
-            r.repo_type as "repo_type: RepositoryType",
-            r.storage_backend, r.storage_path, r.upstream_url,
-            r.is_public, r.quota_bytes, r.promotion_only,
-            r.replication_priority as "replication_priority: ReplicationPriority",
-            r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
-            r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-            r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
-            r.project_id, r.created_at, r.updated_at
-        FROM repositories r
-        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-        WHERE vrm.virtual_repo_id = $1
-        ORDER BY vrm.priority
-        "#,
-        virtual_repo_id
+    Ok(fetch_virtual_expansion(db, virtual_repo_id)
+        .await?
+        .members
+        .into_iter()
+        .map(|m| m.repo)
+        .collect())
+}
+
+/// [`expand_virtual_members`] plus the guard-flag logging every caller wants;
+/// the shape behind [`fetch_virtual_members`] for callers that also need each
+/// leaf's priority path ([`fetch_virtual_member_priorities`],
+/// [`pypi_virtual_isolates_name`]).
+pub(crate) async fn fetch_virtual_expansion(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<VirtualMemberExpansion, Response> {
+    let expansion = expand_virtual_members(db, virtual_repo_id).await?;
+    if expansion.cycle_edge_skipped {
+        tracing::warn!(
+            virtual_repo_id = %virtual_repo_id,
+            "virtual repository membership graph contains a cycle; \
+             cycle-closing edges were skipped during member expansion"
+        );
+    }
+    if expansion.depth_limit_reached {
+        tracing::warn!(
+            virtual_repo_id = %virtual_repo_id,
+            max_depth = crate::services::repository_service::MAX_VIRTUAL_DEPTH,
+            "virtual repository nesting exceeds the maximum depth; deeper members were omitted"
+        );
+    }
+    Ok(expansion)
+}
+
+/// Dense resolution rank of every leaf in an expansion, keyed by repository
+/// id: `1` for the best-ranked leaf, increasing in resolution order, with
+/// leaves that share a priority path (equal-priority siblings under the same
+/// parent) sharing a rank. Lower means higher priority, exactly as
+/// `virtual_repo_members.priority` reads for a flat virtual — and for a flat
+/// virtual whose priorities run 1, 2, 3… the rank IS the priority. Nested
+/// leaves take ranks between their parent virtual's neighbours, so a caller
+/// comparing "does the owning local outrank this remote" (#2311) gets an
+/// answer consistent with the order the resolver actually walks.
+pub(crate) fn virtual_member_ranks(
+    members: &[ExpandedMember],
+) -> std::collections::HashMap<Uuid, i32> {
+    let mut rank_of_path: std::collections::HashMap<&[i32], i32> = std::collections::HashMap::new();
+    let mut ranks = std::collections::HashMap::with_capacity(members.len());
+    for m in members {
+        let next = rank_of_path.len() as i32 + 1;
+        let rank = *rank_of_path
+            .entry(m.priority_path.as_slice())
+            .or_insert(next);
+        ranks.insert(m.repo.id, rank);
+    }
+    ranks
+}
+
+/// Ids of a virtual repository's leaf members in the same resolution order
+/// [`fetch_virtual_members`] returns, for callers that only need the id set
+/// (package-catalog listing filters, ownership probes).
+#[allow(clippy::result_large_err)]
+pub async fn fetch_virtual_member_leaf_ids(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<Vec<Uuid>, Response> {
+    Ok(fetch_virtual_members(db, virtual_repo_id)
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+/// Convert a member-walk failure (the [`map_db_err`] response shape
+/// [`fetch_virtual_members`] returns) into the `AppError` the JSON-envelope
+/// handlers answer with. A 503 capacity shed stays a 503 — the whole point
+/// of routing the walk through `map_db_err` (#1437) — instead of being
+/// flattened to a 500 along with every other failure.
+pub fn member_walk_app_error(resp: &Response) -> AppError {
+    const MSG: &str = "Failed to resolve virtual repository members";
+    if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+        AppError::ServiceUnavailable(MSG.to_string())
+    } else {
+        AppError::Internal(MSG.to_string())
+    }
+}
+
+/// Resolve the deployment target for a publish addressed at a VIRTUAL
+/// repository (#968): the first hosted (local/staging) member, in the same
+/// flattened priority order [`fetch_virtual_members`] serves content in, that
+/// accepts direct uploads and that THIS caller may write.
+///
+/// A member is eligible when:
+///
+///   * its type is `Local` or `Staging` — a virtual owns no artifacts and a
+///     remote cannot accept publishes;
+///   * it is not `promotion_only` (direct uploads are disabled there);
+///   * the caller's token repository scope covers it
+///     ([`AuthExtension::can_access_repo`]); and
+///   * the caller holds the `write` action on it
+///     (`PermissionService::check_repository_action`).
+///
+/// The route middleware has already required `write` on the virtual parent,
+/// so a through-virtual publish needs write on BOTH the virtual and the
+/// resolved member — the same composition the read side uses (#3323), which
+/// keeps aggregation from becoming a confused deputy that publishes where the
+/// caller could not publish directly.
+///
+/// A per-member lookup ERROR fails the request (503 via [`map_db_err`])
+/// rather than silently skipping to a lower-priority member the operator did
+/// not intend to receive the package. When no member qualifies the answer is
+/// a 400 that names no member, so the response cannot be used to probe
+/// membership.
+///
+/// [`AuthExtension::can_access_repo`]: crate::api::middleware::auth::AuthExtension::can_access_repo
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+#[allow(clippy::result_large_err)]
+pub async fn resolve_virtual_deploy_target(
+    db: &PgPool,
+    permission_service: &crate::services::permission_service::PermissionService,
+    auth: &crate::api::middleware::auth::AuthExtension,
+    virtual_repo_id: Uuid,
+) -> Result<Repository, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    for member in members {
+        if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
+        {
+            continue;
+        }
+        if member.promotion_only {
+            continue;
+        }
+        if !auth.can_access_repo(member.id) {
+            continue;
+        }
+        let writable = permission_service
+            .check_repository_action(auth.user_id, member.id, "write", auth.is_admin)
+            .await
+            .map_err(|e| map_db_err(e.to_string()))?;
+        if writable {
+            return Ok(member);
+        }
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Cannot publish to a virtual repository: it has no hosted member that \
+         accepts uploads for this caller. Publish to a hosted repository \
+         directly, or ask an administrator to add a writable local member.",
     )
-    .fetch_all(db)
-    .await
-    // Route through map_db_err so pool saturation surfaces as 503 (capacity
-    // shed) instead of 500, and to avoid leaking raw DB error text (#1437).
-    .map_err(map_db_err)
+        .into_response())
 }
 
 /// Filter a virtual repository's members down to those the caller may read
@@ -3534,7 +3983,7 @@ pub async fn try_authorize_virtual_members(
         .into_iter()
         .filter(|m| {
             granted.contains(&m.id)
-                && member_passes_token_scope(auth, virtual_repo_id, m.id, m.is_public)
+                && member_passes_token_scope(auth, virtual_repo_id, m.id, m.visibility)
         })
         .collect();
 
@@ -3582,9 +4031,14 @@ pub async fn try_authorize_virtual_members(
     let decisions = futures::future::join_all(tenant_admitted.iter().map(|member| {
         let permission_service = &permission_service;
         async move {
-            // A public member keeps the anonymous read baseline (#2329): rules
-            // must not leave an authenticated caller below a logged-out one.
-            if member.is_public {
+            // A member whose visibility already admits this caller keeps that
+            // read baseline (#2329): rules must not leave an authenticated
+            // caller below a logged-out one. `internal` counts here as well as
+            // `public` — the anonymous arm returned above, so this branch is
+            // authenticated by construction, and an authenticated caller can
+            // read an internal member directly. Refusing its bytes through the
+            // virtual parent would not be a ceiling, only a different URL.
+            if member.visibility.allows_authenticated_read() {
                 return true;
             }
             match permission_service
@@ -3792,7 +4246,17 @@ pub fn member_miss_response() -> Response {
     crate::error::AppError::NotFound(MEMBER_MISS_MSG.to_string()).into_response()
 }
 
-/// True when any member of a virtual repository is NOT public (#3323).
+/// True when any repository reachable through a virtual repository's
+/// membership graph is NOT public (#3323).
+///
+/// Walks the graph RECURSIVELY (#3840): since [`fetch_virtual_members`]
+/// aggregates the leaves of nested virtuals, a private leaf two levels down
+/// makes the aggregated document just as caller-dependent as a private direct
+/// member, and a single-level check would let the first authorized request
+/// warm a shared cache that anonymous callers then read. Intermediate
+/// virtuals count too — conservative, since the resolver never consults their
+/// ACL, but a private intermediate only costs a per-request recompute.
+/// `UNION` terminates on a cycle in the stored graph.
 ///
 /// Errs on the side of `true` if the lookup fails, because the only caller
 /// shape is "may this caller-independent cache be used?", where `true` means
@@ -3800,10 +4264,19 @@ pub fn member_miss_response() -> Response {
 /// caller's view to another.
 pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.is_public = false)",
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id \
+            WHERE r.is_public = false)",
     )
     .bind(virtual_repo_id)
     .fetch_one(db)
@@ -3815,8 +4288,9 @@ pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> b
 /// stored in a CALLER-INDEPENDENT cache (#3323).
 ///
 /// Several formats front their aggregated virtual document with a shared cache
-/// keyed by repository/document and NOT by caller — npm's computed packument
-/// cache, cargo's in-process sparse-index cache. Once the aggregation is
+/// keyed by repository/document and NOT by caller — cargo's in-process
+/// sparse-index cache, and npm's computed packument cache until #4240 keyed it
+/// by the caller's authorized member list instead. Once the aggregation is
 /// narrowed to the members the caller may read, that document becomes
 /// caller-dependent, and a caller-independent cache in front of it re-opens the
 /// leak from the other side: the first authorized request stores a document
@@ -3826,9 +4300,18 @@ pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> b
 /// The document is caller-INdependent exactly when every member is public.
 /// [`try_authorize_virtual_members`] admits a public member for every caller
 /// unconditionally — the grant half and `member_passes_token_scope` both
-/// short-circuit on `is_public`, and the read-action gate skips public members —
-/// so with an all-public member set the authorized member list is identical for
-/// anonymous and authenticated callers alike.
+/// short-circuit on `allows_anonymous_read`, and the read-action gate skips a
+/// member the caller's visibility baseline already admits — so with an
+/// all-public member set the authorized member list is identical for anonymous
+/// and authenticated callers alike.
+///
+/// `internal` does NOT make a member public for this purpose, and must not: the
+/// action gate's short-circuit is `allows_authenticated_read`, so an internal
+/// member is admitted for an authenticated caller and dropped for an anonymous
+/// one, which is precisely a caller-dependent document.
+/// [`virtual_has_private_member`] reads the `is_public` mirror, under which
+/// `internal` is not public, so it already answers `true` for such a member and
+/// the cache stays off.
 ///
 /// Pure so the decision is unit-testable without a database; the `is_private`
 /// input comes from [`virtual_has_private_member`].
@@ -3855,15 +4338,28 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
 /// answer vary by caller and let an unauthorized caller warm an unfiltered
 /// entry that an authorized one then reads.
 ///
+/// Recursive over nested virtuals (#3840), like [`virtual_has_private_member`]
+/// and for the same reason: the aggregated document now includes the leaves
+/// of nested members, so a gated leaf anywhere below the root can filter it.
+///
 /// Errs on the side of `true` (bypass the cache) if the lookup fails:
 /// recomputing is merely slower, while serving a possibly-unfiltered cached
 /// document is wrong.
 pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id \
+            WHERE r.age_gate_enabled = true)",
     )
     .bind(virtual_repo_id)
     .fetch_one(db)
@@ -4732,6 +5228,73 @@ pub async fn virtual_non_remote_owns_name_version(
     Ok(pypi_version_owned(version, &stored_versions))
 }
 
+/// Exact-version variant of the npm shadowing guard, made priority-aware by
+/// #3955: returns `Some(min_priority)` — the smallest
+/// `virtual_repo_members.priority` among the non-Remote members owning this
+/// exact `name@version` — or `None` when no non-Remote member owns it.
+/// (`artifacts.version` holds the exact string npm published: `1.0.0` and
+/// `1.0.0-next.3` are distinct versions, compared byte-for-byte.)
+///
+/// The caller must then decide suppression PER REMOTE MEMBER, exactly as the
+/// PyPI PEP 708 isolation does (#2311, see [`pypi_virtual_isolates_name`]): a
+/// Remote member `R` is suppressed only when an owning non-Remote member
+/// OUTRANKS it (`min_priority < R.priority`). A Remote member ranked at or
+/// above every owner still surfaces — the operator explicitly placed the
+/// upstream there, and the merged packument (#2844) already advertises that
+/// winner's `dist.integrity` for the version. Suppressing it anyway made the
+/// two legs of the virtual disagree: the packument pointed npm at the
+/// upstream's SRI digest while the tarball route served the hosted member's
+/// bytes, and npm failed with EINTEGRITY (#3955).
+///
+/// The version-aware shape (rather than name-only) is #3646's: a hosted
+/// member holding one fork build of a name suppresses Remote members only
+/// for the version it actually owns, so every upstream version the merged
+/// packument advertises stays downloadable.
+///
+/// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
+#[allow(clippy::result_large_err)]
+pub async fn npm_virtual_owner_min_priority(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+    version: &str,
+) -> Result<Option<i32>, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(None);
+    }
+
+    // Which non-Remote members own this exact name@version, and at what
+    // member priority? Joined against `virtual_repo_members` — the same
+    // table `fetch_virtual_member_priorities` reads — so the ownership and
+    // the priority the caller compares it against cannot drift apart.
+    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT DISTINCT a.repository_id, vrm.priority \
+         FROM artifacts a \
+         INNER JOIN virtual_repo_members vrm \
+                 ON vrm.member_repo_id = a.repository_id \
+                AND vrm.virtual_repo_id = $4 \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+           AND a.version = $3",
+    )
+    .bind(&non_remote_ids)
+    .bind(package_name)
+    .bind(version)
+    .bind(virtual_repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
+    Ok(owning.iter().map(|(_, priority)| *priority).min())
+}
+
 /// Exact-version variant of [`virtual_non_remote_owns_name`] for formats whose
 /// version is an opaque string compared byte-for-byte (npm semver: `1.0.0`
 /// and `1.0.0-next.3` are distinct versions, and `artifacts.version` holds the
@@ -4779,7 +5342,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     .bind(version)
     .fetch_optional(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
     Ok(exists.is_some())
 }
 
@@ -4858,9 +5421,16 @@ pub async fn pypi_virtual_isolates_name(
     virtual_repo_id: Uuid,
     normalized_name: &str,
 ) -> Result<Option<i32>, Response> {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
-    let local_ids: Vec<Uuid> = members
+    // Recursive walk (#3840): a local owner nested inside a member virtual
+    // must trigger isolation too, and its "priority" is its rank in the
+    // flattened resolution order — the same rank map
+    // `fetch_virtual_member_priorities` hands the callers, so the two compare.
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    let ranks = virtual_member_ranks(&expansion.members);
+    let local_ids: Vec<Uuid> = expansion
+        .members
         .iter()
+        .map(|m| &m.repo)
         .filter(|m| m.repo_type == RepositoryType::Local || m.repo_type == RepositoryType::Staging)
         .map(|m| m.id)
         .collect();
@@ -4868,31 +5438,26 @@ pub async fn pypi_virtual_isolates_name(
         return Ok(None);
     }
 
-    // Which local/staging members actually own (hold artifacts for) this name,
-    // and at what member priority? Uses the same PEP 503 normalization as
-    // simple_project so isolation agrees with what the index lists.
-    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT DISTINCT a.repository_id, vrm.priority \
+    // Which local/staging members actually own (hold artifacts for) this
+    // name? Uses the same PEP 503 normalization as simple_project so
+    // isolation agrees with what the index lists.
+    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT a.repository_id \
          FROM artifacts a \
-         INNER JOIN virtual_repo_members vrm \
-                 ON vrm.member_repo_id = a.repository_id \
-                AND vrm.virtual_repo_id = $3 \
          WHERE a.repository_id = ANY($1) \
            AND a.is_deleted = false \
            AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2",
     )
     .bind(&local_ids)
     .bind(normalized_name)
-    .bind(virtual_repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    if owning.is_empty() {
+    if owning_ids.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
         return Ok(None);
     }
-    let owning_ids: Vec<Uuid> = owning.iter().map(|(id, _)| *id).collect();
 
     // A `tracks` declaration on any owning member means the operator has
     // asserted the local project is the same project as upstream, so merging is
@@ -4910,28 +5475,29 @@ pub async fn pypi_virtual_isolates_name(
     if tracked > 0 {
         return Ok(None);
     }
-    Ok(owning.iter().map(|(_, priority)| *priority).min())
+    Ok(owning_ids
+        .iter()
+        .filter_map(|id| ranks.get(id))
+        .min()
+        .copied())
 }
 
-/// Fetches the `virtual_repo_members.priority` value for every member of
-/// `virtual_repo_id`, keyed by member repository id (lower value = higher
-/// priority). Used by the PyPI virtual paths to make the PEP 708 isolation
-/// decision per remote member relative to the owning local member's priority
-/// (#2311). Fails closed (Err) on DB error, matching
-/// [`pypi_virtual_isolates_name`].
+/// The resolution rank of every LEAF member of `virtual_repo_id`, keyed by
+/// member repository id (lower value = higher priority) — see
+/// [`virtual_member_ranks`]. For a flat virtual this reads exactly like
+/// `virtual_repo_members.priority` (equal priorities stay equal; contiguous
+/// priorities from 1 map to themselves); with nested virtuals (#3840) the
+/// nested leaves take ranks at their parent virtual's slot, so the per-remote
+/// PEP 708 decision (#2311) the PyPI paths make against
+/// [`pypi_virtual_isolates_name`]'s answer stays consistent with the order the
+/// resolver walks. Fails closed (Err) on DB error, matching that function.
 #[allow(clippy::result_large_err)]
 pub async fn fetch_virtual_member_priorities(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<std::collections::HashMap<Uuid, i32>, Response> {
-    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT member_repo_id, priority FROM virtual_repo_members WHERE virtual_repo_id = $1",
-    )
-    .bind(virtual_repo_id)
-    .fetch_all(db)
-    .await
-    .map_err(map_db_err)?;
-    Ok(rows.into_iter().collect())
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    Ok(virtual_member_ranks(&expansion.members))
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -4994,11 +5560,13 @@ pub async fn virtual_non_remote_owns_path(
 ///
 /// Only meaningful after [`virtual_non_remote_owns_path`] returned `true`:
 /// the caller then suppresses the proxy, Remote members classify as `Skip`,
-/// and [`resolve_virtual_download`] finalizes in strict member-priority
-/// order — so the winning bytes belong to the FIRST non-Remote member (by
-/// `virtual_repo_members.priority`) holding a non-deleted artifact at the
-/// exact path. This query re-derives that row. Remote pass-through has no
-/// local row and stays unrecorded (#1278).
+/// and [`resolve_virtual_download`] finalizes in strict resolution order — so
+/// the winning bytes belong to the FIRST non-Remote member, in the order
+/// [`fetch_virtual_members`] returns (recursive over nested virtuals, #3840),
+/// holding a non-deleted artifact at the exact path. This re-derives that row
+/// from the same walk, so a leaf nested inside a member virtual is attributed
+/// to itself rather than to a lower-ranked direct member. Remote pass-through
+/// has no local row and stays unrecorded (#1278).
 ///
 /// Best-effort: a database error logs at `warn` and yields `None` —
 /// telemetry must never block or fail the download itself.
@@ -5007,18 +5575,34 @@ pub async fn virtual_local_winner_artifact_id(
     virtual_repo_id: Uuid,
     path: &str,
 ) -> Option<Uuid> {
+    let candidates: Vec<Uuid> = match fetch_virtual_members(db, virtual_repo_id).await {
+        Ok(members) => members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote)
+            .map(|m| m.id)
+            .collect(),
+        Err(resp) => {
+            tracing::warn!(
+                %virtual_repo_id,
+                path,
+                status = %resp.status(),
+                "failed to walk virtual members for download attribution; skipping statistics"
+            );
+            return None;
+        }
+    };
+    if candidates.is_empty() {
+        return None;
+    }
     match sqlx::query_scalar::<_, Uuid>(
         "SELECT a.id FROM artifacts a \
-         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
-         JOIN repositories r ON r.id = a.repository_id \
-         WHERE vrm.virtual_repo_id = $1 \
-           AND r.repo_type != 'remote' \
+         WHERE a.repository_id = ANY($1::uuid[]) \
            AND a.path = $2 \
            AND a.is_deleted = false \
-         ORDER BY vrm.priority \
+         ORDER BY array_position($1::uuid[], a.repository_id) \
          LIMIT 1",
     )
-    .bind(virtual_repo_id)
+    .bind(&candidates)
     .bind(path)
     .fetch_optional(db)
     .await
@@ -5148,6 +5732,26 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// artifact body (up to gigabytes for some package formats) into
 /// memory before responding — see #895 / #737 for the OOM-kill history
 /// that prompted the streaming migration.
+/// The proxy-cache `(storage_key, metadata_key)` pair under which a recorded
+/// serve ensures its transient catalog placeholder — the keys the streaming
+/// tee later refines in place. `None` when no proxy service is wired (the
+/// scope must come from the live `ProxyService`, #3454) or when the path is
+/// too long to cache at all (it could never have a catalog row).
+fn proxy_record_target(
+    state: &crate::api::SharedState,
+    repo_key: &str,
+    path: &str,
+) -> Option<(String, String)> {
+    let scope = state.proxy_service.as_ref()?.cache_scope();
+    match (
+        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
+    ) {
+        (Ok(s), Ok(m)) => Some((s, m)),
+        _ => None,
+    }
+}
+
 /// Record one proxy-served download into the `proxy_download_statistics`
 /// sibling table (#2270 / #2260), keyed via the `proxy_cache_artifacts` catalog
 /// row for `(repo_id, path)`. This is the counting decision #2505 deferred until
@@ -5182,16 +5786,8 @@ pub(crate) async fn record_proxy_download(
     // The scope must come from the live `ProxyService` (#3454): a placeholder
     // row keyed under a different scope than the tee writes would never be
     // refined in place, leaving a permanently orphaned catalog row.
-    let Some(proxy) = state.proxy_service.as_ref() else {
+    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
         return;
-    };
-    let scope = proxy.cache_scope();
-    let (storage_key, metadata_key) = match (
-        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
-        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
-    ) {
-        (Ok(s), Ok(m)) => (s, m),
-        _ => return,
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
     if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
@@ -5213,6 +5809,92 @@ pub(crate) async fn record_proxy_download(
             "best-effort proxy download record failed"
         );
     }
+}
+
+/// Max concurrent fire-and-forget proxy-download record tasks
+/// ([`record_proxy_download_deferred`]). Small relative to
+/// `DATABASE_MAX_CONNECTIONS` (default 50) — the same slice-of-the-pool
+/// reasoning as `ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS` — so
+/// background telemetry can never starve real request handlers.
+const MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS: usize = 8;
+
+static PROXY_DOWNLOAD_RECORD_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS)));
+
+/// Fire-and-forget sibling of [`record_proxy_download`] (#3778): the
+/// catalog-upsert + statistics insert rides a spawned task, so PostgreSQL
+/// latency is no longer part of the critical path of a warm proxy-cache hit
+/// (the serve itself reads only the cache + storage).
+///
+/// Bounded by a process-wide limiter. When it is saturated the caller records
+/// INLINE instead of dropping the event — download statistics stay exact
+/// under load, degrading to the pre-#3778 synchronous posture only while the
+/// pool is already the bottleneck. Same HEAD guard and best-effort error
+/// posture as the synchronous variant.
+pub(crate) async fn record_proxy_download_deferred(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    if ctx.is_head {
+        return;
+    }
+    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+        return;
+    };
+    let db = state.db.clone();
+    let path_owned = path.to_string();
+    let user_id = ctx.user_id;
+    let ip = ctx.client_ip.map(|i| i.to_string());
+    let user_agent = ctx.user_agent.clone();
+
+    let Ok(permit) = Arc::clone(&PROXY_DOWNLOAD_RECORD_LIMITER).try_acquire_owned() else {
+        // Saturated: record inline rather than drop a download event.
+        if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
+            &db,
+            repo_id,
+            &path_owned,
+            &storage_key,
+            &metadata_key,
+            user_id,
+            ip.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            tracing::debug!(
+                repo_id = %repo_id,
+                path = %path_owned,
+                error = %e,
+                "best-effort proxy download record failed"
+            );
+        }
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit; // held for the task's lifetime, released on drop
+        if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
+            &db,
+            repo_id,
+            &path_owned,
+            &storage_key,
+            &metadata_key,
+            user_id,
+            ip.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            tracing::debug!(
+                repo_id = %repo_id,
+                path = %path_owned,
+                error = %e,
+                "best-effort proxy download record failed"
+            );
+        }
+    });
 }
 
 /// `auth` is the CALLER (#3178). Only the Virtual arm consults it, to narrow
@@ -5452,6 +6134,10 @@ pub async fn find_artifact_by_name_lowercase(
 /// List every non-deleted artifact whose name matches `name`
 /// case-insensitively in `repository_id`, newest first.
 ///
+/// The `id` tiebreaker makes the order total: rows written in one transaction
+/// share `created_at`, and a caller that pages over this list (the Galaxy
+/// version list, #3873) must see the same order on every page request.
+///
 /// Companion to [`find_artifact_by_name_lowercase`] for endpoints that
 /// need the full version history (e.g. RubyGems versions, Puppet release
 /// list, Hex package versions).
@@ -5470,7 +6156,7 @@ pub async fn list_artifacts_by_name_lowercase(
          WHERE a.repository_id = $1 \
            AND a.is_deleted = false \
            AND LOWER(a.name) = LOWER($2) \
-         ORDER BY a.created_at DESC",
+         ORDER BY a.created_at DESC, a.id DESC",
     )
     .bind(repository_id)
     .bind(name)
@@ -5920,27 +6606,10 @@ where
 
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            match (&e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
-                Some(multer::Error::StreamSizeExceeded { limit }) => (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    payload_too_large_message(*limit),
-                )
-                    .into_response(),
-                _ => (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read upload body: {e}"),
-                )
-                    .into_response(),
-            }
-        })?;
+        let chunk = chunk.map_err(|e| upload_body_error_response(&e))?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                payload_too_large_message(max),
-            )
-                .into_response());
+            return Err(upload_too_large_response(max));
         }
         hasher.update(&chunk);
         file.write_all(&chunk)
@@ -5988,6 +6657,267 @@ pub async fn open_staged_upload_stream(
     staged: &StagedUpload,
 ) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
     open_staged_stream(staged.path()).await
+}
+
+/// Map an upload-body read error to its response: 413 when a multipart
+/// stream hit its size cap, 400 for any other read failure.
+fn upload_body_error_response<E: std::fmt::Display + 'static>(e: &E) -> Response {
+    match (e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
+        Some(multer::Error::StreamSizeExceeded { limit }) => upload_too_large_response(*limit),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload body: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+fn upload_too_large_response(max: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        payload_too_large_message(max),
+    )
+        .into_response()
+}
+
+/// Key namespace for generic upload bodies staged directly on a repository's
+/// object-storage backend instead of local scratch (#3916). Deliberately
+/// distinct from the chunked-session namespace
+/// ([`crate::services::upload_service::STAGING_KEY_PREFIX`]) so the two
+/// reapers can never claim each other's objects.
+pub const GENERIC_UPLOAD_STAGING_PREFIX: &str = "generic-upload-staging/";
+
+/// Age after which a tracked generic staging object has no live owner: the
+/// upload that wrote it was killed (crash, eviction, shutdown) before it could
+/// promote or delete it. Generous, so no in-flight multi-GiB upload is reaped.
+pub const GENERIC_UPLOAD_STAGING_MAX_AGE_HOURS: i64 = 24;
+
+/// Rows reaped per sweep pass, so one pass stays bounded.
+const GENERIC_UPLOAD_STAGING_SWEEP_BATCH: i64 = 500;
+
+/// An upload body staged as an object on the repository's own storage backend
+/// (#3916) -- the object-storage counterpart of [`StagedUpload`].
+///
+/// Every staged object is also tracked in `generic_upload_staging` so
+/// [`sweep_stale_generic_upload_staging`] can reclaim one whose upload died
+/// before cleaning up. Promote it with
+/// [`UploadContent::StagedObject`](crate::services::artifact_service::UploadContent::StagedObject),
+/// then [`BackendStagedUpload::discard`] it. Dropping it without discarding
+/// (an early error return) cleans up in the background.
+pub struct BackendStagedUpload {
+    db: PgPool,
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    key: String,
+    size_bytes: i64,
+    armed: bool,
+}
+
+impl BackendStagedUpload {
+    /// Storage key of the staged object on the repository's backend.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Number of bytes staged (== the eventual artifact size).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// Delete the staged object and its tracking row now.
+    pub async fn discard(mut self) {
+        self.armed = false;
+        delete_generic_staging(&self.db, self.storage.as_ref(), &self.key).await;
+    }
+}
+
+impl Drop for BackendStagedUpload {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let db = self.db.clone();
+        let storage = self.storage.clone();
+        let key = std::mem::take(&mut self.key);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                delete_generic_staging(&db, storage.as_ref(), &key).await;
+            });
+        }
+    }
+}
+
+/// Delete one generic staging object, then its tracking row. The row is kept
+/// when the object delete fails so the sweep retries it.
+async fn delete_generic_staging(
+    db: &PgPool,
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> bool {
+    match storage.delete(key).await {
+        Ok(()) | Err(AppError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "Failed to delete staged upload object");
+            return false;
+        }
+    }
+    let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_key = $1")
+        .bind(key)
+        .execute(db)
+        .await;
+    true
+}
+
+/// Reclaim generic staging objects (#3916) whose upload died before it could
+/// promote or delete them: every tracked object older than `max_age_hours`,
+/// oldest first, at most one bounded batch per call. A row whose backend is no
+/// longer registered is dropped (nothing can reach its object). Returns how
+/// many objects were reclaimed.
+pub async fn sweep_stale_generic_upload_staging(
+    db: &PgPool,
+    registry: &crate::storage::StorageRegistry,
+    max_age_hours: i64,
+) -> usize {
+    let rows: Vec<(String, String, String)> = match sqlx::query_as(
+        "SELECT storage_key, storage_backend, storage_path FROM generic_upload_staging \
+         WHERE created_at < NOW() - make_interval(hours => $1::int) \
+         ORDER BY created_at LIMIT $2",
+    )
+    .bind(max_age_hours as i32)
+    .bind(GENERIC_UPLOAD_STAGING_SWEEP_BATCH)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "Generic upload staging sweep query failed");
+            return 0;
+        }
+    };
+    let mut reclaimed = 0;
+    for (key, backend, path) in rows {
+        match registry.backend_for(&StorageLocation { backend, path }) {
+            Ok(storage) => {
+                if delete_generic_staging(db, storage.as_ref(), &key).await {
+                    reclaimed += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "Dropping generic staging row for an unregistered backend");
+                let _ = sqlx::query("DELETE FROM generic_upload_staging WHERE storage_key = $1")
+                    .bind(&key)
+                    .execute(db)
+                    .await;
+            }
+        }
+    }
+    reclaimed
+}
+
+/// Object-storage counterpart of [`stage_stream_content_addressed`] (#3916):
+/// stream an upload body straight into `generic-upload-staging/<uuid>` on the
+/// repository's own backend while computing SHA-256 / SHA-1 / MD5 and enforcing
+/// `max_upload_size_bytes`, so an upload into an S3/GCS/Azure repository never
+/// needs local disk proportional to its size. The backend's `put_stream`
+/// bounds memory (multipart / block uploads). The object is recorded in
+/// `generic_upload_staging` BEFORE the first byte is written, so a crash at any
+/// point leaves a row the sweep can reclaim it from.
+#[allow(clippy::result_large_err)]
+pub async fn stage_stream_on_backend<S, E>(
+    state: &crate::api::SharedState,
+    location: &StorageLocation,
+    stream: S,
+) -> Result<
+    (
+        BackendStagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + 'static,
+{
+    use crate::services::artifact_service::MultiHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    let key = format!("{}{}", GENERIC_UPLOAD_STAGING_PREFIX, Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO generic_upload_staging (storage_key, storage_backend, storage_path) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&key)
+    .bind(&location.backend)
+    .bind(&location.path)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    let mut staged = BackendStagedUpload {
+        db: state.db.clone(),
+        storage: storage.clone(),
+        key,
+        size_bytes: 0,
+        armed: true,
+    };
+
+    let max = state.config.max_upload_size_bytes;
+    let hasher = Arc::new(Mutex::new(MultiHasher::new()));
+    let counted = Arc::new(AtomicU64::new(0));
+    let rejection: Arc<Mutex<Option<Response>>> = Arc::new(Mutex::new(None));
+    let body = {
+        let hasher = hasher.clone();
+        let counted = counted.clone();
+        let rejection = rejection.clone();
+        stream
+            .map(move |chunk| {
+                let refuse = |response: Response| -> crate::error::Result<Bytes> {
+                    *rejection.lock().unwrap_or_else(|p| p.into_inner()) = Some(response);
+                    Err(AppError::Validation("upload body rejected".to_string()))
+                };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => return refuse(upload_body_error_response(&e)),
+                };
+                let written = counted
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                    .saturating_add(chunk.len() as u64);
+                if max != 0 && written > max {
+                    return refuse(upload_too_large_response(max));
+                }
+                hasher
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .update(&chunk);
+                Ok(chunk)
+            })
+            .boxed()
+    };
+
+    let put = match storage.put_stream(&staged.key, body).await {
+        Ok(put) => put,
+        Err(e) => {
+            staged.discard().await;
+            let rejected = rejection.lock().unwrap_or_else(|p| p.into_inner()).take();
+            return Err(rejected.unwrap_or_else(|| map_storage_err(e)));
+        }
+    };
+    let digests = std::mem::take(&mut *hasher.lock().unwrap_or_else(|p| p.into_inner())).finalize();
+    // The promotion copies this object to the key named by `digests`, so the
+    // backend's own account of what it stored must agree with ours.
+    let counted = counted.load(Ordering::Relaxed);
+    if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) || put.bytes_written != counted {
+        staged.discard().await;
+        return Err(map_storage_err(format!(
+            "staged upload mismatch: backend stored {} bytes with SHA-256 {}, \
+             received {} bytes with SHA-256 {}",
+            put.bytes_written, put.checksum_sha256, counted, digests.sha256
+        )));
+    }
+    staged.size_bytes = put.bytes_written as i64;
+    Ok((staged, digests))
 }
 
 /// Borrowed handle to the columns required to insert a new artifact row.
@@ -6872,6 +7802,10 @@ pub(crate) fn build_remote_repo_with_format(
         storage_backend: "filesystem".to_string(),
         storage_path: String::new(),
         upstream_url: Some(upstream_url.to_string()),
+        // Synthesized in-memory repo for the proxy path, never persisted.
+        // Private is the state that grants nothing on its own, matching the
+        // `is_public: false` this has always carried.
+        visibility: RepositoryVisibility::Private,
         is_public: false,
         quota_bytes: None,
         promotion_only: false,
@@ -7001,9 +7935,8 @@ pub(crate) fn cache_path_filename(path: &str) -> Option<&str> {
 /// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
 /// for an on-demand rescan of already-cached bytes (#3396).
 ///
-/// The per-format serve paths build their own (`pypi_synthetic_artifact`,
-/// `npm_synthetic_artifact`, ...) because they know the coordinate the client
-/// asked for. A rescan has only a stored path and the content type recorded at
+/// The serve paths build theirs through [`ScannedProxyFile::synthetic_artifact`]
+/// because they know the coordinate the client asked for. A rescan has only a stored path and the content type recorded at
 /// cache time, so it reconstructs the minimum the scanners actually consume:
 /// filename (applicability + archive extraction) and content type.
 ///
@@ -7018,29 +7951,14 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
     size: i64,
     content_type: Option<&str>,
 ) -> crate::models::artifact::Artifact {
-    let filename = cache_path_filename(path).unwrap_or(path).to_string();
-    let now = Utc::now();
-    crate::models::artifact::Artifact {
-        id: Uuid::new_v4(),
-        repository_id: repo_id,
-        path: filename.clone(),
-        name: filename,
-        version: None,
-        size_bytes: size,
-        checksum_sha256: digest.to_string(),
-        checksum_md5: None,
-        checksum_sha1: None,
-        content_type: content_type
-            .unwrap_or("application/octet-stream")
-            .to_string(),
-        storage_key: String::new(),
-        is_deleted: false,
-        uploaded_by: None,
-        quarantine_status: None,
-        quarantine_until: None,
-        created_at: now,
-        updated_at: now,
-    }
+    proxy_synthetic_artifact(
+        repo_id,
+        cache_path_filename(path).unwrap_or(path),
+        digest,
+        size,
+        None,
+        content_type.unwrap_or("application/octet-stream"),
+    )
 }
 
 /// Why [`proxy_scan_and_record`] could not produce a verdict (#3455).
@@ -7192,15 +8110,37 @@ pub(crate) async fn proxy_scan_and_record(
     // vulnerable artifact from being recorded as vulnerable. The worst case
     // is that this digest has no SBOM until it is pulled again.
     if !verdict.packages.is_empty() {
-        if let Err(e) = pss
+        match pss
             .record_packages(digest, PROXY_SCAN_TYPE, &verdict.packages)
             .await
         {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, error = %e,
-                "failed to persist proxy scan package inventory; SBOM will be \
-                 unavailable for this digest until it is pulled again"
-            );
+            // #4096: record whether THIS inventory is complete, so the proxy
+            // SBOM can carry the partial-inventory marker. Only after the
+            // inventory itself landed, so the marker describes the packages
+            // the SBOM is generated from.
+            Ok(()) => {
+                if let Err(e) = pss
+                    .record_inventory_completeness(
+                        digest,
+                        PROXY_SCAN_TYPE,
+                        verdict.scan_completeness.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename, error = %e,
+                        "failed to persist proxy scan inventory completeness; \
+                         the SBOM for this digest will carry no completeness marker"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, error = %e,
+                    "failed to persist proxy scan package inventory; SBOM will be \
+                     unavailable for this digest until it is pulled again"
+                );
+            }
         }
     }
 
@@ -7461,6 +8401,659 @@ pub(crate) async fn gate_proxy_scan_serve(
     }
 }
 
+// ---------------------------------------------------------------------------
+// #4098: the generic scan-on-proxy serve wrapper.
+//
+// Every format that scans on proxy runs the same sequence: buffered capped
+// fetch (cache-first) → over-cap handling per fail-open/closed → content
+// digest → the digest-keyed verdict gate above → record the download → serve
+// the buffered bytes or return the 403/423. npm, PyPI and VS Code each carried
+// a ~150-line copy of that sequence; [`serve_scanned_proxy_file`] is the one
+// copy, and a format supplies only what genuinely differs through
+// [`ScannedProxyFile`]: the synthetic artifact's content type and version, the
+// request-derived identity, the unscanned streaming fallback for an oversized
+// object, and the 200 response shape.
+//
+// Adopting the gate in a new format (#4100 Maven, #4101 Cargo, #4102 NuGet, …)
+// is: implement `ScannedProxyFile` on a small struct holding the request's
+// coordinate, and at the Remote download arm, when
+// `ScanConfigService::is_proxy_scan_enabled` is true, call
+// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from
+// `direct_scan_policy` (or `effective_virtual_scan_policy` per virtual member)
+// instead of streaming. Then add the format's handler key to
+// `crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` so `GET /api/v1/formats`
+// reports it enforced (#4099; `scan_on_proxy_capability_matches_the_gate`
+// reads every handler's source and keeps the two in step).
+// ---------------------------------------------------------------------------
+
+/// The synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// the leaf scanners run over for buffered proxy bytes. There is NO
+/// `artifacts` row: proxy-cached bytes are deliberately not persisted as
+/// artifacts (#1278/#1280), so the storage key stays empty. The filename and
+/// content type drive scanner applicability and archive extraction exactly as
+/// for a hosted artifact; `version` names the coordinate when the format can
+/// derive one from the request.
+pub(crate) fn proxy_synthetic_artifact(
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+    version: Option<String>,
+    content_type: &str,
+) -> crate::models::artifact::Artifact {
+    let now = Utc::now();
+    crate::models::artifact::Artifact {
+        id: Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: content_type.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Where and how one scanned proxy download is fetched, gated and recorded.
+pub(crate) struct ScannedProxyRequest<'a> {
+    /// The Remote repository (a virtual's MEMBER on the virtual path) whose
+    /// upstream serves the bytes and whose verdicts/downloads they count to.
+    pub repo_id: Uuid,
+    pub repo_key: &'a str,
+    /// Base URL of the synthesized remote repo the capped fetch runs against.
+    pub fetch_base: &'a str,
+    /// The repository's real format, so the proxy cache classifier picks the
+    /// right TTL arm (see [`build_remote_repo_with_format`]).
+    pub format: RepositoryFormat,
+    /// Upstream path (relative to `fetch_base`, or absolute) of the file.
+    pub source_path: &'a str,
+    /// Proxy-cache key. The download is recorded under this path too, so the
+    /// buffered and streaming arms keep one cache entry and one catalog row.
+    pub cache_path: &'a str,
+    /// The file name the client receives; names the scan target and the
+    /// block/lock bodies.
+    pub filename: &'a str,
+    pub action: crate::services::proxy_scan_service::ProxyScanAction,
+    pub severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    /// `None` skips download recording (a caller with no telemetry context).
+    pub ctx: Option<&'a crate::api::middleware::download_telemetry::DownloadContext>,
+}
+
+/// The buffered bytes that passed the gate, with what the upstream declared
+/// about them.
+pub(crate) struct ScannedProxyBody {
+    pub bytes: Bytes,
+    /// Upstream `Content-Type`, when it sent one. Formats with a fixed media
+    /// type ignore it.
+    pub content_type: Option<String>,
+    /// The coding these exact bytes arrived under. A buffered body is
+    /// forwarded verbatim, so the response MUST declare it (#3149/#3184).
+    pub content_encoding: Option<String>,
+    /// SHA-256 of `bytes`, computed here, never taken from upstream.
+    pub digest: String,
+}
+
+/// The per-format half of [`serve_scanned_proxy_file`] (#4098).
+#[async_trait::async_trait]
+pub(crate) trait ScannedProxyFile: Send + Sync {
+    /// Short name for log lines, e.g. `"npm tarball"`.
+    const LABEL: &'static str;
+
+    /// Content type of the synthetic scan artifact for `filename`.
+    fn synthetic_content_type(filename: &str) -> String;
+
+    /// Version stamped on the synthetic scan artifact. `None` unless the
+    /// format derives it from the requested file name.
+    fn synthetic_version(_filename: &str) -> Option<String> {
+        None
+    }
+
+    /// The synthetic scan artifact for these bytes.
+    fn synthetic_artifact(
+        repo_id: Uuid,
+        filename: &str,
+        digest: &str,
+        size: i64,
+    ) -> crate::models::artifact::Artifact
+    where
+        Self: Sized,
+    {
+        proxy_synthetic_artifact(
+            repo_id,
+            filename,
+            digest,
+            size,
+            Self::synthetic_version(filename),
+            &Self::synthetic_content_type(filename),
+        )
+    }
+
+    /// What these bytes are served as, derived from the REQUEST (#3003). Only
+    /// consulted when the gate has to scan.
+    ///
+    /// Deliberately required, with no default: `NotApplicable` skips the
+    /// assessment gate, so a format that expects a coordinate must say so
+    /// (`Established` / `Unestablished`), and one that returns
+    /// `NotApplicable` has to state it in code rather than inherit it.
+    fn identity(
+        &self,
+        req: &ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        digest: &str,
+    ) -> ProxyScanIdentity;
+
+    /// Runs once the buffered fetch has the bytes (cache hit or fill), before
+    /// the gate. Formats that fix up the cached record hook in here.
+    async fn after_buffered_fetch(
+        &self,
+        _state: &crate::api::SharedState,
+        _req: &ScannedProxyRequest<'_>,
+    ) {
+    }
+
+    /// Fail-open over the scan byte cap: serve the object UNSCANNED through
+    /// the format's streaming path. The wrapper records the download and adds
+    /// `X-AK-Scan: pending`; this only fetches and shapes the response.
+    async fn serve_unscanned_stream(
+        &self,
+        state: &crate::api::SharedState,
+        req: &ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response>;
+
+    /// The 200 for bytes the gate let through. `pending` is the fail-open
+    /// serve-before-verdict case. The wrapper stamps `X-AK-Scan`
+    /// (`pending` / `clean`) on the result itself, so the header holds on
+    /// every arm whatever the builder sets.
+    fn scanned_response(
+        &self,
+        req: &ScannedProxyRequest<'_>,
+        body: ScannedProxyBody,
+        pending: bool,
+    ) -> Response;
+}
+
+/// Inline scan-and-block for one proxied file (#2954/#3003, generic since
+/// #4098).
+///
+/// The caller takes this path ONLY when scan-on-proxy is enabled for the
+/// repository; a repository that has not opted in keeps its streaming path.
+/// Flow: buffered capped fetch (cache-first, so a repeat pull is answered from
+/// the proxy cache with no upstream hit) → over the byte cap, 423 under
+/// fail-closed or the format's streaming path, loudly pending, under fail-open
+/// (never buffer unbounded, #895) → content digest → the shared digest-keyed
+/// verdict gate ([`gate_proxy_scan_serve`]) → record + 200, or the 403/423 as
+/// built. Any other fetch error (an upstream 404) is returned as-is, so a
+/// virtual member walk can fall through to the next member.
+pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    proxy: &ProxyService,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    let remote = build_remote_repo_with_format(
+        req.repo_id,
+        req.repo_key,
+        req.fetch_base,
+        req.format.clone(),
+    );
+    let (bytes, content_type, content_encoding) = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &remote,
+            req.source_path,
+            req.cache_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) if is_over_cap_error(&e) => {
+            return serve_oversized_proxy_file(state, req, file).await
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+    file.after_buffered_fetch(state, req).await;
+
+    let digest = sha256_hex(&bytes);
+    let identity = file.identity(req, &bytes, &digest);
+    let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
+    match gate_proxy_scan_serve(
+        state,
+        req.repo_id,
+        req.filename,
+        &digest,
+        synthetic,
+        &bytes,
+        req.action,
+        req.severity_gate,
+        identity,
+        ProxyScanMode::File,
+    )
+    .await
+    {
+        ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        ProxyScanServeOutcome::Serve { pending } => {
+            record_scanned_proxy_download(state, req).await;
+            let body = ScannedProxyBody {
+                bytes,
+                content_type,
+                content_encoding,
+                digest,
+            };
+            let mut resp = file.scanned_response(req, body, pending);
+            resp.headers_mut().insert(
+                "X-AK-Scan",
+                axum::http::HeaderValue::from_static(if pending { "pending" } else { "clean" }),
+            );
+            Ok(resp)
+        }
+    }
+}
+
+/// The over-cap branch of [`serve_scanned_proxy_file`]: the object is too
+/// large to buffer for an inline scan, which is inconclusive.
+async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    use crate::services::proxy_scan_service::{decide_inconclusive, InconclusiveOutcome};
+    match decide_inconclusive(req.action) {
+        InconclusiveOutcome::Locked => {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
+                "proxy object exceeds scan byte cap; fail-closed -> 423"
+            );
+            Err(scan_pending_locked_response(req.filename))
+        }
+        InconclusiveOutcome::ServePending => {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
+                "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+            );
+            let mut resp = file.serve_unscanned_stream(state, req).await?;
+            record_scanned_proxy_download(state, req).await;
+            resp.headers_mut()
+                .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+            Ok(resp)
+        }
+    }
+}
+
+/// Record a download served by [`serve_scanned_proxy_file`], on either arm.
+async fn record_scanned_proxy_download(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+) {
+    if let Some(ctx) = req.ctx {
+        record_proxy_download(state, req.repo_id, req.repo_key, req.cache_path, ctx).await;
+    }
+}
+
+/// #4098: the generic scan-on-proxy wrapper, driven through a fake format so
+/// the shared sequence is pinned independently of npm / PyPI / VS Code (whose
+/// own end-to-end suites prove the ports kept their behaviour).
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scanned_proxy_file_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A format whose hooks count their calls and whose 200 names what the
+    /// wrapper handed it.
+    #[derive(Default)]
+    struct FakeFormat {
+        after_fetch: AtomicUsize,
+        streamed: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScannedProxyFile for FakeFormat {
+        const LABEL: &'static str = "fake";
+
+        fn synthetic_content_type(_filename: &str) -> String {
+            "application/x-fake".to_string()
+        }
+
+        fn synthetic_version(filename: &str) -> Option<String> {
+            filename.strip_suffix(".fake").map(str::to_string)
+        }
+
+        fn identity(
+            &self,
+            _req: &ScannedProxyRequest<'_>,
+            _bytes: &Bytes,
+            _digest: &str,
+        ) -> ProxyScanIdentity {
+            ProxyScanIdentity::NotApplicable
+        }
+
+        async fn after_buffered_fetch(
+            &self,
+            _state: &crate::api::SharedState,
+            _req: &ScannedProxyRequest<'_>,
+        ) {
+            self.after_fetch.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn serve_unscanned_stream(
+            &self,
+            _state: &crate::api::SharedState,
+            _req: &ScannedProxyRequest<'_>,
+        ) -> Result<Response, Response> {
+            self.streamed.fetch_add(1, Ordering::SeqCst);
+            Ok((StatusCode::OK, "streamed").into_response())
+        }
+
+        fn scanned_response(
+            &self,
+            req: &ScannedProxyRequest<'_>,
+            body: ScannedProxyBody,
+            pending: bool,
+        ) -> Response {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("X-Fake-File", req.filename)
+                .header("X-Fake-Digest", body.digest)
+                .header("X-Fake-Pending", pending.to_string())
+                .body(axum::body::Body::from(body.bytes))
+                .unwrap()
+        }
+    }
+
+    fn request<'a>(
+        repo_id: Uuid,
+        repo_key: &'a str,
+        fetch_base: &'a str,
+        action: ProxyScanAction,
+    ) -> ScannedProxyRequest<'a> {
+        ScannedProxyRequest {
+            repo_id,
+            repo_key,
+            fetch_base,
+            format: RepositoryFormat::Generic,
+            source_path: "files/pkg-1.0.fake",
+            cache_path: "files/pkg-1.0.fake",
+            filename: "pkg-1.0.fake",
+            action,
+            severity_gate: ProxySeverityGate::BlockOnAny,
+            ctx: None,
+        }
+    }
+
+    /// Proxy downloads recorded for the request's cache path (#3446).
+    async fn recorded(fx: &tdh::Fixture) -> i64 {
+        crate::services::proxy_catalog::download_counts_by_paths(
+            &fx.pool,
+            fx.repo_id,
+            &["files/pkg-1.0.fake".to_string()],
+        )
+        .await
+        .unwrap()
+        .get("files/pkg-1.0.fake")
+        .copied()
+        .unwrap_or(0)
+    }
+
+    async fn body_of(resp: Response) -> Bytes {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// A DB-backed Remote repo, a proxy over its storage, and an upstream
+    /// serving `bytes` at the request's source path (`None` = 404).
+    async fn rig(
+        bytes: Option<Vec<u8>>,
+    ) -> Option<(
+        tdh::Fixture,
+        crate::api::SharedState,
+        Arc<ProxyService>,
+        wiremock::MockServer,
+    )> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy.clone());
+        let upstream = wiremock::MockServer::start().await;
+        let template = match bytes {
+            Some(b) => ResponseTemplate::new(200).set_body_bytes(b),
+            None => ResponseTemplate::new(404),
+        };
+        Mock::given(method("GET"))
+            .and(path("/files/pkg-1.0.fake"))
+            .respond_with(template)
+            .mount(&upstream)
+            .await;
+        Some((fx, state, proxy, upstream))
+    }
+
+    #[test]
+    fn synthetic_artifact_takes_the_format_bits() {
+        let repo_id = Uuid::new_v4();
+        let a = FakeFormat::synthetic_artifact(repo_id, "pkg-1.0.fake", "ab12", 7);
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.name, "pkg-1.0.fake");
+        assert_eq!(a.path, "pkg-1.0.fake");
+        assert_eq!(a.version.as_deref(), Some("pkg-1.0"));
+        assert_eq!(a.content_type, "application/x-fake");
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 7);
+        assert!(a.storage_key.is_empty());
+        assert!(a.quarantine_status.is_none());
+    }
+
+    /// The rescan builder shares the same constructor: the filename is the
+    /// cache path's last segment and an unknown content type is octet-stream.
+    #[test]
+    fn rescan_synthetic_artifact_uses_the_shared_builder() {
+        let a = proxy_rescan_synthetic_artifact(Uuid::new_v4(), "a/b/c.whl", "d", 1, None);
+        assert_eq!(a.name, "c.whl");
+        assert_eq!(a.path, "c.whl");
+        assert_eq!(a.version, None);
+        assert_eq!(a.content_type, "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn oversized_fail_closed_locks_without_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = FakeFormat::default();
+        let req = request(
+            Uuid::new_v4(),
+            "r",
+            "http://unused",
+            ProxyScanAction::FailClosed,
+        );
+        let resp = serve_oversized_proxy_file(&state, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        let body: serde_json::Value = serde_json::from_slice(&body_of(resp).await).unwrap();
+        assert_eq!(body["error"], "scan_pending");
+        assert_eq!(body["file"], "pkg-1.0.fake");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_fail_open_streams_loudly_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = FakeFormat::default();
+        let req = request(
+            Uuid::new_v4(),
+            "r",
+            "http://unused",
+            ProxyScanAction::FailOpen,
+        );
+        let resp = serve_oversized_proxy_file(&state, &req, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(&body_of(resp).await[..], b"streamed");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 1);
+    }
+
+    /// Fail-open first pull of an unknown digest: the BUFFERED bytes are
+    /// served through the format's builder, loudly pending, digest computed
+    /// over exactly those bytes.
+    #[tokio::test]
+    async fn fail_open_first_pull_serves_buffered_bytes_through_the_format() {
+        let bytes = format!("fake-4098-open-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Stamped by the wrapper; the fake builder does not set it.
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(resp.headers()["X-Fake-Pending"], "true");
+        assert_eq!(resp.headers()["X-Fake-File"], "pkg-1.0.fake");
+        assert_eq!(
+            resp.headers()["X-Fake-Digest"].to_str().unwrap(),
+            sha256_hex(&Bytes::from(bytes.clone()))
+        );
+        assert_eq!(&body_of(resp).await[..], &bytes[..]);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 1);
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+        assert_eq!(recorded(&fx).await, 1, "a scanned 200 records exactly once");
+        fx.teardown().await;
+    }
+
+    /// Fail-closed first pull with no scanner configured: the inline scan is
+    /// inconclusive, so the wrapper withholds (423) and never builds a 200.
+    #[tokio::test]
+    async fn fail_closed_unscannable_first_pull_is_locked() {
+        let bytes = format!("fake-4098-closed-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
+        fx.teardown().await;
+    }
+
+    /// A cached vulnerable verdict for the content digest blocks with the
+    /// neutral 403, before any scan.
+    #[tokio::test]
+    async fn cached_vulnerable_digest_is_blocked() {
+        let bytes = format!("fake-4098-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-4098-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body_of(resp).await).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], "pkg-1.0.fake");
+        assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
+        fx.teardown().await;
+    }
+
+    /// Over the cap, the fail-open stream is recorded exactly once and the
+    /// fail-closed lock records nothing (#3446 on both inconclusive arms).
+    #[tokio::test]
+    async fn oversized_arms_record_exactly_what_they_serve() {
+        let Some((fx, state, _proxy, upstream)) = rig(None).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let file = FakeFormat::default();
+
+        let mut locked = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        locked.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &locked, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert_eq!(recorded(&fx).await, 0);
+
+        let mut open = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        open.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &open, &file)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(recorded(&fx).await, 1);
+        fx.teardown().await;
+    }
+
+    /// An upstream miss is passed through as-is (a virtual member walk falls
+    /// through to the next member on it) and never reaches the format hooks.
+    #[tokio::test]
+    async fn upstream_miss_passes_through_untouched() {
+        let Some((fx, state, proxy, upstream)) = rig(None).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(file.after_fetch.load(Ordering::SeqCst), 0);
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
+        fx.teardown().await;
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(ak_test_shard = "handlers-2")]
@@ -7608,6 +9201,126 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProxyScanInconclusive::NoScanner)));
+    }
+
+    /// Leaf scanner whose single finding names the bytes it was handed, so a
+    /// finding recorded under the wrong digest is visible (#3868).
+    struct ContentEchoScanner;
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for ContentEchoScanner {
+        fn name(&self) -> &str {
+            "content-echo"
+        }
+
+        fn scan_type(&self) -> &str {
+            "content-echo"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &crate::models::artifact::Artifact,
+            _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+            content: &Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            // Hold the scan open briefly so the two scans below overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(crate::services::scanner_service::ScanOutput {
+                findings: vec![crate::models::security::RawFinding {
+                    severity: crate::models::security::Severity::High,
+                    title: "echo".to_string(),
+                    description: None,
+                    cve_id: Some("CVE-3868-0001".to_string()),
+                    affected_component: Some(String::from_utf8_lossy(content).into_owned()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: None,
+                    source_url: None,
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    /// #3868 regression: two DIFFERENT artifacts scanned concurrently through
+    /// the proxy path must each record only their own findings under their
+    /// own digest. (The reported psycopg2 findings were not cross-attributed:
+    /// `psycopg2-2.9.12.tar.gz` ships `doc/requirements.txt` pinning
+    /// requests/urllib3/idna/pygments, and 2.9.13 ships the same file -- see
+    /// the #3868 handoff. This pins the digest/finding association the report
+    /// suspected.)
+    #[tokio::test]
+    async fn proxy_scan_records_each_artifacts_findings_under_its_own_digest_3868() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(ContentEchoScanner)],
+        );
+        let a = Bytes::from(format!("alpha-{}", Uuid::new_v4()));
+        let b = Bytes::from(format!("bravo-{}", Uuid::new_v4()));
+        let (da, db) = (sha256_hex(&a), sha256_hex(&b));
+        let scan = |bytes: Bytes, digest: String, file: &'static str| {
+            let state = state.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                let synthetic = proxy_rescan_synthetic_artifact(
+                    repo_id,
+                    file,
+                    &digest,
+                    bytes.len() as i64,
+                    None,
+                );
+                proxy_scan_and_record(
+                    &state,
+                    repo_id,
+                    &digest,
+                    &synthetic,
+                    &bytes,
+                    None,
+                    &ProxyScanMode::File,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .is_ok()
+            }
+        };
+        let (ok_a, ok_b) = tokio::join!(
+            scan(a.clone(), da.clone(), "alpha-1.0.tar.gz"),
+            scan(b.clone(), db.clone(), "bravo-1.0.tar.gz"),
+        );
+        assert!(ok_a && ok_b, "both proxy scans must complete");
+
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        for (digest, own) in [(&da, &a), (&db, &b)] {
+            let names: Vec<Option<String>> = pss
+                .fetch_findings(digest, PROXY_SCAN_TYPE, 50)
+                .await
+                .expect("fetch findings")
+                .into_iter()
+                .map(|f| f.package_name)
+                .collect();
+            assert_eq!(
+                names,
+                vec![Some(String::from_utf8_lossy(own).into_owned())],
+                "digest {digest} must carry only its own artifact's findings"
+            );
+        }
+        for digest in [&da, &db] {
+            let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
     }
 
     /// Drive [`gate_proxy_scan_serve`] once with a fresh (unseeded) digest so
@@ -8786,6 +10499,144 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: the deferred recorder moves the catalog upsert + statistics
+    /// insert off the request path (spawned task) but must still land exactly
+    /// the rows the synchronous variant writes. DB-backed; polls briefly
+    /// because the write now races the assertion by design.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_lands_row_off_path_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        record_proxy_download_deferred(&state, repo_id, &repo_key, path, &ctx).await;
+
+        let mut storage_key: Option<String> = None;
+        for _ in 0..100 {
+            storage_key = sqlx::query_scalar(
+                "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&pool)
+            .await
+            .expect("query catalog row");
+            if storage_key.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let storage_key =
+            storage_key.expect("deferred record must land the catalog row from its spawned task");
+        assert!(
+            storage_key.starts_with("proxy-cache/prod-eu/"),
+            "deferred placeholder must key under the live scope, same as the sync variant: {storage_key}"
+        );
+        let stats: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_download_statistics d \
+             JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("count statistics rows");
+        assert_eq!(stats, 1, "exactly one statistics row per deferred serve");
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: with the record limiter saturated (a download burst already
+    /// claiming every permit), the deferred recorder must fall back to
+    /// recording INLINE rather than dropping the event — download statistics
+    /// stay exact under load. DB-backed.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_saturated_limiter_records_inline_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        // Claim every permit: the next deferred record cannot spawn.
+        let _permits = Arc::clone(&PROXY_DOWNLOAD_RECORD_LIMITER)
+            .acquire_many_owned(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS as u32)
+            .await
+            .expect("semaphore is not closed");
+        assert_eq!(PROXY_DOWNLOAD_RECORD_LIMITER.available_permits(), 0);
+
+        record_proxy_download_deferred(&state, repo_id, &repo_key, path, &ctx).await;
+
+        // Inline fallback: the row exists IMMEDIATELY when the call returns —
+        // there is no spawned task to race.
+        let storage_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog row");
+        assert!(
+            storage_key.is_some(),
+            "a saturated limiter must record inline, never drop the download event"
+        );
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: the HEAD guard must short-circuit BEFORE a permit is claimed or
+    /// a task spawned — a metadata probe serves no bytes and never counts.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_head_guard_claims_nothing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope);
+        let state = tdh::build_state_with_proxy(pool, "/tmp/unused", proxy);
+
+        let mut ctx = get_ctx();
+        ctx.is_head = true;
+        let before = PROXY_DOWNLOAD_RECORD_LIMITER.available_permits();
+        record_proxy_download_deferred(&state, Uuid::nil(), "any-repo", "any/path", &ctx).await;
+        assert_eq!(
+            PROXY_DOWNLOAD_RECORD_LIMITER.available_permits(),
+            before,
+            "a HEAD probe must not claim a record permit or spawn a task"
+        );
     }
 
     #[tokio::test]
@@ -11238,13 +13089,21 @@ mod tests {
                 password_min_strength: 0,
                 presigned_downloads_enabled: false,
                 presigned_download_expiry_secs: 300,
+                download_verify_checksums: true,
+                storage_scrub_interval_secs: 0,
+                storage_scrub_max_objects: 500,
+                storage_scrub_max_bytes: 2 << 30,
                 proxy_singleflight_advisory_locks_enabled: false,
                 proxy_singleflight_lock_poll_interval_ms: 200,
                 proxy_singleflight_lock_wait_timeout_secs: 65,
                 oci_virtual_negative_cache_ttl_ms:
                     crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+                npm_virtual_negative_cache_ttl_ms:
+                    crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
                 oci_virtual_negative_cache_max_entries:
                     crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+                npm_virtual_negative_cache_max_entries:
+                    crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
@@ -12526,9 +14385,10 @@ mod tests {
 
     #[test]
     fn test_strategy_virtual_falls_through_to_local() {
-        // Nested virtual repositories are not supported as members, but
-        // if one ever appears we prefer a terminating Local lookup over
-        // infinite proxy recursion.
+        // Post-#3840 the member walk is recursive and leaf-only, so a
+        // Virtual row can no longer reach this function. The arm stays
+        // pinned as fail-safe: if a regression ever let one through, a
+        // terminating Local lookup beats infinite proxy recursion.
         assert_eq!(
             virtual_member_fetch_strategy(&RepositoryType::Virtual, true, true),
             VirtualMemberFetchStrategy::Local,
@@ -15667,6 +17527,693 @@ mod tests {
         }
     }
 
+    // ── #3840: recursive virtual member expansion ────────────────────────
+
+    /// Remove every repo in `ids` (and its membership rows) plus the fixture
+    /// user, then drop the temp storage dirs. Mirrors the per-test cleanup
+    /// the surrounding db-backed tests open-code.
+    async fn cleanup_member_graph(pool: &PgPool, ids: &[Uuid], user_id: Uuid, dirs: &[PathBuf]) {
+        // Membership rows reference both repos with ON DELETE CASCADE, but
+        // deleting parent-first is not guaranteed to clear rows whose
+        // member side is deleted later in the loop; remove them up front.
+        // `permissions` rows (from `grant_repo_actions`) have NO foreign key
+        // to `repositories`, so they must be removed explicitly or every run
+        // leaks one per grant.
+        for id in ids {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+        }
+        for id in ids {
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+        for (i, id) in ids.iter().enumerate() {
+            // Only the first cleanup deletes the user; the rest no-op.
+            if i == 0 {
+                db_helpers::cleanup(pool, *id, user_id).await;
+            } else {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A virtual whose member is itself a virtual must list the nested
+    /// virtual's LEAF members. The single-level join returned the
+    /// intermediate virtual row, which owns no artifacts, so a nested
+    /// virtual listed nothing at all.
+    #[tokio::test]
+    async fn fetch_virtual_members_expands_nested_virtual() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, leaf_id, 1).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(&pool, &[root_id, mid_id, leaf_id], user_id, &[rd, md, ld]).await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![leaf_id],
+            "a nested virtual must contribute its leaf, not the intermediate virtual row"
+        );
+        assert_eq!(
+            members[0].repo_type,
+            RepositoryType::Local,
+            "the returned member is the content-owning leaf"
+        );
+    }
+
+    /// Priority flattening rule (#3840): depth-first pre-order. A nested
+    /// virtual's leaves are inlined at the slot the nested virtual occupies
+    /// in its parent's priority order, and within the nested virtual by its
+    /// own priorities.
+    #[tokio::test]
+    async fn fetch_virtual_members_orders_depth_first_preorder() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (n1_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (n2_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (direct_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, root_id, direct_id, 2).await;
+        db_helpers::link_member(&pool, mid_id, n2_id, 2).await;
+        db_helpers::link_member(&pool, mid_id, n1_id, 1).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, n1_id, n2_id, direct_id],
+            user_id,
+            &[rd, md, d1, d2, d3],
+        )
+        .await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![n1_id, n2_id, direct_id],
+            "the nested virtual's members (in its own priority order) must be              inlined at the nested virtual's slot, ahead of the root's              priority-2 member"
+        );
+    }
+
+    /// A leaf reachable through TWO paths (a diamond) must appear ONCE, at
+    /// its best rank — the same copy a download would resolve first, so
+    /// listing and resolution cannot disagree about which member wins a
+    /// duplicate coordinate.
+    #[tokio::test]
+    async fn fetch_virtual_members_diamond_dedupes_at_best_rank() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (v1_id, _k1, d1) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (v2_id, _k2, d2) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (shared_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (other_id, _k4, d4) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, v1_id, 1).await;
+        db_helpers::link_member(&pool, root_id, v2_id, 2).await;
+        db_helpers::link_member(&pool, v1_id, shared_id, 1).await;
+        db_helpers::link_member(&pool, v2_id, shared_id, 1).await;
+        db_helpers::link_member(&pool, v2_id, other_id, 2).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, v1_id, v2_id, shared_id, other_id],
+            user_id,
+            &[rd, d1, d2, d3, d4],
+        )
+        .await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![shared_id, other_id],
+            "the shared leaf must appear exactly once, at the rank of its              best path (through the priority-1 virtual)"
+        );
+    }
+
+    /// A cycle in the stored graph — impossible through the API, so it can
+    /// only arrive through direct table manipulation — must TERMINATE and be
+    /// reported via the guard flag, never hang and never silently truncate.
+    /// `db_helpers::link_member` is raw SQL and deliberately bypasses the
+    /// write-time cycle guard, simulating exactly that corrupted state.
+    #[tokio::test]
+    async fn fetch_virtual_members_cycle_terminates_and_is_reported() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (a_id, _ka, da) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (b_id, _kb, db) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _kl, dl) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, a_id, b_id, 1).await;
+        db_helpers::link_member(&pool, b_id, a_id, 1).await;
+        db_helpers::link_member(&pool, a_id, leaf_id, 2).await;
+        db_helpers::link_member(&pool, b_id, leaf_id, 2).await;
+
+        let expansion = expand_virtual_members(&pool, a_id)
+            .await
+            .expect("cycle must terminate");
+
+        cleanup_member_graph(&pool, &[a_id, b_id, leaf_id], user_id, &[da, db, dl]).await;
+
+        assert!(
+            expansion.cycle_edge_skipped,
+            "the cycle-closing edge must be reported via the guard flag"
+        );
+        assert!(!expansion.depth_limit_reached);
+        assert_eq!(
+            expansion
+                .members
+                .iter()
+                .map(|m| m.repo.id)
+                .collect::<Vec<_>>(),
+            vec![leaf_id],
+            "the reachable leaf is still listed, exactly once, cycle notwithstanding"
+        );
+    }
+
+    /// Nesting deeper than `MAX_VIRTUAL_DEPTH` must terminate with the
+    /// truncation flag set rather than walking unboundedly. The chain's tail
+    /// virtual is ALSO linked directly under the root at a lower priority: the
+    /// walk reaches it first down the long side (too deep, dropped) and then
+    /// down the short side, where it must still expand — the depth cap must
+    /// not poison the "already expanded" set.
+    #[tokio::test]
+    async fn fetch_virtual_members_beyond_max_depth_is_truncated_and_reported() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        // One more level than the cap allows: the leaf sits at depth
+        // MAX_VIRTUAL_DEPTH + 2 from the root.
+        let chain_len = crate::services::repository_service::MAX_VIRTUAL_DEPTH + 2;
+        let mut ids = Vec::with_capacity(chain_len + 1);
+        let mut dirs = Vec::with_capacity(chain_len + 1);
+        for _ in 0..chain_len {
+            let (id, _k, d) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+            ids.push(id);
+            dirs.push(d);
+        }
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        dirs.push(ld);
+        for w in ids.windows(2) {
+            db_helpers::link_member(&pool, w[0], w[1], 1).await;
+        }
+        let tail_id = *ids.last().unwrap();
+        db_helpers::link_member(&pool, tail_id, leaf_id, 1).await;
+        let (shallow_leaf_id, _sk, sd) = db_helpers::create_repo(&pool, "local", "npm").await;
+        dirs.push(sd);
+        db_helpers::link_member(&pool, tail_id, shallow_leaf_id, 2).await;
+        // Diamond short side: the tail virtual is also a direct member.
+        db_helpers::link_member(&pool, ids[0], tail_id, 2).await;
+
+        let expansion = expand_virtual_members(&pool, ids[0])
+            .await
+            .expect("deep chain must terminate");
+
+        let mut all_ids = ids.clone();
+        all_ids.push(leaf_id);
+        all_ids.push(shallow_leaf_id);
+        cleanup_member_graph(&pool, &all_ids, user_id, &dirs).await;
+
+        assert!(
+            expansion.depth_limit_reached,
+            "crossing the depth cap must be reported"
+        );
+        let listed: Vec<Uuid> = expansion.members.iter().map(|m| m.repo.id).collect();
+        assert_eq!(
+            listed,
+            vec![leaf_id, shallow_leaf_id],
+            "both leaves are within the cap through the short side and must be \
+             listed, in the tail virtual's own priority order, even though the \
+             tail was first reached (and dropped) beyond the cap"
+        );
+        assert_eq!(
+            expansion
+                .members
+                .iter()
+                .map(|m| m.priority_path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2, 1], vec![2, 2]],
+            "the priority path records the path the leaf was actually reached by"
+        );
+        assert!(!expansion.cycle_edge_skipped);
+    }
+
+    /// `virtual_member_ranks` (#3840 / #2311): nested leaves rank at their
+    /// parent virtual's slot, equal-priority direct siblings share a rank,
+    /// and a flat virtual with priorities 1..n ranks exactly as its priorities.
+    #[tokio::test]
+    async fn fetch_virtual_member_priorities_ranks_nested_leaves_in_resolution_order() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (nested_id, _nk, nd) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        let (remote_id, _rmk, rmd) = db_helpers::create_repo(&pool, "remote", "pypi").await;
+        let (tie_a_id, _ak, ad) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        let (tie_b_id, _bk, bd) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, nested_id, 1).await;
+        db_helpers::link_member(&pool, root_id, remote_id, 2).await;
+        db_helpers::link_member(&pool, root_id, tie_a_id, 3).await;
+        db_helpers::link_member(&pool, root_id, tie_b_id, 3).await;
+
+        let ranks = fetch_virtual_member_priorities(&pool, root_id).await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, nested_id, remote_id, tie_a_id, tie_b_id],
+            user_id,
+            &[rd, md, nd, rmd, ad, bd],
+        )
+        .await;
+
+        let ranks = ranks.expect("rank map");
+        assert!(
+            !ranks.contains_key(&mid_id),
+            "intermediate virtuals own nothing and get no rank"
+        );
+        assert_eq!(
+            ranks[&nested_id], 1,
+            "the nested local sits at the root's slot 1"
+        );
+        assert_eq!(ranks[&remote_id], 2);
+        assert_eq!(ranks[&tie_a_id], 3);
+        assert_eq!(
+            ranks[&tie_a_id], ranks[&tie_b_id],
+            "equal-priority siblings keep their tie (#2311: an equal-priority \
+             remote is not suppressed by a local owner)"
+        );
+        assert!(
+            ranks[&nested_id] < ranks[&remote_id],
+            "a local owner nested at slot 1 outranks a direct remote at slot 2"
+        );
+    }
+
+    /// `virtual_has_private_member` / `virtual_has_age_gated_member` gate the
+    /// caller-INDEPENDENT caches; with recursive expansion (#3840) a private or
+    /// gated leaf behind a nested virtual contributes to the aggregated
+    /// document, so the gate must see it too — or the first authorized request
+    /// warms a shared cache that anonymous callers then read.
+    #[tokio::test]
+    async fn virtual_cache_gates_see_nested_leaves() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, leaf_id, 1).await;
+        // Public intermediate, private leaf: a single-level check saw only
+        // the public intermediate and reported "all public".
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(mid_id)
+            .execute(&pool)
+            .await
+            .expect("publish intermediate");
+
+        let private_nested = virtual_has_private_member(&pool, root_id).await;
+        let cacheable_nested = virtual_aggregate_cacheable(&pool, root_id, true).await;
+        let gated_before = virtual_has_age_gated_member(&pool, root_id).await;
+
+        sqlx::query(
+            "UPDATE repositories SET is_public = true, age_gate_enabled = true WHERE id = $1",
+        )
+        .bind(leaf_id)
+        .execute(&pool)
+        .await
+        .expect("publish + gate leaf");
+        let private_all_public = virtual_has_private_member(&pool, root_id).await;
+        let gated_after = virtual_has_age_gated_member(&pool, root_id).await;
+
+        cleanup_member_graph(&pool, &[root_id, mid_id, leaf_id], user_id, &[rd, md, ld]).await;
+
+        assert!(
+            private_nested,
+            "a private leaf behind a nested virtual must be seen"
+        );
+        assert!(
+            !cacheable_nested,
+            "...so the aggregate must not be cached caller-independently"
+        );
+        assert!(!gated_before, "positive control: nothing gated yet");
+        assert!(
+            !private_all_public,
+            "all public again: the aggregate is shareable"
+        );
+        assert!(
+            gated_after,
+            "an age-gated leaf behind a nested virtual must be seen"
+        );
+    }
+
+    /// `virtual_local_winner_artifact_id` must attribute a virtual download to
+    /// the row the resolver actually served: with nested expansion (#3840)
+    /// that can be a leaf inside a member virtual, ranked ahead of a direct
+    /// member holding the same path.
+    #[tokio::test]
+    async fn virtual_local_winner_follows_recursive_resolution_order() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (nested_id, _nk, nd) = db_helpers::create_repo(&pool, "local", "generic").await;
+        let (direct_id, _dk, dd) = db_helpers::create_repo(&pool, "local", "generic").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, nested_id, 1).await;
+        db_helpers::link_member(&pool, root_id, direct_id, 2).await;
+        let path = "shadow/1.0.0/shadow-1.0.0.bin";
+        let mut inserted = Vec::new();
+        for repo_id in [direct_id, nested_id] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'shadow', 1, $3, 'application/octet-stream', $4) RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .bind("0".repeat(64))
+            .bind(format!("generic/{repo_id}/shadow"))
+            .fetch_one(&pool)
+            .await
+            .expect("insert artifact");
+            inserted.push(id);
+        }
+        let nested_artifact = inserted[1];
+
+        let winner = virtual_local_winner_artifact_id(&pool, root_id, path).await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, nested_id, direct_id],
+            user_id,
+            &[rd, md, nd, dd],
+        )
+        .await;
+
+        assert_eq!(
+            winner,
+            Some(nested_artifact),
+            "the nested leaf at slot 1 wins over the direct member at slot 2"
+        );
+    }
+
+    // ── #968: deployment target of a virtual repository ──────────────────
+
+    /// The deployment target is the first WRITABLE hosted member in
+    /// resolution order: remote members are skipped (they cannot accept
+    /// publishes), and a hosted leaf nested inside another virtual is
+    /// reached through the recursive walk.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_picks_first_writable_hosted_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (remote_id, _kr, rr) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        let (nested_id, _kn, dn) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (hosted_id, _kh, dh) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, remote_id, 1).await;
+        db_helpers::link_member(&pool, root_id, nested_id, 2).await;
+        db_helpers::link_member(&pool, nested_id, hosted_id, 1).await;
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            hosted_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+
+        let auth = nonadmin_auth(user_id);
+        let target = resolve_virtual_deploy_target(
+            &pool,
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+            &auth,
+            root_id,
+        )
+        .await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, remote_id, nested_id, hosted_id],
+            user_id,
+            &[rd, rr, dn, dh],
+        )
+        .await;
+
+        let target = target.expect("a writable hosted member must resolve");
+        assert_eq!(
+            target.id, hosted_id,
+            "the hosted leaf of the nested virtual is the deployment target"
+        );
+    }
+
+    /// A member the caller may not write — no grant, a `promotion_only`
+    /// flag, or a token scope that excludes it — is skipped; the next
+    /// eligible member in resolution order wins. With no eligible member at
+    /// all the answer is 400, and it must not name any member.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_skips_ineligible_members() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (locked_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (promo_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (open_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, locked_id, 1).await;
+        db_helpers::link_member(&pool, root_id, promo_id, 2).await;
+        db_helpers::link_member(&pool, root_id, open_id, 3).await;
+        // locked_id: no grant at all. promo_id: writable but promotion_only.
+        sqlx::query("UPDATE repositories SET promotion_only = true WHERE id = $1")
+            .bind(promo_id)
+            .execute(&pool)
+            .await
+            .expect("flag promotion_only");
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            promo_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            open_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+
+        let svc = crate::services::permission_service::PermissionService::new(pool.clone());
+        let auth = nonadmin_auth(user_id);
+        let target = resolve_virtual_deploy_target(&pool, &svc, &auth, root_id).await;
+
+        // A token scoped to the virtual only (not to any member) resolves
+        // nothing: scope to the members, or to both (#3173's composition,
+        // applied to writes).
+        let mut scoped = nonadmin_auth(user_id);
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![root_id]);
+        let denied = resolve_virtual_deploy_target(&pool, &svc, &scoped, root_id).await;
+
+        // Clean up BEFORE asserting so a failure does not leak the fixtures.
+        cleanup_member_graph(
+            &pool,
+            &[root_id, locked_id, promo_id, open_id],
+            user_id,
+            &[rd, d1, d2, d3],
+        )
+        .await;
+
+        assert_eq!(
+            target.expect("the writable open member must resolve").id,
+            open_id,
+            "grant-less and promotion_only members are skipped in resolution order"
+        );
+        let status = denied
+            .expect_err("an out-of-scope member must not deploy")
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A virtual with no hosted member at all has no deployment target.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_none_when_no_hosted_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (remote_id, _kr, rr) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        db_helpers::link_member(&pool, root_id, remote_id, 1).await;
+
+        let auth = nonadmin_auth(user_id);
+        let result = resolve_virtual_deploy_target(
+            &pool,
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+            &auth,
+            root_id,
+        )
+        .await;
+
+        cleanup_member_graph(&pool, &[root_id, remote_id], user_id, &[rd, rr]).await;
+
+        let err = result.expect_err("a remote-only virtual has no deploy target");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #3813 F1: the virtual-parent byte fan-out and a direct member fetch must
+    /// give an authenticated grant-less caller the SAME answer for an
+    /// `internal` member.
+    ///
+    /// The fan-out's read-baseline short-circuit read `member.is_public`, so an
+    /// internal member's bytes were refused through the virtual parent while
+    /// `check_artifact_visibility` served the very same artifact on a direct
+    /// fetch (`artifacts.rs`, `allows_authenticated_read`). That is not a leak
+    /// — it is worse as a ceiling than as a gate: the caller could reach the
+    /// bytes by changing the URL, so the restriction only obscured the path.
+    ///
+    /// The private half is asserted in the same test on purpose. A fix that
+    /// simply returned `true` here would widen private members through the
+    /// parent and still satisfy the internal half alone.
+    #[tokio::test]
+    async fn virtual_parent_and_direct_fetch_agree_on_an_internal_member() {
+        use crate::api::handlers::artifacts::check_artifact_visibility;
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let virtual_id = Uuid::new_v4();
+        let (internal_id, internal_key, internal_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (private_id, private_key, private_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(internal_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+
+        // Authenticated, holding NO grant on either repository.
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let auth = nonadmin_auth(user_id);
+
+        // One artifact in each member, so the direct-fetch half asks the real
+        // content gate rather than a predicate standing in for it.
+        let mut artifact_ids = Vec::new();
+        for (repo_id, key, dir) in [
+            (internal_id, &internal_key, &internal_dir),
+            (private_id, &private_key, &private_dir),
+        ] {
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let repo_info = tdh::make_repo_info(repo_id, key, dir, "local", None);
+            artifact_ids.push(
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &repo_info,
+                    "f1.txt",
+                    "f1.txt",
+                    "f1",
+                    "1.0.0",
+                    "text/plain",
+                    Bytes::from_static(b"f1"),
+                    user_id,
+                )
+                .await,
+            );
+        }
+
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let internal = svc.get_by_id(internal_id).await.expect("load internal");
+        let private = svc.get_by_id(private_id).await.expect("load private");
+        let auth_opt = Some(auth.clone());
+
+        let direct_internal =
+            check_artifact_visibility(&auth_opt, artifact_ids[0], &pool, "read").await;
+        let parent_internal =
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &internal).await;
+        let direct_private =
+            check_artifact_visibility(&auth_opt, artifact_ids[1], &pool, "read").await;
+        let parent_private = caller_can_read_member(&pool, Some(&auth), virtual_id, &private).await;
+
+        // Clean up before asserting so a failure does not leak the fixture.
+        for id in [internal_id, private_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        for d in [internal_dir, private_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        // -- internal: both surfaces must say yes.
+        assert!(
+            direct_internal.is_ok(),
+            "baseline: a direct fetch of an internal member's artifact must succeed \
+             for an authenticated grant-less caller"
+        );
+        assert_eq!(
+            direct_internal.is_ok(),
+            parent_internal,
+            "the virtual-parent fan-out must give the SAME answer as a direct \
+             fetch for an internal member; refusing the bytes here while the \
+             direct URL serves them makes the ceiling bypassable rather than \
+             enforced"
+        );
+
+        // -- private: both surfaces must still say no.
+        assert!(
+            direct_private.is_err(),
+            "a private member must stay refused on a direct fetch without a grant"
+        );
+        assert_eq!(
+            direct_private.is_err(),
+            !parent_private,
+            "the fan-out must not widen a private member; a fix that returns \
+             true unconditionally passes the internal half and fails here"
+        );
+    }
+
     #[test]
     fn age_gate_params_maps_remote_npm_repo() {
         let info = RepoInfo {
@@ -16972,6 +19519,276 @@ mod virtual_read_authz_tests {
     }
 }
 
+/// Scan-on-upload coverage gate (#4166).
+///
+/// `scan_on_upload` used to be honored only where an upload went through
+/// `ArtifactService::finalize_upload`; 30 format-native handlers persisted the
+/// artifact row themselves and never scanned, so the setting silently did
+/// nothing for npm, Maven, Cargo, Go, docker push and most other formats. The
+/// gate below is structural: it reads EVERY handler source and requires each
+/// production `artifacts` insert to be one of
+///
+/// * inside a function that calls
+///   [`crate::services::scanner_service::trigger_scan_on_upload`], or one call
+///   hop from such a function (the insert lives in a shared primitive such as
+///   `upsert_manifest_artifact`, the trigger in the handler that calls it); or
+/// * directly under a `NO-SCAN-ON-UPLOAD:` comment (in the comment block right
+///   above the statement holding the insert) saying why the row is not an
+///   upload (a promotion copy, a registry-generated index, a pull-side cache
+///   listing, a provenance signature).
+///
+/// Each trigger call covers ONE insert: a function with two unmarked inserts
+/// and one trigger fails, so a second row cannot ride on the first's scan.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_upload_coverage_tests {
+    use super::proxy_download_recording_tests::{test_spans, top_level_fns};
+
+    /// Raw SQL inserts, tolerant of case, line breaks and a schema prefix.
+    const INSERT_SQL: &str = r"(?i)INSERT\s+INTO\s+(public\.)?artifacts\b";
+    /// Calls of the shared insert primitives.
+    const INSERT_CALLS: &[&str] = &["insert_artifact(", "insert_artifact_row("];
+    const TRIGGER: &str = "trigger_scan_on_upload(";
+    const MARKER: &str = "NO-SCAN-ON-UPLOAD:";
+    /// The shared insert primitives in this file: their callers are checked.
+    const PRIMITIVES: &[&str] = &["insert_artifact", "insert_artifact_row"];
+    /// Test-fixture-only sources.
+    const EXEMPT_FILES: &[&str] = &["test_db_helpers.rs"];
+
+    /// The 30 handlers #4166 enumerated, as `(file, function holding the
+    /// insert)`. Pinned so a rename or a matcher regression fails loudly
+    /// instead of silently dropping a handler out of the gate.
+    const ISSUE_4166_HANDLERS: &[(&str, &str)] = &[
+        ("alpine.rs", "store_apk"),
+        ("cargo.rs", "store_crate_artifact"),
+        ("chef.rs", "upload_cookbook"),
+        ("cocoapods.rs", "push_pod"),
+        ("composer.rs", "upload"),
+        ("conan.rs", "recipe_file_upload"),
+        ("conan.rs", "package_file_upload"),
+        ("gitlfs.rs", "upload_object"),
+        ("goproxy.rs", "upload_zip"),
+        ("goproxy.rs", "upload_mod"),
+        ("jetbrains.rs", "upload_plugin"),
+        ("maven.rs", "upload"),
+        ("npm.rs", "store_npm_version"),
+        ("protobuf.rs", "upload"),
+        ("pub_registry.rs", "upload_package"),
+        ("sbt.rs", "upload_artifact"),
+        ("swift.rs", "publish_release"),
+        ("terraform.rs", "upload_module"),
+        ("terraform.rs", "upload_provider"),
+        ("vscode.rs", "publish_extension"),
+        ("oci_v2.rs", "upsert_manifest_artifact"),
+        ("upload.rs", "complete_session_commit"),
+        ("helm.rs", "upload_chart"),
+        ("hex.rs", "publish_package"),
+        ("cran.rs", "upload_package"),
+        ("ansible.rs", "upload_collection"),
+        ("puppet.rs", "publish_module"),
+        ("rubygems.rs", "push_gem"),
+        ("rpm.rs", "store_rpm"),
+        ("huggingface.rs", "upload_file_impl"),
+    ];
+
+    /// Every handler source, read from disk so a NEW handler file is covered
+    /// without anyone remembering to list it.
+    fn handler_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("read src/api/handlers")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                let src = std::fs::read_to_string(&p).expect("read handler source");
+                (name, src)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One production insert site: the enclosing function and whether the
+    /// gate considers it covered.
+    #[derive(Debug)]
+    struct Site {
+        func: String,
+        covered: bool,
+    }
+
+    /// Source text of the `i`th top-level function (up to the next one).
+    fn body_of<'a>(src: &'a str, fns: &[(usize, String)], i: usize) -> &'a str {
+        let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
+        &src[fns[i].0..end]
+    }
+
+    /// Byte offsets of every insert site (SQL or primitive call) in `src`.
+    fn insert_offsets(src: &str) -> Vec<usize> {
+        let sql = regex::Regex::new(INSERT_SQL).expect("valid insert regex");
+        let mut out: Vec<usize> = sql.find_iter(src).map(|m| m.start()).collect();
+        for needle in INSERT_CALLS {
+            out.extend(src.match_indices(needle).map(|(at, _)| at));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether the comment block directly above the statement holding the
+    /// insert at `at` carries the marker. Walks up from the insert's line
+    /// through the statement's own code lines; a line ending a previous
+    /// statement or block (`;`, `{`, `}`) or a blank line ends the search.
+    fn marker_above(src: &str, at: usize) -> bool {
+        let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let mut in_comment = false;
+        for line in src[..line_start].lines().rev().take(12) {
+            let t = line.trim();
+            if t.starts_with("//") {
+                in_comment = true;
+                if t.contains(MARKER) {
+                    return true;
+                }
+            } else if in_comment
+                || t.is_empty()
+                || t.ends_with(';')
+                || t.ends_with('{')
+                || t.ends_with('}')
+            {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// `TRIGGER` calls on code (not comment) lines of `body`.
+    fn trigger_calls(body: &str) -> usize {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains(TRIGGER))
+            .count()
+    }
+
+    /// Classify every production insert site in one source file.
+    fn insert_sites(file: &str, src: &str) -> Vec<Site> {
+        let spans = test_spans(src);
+        let fns = top_level_fns(src, &spans);
+        let mut out = Vec::new();
+        // Unmarked sites already charged against each function's triggers.
+        let mut charged: std::collections::HashMap<usize, usize> = Default::default();
+        for at in insert_offsets(src) {
+            if spans.iter().any(|(a, b)| *a <= at && at < *b) {
+                continue;
+            }
+            let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            if src[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            let Some(idx) = fns.iter().rposition(|(off, _)| *off <= at) else {
+                continue;
+            };
+            let func = fns[idx].1.clone();
+            if file == "proxy_helpers.rs" && PRIMITIVES.contains(&func.as_str()) {
+                continue;
+            }
+            if marker_above(src, at) {
+                out.push(Site {
+                    func,
+                    covered: true,
+                });
+                continue;
+            }
+            let call = format!("{func}(");
+            let caller_triggers = (0..fns.len()).any(|j| {
+                let caller = body_of(src, &fns, j);
+                j != idx && caller.contains(&call) && trigger_calls(caller) > 0
+            });
+            let budget = trigger_calls(body_of(src, &fns, idx)) + usize::from(caller_triggers);
+            let used = charged.entry(idx).or_default();
+            *used += 1;
+            out.push(Site {
+                func,
+                covered: *used <= budget,
+            });
+        }
+        out
+    }
+
+    /// THE gate: no production `artifacts` insert escapes scan-on-upload.
+    #[test]
+    fn every_format_upload_triggers_scan_on_upload() {
+        let mut uncovered = Vec::new();
+        let mut scanned = 0usize;
+        let mut found: std::collections::HashSet<(String, String)> = Default::default();
+        for (file, src) in handler_sources() {
+            if EXEMPT_FILES.contains(&file.as_str()) {
+                continue;
+            }
+            for site in insert_sites(&file, &src) {
+                scanned += 1;
+                if !site.covered {
+                    uncovered.push(format!("{file}::{}", site.func));
+                }
+                found.insert((file.clone(), site.func));
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `artifacts` row without reaching \
+             scanner_service::trigger_scan_on_upload (add the call after the \
+             row commits, or a `{MARKER}` comment saying why the row is not an \
+             upload): {uncovered:?}"
+        );
+        for (file, func) in ISSUE_4166_HANDLERS {
+            assert!(
+                found.contains(&(file.to_string(), func.to_string())),
+                "#4166 handler {file}::{func} no longer has an insert site the gate \
+                 can see; update ISSUE_4166_HANDLERS or the matcher"
+            );
+        }
+        assert!(
+            scanned >= ISSUE_4166_HANDLERS.len(),
+            "scanned only {scanned} sites"
+        );
+    }
+
+    /// The matcher itself: a handler that inserts without the trigger fails;
+    /// the trigger (in the function, or in a caller for a primitive) or a
+    /// marker directly above the insert passes; a marker elsewhere in the
+    /// function does not; a second insert on one trigger fails; SQL split
+    /// across lines or lower-cased is still an insert; test modules are
+    /// ignored.
+    #[test]
+    fn scan_on_upload_gate_classifies_sites() {
+        let src = "async fn bad() {\n    q(\"insert into\n  artifacts (a) VALUES ($1)\");\n}\n\
+                   async fn good() {\n    let id = insert_artifact(db, a).await;\n    \
+                   trigger_scan_on_upload(db, s, r, id).await;\n}\n\
+                   async fn marked() {\n    let x = 1;\n    // NO-SCAN-ON-UPLOAD: generated index\n    \
+                   q(\n        \"INSERT INTO artifacts\");\n}\n\
+                   async fn far() {\n    // NO-SCAN-ON-UPLOAD: too far away\n    let x = 1;\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn two() {\n    insert_artifact_row(a);\n    insert_artifact_row(b);\n    \
+                   trigger_scan_on_upload(a);\n}\n\
+                   fn prim() {\n    q(\"INSERT INTO public.artifacts\");\n}\n\
+                   async fn caller() {\n    let id = prim();\n    trigger_scan_on_upload(id);\n}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { q(\"INSERT INTO artifacts\"); }\n}\n";
+        let sites: Vec<(String, bool)> = insert_sites("x.rs", src)
+            .into_iter()
+            .map(|s| (s.func, s.covered))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![
+                ("bad".to_string(), false),
+                ("good".to_string(), true),
+                ("marked".to_string(), true),
+                ("far".to_string(), false),
+                ("two".to_string(), true),
+                ("two".to_string(), false),
+                ("prim".to_string(), true),
+            ]
+        );
+    }
+}
+
 /// #3446: proxy/remote download RECORDING across every format handler.
 ///
 /// Two functions count a download and they are not interchangeable.
@@ -17068,8 +19885,19 @@ mod proxy_download_recording_tests {
 
     /// Calls that count as recording the serve. `try_remote_or_virtual_download`
     /// records internally, so routing through it is the preferred fix and needs
-    /// no separate call.
-    const RECORDERS: &[&str] = &["record_proxy_download(", "try_remote_or_virtual_download("];
+    /// no separate call. `record_proxy_download_deferred` is #3778's
+    /// spawned-task sibling: it lands the same download row off the response
+    /// path (inline when the limiter is saturated), so a serve that calls it
+    /// IS recorded. The `(` after each name is load-bearing —
+    /// `record_proxy_download(` is not a substring of the deferred variant.
+    const RECORDERS: &[&str] = &[
+        "record_proxy_download(",
+        "record_proxy_download_deferred(",
+        "try_remote_or_virtual_download(",
+        // #4098: the generic scan-on-proxy wrapper records on both of its serve
+        // arms (the scanned 200 and the over-cap fail-open stream).
+        "serve_scanned_proxy_file(",
+    ];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
 
@@ -17080,7 +19908,7 @@ mod proxy_download_recording_tests {
     /// A top-level `#[cfg(test)]` item ends at the next line that is exactly
     /// `}` in column 0 — rustfmt guarantees that for a top-level item, and the
     /// handlers are all rustfmt-clean (CI enforces `cargo fmt --check`).
-    fn test_spans(src: &str) -> Vec<(usize, usize)> {
+    pub(super) fn test_spans(src: &str) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
         let mut from = 0usize;
         while let Some(rel) = src[from..].find("\n#[cfg(test)]") {
@@ -17098,7 +19926,7 @@ mod proxy_download_recording_tests {
     /// Byte offsets and names of the top-level `fn` items outside test spans.
     /// A top-level item starts in column 0, so a line beginning with an
     /// optional `pub`/`pub(..)`, an optional `async`, then `fn ` is one.
-    fn top_level_fns(src: &str, spans: &[(usize, usize)]) -> Vec<(usize, String)> {
+    pub(super) fn top_level_fns(src: &str, spans: &[(usize, usize)]) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         let mut at = 0usize;
         for line in src.split_inclusive('\n') {
@@ -17334,6 +20162,200 @@ mod proxy_download_recording_tests {
         }
     }
 
+    /// #4099: `GET /api/v1/formats` reports `scan_on_proxy: "enforced"` for
+    /// exactly the handlers whose source reaches the inline proxy scan gate —
+    /// the generic `serve_scanned_proxy_file` (#4098), or
+    /// `gate_proxy_scan_serve` directly (OCI's image-mode manifest gate). A
+    /// format that adopts the gate without declaring it, or a declaration left
+    /// behind after a gate is removed, fails here instead of silently telling
+    /// clients the wrong thing.
+    #[test]
+    fn scan_on_proxy_capability_matches_the_gate() {
+        const GATE_CALLS: &[&str] = &["serve_scanned_proxy_file(", "gate_proxy_scan_serve("];
+
+        // Handler key for a handler source file (see `RepositoryFormat::handler_key`).
+        fn handler_key(file: &str) -> String {
+            match file {
+                "goproxy.rs" => "go".to_string(),
+                "oci_v2.rs" => "oci".to_string(),
+                "pub_registry.rs" => "pub".to_string(),
+                other => other.trim_end_matches(".rs").to_string(),
+            }
+        }
+
+        let mut gated = std::collections::BTreeSet::new();
+        for (file, src) in SERVE_SOURCES {
+            let spans = test_spans(src);
+            let reaches_gate = GATE_CALLS.iter().any(|call| {
+                src.match_indices(call).any(|(at, _)| {
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    !spans.iter().any(|(a, b)| *a <= at && at < *b)
+                        && !prefix.trim_start().starts_with("//")
+                        && !prefix.contains('"')
+                })
+            });
+            if reaches_gate {
+                gated.insert(handler_key(file));
+            }
+        }
+
+        let declared: std::collections::BTreeSet<String> =
+            crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+        assert_eq!(
+            gated, declared,
+            "#4099: the handlers that route proxied downloads through the scan gate \
+             (left) must be exactly `formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` \
+             (right), which `GET /api/v1/formats` reports as enforced"
+        );
+
+        // File granularity alone would let ONE gated route vouch for a sibling
+        // route (Virtual, legacy) that still streams unscanned. Pin each
+        // enforced handler's proxied package entry points to the gate, so
+        // dropping the scan from any of them fails here. Limit: this pins the
+        // named functions' bodies, not every branch inside them; a new
+        // package-serving route must be added to this table.
+        const ROUTE_PINS: &[(&str, &str, &str, usize)] = &[
+            // Direct Remote arm + the Virtual member walk.
+            ("npm.rs", "serve_tarball", "serve_scanned_npm_tarball(", 2),
+            (
+                "npm.rs",
+                "serve_scanned_npm_tarball",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            ("pypi.rs", "serve_file", "serve_scanned_pypi_file(", 2),
+            (
+                "pypi.rs",
+                "serve_scanned_pypi_file",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "proxy_gallery_asset",
+                "serve_scanned_gallery_package(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_gallery_package",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "download_vsix",
+                "serve_scanned_legacy_vsix(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "download_vsix",
+                "serve_scanned_legacy_virtual_vsix(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_legacy_vsix",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_legacy_virtual_vsix",
+                "serve_scanned_legacy_vsix(",
+                1,
+            ),
+            (
+                "oci_v2.rs",
+                "handle_get_manifest",
+                "gate_oci_proxy_manifest_scan(",
+                1,
+            ),
+            (
+                "oci_v2.rs",
+                "gate_oci_proxy_manifest_scan",
+                "gate_proxy_scan_serve(",
+                1,
+            ),
+            // Blob pulls re-check the scan verdict of the image they belong to.
+            (
+                "oci_v2.rs",
+                "handle_get_blob",
+                "enforce_blob_scan_reblock(",
+                1,
+            ),
+        ];
+        // Body of the top-level `fn name(` (brace-matched from its first `{`).
+        fn fn_body<'s>(src: &'s str, name: &str) -> Option<&'s str> {
+            let sig = format!("fn {name}(");
+            let at = src.match_indices(&sig).map(|(i, _)| i).find(|&i| {
+                let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                !src[line_start..i].trim_start().starts_with("//")
+            })?;
+            let open = at + src[at..].find('{')?;
+            let mut depth = 0usize;
+            for (i, c) in src[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&src[open..open + i]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut unpinned = Vec::new();
+        for (file, func, call, min) in ROUTE_PINS {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| n == file)
+                .unwrap_or_else(|| panic!("{file} is scanned"));
+            let body = fn_body(src, func).unwrap_or_else(|| panic!("{file}: fn {func} not found"));
+            let calls = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.matches(call).count())
+                .sum::<usize>();
+            if calls < *min {
+                unpinned.push(format!(
+                    "{file}::{func} calls {call} {calls}x (needs {min})"
+                ));
+            }
+        }
+        assert!(
+            unpinned.is_empty(),
+            "#4099: a scan-on-proxy enforced route no longer reaches the gate: {unpinned:?}"
+        );
+        for key in &declared {
+            assert!(
+                ROUTE_PINS
+                    .iter()
+                    .any(|(file, ..)| handler_key(file) == *key),
+                "#4099: `{key}` is declared enforced but has no ROUTE_PINS entry"
+            );
+        }
+
+        let core: std::collections::HashSet<&str> = crate::formats::core_format_handlers()
+            .iter()
+            .map(|h| h.format_key)
+            .collect();
+        for key in crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS {
+            assert!(
+                core.contains(key),
+                "#4099: `{key}` is declared scan-on-proxy enforced but is not a core handler key"
+            );
+        }
+    }
+
     /// Count the formats still carrying a DEFERRAL marker (as opposed to a
     /// policy exemption like a HEAD or an OCI blob). This is the remaining
     /// #3446 surface, asserted so it can only ever shrink: a new format that
@@ -17367,8 +20389,10 @@ mod proxy_download_recording_tests {
     /// actually call the proxy recorder. The class guard above is satisfied by
     /// a MARKER as well as by a recorder, so with the deferral backlog drained
     /// this pins the positive half: each of these handlers must contain a real
-    /// `record_proxy_download(` call site, so a revert that puts a marker back
-    /// fails here rather than passing the marker-or-recorder gate.
+    /// recorder call site — `record_proxy_download(` or its #3778 spawned-task
+    /// sibling `record_proxy_download_deferred(`, which lands the same row off
+    /// the response path — so a revert that puts a marker back fails here
+    /// rather than passing the marker-or-recorder gate.
     #[test]
     fn every_proxy_serving_format_records_3649() {
         const MUST_RECORD: &[&str] = &[
@@ -17403,16 +20427,26 @@ mod proxy_download_recording_tests {
                     .iter()
                     .find(|(n, _)| n == *name)
                     .unwrap_or_else(|| panic!("{name} is scanned"));
-                !src.contains("record_proxy_download(")
+                !RECORDERS
+                    .iter()
+                    // `try_remote_or_virtual_download(` is a route, not a
+                    // recorder call owned by the handler — this pin is about
+                    // the handler itself carrying the recording call.
+                    //
+                    // #4098's `serve_scanned_proxy_file(` stays counted: it is
+                    // the handler's own scanned serve, and npm's only recording
+                    // call lived in that arm before the wrapper absorbed it.
+                    .filter(|r| **r != "try_remote_or_virtual_download(")
+                    .any(|r| src.contains(r))
             })
             .copied()
             .collect();
         assert!(
             missing.is_empty(),
             "#3649: these formats serve proxied package bytes but no longer call \
-             `record_proxy_download(`: {missing:?}. A proxy-only repository of that \
-             format reports zero downloads while serving continuous traffic, which \
-             is exactly what #3649 reported."
+             `record_proxy_download(` or its deferred sibling: {missing:?}. A \
+             proxy-only repository of that format reports zero downloads while \
+             serving continuous traffic, which is exactly what #3649 reported."
         );
     }
 }

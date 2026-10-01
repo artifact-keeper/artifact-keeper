@@ -18,6 +18,38 @@ pub enum FormatHandlerType {
     Wasm,
 }
 
+/// Whether scan-on-proxy is enforced for a format's proxied downloads (#4099).
+///
+/// `scan_configs.scan_on_proxy` is accepted for any repository, but only some
+/// handlers gate their Remote/Virtual downloads on the inline scan. Clients
+/// read this instead of hand-maintaining the gated-format list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanOnProxySupport {
+    /// Proxied package bytes are scanned inline and blocked per the policy.
+    Enforced,
+    /// The setting is stored but proxied downloads are served unscanned.
+    Accepted,
+    /// The handler has no core proxy serve path the setting could apply to
+    /// (a WASM plugin handler).
+    Unsupported,
+}
+
+impl ScanOnProxySupport {
+    /// The support level of the handler `format_key` of type `handler_type`.
+    pub fn for_handler(handler_type: &FormatHandlerType, format_key: &str) -> Self {
+        match handler_type {
+            FormatHandlerType::Wasm => Self::Unsupported,
+            FormatHandlerType::Core
+                if crate::formats::handler_enforces_scan_on_proxy(format_key) =>
+            {
+                Self::Enforced
+            }
+            FormatHandlerType::Core => Self::Accepted,
+        }
+    }
+}
+
 /// Format handler entity.
 ///
 /// Tracks all registered format handlers in the system, both core (compiled-in)
@@ -85,12 +117,21 @@ pub struct FormatHandlerResponse {
     /// Plugin capabilities if this is a WASM handler
     #[schema(value_type = Option<Object>)]
     pub capabilities: Option<serde_json::Value>,
+    /// Whether scan-on-proxy is enforced for this format's proxied downloads
+    /// (#4099): `enforced` = proxied package bytes are scanned inline and
+    /// withheld per the repository's policy; `accepted` = the setting is
+    /// stored but proxied downloads are served unscanned; `unsupported` = a
+    /// WASM plugin handler, which has no core proxy serve path the setting
+    /// could apply to.
+    pub scan_on_proxy: ScanOnProxySupport,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl From<FormatHandlerRecord> for FormatHandlerResponse {
     fn from(record: FormatHandlerRecord) -> Self {
+        let scan_on_proxy =
+            ScanOnProxySupport::for_handler(&record.handler_type, &record.format_key);
         Self {
             id: record.id,
             format_key: record.format_key,
@@ -103,6 +144,7 @@ impl From<FormatHandlerRecord> for FormatHandlerResponse {
             priority: record.priority,
             repository_count: None,
             capabilities: None,
+            scan_on_proxy,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }
@@ -158,6 +200,8 @@ mod tests {
         // Computed fields should be None
         assert!(response.repository_count.is_none());
         assert!(response.capabilities.is_none());
+        // A WASM plugin handler has no core proxy serve path (#4099).
+        assert_eq!(response.scan_on_proxy, ScanOnProxySupport::Unsupported);
     }
 
     #[test]
@@ -181,6 +225,36 @@ mod tests {
         assert_eq!(response.handler_type, FormatHandlerType::Core);
         assert!(response.plugin_id.is_none());
         assert!(response.description.is_none());
+        // Maven stores the flag but does not gate its downloads yet (#4100).
+        assert_eq!(response.scan_on_proxy, ScanOnProxySupport::Accepted);
+    }
+
+    /// #4099: the per-format capability, serialized the way
+    /// `GET /api/v1/formats` returns it.
+    #[test]
+    fn test_scan_on_proxy_support_per_handler() {
+        use ScanOnProxySupport::*;
+        for key in ["npm", "pypi", "oci", "vscode"] {
+            assert_eq!(
+                ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
+                Enforced,
+                "{key} gates its proxied downloads"
+            );
+        }
+        for key in ["maven", "cargo", "nuget", "go", "generic", "conda"] {
+            assert_eq!(
+                ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
+                Accepted,
+                "{key} stores scan_on_proxy but does not gate"
+            );
+        }
+        assert_eq!(
+            ScanOnProxySupport::for_handler(&FormatHandlerType::Wasm, "unity-assetbundle"),
+            Unsupported
+        );
+        assert_eq!(serde_json::to_value(Enforced).unwrap(), "enforced");
+        assert_eq!(serde_json::to_value(Accepted).unwrap(), "accepted");
+        assert_eq!(serde_json::to_value(Unsupported).unwrap(), "unsupported");
     }
 
     #[test]
