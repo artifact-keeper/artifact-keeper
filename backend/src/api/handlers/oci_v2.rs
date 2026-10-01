@@ -23172,8 +23172,12 @@ mod oci_blob_upload_streaming_tests {
             .await
         });
 
+        // The final PUT is parked at the storage copy until `release_copy` is
+        // notified below, so a PATCH that waited behind the commit would never
+        // complete. A generous timeout therefore still proves "rejected, not
+        // blocked" without racing request auth on a loaded runner (#4353).
         let patch_result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), &mut patch_task).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut patch_task).await;
         let (patch_status, _patch_headers, _patch_body) = patch_result
             .expect("PATCH should be rejected promptly while final PUT is committing")
             .expect("PATCH task should complete");
