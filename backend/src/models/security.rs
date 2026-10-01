@@ -286,6 +286,13 @@ pub struct ScanResult {
     /// When `is_reused` is true, the id of the source scan whose results
     /// were copied. None for original (non-reused) scans.
     pub source_scan_id: Option<Uuid>,
+    /// `complete`, `partial` or `not_cataloged` (#1153, #3604, #4036). A
+    /// `not_cataloged` row graded nothing and floors the repository to F.
+    #[serde(default)]
+    pub scan_completeness: String,
+    /// Why the scan is not `complete`, when that is known (#4154).
+    #[serde(default)]
+    pub scan_completeness_reason: Option<String>,
 }
 
 /// An individual vulnerability finding within a scan.
@@ -336,10 +343,11 @@ pub struct RepoSecurityScore {
     /// `scan_completeness='not_cataloged'` (#4036): a catalog-reporting
     /// scanner ran over a package-archive artifact whose format expects a
     /// catalog and cataloged NO components, so its zero-finding result means
-    /// "nothing was assessed", not "clean". While set, the repo fails
-    /// closed: the persisted `grade` is floored to `F` alongside the #2167
-    /// `has_failed_scan` override. Cleared automatically once a newer
-    /// completed scan supersedes the not-cataloged row.
+    /// "nothing was assessed", not "clean". The persisted `grade` letter is
+    /// floored to `F` (display-only; `score` is unchanged) when the artifact
+    /// is a package -- see `scanner_service::uncataloged_floors_grade`; a
+    /// plain generic archive sets only this flag. Cleared automatically once
+    /// a newer completed scan supersedes the not-cataloged row.
     pub has_uncataloged_scan: bool,
 }
 

@@ -1092,15 +1092,24 @@ impl AuthConfigService {
             hex::encode(&encrypted)
         });
 
-        let user_filter = req.user_filter.unwrap_or_else(|| "(uid={0})".to_string());
-        let email_attribute = req.email_attribute.unwrap_or_else(|| "mail".to_string());
+        // Shared with the env reconcile, which resets an env-owned field the
+        // environment stopped setting to these same defaults (#3904).
+        use crate::services::ldap_env_bootstrap as defaults;
+        let user_filter = req
+            .user_filter
+            .unwrap_or_else(|| defaults::DEFAULT_USER_FILTER.to_string());
+        let email_attribute = req
+            .email_attribute
+            .unwrap_or_else(|| defaults::DEFAULT_EMAIL_ATTRIBUTE.to_string());
         let display_name_attribute = req
             .display_name_attribute
-            .unwrap_or_else(|| "cn".to_string());
-        let username_attribute = req.username_attribute.unwrap_or_else(|| "uid".to_string());
+            .unwrap_or_else(|| defaults::DEFAULT_DISPLAY_NAME_ATTRIBUTE.to_string());
+        let username_attribute = req
+            .username_attribute
+            .unwrap_or_else(|| defaults::DEFAULT_USERNAME_ATTRIBUTE.to_string());
         let groups_attribute = req
             .groups_attribute
-            .unwrap_or_else(|| "memberOf".to_string());
+            .unwrap_or_else(|| defaults::DEFAULT_GROUPS_ATTRIBUTE.to_string());
         let use_starttls = req.use_starttls.unwrap_or(false);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let priority = req.priority.unwrap_or(0);
@@ -1171,6 +1180,11 @@ impl AuthConfigService {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
+
+        // #3904: a field the admin API changes stops being env-owned, so a
+        // later boot without the variable keeps the admin's value.
+        let admin_changed =
+            crate::services::ldap_env_bootstrap::admin_changed_fields(&existing, &req);
 
         let name = req.name.unwrap_or(existing.name);
         let server_url = req.server_url.unwrap_or(existing.server_url);
@@ -1249,6 +1263,9 @@ impl AuthConfigService {
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to update LDAP config: {e}")))?;
+
+        crate::services::ldap_env_bootstrap::release_env_ownership(pool, id, &admin_changed)
+            .await?;
 
         Ok(Self::ldap_row_to_response(row))
     }

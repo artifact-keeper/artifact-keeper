@@ -26,11 +26,11 @@ use crate::error::{AppError, Result};
 /// # The `action` argument (#3704)
 ///
 /// `action` is the `permissions` verb the calling handler performs — `read`
-/// for the by-id reads and their sub-resource siblings, `write` / `delete` for
-/// the label and SBOM mutations that share this gate. It is threaded (rather
-/// than fixed, the way `require_visible` fixes `read`) precisely because the
-/// call sites genuinely differ, and only the `read` ones take the public
-/// short-circuit below.
+/// for the by-id reads and their sub-resource siblings, `write` for the label
+/// and SBOM mutations that share this gate. It is threaded (rather than fixed,
+/// the way `require_visible` fixes `read`) precisely because the call sites
+/// genuinely differ, and only the `read` ones take the public short-circuit
+/// below.
 ///
 /// On a `read`, a **public** repository satisfies the token repository-scope
 /// ceiling, via the same [`public_read_satisfies_acl`] baseline
@@ -42,12 +42,19 @@ use crate::error::{AppError, Result};
 ///
 /// Writes and deletes are unaffected: `public_read_satisfies_acl` is read-only
 /// by construction, so a token scoped to repo A still cannot set or remove a
-/// label on an artifact in public repo B — which matters here because
-/// `authorize_label_write` checks only the token's *action* scope, leaving this
-/// gate as the sole repository ceiling on that path. Private repositories never
-/// take the shortcut.
+/// label on an artifact in public repo B. Private repositories never take the
+/// shortcut.
+///
+/// # This gate never authorizes a mutation (#4193)
+///
+/// Past the token ceiling it answers READ visibility only, whatever `action`
+/// says: a public repository admits every signed-in caller, and a private one
+/// asks for the `read` action. A mutating caller must therefore also pass
+/// [`require_repo_action`] for its own action, as the label (#4193) and SBOM
+/// (GHSA-ww52-pmcg-f53c) mutations do.
 ///
 /// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
+/// [`require_repo_action`]: crate::api::handlers::repositories::require_repo_action
 pub(crate) async fn check_artifact_visibility(
     auth: &Option<AuthExtension>,
     artifact_id: Uuid,
@@ -55,16 +62,17 @@ pub(crate) async fn check_artifact_visibility(
     action: &str,
 ) -> Result<()> {
     // Always fetch repo info so we can check both visibility and token scope.
-    let repo_info: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT r.id, r.is_public FROM repositories r \
+    let repo_info: Option<(Uuid, crate::models::repository::RepositoryVisibility)> =
+        sqlx::query_as(
+            "SELECT r.id, r.visibility FROM repositories r \
          JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
-    )
-    .bind(artifact_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        )
+        .bind(artifact_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((repo_id, is_public)) = repo_info else {
+    let Some((repo_id, visibility)) = repo_info else {
         // No matching repo means the artifact query upstream will 404.
         return Ok(());
     };
@@ -74,7 +82,7 @@ pub(crate) async fn check_artifact_visibility(
             // #3704: a public repository confers a read baseline that the token
             // repository-scope ceiling must not take away, since the `None` arm
             // below grants exactly that baseline with no credential at all.
-            if crate::api::middleware::auth::public_read_satisfies_acl(is_public, action) {
+            if crate::api::middleware::auth::public_read_satisfies_acl(visibility, action) {
                 return Ok(());
             }
             // Enforce API token repository scope: if the token is restricted
@@ -104,7 +112,9 @@ pub(crate) async fn check_artifact_visibility(
             // other caller must hold a role assignment scoped to the repo
             // (direct or global). NotFound (not Forbidden) avoids leaking the
             // existence of repositories the caller may not see.
-            if !is_public && !ext.is_admin {
+            // `internal` grants this authenticated caller the read baseline
+            // without a grant; `private` still requires one.
+            if !visibility.allows_authenticated_read() && !ext.is_admin {
                 let repo_service =
                     crate::services::repository_service::RepositoryService::new(db.clone());
                 if !repo_service
@@ -125,7 +135,7 @@ pub(crate) async fn check_artifact_visibility(
             Ok(())
         }
         None => {
-            if !is_public {
+            if !visibility.allows_anonymous_read() {
                 return Err(AppError::NotFound("Artifact not found".to_string()));
             }
             Ok(())

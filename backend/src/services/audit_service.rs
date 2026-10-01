@@ -128,6 +128,22 @@ pub enum AuditAction {
     // state. Appended at the END of the enum to keep the additive change
     // conflict-free with in-flight taxonomy work.
     ProxyScanVerdictDeleted,
+
+    // CI OIDC group binding reconciled on a mapping write (#4117, #4235
+    // review). Recorded when an admin's create/update of an identity mapping
+    // changed its service account's group memberships, so a grant or a
+    // revocation made through a binding is reviewable after the fact.
+    // Appended at the END of the enum to keep the additive change
+    // conflict-free with in-flight taxonomy work.
+    CiOidcGroupBindingReconciled,
+
+    // Storage integrity (#3910). Recorded when an admin runs the storage
+    // scrub, with the run's mode, scope, and counts. Appended at the END of
+    // the enum to keep the additive change conflict-free.
+    StorageScrubRun,
+    /// An admin reconciled a repository's stored objects with its artifact
+    /// rows (#1570), registering ghost objects.
+    StorageReindexRun,
 }
 
 impl AuditAction {
@@ -188,6 +204,9 @@ impl AuditAction {
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
             AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
+            AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
+            AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
+            AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
         }
     }
 }
@@ -444,6 +463,22 @@ impl AuditEntry {
 
     pub fn ip(mut self, ip_address: IpAddr) -> Self {
         self.ip_address = Some(ip_address);
+        self
+    }
+
+    /// Attach the in-flight request's client IP, resolved by
+    /// `client_ip_context_middleware` (#3888): the TCP peer, with
+    /// `X-Forwarded-For` believed only under the configured trusted-proxy
+    /// policy (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`). Outside a request scope —
+    /// background jobs, startup, detached tasks — or when the address could
+    /// not be resolved, the entry keeps `ip_address: NULL`: the audit row
+    /// records "unknown", never a sentinel. Authentication emitters call this
+    /// so login/logout/refresh events carry the address the credential was
+    /// presented from.
+    pub fn with_request_client_ip(mut self) -> Self {
+        if let Some(ip) = crate::api::middleware::client_ip::current_client_ip() {
+            self.ip_address = Some(ip);
+        }
         self
     }
 
@@ -1488,6 +1523,27 @@ mod tests {
                 "system:stuck_scan_janitor".to_string()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_request_client_ip_picks_up_scoped_request_ip() {
+        // #3888: inside a request scope (what client_ip_context_middleware
+        // establishes) the entry carries the resolved client IP.
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let entry = crate::api::middleware::client_ip::with_client_ip_scope(Some(ip), async {
+            AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(ip));
+    }
+
+    #[tokio::test]
+    async fn test_with_request_client_ip_outside_scope_keeps_none() {
+        // Background jobs / detached tasks have no request IP; the entry must
+        // record NULL rather than a sentinel or a stale address.
+        let entry =
+            AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip();
+        assert!(entry.ip_address.is_none());
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub fn parse_name_and_version(
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
         "nuget" => parse_nuget(filename, artifact_path),
         "go" | "golang" => parse_go(artifact_path, filename),
+        "cran" => parse_cran(filename, artifact_path),
         _ => fallback(filename),
     }
 }
@@ -351,6 +352,43 @@ fn parse_npm(filename: &str, artifact_path: &str) -> ParsedArtifact {
 }
 
 // ---------------------------------------------------------------------------
+// CRAN
+// ---------------------------------------------------------------------------
+
+/// CRAN parser (#2525). Source packages are `<name>_<version>.tar.gz`,
+/// wherever the source keeps them (`src/contrib/` or
+/// `src/contrib/Archive/<name>/`). R package names cannot contain `_`, so the
+/// last `_` splits name from version, exactly as the CRAN handler's own path
+/// parser does.
+///
+/// Binary packages (`bin/<platform>/contrib/<r-version>/...`) deliberately
+/// fall back: the same `<name>_<version>.tgz` exists once per R version, so a
+/// `<name>/<version>/<file>` canonical path would collapse them into one row,
+/// and they are not source packages the `src/contrib/PACKAGES` index may
+/// advertise. They keep their source path instead.
+fn parse_cran(filename: &str, artifact_path: &str) -> ParsedArtifact {
+    if is_cran_binary_path(artifact_path) {
+        return fallback(filename);
+    }
+    let stem = filename.strip_suffix(".tar.gz");
+    if let Some((name, version)) = stem.and_then(|s| s.rsplit_once('_')) {
+        if !name.is_empty() && !version.is_empty() {
+            return ParsedArtifact {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            };
+        }
+    }
+    fallback(filename)
+}
+
+/// `bin/<platform>/contrib/...`: where CRAN mirrors keep binary packages.
+fn is_cran_binary_path(artifact_path: &str) -> bool {
+    let mut segs = artifact_path.trim_start_matches('/').split('/');
+    segs.next() == Some("bin") && segs.next().is_some() && segs.next() == Some("contrib")
+}
+
+// ---------------------------------------------------------------------------
 // Maven
 // ---------------------------------------------------------------------------
 
@@ -610,6 +648,41 @@ mod tests {
         );
         assert_eq!(p.name, "guava");
         assert_eq!(p.version.as_deref(), Some("31.1-jre"));
+    }
+
+    #[test]
+    fn cran_source_and_binary_packages_2525() {
+        let p = parse_name_and_version(
+            "cran",
+            "dplyr_1.1.4.tar.gz",
+            "src/contrib/dplyr_1.1.4.tar.gz",
+        );
+        assert_eq!(p.name, "dplyr");
+        assert_eq!(p.version.as_deref(), Some("1.1.4"));
+
+        let archived = parse_name_and_version(
+            "CRAN",
+            "data.table_1.14.8.tar.gz",
+            "src/contrib/Archive/data.table/data.table_1.14.8.tar.gz",
+        );
+        assert_eq!(archived.name, "data.table");
+        assert_eq!(archived.version.as_deref(), Some("1.14.8"));
+
+        // A source package literally named `bin` is not a binary path.
+        let named_bin = parse_name_and_version("cran", "bin_0.1.tar.gz", "bin/0.1/bin_0.1.tar.gz");
+        assert_eq!(named_bin.name, "bin");
+        assert_eq!(named_bin.version.as_deref(), Some("0.1"));
+
+        // Binaries keep their source path (one file per R version).
+        for (file, path) in [
+            ("Rcpp_1.0.12.zip", "bin/windows/contrib/4.3/Rcpp_1.0.12.zip"),
+            ("Rcpp_1.0.12.tgz", "bin/macosx/contrib/4.4/Rcpp_1.0.12.tgz"),
+        ] {
+            assert_eq!(parse_name_and_version("cran", file, path).version, None);
+        }
+
+        let index = parse_name_and_version("cran", "PACKAGES.gz", "src/contrib/PACKAGES.gz");
+        assert_eq!(index.version, None);
     }
 
     #[test]

@@ -269,6 +269,25 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
     handlers
 }
 
+/// Core handler keys whose Remote/Virtual download path enforces the inline
+/// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
+/// through `proxy_helpers::serve_scanned_proxy_file` (npm, PyPI, VS Code) or,
+/// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
+///
+/// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
+/// other core handler stores the flag and serves unscanned (`"accepted"`).
+/// The `scan_on_proxy_capability_matches_the_gate` test in `proxy_helpers`
+/// reads every format handler's source and fails when a handler reaches the
+/// gate without being listed here, or is listed without reaching it, so the
+/// capability cannot drift from the router. Adopting the gate in a new format
+/// (#4100 Maven, #4101 Cargo, #4102 NuGet, ...) adds its key here.
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &["npm", "oci", "pypi", "vscode"];
+
+/// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
+pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
+    SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&handler_key)
+}
+
 /// Presentation metadata for a core handler key.
 ///
 /// Deliberately total: an unrecognised key falls back to the key itself rather

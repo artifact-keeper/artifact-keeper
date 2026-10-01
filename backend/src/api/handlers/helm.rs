@@ -1112,6 +1112,8 @@ async fn upload_chart(
 
     let prov_artifact_id = match prov_put.as_ref() {
         Some(prov_put) => Some(
+            // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
+            // signature, not package content; the chart row above is scanned.
             proxy_helpers::insert_artifact_row(
                 &mut tx,
                 proxy_helpers::NewArtifact {
@@ -1140,6 +1142,13 @@ async fn upload_chart(
     // through the pool, so it can only run once the rows are visible; metadata
     // recording is best-effort by contract.
     quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id).await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Build metadata JSON including the full Chart.yaml data
     let helm_metadata = serde_json::json!({

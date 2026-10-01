@@ -478,9 +478,12 @@ const OCI_BLOB_DIGEST_TEST_LOCK_KEY: i64 = 0x4244_3529; // "BD" + issue #3529
 /// Cross-process serialization guard for DB-backed OCI upload tests that
 /// commit a blob whose CONTENT another test also commits (#3529).
 ///
-/// `oci_upload_cleanup_keys.storage_key` is `UNIQUE` across the whole
-/// database and `blob_storage_key` is content-addressed, so two tests pushing
-/// identical bytes register the *same* cleanup-journal row: the second
+/// Until #3851, `oci_upload_cleanup_keys.storage_key` was `UNIQUE` across the
+/// whole database and `blob_storage_key` is content-addressed, so two tests
+/// pushing identical bytes registered the *same* cleanup-journal row. Rows are
+/// now per (repository, key), which removes the cross-repository collision
+/// described below; the lock is kept because tests pushing one digest also
+/// share its storage object. Historically the second
 /// `register_oci_upload_cleanup_key` hits `ON CONFLICT (storage_key)` and gets
 /// the first test's row id back. Whichever push commits first deletes that row
 /// inside its `oci_blobs` transaction (the #3187 guard) and then tears its
@@ -665,12 +668,19 @@ fn cfg(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        download_verify_checksums: true,
+        storage_scrub_interval_secs: 0,
+        storage_scrub_max_objects: 500,
+        storage_scrub_max_bytes: 2 << 30,
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
         oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        npm_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
             crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+        npm_virtual_negative_cache_max_entries:
+            crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
@@ -1185,16 +1195,23 @@ pub async fn send_with_headers(
 /// tests use this for an ordinary read/write repository member; owner-specific
 /// tests should grant the `repository-owner` role explicitly.
 pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    grant_repo_role(pool, repo_id, user_id, "developer").await;
+}
+
+/// Grant `user_id` the built-in role `role` (e.g. `reader`, `developer`,
+/// `repository-owner`) scoped to `repo_id`. Cleaned up by [`cleanup`].
+pub async fn grant_repo_role(pool: &PgPool, repo_id: Uuid, user_id: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name = $3 \
          ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
     )
     .bind(user_id)
     .bind(repo_id)
+    .bind(role)
     .execute(pool)
     .await
-    .expect("grant developer role");
+    .unwrap_or_else(|e| panic!("grant {role} role: {e}"));
 }
 
 /// Like [`make_auth`] but for a GLOBAL admin (`is_admin = true`). Used by
@@ -2166,6 +2183,22 @@ pub fn build_state_with_proxy(
     Arc::new(state)
 }
 
+/// Like [`build_state_with_proxy`], but lets the caller adjust the test
+/// [`Config`] before the state is built (e.g. disabling the npm
+/// computed-packument cache so a test exercises the per-request merge).
+pub fn build_state_with_proxy_with(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    mutate: impl FnOnce(&mut Config),
+) -> crate::api::SharedState {
+    let mut config = cfg(storage_path);
+    mutate(&mut config);
+    let mut state = app_state_with(config, pool, storage_path);
+    state.set_proxy_service(proxy);
+    Arc::new(state)
+}
+
 /// Like [`build_state_with_proxy`] but also wires a
 /// [`crate::services::scanner_service::ScannerService`] onto the state, so
 /// handler tests can exercise the inline proxy scan + verdict-freshness wiring
@@ -2200,6 +2233,42 @@ pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     .expect("enable scan-on-proxy");
 }
 
+/// Attach a new public Remote repository of `format`, proxying `upstream`, to
+/// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
+pub async fn attach_remote_member(
+    pool: &PgPool,
+    virtual_id: Uuid,
+    format: &str,
+    upstream: &str,
+    priority: i32,
+) -> (Uuid, String, PathBuf) {
+    let (member_id, member_key, member_dir) = create_repo(pool, "remote", format).await;
+    sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+        .bind(upstream)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("configure remote member");
+    link_virtual_member(pool, virtual_id, member_id, priority).await;
+    (member_id, member_key, member_dir)
+}
+
+/// Turn on the Package Age Policy hold (#1770) for a Remote repository, so
+/// every freshly proxied object is held (`409`) for `minutes`.
+pub async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, 'quarantine_enabled', 'true'), \
+                ($1, 'quarantine_duration_minutes', $2)",
+    )
+    .bind(repo_id)
+    .bind(minutes.to_string())
+    .execute(pool)
+    .await
+    .expect("enable quarantine config");
+    crate::services::quarantine_service::invalidate_config_cache(repo_id);
+}
+
 /// Build a state whose scanner service holds exactly the given mock leaf
 /// scanners, wired over the fixture's storage + a real proxy service. Shared
 /// by the #2976 verdict-freshness handler tests across formats so each format
@@ -2222,6 +2291,82 @@ pub fn build_scan_state_with_leaf_scanners(
             .into_owned(),
     );
     build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+}
+
+/// Leaf scanner for the #4166 scan-on-upload handler tests: applies to
+/// everything and completes clean. Its rows use scan_type `malware` -- allowed
+/// by the `scan_results_scan_type_check` constraint and used by no real
+/// scanner -- so the tests count only its rows.
+struct UploadProbeScanner;
+
+#[async_trait::async_trait]
+impl crate::services::scanner_service::Scanner for UploadProbeScanner {
+    fn name(&self) -> &str {
+        "upload-probe"
+    }
+
+    fn scan_type(&self) -> &str {
+        "malware"
+    }
+
+    async fn scan(
+        &self,
+        _artifact: &crate::models::artifact::Artifact,
+        _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+        Ok(crate::services::scanner_service::ScanOutput::default())
+    }
+}
+
+/// #4166: send one native upload `req` through `router` for `fx`'s repository
+/// with scanning enabled and `scan_on_upload = on_upload`, then return how many
+/// probe (`malware`) scan rows the repository has once `budget` elapses or the
+/// first row lands. Shared by the per-format scan-on-upload tests.
+pub async fn native_upload_probe_scans(
+    fx: &Fixture,
+    router: Router<SharedState>,
+    req: Request<Body>,
+    on_upload: bool,
+    budget: std::time::Duration,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold) \
+         VALUES ($1, true, $2, false, false, 'high')",
+    )
+    .bind(fx.repo_id)
+    .bind(on_upload)
+    .execute(&fx.pool)
+    .await
+    .expect("seed scan_configs");
+
+    let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+    let state =
+        build_scan_state_with_leaf_scanners(fx, &storage_path, vec![Arc::new(UploadProbeScanner)]);
+    let app = router_with_auth(router, state, make_auth(fx.user_id, &fx.username));
+    let (status, body) = send(app, req).await;
+    assert!(
+        status.is_success(),
+        "native upload failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results \
+             WHERE repository_id = $1 AND scan_type = 'malware'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count scan_results");
+        if n > 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the

@@ -969,6 +969,13 @@ async fn publish_package(
     // Store metadata
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "hex", &hex_metadata)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     info!(
         "Hex publish: {} {} ({}) to repo {}",
@@ -2275,6 +2282,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: String::new(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,

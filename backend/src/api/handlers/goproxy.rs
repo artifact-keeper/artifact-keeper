@@ -1606,6 +1606,13 @@ async fn upload_zip(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Surface the module on the Packages page (#3659), keyed on the Go module
     // path and version. Registered from the `.zip` (the module distribution)
@@ -1739,6 +1746,13 @@ async fn upload_mod(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let metadata = build_go_artifact_metadata(module, version, "mod");
@@ -3699,5 +3713,35 @@ mod catalog_registration_tests {
         let row = row.expect("a goproxy module upload must write a packages row (#3659)");
         assert_eq!(row.version, "v1.2.3");
         assert_eq!(row.versions, vec!["v1.2.3".to_string()]);
+    }
+
+    /// #4166: a native `go.mod` upload into a `scan_on_upload` repository
+    /// must enqueue a scan (before, `upload_mod` never triggered one), and
+    /// must not when `scan_on_upload` is off.
+    #[tokio::test]
+    async fn native_upload_triggers_scan_on_upload_4166() {
+        for (on_upload, budget_secs, expect_scan) in [(true, 30, true), (false, 3, false)] {
+            let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+                return;
+            };
+            let req = tdh::put(
+                format!("/{}/example.com/scanme/@v/v1.0.0.mod", fx.repo_key),
+                bytes::Bytes::from_static(b"module example.com/scanme\n"),
+            );
+            let scans = tdh::native_upload_probe_scans(
+                &fx,
+                super::router(),
+                req,
+                on_upload,
+                std::time::Duration::from_secs(budget_secs),
+            )
+            .await;
+            fx.teardown().await;
+            assert_eq!(
+                scans > 0,
+                expect_scan,
+                "scan_on_upload={on_upload}: {scans} scans"
+            );
+        }
     }
 }

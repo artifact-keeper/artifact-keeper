@@ -517,13 +517,56 @@ pub struct StorageService {
 /// `filesystem`, `s3`, and `gcs` each have an arm in
 /// [`StorageService::from_config`]. Azure deliberately does not (#1555):
 /// `main.rs` builds an Azure *primary* backend for hosted repositories, but the
-/// proxy facade has no `AzureBackendWrapper`, so remote/proxy repositories
-/// cannot be served on Azure. Callers use this to make the gap loud at startup
-/// (fail closed / log at error level) instead of booting green and silently
-/// black-holing every proxy request (handlers skip the upstream fetch when the
-/// proxy service is absent). Kept in lockstep with the arms in `from_config`.
+/// proxy facade has no `AzureBackendWrapper`, so the proxy cache cannot live on
+/// Azure. [`proxy_cache_backend_for`] turns that into a filesystem fallback
+/// facade, and [`remote_repository_backend_error`] into a per-repository
+/// create-time check (#3923). Kept in lockstep with the arms in `from_config`.
 pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
     matches!(storage_backend, "filesystem" | "s3" | "gcs")
+}
+
+/// The backend the proxy-cache facade is built on for a deployment whose
+/// default is `default_backend` (#3923).
+///
+/// A default with its own proxy-cache arm keeps it. A default without one
+/// (Azure) falls back to `filesystem`, rooted at `STORAGE_PATH`, so remote
+/// repositories pinned to `storage_backend: "filesystem"` are served instead of
+/// the whole deployment being unable to proxy (and, before #3923, refusing to
+/// start once any remote repository existed).
+pub fn proxy_cache_backend_for(default_backend: &str) -> &str {
+    if backend_supports_proxy_cache(default_backend) {
+        default_backend
+    } else {
+        "filesystem"
+    }
+}
+
+/// Why a remote/proxy repository on `repo_backend` cannot be served by a
+/// deployment whose default backend is `default_backend`, or `None` when it
+/// can (#3923).
+///
+/// The proxy cache is one deployment-wide facade (see
+/// [`proxy_cache_backend_for`]). When the default backend has a proxy-cache arm
+/// every remote repository is served through it, as before. When it does not,
+/// the facade is the filesystem fallback, which only matches a remote
+/// repository whose own backend is `filesystem`: a remote repository pinned to
+/// the object-storage default would have its cached bytes written somewhere its
+/// artifact rows are never read from. Repository creation rejects that up front
+/// (400) rather than accepting a repository the deployment cannot serve.
+pub fn remote_repository_backend_error(
+    default_backend: &str,
+    repo_backend: &str,
+) -> Option<String> {
+    let proxy_backend = proxy_cache_backend_for(default_backend);
+    if proxy_backend == default_backend || repo_backend == proxy_backend {
+        return None;
+    }
+    Some(format!(
+        "Remote (proxy) repositories cannot use storage backend '{repo_backend}' on this \
+         deployment: the proxy cache has no '{default_backend}' support (STORAGE_BACKEND={default_backend}), \
+         so it is kept on the local filesystem under STORAGE_PATH. Create the remote repository \
+         with \"storage_backend\": \"{proxy_backend}\"."
+    ))
 }
 
 /// What a [`StorageService`] handle is being built to address.
@@ -597,6 +640,23 @@ impl StorageService {
     /// [`StorageService::artifact_source_from_config`] instead (#3171).
     pub async fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_role(config, StorageRole::ProxyCache).await
+    }
+
+    /// Build the proxy-cache facade the deployment actually runs with (#3923).
+    ///
+    /// Same as [`StorageService::from_config`] when the default backend has a
+    /// proxy-cache arm; otherwise the facade is built on the backend
+    /// [`proxy_cache_backend_for`] picks (the filesystem under
+    /// `STORAGE_PATH`), so an object-storage default without a proxy arm no
+    /// longer leaves every remote repository unserved.
+    pub async fn proxy_cache_from_config(config: &Config) -> Result<Self> {
+        let backend = proxy_cache_backend_for(&config.storage_backend);
+        if backend == config.storage_backend {
+            return Self::from_config(config).await;
+        }
+        let mut proxy_config = config.clone();
+        proxy_config.storage_backend = backend.to_string();
+        Self::from_config(&proxy_config).await
     }
 
     /// Build the storage handle used to read and write **artifact bytes**,
@@ -1253,6 +1313,59 @@ mod tests {
             result.is_err(),
             "from_config must fail for azure until #1555 wires an Azure proxy arm"
         );
+    }
+
+    // -- Remote repositories on a default without a proxy arm (#3923) -------
+
+    #[test]
+    fn proxy_cache_backend_for_keeps_supported_defaults_and_falls_back_for_azure_3923() {
+        for backend in ["filesystem", "s3", "gcs"] {
+            assert_eq!(proxy_cache_backend_for(backend), backend);
+        }
+        assert_eq!(proxy_cache_backend_for("azure"), "filesystem");
+    }
+
+    #[test]
+    fn remote_repository_backend_error_is_per_repository_3923() {
+        // Defaults with a proxy arm serve every remote repository, as before.
+        for default in ["filesystem", "s3", "gcs"] {
+            for repo in ["filesystem", "s3", "gcs", "azure"] {
+                assert_eq!(remote_repository_backend_error(default, repo), None);
+            }
+        }
+        // On Azure the check is on the REPOSITORY's backend, not the default:
+        // a filesystem-pinned remote repository is servable...
+        assert_eq!(remote_repository_backend_error("azure", "filesystem"), None);
+        // ...one on the Azure default is rejected with an actionable message
+        // that does not cite the unrelated #1555.
+        let message = remote_repository_backend_error("azure", "azure")
+            .expect("an azure-pinned remote repository cannot be served");
+        assert!(
+            message.contains("\"storage_backend\": \"filesystem\""),
+            "{message}"
+        );
+        assert!(!message.contains("1555"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn proxy_cache_from_config_serves_azure_default_from_storage_path_3923() {
+        let dir = std::env::temp_dir().join(format!("ak-3923-{}", uuid::Uuid::new_v4()));
+        let mut config = minimal_config("azure");
+        config.storage_path = dir.to_string_lossy().into_owned();
+
+        let service = StorageService::proxy_cache_from_config(&config)
+            .await
+            .expect("an Azure default must still yield a proxy-cache facade (#3923)");
+        let key = "proxy-cache/scope/pypi-remote/simple/six/__content__";
+        service
+            .put(key, Bytes::from_static(b"cached"))
+            .await
+            .expect("write through the fallback facade");
+        assert_eq!(
+            std::fs::read(dir.join(key)).expect("the cached object lives under STORAGE_PATH"),
+            b"cached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Separate backup S3 bucket (#2507) -----------------------------------

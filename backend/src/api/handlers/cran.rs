@@ -394,6 +394,13 @@ async fn upload_package(
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "cran", &pkg_metadata)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     info!(
         "CRAN upload: {} {} ({}) to repo {}",
@@ -439,6 +446,11 @@ fn source_index_coordinates(path: &str, name: &str, version: &str) -> (String, S
 }
 
 /// Build PACKAGES index in CRAN DCF text format for source packages.
+///
+/// Rows under `bin/<platform>/contrib/` are binary packages a migration
+/// imported at their source path (#2525): they are not source packages, and advertising them here
+/// would send `install.packages()` after a `.tar.gz` that does not exist.
+/// Native uploads never store under `bin/`.
 async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, Response> {
     use sqlx::Row;
     // Runtime query (not the `query!` macro) so the added `a.path` column does
@@ -451,6 +463,7 @@ async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, 
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
+          AND a.path NOT LIKE 'bin/%/contrib/%'
         ORDER BY a.name, a.created_at DESC
         "#,
     )
@@ -831,6 +844,100 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"fake-r-pkg");
+        f.teardown().await;
+    }
+
+    /// #4166: CRAN inserts through `proxy_helpers::insert_artifact`, which
+    /// never triggered scan-on-upload. A native upload into a
+    /// `scan_on_upload` repository must now enqueue a scan.
+    #[tokio::test]
+    async fn test_cran_upload_triggers_scan_on_upload_4166() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let req = tdh::put(
+            format!("/{}/src/contrib/scanme_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"fake-r-pkg"),
+        );
+        let scans = tdh::native_upload_probe_scans(
+            &f,
+            super::router(),
+            req,
+            true,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        f.teardown().await;
+        assert!(
+            scans > 0,
+            "a native CRAN upload must enqueue a scan (#4166)"
+        );
+    }
+
+    /// #2525: a migrated binary package keeps its `bin/...` source path and
+    /// must not be listed in the source `PACKAGES` index, while a migrated
+    /// source package (canonical `<name>/<version>/<file>` path) is.
+    #[tokio::test]
+    async fn test_cran_source_index_excludes_migrated_binaries_2525() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/dplyr/1.1.4/dplyr_1.1.4.tar.gz",
+            "dplyr/1.1.4/dplyr_1.1.4.tar.gz",
+            "dplyr",
+            "1.1.4",
+            "application/x-gzip",
+            Bytes::from_static(b"src-pkg"),
+            f.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/bin/windows/contrib/4.3/Rcpp_1.0.12.zip",
+            "bin/windows/contrib/4.3/Rcpp_1.0.12.zip",
+            "Rcpp_1.0.12.zip",
+            "",
+            "application/zip",
+            Bytes::from_static(b"bin-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        // A source package that happens to be called `bin` is stored at
+        // `bin/<version>/...` and must still be listed.
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/bin/0.1/bin_0.1.tar.gz",
+            "bin/0.1/bin_0.1.tar.gz",
+            "bin",
+            "0.1",
+            "application/x-gzip",
+            Bytes::from_static(b"src-pkg-named-bin"),
+            f.user_id,
+        )
+        .await;
+
+        let index = build_source_index(&f.pool, repo.id)
+            .await
+            .unwrap_or_else(|_| panic!("index builds"));
+        assert!(index.contains("Package: dplyr"), "{index}");
+        assert!(
+            index.contains("Package: bin\n"),
+            "a source package named `bin` stays listed: {index}"
+        );
+        assert!(
+            !index.contains("Rcpp"),
+            "binary rows must not reach the source index: {index}"
+        );
         f.teardown().await;
     }
 

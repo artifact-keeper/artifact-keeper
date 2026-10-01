@@ -70,8 +70,22 @@ pub struct ArtifactoryClientConfig {
     pub base_url: String,
     /// Authentication credentials
     pub auth: ArtifactoryAuth,
-    /// Request timeout in seconds
+    /// How long a read may stall with no bytes arriving (#3926). Not a
+    /// deadline for the whole request: it restarts on every chunk, so a
+    /// multi-GiB download survives as long as bytes keep flowing, while a dead
+    /// connection is still cut off. Before #3926 this was a *total* request
+    /// timeout, which failed every artifact whose transfer took longer than
+    /// 30 s with "error decoding response body".
     pub timeout_secs: u64,
+    /// How long to wait for the TCP/TLS connection itself.
+    pub connect_timeout_secs: u64,
+    /// Ceiling on a whole request (connect, headers and body) for the callers
+    /// that buffer the body: the JSON API calls and `download_artifact`.
+    /// `read_timeout` alone does not bound them, since a source dribbling one
+    /// byte per read restarts it forever. The streaming download that the
+    /// migration worker uses carries no such ceiling, so a large artifact is
+    /// never cut off mid-transfer. `0` disables the ceiling.
+    pub buffered_timeout_secs: u64,
     /// Maximum concurrent requests
     pub max_concurrent: usize,
     /// Delay between requests in milliseconds (for throttling)
@@ -85,10 +99,71 @@ impl Default for ArtifactoryClientConfig {
         Self {
             base_url: String::new(),
             auth: ArtifactoryAuth::ApiToken(String::new()),
-            timeout_secs: 30,
+            timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_READ_TIMEOUT_ENV,
+                DEFAULT_READ_TIMEOUT_SECS,
+            ),
+            connect_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV,
+                DEFAULT_CONNECT_TIMEOUT_SECS,
+            ),
+            buffered_timeout_secs: migration_timeout_secs_from_env(
+                MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV,
+                DEFAULT_BUFFERED_TIMEOUT_SECS,
+            ),
             max_concurrent: 4,
             throttle_delay_ms: 100,
             retry_config: RetryConfig::default(),
+        }
+    }
+}
+
+/// Default read-idle timeout for migration source clients (#3926).
+pub(crate) const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+/// Default connect timeout for migration source clients (#3926).
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Default whole-request ceiling for buffered source requests (#3926).
+pub(crate) const DEFAULT_BUFFERED_TIMEOUT_SECS: u64 = 300;
+
+/// Env override for the migration source clients' read-idle timeout (seconds).
+pub(crate) const MIGRATION_SOURCE_READ_TIMEOUT_ENV: &str = "MIGRATION_SOURCE_READ_TIMEOUT_SECS";
+/// Env override for the migration source clients' connect timeout (seconds).
+pub(crate) const MIGRATION_SOURCE_CONNECT_TIMEOUT_ENV: &str =
+    "MIGRATION_SOURCE_CONNECT_TIMEOUT_SECS";
+/// Env override for the buffered-request ceiling (seconds, `0` disables).
+pub(crate) const MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV: &str =
+    "MIGRATION_SOURCE_BUFFERED_TIMEOUT_SECS";
+
+/// Read a migration source timeout from `name`, falling back to `default`
+/// when it is unset or not a non-negative integer. A read-idle or connect
+/// timeout of `0` would make every request fail instantly, so for those the
+/// caller-supplied default also replaces `0`; the buffered ceiling keeps `0`
+/// as its documented "disabled" value.
+pub(crate) fn migration_timeout_secs_from_env(name: &str, default: u64) -> u64 {
+    parse_timeout_secs(std::env::var(name).ok().as_deref(), name, default)
+}
+
+fn parse_timeout_secs(raw: Option<&str>, name: &str, default: u64) -> u64 {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) if name != MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV => {
+            tracing::warn!(
+                env = name,
+                default,
+                "ignoring a zero timeout override: it would fail every request; using the default"
+            );
+            default
+        }
+        Ok(secs) => secs,
+        Err(_) => {
+            tracing::warn!(
+                env = name,
+                value = raw,
+                "ignoring non-numeric timeout override"
+            );
+            default
         }
     }
 }
@@ -332,12 +407,41 @@ impl ArtifactoryClient {
             );
         }
 
-        let client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .https_only(!allow_http)
-            .build()?;
-
+        let client = Self::build_http_client(&config, allow_http)?;
         Ok(Self { client, config })
+    }
+
+    /// Build the reqwest client. A `.timeout()` here would be a *total*
+    /// deadline covering the body, which killed every download that took
+    /// longer than it (#3926). Bound the connect and per-read phases instead:
+    /// a slow download survives, a dead one does not. The buffered callers add
+    /// their own whole-request ceiling per request (`buffered_timeout`).
+    fn build_http_client(
+        config: &ArtifactoryClientConfig,
+        allow_http: bool,
+    ) -> Result<Client, ArtifactoryError> {
+        Ok(crate::services::http_client::base_client_builder()
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(config.timeout_secs))
+            .https_only(!allow_http)
+            .build()?)
+    }
+
+    /// Whole-request ceiling for the callers that buffer the response body,
+    /// or `None` when `buffered_timeout_secs` is `0` (disabled).
+    fn buffered_timeout(&self) -> Option<Duration> {
+        match self.config.buffered_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
+    }
+
+    /// Apply the buffered ceiling to a request that will be read to the end.
+    fn buffered(&self, builder: RequestBuilder) -> RequestBuilder {
+        match self.buffered_timeout() {
+            Some(total) => builder.timeout(total),
+            None => builder,
+        }
     }
 
     /// Build an authenticated request
@@ -354,7 +458,7 @@ impl ArtifactoryClient {
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ArtifactoryError> {
         self.request_with_retry(|| async {
             let url = format!("{}{}", self.config.base_url, path);
-            let request = self.auth_request(self.client.get(&url));
+            let request = self.buffered(self.auth_request(self.client.get(&url)));
             request.send().await
         })
         .await
@@ -463,7 +567,9 @@ impl ArtifactoryClient {
         body: &B,
     ) -> Result<T, ArtifactoryError> {
         let url = format!("{}{}", self.config.base_url, path);
-        let request = self.auth_request(self.client.post(&url)).json(body);
+        let request = self
+            .buffered(self.auth_request(self.client.post(&url)))
+            .json(body);
 
         let response = request.send().await?;
         self.handle_response(response).await
@@ -477,7 +583,7 @@ impl ArtifactoryClient {
     ) -> Result<T, ArtifactoryError> {
         let url = format!("{}{}", self.config.base_url, path);
         let request = self
-            .auth_request(self.client.post(&url))
+            .buffered(self.auth_request(self.client.post(&url)))
             .header("Content-Type", "text/plain")
             .body(body.to_string());
 
@@ -533,7 +639,9 @@ impl ArtifactoryClient {
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
         let mut last_err: Option<ArtifactoryError> = None;
         for url in ping_candidate_urls(&self.config.base_url) {
-            let request = self.auth_request(self.client.get(&url));
+            // The whole-request ceiling, so a connection test cannot be held
+            // open indefinitely by a source that answers one byte at a time.
+            let request = self.buffered(self.auth_request(self.client.get(&url)));
             match request.send().await {
                 Ok(response) if response.status().is_success() => return Ok(true),
                 // Non-success: this deployment does not answer this ping
@@ -652,13 +760,24 @@ impl ArtifactoryClient {
             .await
     }
 
+    /// `buffered` applies the whole-request ceiling: `true` for a caller that
+    /// reads the body into memory, `false` for the streaming download, which
+    /// must be allowed to take as long as a large artifact needs (#3926).
     async fn download_response_with_fallback(
         &self,
         repo_key: &str,
         path: &str,
+        buffered: bool,
     ) -> Result<reqwest::Response, ArtifactoryError> {
+        let with_ceiling = |builder: RequestBuilder| {
+            if buffered {
+                self.buffered(builder)
+            } else {
+                builder
+            }
+        };
         let raw_url = format!("{}/{}/{}", self.config.base_url, repo_key, path);
-        let request = self.auth_request(self.client.get(&raw_url));
+        let request = with_ceiling(self.auth_request(self.client.get(&raw_url)));
         let response = request.send().await?;
 
         if response.status().as_u16() != 404 {
@@ -721,7 +840,7 @@ impl ArtifactoryClient {
             "Direct artifact download returned 404; retrying with Artifactory storage downloadUri"
         );
 
-        let fallback_request = self.auth_request(self.client.get(download_uri));
+        let fallback_request = with_ceiling(self.auth_request(self.client.get(download_uri)));
         fallback_request
             .send()
             .await
@@ -750,7 +869,9 @@ impl ArtifactoryClient {
         repo_key: &str,
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
-        let response = self.download_response_with_fallback(repo_key, path).await?;
+        let response = self
+            .download_response_with_fallback(repo_key, path, true)
+            .await?;
         let status = response.status();
 
         if status.is_success() {
@@ -785,7 +906,9 @@ impl ArtifactoryClient {
     > {
         use futures::StreamExt;
 
-        let response = self.download_response_with_fallback(repo_key, path).await?;
+        let response = self
+            .download_response_with_fallback(repo_key, path, false)
+            .await?;
         let status = response.status();
 
         if status.is_success() {
@@ -987,8 +1110,160 @@ mod tests {
     fn test_config_default() {
         let config = ArtifactoryClientConfig::default();
         assert_eq!(config.timeout_secs, 30);
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(config.buffered_timeout_secs, 300);
         assert_eq!(config.max_concurrent, 4);
         assert_eq!(config.throttle_delay_ms, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-artifact timeouts (#3926)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_timeout_override_parsing_3926() {
+        let read = MIGRATION_SOURCE_READ_TIMEOUT_ENV;
+        let buffered = MIGRATION_SOURCE_BUFFERED_TIMEOUT_ENV;
+        assert_eq!(parse_timeout_secs(None, read, 30), 30);
+        assert_eq!(parse_timeout_secs(Some("120"), read, 30), 120);
+        assert_eq!(parse_timeout_secs(Some(" 45 "), read, 30), 45);
+        assert_eq!(parse_timeout_secs(Some("soon"), read, 30), 30);
+        // A zero read/connect timeout would fail every request instantly.
+        assert_eq!(parse_timeout_secs(Some("0"), read, 30), 30);
+        // The buffered ceiling keeps 0 as "disabled".
+        assert_eq!(parse_timeout_secs(Some("0"), buffered, 300), 0);
+    }
+
+    /// A client built through the real builder (connect + read-idle timeouts,
+    /// no total deadline), with plain HTTP allowed for the local test server,
+    /// and no retries so a failure surfaces immediately.
+    fn timeout_client(
+        base_url: String,
+        read_timeout_secs: u64,
+        buffered_timeout_secs: u64,
+    ) -> ArtifactoryClient {
+        let config = ArtifactoryClientConfig {
+            base_url,
+            timeout_secs: read_timeout_secs,
+            connect_timeout_secs: 5,
+            buffered_timeout_secs,
+            throttle_delay_ms: 0,
+            retry_config: RetryConfig {
+                max_retries: 0,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                backoff_multiplier: 2.0,
+            },
+            ..Default::default()
+        };
+        let client = ArtifactoryClient::build_http_client(&config, true).unwrap();
+        ArtifactoryClient { client, config }
+    }
+
+    /// Serve one HTTP response whose body arrives in `chunks` pieces spaced
+    /// `gap` apart: a source that is slow in total but never idle for long,
+    /// i.e. a large artifact on a modest link. Returns the base URL.
+    async fn spawn_trickling_server(chunks: usize, gap: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            // Drain the request head; its content is irrelevant here.
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            for _ in 0..chunks {
+                tokio::time::sleep(gap).await;
+                // The client may already have given up (the timeout tests).
+                if sock.write_all(b"x").await.is_err() || sock.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// #3926: the streaming download must not carry a total deadline. The body
+    /// here takes ~2.4 s to arrive while no single read waits more than 0.4 s;
+    /// with a 1 s timeout the pre-#3926 client (`.timeout(timeout_secs)`, a
+    /// whole-request deadline) aborted it mid-body with "error decoding
+    /// response body". A read-idle timeout lets it finish.
+    #[tokio::test]
+    async fn test_streaming_download_outlives_the_read_timeout_3926() {
+        use futures::StreamExt;
+
+        let base = spawn_trickling_server(6, Duration::from_millis(400)).await;
+        let client = timeout_client(base, 1, 1);
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .download_artifact_stream("repo", "big.bin")
+            .await
+            .expect("headers arrive immediately");
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("a slow-but-alive body must not be cut off"));
+        }
+        assert_eq!(body, b"xxxxxx");
+        assert!(
+            started.elapsed() > Duration::from_secs(2),
+            "the test body must take longer than the timeouts it exercises"
+        );
+    }
+
+    /// The buffered path keeps a whole-request ceiling, so a source that
+    /// dribbles bytes cannot hold a buffered caller forever.
+    #[tokio::test]
+    async fn test_buffered_download_is_bounded_by_the_total_ceiling_3926() {
+        let base = spawn_trickling_server(6, Duration::from_millis(400)).await;
+        let client = timeout_client(base, 1, 1);
+        let started = std::time::Instant::now();
+        let err = client
+            .download_artifact("repo", "big.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ArtifactoryError::HttpError(e) if e.is_timeout()),
+            "expected the buffered path to hit its ceiling, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the ceiling did not bound the request: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stalled source (headers sent, then silence) is still cut off by the
+    /// read-idle timeout on the streaming path: no unbounded waits.
+    #[tokio::test]
+    async fn test_streaming_download_stalled_source_times_out_3926() {
+        use futures::StreamExt;
+
+        // One byte after 3 s: longer than the 1 s read-idle timeout.
+        let base = spawn_trickling_server(1, Duration::from_secs(3)).await;
+        let client = timeout_client(base, 1, 0);
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .download_artifact_stream("repo", "stuck.bin")
+            .await
+            .expect("headers arrive immediately");
+        let mut saw_error = false;
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "a stalled body must surface an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the read-idle timeout did not fire: {:?}",
+            started.elapsed()
+        );
     }
 
     // -----------------------------------------------------------------------

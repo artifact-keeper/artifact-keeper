@@ -254,6 +254,10 @@ static OCI_GC_CANDIDATE_REFERENCED_SQL: Lazy<String> = Lazy::new(|| {
             "oci_manifest_refs",
             &format!("{is_manifest} AND t.parent_digest = {manifest_digest}"),
         ),
+        // #3851: another repository's cleanup-journal row for the key is an
+        // in-flight (or not yet reaped) push of this very object; the journal
+        // sweeps own it from here.
+        candidate_reference_arm("oci_upload_cleanup_keys", "t.storage_key = $1"),
     ]
     .join("\n   OR ")
 });
@@ -557,7 +561,48 @@ const CLEANUP_KEY_SHARED_LIVENESS_SQL: &str = r#"
               AND NOT EXISTS (
                 SELECT 1 FROM oci_blobs b
                 WHERE b.storage_key = oci_upload_cleanup_keys.storage_key
+              )
+              -- #3851: journal rows are per (repository, key), so on a backend
+              -- whose repositories share one object namespace another
+              -- repository's in-flight push can hold its own row for this
+              -- very object. A fresh, un-tombstoned sibling row is a live
+              -- push: never delete the bytes under it. Aged siblings are
+              -- abandoned uploads themselves and do not block (so two
+              -- abandoned rows cannot pin an object forever).
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_upload_cleanup_keys sibling
+                WHERE sibling.storage_key = oci_upload_cleanup_keys.storage_key
+                  AND sibling.id <> oci_upload_cleanup_keys.id
+                  AND sibling.pending_delete_at IS NULL
+                  AND GREATEST(sibling.last_registered_at,
+                               COALESCE(sibling.storage_write_completed_at, sibling.created_at))
+                      >= NOW() - INTERVAL '24 hours'
               )"#;
+
+/// Advisory-lock seed namespacing [`lock_cleanup_journal_key`]'s key hash.
+const CLEANUP_JOURNAL_KEY_LOCK_SEED: i64 = 3851;
+
+/// Serialize cleanup-journal registration against a sweep's phase-1 tombstone
+/// for one storage key (#3851), for the rest of the caller's transaction.
+///
+/// Journal rows are per (repository, key), so a push registering a NEW row
+/// for a key and a sweep tombstoning ANOTHER repository's row for the same
+/// key no longer meet on a shared row lock the way they did under the old
+/// global `UNIQUE(storage_key)`. Both sides take this lock first, so each one's
+/// next statement sees the other's committed effect: a sweep whose tombstone
+/// runs after a registration sees the fresh sibling row and skips the delete;
+/// a registration after a tombstone sees it and refuses the push.
+pub(crate) async fn lock_cleanup_journal_key(
+    conn: &mut sqlx::PgConnection,
+    storage_key: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(storage_key)
+        .bind(CLEANUP_JOURNAL_KEY_LOCK_SEED)
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
 
 /// Committed-key (`storage_write_completed_at IS NOT NULL`) half of the
 /// liveness predicate. Deliberately NOT guarded by `s.id = upload_session_id`
@@ -2424,13 +2469,22 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             liveness = kind.liveness_predicate_sql(),
         );
-        match sqlx::query(sqlx::AssertSqlSafe(&*sql))
-            .bind(cleanup_key.id)
-            .bind(cleanup_key.claim_token)
-            .execute(&self.db)
-            .await
-        {
-            Ok(r) => r.rows_affected() == 1,
+        // #3851: under the per-key lock shared with registration, so the
+        // sibling-row liveness clause sees any push that registered first.
+        let tombstoned = async {
+            let mut tx = self.db.begin().await?;
+            lock_cleanup_journal_key(&mut tx, &cleanup_key.storage_key).await?;
+            let r = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+                .bind(cleanup_key.id)
+                .bind(cleanup_key.claim_token)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(r.rows_affected() == 1)
+        }
+        .await;
+        match tombstoned {
+            Ok(done) => done,
             Err(e) => {
                 tracing::warn!(
                     storage_key = %cleanup_key.storage_key,
@@ -3424,6 +3478,14 @@ pub(crate) async fn record_oci_gc_candidates(
             UNION
             SELECT '{manifest}' || omr.parent_digest FROM oci_manifest_refs omr
              WHERE omr.repository_id = $1
+            UNION
+            -- #3851: a final blob object this repository's abandoned push
+            -- wrote (journaled, but its `oci_blobs` row never landed). The
+            -- repository delete leaves it in place on a shared-namespace
+            -- backend because another repository may use it; once the
+            -- journal row cascades away this candidate is its only record.
+            SELECT c.storage_key FROM oci_upload_cleanup_keys c
+             WHERE c.repository_id = $1 AND c.storage_key LIKE '{blob}%'
         ) AS k(storage_key)
         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING
         "#,
@@ -3763,6 +3825,36 @@ pub(crate) async fn claim_cleanup_journal_row_for_blob_commit(
     repository_id: Uuid,
     storage_key: &str,
 ) -> sqlx::Result<CleanupJournalClaim> {
+    // Step 0 (#3851): take the per-key lock shared with registration and the
+    // sweep's phase-1 tombstone, for the rest of the caller's transaction, and
+    // refuse if ANY repository's row for this key is tombstoned under a live
+    // claim. Journal rows are per repository, so on a shared-namespace backend
+    // another repository's sweep can be deleting this very object while our
+    // own row is untouched. (A filesystem repository has its own copy of
+    // every object, so another repository's sweep cannot touch it.) Holding
+    // the lock until the `oci_blobs` INSERT
+    // commits also means a sweep's tombstone that runs after us sees that row
+    // and skips the delete.
+    lock_cleanup_journal_key(&mut *conn, storage_key).await?;
+    let foreign_sweep = sqlx::query(
+        "SELECT 1 AS present FROM oci_upload_cleanup_keys \
+         WHERE storage_key = $1 AND id <> $2 \
+           AND pending_delete_at IS NOT NULL \
+           AND (claim_expires_at IS NULL OR claim_expires_at > NOW()) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM repositories r \
+             WHERE r.id = $3 AND r.storage_backend = 'filesystem') \
+         LIMIT 1",
+    )
+    .bind(storage_key)
+    .bind(journal_id)
+    .bind(repository_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if foreign_sweep.is_some() {
+        return Ok(CleanupJournalClaim::Doomed);
+    }
+
     // Step 1: take the row lock. `FOR UPDATE` conflicts with the sweep's
     // phase-1 `UPDATE`, so from here on exactly one of the two proceeds.
     //
@@ -3783,11 +3875,19 @@ pub(crate) async fn claim_cleanup_journal_row_for_blob_commit(
     let Some(row) = row else {
         // Step 4: our journal row is gone. A peer push that cleared it
         // committed its `oci_blobs` row in the same transaction, so that row
-        // is visible to us now if it exists at all.
-        let live = sqlx::query("SELECT 1 AS present FROM oci_blobs WHERE storage_key = $1 LIMIT 1")
-            .bind(storage_key)
-            .fetch_optional(&mut *conn)
-            .await?;
+        // is visible to us now if it exists at all. Since #3851 journal rows
+        // are per (repository, key), so the only peer that can have cleared
+        // ours pushed to this same repository: its proof row is in this
+        // repository, and a deletion of this repository is also a deletion
+        // of the row's owner (checked below).
+        let live = sqlx::query(
+            "SELECT 1 AS present FROM oci_blobs \
+             WHERE storage_key = $1 AND repository_id = $2 LIMIT 1",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .fetch_optional(&mut *conn)
+        .await?;
         if live.is_some() {
             return Ok(CleanupJournalClaim::Cleared);
         }
@@ -4126,6 +4226,7 @@ mod tests {
             "manifest_blob_refs",
             "oci_tags",
             "oci_manifest_refs",
+            "oci_upload_cleanup_keys",
         ] {
             assert!(
                 sql.contains(&format!("FROM {table} t ")),
@@ -4369,6 +4470,73 @@ mod tests {
             !manifest_b_final,
             "#3733: repo B's manifest must be reclaimed as well"
         );
+    }
+
+    /// #3851 review SF1: a cloud repository's abandoned push wrote its final
+    /// `oci-blobs/<digest>` object (journaled) but never landed the
+    /// `oci_blobs` row. Repository delete leaves shared-namespace blob keys in
+    /// place, and the journal row cascades away — so the recorded candidate is
+    /// the object's only record, and the sweep must reclaim it.
+    #[tokio::test]
+    async fn abandoned_journaled_blob_of_a_deleted_cloud_repo_is_reclaimed() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        const CLOUD: &str = "sf1-shared-cloud";
+        let shared: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&fx.storage_dir),
+        );
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(CLOUD.to_string(), shared.clone());
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            "filesystem".to_string(),
+        ));
+        sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+            .bind(CLOUD)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("cloud-style repo");
+        let location = StorageLocation {
+            backend: CLOUD.to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+
+        let key = format!("oci-blobs/sha256:{:0>64}", Uuid::new_v4().simple());
+        shared
+            .put(&key, Bytes::from_static(b"abandoned push"))
+            .await
+            .expect("final copy");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) VALUES ($1, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(&key)
+        .execute(&fx.pool)
+        .await
+        .expect("journal row");
+
+        delete_repo_recording_candidates(&fx.pool, fx.repo_id, &location).await;
+        let recorded = surviving_candidate_count(&fx.pool, std::slice::from_ref(&key)).await;
+        age_oci_gc_candidates(&fx.pool).await;
+        StorageGcService::new(fx.pool.clone(), registry)
+            .run_gc(false)
+            .await
+            .expect("gc");
+        let survived = shared.exists(&key).await.expect("exists");
+        let left = surviving_candidate_count(&fx.pool, std::slice::from_ref(&key)).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            recorded, 1,
+            "the journaled blob key must be recorded as a candidate"
+        );
+        assert!(!survived, "the orphaned object must be reclaimed");
+        assert_eq!(left, 0, "the candidate is consumed");
     }
 
     /// Repository-delete hand-off, as `delete_repository` performs it: record
@@ -10931,5 +11099,88 @@ mod tests {
              the object was deleted but its journal row was not: {:?}",
             result.errors
         );
+    }
+
+    /// The sibling-row guard's freshness window is the abandoned-upload TTL
+    /// the sweeps age rows by; a drift would let one block the other forever
+    /// or not at all (#3851).
+    #[test]
+    fn sibling_liveness_window_matches_the_abandoned_upload_ttl() {
+        assert!(
+            CLEANUP_KEY_SHARED_LIVENESS_SQL.contains(ABANDONED_OCI_UPLOAD_TTL_SQL),
+            "sibling guard must age rows by {ABANDONED_OCI_UPLOAD_TTL_SQL}"
+        );
+    }
+
+    /// #3851: journal rows are per (repository, key). Where repositories share
+    /// one object namespace, an abandoned row in repository A and a live push's
+    /// fresh row in repository B name the same object, so A's sweep must not
+    /// tombstone (and then delete) it while B's row is fresh — and may once B's
+    /// row is gone.
+    #[tokio::test]
+    async fn cleanup_tombstone_refuses_while_another_repository_has_a_fresh_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(repo_a) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let Some(repo_b) = tdh::Fixture::setup("local", "docker").await else {
+            repo_a.teardown().await;
+            return;
+        };
+
+        let key = format!("oci-blobs/sha256:{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, created_at) \
+             VALUES ($1, $3, NOW() - INTERVAL '48 hours'), ($2, $3, NOW())",
+        )
+        .bind(repo_a.repo_id)
+        .bind(repo_b.repo_id)
+        .bind(&key)
+        .execute(&repo_a.pool)
+        .await
+        .expect("one key journaled by two repositories");
+
+        let service =
+            StorageGcService::new(repo_a.pool.clone(), repo_a.state.storage_registry.clone());
+        let abandoned = service
+            .claim_pending_oci_upload_cleanup_keys(Some(repo_a.repo_id))
+            .await
+            .expect("claim")
+            .into_iter()
+            .find(|k| k.storage_key == key)
+            .expect("repository A's aged row is claimable");
+
+        assert!(
+            !service
+                .tombstone_cleanup_key_for_delete(&abandoned, CleanupSweepKind::Pending)
+                .await,
+            "a live push in another repository holds a fresh row for this object"
+        );
+
+        // Repository B's push finishes (its row is cleared at commit): the
+        // abandoned row is reclaimable again.
+        sqlx::query(
+            "DELETE FROM oci_upload_cleanup_keys WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(repo_b.repo_id)
+        .bind(&key)
+        .execute(&repo_a.pool)
+        .await
+        .expect("clear B's row");
+        assert!(
+            service
+                .tombstone_cleanup_key_for_delete(&abandoned, CleanupSweepKind::Pending)
+                .await,
+            "with no live sibling the sweep may tombstone its abandoned row"
+        );
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&repo_a.pool)
+            .await;
+        repo_b.teardown().await;
+        repo_a.teardown().await;
     }
 }

@@ -708,6 +708,9 @@ async fn save_label_index(
         None => {
             crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
             // Create label index artifact
+            // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
+            // JSON document, not uploaded content; the module upload itself
+            // triggers the scan (#4166).
             let row = sqlx::query(
                 r#"INSERT INTO artifacts (
                     repository_id, path, name, version, size_bytes,
@@ -1188,6 +1191,13 @@ async fn upload(
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
+            repo.id,
+            artifact_id,
+        )
+        .await;
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
             repo.id,
             artifact_id,
         )
@@ -2776,5 +2786,128 @@ mod catalog_registration_tests {
         let row = row.expect("a protobuf upload must write a packages row (#3659)");
         assert_eq!(row.version, digest);
         assert_eq!(row.versions, vec![digest]);
+    }
+}
+
+/// #3919 review (B1): a protobuf commit row records the COMMIT digest (over
+/// file paths + contents), not the SHA-256 of the stored gzip bundle.
+/// Download verification must not abort those downloads.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+pub(crate) mod integrity_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Push one module through the real BSR upload route and return its
+    /// commit digest (the artifact row's `version`).
+    pub(crate) async fn push_module(fx: &tdh::Fixture) -> String {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "integrity" },
+                "files": [{
+                    "path": "acme/integrity/v1/thing.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\nmessage Thing {}\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        sqlx::query_scalar(
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/integrity' AND version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("commit row")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — collects a small test bundle to
+    // assert it was delivered in full (#1608).
+    async fn protobuf_commit_bundle_downloads_in_full_with_verification_on() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        assert!(fx.state.config.download_verify_checksums);
+        let digest = push_module(&fx).await;
+        let (size, recorded): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("row");
+
+        use tower::ServiceExt;
+        let resp = fx
+            .router_with_auth(crate::api::handlers::repositories::download_router())
+            .oneshot(tdh::get(format!(
+                "/{}/download/modules/acme/integrity/commits/{digest}",
+                fx.repo_key
+            )))
+            .await
+            .expect("respond");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body = body.expect("a protobuf commit bundle must download completely");
+        assert_eq!(body.len() as i64, size);
+        // Pin the premise: the recorded checksum is NOT the bundle's digest.
+        use sha2::Digest;
+        assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
+    }
+
+    /// #3910 review (B1): the scrub must not flag protobuf commit bundles as
+    /// corrupt (their row records the commit digest, not the bundle's).
+    #[tokio::test]
+    async fn scrub_reports_nothing_for_protobuf_commit_bundles() {
+        use crate::services::storage_scrub_service::{ScrubOptions, StorageScrubService};
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_module(&fx).await;
+        let res = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run(&ScrubOptions {
+                max_objects: 100,
+                max_bytes: 1 << 30,
+                repair: true,
+                repository_id: Some(fx.repo_id),
+            })
+            .await
+            .expect("scrub run");
+        let findings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_scrub_findings WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count findings");
+        fx.teardown().await;
+
+        assert_eq!(res.corrupt + res.missing + res.repaired, 0, "{res:?}");
+        assert!(res.unverifiable >= 1, "{res:?}");
+        assert_eq!(findings, 0);
     }
 }

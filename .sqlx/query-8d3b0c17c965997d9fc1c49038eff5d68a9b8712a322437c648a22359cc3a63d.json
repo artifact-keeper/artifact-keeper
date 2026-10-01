@@ -1,0 +1,260 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason\n            FROM scan_results\n            WHERE artifact_id = $1\n              AND checksum_sha256 = $2\n              AND scan_type = $3\n              AND status = 'completed'\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "artifact_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_type",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "findings_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "findings_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "critical_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "critical_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "high_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "high_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "medium_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "medium_count"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "low_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "low_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "info_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "info_count"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "scanner_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scanner_version"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "error_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "completed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "completed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "is_reused"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "source_scan_id"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "scan_completeness",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "scan_completeness_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness_reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bpchar",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "8d3b0c17c965997d9fc1c49038eff5d68a9b8712a322437c648a22359cc3a63d"
+}
