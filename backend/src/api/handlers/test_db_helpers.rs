@@ -2233,6 +2233,42 @@ pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     .expect("enable scan-on-proxy");
 }
 
+/// Attach a new public Remote repository of `format`, proxying `upstream`, to
+/// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
+pub async fn attach_remote_member(
+    pool: &PgPool,
+    virtual_id: Uuid,
+    format: &str,
+    upstream: &str,
+    priority: i32,
+) -> (Uuid, String, PathBuf) {
+    let (member_id, member_key, member_dir) = create_repo(pool, "remote", format).await;
+    sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+        .bind(upstream)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("configure remote member");
+    link_virtual_member(pool, virtual_id, member_id, priority).await;
+    (member_id, member_key, member_dir)
+}
+
+/// Turn on the Package Age Policy hold (#1770) for a Remote repository, so
+/// every freshly proxied object is held (`409`) for `minutes`.
+pub async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, 'quarantine_enabled', 'true'), \
+                ($1, 'quarantine_duration_minutes', $2)",
+    )
+    .bind(repo_id)
+    .bind(minutes.to_string())
+    .execute(pool)
+    .await
+    .expect("enable quarantine config");
+    crate::services::quarantine_service::invalidate_config_cache(repo_id);
+}
+
 /// Build a state whose scanner service holds exactly the given mock leaf
 /// scanners, wired over the fixture's storage + a real proxy service. Shared
 /// by the #2976 verdict-freshness handler tests across formats so each format

@@ -4591,7 +4591,11 @@ async fn serve_tarball(
                     Ok(resp) => return Ok(resp),
                     Err(resp) => {
                         let status = resp.status();
-                        if status == StatusCode::FORBIDDEN || status == StatusCode::LOCKED {
+                        // 403 / 409 (quarantine hold) / 423 are the member's
+                        // verdict on bytes it holds: final, never a miss.
+                        if proxy_helpers::is_member_policy_block_response(&resp)
+                            || status == StatusCode::LOCKED
+                        {
                             return Err(resp);
                         }
                         debug!(
@@ -15492,6 +15496,57 @@ mod proxy_scan_block_tests {
                 .await;
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A scanning member's quarantine hold (409) is final for the virtual
+    /// tarball walk: the next member must not serve the same tarball.
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_stops_at_a_quarantined_scanning_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "heldwidget";
+        let filename = "heldwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b heldwidget-tarball-quarantine";
+        let held = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&held, package, filename, tarball, None).await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&fallback, package, filename, tarball, Some(0)).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = match super::serve_tarball(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            package,
+            filename,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+
+        fallback.verify().await;
+        cleanup_npm_member(&fx.pool, first, &first_dir).await;
+        cleanup_npm_member(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
     }
 
     // ── #3023: the inline scan gate on the VIRTUAL npm tarball path ────────

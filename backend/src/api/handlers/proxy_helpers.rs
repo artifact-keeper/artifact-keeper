@@ -8398,7 +8398,10 @@ pub(crate) async fn gate_proxy_scan_serve(
 // `ScanConfigService::is_proxy_scan_enabled` is true, call
 // `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from
 // `direct_scan_policy` (or `effective_virtual_scan_policy` per virtual member)
-// instead of streaming.
+// instead of streaming. Then add the format's handler key to
+// `crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` so `GET /api/v1/formats`
+// reports it enforced (#4099; `scan_on_proxy_capability_matches_the_gate`
+// reads every handler's source and keeps the two in step).
 // ---------------------------------------------------------------------------
 
 /// The synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
@@ -20133,6 +20136,200 @@ mod proxy_download_recording_tests {
             assert!(
                 src.contains("record_proxy_download("),
                 "#3446: {format} proxied downloads must record"
+            );
+        }
+    }
+
+    /// #4099: `GET /api/v1/formats` reports `scan_on_proxy: "enforced"` for
+    /// exactly the handlers whose source reaches the inline proxy scan gate —
+    /// the generic `serve_scanned_proxy_file` (#4098), or
+    /// `gate_proxy_scan_serve` directly (OCI's image-mode manifest gate). A
+    /// format that adopts the gate without declaring it, or a declaration left
+    /// behind after a gate is removed, fails here instead of silently telling
+    /// clients the wrong thing.
+    #[test]
+    fn scan_on_proxy_capability_matches_the_gate() {
+        const GATE_CALLS: &[&str] = &["serve_scanned_proxy_file(", "gate_proxy_scan_serve("];
+
+        // Handler key for a handler source file (see `RepositoryFormat::handler_key`).
+        fn handler_key(file: &str) -> String {
+            match file {
+                "goproxy.rs" => "go".to_string(),
+                "oci_v2.rs" => "oci".to_string(),
+                "pub_registry.rs" => "pub".to_string(),
+                other => other.trim_end_matches(".rs").to_string(),
+            }
+        }
+
+        let mut gated = std::collections::BTreeSet::new();
+        for (file, src) in SERVE_SOURCES {
+            let spans = test_spans(src);
+            let reaches_gate = GATE_CALLS.iter().any(|call| {
+                src.match_indices(call).any(|(at, _)| {
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    !spans.iter().any(|(a, b)| *a <= at && at < *b)
+                        && !prefix.trim_start().starts_with("//")
+                        && !prefix.contains('"')
+                })
+            });
+            if reaches_gate {
+                gated.insert(handler_key(file));
+            }
+        }
+
+        let declared: std::collections::BTreeSet<String> =
+            crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+        assert_eq!(
+            gated, declared,
+            "#4099: the handlers that route proxied downloads through the scan gate \
+             (left) must be exactly `formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` \
+             (right), which `GET /api/v1/formats` reports as enforced"
+        );
+
+        // File granularity alone would let ONE gated route vouch for a sibling
+        // route (Virtual, legacy) that still streams unscanned. Pin each
+        // enforced handler's proxied package entry points to the gate, so
+        // dropping the scan from any of them fails here. Limit: this pins the
+        // named functions' bodies, not every branch inside them; a new
+        // package-serving route must be added to this table.
+        const ROUTE_PINS: &[(&str, &str, &str, usize)] = &[
+            // Direct Remote arm + the Virtual member walk.
+            ("npm.rs", "serve_tarball", "serve_scanned_npm_tarball(", 2),
+            (
+                "npm.rs",
+                "serve_scanned_npm_tarball",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            ("pypi.rs", "serve_file", "serve_scanned_pypi_file(", 2),
+            (
+                "pypi.rs",
+                "serve_scanned_pypi_file",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "proxy_gallery_asset",
+                "serve_scanned_gallery_package(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_gallery_package",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "download_vsix",
+                "serve_scanned_legacy_vsix(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "download_vsix",
+                "serve_scanned_legacy_virtual_vsix(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_legacy_vsix",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "vscode.rs",
+                "serve_scanned_legacy_virtual_vsix",
+                "serve_scanned_legacy_vsix(",
+                1,
+            ),
+            (
+                "oci_v2.rs",
+                "handle_get_manifest",
+                "gate_oci_proxy_manifest_scan(",
+                1,
+            ),
+            (
+                "oci_v2.rs",
+                "gate_oci_proxy_manifest_scan",
+                "gate_proxy_scan_serve(",
+                1,
+            ),
+            // Blob pulls re-check the scan verdict of the image they belong to.
+            (
+                "oci_v2.rs",
+                "handle_get_blob",
+                "enforce_blob_scan_reblock(",
+                1,
+            ),
+        ];
+        // Body of the top-level `fn name(` (brace-matched from its first `{`).
+        fn fn_body<'s>(src: &'s str, name: &str) -> Option<&'s str> {
+            let sig = format!("fn {name}(");
+            let at = src.match_indices(&sig).map(|(i, _)| i).find(|&i| {
+                let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                !src[line_start..i].trim_start().starts_with("//")
+            })?;
+            let open = at + src[at..].find('{')?;
+            let mut depth = 0usize;
+            for (i, c) in src[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&src[open..open + i]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut unpinned = Vec::new();
+        for (file, func, call, min) in ROUTE_PINS {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| n == file)
+                .unwrap_or_else(|| panic!("{file} is scanned"));
+            let body = fn_body(src, func).unwrap_or_else(|| panic!("{file}: fn {func} not found"));
+            let calls = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.matches(call).count())
+                .sum::<usize>();
+            if calls < *min {
+                unpinned.push(format!(
+                    "{file}::{func} calls {call} {calls}x (needs {min})"
+                ));
+            }
+        }
+        assert!(
+            unpinned.is_empty(),
+            "#4099: a scan-on-proxy enforced route no longer reaches the gate: {unpinned:?}"
+        );
+        for key in &declared {
+            assert!(
+                ROUTE_PINS
+                    .iter()
+                    .any(|(file, ..)| handler_key(file) == *key),
+                "#4099: `{key}` is declared enforced but has no ROUTE_PINS entry"
+            );
+        }
+
+        let core: std::collections::HashSet<&str> = crate::formats::core_format_handlers()
+            .iter()
+            .map(|h| h.format_key)
+            .collect();
+        for key in crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS {
+            assert!(
+                core.contains(key),
+                "#4099: `{key}` is declared scan-on-proxy enforced but is not a core handler key"
             );
         }
     }

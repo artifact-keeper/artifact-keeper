@@ -3060,7 +3060,9 @@ async fn serve_file(
                                     Ok(resp) => return Ok(resp),
                                     Err(resp) => {
                                         let status = resp.status();
-                                        if status == StatusCode::FORBIDDEN
+                                        // 403 / 409 (quarantine hold) / 423 are
+                                        // the member's verdict: final, not a miss.
+                                        if proxy_helpers::is_member_policy_block_response(&resp)
                                             || status == StatusCode::LOCKED
                                         {
                                             return Err(resp);
@@ -17913,6 +17915,70 @@ mod tests {
             )
             .mount(upstream)
             .await;
+    }
+
+    /// A scanning member's quarantine hold (409) is final for the virtual
+    /// file walk: the next member must not serve the same wheel.
+    #[tokio::test]
+    async fn test_virtual_serve_file_stops_at_a_quarantined_scanning_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "heldpkg";
+        let filename = "heldpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 heldpkg-wheel-quarantine";
+        let held = wiremock::MockServer::start().await;
+        mount_scan_upstream(&held, project, filename, wheel).await;
+        let fallback = wiremock::MockServer::start().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path(format!("/simple/{project}/{filename}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+                .expect(0)
+                .mount(&fallback)
+                .await;
+        }
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "pypi", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "pypi", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let status = match super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+
+        fallback.verify().await;
+        cleanup_virtual_member(&fx.pool, first, &first_dir).await;
+        cleanup_virtual_member(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
     }
 
     // ── #3023: the inline scan gate on the VIRTUAL pypi serve path ─────────
