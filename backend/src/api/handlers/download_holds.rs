@@ -1,4 +1,4 @@
-//! Admin download-hold observability: quarantine queue + policy-blocked packages.
+//! Admin download-hold observability: hosted and proxy-cache quarantine queues.
 
 use axum::extract::{Extension, Query, State};
 use axum::routing::get;
@@ -14,14 +14,13 @@ use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::download_holds_service::{
     classify_hold, normalize_pagination, parse_hold_kinds, remaining_seconds, total_pages,
-    DownloadHoldsService, HoldKind, PolicyBlockRow, QuarantineHoldRow,
+    DownloadHoldsService, HoldKind, QuarantineHoldRow,
 };
 
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/summary", get(holds_summary))
         .route("/quarantine", get(list_quarantine))
-        .route("/policy-blocks", get(list_policy_blocks))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -33,26 +32,22 @@ pub struct HoldListQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
-pub struct PolicyBlockListQuery {
-    pub repository_key: Option<String>,
-    pub page: Option<u32>,
-    pub per_page: Option<u32>,
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HoldsSummaryResponse {
     pub age_gate_pending: i64,
     pub quarantine_active: i64,
     pub quarantine_rejected: i64,
-    pub policy_blocked: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuarantineHoldResponse {
-    pub artifact_id: Uuid,
+    /// `hosted` (an `artifacts` row) or `proxy-cache` (`proxy_cache_artifacts`).
+    pub source: String,
+    /// Present for hosted rows; proxy-cache holds have no `artifacts` identity.
+    pub artifact_id: Option<Uuid>,
     pub name: String,
     pub version: Option<String>,
+    pub path: String,
     pub repository_key: String,
     pub repository_format: String,
     pub quarantine_status: String,
@@ -70,33 +65,6 @@ pub struct QuarantineHoldListResponse {
     pub pagination: Pagination,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PolicyBlockResponse {
-    pub id: String,
-    pub source: String,
-    pub artifact_id: Option<Uuid>,
-    pub package_name: String,
-    pub package_version: Option<String>,
-    pub path: String,
-    pub repository_key: String,
-    pub repository_format: String,
-    pub uploaded_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub critical_count: i32,
-    pub high_count: i32,
-    pub medium_count: i32,
-    pub low_count: i32,
-    pub findings_count: i32,
-    pub max_severity: Option<String>,
-    pub policy_name: Option<String>,
-    pub block_reason: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PolicyBlockListResponse {
-    pub items: Vec<PolicyBlockResponse>,
-    pub pagination: Pagination,
-}
-
 fn svc(state: &SharedState) -> DownloadHoldsService {
     DownloadHoldsService::new(state.db.clone())
 }
@@ -111,9 +79,11 @@ fn to_quarantine_response(row: QuarantineHoldRow) -> QuarantineHoldResponse {
         remaining_seconds(row.quarantine_until, now)
     };
     QuarantineHoldResponse {
+        source: row.source,
         artifact_id: row.artifact_id,
         name: row.name,
         version: row.version,
+        path: row.path,
         repository_key: row.repository_key,
         repository_format: row.repository_format,
         quarantine_status: row.quarantine_status,
@@ -123,28 +93,6 @@ fn to_quarantine_response(row: QuarantineHoldRow) -> QuarantineHoldResponse {
         quarantine_reason: row.quarantine_reason,
         created_at: row.created_at,
         is_blocked: matches!(kind, HoldKind::Active | HoldKind::Rejected),
-    }
-}
-
-fn to_policy_response(row: PolicyBlockRow) -> PolicyBlockResponse {
-    PolicyBlockResponse {
-        id: row.id,
-        source: row.source,
-        artifact_id: row.artifact_id,
-        package_name: row.package_name,
-        package_version: row.package_version,
-        path: row.path,
-        repository_key: row.repository_key,
-        repository_format: row.repository_format,
-        uploaded_at: row.uploaded_at,
-        critical_count: row.critical_count,
-        high_count: row.high_count,
-        medium_count: row.medium_count,
-        low_count: row.low_count,
-        findings_count: row.findings_count,
-        max_severity: row.max_severity,
-        policy_name: row.policy_name,
-        block_reason: row.block_reason,
     }
 }
 
@@ -166,7 +114,6 @@ pub async fn holds_summary(
         age_gate_pending: summary.age_gate_pending,
         quarantine_active: summary.quarantine_active,
         quarantine_rejected: summary.quarantine_rejected,
-        policy_blocked: summary.policy_blocked,
     }))
 }
 
@@ -206,50 +153,17 @@ pub async fn list_quarantine(
     }))
 }
 
-#[utoipa::path(
-    get,
-    path = "/holds/policy-blocks",
-    context_path = "/api/v1/admin",
-    tag = "holds",
-    security(("bearer_auth" = [])),
-    params(PolicyBlockListQuery),
-    responses((status = 200, body = PolicyBlockListResponse))
-)]
-pub async fn list_policy_blocks(
-    State(state): State<SharedState>,
-    Extension(auth): Extension<AuthExtension>,
-    Query(query): Query<PolicyBlockListQuery>,
-) -> Result<Json<PolicyBlockListResponse>> {
-    auth.require_admin()?;
-    let (page, per_page, offset) = normalize_pagination(query.page, query.per_page);
-    let (rows, total) = svc(&state)
-        .list_policy_blocks(query.repository_key.as_deref(), offset, i64::from(per_page))
-        .await?;
-    Ok(Json(PolicyBlockListResponse {
-        items: rows.into_iter().map(to_policy_response).collect(),
-        pagination: Pagination {
-            page,
-            per_page,
-            total,
-            total_pages: total_pages(total, per_page),
-        },
-    }))
-}
-
 #[derive(OpenApi)]
 #[openapi(
-    paths(holds_summary, list_quarantine, list_policy_blocks),
+    paths(holds_summary, list_quarantine),
     components(schemas(
         HoldsSummaryResponse,
         QuarantineHoldResponse,
         QuarantineHoldListResponse,
-        PolicyBlockResponse,
-        PolicyBlockListResponse,
         HoldListQuery,
-        PolicyBlockListQuery,
         Pagination,
     )),
-    tags((name = "holds", description = "Download-hold observability: quarantine and policy blocks"))
+    tags((name = "holds", description = "Download-hold observability: hosted and proxy-cache quarantine"))
 )]
 pub struct DownloadHoldsApiDoc;
 
@@ -349,7 +263,8 @@ mod tests {
         fx.teardown().await;
 
         assert_eq!(body.pagination.total, 1);
-        assert_eq!(body.items[0].artifact_id, artifact_id);
+        assert_eq!(body.items[0].artifact_id, Some(artifact_id));
+        assert_eq!(body.items[0].source, "hosted");
         assert_eq!(body.items[0].kind, "active");
         assert!(body.items[0].is_blocked);
         assert_eq!(
@@ -357,6 +272,63 @@ mod tests {
             Some("manual hold")
         );
         assert!(body.items[0].remaining_seconds.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_quarantine_includes_proxy_cache_hold() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_cache_artifacts (
+                repository_id, path, storage_key, metadata_key, size_bytes,
+                quarantine_until, quarantine_released_at
+            )
+            VALUES ($1, $2, $3, $4, 8, $5, NULL)
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind("simple/held/held-1.0.whl")
+        .bind(format!(
+            "proxy-cache/{}/simple/held/held-1.0.whl/__content__",
+            fx.repo_key
+        ))
+        .bind(format!(
+            "proxy-cache/{}/simple/held/held-1.0.whl/__cache_meta__.json",
+            fx.repo_key
+        ))
+        .bind(until)
+        .execute(&fx.pool)
+        .await
+        .expect("insert proxy-cache hold");
+
+        let Json(list) = list_quarantine(
+            State(fx.state.clone()),
+            Extension(admin()),
+            Query(HoldListQuery {
+                repository_key: Some(fx.repo_key.clone()),
+                kind: Some("active".into()),
+                page: Some(1),
+                per_page: Some(20),
+            }),
+        )
+        .await
+        .expect("admin list");
+        let Json(summary) = holds_summary(State(fx.state.clone()), Extension(admin()))
+            .await
+            .expect("admin summary");
+        fx.teardown().await;
+
+        assert_eq!(list.pagination.total, 1);
+        assert_eq!(list.items[0].source, "proxy-cache");
+        assert_eq!(list.items[0].artifact_id, None);
+        assert_eq!(list.items[0].name, "held-1.0.whl");
+        assert_eq!(list.items[0].path, "simple/held/held-1.0.whl");
+        assert_eq!(list.items[0].kind, "active");
+        assert!(list.items[0].is_blocked);
+        assert!(summary.quarantine_active >= 1);
     }
 
     #[tokio::test]
@@ -378,25 +350,5 @@ mod tests {
         .expect_err("unknown kind");
         fx.teardown().await;
         assert!(matches!(err, AppError::Validation(_)));
-    }
-
-    #[tokio::test]
-    async fn list_policy_blocks_rejects_non_admin() {
-        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
-            return;
-        };
-        let err = list_policy_blocks(
-            State(fx.state.clone()),
-            Extension(user()),
-            Query(PolicyBlockListQuery {
-                repository_key: None,
-                page: None,
-                per_page: None,
-            }),
-        )
-        .await
-        .expect_err("non-admin must not list policy blocks");
-        fx.teardown().await;
-        assert!(matches!(err, AppError::Authorization(_)));
     }
 }

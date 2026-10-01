@@ -1,14 +1,14 @@
 //! Admin observability for packages that currently cannot be downloaded.
 //!
-//! Three independent control planes refuse bytes for different reasons:
+//! Two independent control planes refuse bytes for different reasons:
 //!
 //! * **Age gate** — too-new upstream versions (`age_gate_reviews`, HTTP 451).
-//! * **Quarantine** — timed upload/age holds and admin blocks (`artifacts`, HTTP 409/403).
-//! * **Scan policy** — unacknowledged findings at/above a policy threshold, plus
-//!   proxy-cache verdicts (`scan_policies` / `proxy_scan_results`, HTTP 403).
+//! * **Quarantine** — timed upload/age holds and admin blocks (`artifacts`
+//!   status, plus proxy-cache `quarantine_until` / `quarantine_released_at`).
 //!
-//! This module lists the last two (age-gate already has its own queue) and
-//! rolls the three into a single summary so the UI can show counts at a glance.
+//! Scan-policy 403s are a separate gate and are **not** listed here; they
+//! belong on a dedicated surface once that gate has a real identity other
+//! than a quarantine stamp.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -19,16 +19,19 @@ use crate::error::{AppError, Result};
 /// How a quarantine row currently behaves at the download gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind {
-    /// `quarantined` and the window is still open (or permanent: `until` is NULL).
+    /// Still held: hosted `quarantined` with a future/NULL until, or a
+    /// proxy-cache row whose `quarantine_until` has not lapsed and has not
+    /// been released.
     Active,
-    /// Still labelled `quarantined`, but `quarantine_until` has lapsed — downloads work.
+    /// Still labelled held, but `quarantine_until` has lapsed — downloads work.
     Expired,
-    /// Terminal admin/scan rejection — downloads stay 403.
+    /// Terminal admin/scan rejection on a hosted artifact — downloads stay 403.
     Rejected,
 }
 
-/// Classify a stored quarantine row the same way [`crate::services::quarantine_service::check_download_allowed`]
-/// does, plus the expired-but-still-labelled case the queue needs to show remaining time as "Expired".
+/// Classify a stored quarantine row the same way
+/// [`crate::services::quarantine_service::check_download_allowed`] does, plus
+/// the expired-but-still-labelled case the queue needs to show as "Expired".
 pub fn classify_hold(
     status: &str,
     until: Option<DateTime<Utc>>,
@@ -67,22 +70,6 @@ impl HoldKind {
 /// rejected rows (they do not expire). Negative means already expired.
 pub fn remaining_seconds(until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
     until.map(|ts| ts.signed_duration_since(now).num_seconds())
-}
-
-/// Count of unacknowledged findings at or above a policy's `max_severity`.
-pub fn violating_finding_count(
-    max_severity: &str,
-    critical: i32,
-    high: i32,
-    medium: i32,
-    low: i32,
-) -> i32 {
-    match max_severity {
-        "critical" => critical,
-        "high" => critical + high,
-        "medium" => critical + high + medium,
-        _ => critical + high + medium + low,
-    }
 }
 
 /// Parse a comma-separated `kind` query into a de-duplicated, validated set.
@@ -129,9 +116,11 @@ pub fn total_pages(total: i64, per_page: u32) -> u32 {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct QuarantineHoldRow {
-    pub artifact_id: Uuid,
+    pub source: String,
+    pub artifact_id: Option<Uuid>,
     pub name: String,
     pub version: Option<String>,
+    pub path: String,
     pub repository_key: String,
     pub repository_format: String,
     pub quarantine_status: String,
@@ -140,38 +129,66 @@ pub struct QuarantineHoldRow {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct PolicyBlockRow {
-    pub id: String,
-    pub source: String,
-    pub artifact_id: Option<Uuid>,
-    pub package_name: String,
-    pub package_version: Option<String>,
-    pub path: String,
-    pub repository_key: String,
-    pub repository_format: String,
-    pub uploaded_at: Option<DateTime<Utc>>,
-    pub critical_count: i32,
-    pub high_count: i32,
-    pub medium_count: i32,
-    pub low_count: i32,
-    pub findings_count: i32,
-    pub max_severity: Option<String>,
-    pub policy_name: Option<String>,
-    pub block_reason: String,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct HoldsSummary {
     pub age_gate_pending: i64,
     pub quarantine_active: i64,
     pub quarantine_rejected: i64,
-    pub policy_blocked: i64,
 }
 
 pub struct DownloadHoldsService {
     db: PgPool,
 }
+
+/// Hosted artifacts + proxy-cache catalog rows that currently match `kind`.
+/// `$1` repository key, `$2` want_active, `$3` want_expired, `$4` want_rejected.
+const QUARANTINE_FROM_SQL: &str = r#"
+SELECT
+    'hosted'::text AS source,
+    a.id AS artifact_id,
+    a.name,
+    a.version,
+    a.path,
+    repo.key AS repository_key,
+    repo.format::text AS repository_format,
+    a.quarantine_status,
+    a.quarantine_until,
+    a.quarantine_reason,
+    a.created_at
+FROM artifacts a
+INNER JOIN repositories repo ON repo.id = a.repository_id
+WHERE a.is_deleted = false
+  AND ($1::text IS NULL OR repo.key = $1)
+  AND (
+        ($2::bool AND a.quarantine_status = 'quarantined'
+            AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))
+     OR ($3::bool AND a.quarantine_status = 'quarantined'
+            AND a.quarantine_until IS NOT NULL AND a.quarantine_until <= NOW())
+     OR ($4::bool AND a.quarantine_status = 'rejected')
+  )
+UNION ALL
+SELECT
+    'proxy-cache'::text AS source,
+    NULL::uuid AS artifact_id,
+    COALESCE(NULLIF(regexp_replace(pca.path, '.*/', ''), ''), pca.path) AS name,
+    NULL::text AS version,
+    pca.path,
+    repo.key AS repository_key,
+    repo.format::text AS repository_format,
+    'quarantined'::text AS quarantine_status,
+    pca.quarantine_until,
+    NULL::text AS quarantine_reason,
+    pca.cached_at AS created_at
+FROM proxy_cache_artifacts pca
+INNER JOIN repositories repo ON repo.id = pca.repository_id
+WHERE pca.quarantine_released_at IS NULL
+  AND pca.quarantine_until IS NOT NULL
+  AND ($1::text IS NULL OR repo.key = $1)
+  AND (
+        ($2::bool AND pca.quarantine_until > NOW())
+     OR ($3::bool AND pca.quarantine_until <= NOW())
+  )
+"#;
 
 impl DownloadHoldsService {
     pub fn new(db: PgPool) -> Self {
@@ -188,11 +205,16 @@ impl DownloadHoldsService {
 
         let quarantine_active = sqlx::query_scalar::<_, i64>(
             r#"
-            SELECT COUNT(*)::bigint FROM artifacts
-            WHERE is_deleted = false
-              AND quarantine_status = 'quarantined'
-              AND (quarantine_until IS NULL OR quarantine_until > NOW())
-              AND (quarantine_reason IS NULL OR quarantine_reason NOT LIKE '%Policy ''%')
+            SELECT (
+                (SELECT COUNT(*)::bigint FROM artifacts
+                 WHERE is_deleted = false
+                   AND quarantine_status = 'quarantined'
+                   AND (quarantine_until IS NULL OR quarantine_until > NOW()))
+              + (SELECT COUNT(*)::bigint FROM proxy_cache_artifacts
+                 WHERE quarantine_released_at IS NULL
+                   AND quarantine_until IS NOT NULL
+                   AND quarantine_until > NOW())
+            )
             "#,
         )
         .fetch_one(&self.db)
@@ -210,18 +232,10 @@ impl DownloadHoldsService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let policy_blocked =
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(policy_block_count_sql()))
-                .bind(None::<String>)
-                .fetch_one(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-
         Ok(HoldsSummary {
             age_gate_pending,
             quarantine_active,
             quarantine_rejected,
-            policy_blocked,
         })
     }
 
@@ -236,23 +250,9 @@ impl DownloadHoldsService {
         let want_expired = kinds.contains(&HoldKind::Expired);
         let want_rejected = kinds.contains(&HoldKind::Rejected);
 
-        let total = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM artifacts a
-            INNER JOIN repositories repo ON repo.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::text IS NULL OR repo.key = $1)
-              AND (a.quarantine_reason IS NULL OR a.quarantine_reason NOT LIKE '%Policy ''%')
-              AND (
-                    ($2::bool AND a.quarantine_status = 'quarantined'
-                        AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))
-                 OR ($3::bool AND a.quarantine_status = 'quarantined'
-                        AND a.quarantine_until IS NOT NULL AND a.quarantine_until <= NOW())
-                 OR ($4::bool AND a.quarantine_status = 'rejected')
-              )
-            "#,
-        )
+        let total = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*)::bigint FROM ({QUARANTINE_FROM_SQL}) holds"
+        )))
         .bind(repository_key)
         .bind(want_active)
         .bind(want_expired)
@@ -261,41 +261,18 @@ impl DownloadHoldsService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let rows = sqlx::query_as::<_, QuarantineHoldRow>(
-            r#"
-            SELECT
-                a.id AS artifact_id,
-                a.name,
-                a.version,
-                repo.key AS repository_key,
-                repo.format::text AS repository_format,
-                a.quarantine_status,
-                a.quarantine_until,
-                a.quarantine_reason,
-                a.created_at
-            FROM artifacts a
-            INNER JOIN repositories repo ON repo.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::text IS NULL OR repo.key = $1)
-              AND (a.quarantine_reason IS NULL OR a.quarantine_reason NOT LIKE '%Policy ''%')
-              AND (
-                    ($2::bool AND a.quarantine_status = 'quarantined'
-                        AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))
-                 OR ($3::bool AND a.quarantine_status = 'quarantined'
-                        AND a.quarantine_until IS NOT NULL AND a.quarantine_until <= NOW())
-                 OR ($4::bool AND a.quarantine_status = 'rejected')
-              )
-            ORDER BY
-                CASE a.quarantine_status
+        let rows = sqlx::query_as::<_, QuarantineHoldRow>(sqlx::AssertSqlSafe(format!(
+            "{QUARANTINE_FROM_SQL}
+             ORDER BY
+                CASE quarantine_status
                     WHEN 'quarantined' THEN 0
                     WHEN 'rejected' THEN 1
                     ELSE 2
                 END,
-                a.quarantine_until ASC NULLS LAST,
-                a.created_at DESC
-            OFFSET $5 LIMIT $6
-            "#,
-        )
+                quarantine_until ASC NULLS LAST,
+                created_at DESC
+             OFFSET $5 LIMIT $6"
+        )))
         .bind(repository_key)
         .bind(want_active)
         .bind(want_expired)
@@ -308,172 +285,6 @@ impl DownloadHoldsService {
 
         Ok((rows, total))
     }
-
-    pub async fn list_policy_blocks(
-        &self,
-        repository_key: Option<&str>,
-        offset: i64,
-        limit: i64,
-    ) -> Result<(Vec<PolicyBlockRow>, i64)> {
-        let total = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(policy_block_count_sql()))
-            .bind(repository_key)
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let rows = sqlx::query_as::<_, PolicyBlockRow>(sqlx::AssertSqlSafe(format!(
-            "{POLICY_BLOCK_FROM_SQL}
-             ORDER BY uploaded_at DESC NULLS LAST, package_name
-             OFFSET $2 LIMIT $3"
-        )))
-        .bind(repository_key)
-        .bind(offset)
-        .bind(limit)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok((rows, total))
-    }
-}
-
-/// Shared FROM/WHERE for policy-blocked hosted + proxy rows.
-/// `$1` is an optional repository key.
-const POLICY_BLOCK_FROM_SQL: &str = r#"
-WITH finding_counts AS (
-    SELECT
-        artifact_id,
-        COUNT(*) FILTER (WHERE NOT is_acknowledged AND severity = 'critical')::int AS critical_count,
-        COUNT(*) FILTER (WHERE NOT is_acknowledged AND severity = 'high')::int AS high_count,
-        COUNT(*) FILTER (WHERE NOT is_acknowledged AND severity = 'medium')::int AS medium_count,
-        COUNT(*) FILTER (WHERE NOT is_acknowledged AND severity = 'low')::int AS low_count,
-        COUNT(*) FILTER (WHERE NOT is_acknowledged)::int AS findings_count
-    FROM scan_findings
-    GROUP BY artifact_id
-),
-hosted_raw AS (
-    SELECT
-        a.id,
-        a.name,
-        a.version,
-        a.path,
-        repo.key AS repository_key,
-        repo.format::text AS repository_format,
-        a.created_at,
-        fc.critical_count,
-        fc.high_count,
-        fc.medium_count,
-        fc.low_count,
-        fc.findings_count,
-        p.max_severity,
-        p.name AS policy_name,
-        p.repository_id IS NOT NULL AS repo_scoped,
-        CASE p.max_severity
-            WHEN 'critical' THEN fc.critical_count
-            WHEN 'high' THEN fc.critical_count + fc.high_count
-            WHEN 'medium' THEN fc.critical_count + fc.high_count + fc.medium_count
-            ELSE fc.critical_count + fc.high_count + fc.medium_count + fc.low_count
-        END AS violating_count
-    FROM artifacts a
-    INNER JOIN repositories repo ON repo.id = a.repository_id
-    INNER JOIN finding_counts fc ON fc.artifact_id = a.id
-    INNER JOIN scan_policies p
-        ON p.is_enabled
-       AND (p.repository_id = repo.id OR p.repository_id IS NULL)
-    WHERE a.is_deleted = false
-      AND ($1::text IS NULL OR repo.key = $1)
-),
-hosted AS (
-    SELECT DISTINCT ON (id)
-        id::text AS id,
-        'hosted'::text AS source,
-        id AS artifact_id,
-        name AS package_name,
-        version AS package_version,
-        path,
-        repository_key,
-        repository_format,
-        created_at AS uploaded_at,
-        critical_count,
-        high_count,
-        medium_count,
-        low_count,
-        findings_count,
-        max_severity,
-        policy_name,
-        format(
-            'Policy ''%s'': %s findings at or above %s',
-            policy_name, violating_count, max_severity
-        ) AS block_reason
-    FROM hosted_raw
-    WHERE violating_count > 0
-    ORDER BY id, repo_scoped DESC, violating_count DESC
-),
-proxy AS (
-    SELECT DISTINCT ON (pca.id)
-        pca.id::text AS id,
-        'proxy'::text AS source,
-        NULL::uuid AS artifact_id,
-        COALESCE(NULLIF(regexp_replace(pca.path, '.*/', ''), ''), pca.path) AS package_name,
-        NULL::text AS package_version,
-        pca.path AS path,
-        repo.key AS repository_key,
-        repo.format::text AS repository_format,
-        pca.cached_at AS uploaded_at,
-        psr.critical_count,
-        psr.high_count,
-        psr.medium_count,
-        psr.low_count,
-        psr.findings_count,
-        psr.max_severity,
-        NULL::text AS policy_name,
-        'Vulnerable according to proxy scan'::text AS block_reason
-    FROM proxy_cache_artifacts pca
-    INNER JOIN repositories repo ON repo.id = pca.repository_id
-    INNER JOIN proxy_scan_results psr
-        ON psr.checksum_sha256 = pca.checksum_sha256
-       AND psr.verdict = 'vulnerable'
-    WHERE pca.size_bytes > 0
-      AND pca.checksum_sha256 IS NOT NULL
-      AND ($1::text IS NULL OR repo.key = $1)
-    ORDER BY pca.id, psr.scanned_at DESC
-),
-stamped AS (
-    SELECT
-        a.id::text AS id,
-        'hosted'::text AS source,
-        a.id AS artifact_id,
-        COALESCE(NULLIF(a.name, ''), a.path) AS package_name,
-        a.version AS package_version,
-        a.path,
-        repo.key AS repository_key,
-        repo.format::text AS repository_format,
-        a.created_at AS uploaded_at,
-        0::int AS critical_count,
-        0::int AS high_count,
-        0::int AS medium_count,
-        0::int AS low_count,
-        0::int AS findings_count,
-        NULL::text AS max_severity,
-        NULL::text AS policy_name,
-        COALESCE(a.quarantine_reason, 'Blocked by scan policy') AS block_reason
-    FROM artifacts a
-    INNER JOIN repositories repo ON repo.id = a.repository_id
-    WHERE a.is_deleted = false
-      AND a.quarantine_status = 'policy_blocked'
-      AND ($1::text IS NULL OR repo.key = $1)
-)
-SELECT * FROM hosted
-UNION ALL
-SELECT s.* FROM stamped s
-LEFT JOIN hosted h ON h.artifact_id = s.artifact_id
-WHERE h.artifact_id IS NULL
-UNION ALL
-SELECT * FROM proxy
-"#;
-
-fn policy_block_count_sql() -> String {
-    format!("SELECT COUNT(*)::bigint FROM ({POLICY_BLOCK_FROM_SQL}) policy_blocks")
 }
 
 #[cfg(test)]
@@ -517,15 +328,6 @@ mod tests {
         assert_eq!(remaining_seconds(Some(until), now), Some(90));
         let past = now - Duration::seconds(5);
         assert_eq!(remaining_seconds(Some(past), now), Some(-5));
-    }
-
-    #[test]
-    fn violating_count_matches_policy_threshold() {
-        assert_eq!(violating_finding_count("critical", 1, 9, 9, 9), 1);
-        assert_eq!(violating_finding_count("high", 1, 2, 9, 9), 3);
-        assert_eq!(violating_finding_count("medium", 0, 0, 4, 1), 4);
-        assert_eq!(violating_finding_count("low", 0, 0, 0, 2), 2);
-        assert_eq!(violating_finding_count("unknown", 1, 1, 1, 1), 4);
     }
 
     #[test]
