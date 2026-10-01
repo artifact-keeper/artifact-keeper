@@ -70,7 +70,8 @@ async fn audit_federated_login(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let mut entry = AuditEntry::new(action, ResourceType::User)
-        .details(federated_login_details(provider, extra));
+        .details(federated_login_details(provider, extra))
+        .with_request_client_ip();
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
     }
@@ -878,6 +879,21 @@ pub async fn ldap_login(
             },
         )
         .await?;
+
+    // #3830: remember which provider this user authenticated through, so the
+    // periodic directory reconcile re-reads them with this provider's base,
+    // filter and service account rather than guessing from the DN.
+    // Non-fatal: login still succeeds if the write fails.
+    if let Err(e) =
+        crate::services::ldap_sync_service::record_ldap_provider(&state.db, user.id, id).await
+    {
+        tracing::warn!(
+            user_id = %user.id,
+            provider_id = %id,
+            error = %e,
+            "Failed to record the LDAP provider for this user; login still succeeds"
+        );
+    }
 
     // Issue #2468: when group sync is configured (group_base_dn and/or
     // group_filter set), reflect the user's LDAP/AD groups as Artifact

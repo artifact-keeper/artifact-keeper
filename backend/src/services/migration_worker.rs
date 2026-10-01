@@ -1097,6 +1097,19 @@ impl MigrationWorker {
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
 
+                // The source's own generated index is not content: AK builds
+                // it from the imported rows, and a copied one would be listed
+                // as a bogus package (#2525).
+                if is_source_generated_index(package_type, &artifact_path) {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Skipping the source's generated package index"
+                    );
+                    *skipped += 1;
+                    continue;
+                }
+
                 // Dry run: report what would move and stop here. First branch
                 // in the body on purpose, ahead of every DB read/write, the
                 // download, and the storage put.
@@ -1146,6 +1159,14 @@ impl MigrationWorker {
                         path = %artifact_path,
                         "Skipping duplicate artifact (already exists with matching checksum)"
                     );
+                    // #3927: repair a pre-fix import's missing Maven
+                    // coordinates instead of skipping past them.
+                    self.repair_migrated_maven_metadata(
+                        keys.target.as_str(),
+                        package_type,
+                        &artifact_path,
+                    )
+                    .await;
                     *skipped += 1;
                     continue;
                 }
@@ -1318,6 +1339,11 @@ impl MigrationWorker {
             .await?;
 
         if should_skip {
+            // #3927: a repository migrated before the importer wrote Maven
+            // coordinates has rows but no `maven-metadata.xml`; re-running the
+            // job repairs it here instead of skipping past it.
+            self.repair_migrated_maven_metadata(keys.target.as_str(), package_type, artifact_path)
+                .await;
             self.migration_service
                 .skip_item(item_id, "Artifact already exists")
                 .await?;
@@ -1377,6 +1403,115 @@ impl MigrationWorker {
         }
 
         Ok(())
+    }
+
+    /// The `artifact_metadata` document the RPM upload paths record for a
+    /// `.rpm`, read from the migrated file's header (#3925). `None` for other
+    /// formats and files, for an unreadable header, and for a header over the
+    /// repodata indexing limits (which a native upload would refuse; here the
+    /// package is still migrated and listed from its filename).
+    async fn migration_rpm_metadata(
+        &self,
+        package_type: &str,
+        artifact_path: &str,
+        temp_path: &std::path::Path,
+    ) -> Option<serde_json::Value> {
+        if !package_type.eq_ignore_ascii_case("rpm") || !artifact_path.ends_with(".rpm") {
+            return None;
+        }
+        let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+        let prefix = crate::api::handlers::upload::read_rpm_header_prefix(temp_path)
+            .await
+            .ok()?;
+        // Parsing an untrusted header (up to `RPM_HEADER_READ_MAX`) is CPU
+        // work; keep it off the async runtime, as the upload paths do.
+        let filename = filename.to_string();
+        match tokio::task::spawn_blocking(move || {
+            crate::api::handlers::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+        })
+        .await
+        {
+            Ok(Ok(meta)) => meta,
+            // Unlike an upload, which refuses an over-limit header with 400,
+            // the migration still moves the bytes: the package is listed from
+            // its filename, and the repodata heal marks it unparseable.
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    "RPM header exceeds the repodata indexing limits; migrated without header metadata"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    error = %e,
+                    "RPM header parse task failed; migrated without header metadata"
+                );
+                None
+            }
+        }
+    }
+
+    /// Give an already-imported Maven file the `artifact_metadata` row that
+    /// `maven-metadata.xml` generation reads, when it has none (#3927).
+    ///
+    /// Only fills a gap: an existing row (a live deploy's POM-derived one, or
+    /// one this importer already wrote) is left untouched. Best-effort, like
+    /// the catalog and search side effects: a failure here is logged and never
+    /// fails or re-transfers an item whose content is already in place.
+    async fn repair_migrated_maven_metadata(
+        &self,
+        target_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+    ) {
+        let Some(meta) = migration_maven_metadata(package_type, artifact_path) else {
+            return;
+        };
+        let stored_path = migration_destination_path(package_type, artifact_path);
+        let result = sqlx::query_scalar::<_, Uuid>(
+            "WITH target AS ( \
+                 SELECT a.id, a.repository_id \
+                 FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 WHERE r.key = $1 AND a.path = $2 AND a.is_deleted = false \
+             ), inserted AS ( \
+                 INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 SELECT id, 'maven', $3 FROM target \
+                 ON CONFLICT (artifact_id) DO NOTHING \
+                 RETURNING artifact_id \
+             ) \
+             SELECT t.repository_id FROM target t \
+             JOIN inserted i ON i.artifact_id = t.id",
+        )
+        .bind(target_key)
+        .bind(&stored_path)
+        .bind(&meta)
+        .fetch_optional(&self.db)
+        .await;
+        match result {
+            Ok(Some(repository_id)) => {
+                if let (Some(group_id), Some(maven_artifact_id)) = (
+                    meta.get("groupId").and_then(|v| v.as_str()),
+                    meta.get("artifactId").and_then(|v| v.as_str()),
+                ) {
+                    crate::api::handlers::maven::invalidate_maven_metadata_cache(
+                        repository_id,
+                        group_id,
+                        maven_artifact_id,
+                    )
+                    .await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                repo = %target_key,
+                path = %artifact_path,
+                error = %e,
+                "could not backfill Maven coordinates for an already-migrated artifact"
+            ),
+        }
     }
 
     /// Verify checksum and record transfer result as completed or failed
@@ -2091,7 +2226,21 @@ impl MigrationWorker {
             )
         })
         .ok()
-        .flatten();
+        .flatten()
+        // #3927: Maven coordinates carry no archive metadata to extract, but
+        // `maven-metadata.xml` is generated from `artifact_metadata` rows
+        // (`format = 'maven'`, `groupId`/`artifactId`). Without one a migrated
+        // coordinate resolved by exact version yet had no metadata document,
+        // so LATEST/RELEASE resolution fell through to another repository.
+        .or_else(|| migration_maven_metadata(package_type, artifact_path));
+
+        // #3925: an RPM's header metadata (summary, requires/provides, the
+        // #3801 repodata block) is what repodata renders beyond the filename.
+        // Read the same bounded header prefix the generic upload path reads,
+        // from the spilled temp file, and record it after the row commits.
+        let rpm_metadata = self
+            .migration_rpm_metadata(package_type, artifact_path, &temp_path)
+            .await;
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -2494,6 +2643,46 @@ impl MigrationWorker {
                 }
 
                 tx.commit().await?;
+
+                // #3925: record the RPM header metadata through the helper the
+                // native and generic upload paths share (it also bumps the
+                // repository so the repodata cache re-renders). Best-effort:
+                // without it the package is still listed, from its filename.
+                if let (Some(id), Some(meta)) = (artifact_id, &rpm_metadata) {
+                    if let Err(e) = crate::api::handlers::rpm::record_rpm_metadata(
+                        &self.db,
+                        id,
+                        repository_id,
+                        meta,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            path = %artifact_path,
+                            error = %e,
+                            "could not record RPM header metadata for a migrated package"
+                        );
+                    }
+                }
+
+                // #3927: a GET of this GA's `maven-metadata.xml` during the
+                // migration cached the version set as it stood then; drop it so
+                // the next resolve sees the version just imported.
+                if artifact_id.is_some() {
+                    if let Some(meta) = &extracted_metadata {
+                        if let (Some(group_id), Some(maven_artifact_id)) = (
+                            meta.get("groupId").and_then(|v| v.as_str()),
+                            meta.get("artifactId").and_then(|v| v.as_str()),
+                        ) {
+                            crate::api::handlers::maven::invalidate_maven_metadata_cache(
+                                repository_id,
+                                group_id,
+                                maven_artifact_id,
+                            )
+                            .await;
+                        }
+                    }
+                }
 
                 // #2676: surface the migrated artifact in the packages
                 // catalog. The web UI's Packages tab reads `packages` /
@@ -3623,6 +3812,72 @@ pub(crate) fn migration_catalog_entry(
             })
         }
     }
+}
+
+/// Whether `artifact_path` is an index the source registry generates for a
+/// format whose index Artifact Keeper builds itself from the imported rows.
+///
+/// CRAN only today (#2525): `PACKAGES`, `PACKAGES.gz`, `PACKAGES.rds` and
+/// `PACKAGES.json` under `src/contrib/` or `bin/.../contrib/<r-version>/`. AK's
+/// CRAN handler lists every `artifacts` row of the repository, so a copied
+/// `PACKAGES` file would appear in the served index as a package called
+/// `PACKAGES` with no version.
+pub(crate) fn is_source_generated_index(package_type: &str, artifact_path: &str) -> bool {
+    if !package_type.eq_ignore_ascii_case("cran") {
+        return false;
+    }
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    matches!(
+        filename,
+        "PACKAGES" | "PACKAGES.gz" | "PACKAGES.rds" | "PACKAGES.json"
+    )
+}
+
+/// The `artifact_metadata` document a live `mvn deploy` stores for a Maven
+/// file, derived from its repository path (#3927).
+///
+/// `maven-metadata.xml` for a hosted repository is generated from
+/// `artifact_metadata` rows with `format = 'maven'` keyed on
+/// `groupId`/`artifactId` (`handlers::maven::load_maven_metadata_entry`), so an
+/// imported coordinate without such a row is invisible to LATEST/RELEASE
+/// resolution. This builds the same `groupId`/`artifactId`/`version`/
+/// `extension`(/`classifier`) shape the upload handler writes.
+///
+/// Returns `None` for non-Maven formats, for paths that do not parse as
+/// `group/artifact/version/file`, and for the metadata document and checksum
+/// sidecars themselves: those live beside a coordinate rather than being one,
+/// and parsing `com/ex/lib/maven-metadata.xml` as a GAV would invent a
+/// version called `lib`.
+pub(crate) fn migration_maven_metadata(
+    package_type: &str,
+    artifact_path: &str,
+) -> Option<serde_json::Value> {
+    if !package_type.eq_ignore_ascii_case("maven") {
+        return None;
+    }
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("maven-metadata")
+        || [".md5", ".sha1", ".sha256", ".sha512", ".asc"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+    {
+        return None;
+    }
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(artifact_path).ok()?;
+    if coords.group_id.is_empty() {
+        return None;
+    }
+    let mut meta = serde_json::json!({
+        "groupId": coords.group_id,
+        "artifactId": coords.artifact_id,
+        "version": coords.version,
+        "extension": coords.extension,
+    });
+    if let Some(classifier) = coords.classifier {
+        meta["classifier"] = serde_json::Value::String(classifier);
+    }
+    Some(meta)
 }
 
 /// Reject artifact paths that could escape the repository root once stored
@@ -10579,6 +10834,475 @@ mod tests {
             single_catalog_row(&pool, repo_id).await,
             Some(("mychart".to_string(), "1.2.3".to_string())),
             "migrated helm chart must appear in the packages catalog"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3927: migrated Maven coordinates must feed maven-metadata.xml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_source_generated_index_cran_2525() {
+        for path in [
+            "src/contrib/PACKAGES",
+            "src/contrib/PACKAGES.gz",
+            "src/contrib/PACKAGES.rds",
+            "bin/windows/contrib/4.3/PACKAGES",
+        ] {
+            assert!(is_source_generated_index("cran", path), "{path}");
+        }
+        assert!(!is_source_generated_index(
+            "cran",
+            "src/contrib/dplyr_1.1.4.tar.gz"
+        ));
+        // Only CRAN: a generic repository's file called PACKAGES is content.
+        assert!(!is_source_generated_index(
+            "generic",
+            "src/contrib/PACKAGES"
+        ));
+    }
+
+    #[test]
+    fn test_migration_maven_metadata_shape_3927() {
+        let meta = migration_maven_metadata("maven", "com/example/lib/1.2.0/lib-1.2.0-sources.jar")
+            .expect("a Maven artifact path yields coordinates");
+        assert_eq!(meta["groupId"], "com.example");
+        assert_eq!(meta["artifactId"], "lib");
+        assert_eq!(meta["version"], "1.2.0");
+        assert_eq!(meta["extension"], "jar");
+        assert_eq!(meta["classifier"], "sources");
+
+        let pom = migration_maven_metadata("MAVEN", "com/example/lib/1.2.0/lib-1.2.0.pom")
+            .expect("case-insensitive format match");
+        assert_eq!(pom["extension"], "pom");
+        assert!(pom.get("classifier").is_none());
+    }
+
+    #[test]
+    fn test_migration_maven_metadata_skips_sidecars_and_other_formats_3927() {
+        // The metadata document itself would otherwise parse as version `lib`.
+        assert!(migration_maven_metadata("maven", "com/example/lib/maven-metadata.xml").is_none());
+        assert!(
+            migration_maven_metadata("maven", "com/example/lib/maven-metadata.xml.sha1").is_none()
+        );
+        assert!(
+            migration_maven_metadata("maven", "com/example/lib/1.0/lib-1.0.jar.sha1").is_none()
+        );
+        assert!(migration_maven_metadata("maven", "com/example/lib/1.0/lib-1.0.jar.asc").is_none());
+        // Too short to be group/artifact/version/file.
+        assert!(migration_maven_metadata("maven", "lib/1.0/lib-1.0.jar").is_none());
+        assert!(migration_maven_metadata("npm", "com/example/lib/1.0/lib-1.0.jar").is_none());
+    }
+
+    /// The versions `maven-metadata.xml` generation reads for one GA: the
+    /// same predicate as `handlers::maven::load_maven_metadata_entry`.
+    async fn maven_metadata_versions(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        group_id: &str,
+        artifact_id: &str,
+    ) -> Vec<String> {
+        let mut versions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT a.version FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false \
+               AND am.format = 'maven' \
+               AND am.metadata->>'groupId' = $2 \
+               AND am.metadata->>'artifactId' = $3 \
+               AND a.version IS NOT NULL",
+        )
+        .bind(repo_id)
+        .bind(group_id)
+        .bind(artifact_id)
+        .fetch_all(pool)
+        .await
+        .expect("query maven metadata versions");
+        versions.sort();
+        versions
+    }
+
+    /// #3927: after migrating a Maven repository, the dynamic
+    /// `maven-metadata.xml` generator must see every imported version, so
+    /// LATEST/RELEASE resolve against the migrated repository instead of
+    /// falling through. Pre-fix the importer wrote no `artifact_metadata` row
+    /// for Maven files, the generator found no versions and answered 404.
+    #[tokio::test]
+    async fn test_maven_import_feeds_metadata_generation_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3927-maven", "maven").await;
+
+        let paths = [
+            "com/example/lib/1.0.0/lib-1.0.0.pom",
+            "com/example/lib/1.0.0/lib-1.0.0.jar",
+            "com/example/lib/1.1.0/lib-1.1.0.jar",
+            "com/example/lib/1.1.0/lib-1.1.0.jar.sha1",
+            "com/example/lib/maven-metadata.xml",
+        ];
+        let mut files = std::collections::HashMap::new();
+        for p in paths {
+            files.insert(p.to_string(), bytes::Bytes::from(format!("bytes of {p}")));
+        }
+        for p in paths {
+            transfer_one(&worker, &storage, &files, &repo_key, "maven", p)
+                .await
+                .unwrap_or_else(|e| panic!("maven transfer of {p} must succeed: {e}"));
+        }
+
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            vec!["1.0.0".to_string(), "1.1.0".to_string()],
+            "every migrated version must be visible to maven-metadata.xml generation"
+        );
+
+        // Sidecars and the source's own metadata document carry no GAV row.
+        let sidecar_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 \
+               AND (a.path LIKE '%.sha1' OR a.path LIKE '%maven-metadata.xml')",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count sidecar metadata rows");
+        assert_eq!(
+            sidecar_rows, 0,
+            "sidecars must not be recorded as coordinates"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// Mock Maven source for the #3927 job-level test: one repository of
+    /// `(directory, filename)` entries, each served with fixed bytes and no
+    /// advertised digests (so a re-run treats them as duplicates).
+    struct MavenSource {
+        repo_key: String,
+        files: Vec<(&'static str, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for MavenSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "maven2")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+            let start = (offset.max(0) as usize).min(self.files.len());
+            let end = start
+                .saturating_add(limit.max(0) as usize)
+                .min(self.files.len());
+            let results: Vec<AqlResult> = self.files[start..end]
+                .iter()
+                .map(|(dir, name)| AqlResult {
+                    repo: repo_key.to_string(),
+                    path: (*dir).to_string(),
+                    name: (*name).to_string(),
+                    size: Some(3),
+                    created: None,
+                    modified: None,
+                    sha256: None,
+                    actual_sha1: None,
+                })
+                .collect();
+            let page = results.len() as i64;
+            Ok(AqlResponse {
+                results,
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + page,
+                    total: page,
+                },
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(bytes::Bytes::from_static(b"jar"))
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "maven-mock"
+        }
+    }
+
+    /// #3927 end to end through `process_job`: the first run records the
+    /// coordinates; a repository left without them (the pre-fix state) is
+    /// repaired by simply running the job again, through the job loop's real
+    /// duplicate-skip path, without re-transferring anything.
+    #[tokio::test]
+    async fn test_maven_job_rerun_repairs_missing_coordinates_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "mvn-3927").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $1, $2, 'local', 'maven'::repository_format, true) RETURNING id",
+        )
+        .bind(&repo_key)
+        .bind(tmp.path().to_str().expect("utf-8 tempdir"))
+        .fetch_one(&pool)
+        .await
+        .expect("seed maven destination");
+
+        let source = Arc::new(MavenSource {
+            repo_key: repo_key.clone(),
+            files: vec![
+                ("com/example/lib/1.0.0", "lib-1.0.0.jar"),
+                ("com/example/lib/1.1.0", "lib-1.1.0.jar"),
+            ],
+        });
+        let config = WorkerConfig {
+            throttle_delay_ms: 0,
+            ..WorkerConfig::default()
+        };
+
+        run_job_with_source(&pool, job_id, source.clone(), config.clone()).await;
+        let expected = vec!["1.0.0".to_string(), "1.1.0".to_string()];
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            expected,
+            "the first run records the coordinates"
+        );
+
+        // Pre-fix state: rows present, coordinates missing.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip coordinates");
+
+        let rerun_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({ "include_repos": [repo_key.as_str()] }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed re-run job");
+        run_job_with_source(&pool, rerun_id, source, config).await;
+
+        let (completed, skipped): (i32, i32) = sqlx::query_as(
+            "SELECT completed_items, skipped_items FROM migration_jobs WHERE id = $1",
+        )
+        .bind(rerun_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read re-run counters");
+        assert_eq!((completed, skipped), (0, 2), "the re-run transfers nothing");
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "com.example", "lib").await,
+            expected,
+            "the re-run's duplicate-skip path backfills the coordinates"
+        );
+
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(rerun_id)
+            .execute(&pool)
+            .await;
+        cleanup_repo(&pool, repo_id).await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #3927: a repository migrated before the fix has artifact rows but no
+    /// Maven coordinates. Re-running the job skips those items as duplicates;
+    /// the skip path must backfill the coordinates so the repair needs no
+    /// re-transfer, and must leave an existing row alone.
+    #[tokio::test]
+    async fn test_maven_remigration_backfills_missing_coordinates_3927() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3927-repair", "maven").await;
+
+        let path = "org/acme/tool/2.0.0/tool-2.0.0.jar";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from_static(b"tool jar"));
+        transfer_one(&worker, &storage, &files, &repo_key, "maven", path)
+            .await
+            .expect("maven transfer must succeed");
+
+        // Simulate the pre-fix state: the row exists, its coordinates do not.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip coordinates");
+        assert!(maven_metadata_versions(&pool, repo_id, "org.acme", "tool")
+            .await
+            .is_empty());
+
+        worker
+            .repair_migrated_maven_metadata(&repo_key, "maven", path)
+            .await;
+        assert_eq!(
+            maven_metadata_versions(&pool, repo_id, "org.acme", "tool").await,
+            vec!["2.0.0".to_string()],
+            "the duplicate-skip path must backfill the missing coordinates"
+        );
+
+        // A second pass is a no-op: the row is not rewritten or duplicated.
+        worker
+            .repair_migrated_maven_metadata(&repo_key, "maven", path)
+            .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id WHERE a.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count metadata rows");
+        assert_eq!(rows, 1);
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #2525: a migrated CRAN source package lands at the native
+    /// `<name>/<version>/<name>_<version>.tar.gz` path with its coordinates,
+    /// in the packages catalog; a binary keeps its source path.
+    #[tokio::test]
+    async fn test_cran_import_uses_native_layout_2525() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2525-cran", "cran").await;
+
+        let src = "src/contrib/Archive/dplyr/dplyr_1.1.3.tar.gz";
+        let bin = "bin/windows/contrib/4.3/dplyr_1.1.3.zip";
+        let mut files = std::collections::HashMap::new();
+        files.insert(src.to_string(), bytes::Bytes::from_static(b"src tarball"));
+        files.insert(bin.to_string(), bytes::Bytes::from_static(b"win binary"));
+        for p in [src, bin] {
+            transfer_one(&worker, &storage, &files, &repo_key, "cran", p)
+                .await
+                .unwrap_or_else(|e| panic!("cran transfer of {p} must succeed: {e}"));
+        }
+
+        let mut rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT path, name, version FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("query rows");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (bin.to_string(), "dplyr_1.1.3.zip".to_string(), None),
+                (
+                    "dplyr/1.1.3/dplyr_1.1.3.tar.gz".to_string(),
+                    "dplyr".to_string(),
+                    Some("1.1.3".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("dplyr".to_string(), "1.1.3".to_string()))
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #3925: a migrated `.rpm` must carry the header metadata the native and
+    /// generic upload paths record, so the dynamically rendered repodata
+    /// advertises its summary and dependencies, not just a filename.
+    #[tokio::test]
+    async fn test_rpm_import_records_header_metadata_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3925-rpm", "rpm").await;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ak-meta-test-1.0-1.noarch.rpm");
+        let bytes = std::fs::read(&fixture).expect("read rpm fixture");
+        let path = "Packages/a/ak-meta-test-1.0-1.noarch.rpm";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from(bytes));
+        transfer_one(&worker, &storage, &files, &repo_key, "rpm", path)
+            .await
+            .expect("rpm transfer must succeed");
+
+        let meta: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND am.format = 'rpm'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query rpm metadata");
+        let meta = meta.expect("the migrated .rpm must have a header-metadata row");
+        assert_eq!(meta["name"], "ak-meta-test", "{meta}");
+        assert!(
+            meta.get(crate::api::handlers::rpm::RPM_REPODATA_KEY)
+                .is_some(),
+            "the repodata block is recorded: {meta}"
         );
 
         cleanup_repo(&pool, repo_id).await;

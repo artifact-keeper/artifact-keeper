@@ -1,14 +1,37 @@
 //! Chunked/resumable upload session management.
 //!
-//! Handles creation of upload sessions, streaming chunk writes to a temp file
-//! (never buffering full chunks in memory), session finalization with SHA256
-//! verification, and cleanup of expired sessions.
+//! Handles creation of upload sessions, staging each chunk as its own object
+//! in the repository's storage backend, session finalization with SHA256
+//! verification, and cleanup of expired, failed and cancelled sessions.
+//!
+//! # Multi-replica staging (#3918)
+//!
+//! Session state lives in Postgres and staged chunk bytes live in the
+//! repository's storage backend under [`staged_chunk_key`], never on the
+//! local disk of the replica that happened to serve a request. Any replica can
+//! therefore accept any chunk of a session and any replica can complete it.
+//! Completion reassembles the chunks into a request-scoped scratch file on the
+//! completing replica ([`AssembledUpload`], removed on drop), verifies size and
+//! SHA256, and hands that file to the existing storage-copy path.
+//!
+//! # Reclaiming staged data (#3922)
+//!
+//! Staged chunk objects are deleted when a session completes, fails
+//! terminally, or is cancelled ([`UploadService::purge_staged_chunks`]), and
+//! `staging_purged_at` records it. The hourly reaper
+//! ([`UploadService::cleanup_expired`]) cancels abandoned sessions and purges
+//! any terminal session whose staged chunks were not yet deleted (a replica
+//! crashed, or its purge failed), so nothing depends on the request that
+//! created the bytes surviving.
 
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -45,6 +68,12 @@ pub struct UploadSession {
     pub state_token: Option<Uuid>,
     /// Committing-lease deadline; an expired lease is reclaimable.
     pub committing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `true` when chunks are staged in the repository's storage backend
+    /// (#3918). `false` only for sessions created by an older server version,
+    /// whose bytes sit in `temp_file_path` on one replica's local disk.
+    pub staged_in_storage: bool,
+    /// When the staged chunk objects were deleted (#3922).
+    pub staging_purged_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
@@ -112,6 +141,39 @@ pub enum UploadError {
 
     #[error("artifact_path is too long: {len} characters (maximum {max})")]
     PathTooLong { len: usize, max: usize },
+
+    /// The session was created by an earlier server version whose staged
+    /// bytes live on one replica's local disk (#3918). Restart the upload.
+    #[error("{}", LEGACY_SESSION_MESSAGE)]
+    LegacySession,
+
+    /// The storage backend holding staged chunks failed (#3918). Retryable.
+    #[error("staging storage error: {0}")]
+    Storage(String),
+}
+
+/// Storage-key prefix under which a session's chunks are staged.
+pub const STAGING_KEY_PREFIX: &str = "upload-staging";
+
+/// Refusal for a session created before chunks were staged in shared storage:
+/// its bytes are on one replica's local disk, which no replica can rely on.
+pub const LEGACY_SESSION_MESSAGE: &str =
+    "session was created by an earlier server version and cannot be continued; start a new upload";
+
+/// The staging "directory" for a session (stored in `temp_file_path` for
+/// operators; the chunk keys below are derived from the session id).
+pub fn staging_prefix(session_id: Uuid) -> String {
+    format!("{STAGING_KEY_PREFIX}/{session_id}")
+}
+
+/// Storage key of one staged chunk. Zero-padded so a listing sorts in
+/// assembly order.
+pub fn staged_chunk_key(session_id: Uuid, chunk_index: i32) -> String {
+    format!("{}/{chunk_index:08}", staging_prefix(session_id))
+}
+
+fn storage_err(e: impl std::fmt::Display) -> UploadError {
+    UploadError::Storage(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +278,6 @@ pub fn enforce_max_total_size(total_size: i64, max: u64) -> Result<(), UploadErr
 const MIN_CHUNK_SIZE: i64 = 1_048_576; // 1 MB
 const MAX_CHUNK_SIZE: i64 = 268_435_456; // 256 MB
 const DEFAULT_CHUNK_SIZE: i32 = 8_388_608; // 8 MB
-const SHA256_BUF_SIZE: usize = 64 * 1024; // 64 KB read buffer for checksums
 pub const COMMIT_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
 // ---------------------------------------------------------------------------
@@ -226,7 +287,6 @@ pub const COMMIT_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 /// Parameters for creating a new upload session.
 pub struct CreateSessionParams<'a> {
     pub db: &'a PgPool,
-    pub storage_path: &'a str,
     pub user_id: Uuid,
     pub repo_id: Uuid,
     pub repo_key: &'a str,
@@ -253,8 +313,9 @@ pub struct UploadService;
 impl UploadService {
     /// Create a new chunked upload session.
     ///
-    /// Validates chunk size, computes chunk count, creates the temp file on
-    /// disk, and inserts session + chunk rows into the database.
+    /// Validates chunk size, computes chunk count, and inserts session + chunk
+    /// rows into the database. Nothing is written to local disk: chunks are
+    /// staged in the repository's storage backend as they arrive (#3918).
     pub async fn create_session(p: CreateSessionParams<'_>) -> Result<UploadSession, UploadError> {
         // C5: Validate total_size is positive before any arithmetic
         if p.total_size <= 0 {
@@ -286,14 +347,7 @@ impl UploadService {
         let package_metadata = p.package_metadata.cloned();
 
         let session_id = Uuid::new_v4();
-        let temp_dir = PathBuf::from(p.storage_path).join(".uploads");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-        let temp_file_path = temp_dir.join(session_id.to_string());
-
-        // Pre-allocate temp file at the expected size (sparse file on most FS)
-        let file = tokio::fs::File::create(&temp_file_path).await?;
-        file.set_len(p.total_size as u64).await?;
-        drop(file);
+        let staging = staging_prefix(session_id);
 
         // ak-4q87: wrap the session INSERT and the per-chunk placeholder
         // INSERTs in one transaction. Without this, a failure midway through
@@ -310,9 +364,13 @@ impl UploadService {
                  artifact_name, artifact_version, artifact_metadata_format,
                  artifact_metadata, artifact_metadata_properties, package_description,
                  package_metadata, is_replication, content_type, total_size, chunk_size,
-                 total_chunks, checksum_sha256, temp_file_path)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18, $19)
+                 total_chunks, checksum_sha256, temp_file_path, staged_in_storage,
+                 staging_storage_backend, staging_storage_path)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                   $14, $15, $16, $17, $18, $19, TRUE,
+                   r.storage_backend, r.storage_path
+            FROM repositories r
+            WHERE r.id = $3
             RETURNING *
             "#,
         )
@@ -334,7 +392,7 @@ impl UploadService {
         .bind(chunk_size)
         .bind(total_chunks)
         .bind(p.checksum_sha256)
-        .bind(&*temp_file_path.to_string_lossy())
+        .bind(&staging)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -375,12 +433,16 @@ impl UploadService {
         Ok(session)
     }
 
-    /// Write a chunk to the temp file at the correct offset.
+    /// Stage one chunk as its own object in the repository's storage backend.
     ///
-    /// The data is streamed directly to disk via `seek` + `write`, never
-    /// buffered as a complete chunk in memory. Computes SHA256 incrementally.
+    /// `storage` must be the session repository's backend (the same one the
+    /// completion reads from), which is what makes the session continuable on
+    /// any replica (#3918). The chunk must match its placeholder row exactly:
+    /// `byte_offset` is the row's offset and `data` is exactly the row's
+    /// length, so the staged objects concatenate back into the declared file.
     pub async fn upload_chunk(
         db: &PgPool,
+        storage: &dyn StorageBackend,
         session_id: Uuid,
         chunk_index: i32,
         byte_offset: i64,
@@ -402,6 +464,9 @@ impl UploadService {
             "completed" | "cancelled" | "committing" | "failed"
         ) {
             return Err(UploadError::InvalidStatus(session.status));
+        }
+        if !session.staged_in_storage {
+            return Err(UploadError::LegacySession);
         }
 
         // C6/#2316: Serialize concurrent uploads of the SAME chunk with a
@@ -428,9 +493,10 @@ impl UploadService {
 
         let mut tx = db.begin().await?;
 
-        let existing = sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>)>(
+        type ChunkRow = (String, Option<chrono::DateTime<chrono::Utc>>, i64, i32);
+        let existing = sqlx::query_as::<_, ChunkRow>(
             r#"
-            SELECT status, claimed_at
+            SELECT status, claimed_at, byte_offset, byte_length
             FROM upload_chunks
             WHERE session_id = $1 AND chunk_index = $2
             FOR UPDATE
@@ -440,6 +506,7 @@ impl UploadService {
         .bind(chunk_index)
         .fetch_optional(&mut *tx)
         .await?;
+        let placeholder_range = existing.as_ref().map(|row| (row.2, row.3));
 
         match existing {
             None => {
@@ -449,7 +516,7 @@ impl UploadService {
                     chunk_index, session.total_chunks
                 )));
             }
-            Some((ref status, _)) if status == "completed" => {
+            Some((ref status, ..)) if status == "completed" => {
                 // Idempotent: the winning request already uploaded this chunk.
                 let _ = tx.rollback().await;
                 let completed = session.completed_chunks;
@@ -460,7 +527,7 @@ impl UploadService {
                     chunks_remaining: session.total_chunks - completed,
                 });
             }
-            Some((ref status, claimed_at)) if status == "uploading" => {
+            Some((ref status, claimed_at, ..)) if status == "uploading" => {
                 let stale = claimed_at
                     .map(|t| (chrono::Utc::now() - t).num_seconds() > CHUNK_CLAIM_LEASE_SECS)
                     .unwrap_or(true);
@@ -470,14 +537,30 @@ impl UploadService {
                 }
                 // Lease expired: fall through and re-claim the abandoned chunk.
             }
-            Some((ref status, _)) if status == "pending" || status == "failed" => {
+            Some((ref status, ..)) if status == "pending" || status == "failed" => {
                 // Fall through and claim.
             }
-            Some((status, _)) => {
+            Some((status, ..)) => {
                 let _ = tx.rollback().await;
                 return Err(UploadError::InvalidChunk(format!(
                     "chunk {} is in an unexpected state ({})",
                     chunk_index, status
+                )));
+            }
+        }
+
+        // Each chunk is staged as a separate object and the completion
+        // concatenates them in index order, so a chunk that does not cover
+        // exactly its placeholder's byte range would assemble into a file
+        // with holes or overlaps. Reject it rather than stage it.
+        if let Some((row_offset, row_length)) = placeholder_range {
+            if byte_offset != row_offset || data.len() as i64 != row_length as i64 {
+                let _ = tx.rollback().await;
+                return Err(UploadError::InvalidChunk(format!(
+                    "chunk {chunk_index} must cover bytes {row_offset}..{} ({row_length} bytes); \
+                     got offset {byte_offset} with {} bytes",
+                    row_offset + row_length as i64 - 1,
+                    data.len()
                 )));
             }
         }
@@ -500,20 +583,16 @@ impl UploadService {
         hasher.update(&data);
         let chunk_checksum = format!("{:x}", hasher.finalize());
 
-        // Write to temp file at the correct offset. Any `?` failure below
-        // returns before `tx.commit()`, so the transaction is dropped and the
-        // 'uploading' claim rolls back to its prior state.
-        let temp_path = PathBuf::from(&session.temp_file_path);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&temp_path)
-            .await?;
-        file.seek(std::io::SeekFrom::Start(byte_offset as u64))
-            .await?;
-        file.write_all(&data).await?;
-        file.sync_data().await?;
-
+        // Stage the chunk in shared storage while holding the chunk-row lock.
+        // Any failure below returns before `tx.commit()`, so the transaction
+        // is dropped and the 'uploading' claim rolls back to its prior state.
+        // A put that succeeded under a rolled-back claim leaves an object the
+        // retry overwrites, or the purge deletes.
         let data_len = data.len() as i64;
+        storage
+            .put(&staged_chunk_key(session_id, chunk_index), data)
+            .await
+            .map_err(storage_err)?;
 
         // Mark chunk as completed within the same transaction.
         sqlx::query(
@@ -533,6 +612,15 @@ impl UploadService {
         // Because the chunk-row lock is held for the whole claim→complete
         // window, exactly one request completes each chunk, so `+ 1` counts
         // every completed chunk once.
+        //
+        // The status guard is the fence against a concurrent cancel or reaper
+        // (#3922 review S1): the status check at the top ran without a lock,
+        // so the session may have been cancelled — and its staged chunks
+        // purged — while this chunk was being stored. This UPDATE takes the
+        // session row lock: if it wins, a later cancel waits for this commit
+        // and its purge covers the new chunk; if the cancel won, the guard
+        // matches nothing and the chunk just stored is deleted here, since no
+        // purge will ever look for it again.
         let updated = sqlx::query_as::<_, (i32, i64)>(
             r#"
             UPDATE upload_sessions
@@ -541,17 +629,55 @@ impl UploadService {
                 status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END,
                 updated_at = NOW()
             WHERE id = $1
+              AND status IN ('pending', 'in_progress')
             RETURNING completed_chunks, bytes_received
             "#,
         )
         .bind(session_id)
         .bind(data_len)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        tx.commit().await?;
+        let Some((completed_chunks, bytes_received)) = updated else {
+            let _ = tx.rollback().await;
+            let key = staged_chunk_key(session_id, chunk_index);
+            match storage.delete(&key).await {
+                Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+                Err(e) => {
+                    // The session's own purge may already have run; queue the
+                    // session for the reaper so this chunk is retried.
+                    tracing::warn!(
+                        session = %session_id,
+                        storage_key = %key,
+                        error = %e,
+                        "failed to delete a refused chunk; queued for the upload reaper"
+                    );
+                    let _ = sqlx::query(
+                        "INSERT INTO upload_staging_orphans \
+                             (session_id, total_chunks, storage_backend, storage_path) \
+                         SELECT id, total_chunks, staging_storage_backend, \
+                                COALESCE(staging_storage_path, '') \
+                         FROM upload_sessions \
+                         WHERE id = $1 AND staging_storage_backend IS NOT NULL \
+                         ON CONFLICT (session_id) DO NOTHING",
+                    )
+                    .bind(session_id)
+                    .execute(db)
+                    .await;
+                }
+            }
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                    .bind(session_id)
+                    .fetch_optional(db)
+                    .await?;
+            return Err(match status {
+                Some(status) => UploadError::InvalidStatus(status),
+                None => UploadError::NotFound,
+            });
+        };
 
-        let (completed_chunks, bytes_received) = updated;
+        tx.commit().await?;
 
         Ok(ChunkResult {
             chunk_index,
@@ -592,7 +718,9 @@ impl UploadService {
     }
 
     /// Begin finalizing an upload session: take the completion lease, then
-    /// verify all chunks, size, and the full-file SHA256.
+    /// verify every chunk is staged. Size and the full-file SHA256 are
+    /// verified by [`Self::assemble_for_commit`], which needs the storage
+    /// backend the chunks were staged in.
     ///
     /// This is the StateMachineLease pattern (see
     /// [`crate::services::cluster_work`]), mirroring the OCI upload
@@ -620,6 +748,9 @@ impl UploadService {
         }
         if session.status == "cancelled" {
             return Err(UploadError::InvalidStatus("cancelled".into()));
+        }
+        if !session.staged_in_storage {
+            return Err(UploadError::LegacySession);
         }
 
         // Take the completion lease.
@@ -675,53 +806,65 @@ impl UploadService {
             });
         }
 
-        // Verify total file size
-        let temp_path = PathBuf::from(&session.temp_file_path);
-        let file_meta = match tokio::fs::metadata(&temp_path).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                Self::release_commit_lease(db, &session).await;
-                return Err(UploadError::Io(e));
-            }
-        };
-        if file_meta.len() != session.total_size as u64 {
-            Self::release_commit_lease(db, &session).await;
-            return Err(UploadError::SizeMismatch {
-                expected: session.total_size,
-                actual: file_meta.len() as i64,
-            });
-        }
-
-        // Compute full-file SHA256 by streaming in 64 KB blocks
-        let actual_checksum = match compute_file_sha256(&temp_path).await {
-            Ok(checksum) => checksum,
-            Err(e) => {
-                Self::release_commit_lease(db, &session).await;
-                return Err(UploadError::Io(e));
-            }
-        };
-        if actual_checksum != session.checksum_sha256 {
-            // Terminal: the assembled bytes are wrong; retrying won't help.
-            Self::fail_committing(
-                db,
-                &session,
-                &format!(
-                    "checksum mismatch: expected {}, got {}",
-                    session.checksum_sha256, actual_checksum
-                ),
-            )
-            .await;
-
-            return Err(UploadError::ChecksumMismatch {
-                expected: session.checksum_sha256.clone(),
-                actual: actual_checksum,
-            });
-        }
-
-        // Leave the session in 'committing': the caller streams the temp file
-        // to final storage and upserts the artifact under this lease, then
-        // finalizes by token.
+        // Leave the session in 'committing': the caller assembles the staged
+        // chunks, streams the result to final storage and upserts the
+        // artifact under this lease, then finalizes by token.
         Ok(session)
+    }
+
+    /// Reassemble a committing session's staged chunks into a scratch file on
+    /// this replica and verify its size and SHA256 (#3918).
+    ///
+    /// Must be called under the completion lease taken by
+    /// [`Self::complete_session`], and settles that lease on failure: a
+    /// checksum mismatch is terminal (the staged bytes are wrong; the session
+    /// is failed and its staged data becomes reclaimable, #3922), anything
+    /// else (a transient storage or local I/O error, a size mismatch) releases
+    /// the lease so the client can retry the completion.
+    ///
+    /// The returned file lives in `scratch_dir` (local, per replica, and only
+    /// for the duration of this request) and is removed when the
+    /// [`AssembledUpload`] is dropped, on every path.
+    pub async fn assemble_for_commit(
+        db: &PgPool,
+        storage: &dyn StorageBackend,
+        session: &UploadSession,
+        scratch_dir: &Path,
+    ) -> Result<AssembledUpload, UploadError> {
+        match assemble_staged_chunks(storage, session, scratch_dir).await {
+            Ok(assembled) => Ok(assembled),
+            Err(e @ UploadError::ChecksumMismatch { .. }) => {
+                Self::fail_committing(db, session, &e.to_string()).await;
+                Err(e)
+            }
+            Err(e) => {
+                Self::release_commit_lease(db, session).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete a session's staged chunk objects and record the purge (#3922).
+    ///
+    /// Idempotent: a chunk that is already gone counts as deleted, so two
+    /// replicas purging the same session (the completer and the reaper) both
+    /// succeed. On a storage failure `staging_purged_at` stays unset and the
+    /// reaper retries.
+    pub async fn purge_staged_chunks(
+        db: &PgPool,
+        storage: &dyn StorageBackend,
+        session_id: Uuid,
+        total_chunks: i32,
+    ) -> Result<(), UploadError> {
+        delete_staged_chunk_objects(storage, session_id, total_chunks).await?;
+        sqlx::query(
+            "UPDATE upload_sessions SET staging_purged_at = NOW() \
+             WHERE id = $1 AND staging_purged_at IS NULL",
+        )
+        .bind(session_id)
+        .execute(db)
+        .await?;
+        Ok(())
     }
 
     /// Extend a live completion lease. Returns `false` when the token no
@@ -850,13 +993,18 @@ impl UploadService {
         .await;
     }
 
-    /// Cancel an upload session. Deletes the temp file and marks the session
-    /// as cancelled.
+    /// Cancel an upload session and mark it cancelled.
+    ///
+    /// Returns the cancelled session when it still owns staged chunk objects,
+    /// which the caller (holding the repository's storage backend) should
+    /// delete with [`Self::purge_staged_chunks`]; the reaper backstops a purge
+    /// that is skipped or fails (#3922). A legacy session's local temp file
+    /// is removed here, best-effort.
     pub async fn cancel_session(
         db: &PgPool,
         session_id: Uuid,
         user_id: Uuid,
-    ) -> Result<(), UploadError> {
+    ) -> Result<Option<UploadSession>, UploadError> {
         let session =
             sqlx::query_as::<_, UploadSession>("SELECT * FROM upload_sessions WHERE id = $1")
                 .bind(session_id)
@@ -908,38 +1056,46 @@ impl UploadService {
                     .await?;
             return match status.as_deref() {
                 None => Err(UploadError::NotFound),
-                Some("cancelled") => Ok(()),
+                Some("cancelled") => Ok(None),
                 Some(other) => Err(UploadError::InvalidStatus(other.to_string())),
             };
         }
 
-        // Delete temp file (best-effort) only after winning the cancel claim.
-        let temp_path = PathBuf::from(&session.temp_file_path);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-
         tracing::info!("Cancelled upload session {}", session_id);
-        Ok(())
+
+        // Reclaim staged bytes only after winning the cancel claim.
+        if session.staged_in_storage {
+            return Ok(Some(session));
+        }
+        let _ = tokio::fs::remove_file(&session.temp_file_path).await;
+        Ok(None)
     }
 
-    /// Delete expired sessions and their temp files.
-    /// Returns the number of sessions cleaned up.
+    /// Reap abandoned sessions and reclaim staged data (#3922). Returns the
+    /// number of sessions cancelled for expiry.
     ///
-    /// The cancel transition is the claim: rows are flipped `-> cancelled`
-    /// with FOR UPDATE SKIP LOCKED *before* the temp-file delete, so
-    /// concurrent replicas running the hourly sweep claim disjoint sessions
-    /// instead of racing the same ones. Sessions in `committing` are skipped
-    /// while their completion lease is live — a reaper on pod A must not
-    /// remove a temp file that a finalizer on pod A is still streaming
-    /// (each pod only sees its own temp files, so only same-pod races are
-    /// physically possible, but the guard is cheap and universal).
-    pub async fn cleanup_expired(db: &PgPool) -> Result<i64, UploadError> {
-        let expired = sqlx::query_as::<_, (Uuid, String)>(
+    /// 1. **Expire.** Sessions past `expires_at` that are not terminal are
+    ///    cancelled. The cancel transition is the claim: rows are flipped
+    ///    `-> cancelled` with FOR UPDATE SKIP LOCKED, so concurrent replicas
+    ///    running the hourly sweep claim disjoint sessions. Sessions in
+    ///    `committing` are skipped while their completion lease is live: the
+    ///    finalizer is still reading their staged chunks.
+    /// 2. **Purge.** Every terminal session (completed, failed, cancelled —
+    ///    including the ones just expired) whose staged chunk objects were not
+    ///    yet deleted has them deleted from its repository's backend. This is
+    ///    what reclaims staged data when the replica that failed or cancelled a
+    ///    session crashed or could not reach storage.
+    pub async fn cleanup_expired(
+        db: &PgPool,
+        registry: &crate::storage::StorageRegistry,
+    ) -> Result<i64, UploadError> {
+        let expired = sqlx::query_as::<_, (Uuid, String, bool)>(
             r#"
             WITH candidate AS (
                 SELECT id
                 FROM upload_sessions
                 WHERE expires_at < NOW()
-                  AND status NOT IN ('completed', 'cancelled')
+                  AND status NOT IN ('completed', 'cancelled', 'failed')
                   AND (
                     status != 'committing'
                     OR committing_expires_at IS NULL
@@ -952,47 +1108,265 @@ impl UploadService {
                 state_token = NULL, committing_expires_at = NULL, updated_at = NOW()
             FROM candidate
             WHERE s.id = candidate.id
-            RETURNING s.id, s.temp_file_path
+            RETURNING s.id, s.temp_file_path, s.staged_in_storage
             "#,
         )
         .fetch_all(db)
         .await?;
 
         let count = expired.len() as i64;
-
-        for (id, temp_path) in &expired {
-            let _ = tokio::fs::remove_file(temp_path).await;
-            tracing::info!("Cleaned up expired upload session {}", id);
+        for (id, temp_path, staged) in &expired {
+            if !staged {
+                // Legacy session: its bytes are a local file, possibly on
+                // another replica; removing it here is best-effort.
+                let _ = tokio::fs::remove_file(temp_path).await;
+            }
+            tracing::info!("Cancelled expired upload session {}", id);
         }
 
-        if count > 0 {
-            tracing::info!("Cleaned up {} expired upload sessions", count);
+        let purged = Self::purge_unreclaimed_staging(db, registry).await?;
+        if count > 0 || purged > 0 {
+            tracing::info!(
+                "Upload reaper: cancelled {} expired session(s), purged staged data of {} session(s)",
+                count,
+                purged
+            );
         }
 
         Ok(count)
     }
+
+    /// Purge pass of [`Self::cleanup_expired`] (#3922).
+    ///
+    /// Works one session at a time: it locks the session row
+    /// (FOR UPDATE SKIP LOCKED, so replicas take disjoint sessions), deletes
+    /// the chunk objects, and only then stamps `staging_purged_at` and
+    /// commits. A crash or storage error mid-delete rolls the claim back, so
+    /// the next pass retries it. Then it drains `upload_staging_orphans`
+    /// (sessions deleted by a repository/user cascade) the same way. The pass
+    /// stops after [`STAGING_PURGE_OBJECT_BUDGET`] chunk objects so one tick
+    /// cannot run unbounded.
+    async fn purge_unreclaimed_staging(
+        db: &PgPool,
+        registry: &crate::storage::StorageRegistry,
+    ) -> Result<i64, UploadError> {
+        let mut budget = STAGING_PURGE_OBJECT_BUDGET;
+        let mut purged = 0_i64;
+        let mut failed: Vec<Uuid> = Vec::new();
+        for orphans in [false, true] {
+            while budget > 0 {
+                let mut tx = db.begin().await?;
+                let sql = if orphans {
+                    "SELECT session_id, total_chunks, storage_backend, storage_path \
+                     FROM upload_staging_orphans \
+                     WHERE NOT (session_id = ANY($1)) \
+                       AND attempts < 24 \
+                     ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                } else {
+                    "SELECT id, total_chunks, staging_storage_backend, \
+                            COALESCE(staging_storage_path, '') \
+                     FROM upload_sessions \
+                     WHERE staged_in_storage AND staging_purged_at IS NULL \
+                       AND staging_storage_backend IS NOT NULL \
+                       AND status IN ('completed', 'failed', 'cancelled') \
+                       AND NOT (id = ANY($1)) \
+                     ORDER BY updated_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                };
+                let Some((id, total_chunks, backend, path)) =
+                    sqlx::query_as::<_, (Uuid, i32, String, String)>(sql)
+                        .bind(&failed)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                else {
+                    break;
+                };
+                budget -= i64::from(total_chunks.max(1));
+
+                let location = crate::storage::StorageLocation { backend, path };
+                let deleted = match registry.backend_for(&location) {
+                    Ok(storage) => {
+                        delete_staged_chunk_objects(storage.as_ref(), id, total_chunks).await
+                    }
+                    Err(e) => Err(storage_err(e)),
+                };
+                if let Err(e) = deleted {
+                    tracing::warn!(
+                        session = %id,
+                        error = %e,
+                        "failed to purge staged upload chunks; will retry next pass"
+                    );
+                    failed.push(id);
+                    let _ = tx.rollback().await;
+                    if orphans {
+                        Self::record_orphan_purge_failure(db, id, &e.to_string()).await;
+                    }
+                    continue;
+                }
+                let done = if orphans {
+                    "DELETE FROM upload_staging_orphans WHERE session_id = $1"
+                } else {
+                    "UPDATE upload_sessions SET staging_purged_at = NOW() WHERE id = $1"
+                };
+                sqlx::query(done).bind(id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+}
+
+/// Remove completion scratch files (`<scratch_dir>/assemble-*`) left behind
+/// when a replica died mid-completion (#3922 review N4). A live completion
+/// renews its lease for at most [`COMMIT_LEASE_TTL_SECS`], so a scratch file
+/// older than that plus a margin has no owner. Returns how many were removed.
+pub async fn sweep_stale_assembly_scratch(scratch_dir: &Path) -> usize {
+    let max_age = std::time::Duration::from_secs_f64(COMMIT_LEASE_TTL_SECS + 3600.0);
+    let Ok(mut entries) = tokio::fs::read_dir(scratch_dir).await else {
+        return 0;
+    };
+    let mut removed = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_name().to_string_lossy().starts_with("assemble-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale && tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Purge attempts after which an orphan (e.g. whose storage backend is no
+/// longer registered) is given up on rather than retried every pass.
+const ORPHAN_PURGE_MAX_ATTEMPTS: i32 = 24;
+
+impl UploadService {
+    async fn record_orphan_purge_failure(db: &PgPool, session_id: Uuid, error: &str) {
+        let attempts: Option<i32> = sqlx::query_scalar(
+            "UPDATE upload_staging_orphans \
+             SET attempts = attempts + 1, last_error = $2 \
+             WHERE session_id = $1 RETURNING attempts",
+        )
+        .bind(session_id)
+        .bind(error)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        if attempts == Some(ORPHAN_PURGE_MAX_ATTEMPTS) {
+            tracing::error!(
+                session = %session_id,
+                error = %error,
+                "giving up purging staged upload chunks after {ORPHAN_PURGE_MAX_ATTEMPTS} attempts; \
+                 the row stays in upload_staging_orphans for manual cleanup"
+            );
+        }
+    }
+}
+
+/// Chunk objects one reaper pass may delete before yielding to the next tick.
+const STAGING_PURGE_OBJECT_BUDGET: i64 = 50_000;
+
+/// Concurrent deletes per session purge.
+const STAGING_PURGE_CONCURRENCY: usize = 16;
+
+/// A verified, reassembled upload on this replica's local disk. The file is
+/// removed when this is dropped, so no path (success, error, panic) can leave
+/// it behind (#3922).
+#[derive(Debug)]
+pub struct AssembledUpload {
+    path: PathBuf,
+}
+
+impl AssembledUpload {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AssembledUpload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Stream every staged chunk, in order, into a scratch file while hashing it,
+/// then verify the total size and SHA256 against the session.
+async fn assemble_staged_chunks(
+    storage: &dyn StorageBackend,
+    session: &UploadSession,
+    scratch_dir: &Path,
+) -> Result<AssembledUpload, UploadError> {
+    tokio::fs::create_dir_all(scratch_dir).await?;
+    // Owned by the guard before the first write so an early return removes it.
+    let assembled = AssembledUpload {
+        path: scratch_dir.join(format!("assemble-{}-{}", session.id, Uuid::new_v4())),
+    };
+    let mut file = tokio::fs::File::create(&assembled.path).await?;
+    let mut hasher = Sha256::new();
+    let mut size: i64 = 0;
+
+    for index in 0..session.total_chunks {
+        let mut stream = storage
+            .get_stream(&staged_chunk_key(session.id, index))
+            .await
+            .map_err(storage_err)?;
+        while let Some(block) = stream.next().await {
+            let block = block.map_err(storage_err)?;
+            hasher.update(&block);
+            file.write_all(&block).await?;
+            size += block.len() as i64;
+        }
+    }
+    file.flush().await?;
+    file.sync_data().await?;
+    drop(file);
+
+    if size != session.total_size {
+        return Err(UploadError::SizeMismatch {
+            expected: session.total_size,
+            actual: size,
+        });
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != session.checksum_sha256 {
+        return Err(UploadError::ChecksumMismatch {
+            expected: session.checksum_sha256.clone(),
+            actual,
+        });
+    }
+    Ok(assembled)
+}
+
+/// Delete a session's staged chunk objects; an already-missing one is fine.
+async fn delete_staged_chunk_objects(
+    storage: &dyn StorageBackend,
+    session_id: Uuid,
+    total_chunks: i32,
+) -> Result<(), UploadError> {
+    let mut deletes = futures::stream::iter(0..total_chunks)
+        .map(|index| async move { storage.delete(&staged_chunk_key(session_id, index)).await })
+        .buffer_unordered(STAGING_PURGE_CONCURRENCY);
+    while let Some(result) = deletes.next().await {
+        match result {
+            Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+            Err(e) => return Err(storage_err(e)),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Compute SHA256 of a file by streaming in 64 KB blocks.
-async fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; SHA256_BUF_SIZE];
-
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
 
 /// Normalize an optional artifact metadata field for persistence: treat an
 /// empty string the same as an absent value so peer replication and regular
@@ -1459,14 +1833,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_buf_size() {
-        assert_eq!(SHA256_BUF_SIZE, 64 * 1024);
-        // Buffer should be a reasonable size, not too small, not too large
-        assert!(SHA256_BUF_SIZE >= 4096);
-        assert!(SHA256_BUF_SIZE <= 1024 * 1024);
-    }
-
-    #[test]
     fn test_default_chunk_size_is_8mb() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 8 * 1024 * 1024);
     }
@@ -1553,43 +1919,69 @@ mod tests {
     // Temp file path construction
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_temp_dir_path_construction() {
-        let storage_path = "/data/artifact-storage";
-        let temp_dir = PathBuf::from(storage_path).join(".uploads");
-        assert_eq!(temp_dir, PathBuf::from("/data/artifact-storage/.uploads"));
+    #[tokio::test]
+    async fn stale_assembly_scratch_is_swept_and_fresh_is_kept() {
+        let dir = std::env::temp_dir().join(format!("ak-scratch-sweep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("assemble-stale");
+        let fresh = dir.join("assemble-fresh");
+        let other = dir.join("not-a-scratch-file");
+        for p in [&stale, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 3600);
+        for p in [&stale, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        assert_eq!(sweep_stale_assembly_scratch(&dir).await, 1);
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "an in-flight completion's file is kept");
+        assert!(other.exists(), "only assembly scratch files are touched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_temp_file_path_contains_session_id() {
-        let storage_path = "/data/storage";
+    fn test_staged_chunk_key_is_derived_from_session_and_index() {
         let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let temp_dir = PathBuf::from(storage_path).join(".uploads");
-        let temp_file_path = temp_dir.join(session_id.to_string());
         assert_eq!(
-            temp_file_path,
-            PathBuf::from("/data/storage/.uploads/550e8400-e29b-41d4-a716-446655440000")
+            staging_prefix(session_id),
+            "upload-staging/550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            staged_chunk_key(session_id, 7),
+            "upload-staging/550e8400-e29b-41d4-a716-446655440000/00000007"
         );
     }
 
     #[test]
-    fn test_temp_dir_is_hidden_directory() {
-        let storage_path = "/data/storage";
-        let temp_dir = PathBuf::from(storage_path).join(".uploads");
-        let dir_name = temp_dir.file_name().unwrap().to_str().unwrap();
-        assert!(
-            dir_name.starts_with('.'),
-            "temp dir should be hidden (dot-prefixed)"
-        );
-    }
-
-    #[test]
-    fn test_temp_file_path_with_trailing_slash_storage() {
-        let storage_path = "/data/storage/";
+    fn test_staged_chunk_keys_sort_in_assembly_order() {
         let session_id = Uuid::new_v4();
-        let temp_dir = PathBuf::from(storage_path).join(".uploads");
-        let temp_file_path = temp_dir.join(session_id.to_string());
-        assert!(temp_file_path.to_string_lossy().contains(".uploads/"));
+        let mut keys: Vec<String> = [10, 2, 100, 0]
+            .iter()
+            .map(|i| staged_chunk_key(session_id, *i))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [0, 2, 10, 100]
+                .iter()
+                .map(|i| staged_chunk_key(session_id, *i))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_staging_keys_never_collide_with_content_addressed_keys() {
+        // Content keys are `<hash[:2]>/<hash[2:4]>/<hash>`: a two-hex-char
+        // first segment. The staging prefix can never be one.
+        let key = staged_chunk_key(Uuid::new_v4(), 0);
+        let first = key.split('/').next().unwrap();
+        assert!(first.len() > 2, "{key}");
     }
 
     // -----------------------------------------------------------------------
@@ -1774,6 +2166,8 @@ mod tests {
             error_message: None,
             state_token: None,
             committing_expires_at: None,
+            staged_in_storage: true,
+            staging_purged_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -1811,6 +2205,8 @@ mod tests {
             error_message: Some("test error".into()),
             state_token: None,
             committing_expires_at: None,
+            staged_in_storage: true,
+            staging_purged_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -1819,72 +2215,6 @@ mod tests {
         assert_eq!(session.id, cloned.id);
         assert_eq!(session.repository_key, cloned.repository_key);
         assert_eq!(session.error_message, cloned.error_message);
-    }
-
-    // -----------------------------------------------------------------------
-    // compute_file_sha256 (async, uses real temp files)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_compute_file_sha256_known_content() {
-        // SHA256 of "hello world\n" is well-known
-        let dir = std::env::temp_dir().join("ak_upload_test");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("sha256_test_known.bin");
-        tokio::fs::write(&path, b"hello world\n").await.unwrap();
-
-        let hash = compute_file_sha256(&path).await.unwrap();
-        // sha256sum of "hello world\n"
-        assert_eq!(
-            hash,
-            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
-        );
-
-        tokio::fs::remove_file(&path).await.ok();
-    }
-
-    #[tokio::test]
-    async fn test_compute_file_sha256_empty_file() {
-        let dir = std::env::temp_dir().join("ak_upload_test");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("sha256_test_empty.bin");
-        tokio::fs::write(&path, b"").await.unwrap();
-
-        let hash = compute_file_sha256(&path).await.unwrap();
-        // SHA256 of empty input
-        assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-
-        tokio::fs::remove_file(&path).await.ok();
-    }
-
-    #[tokio::test]
-    async fn test_compute_file_sha256_large_file() {
-        // Create a file larger than SHA256_BUF_SIZE (64 KB) to exercise the loop
-        let dir = std::env::temp_dir().join("ak_upload_test");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("sha256_test_large.bin");
-
-        let data = vec![0xABu8; 128 * 1024]; // 128 KB of 0xAB
-        tokio::fs::write(&path, &data).await.unwrap();
-
-        let hash = compute_file_sha256(&path).await.unwrap();
-        // Verify by computing with the same hasher inline
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        let expected = format!("{:x}", hasher.finalize());
-        assert_eq!(hash, expected);
-
-        tokio::fs::remove_file(&path).await.ok();
-    }
-
-    #[tokio::test]
-    async fn test_compute_file_sha256_nonexistent_file() {
-        let path = PathBuf::from("/tmp/ak_upload_test/nonexistent_file_12345.bin");
-        let result = compute_file_sha256(&path).await;
-        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -2277,13 +2607,12 @@ mod tests {
         };
         let (user_id, _username) = tdh::create_user(&pool).await;
         let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
-        let storage_path = storage_dir.to_string_lossy().into_owned();
+        let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_dir);
 
         // Small single-chunk session (default 8 MB chunk >= 4 KiB total).
         let total_size: i64 = 4096;
         let session = UploadService::create_session(CreateSessionParams {
             db: &pool,
-            storage_path: &storage_path,
             user_id,
             repo_id,
             repo_key: &repo_key,
@@ -2309,8 +2638,8 @@ mod tests {
 
         // Fire the SAME chunk (index 0) as two concurrent uploads.
         let (a, b) = tokio::join!(
-            UploadService::upload_chunk(&pool, session.id, 0, 0, data.clone(), user_id),
-            UploadService::upload_chunk(&pool, session.id, 0, 0, data.clone(), user_id),
+            UploadService::upload_chunk(&pool, &storage, session.id, 0, 0, data.clone(), user_id),
+            UploadService::upload_chunk(&pool, &storage, session.id, 0, 0, data.clone(), user_id),
         );
 
         // Neither request may abort with a terminal InvalidChunk (HTTP 400).
@@ -2349,7 +2678,7 @@ mod tests {
         );
 
         // A subsequent request for the already-completed chunk is idempotent.
-        let again = UploadService::upload_chunk(&pool, session.id, 0, 0, data, user_id)
+        let again = UploadService::upload_chunk(&pool, &storage, session.id, 0, 0, data, user_id)
             .await
             .expect("idempotent replay of a completed chunk");
         assert_eq!(again.chunk_index, 0);
@@ -2362,59 +2691,104 @@ mod tests {
     // Completion lease (Tier-2: no-op without DATABASE_URL)
     // -----------------------------------------------------------------------
 
+    const LEASE_PAYLOAD: &[u8] = b"completion-lease-test-bytes";
+
     struct LeaseFixture {
         pool: PgPool,
         user_id: Uuid,
         repo_id: Uuid,
         session_id: Uuid,
-        temp_path: PathBuf,
+        /// The repository's backend: the shared staging store (#3918).
+        storage: crate::storage::filesystem::FilesystemStorage,
+        storage_dir: PathBuf,
+        /// This "replica's" local scratch dir for completion assembly.
+        scratch_dir: PathBuf,
     }
 
-    /// Session whose temp file exists on disk with a matching size/checksum,
-    /// so `complete_session` can run its verification steps for real.
+    impl LeaseFixture {
+        fn chunk_key(&self) -> String {
+            staged_chunk_key(self.session_id, 0)
+        }
+
+        async fn chunk_staged(&self) -> bool {
+            self.storage
+                .exists(&self.chunk_key())
+                .await
+                .expect("exists")
+        }
+
+        fn registry(&self) -> crate::storage::StorageRegistry {
+            crate::storage::StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            )
+        }
+    }
+
+    /// A one-chunk session whose chunk is already staged in the repository's
+    /// storage backend with a matching size/checksum, so the completion can
+    /// run its assembly and verification steps for real.
     async fn setup_lease_fixture() -> Option<LeaseFixture> {
         use crate::api::handlers::test_db_helpers as tdh;
         let pool = tdh::try_pool().await?;
         let (user_id, _username) = tdh::create_user(&pool).await;
-        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_dir);
 
-        let payload: &[u8] = b"completion-lease-test-bytes";
         let mut hasher = Sha256::new();
-        hasher.update(payload);
+        hasher.update(LEASE_PAYLOAD);
         let checksum = hex::encode(hasher.finalize());
 
-        let dir = std::env::temp_dir().join("ak_upload_lease_test");
-        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
-        let temp_path = dir.join(format!("lease-{}", Uuid::new_v4()));
-        tokio::fs::write(&temp_path, payload).await.expect("write");
-
-        let session_id: Uuid = sqlx::query_scalar(
+        let session_id = Uuid::new_v4();
+        sqlx::query(
             r#"
             INSERT INTO upload_sessions
-                (user_id, repository_id, repository_key, artifact_path,
+                (id, user_id, repository_id, repository_key, artifact_path,
                  total_size, chunk_size, total_chunks, completed_chunks,
-                 bytes_received, checksum_sha256, temp_file_path, status)
-            VALUES ($1, $2, $3, 'lease-test/file.bin',
-                    $4, 1048576, 1, 1, $4, $5, $6, 'in_progress')
-            RETURNING id
+                 bytes_received, checksum_sha256, temp_file_path, status,
+                 staged_in_storage, staging_storage_backend, staging_storage_path)
+            SELECT $1, $2, $3, $4, 'lease-test/file.bin',
+                   $5, 1048576, 1, 1, $5, $6, $7, 'in_progress', TRUE,
+                   r.storage_backend, r.storage_path
+            FROM repositories r WHERE r.id = $3
             "#,
         )
+        .bind(session_id)
         .bind(user_id)
         .bind(repo_id)
         .bind(&repo_key)
-        .bind(payload.len() as i64)
+        .bind(LEASE_PAYLOAD.len() as i64)
         .bind(&checksum)
-        .bind(&*temp_path.to_string_lossy())
-        .fetch_one(&pool)
+        .bind(staging_prefix(session_id))
+        .execute(&pool)
         .await
         .expect("insert session");
+        sqlx::query(
+            "INSERT INTO upload_chunks \
+                 (session_id, chunk_index, byte_offset, byte_length, status) \
+             VALUES ($1, 0, 0, $2, 'completed')",
+        )
+        .bind(session_id)
+        .bind(LEASE_PAYLOAD.len() as i32)
+        .execute(&pool)
+        .await
+        .expect("insert chunk row");
+        storage
+            .put(
+                &staged_chunk_key(session_id, 0),
+                bytes::Bytes::from_static(LEASE_PAYLOAD),
+            )
+            .await
+            .expect("stage chunk");
 
         Some(LeaseFixture {
             pool,
             user_id,
             repo_id,
             session_id,
-            temp_path,
+            storage,
+            storage_dir,
+            scratch_dir: std::env::temp_dir().join(format!("ak-upload-scratch-{session_id}")),
         })
     }
 
@@ -2425,7 +2799,20 @@ mod tests {
             .execute(&f.pool)
             .await;
         tdh::cleanup(&f.pool, f.repo_id, f.user_id).await;
-        let _ = tokio::fs::remove_file(&f.temp_path).await;
+        let _ = tokio::fs::remove_dir_all(&f.storage_dir).await;
+        let _ = tokio::fs::remove_dir_all(&f.scratch_dir).await;
+    }
+
+    /// Files left in a replica's scratch dir (none may survive a request).
+    async fn scratch_files(dir: &Path) -> usize {
+        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+            return 0;
+        };
+        let mut n = 0;
+        while let Ok(Some(_)) = rd.next_entry().await {
+            n += 1;
+        }
+        n
     }
 
     async fn session_status(pool: &PgPool, id: Uuid) -> String {
@@ -2542,73 +2929,89 @@ mod tests {
         teardown_lease_fixture(&f).await;
     }
 
-    /// Missing temp file after claiming the commit lease is retryable: the
-    /// session returns to `in_progress` instead of waiting out the full TTL.
+    /// A staged chunk missing after claiming the commit lease is retryable:
+    /// the session returns to `in_progress` instead of waiting out the TTL.
     #[tokio::test]
-    async fn complete_session_releases_lease_when_temp_file_missing() {
+    async fn assemble_releases_lease_when_a_staged_chunk_is_missing() {
         let Some(f) = setup_lease_fixture().await else {
             return;
         };
-        tokio::fs::remove_file(&f.temp_path)
-            .await
-            .expect("remove temp file");
+        f.storage.delete(&f.chunk_key()).await.expect("drop chunk");
 
-        let err = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
             .await
-            .expect_err("missing file should fail verification");
-        assert!(matches!(err, UploadError::Io(_)), "got {err:?}");
+            .expect("claim");
+        let err = UploadService::assemble_for_commit(&f.pool, &f.storage, &session, &f.scratch_dir)
+            .await
+            .expect_err("a missing staged chunk must fail assembly");
+        assert!(matches!(err, UploadError::Storage(_)), "got {err:?}");
 
         let (status, token, expires) = session_claim_state(&f.pool, f.session_id).await;
         assert_eq!(status, "in_progress");
-        assert!(token.is_none(), "retryable IO failure must clear token");
+        assert!(
+            token.is_none(),
+            "retryable storage failure must clear token"
+        );
         assert!(
             expires.is_none(),
-            "retryable IO failure must clear deadline"
+            "retryable storage failure must clear deadline"
+        );
+        assert_eq!(
+            scratch_files(&f.scratch_dir).await,
+            0,
+            "no partial assembly left"
         );
 
         teardown_lease_fixture(&f).await;
     }
 
-    /// A local read error during checksum streaming is also retryable and must
-    /// release the commit lease immediately.
+    /// #3922: a completion that fails terminally (checksum mismatch) leaves no
+    /// assembled file on the replica, fails the session, and the reaper then
+    /// reclaims the staged chunk objects and records the purge.
     #[tokio::test]
-    async fn complete_session_releases_lease_when_checksum_read_fails() {
+    async fn failed_completion_leaves_no_scratch_file_and_reaper_purges_staging() {
         let Some(f) = setup_lease_fixture().await else {
             return;
         };
-
-        let bad_dir = std::env::temp_dir().join(format!("ak-upload-bad-dir-{}", f.session_id));
-        tokio::fs::create_dir_all(&bad_dir).await.expect("mkdir");
-        let dir_size = tokio::fs::metadata(&bad_dir)
+        // Same length, different bytes: assembles fine, checksum mismatches.
+        let corrupt = vec![b'x'; LEASE_PAYLOAD.len()];
+        f.storage
+            .put(&f.chunk_key(), bytes::Bytes::from(corrupt))
             .await
-            .expect("dir metadata")
-            .len() as i64;
-        sqlx::query(
-            "UPDATE upload_sessions \
-             SET temp_file_path = $2, total_size = $3, bytes_received = $3 \
-             WHERE id = $1",
-        )
-        .bind(f.session_id)
-        .bind(&*bad_dir.to_string_lossy())
-        .bind(dir_size)
-        .execute(&f.pool)
-        .await
-        .expect("point session at unreadable temp path");
+            .expect("corrupt chunk");
 
-        let err = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
             .await
-            .expect_err("directory checksum read should fail");
-        assert!(matches!(err, UploadError::Io(_)), "got {err:?}");
-
-        let (status, token, expires) = session_claim_state(&f.pool, f.session_id).await;
-        assert_eq!(status, "in_progress");
-        assert!(token.is_none(), "retryable IO failure must clear token");
+            .expect("claim");
+        let err = UploadService::assemble_for_commit(&f.pool, &f.storage, &session, &f.scratch_dir)
+            .await
+            .expect_err("checksum mismatch");
         assert!(
-            expires.is_none(),
-            "retryable IO failure must clear deadline"
+            matches!(err, UploadError::ChecksumMismatch { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(session_status(&f.pool, f.session_id).await, "failed");
+        assert_eq!(
+            scratch_files(&f.scratch_dir).await,
+            0,
+            "the assembled scratch file must not outlive a failed completion"
         );
 
-        let _ = tokio::fs::remove_dir_all(&bad_dir).await;
+        UploadService::cleanup_expired(&f.pool, &f.registry())
+            .await
+            .expect("reaper ok");
+        assert!(
+            !f.chunk_staged().await,
+            "the reaper must delete a failed session's staged chunks"
+        );
+        let purged: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT staging_purged_at FROM upload_sessions WHERE id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("purge marker");
+        assert!(purged.is_some(), "the purge must be recorded");
+
         teardown_lease_fixture(&f).await;
     }
 
@@ -2675,13 +3078,17 @@ mod tests {
         .await
         .expect("age session");
 
-        UploadService::cleanup_expired(&f.pool)
+        UploadService::cleanup_expired(&f.pool, &f.registry())
             .await
             .expect("cleanup ok");
         assert_eq!(
             session_status(&f.pool, f.session_id).await,
             "committing",
             "reaper must not cancel a session with a live commit lease"
+        );
+        assert!(
+            f.chunk_staged().await,
+            "reaper must not purge chunks a live committer is reading"
         );
 
         // Once the lease lapses the reaper may cancel it.
@@ -2693,10 +3100,14 @@ mod tests {
         .execute(&f.pool)
         .await
         .expect("expire lease");
-        UploadService::cleanup_expired(&f.pool)
+        UploadService::cleanup_expired(&f.pool, &f.registry())
             .await
             .expect("cleanup ok");
         assert_eq!(session_status(&f.pool, f.session_id).await, "cancelled");
+        assert!(
+            !f.chunk_staged().await,
+            "an expired session's staged chunks are reclaimed (#3922)"
+        );
 
         let _ = session;
         teardown_lease_fixture(&f).await;
@@ -2721,8 +3132,8 @@ mod tests {
             "cancel must conflict with a live commit lease, got {denied:?}"
         );
         assert!(
-            tokio::fs::try_exists(&f.temp_path).await.unwrap_or(false),
-            "a denied cancel must not delete the temp file"
+            f.chunk_staged().await,
+            "a denied cancel must not delete the staged chunks"
         );
         assert_eq!(session_status(&f.pool, f.session_id).await, "committing");
 
@@ -2759,6 +3170,7 @@ mod tests {
 
         let refused = UploadService::upload_chunk(
             &f.pool,
+            &f.storage,
             f.session_id,
             0,
             0,
@@ -2777,6 +3189,7 @@ mod tests {
         assert_eq!(session_status(&f.pool, f.session_id).await, "in_progress");
         let after_release = UploadService::upload_chunk(
             &f.pool,
+            &f.storage,
             f.session_id,
             0,
             0,
@@ -2809,6 +3222,7 @@ mod tests {
 
         let refused = UploadService::upload_chunk(
             &f.pool,
+            &f.storage,
             f.session_id,
             0,
             0,
@@ -2878,20 +3292,551 @@ mod tests {
         .await
         .expect("expire lease");
 
-        UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
+        let to_purge = UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
             .await
-            .expect("cancel must reclaim an expired commit lease");
+            .expect("cancel must reclaim an expired commit lease")
+            .expect("a staged session is handed back for purging");
         assert_eq!(session_status(&f.pool, f.session_id).await, "cancelled");
+        UploadService::purge_staged_chunks(&f.pool, &f.storage, to_purge.id, to_purge.total_chunks)
+            .await
+            .expect("purge");
         assert!(
-            !tokio::fs::try_exists(&f.temp_path).await.unwrap_or(true),
-            "a successful cancel removes the temp file"
+            !f.chunk_staged().await,
+            "a successful cancel reclaims the staged chunks"
         );
 
-        // Repeated cancel is an idempotent no-op.
-        UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
+        let again = UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
             .await
             .expect("cancel of a cancelled session is a no-op");
+        assert!(again.is_none(), "nothing left to purge on a repeat cancel");
 
         teardown_lease_fixture(&f).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-replica staging (#3918)
+    // -----------------------------------------------------------------------
+
+    /// One replica's view of the world: its own storage-backend client (no
+    /// in-process state shared with any other replica) and its own local
+    /// scratch disk. What replicas share is Postgres and the object store.
+    struct Replica {
+        storage: crate::storage::filesystem::FilesystemStorage,
+        scratch_dir: PathBuf,
+    }
+
+    impl Replica {
+        fn new(shared_store: &Path) -> Self {
+            Self {
+                storage: crate::storage::filesystem::FilesystemStorage::new(shared_store),
+                scratch_dir: std::env::temp_dir()
+                    .join(format!("ak-upload-replica-{}", Uuid::new_v4())),
+            }
+        }
+    }
+
+    async fn create_two_chunk_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        repo_id: Uuid,
+        repo_key: &str,
+        payload: &[u8],
+    ) -> UploadSession {
+        let checksum = hex::encode(Sha256::digest(payload));
+        UploadService::create_session(CreateSessionParams {
+            db: pool,
+            user_id,
+            repo_id,
+            repo_key,
+            artifact_path: "multi-replica/blob.bin",
+            artifact_name: None,
+            artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
+            is_replication: false,
+            total_size: payload.len() as i64,
+            max_upload_size: 0,
+            chunk_size: Some(MIN_CHUNK_SIZE as i32),
+            checksum_sha256: &checksum,
+            content_type: None,
+        })
+        .await
+        .expect("create session")
+    }
+
+    /// #3918: a session started on replica A — which then disappears together
+    /// with its local disk — accepts its remaining chunk on replica B and
+    /// completes on replica B with the exact bytes. Before the fix the first
+    /// chunk lived in `<A's STORAGE_PATH>/.uploads/<id>`, so B's PATCH and
+    /// completion failed with `I/O error`.
+    #[tokio::test]
+    async fn chunked_session_started_on_one_replica_completes_on_another() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, shared_store) = tdh::create_repo(&pool, "local", "generic").await;
+        let replica_a = Replica::new(&shared_store);
+        let replica_b = Replica::new(&shared_store);
+
+        let chunk = MIN_CHUNK_SIZE as usize;
+        let payload: Vec<u8> = (0..chunk + 4099).map(|i| (i % 251) as u8).collect();
+        let session = create_two_chunk_session(&pool, user_id, repo_id, &repo_key, &payload).await;
+        assert!(session.staged_in_storage);
+        assert_eq!(session.total_chunks, 2);
+
+        // Chunk 0 lands on replica A.
+        UploadService::upload_chunk(
+            &pool,
+            &replica_a.storage,
+            session.id,
+            0,
+            0,
+            bytes::Bytes::copy_from_slice(&payload[..chunk]),
+            user_id,
+        )
+        .await
+        .expect("chunk 0 on replica A");
+        // Replica A is evicted: its per-pod disk is gone.
+        let _ = tokio::fs::remove_dir_all(&replica_a.scratch_dir).await;
+        drop(replica_a);
+
+        // Chunk 1 and the completion land on replica B.
+        let progress = UploadService::upload_chunk(
+            &pool,
+            &replica_b.storage,
+            session.id,
+            1,
+            chunk as i64,
+            bytes::Bytes::copy_from_slice(&payload[chunk..]),
+            user_id,
+        )
+        .await
+        .expect("chunk 1 on replica B");
+        assert_eq!(progress.chunks_remaining, 0);
+        assert_eq!(progress.bytes_received, payload.len() as i64);
+
+        let claimed = UploadService::complete_session(&pool, session.id, user_id)
+            .await
+            .expect("complete on replica B");
+        let assembled = UploadService::assemble_for_commit(
+            &pool,
+            &replica_b.storage,
+            &claimed,
+            &replica_b.scratch_dir,
+        )
+        .await
+        .expect("assemble on replica B");
+        let bytes = tokio::fs::read(assembled.path())
+            .await
+            .expect("read assembled");
+        assert_eq!(bytes, payload, "assembled file must be the uploaded bytes");
+        let scratch_path = assembled.path().to_path_buf();
+        drop(assembled);
+        assert!(
+            !scratch_path.exists(),
+            "the scratch copy is removed when the completion is done"
+        );
+
+        assert!(UploadService::finalize_completed(&pool, &claimed)
+            .await
+            .expect("finalize"));
+        UploadService::purge_staged_chunks(&pool, &replica_b.storage, session.id, 2)
+            .await
+            .expect("purge");
+        for i in 0..2 {
+            assert!(
+                !replica_b
+                    .storage
+                    .exists(&staged_chunk_key(session.id, i))
+                    .await
+                    .expect("exists"),
+                "chunk {i} must be purged after completion"
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = tokio::fs::remove_dir_all(&shared_store).await;
+        let _ = tokio::fs::remove_dir_all(&replica_b.scratch_dir).await;
+    }
+
+    /// Chunks are staged as separate objects and concatenated in index
+    /// order, so one that does not cover exactly its placeholder's range is
+    /// refused rather than staged into a corrupt assembly.
+    #[tokio::test]
+    async fn misaligned_chunk_is_rejected_and_nothing_is_staged() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_chunks SET status = 'pending' WHERE session_id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reopen chunk");
+        f.storage.delete(&f.chunk_key()).await.expect("unstage");
+
+        let short = UploadService::upload_chunk(
+            &f.pool,
+            &f.storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(b"short"),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(short, Err(UploadError::InvalidChunk(_))),
+            "got {short:?}"
+        );
+        assert!(!f.chunk_staged().await, "a rejected chunk stages nothing");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A session created by an older server version has its bytes on one
+    /// replica's local disk; it is refused with a clear message rather than
+    /// failing later with an opaque I/O error.
+    #[tokio::test]
+    async fn legacy_local_disk_session_is_refused_clearly() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_sessions SET staged_in_storage = FALSE WHERE id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("mark legacy");
+
+        let chunk = UploadService::upload_chunk(
+            &f.pool,
+            &f.storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(LEASE_PAYLOAD),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(chunk, Err(UploadError::LegacySession)),
+            "got {chunk:?}"
+        );
+        let complete = UploadService::complete_session(&f.pool, f.session_id, f.user_id).await;
+        assert!(
+            matches!(complete, Err(UploadError::LegacySession)),
+            "got {complete:?}"
+        );
+        assert_eq!(session_status(&f.pool, f.session_id).await, "in_progress");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Review follow-ups (S1-S3)
+    // -----------------------------------------------------------------------
+
+    /// Filesystem-backed storage with scripted interference: on `put` it can
+    /// cancel the session (a cancel landing mid-PATCH), and `delete` can be
+    /// made to fail (a storage outage during the reaper's purge).
+    struct ScriptedStorage {
+        inner: crate::storage::filesystem::FilesystemStorage,
+        cancel_on_put: Option<(PgPool, Uuid)>,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for ScriptedStorage {
+        async fn put(&self, key: &str, content: bytes::Bytes) -> crate::error::Result<()> {
+            self.inner.put(key, content).await?;
+            if let Some((pool, id)) = &self.cancel_on_put {
+                sqlx::query("UPDATE upload_sessions SET status = 'cancelled' WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .expect("cancel mid-put");
+            }
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<bytes::Bytes> {
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage("scripted outage".into()));
+            }
+            self.inner.delete(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    /// S1: a cancel that lands while a PATCH is storing its chunk must not
+    /// leave that chunk behind (the cancel's purge has already run or will
+    /// never see it) nor bump the cancelled session's counters.
+    #[tokio::test]
+    async fn chunk_stored_while_the_session_is_cancelled_is_removed() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_chunks SET status = 'pending' WHERE session_id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reopen chunk");
+        sqlx::query("UPDATE upload_sessions SET completed_chunks = 0 WHERE id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reset counter");
+        f.storage.delete(&f.chunk_key()).await.expect("unstage");
+
+        let storage = ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: Some((f.pool.clone(), f.session_id)),
+            fail_delete: Default::default(),
+        };
+        let result = UploadService::upload_chunk(
+            &f.pool,
+            &storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(LEASE_PAYLOAD),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UploadError::InvalidStatus(ref s)) if s == "cancelled"),
+            "got {result:?}"
+        );
+        assert!(
+            !f.chunk_staged().await,
+            "the orphaned chunk must be deleted"
+        );
+        let completed: i32 =
+            sqlx::query_scalar("SELECT completed_chunks FROM upload_sessions WHERE id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("counter");
+        assert_eq!(completed, 0, "a cancelled session's counters stay put");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// Review nit 5: when the refused chunk's delete also fails, the session
+    /// is queued in `upload_staging_orphans` and the reaper purges it later.
+    #[tokio::test]
+    async fn refused_chunk_whose_delete_fails_is_queued_for_the_reaper() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE upload_chunks SET status = 'pending' WHERE session_id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("reopen chunk");
+        f.storage.delete(&f.chunk_key()).await.expect("unstage");
+
+        let storage = ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: Some((f.pool.clone(), f.session_id)),
+            fail_delete: std::sync::atomic::AtomicBool::new(true),
+        };
+        let result = UploadService::upload_chunk(
+            &f.pool,
+            &storage,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(LEASE_PAYLOAD),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UploadError::InvalidStatus(ref s)) if s == "cancelled"),
+            "got {result:?}"
+        );
+        assert!(
+            f.chunk_staged().await,
+            "the delete failed, so the chunk is still there"
+        );
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(queued, 1, "the leaked chunk must be queued for the reaper");
+
+        UploadService::cleanup_expired(&f.pool, &f.registry())
+            .await
+            .expect("reaper ok");
+        assert!(
+            !f.chunk_staged().await,
+            "the reaper purges the queued chunk"
+        );
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(left, 0, "the orphan row is consumed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// S2: the reaper stamps `staging_purged_at` only after the deletes
+    /// succeeded, so a storage failure leaves the session to be retried.
+    #[tokio::test]
+    async fn reaper_does_not_mark_purged_when_the_delete_fails() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        const FLAKY: &str = "flaky-staging-test";
+        let flaky = std::sync::Arc::new(ScriptedStorage {
+            inner: crate::storage::filesystem::FilesystemStorage::new(&f.storage_dir),
+            cancel_on_put: None,
+            fail_delete: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut backends: std::collections::HashMap<String, std::sync::Arc<dyn StorageBackend>> =
+            std::collections::HashMap::new();
+        backends.insert(FLAKY.to_string(), flaky.clone());
+        let registry = crate::storage::StorageRegistry::new(backends, FLAKY.to_string());
+        sqlx::query(
+            "UPDATE upload_sessions SET status = 'failed', staging_storage_backend = $2 \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .bind(FLAKY)
+        .execute(&f.pool)
+        .await
+        .expect("fail session on the flaky backend");
+
+        UploadService::cleanup_expired(&f.pool, &registry)
+            .await
+            .expect("reaper ok");
+        let purged: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT staging_purged_at FROM upload_sessions WHERE id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("marker");
+        assert!(purged.is_none(), "a failed purge must stay retryable");
+        assert!(f.chunk_staged().await);
+
+        flaky
+            .fail_delete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        UploadService::cleanup_expired(&f.pool, &registry)
+            .await
+            .expect("reaper ok");
+        assert!(!f.chunk_staged().await, "the retry purges the chunks");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// S3: a repository delete cascades the session row away; the trigger
+    /// records its staged chunks and the reaper still purges them.
+    #[tokio::test]
+    async fn staged_chunks_are_purged_after_a_repository_delete_cascade() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete repository (cascades upload_sessions)");
+        let orphaned: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(orphaned, 1, "the cascade must record the staged chunks");
+
+        UploadService::cleanup_expired(&f.pool, &f.registry())
+            .await
+            .expect("reaper ok");
+        assert!(!f.chunk_staged().await, "orphaned staged chunks are purged");
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_staging_orphans WHERE session_id = $1")
+                .bind(f.session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(left, 0);
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// Review nit 4: an orphan whose storage backend is gone is not retried
+    /// every pass forever; it is given up on after the attempt cap.
+    #[tokio::test]
+    async fn orphan_purge_gives_up_after_the_attempt_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        assert_eq!(
+            ORPHAN_PURGE_MAX_ATTEMPTS, 24,
+            "keep the SQL literal in step"
+        );
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO upload_staging_orphans \
+                 (session_id, total_chunks, storage_backend, storage_path, attempts) \
+             VALUES ($1, 1, 'backend-that-was-removed', '', 22)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("orphan");
+        let registry = crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        );
+        let attempts = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM upload_staging_orphans WHERE session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("attempts")
+        };
+        for _ in 0..3 {
+            UploadService::cleanup_expired(&pool, &registry)
+                .await
+                .expect("reaper ok");
+        }
+        assert_eq!(
+            attempts(pool.clone()).await,
+            24,
+            "capped, not retried forever"
+        );
+        let _ = sqlx::query("DELETE FROM upload_staging_orphans WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await;
     }
 }

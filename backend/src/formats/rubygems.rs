@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
@@ -1138,18 +1139,304 @@ pub fn marshal_quick_spec(spec: &GemSpec) -> Vec<u8> {
 /// `[name, Gem::Version(version), platform]` triples. The returned bytes are a
 /// Ruby Marshal 4.8 stream (leading `\x04\x08`), ready to be gzipped and served
 /// as `specs.4.8.gz` / `latest_specs.4.8.gz` / `prerelease_specs.4.8.gz`.
-pub fn marshal_specs_index(specs: &[(String, String, String)]) -> Vec<u8> {
+pub fn marshal_specs_index<S: AsRef<str>>(specs: &[(S, S, S)]) -> Vec<u8> {
     let mut w = MarshalWriter::new();
     w.out.push(b'['); // outer array
     w.write_long(specs.len() as i64);
     for (name, version, platform) in specs {
         w.out.push(b'['); // triple
         w.write_long(3);
-        w.write_utf8_string(name);
-        w.write_gem_version(version);
-        w.write_utf8_string(platform);
+        w.write_utf8_string(name.as_ref());
+        w.write_gem_version(version.as_ref());
+        w.write_utf8_string(platform.as_ref());
     }
     w.out
+}
+
+// ---------------------------------------------------------------------------
+// Ruby Marshal 4.8 decoding for an upstream specs index (#4280)
+// ---------------------------------------------------------------------------
+//
+// A virtual repository that mixes hosted and remote members has to merge the
+// upstream `specs.4.8.gz` with its hosted gems, so it has to read the upstream
+// Marshal stream. rubygems.org generates that stream with `Marshal.dump`, which
+// emits `@` object links for repeated objects: the shared `"ruby"` platform
+// String and the interned `Gem::Version` instances (`Gem::Version.new` caches
+// by version string). The reader therefore keeps Ruby's object table in the
+// same order `r_entry` fills it. Arrays, hashes and user-marshal objects take
+// their slot BEFORE their children are read; strings, floats and bignums take
+// it after.
+
+/// One `(name, version, platform)` entry of a specs index. `Arc<str>` lets an
+/// `@` object link (the shared `"ruby"` platform, an interned `Gem::Version`)
+/// reuse the first allocation instead of copying the string per entry.
+pub type SpecEntry = (Arc<str>, Arc<str>, Arc<str>);
+
+/// Nesting limit for the Marshal reader. A specs index nests four levels
+/// (outer array, triple, `Gem::Version`, its dump array); anything much deeper
+/// is not a specs index and must not recurse unbounded.
+const MARSHAL_MAX_DEPTH: usize = 32;
+
+/// A decoded Marshal value, limited to what a specs index can contain.
+#[derive(Debug, Clone)]
+enum MarshalValue {
+    Str(Arc<str>),
+    Version(Arc<str>),
+    Array(Vec<MarshalValue>),
+    /// Anything else (nil, booleans, integers, symbols, hashes, floats,
+    /// non-`Gem::Version` user objects). Valid Marshal, but never a field the
+    /// specs index needs.
+    Other,
+}
+
+/// An object-table slot. Only strings and versions are ever the target of a
+/// link a specs index needs; other slots keep their position so later link
+/// indices stay aligned with Ruby's numbering.
+#[derive(Clone)]
+enum MarshalObject {
+    Str(Arc<str>),
+    Version(Arc<str>),
+    Opaque,
+}
+
+struct MarshalReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    symbols: Vec<Arc<str>>,
+    objects: Vec<MarshalObject>,
+}
+
+impl<'a> MarshalReader<'a> {
+    fn new(data: &'a [u8]) -> std::result::Result<Self, String> {
+        if data.len() < 2 || data[0] != 0x04 || data[1] != 0x08 {
+            return Err("not a Ruby Marshal 4.8 stream".to_string());
+        }
+        Ok(Self {
+            data,
+            pos: 2,
+            symbols: Vec::new(),
+            objects: Vec::new(),
+        })
+    }
+
+    fn byte(&mut self) -> std::result::Result<u8, String> {
+        let b = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| format!("truncated Marshal stream at byte {}", self.pos))?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn bytes(&mut self, len: usize) -> std::result::Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|end| *end <= self.data.len())
+            .ok_or_else(|| format!("truncated Marshal stream at byte {}", self.pos))?;
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    /// Marshal variable-length signed integer (`r_long` in Ruby's marshal.c).
+    fn long(&mut self) -> std::result::Result<i64, String> {
+        let c = self.byte()? as i8;
+        match c {
+            0 => Ok(0),
+            5..=127 => Ok(i64::from(c) - 5),
+            -128..=-5 => Ok(i64::from(c) + 5),
+            1..=4 => {
+                let mut x: i64 = 0;
+                for i in 0..c as u32 {
+                    x |= i64::from(self.byte()?) << (8 * i);
+                }
+                Ok(x)
+            }
+            _ => {
+                // -4..=-1: a negative number in `-c` little-endian bytes.
+                let mut x: i64 = -1;
+                for i in 0..u32::from(c.unsigned_abs()) {
+                    x &= !(0xff << (8 * i));
+                    x |= i64::from(self.byte()?) << (8 * i);
+                }
+                Ok(x)
+            }
+        }
+    }
+
+    /// A non-negative length or index, bounded by the bytes left so a hostile
+    /// count cannot drive a huge allocation.
+    fn count(&mut self) -> std::result::Result<usize, String> {
+        let n = self.long()?;
+        usize::try_from(n)
+            .ok()
+            .filter(|n| *n <= self.data.len())
+            .ok_or_else(|| format!("invalid Marshal length {n} at byte {}", self.pos))
+    }
+
+    fn raw_string(&mut self) -> std::result::Result<Arc<str>, String> {
+        let len = self.count()?;
+        let raw = self.bytes(len)?;
+        Ok(Arc::from(String::from_utf8_lossy(raw).as_ref()))
+    }
+
+    fn symbol(&mut self) -> std::result::Result<Arc<str>, String> {
+        match self.byte()? {
+            b':' => {
+                let sym = self.raw_string()?;
+                self.symbols.push(sym.clone());
+                Ok(sym)
+            }
+            b';' => {
+                let idx = self.count()?;
+                self.symbols
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| format!("dangling Marshal symlink {idx}"))
+            }
+            t => Err(format!(
+                "expected a Marshal symbol, found type 0x{t:02x} at byte {}",
+                self.pos - 1
+            )),
+        }
+    }
+
+    fn reserve_slot(&mut self) -> usize {
+        self.objects.push(MarshalObject::Opaque);
+        self.objects.len() - 1
+    }
+
+    fn value(&mut self, depth: usize) -> std::result::Result<MarshalValue, String> {
+        if depth > MARSHAL_MAX_DEPTH {
+            return Err("Marshal stream nests too deeply for a specs index".to_string());
+        }
+        let at = self.pos;
+        match self.byte()? {
+            b'0' | b'T' | b'F' => Ok(MarshalValue::Other),
+            b'i' => {
+                self.long()?;
+                Ok(MarshalValue::Other)
+            }
+            b':' | b';' => {
+                self.pos -= 1;
+                self.symbol()?;
+                Ok(MarshalValue::Other)
+            }
+            b'"' => {
+                let s = self.raw_string()?;
+                self.objects.push(MarshalObject::Str(s.clone()));
+                Ok(MarshalValue::Str(s))
+            }
+            b'f' => {
+                self.raw_string()?;
+                self.objects.push(MarshalObject::Opaque);
+                Ok(MarshalValue::Other)
+            }
+            b'l' => {
+                self.byte()?; // sign
+                let shorts = self.count()?;
+                self.bytes(shorts.saturating_mul(2))?;
+                self.objects.push(MarshalObject::Opaque);
+                Ok(MarshalValue::Other)
+            }
+            b'I' => {
+                // Instance-variable envelope (a String's encoding): the wrapped
+                // object, then `count` symbol/value pairs that do not matter here.
+                let inner = self.value(depth + 1)?;
+                let ivars = self.count()?;
+                for _ in 0..ivars {
+                    self.symbol()?;
+                    self.value(depth + 1)?;
+                }
+                Ok(inner)
+            }
+            b'[' => {
+                self.reserve_slot();
+                let len = self.count()?;
+                let mut items = Vec::with_capacity(len.min(64));
+                for _ in 0..len {
+                    items.push(self.value(depth + 1)?);
+                }
+                Ok(MarshalValue::Array(items))
+            }
+            b'{' => {
+                self.reserve_slot();
+                let pairs = self.count()?;
+                for _ in 0..pairs {
+                    self.value(depth + 1)?;
+                    self.value(depth + 1)?;
+                }
+                Ok(MarshalValue::Other)
+            }
+            b'U' => {
+                let slot = self.reserve_slot();
+                let class = self.symbol()?;
+                let dumped = self.value(depth + 1)?;
+                if &*class == "Gem::Version" {
+                    if let MarshalValue::Array(items) = &dumped {
+                        if let Some(MarshalValue::Str(v)) = items.first() {
+                            self.objects[slot] = MarshalObject::Version(v.clone());
+                            return Ok(MarshalValue::Version(v.clone()));
+                        }
+                    }
+                    return Err(format!("malformed Gem::Version at byte {at}"));
+                }
+                Ok(MarshalValue::Other)
+            }
+            b'@' => {
+                let idx = self.count()?;
+                match self.objects.get(idx) {
+                    Some(MarshalObject::Str(s)) => Ok(MarshalValue::Str(s.clone())),
+                    Some(MarshalObject::Version(v)) => Ok(MarshalValue::Version(v.clone())),
+                    Some(MarshalObject::Opaque) => Ok(MarshalValue::Other),
+                    None => Err(format!("dangling Marshal object link {idx} at byte {at}")),
+                }
+            }
+            t => Err(format!(
+                "unsupported Marshal type 0x{t:02x} at byte {at} in a specs index"
+            )),
+        }
+    }
+}
+
+/// Decode a RubyGems specs index (`Marshal.dump` of
+/// `[[name, Gem::Version, platform], ...]`, NOT gzipped) into its entries.
+///
+/// Fails on anything that is not that shape rather than returning a partial
+/// list: a virtual repository that silently merged half an upstream index
+/// would tell clients the missing gems do not exist (#4192).
+pub fn unmarshal_specs_index(data: &[u8]) -> std::result::Result<Vec<SpecEntry>, String> {
+    let mut r = MarshalReader::new(data)?;
+    if r.byte()? != b'[' {
+        return Err("specs index is not a Marshal Array".to_string());
+    }
+    r.reserve_slot();
+    let len = r.count()?;
+    let mut out = Vec::with_capacity(len.min(1 << 20));
+    for i in 0..len {
+        let MarshalValue::Array(fields) = r.value(1)? else {
+            return Err(format!("specs index entry {i} is not an Array"));
+        };
+        let (name, version, platform) = match fields.as_slice() {
+            [MarshalValue::Str(n), MarshalValue::Version(v) | MarshalValue::Str(v), MarshalValue::Str(p)] => {
+                (n.clone(), v.clone(), p.clone())
+            }
+            _ => {
+                return Err(format!(
+                    "specs index entry {i} is not a [name, version, platform] triple"
+                ))
+            }
+        };
+        out.push((name, version, platform));
+    }
+    if r.pos != data.len() {
+        return Err(format!(
+            "{} trailing bytes after the specs index",
+            data.len() - r.pos
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -1212,7 +1499,7 @@ mod marshal_tests {
     // Marshal.dump([]) == "\x04\x08[\x00"
     #[test]
     fn test_marshal_specs_empty() {
-        let got = marshal_specs_index(&[]);
+        let got = marshal_specs_index::<String>(&[]);
         assert_eq!(got, vec![0x04, 0x08, 0x5b, 0x00]);
     }
 
@@ -1431,6 +1718,180 @@ dependencies:
         assert!(contains(b"dtf-dep"));
         assert!(contains(b"runtime"));
         assert!(contains(b"Gem::Requirement"));
+    }
+
+    /// A real `specs.4.8.gz` written by Ruby 3.3 / RubyGems 3.5
+    /// (`tests/fixtures/rubygems-specs-ruby33.rb`). Its shared `"ruby"` String
+    /// and interned `Gem::Version` come out as `@` object links.
+    const RUBY_SPECS_GZ: &[u8] =
+        include_bytes!("../../tests/fixtures/rubygems-specs-ruby33.4.8.gz");
+
+    fn gunzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(data)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn owned(entries: &[SpecEntry]) -> Vec<(String, String, String)> {
+        entries
+            .iter()
+            .map(|(n, v, p)| (n.to_string(), v.to_string(), p.to_string()))
+            .collect()
+    }
+
+    fn triple(n: &str, v: &str, p: &str) -> (String, String, String) {
+        (n.to_string(), v.to_string(), p.to_string())
+    }
+
+    #[test]
+    fn test_unmarshal_real_ruby_specs_resolves_object_links_4280() {
+        let raw = gunzip(RUBY_SPECS_GZ);
+        assert!(
+            raw.contains(&b'@'),
+            "fixture must exercise Marshal object links"
+        );
+        let got = unmarshal_specs_index(&raw).expect("real Ruby specs index decodes");
+        assert_eq!(
+            owned(&got),
+            vec![
+                triple("rake", "13.2.1", "ruby"),
+                triple("rake", "13.2.1", "java"),
+                triple("rake", "13.0.0", "ruby"),
+                triple("rails", "7.1.0", "ruby"),
+                triple("nokogiri", "1.16.0", "x86_64-linux"),
+                triple("private-gem", "9.9.9", "ruby"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unmarshal_roundtrips_our_encoder() {
+        let specs = vec![
+            triple("dtf-marker", "1.0.0", "ruby"),
+            triple("other-gem", "2.1.3.beta1", "java"),
+        ];
+        let got = unmarshal_specs_index(&marshal_specs_index(&specs)).unwrap();
+        assert_eq!(owned(&got), specs);
+        let empty = unmarshal_specs_index(&marshal_specs_index::<String>(&[])).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_unmarshal_long_encodings_match_ruby_r_long() {
+        // (bytes after the type tag, expected value) per marshal.c w_long.
+        let cases: &[(&[u8], i64)] = &[
+            (&[0x00], 0),
+            (&[0x06], 1),
+            (&[0x7f], 122),
+            (&[0x01, 0x7b], 123),
+            (&[0x02, 0x00, 0x01], 256),
+            (&[0xfa], -1),
+            (&[0x80], -123),
+            (&[0xff, 0x84], -124),
+            (&[0xfe, 0x00, 0xff], -256),
+        ];
+        for (bytes, want) in cases {
+            let mut data = vec![0x04, 0x08];
+            data.extend_from_slice(bytes);
+            let mut r = MarshalReader::new(&data).unwrap();
+            assert_eq!(r.long().unwrap(), *want, "bytes {bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn test_unmarshal_skips_values_a_specs_index_may_carry() {
+        // A triple whose fields carry extra, valid Marshal: nil, true/false,
+        // fixnum, a float, a bignum, a hash, a non-Version user object and a
+        // symbol inside an array, plus a link to an opaque slot.
+        let mut data = vec![0x04, 0x08, b'[', 0x06, b'[', 0x09];
+        data.extend_from_slice(b"\"\x09rake"); // "rake" (no ivars)
+        data.extend_from_slice(b"\"\x0a1.0.0"); // version as plain String
+        data.extend_from_slice(b"\"\x09ruby");
+        data.extend_from_slice(b"[\x0f0TFi\x06"); // 10 extras: nil, true, false, 1
+        data.extend_from_slice(b"f\x081.5"); // float
+        data.extend_from_slice(b"l+\x06\x01\x00"); // bignum
+        data.extend_from_slice(b"{\x06:\x06ki\x07"); // {:k => 2}
+        data.extend_from_slice(b"U:\x08Foo[\x00"); // non-Version user object
+        data.extend_from_slice(b";\x00"); // symlink to :k
+        data.extend_from_slice(b"@\x06"); // link to an opaque slot
+        let got = unmarshal_specs_index(&data);
+        // Every extra parsed; the entry is rejected only for its shape.
+        assert!(got.unwrap_err().contains("not a [name, version, platform]"));
+
+        let mut ok = vec![0x04, 0x08, b'[', 0x06, b'[', 0x08];
+        ok.extend_from_slice(b"\"\x09rake\"\x0a1.0.0\"\x09ruby");
+        assert_eq!(
+            owned(&unmarshal_specs_index(&ok).unwrap()),
+            vec![triple("rake", "1.0.0", "ruby")]
+        );
+    }
+
+    #[test]
+    fn test_unmarshal_rejects_malformed_streams() {
+        let raw = gunzip(RUBY_SPECS_GZ);
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("json", b"[]".to_vec(), "not a Ruby Marshal 4.8"),
+            ("not array", vec![0x04, 0x08, b'0'], "not a Marshal Array"),
+            ("truncated", raw[..raw.len() - 3].to_vec(), "truncated"),
+            (
+                "trailing",
+                [raw.as_slice(), b"0"].concat(),
+                "trailing bytes",
+            ),
+            (
+                "entry not array",
+                vec![0x04, 0x08, b'[', 0x06, b'0'],
+                "is not an Array",
+            ),
+            (
+                "dangling link",
+                vec![0x04, 0x08, b'[', 0x06, b'@', 0x07],
+                "dangling Marshal object link",
+            ),
+            (
+                "dangling symlink",
+                vec![0x04, 0x08, b'[', 0x06, b';', 0x06],
+                "dangling Marshal symlink",
+            ),
+            (
+                "bad version",
+                vec![0x04, 0x08, b'[', 0x06, b'U', b':', 0x11]
+                    .into_iter()
+                    .chain(b"Gem::Version0".iter().copied())
+                    .collect(),
+                "malformed Gem::Version",
+            ),
+            (
+                "unsupported type",
+                vec![0x04, 0x08, b'[', 0x06, b'o'],
+                "unsupported Marshal type",
+            ),
+            (
+                "huge length",
+                vec![0x04, 0x08, b'[', 0x04, 0xff, 0xff, 0xff, 0x7f],
+                "invalid Marshal length",
+            ),
+            (
+                "class not a symbol",
+                vec![0x04, 0x08, b'[', 0x06, b'U', b'0'],
+                "expected a Marshal symbol",
+            ),
+        ];
+        for (label, data, want) in cases {
+            let err = unmarshal_specs_index(&data).expect_err(label);
+            assert!(err.contains(want), "{label}: {err}");
+        }
+
+        let mut deep = vec![0x04, 0x08, b'['];
+        for _ in 0..40 {
+            deep.extend_from_slice(&[0x06, b'[']);
+        }
+        deep.push(0x00);
+        let err = unmarshal_specs_index(&deep).unwrap_err();
+        assert!(err.contains("nests too deeply"), "{err}");
     }
 }
 

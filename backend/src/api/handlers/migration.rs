@@ -441,7 +441,10 @@ pub struct AssessmentResult {
     pub users_count: i64,
     pub groups_count: i64,
     pub permissions_count: i64,
+    /// Exact only when `total_artifacts_exact`; otherwise a lower bound (#3928).
     pub total_artifacts: i64,
+    /// Whether every repository was counted exactly.
+    pub total_artifacts_exact: bool,
     pub total_size_bytes: i64,
     pub estimated_duration_seconds: i64,
     pub warnings: Vec<String>,
@@ -454,7 +457,10 @@ pub struct RepositoryAssessment {
     #[serde(rename = "type")]
     pub repo_type: String,
     pub package_type: String,
+    /// Exact only when `artifact_count_exact`; otherwise a lower bound (#3928).
     pub artifact_count: i64,
+    /// Whether `artifact_count` is the repository's real size.
+    pub artifact_count_exact: bool,
     pub total_size_bytes: i64,
     pub compatibility: String,
     pub warnings: Vec<String>,
@@ -1809,6 +1815,7 @@ async fn get_assessment(
                         repo_type: r.repo_type,
                         package_type: r.package_type,
                         artifact_count: r.artifact_count,
+                        artifact_count_exact: r.artifact_count_exact,
                         total_size_bytes: r.total_size_bytes,
                         compatibility: r.compatibility,
                         warnings: r.warnings,
@@ -1818,6 +1825,7 @@ async fn get_assessment(
                 groups_count: service_result.groups_count,
                 permissions_count: service_result.permissions_count,
                 total_artifacts: service_result.total_artifacts,
+                total_artifacts_exact: service_result.total_artifacts_exact,
                 total_size_bytes: service_result.total_size_bytes,
                 estimated_duration_seconds: service_result.estimated_duration_seconds,
                 warnings: service_result.warnings,
@@ -1835,6 +1843,7 @@ async fn get_assessment(
         groups_count: 0,
         permissions_count: 0,
         total_artifacts: 0,
+        total_artifacts_exact: false,
         total_size_bytes: 0,
         estimated_duration_seconds: 0,
         warnings: vec![],
@@ -2305,6 +2314,7 @@ mod tests {
             groups_count: 0,
             permissions_count: 0,
             total_artifacts: 0,
+            total_artifacts_exact: false,
             total_size_bytes: 0,
             estimated_duration_seconds: 0,
             warnings: vec![],
@@ -2322,6 +2332,7 @@ mod tests {
             repo_type: "local".to_string(),
             package_type: "npm".to_string(),
             artifact_count: 500,
+            artifact_count_exact: true,
             total_size_bytes: 1024 * 1024 * 100,
             compatibility: "full".to_string(),
             warnings: vec!["Large repository".to_string()],

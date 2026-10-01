@@ -344,6 +344,54 @@ fn parse_upstream_resources(index: &serde_json::Value) -> NugetUpstreamResources
     }
 }
 
+/// Record which step of a remote NuGet resolution failed, and against what
+/// (#3899). A proxied failure otherwise reached the log only as the request's
+/// final status, so a client-side "NotFound" on a registration page could not
+/// be told apart from an unreachable upstream, an unadvertised resource or an
+/// undecodable document. Both URLs are redacted (userinfo, query, fragment)
+/// before they are logged. An upstream 404 is an ordinary answer (the package
+/// or version does not exist) and logs at INFO; anything else at WARN.
+fn log_upstream_failure(
+    step: &'static str,
+    repo_key: &str,
+    upstream_url: &str,
+    target: &str,
+    response: &Response,
+) {
+    let upstream = crate::services::proxy_service::redact_url_for_diagnostics(upstream_url);
+    let target = crate::services::proxy_service::redact_url_for_diagnostics(target);
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        info!(
+            step,
+            repo_key = %repo_key,
+            upstream = %upstream,
+            target = %target,
+            status = status.as_u16(),
+            "NuGet upstream resolution step answered not found"
+        );
+    } else {
+        warn!(
+            step,
+            repo_key = %repo_key,
+            upstream = %upstream,
+            target = %target,
+            status = status.as_u16(),
+            "NuGet upstream resolution step failed"
+        );
+    }
+}
+
+/// [`log_upstream_failure`] as an `inspect_err` callback.
+fn upstream_failure<'a>(
+    step: &'static str,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    target: &'a str,
+) -> impl Fn(&Response) + Copy + 'a {
+    move |response| log_upstream_failure(step, repo_key, upstream_url, target, response)
+}
+
 /// Resolve what protocol `upstream_url` speaks, memoized through the same
 /// proxy-cache entry discovery already uses (`v3/index.json`), so a request
 /// pays at most one probe per member.
@@ -373,7 +421,10 @@ async fn discover_upstream_protocol(
         Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(UpstreamProtocol::V2 {
             base: v2_feed_base(upstream_url),
         }),
-        Err(resp) => Err(resp),
+        Err(resp) => {
+            log_upstream_failure("service_index", repo_key, upstream_url, &index_url, &resp);
+            Err(resp)
+        }
     }
 }
 
@@ -394,14 +445,27 @@ async fn discover_upstream_resources(
         "v3/index.json", // clean, stable proxy-cache key
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
-    let index: serde_json::Value = serde_json::from_slice(&content).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet service index was not valid JSON",
-        )
-            .into_response()
-    })?;
+    .await
+    .inspect_err(upstream_failure(
+        "service_index",
+        repo_key,
+        upstream_url,
+        &index_url,
+    ))?;
+    let index: serde_json::Value = serde_json::from_slice(&content)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet service index was not valid JSON",
+            )
+                .into_response()
+        })
+        .inspect_err(upstream_failure(
+            "service_index_decode",
+            repo_key,
+            upstream_url,
+            &index_url,
+        ))?;
     Ok(parse_upstream_resources(&index))
 }
 
@@ -639,7 +703,13 @@ async fn fetch_v3_registration(
         resources.registration_base.as_ref(),
         upstream_url,
         "RegistrationsBaseUrl",
-    )?;
+    )
+    .inspect_err(upstream_failure(
+        "registration_base",
+        fetch_repo_key,
+        upstream_url,
+        upstream_url,
+    ))?;
     let fetch_url = registration_fetch_url(&reg_base, package_id_lower, &["index.json"])?;
     let cache_path = format!("v3/registration/{}/index.json", package_id_lower);
     let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
@@ -651,7 +721,13 @@ async fn fetch_v3_registration(
         &cache_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
+    .await
+    .inspect_err(upstream_failure(
+        "registration_index",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    ))?;
     let body = String::from_utf8_lossy(&content);
     Ok((
         rewrite_v3_registration(&body, &resources, ak_base, client_repo_key),
@@ -741,17 +817,31 @@ async fn proxy_v3_registration_subresource(
     let UpstreamProtocol::V3(resources) =
         discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?
     else {
-        return Err((
+        let response = (
             StatusCode::NOT_FOUND,
             "NuGet registration resource not found",
         )
-            .into_response());
+            .into_response();
+        log_upstream_failure(
+            "registration_page_v2_upstream",
+            fetch_repo_key,
+            upstream_url,
+            &subpath_segments.join("/"),
+            &response,
+        );
+        return Err(response);
     };
     let reg_base = guard_upstream_base(
         resources.registration_base.as_ref(),
         upstream_url,
         "RegistrationsBaseUrl",
-    )?;
+    )
+    .inspect_err(upstream_failure(
+        "registration_base",
+        fetch_repo_key,
+        upstream_url,
+        upstream_url,
+    ))?;
     let fetch_url = registration_fetch_url(&reg_base, package_id_lower, subpath_segments)?;
     let cache_path = format!(
         "v3/registration/{}/{}",
@@ -767,21 +857,37 @@ async fn proxy_v3_registration_subresource(
         &cache_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
-    let body = std::str::from_utf8(&content).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet registration response was not valid UTF-8",
-        )
-            .into_response()
-    })?;
-    serde_json::from_str::<serde_json::Value>(body).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Upstream NuGet registration response was not valid JSON",
-        )
-            .into_response()
-    })?;
+    .await
+    .inspect_err(upstream_failure(
+        "registration_page",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    ))?;
+    let log_decode = upstream_failure(
+        "registration_page_decode",
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+    );
+    let body = std::str::from_utf8(&content)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration response was not valid UTF-8",
+            )
+                .into_response()
+        })
+        .inspect_err(log_decode)?;
+    serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration response was not valid JSON",
+            )
+                .into_response()
+        })
+        .inspect_err(log_decode)?;
     let rewritten = rewrite_v3_registration(body, &resources, ak_base, client_repo_key);
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1180,6 +1286,11 @@ async fn local_autocomplete_data(
     .fetch_one(db)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    let authored = catalog_display_ids(db, repo_ids, &ids).await;
+    let ids = ids
+        .iter()
+        .map(|id| authored_or_stored(&authored, id))
+        .collect();
     Ok((ids, total))
 }
 
@@ -1747,7 +1858,9 @@ async fn flatcontainer_fetch_target(
 ) -> Result<(String, String), Response> {
     match discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await? {
         UpstreamProtocol::V3(resources) => {
-            v3_flatcontainer_target(&resources, upstream_url, sub_path)
+            v3_flatcontainer_target(&resources, upstream_url, sub_path).inspect_err(
+                upstream_failure("flatcontainer_base", fetch_repo_key, upstream_url, sub_path),
+            )
         }
         // A V2 feed serves package content from `package/{id}/{version}`
         // (#4122). Cached under the key `v2_download` already uses, so a V2 and
@@ -1921,7 +2034,13 @@ async fn proxy_v3_flatcontainer(
             "application/octet-stream",
             RepositoryFormat::Nuget,
         )
-        .await?;
+        .await
+        .inspect_err(upstream_failure(
+            "flatcontainer_package",
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+        ))?;
         // #3446: `streaming` is exactly the `.nupkg` arm — the non-streaming
         // sibling below serves a version LIST, which is metadata and must not
         // count. `ctx` is therefore `Some` only where a real download context
@@ -1958,7 +2077,13 @@ async fn proxy_v3_flatcontainer(
                 &cache_path,
                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
             )
-            .await?;
+            .await
+            .inspect_err(upstream_failure(
+                "flatcontainer_versions",
+                fetch_repo_key,
+                upstream_url,
+                &fetch_url,
+            ))?;
         let mut builder = Response::builder().status(StatusCode::OK).header(
             CONTENT_TYPE,
             content_type.unwrap_or_else(|| "application/json".to_string()),
@@ -2077,6 +2202,65 @@ struct SearchPackageRow {
     description: Option<String>,
 }
 
+/// The display casing of each of `names` across `repo_ids`, keyed by
+/// lowercased id, read from the package catalog (#3835).
+///
+/// `artifacts.name` holds the lowercased id every lookup compares against
+/// (NuGet ids are case-insensitive); the id as authored lives in the one
+/// `packages` row per package, which a push names once, with the spelling the
+/// first push declared, and reuses thereafter (#3976 / #3978). Reading the
+/// display id from that row, rather than from per-version push metadata, keeps
+/// it stable when versions are deleted or re-pushed and makes V3 search,
+/// registration, autocomplete and the V2 feed report the same id.
+///
+/// Deterministic when several rows qualify (a virtual repository's members,
+/// or the lowercased twin a pre-#3978 push wrote beside the authored row): a
+/// row whose name carries casing beats an all-lowercase one, then the oldest
+/// row, then the lowest id. On a virtual repository the rows come only from
+/// the members `repo_ids` already narrowed to the caller (#3323), so the
+/// casing can differ between callers who can see different members.
+///
+/// Best-effort: an id with no catalog row, or a failed query, is absent and
+/// the caller reports the stored (lowercased) name.
+async fn catalog_display_ids(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+    names: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    lowered.sort_unstable();
+    lowered.dedup();
+    if lowered.is_empty() || repo_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (LOWER(p.name)) LOWER(p.name), p.name
+          FROM packages p
+         WHERE p.repository_id = ANY($1::uuid[])
+           AND LOWER(p.name) = ANY($2::text[])
+         ORDER BY LOWER(p.name), (p.name = LOWER(p.name)), p.created_at, p.id
+        "#,
+    )
+    .bind(repo_ids)
+    .bind(&lowered)
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "NuGet catalog id lookup failed; reporting stored ids");
+        Vec::new()
+    });
+    rows.into_iter().collect()
+}
+
+/// `name` in its authored casing from `authored`, else unchanged.
+fn authored_or_stored(authored: &std::collections::HashMap<String, String>, name: &str) -> String {
+    authored
+        .get(&name.to_lowercase())
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
 async fn search_packages(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2151,10 +2335,14 @@ async fn search_packages(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+    let authored = catalog_display_ids(&state.db, &repo_ids, &names).await;
     let mut data: Vec<serde_json::Value> = packages
         .iter()
         .map(|p| {
-            let id = &p.name;
+            // URLs carry the lowercased id; `id` the authored one (#3835).
+            let id = p.name.to_lowercase();
+            let display_id = authored_or_stored(&authored, &p.name);
             // When prerelease=false, prefer the highest *stable* version and
             // only fall back to a pre-release if no stable version exists.
             let latest = select_latest_version(&p.versions, prerelease);
@@ -2169,7 +2357,7 @@ async fn search_packages(
                 "@id": format!("{}/v3/registration/{}/index.json", base, id),
                 "@type": "Package",
                 "registration": format!("{}/v3/registration/{}/index.json", base, id),
-                "id": id,
+                "id": display_id,
                 "version": latest,
                 "description": p.description.clone().unwrap_or_default(),
                 "totalDownloads": 0,
@@ -2465,6 +2653,16 @@ async fn registration_index(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
+    // The catalog's spelling, as search and the V2 feed report it (#3835).
+    let display_id = authored_or_stored(
+        &catalog_display_ids(
+            &state.db,
+            &repo_ids,
+            std::slice::from_ref(&package_id_lower),
+        )
+        .await,
+        &package_id_lower,
+    );
     let items: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
@@ -2494,7 +2692,7 @@ async fn registration_index(
                 "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
                 "catalogEntry": {
                     "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
-                    "id": package_id_lower,
+                    "id": display_id,
                     "version": version,
                     "description": description,
                     "authors": authors,
@@ -3685,6 +3883,10 @@ async fn load_hosted_v2_entries(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    // Every version reports the one authored id, the first push's spelling,
+    // as V3 does -- not whichever spelling that version was pushed under.
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let authored = catalog_display_ids(&state.db, &repo_ids, &names).await;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -3706,7 +3908,7 @@ async fn load_hosted_v2_entries(
                 .as_ref()
                 .and_then(|hex| hex::decode(hex).ok().map(|bytes| base64_standard(&bytes)));
             V2Entry {
-                id: r.name,
+                id: authored_or_stored(&authored, &r.name),
                 version: r.version.unwrap_or_default(),
                 authors,
                 description,
@@ -3895,6 +4097,11 @@ fn base64_standard(bytes: &[u8]) -> String {
 /// keeps a later push that spells the id differently on the row the first push
 /// created instead of opening a twin beside it.
 ///
+/// Chosen by the same rule the reads report the id with
+/// ([`catalog_display_ids`]), so the row a push extends is the row whose
+/// spelling clients see, including where a pre-#3978 push left a lowercased
+/// twin beside the authored row.
+///
 /// Best-effort like the catalog writes it feeds: a failed lookup falls back to
 /// the `.nuspec` casing rather than failing the push.
 async fn existing_catalog_name(
@@ -3902,21 +4109,9 @@ async fn existing_catalog_name(
     repository_id: uuid::Uuid,
     lowercased_id: &str,
 ) -> Option<String> {
-    sqlx::query_scalar(
-        r#"
-        SELECT name
-          FROM packages
-         WHERE repository_id = $1
-           AND LOWER(name) = $2
-         ORDER BY created_at
-         LIMIT 1
-        "#,
-    )
-    .bind(repository_id)
-    .bind(lowercased_id)
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None)
+    catalog_display_ids(db, &[repository_id], &[lowercased_id.to_string()])
+        .await
+        .remove(lowercased_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -4574,6 +4769,15 @@ mod tests {
             ],
         );
         assert_eq!(versions, ["1.0.0", "1.5.0-Beta", "2.0.0"]);
+    }
+
+    #[test]
+    fn test_authored_or_stored_falls_back_to_the_stored_name() {
+        let mut authored = std::collections::HashMap::new();
+        authored.insert("a.b".to_string(), "A.B".to_string());
+        assert_eq!(authored_or_stored(&authored, "a.b"), "A.B");
+        assert_eq!(authored_or_stored(&authored, "A.b"), "A.B");
+        assert_eq!(authored_or_stored(&authored, "c.d"), "c.d");
     }
 
     #[test]
@@ -5721,6 +5925,193 @@ mod push_db_tests {
         assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
     }
 
+    /// Push each `(id, version)` to the fixture repo, in order.
+    async fn push_all(app: &axum::Router, repo_key: &str, pushes: &[(&str, &str)]) {
+        for (id, version) in pushes {
+            let pkg = build_nupkg(id, version, "authored casing");
+            let req = put_nupkg(format!("/{repo_key}/api/v2/package"), pkg).await;
+            let (status, _) = tdh::send(app.clone(), req).await;
+            assert!(
+                status.is_success(),
+                "push of {id} {version} failed: {status}"
+            );
+        }
+    }
+
+    async fn get_text(app: &axum::Router, uri: String) -> String {
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri.clone())
+            .body(axum::body::Body::empty())
+            .expect("build GET request");
+        let (status, body) = tdh::send(app.clone(), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "GET {uri}");
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// Every id `Some.Package.Id` is reported under -- V3 search,
+    /// registration and autocomplete, and each V2 feed shape -- must be
+    /// `expected`, with `versions` live versions, `latest` the newest (#3835).
+    /// V3 URLs stay lowercased; the V2 entry URLs carry the reported id, as
+    /// nuget.org's V2 feed does.
+    async fn assert_every_reported_id(
+        app: &axum::Router,
+        repo_key: &str,
+        expected: &str,
+        versions: usize,
+        latest: &str,
+    ) {
+        let text = |uri: String| get_text(app, uri);
+        let json = |body: String| -> serde_json::Value {
+            serde_json::from_str(&body).expect("response is JSON")
+        };
+        let search = json(text(format!("/{repo_key}/v3/search?q=some.package")).await);
+        assert_eq!(search["totalHits"], 1, "one package: {search}");
+        let hit = &search["data"][0];
+        assert_eq!(hit["id"], expected, "search id: {search}");
+        assert!(
+            hit["registration"]
+                .as_str()
+                .unwrap()
+                .ends_with("/v3/registration/some.package.id/index.json"),
+            "V3 URLs stay lowercased: {search}"
+        );
+
+        let registration = json(
+            text(format!(
+                "/{repo_key}/v3/registration/SOME.PACKAGE.ID/index.json"
+            ))
+            .await,
+        );
+        let leaves = registration["items"][0]["items"]
+            .as_array()
+            .expect("inline registration leaves");
+        assert_eq!(leaves.len(), versions, "{registration}");
+        for leaf in leaves {
+            assert_eq!(leaf["catalogEntry"]["id"], expected, "{registration}");
+            assert!(leaf["packageContent"]
+                .as_str()
+                .unwrap()
+                .contains("/v3/flatcontainer/some.package.id/"));
+        }
+
+        let autocomplete = json(text(format!("/{repo_key}/v3/autocomplete?q=some")).await);
+        assert_eq!(autocomplete["data"], serde_json::json!([expected]));
+
+        for (query, count) in [
+            (
+                "FindPackagesById()?id='some.package.id'".to_string(),
+                versions,
+            ),
+            (
+                format!("Packages(Id='some.package.id',Version='{latest}')"),
+                1,
+            ),
+            ("Packages()".to_string(), versions),
+            ("Search()?searchTerm='some'".to_string(), versions),
+        ] {
+            let feed = text(format!("/{repo_key}/v2/{query}")).await;
+            let ids: Vec<&str> = feed
+                .split("<d:Id>")
+                .skip(1)
+                .filter_map(|rest| rest.split("</d:Id>").next())
+                .collect();
+            assert_eq!(ids.len(), count, "V2 {query}: {feed}");
+            assert!(ids.iter().all(|id| *id == expected), "V2 {query}: {feed}");
+            assert_eq!(
+                feed.matches(&format!("/Packages(Id='{expected}',")).count(),
+                count,
+                "V2 entry <id> URLs: {feed}"
+            );
+            assert_eq!(
+                feed.matches(&format!("/package/{expected}/")).count(),
+                count,
+                "V2 <content src> URLs: {feed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn push_package_serves_the_authored_id_casing_through_v3() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        // The second push spells the id differently; the id is reported as
+        // the first push declared it, from the catalog row (#3835, #3976).
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("SOME.package.ID", "2.0.0")],
+        )
+        .await;
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 2, "2.0.0").await;
+        let catalog: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_all(&f.pool)
+                .await
+                .expect("query packages");
+        f.teardown().await;
+
+        assert_eq!(catalog, vec!["Some.Package.Id".to_string()]);
+    }
+
+    /// Deleting the versions the first push created does not hand the
+    /// displayed casing to a later pusher: the id comes from the catalog row,
+    /// which outlives the versions (#3835 review).
+    #[tokio::test]
+    async fn deleting_the_first_version_keeps_the_authored_casing() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("SOME.package.ID", "2.0.0")],
+        )
+        .await;
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = '1.0.0'",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("delete 1.0.0");
+
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 1, "2.0.0").await;
+        f.teardown().await;
+    }
+
+    /// A version with no push metadata (the metadata write is best-effort)
+    /// does not make registration disagree with search: every surface reads
+    /// the one catalog row (#3835 review).
+    #[tokio::test]
+    async fn a_version_without_metadata_reports_the_same_id_everywhere() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        push_all(
+            &app,
+            &f.repo_key,
+            &[("Some.Package.Id", "1.0.0"), ("Some.Package.Id", "2.0.0")],
+        )
+        .await;
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1 AND version = '1.0.0')",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("drop 1.0.0 metadata");
+
+        assert_every_reported_id(&app, &f.repo_key, "Some.Package.Id", 2, "2.0.0").await;
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn push_multiple_versions_collapses_into_one_package_row() {
         let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
@@ -6042,7 +6433,8 @@ mod read_db_tests {
             json["totalHits"], 1,
             "virtual search must federate over members; body={json}"
         );
-        assert_eq!(json["data"][0]["id"], "qa.fedpkg");
+        // The id carries the member's `.nuspec` casing (#3835).
+        assert_eq!(json["data"][0]["id"], "Qa.FedPkg");
 
         drop_virtual(&f.pool, vid).await;
         f.teardown().await;
@@ -9627,6 +10019,121 @@ mod remote_discovery_tests {
         assert!(!body.contains(&uri), "upstream URL leaked: {body}");
         assert!(body.contains(&format!("/{}/v3/registration/serilog/", fx.repo_key)));
         assert!(body.contains(&format!("/{}/v3/flatcontainer/serilog/", fx.repo_key)));
+    }
+
+    /// Collects `tracing` output emitted on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #3899: a registration page the upstream does not serve reached the log
+    /// only as the request's final 404. The failing step, the upstream it was
+    /// resolved against and the redacted fetch target are now recorded.
+    #[tokio::test]
+    async fn registration_page_failure_logs_the_step_upstream_and_status() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = v3_upstream(&[("RegistrationsBaseUrl/3.6.0", "/v3-registration/")]).await;
+        Mock::given(method("GET"))
+            .and(path("/v3-registration/serilog/page/0.1.6/1.2.47.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        set_upstream(&fx.pool, fx.repo_id, &upstream).await;
+        let app = app(&fx);
+
+        let capture = LogCapture::default();
+        let status = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            let (status, _) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/{}/v3/registration/serilog/page/0.1.6/1.2.47.json",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            status
+        };
+        let first_phase = capture.0.lock().unwrap().len();
+
+        // An upstream configured with `user:pass@` credentials never reaches
+        // these log lines unredacted.
+        let with_userinfo = upstream.uri().replacen("://", "://ak-user:sekret-pass@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{with_userinfo}/v3/index.json"))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set credentialed upstream");
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{}/v3/registration/serilog/page/1.2.48/2.0.0.json",
+                    fx.repo_key
+                )),
+            )
+            .await;
+        }
+        fx.teardown().await;
+
+        let all = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let credentialed: Vec<&str> = all[first_phase..]
+            .lines()
+            .filter(|l| l.contains("NuGet upstream resolution step"))
+            .collect();
+        assert!(!credentialed.is_empty(), "no step logged: {all}");
+        for line in credentialed {
+            assert!(!line.contains("sekret-pass"), "password logged: {line}");
+            assert!(!line.contains("ak-user"), "username logged: {line}");
+            assert!(line.contains(&upstream.uri()), "upstream missing: {line}");
+        }
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let logs = String::from_utf8(capture.0.lock().unwrap()[..first_phase].to_vec()).unwrap();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("step=\"registration_page\""))
+            .unwrap_or_else(|| panic!("no registration_page failure logged: {logs}"));
+        assert!(line.contains("status=404"), "{line}");
+        assert!(line.contains(&upstream.uri()), "upstream missing: {line}");
+        assert!(
+            line.contains("/v3-registration/serilog/page/0.1.6/1.2.47.json"),
+            "target missing: {line}"
+        );
     }
 
     #[tokio::test]

@@ -417,6 +417,7 @@ pub async fn verify_totp(
         audit_fire_and_forget(
             state.db.clone(),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .with_request_client_ip()
                 .user(claims.sub)
                 .resource(claims.sub)
                 .details_typed(
@@ -503,6 +504,7 @@ pub async fn verify_totp(
             audit_fire_and_forget(
                 state.db.clone(),
                 AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                    .with_request_client_ip()
                     .user(claims.sub)
                     .resource(claims.sub)
                     .details_typed(crate::services::audit_export::details::AuthDetails {
@@ -617,6 +619,7 @@ async fn issue_session_after_totp(
     audit_fire_and_forget(
         state.db.clone(),
         AuditEntry::new(AuditAction::Login, ResourceType::User)
+            .with_request_client_ip()
             .user(user.id)
             .resource(user.id)
             .details(serde_json::json!({
@@ -755,6 +758,7 @@ pub async fn enroll_complete(
         audit_fire_and_forget(
             state.db.clone(),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .with_request_client_ip()
                 .user(claims.sub)
                 .resource(claims.sub)
                 .details_typed(crate::services::audit_export::details::AuthDetails {

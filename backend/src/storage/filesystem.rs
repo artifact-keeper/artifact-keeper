@@ -172,8 +172,62 @@ impl FilesystemStorage {
     }
 }
 
+/// Blocking directory walk behind [`FilesystemStorage::list_keys`]: every
+/// regular file under `dir` as `{prefix}/{relative path}`, skipping atomic-write
+/// temp files. A missing directory is an empty namespace.
+fn list_files_under(dir: &Path, prefix: &str) -> Result<Vec<super::ListedKey>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).follow_links(false) {
+        let entry = entry.map_err(|e| AppError::Storage(format!("filesystem listing: {e}")))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if name.contains(".tmp.") {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let last_modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(chrono::DateTime::<chrono::Utc>::from);
+        keys.push(super::ListedKey {
+            key: format!("{prefix}/{rel}"),
+            last_modified,
+        });
+    }
+    keys.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(keys)
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
+    /// Walk the directory a multi-component key under `prefix` maps to,
+    /// returning `prefix`-relative keys. In-flight atomic-write temp files
+    /// (`*.tmp.<uuid>`, see `put_stream`) are not objects and are skipped.
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        let prefix = prefix.trim_matches('/').to_string();
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let dir = self.root_for(&prefix).join(&prefix);
+        let keys = tokio::task::spawn_blocking(move || list_files_under(&dir, &prefix))
+            .await
+            .map_err(|e| AppError::Storage(format!("filesystem listing task failed: {e}")))??;
+        Ok(Some(keys))
+    }
+
     #[tracing::instrument(skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let path = self.key_to_path(key);

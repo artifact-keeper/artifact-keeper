@@ -104,6 +104,65 @@ pub fn validate_oci_content_ref(image: &str, digest: &str) -> Result<(), Artifac
     Ok(())
 }
 
+/// Page size of the listing walk [`SourceRegistry::count_artifacts`] runs.
+pub const COUNT_PAGE_SIZE: i64 = 1000;
+
+/// Most pages [`SourceRegistry::count_artifacts`] walks before it gives up on
+/// an exact figure. At [`COUNT_PAGE_SIZE`] a repository of up to 10,000
+/// artifacts is counted exactly; a larger one reports a lower bound. The
+/// budget keeps an assessment of a multi-million-artifact source from turning
+/// into a full enumeration — the migration job enumerates anyway, and
+/// publishes the real total as it goes.
+///
+/// The Nexus client overrides this with a smaller budget
+/// (`nexus_client::NEXUS_COUNT_PAGE_BUDGET`): its listing page is assembled
+/// from many throttled `/components` requests.
+pub const COUNT_PAGE_BUDGET: usize = 10;
+
+/// How many artifacts a source repository holds, as far as a bounded listing
+/// walk could tell (#3928).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactCount {
+    /// Artifacts seen. The exact count when `exact`, otherwise a lower bound.
+    pub counted: i64,
+    /// `true` only when the walk reached the end of the listing.
+    pub exact: bool,
+}
+
+/// Count a repository by walking its listing forward, `page_size` rows at a
+/// time, for at most `page_budget` pages.
+///
+/// Neither source reports a result-set total: the Artifactory AQL
+/// `range.total` and the Nexus client's `range.total` both describe the page
+/// just returned. Reading `range.total` from a one-row page — what the
+/// assessment used to do — therefore reported every repository as holding at
+/// most one artifact (#3928). Counting rows until a short page is the only
+/// figure either source can back.
+pub async fn count_by_listing<S: SourceRegistry + ?Sized>(
+    source: &S,
+    repo_key: &str,
+    page_size: i64,
+    page_budget: usize,
+) -> Result<ArtifactCount, ArtifactoryError> {
+    let page_size = page_size.max(1);
+    let mut counted: i64 = 0;
+    for _ in 0..page_budget {
+        let page = source.list_artifacts(repo_key, counted, page_size).await?;
+        let page_len = page.results.len() as i64;
+        counted = counted.saturating_add(page_len);
+        if page_len < page_size {
+            return Ok(ArtifactCount {
+                counted,
+                exact: true,
+            });
+        }
+    }
+    Ok(ArtifactCount {
+        counted,
+        exact: false,
+    })
+}
+
 /// Trait for source registry clients used during migration.
 ///
 /// Both `ArtifactoryClient` and `NexusClient` implement this trait so the
@@ -134,6 +193,13 @@ pub trait SourceRegistry: Send + Sync {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError>;
+
+    /// Count the artifacts in a repository, exactly when a bounded walk
+    /// reaches the end of the listing and as a flagged lower bound otherwise
+    /// (#3928). See [`count_by_listing`].
+    async fn count_artifacts(&self, repo_key: &str) -> Result<ArtifactCount, ArtifactoryError> {
+        count_by_listing(self, repo_key, COUNT_PAGE_SIZE, COUNT_PAGE_BUDGET).await
+    }
 
     /// List artifacts in a repository with optional modified-date filtering.
     ///
@@ -319,6 +385,140 @@ mod tests {
         fn source_type(&self) -> &'static str {
             self.source
         }
+    }
+
+    /// A source of `total` artifacts that answers pages the way both real
+    /// clients do: `range.total` is the size of the page just returned, never
+    /// the size of the repository (#3928).
+    struct ListingSource {
+        total: i64,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListingSource {
+        fn new(total: i64) -> Self {
+            Self {
+                total,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SourceRegistry for ListingSource {
+        async fn ping(&self) -> Result<bool, ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
+            unimplemented!("not used by the count tests")
+        }
+        async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
+            Ok(vec![])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<AqlResponse, ArtifactoryError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let end = (offset + limit).min(self.total).max(offset);
+            let results: Vec<_> = (offset..end)
+                .map(|i| crate::services::artifactory_client::AqlResult {
+                    repo: repo_key.to_string(),
+                    path: "p".to_string(),
+                    name: format!("a{i}.bin"),
+                    size: Some(1),
+                    created: None,
+                    modified: None,
+                    sha256: None,
+                    actual_sha1: None,
+                })
+                .collect();
+            let page = results.len() as i64;
+            Ok(AqlResponse {
+                results,
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + page,
+                    total: page,
+                },
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, ArtifactoryError> {
+            Ok(bytes::Bytes::new())
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<PropertiesResponse, ArtifactoryError> {
+            Ok(PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "listing"
+        }
+    }
+
+    /// #3928: a repository of 2,345 artifacts counts as 2,345, exactly. The
+    /// pre-fix assessment read `range.total` from a one-row page and got 1.
+    #[tokio::test]
+    async fn test_count_artifacts_is_exact_within_budget_3928() {
+        let source = ListingSource::new(2_345);
+        let one_row = source.list_artifacts("repo", 0, 1).await.unwrap();
+        assert_eq!(
+            one_row.range.total, 1,
+            "the page's range.total is not a repository count"
+        );
+
+        let count = source.count_artifacts("repo").await.unwrap();
+        assert_eq!(
+            count,
+            ArtifactCount {
+                counted: 2_345,
+                exact: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_artifacts_exact_on_page_boundary_and_empty_3928() {
+        // A full last page needs one more (empty) page to prove the end.
+        let source = ListingSource::new(2 * COUNT_PAGE_SIZE);
+        let count = source.count_artifacts("repo").await.unwrap();
+        assert_eq!(count.counted, 2 * COUNT_PAGE_SIZE);
+        assert!(count.exact);
+
+        let empty = ListingSource::new(0);
+        let count = empty.count_artifacts("repo").await.unwrap();
+        assert_eq!(
+            count,
+            ArtifactCount {
+                counted: 0,
+                exact: true
+            }
+        );
+    }
+
+    /// Past the page budget the count is a flagged lower bound, and the walk
+    /// stops: an assessment never enumerates a huge repository.
+    #[tokio::test]
+    async fn test_count_artifacts_over_budget_is_a_lower_bound_3928() {
+        let source = ListingSource::new(1_000_000);
+        let count = source.count_artifacts("repo").await.unwrap();
+        assert_eq!(count.counted, COUNT_PAGE_SIZE * COUNT_PAGE_BUDGET as i64);
+        assert!(!count.exact);
+        assert_eq!(
+            source.calls.load(std::sync::atomic::Ordering::SeqCst),
+            COUNT_PAGE_BUDGET
+        );
     }
 
     #[tokio::test]

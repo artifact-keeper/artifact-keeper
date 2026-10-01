@@ -593,7 +593,7 @@ fn candidate_matches_node(candidate: &CpeCandidate, node: &NvdCpeMatch) -> bool 
 /// This is not a full semver/pre-release implementation — NVD version
 /// bounds on C-library releases are dotted numerics in practice, and the
 /// matcher's fixture tests pin the boundary semantics both directions.
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     fn segments(v: &str) -> Vec<&str> {
         v.split(['.', '-', '_', '+']).collect()
     }

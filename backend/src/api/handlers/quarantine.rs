@@ -28,6 +28,13 @@ pub fn router() -> Router<SharedState> {
         .route("/:artifact_id/quarantine", post(quarantine_artifact))
         .route("/:artifact_id/release", post(release_artifact))
         .route("/:artifact_id/reject", post(reject_artifact))
+        // #3912: held PROXIED content has no `artifacts` row, so the
+        // artifact-keyed routes above cannot release it. This one is keyed on
+        // the proxy-cache catalog's (repository, path) identity instead.
+        .route(
+            "/proxy-cache/:repo_key/release",
+            post(release_proxy_cache_entry),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +65,21 @@ pub struct QuarantineNowRequest {
 pub struct RejectRequest {
     /// Optional reason for rejection.
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReleaseProxyCacheRequest {
+    /// Logical path of the cached object within the repository (the proxy
+    /// cache's canonical path, e.g. `simple/click/click-8.0.0-py3-none-any.whl`).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyCacheReleaseResponse {
+    pub repository: String,
+    pub path: String,
+    pub released: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -295,6 +317,72 @@ pub async fn release_artifact(
         artifact_id,
         new_status: "released".to_string(),
         message: "Artifact released from quarantine".to_string(),
+    }))
+}
+
+/// Release a held proxied (proxy-cache) artifact from quarantine (admin only)
+///
+/// Proxied content has no `artifacts` row (#1278), so the artifact-keyed
+/// release endpoint cannot act on it. This endpoint is keyed on the
+/// proxy-cache catalog's `(repository, path)` identity (#3912): it clears
+/// the cache sidecar's hold and stamps the catalog row's release.
+#[utoipa::path(
+    post,
+    path = "/proxy-cache/{repo_key}/release",
+    context_path = "/api/v1/quarantine",
+    operation_id = "release_proxy_cache_entry",
+    tag = "quarantine",
+    params(
+        ("repo_key" = String, Path, description = "Remote (proxy) repository key"),
+    ),
+    request_body = ReleaseProxyCacheRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cached artifact released", body = ProxyCacheReleaseResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Repository or cached path not found"),
+        (status = 409, description = "Cached artifact is not currently held"),
+    )
+)]
+pub async fn release_proxy_cache_entry(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    Json(req): Json<ReleaseProxyCacheRequest>,
+) -> Result<Json<ProxyCacheReleaseResponse>> {
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    auth.require_admin()?;
+
+    if req.path.trim().is_empty() {
+        return Err(AppError::Validation("path must not be empty".to_string()));
+    }
+
+    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+        .get_by_key(&repo_key)
+        .await?;
+    let proxy = state.proxy_service.as_deref().ok_or_else(|| {
+        AppError::Validation("Proxy service is not enabled on this instance".to_string())
+    })?;
+
+    proxy
+        .release_quarantined_cache_entry(repo.id, req.path.trim())
+        .await?;
+
+    tracing::info!(
+        repository = %repo_key,
+        path = %req.path,
+        admin = %auth.username,
+        "Proxy-cache entry released from quarantine by admin"
+    );
+
+    Ok(Json(ProxyCacheReleaseResponse {
+        repository: repo_key,
+        path: req.path,
+        released: true,
+        message: "Cached artifact released from quarantine".to_string(),
     }))
 }
 
@@ -863,6 +951,217 @@ mod tests {
             "an admin must still receive the reason"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #3912: release of HELD PROXY-CACHE entries, keyed on (repo, path)
+    // -----------------------------------------------------------------------
+
+    /// Seed a held proxy-cache entry for the fixture repo: the content object
+    /// and its held sidecar in the proxy fs storage, plus the catalog row
+    /// mirroring the hold. Returns the entry's logical path.
+    async fn seed_held_proxy_entry(fx: &tdh::Fixture, cache_root: &std::path::Path) -> String {
+        let path = format!("pkg/held-{}.bin", &Uuid::new_v4().to_string()[..8]);
+        let storage_key = format!("proxy-cache/{}/{path}/__content__", fx.repo_key);
+        let metadata_key = format!("proxy-cache/{}/{path}/__cache_meta__.json", fx.repo_key);
+        let body = b"held-proxied-body";
+        let checksum = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(body.as_slice()))
+        };
+        let until = Utc::now() + Duration::minutes(45);
+
+        let content_path = cache_root.join(&storage_key);
+        std::fs::create_dir_all(content_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&content_path, body).expect("write content");
+        let metadata = crate::services::proxy_service::CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: Some(until),
+            expires_at: Utc::now() + Duration::hours(24),
+            content_type: Some("application/octet-stream".to_string()),
+            content_encoding: None,
+            upstream_commit_sha: None,
+            size_bytes: body.len() as i64,
+            checksum_sha256: checksum.clone(),
+        };
+        std::fs::write(
+            cache_root.join(&metadata_key),
+            serde_json::to_vec(&metadata).expect("sidecar json"),
+        )
+        .expect("write sidecar");
+
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, \
+             metadata_key, size_bytes, checksum_sha256, quarantine_until) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(fx.repo_id)
+        .bind(&path)
+        .bind(&storage_key)
+        .bind(&metadata_key)
+        .bind(body.len() as i64)
+        .bind(&checksum)
+        .bind(until)
+        .execute(&fx.pool)
+        .await
+        .expect("insert held catalog row");
+
+        path
+    }
+
+    /// The release endpoint clears the sidecar hold AND stamps the catalog
+    /// row, so the read path serves the entry immediately after the release.
+    #[tokio::test]
+    async fn test_release_proxy_cache_entry_releases_held_entry() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("q3912-rel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), tmp.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), tmp.to_str().unwrap(), proxy.clone());
+        let path = seed_held_proxy_entry(&fx, &tmp).await;
+
+        // Control: the read path refuses the held entry before the release.
+        let held = proxy.cache_quarantine_gate(&fx.repo_key, &path).await;
+        assert!(
+            matches!(held, Err(AppError::Conflict(_))),
+            "a held entry must 409 before release, got {held:?}"
+        );
+
+        let Json(resp) = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest { path: path.clone() }),
+        )
+        .await
+        .expect("admin release must succeed");
+        assert!(resp.released);
+        assert_eq!(resp.path, path);
+
+        // The catalog row is stamped: hold cleared, release recorded.
+        let (db_until, db_released): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT quarantine_until, quarantine_released_at FROM proxy_cache_artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(&path)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read catalog row");
+        assert!(db_until.is_none(), "release clears the hold");
+        assert!(db_released.is_some(), "release is stamped");
+
+        // The read path serves the released entry immediately.
+        proxy
+            .cache_quarantine_gate(&fx.repo_key, &path)
+            .await
+            .expect("a released entry must no longer 409");
+
+        // A second release is a 409, exactly like the hosted endpoint's
+        // not-quarantined refusal.
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest { path: path.clone() }),
+        )
+        .await
+        .expect_err("a double release must be refused");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+
+        fx.teardown().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Authz and lookup failures: admin-only (403), unauthenticated (401),
+    /// unknown path/repo (404), empty path (400).
+    #[tokio::test]
+    async fn test_release_proxy_cache_entry_authz_and_lookup_failures() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("q3912-authz-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), tmp.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), tmp.to_str().unwrap(), proxy.clone());
+        let path = seed_held_proxy_entry(&fx, &tmp).await;
+
+        // Anonymous: 401.
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(None),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest { path: path.clone() }),
+        )
+        .await
+        .expect_err("anonymous release must be refused");
+        assert!(matches!(err, AppError::Authentication(_)), "got {err:?}");
+
+        // Non-admin: 403, and the hold must still be in place afterwards.
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest { path: path.clone() }),
+        )
+        .await
+        .expect_err("a non-admin release must be refused");
+        assert!(matches!(err, AppError::Authorization(_)), "got {err:?}");
+        let held = proxy.cache_quarantine_gate(&fx.repo_key, &path).await;
+        assert!(
+            matches!(held, Err(AppError::Conflict(_))),
+            "a refused release must leave the hold in place, got {held:?}"
+        );
+
+        // Unknown path: 404 (no existence oracle — same answer for a path in
+        // another repository).
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest {
+                path: "pkg/never-cached.bin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown cached path must 404");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+
+        // Unknown repository: 404.
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            Path(format!("no-such-{}", &Uuid::new_v4().to_string()[..8])),
+            Json(ReleaseProxyCacheRequest { path: path.clone() }),
+        )
+        .await
+        .expect_err("unknown repository must 404");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+
+        // Empty path: 400.
+        let err = release_proxy_cache_entry(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            Path(fx.repo_key.clone()),
+            Json(ReleaseProxyCacheRequest {
+                path: "   ".to_string(),
+            }),
+        )
+        .await
+        .expect_err("an empty path must be a validation error");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+        fx.teardown().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 #[derive(OpenApi)]
@@ -872,12 +1171,15 @@ mod tests {
         quarantine_artifact,
         release_artifact,
         reject_artifact,
+        release_proxy_cache_entry,
     ),
     components(schemas(
         QuarantineStatusResponse,
         QuarantineNowRequest,
         QuarantineActionResponse,
         RejectRequest,
+        ReleaseProxyCacheRequest,
+        ProxyCacheReleaseResponse,
     )),
     tags(
         (name = "quarantine", description = "Artifact quarantine period management"),

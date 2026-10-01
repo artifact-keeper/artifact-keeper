@@ -361,7 +361,7 @@ impl SearchService {
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
-                  AND ($6 = false OR r.is_public = true)
+                  AND ($6 = false OR r.visibility = 'public')
                 ORDER BY {order_by}
                 OFFSET $4
                 LIMIT $5
@@ -402,7 +402,7 @@ impl SearchService {
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
-              AND ($4 = false OR r.is_public = true)
+              AND ($4 = false OR r.visibility = 'public')
             "#,
             q_match = SEARCH_VECTOR_MATCH,
         );
@@ -437,7 +437,7 @@ impl SearchService {
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
               AND ($1::uuid[] IS NULL OR r.id = ANY($1))
-              AND ($2 = false OR r.is_public = true)
+              AND ($2 = false OR r.visibility = 'public')
             GROUP BY {expr}
             ORDER BY 2 DESC
             LIMIT 20
@@ -497,7 +497,7 @@ impl SearchService {
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.name ILIKE $1 ESCAPE '\' AND a.is_deleted = false
               AND ($3::uuid[] IS NULL OR r.id = ANY($3))
-              AND ($4 = false OR r.is_public = true)
+              AND ($4 = false OR r.visibility = 'public')
             ORDER BY a.name
             LIMIT $2
             "#,
@@ -542,7 +542,7 @@ impl SearchService {
                     AND ds.downloaded_at >= NOW() - make_interval(days => $1)
                 WHERE a.is_deleted = false
                   AND ($4::uuid[] IS NULL OR r.id = ANY($4))
-                  AND ($3 = false OR r.is_public = true)
+                  AND ($3 = false OR r.visibility = 'public')
                 GROUP BY a.id, r.id
                 ORDER BY 11 DESC
                 LIMIT $2
@@ -585,7 +585,7 @@ impl SearchService {
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
                   AND ($3::uuid[] IS NULL OR r.id = ANY($3))
-                  AND ($2 = false OR r.is_public = true)
+                  AND ($2 = false OR r.visibility = 'public')
                 ORDER BY a.created_at DESC
                 LIMIT $1
                 "#,

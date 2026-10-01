@@ -9,6 +9,7 @@
 #![allow(unused_imports)]
 
 pub mod ci_oidc_issuer;
+pub mod conda_support;
 pub mod fixtures;
 pub mod sso_support;
 

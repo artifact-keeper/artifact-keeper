@@ -1,0 +1,7 @@
+---
+section: Fixed
+issues: [#3923]
+---
+- **An Azure default storage backend no longer refuses to start once a remote repository exists** (#3923). The proxy cache has no Azure support, and the startup check that guarded that gap looked only at `STORAGE_BACKEND`: creating any remote repository succeeded, and the next restart exited with a fatal config error, taking the whole instance down. On a default without proxy-cache support the proxy cache now runs on the local filesystem under `STORAGE_PATH`: a remote repository created without `storage_backend` is placed on `filesystem`, served alongside Azure-backed hosted repositories, and one that explicitly names a backend the proxy cache cannot use is rejected up front with a 400 that says which `storage_backend` to use. Pre-existing ones are reported at error level at startup instead of blocking it (startup still fails closed if the filesystem proxy cache itself cannot be initialized while remote repositories exist). The messages no longer cite the unrelated #1555.
+
+  **Multi-replica deployments:** with an Azure default, the proxy cache lives under each replica's `STORAGE_PATH` while its cache records are shared in the database, so `STORAGE_PATH` must be shared storage (for example a ReadWriteMany volume) when more than one replica serves remote repositories; otherwise purges, quarantine and scans reach only one replica's copy. The backend logs a warning at startup when remote repositories exist on such a deployment.

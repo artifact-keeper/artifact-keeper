@@ -569,6 +569,14 @@ fn bucket_root_url(probe_url: &url::Url, probe_segment: &str) -> url::Url {
     root
 }
 
+/// True when an `object_store` copy error is an endpoint's `411 Length
+/// Required` rejection of the header-less CopyObject PUT (#3737).
+fn copy_rejected_for_missing_length(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("411 length required")
+        || (lowered.contains("411") && lowered.contains("length required"))
+}
+
 /// True when an `object_store` LIST error is its XML parser rejecting the
 /// response body rather than a transport, auth or not-found failure.
 ///
@@ -591,6 +599,10 @@ fn list_response_is_unparsable(message: &str) -> bool {
 struct ListBucketPage {
     /// `<Contents><Key>` values, in document order, exactly as sent.
     keys: Vec<String>,
+    /// `<Contents><LastModified>` of each key (parallel to `keys`), `None`
+    /// when absent or unparsable (#1570 review: the storage reindex needs
+    /// object age on the REST fallback too).
+    last_modified: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     /// `<IsTruncated>`.
     is_truncated: bool,
     /// `<NextContinuationToken>`, absent when empty.
@@ -628,6 +640,10 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<String> = None;
     let mut text = String::new();
+    // Per-`<Contents>` accumulators: `<Key>` and `<LastModified>` may come in
+    // either order, so the entry is recorded when `</Contents>` closes.
+    let mut entry_key: Option<String> = None;
+    let mut entry_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     loop {
         match reader.read_event() {
@@ -674,7 +690,19 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                     .unwrap_or_else(|| local(e.local_name().as_ref()));
                 let parent = stack.last().map(String::as_str).unwrap_or("");
                 match (parent, closed.as_str()) {
-                    ("Contents", "Key") => page.keys.push(std::mem::take(&mut text)),
+                    ("Contents", "Key") => entry_key = Some(std::mem::take(&mut text)),
+                    ("Contents", "LastModified") => {
+                        entry_modified = chrono::DateTime::parse_from_rfc3339(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc));
+                    }
+                    ("ListBucketResult", "Contents") => {
+                        if let Some(key) = entry_key.take() {
+                            page.keys.push(key);
+                            page.last_modified.push(entry_modified.take());
+                        }
+                        entry_modified = None;
+                    }
                     ("ListBucketResult", "IsTruncated") => {
                         page.is_truncated = text.trim().eq_ignore_ascii_case("true");
                     }
@@ -687,7 +715,14 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // A truncated body may end inside `<Contents>`: keep the key.
+                if let Some(key) = entry_key.take() {
+                    page.keys.push(key);
+                    page.last_modified.push(entry_modified.take());
+                }
+                break;
+            }
             // Decl, Comment, PI, DocType, and self-closing elements carry no
             // value we read.
             Ok(_) => {}
@@ -1359,6 +1394,14 @@ pub struct S3Backend {
     /// One-way and advisory: a spurious latch costs a slower listing path, not
     /// correctness, so a relaxed load/store is enough.
     list_fallback_latched: AtomicBool,
+    /// Latched once this endpoint has answered `object_store`'s CopyObject
+    /// with `411 Length Required` (#3737), so every later copy goes straight
+    /// to [`S3Backend::copy_object_with_explicit_length`] instead of paying a
+    /// rejected round trip first. Google Cloud Storage's S3-compatible XML API
+    /// requires `Content-Length` on every PUT, including the empty-bodied
+    /// CopyObject that `object_store` sends without one; AWS tolerates the
+    /// omission. One-way and advisory, like `list_fallback_latched`.
+    copy_length_fallback_latched: AtomicBool,
 }
 
 impl S3Backend {
@@ -1751,6 +1794,7 @@ impl S3Backend {
             control_timeout: (config.control_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.control_timeout_secs)),
             list_fallback_latched: AtomicBool::new(config.provider == S3Provider::Oss),
+            copy_length_fallback_latched: AtomicBool::new(false),
         })
     }
 
@@ -2147,6 +2191,10 @@ impl super::StorageBackend for S3Backend {
         }))
     }
 
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
     #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         let path: ObjectPath = ".health-probe".into();
@@ -2436,6 +2484,17 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's last-modified time
+    /// when the listing reports it (`None` on the #3593 REST fallback).
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         // Compose the search prefix through `make_full_key` so a listing
         // resolves the same physical location a `get`/`put` of a key under it
         // would (#3368).
@@ -2471,9 +2530,12 @@ impl S3Backend {
                 .await
             {
                 Ok(objects) => {
-                    let keys: Vec<String> = objects
+                    let keys: Vec<super::ListedKey> = objects
                         .into_iter()
-                        .map(|meta| self.strip_prefix(meta.location.as_ref()))
+                        .map(|meta| super::ListedKey {
+                            key: self.strip_prefix(meta.location.as_ref()),
+                            last_modified: Some(meta.last_modified),
+                        })
                         .collect();
                     tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
                     return Ok(keys);
@@ -2496,7 +2558,13 @@ impl S3Backend {
         }
 
         let full_keys = self.rest_list_objects(&search_prefix).await?;
-        let keys: Vec<String> = full_keys.iter().map(|key| self.strip_prefix(key)).collect();
+        let keys: Vec<super::ListedKey> = full_keys
+            .iter()
+            .map(|(key, last_modified)| super::ListedKey {
+                key: self.strip_prefix(key),
+                last_modified: *last_modified,
+            })
+            .collect();
 
         tracing::debug!(
             prefix = ?prefix,
@@ -2515,7 +2583,10 @@ impl S3Backend {
     /// [`AwsAuthorizer`] against the store's own credential chain (so IRSA and
     /// container credentials keep working), and it rides [`Self::raw_http`].
     /// Returns FULL keys — the caller strips the configured prefix.
-    async fn rest_list_objects(&self, search_prefix: &str) -> Result<Vec<String>> {
+    async fn rest_list_objects(
+        &self,
+        search_prefix: &str,
+    ) -> Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
         use object_store::signer::Signer;
 
         // Both `signed_url` and `credentials()` resolve credentials
@@ -2559,7 +2630,7 @@ impl S3Backend {
                 ))
             })?;
 
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut url = root.clone();
@@ -2609,7 +2680,7 @@ impl S3Backend {
             }
 
             let page = parse_list_bucket_result(&body)?;
-            keys.extend(page.keys);
+            keys.extend(page.keys.into_iter().zip(page.last_modified));
 
             match page.next_continuation_token {
                 Some(token) if page.is_truncated => {
@@ -2648,18 +2719,160 @@ impl S3Backend {
             return self.multipart_server_side_copy(source, dest, size).await;
         }
 
+        if self.copy_length_fallback_latched.load(Ordering::Relaxed) {
+            return self.copy_object_with_explicit_length(source, dest).await;
+        }
+
         let source_key = self.full_key(source);
         let dest_key = self.full_key(dest);
 
         let from: ObjectPath = source_key.into();
         let to: ObjectPath = dest_key.into();
 
-        self.bulk_store.copy(&from, &to).await.map_err(|e| {
-            AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
-        })?;
+        if let Err(e) = self.bulk_store.copy(&from, &to).await {
+            let message = e.to_string();
+            if !copy_rejected_for_missing_length(&message) {
+                return Err(AppError::Storage(format!(
+                    "Failed to copy '{}' to '{}': {}",
+                    source, dest, message
+                )));
+            }
+            tracing::warn!(
+                source = %source,
+                dest = %dest,
+                error = %message,
+                "S3 endpoint rejected CopyObject without Content-Length (411); \
+                 retrying with an explicit Content-Length: 0 and using that form \
+                 for every later copy on this backend (#3737)"
+            );
+            self.copy_length_fallback_latched
+                .store(true, Ordering::Relaxed);
+            return self.copy_object_with_explicit_length(source, dest).await;
+        }
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
+    }
+
+    /// Server-side `CopyObject` carrying an explicit `Content-Length: 0`, for
+    /// endpoints that reject the header-less PUT `object_store` sends (#3737).
+    ///
+    /// Google Cloud Storage's S3-compatible XML API answers a PUT without
+    /// `Content-Length` with `411 Length Required`, even when the body is
+    /// empty; `object_store` exposes no per-call header override, so this is a
+    /// hand-rolled request signed exactly like [`Self::upload_part_copy`]. An
+    /// unsigned store cannot sign it, so it falls back to the streaming
+    /// PUT-copy every provider supports.
+    async fn copy_object_with_explicit_length(&self, source: &str, dest: &str) -> Result<()> {
+        if !self.sign_requests {
+            return self.streaming_put_copy(source, dest).await;
+        }
+        let copy_source = s3_copy_source_value(&self.bucket, &self.full_key(source));
+        let dest_path: ObjectPath = self.full_key(dest).into();
+        let mut url = self.signed_copy_url(&dest_path).await?;
+        url.set_query(None);
+        self.send_signed_copy_put(
+            url,
+            &[("x-amz-copy-source", copy_source.as_str())],
+            &format!("CopyObject '{}' -> '{}'", source, dest),
+        )
+        .await?;
+        tracing::debug!(
+            source = %source,
+            dest = %dest,
+            "S3 CopyObject with explicit Content-Length successful"
+        );
+        Ok(())
+    }
+
+    /// Build the path-style/virtual-hosted URL for a hand-rolled PUT against
+    /// `dest_path`, derived from the configured store (see
+    /// [`Self::upload_part_copy`]). The caller replaces the query string.
+    async fn signed_copy_url(&self, dest_path: &ObjectPath) -> Result<url::Url> {
+        use object_store::signer::Signer;
+        self.store
+            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build copy URL for '{}': {}",
+                    dest_path.as_ref(),
+                    e
+                ))
+            })
+    }
+
+    /// Send one hand-rolled, SigV4-signed, empty-bodied copy PUT
+    /// (`CopyObject` or `UploadPartCopy`) and return the `ETag` from its
+    /// result document.
+    ///
+    /// The request always carries `Content-Length: 0`: S3 accepts it and
+    /// Google Cloud Storage's S3-compatible API requires it on every PUT
+    /// (#3737). A `200 OK` whose body is an `<Error>` document is a failure
+    /// (S3 copy operations can report errors that way).
+    async fn send_signed_copy_put(
+        &self,
+        url: url::Url,
+        headers: &[(&str, &str)],
+        what: &str,
+    ) -> Result<String> {
+        let credential = self
+            .bulk_store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to resolve S3 credentials for {}: {}",
+                    what, e
+                ))
+            })?;
+
+        let mut builder = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(url.as_str())
+            .header(http::header::CONTENT_LENGTH, "0");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder
+            .body(object_store::client::HttpRequestBody::empty())
+            .map_err(|e| AppError::Storage(format!("Failed to build {} request: {}", what, e)))?;
+        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+
+        let mut send = self
+            .raw_http
+            .put(url.as_str())
+            .headers(request.headers().clone());
+        if let Some(timeout) = self.bulk_timeout {
+            // A server-side copy of up to 5 GiB is bulk work: give it the
+            // bulk ceiling, not reqwest's unbounded default.
+            send = send.timeout(timeout);
+        }
+        let response = send
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("{} failed to send: {}", what, e)))?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AppError::Storage(format!(
+                "{} failed: {} {}: {}",
+                what,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )));
+        }
+        parse_copy_part_etag(&body).ok_or_else(|| {
+            AppError::Storage(format!(
+                "{} returned {} without a copy-result ETag: {}",
+                what,
+                status.as_u16(),
+                body
+            ))
+        })
     }
 
     /// Copy by reading the source back and streaming it into `dest` with a
@@ -2829,95 +3042,34 @@ impl S3Backend {
         part_idx: usize,
         range: (u64, u64),
     ) -> Result<PartId> {
-        use object_store::signer::Signer;
-
-        let display = dest_path.as_ref();
         // "Part number of part being copied. This is a positive integer
         // between 1 and 10,000" (S3 API Reference, UploadPartCopy).
         let part_number = part_idx + 1;
 
-        let mut url = self
-            .store
-            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to build UploadPartCopy URL for '{}': {}",
-                    display, e
-                ))
-            })?;
+        let mut url = self.signed_copy_url(dest_path).await?;
         url.set_query(None);
         url.query_pairs_mut()
             .append_pair("partNumber", &part_number.to_string())
             .append_pair("uploadId", upload_id);
 
-        let credential = self
-            .bulk_store
-            .credentials()
-            .get_credential()
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to resolve S3 credentials for UploadPartCopy of '{}': {}",
-                    display, e
-                ))
-            })?;
-
         // "The range value must use the form bytes=first-last, where the
         // first and last are the zero-based byte offsets to copy" (S3 API
         // Reference, UploadPartCopy, x-amz-copy-source-range). Inclusive.
         let range_value = format!("bytes={}-{}", range.0, range.1);
-        let mut request = http::Request::builder()
-            .method(http::Method::PUT)
-            .uri(url.as_str())
-            .header("x-amz-copy-source", copy_source)
-            .header("x-amz-copy-source-range", &range_value)
-            .body(object_store::client::HttpRequestBody::empty())
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to build UploadPartCopy request for '{}': {}",
-                    display, e
-                ))
-            })?;
-        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
-
-        let mut send = self
-            .raw_http
-            .put(url.as_str())
-            .headers(request.headers().clone());
-        if let Some(timeout) = self.bulk_timeout {
-            // A 5 GiB server-side copy is bulk work: give it the bulk
-            // ceiling, not reqwest's unbounded default.
-            send = send.timeout(timeout);
-        }
-        let response = send.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' failed to send: {}",
-                part_number, display, e
-            ))
-        })?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' failed: {} {}: {}",
-                part_number,
-                display,
-                status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                body
-            )));
-        }
-        let etag = parse_copy_part_etag(&body).ok_or_else(|| {
-            AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' returned {} without a CopyPartResult ETag: {}",
-                part_number,
-                display,
-                status.as_u16(),
-                body
-            ))
-        })?;
+        let etag = self
+            .send_signed_copy_put(
+                url,
+                &[
+                    ("x-amz-copy-source", copy_source),
+                    ("x-amz-copy-source-range", range_value.as_str()),
+                ],
+                &format!(
+                    "UploadPartCopy part {} for '{}'",
+                    part_number,
+                    dest_path.as_ref()
+                ),
+            )
+            .await?;
         Ok(PartId { content_id: etag })
     }
 
@@ -4934,6 +5086,7 @@ mod tests {
             provider: S3Provider::Generic,
             control_timeout: Some(S3_CONTROL_TIMEOUT),
             list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
     }
@@ -5249,6 +5402,7 @@ mod tests {
                 provider: S3Provider::Generic,
                 control_timeout: Some(S3_CONTROL_TIMEOUT),
                 list_fallback_latched: AtomicBool::new(false),
+                copy_length_fallback_latched: AtomicBool::new(false),
                 disable_multi_delete: false,
             };
             backend.copy("src-key", "dst-key").await
@@ -5332,6 +5486,7 @@ mod tests {
             provider: S3Provider::Generic,
             control_timeout: Some(S3_CONTROL_TIMEOUT),
             list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete: false,
         };
 
@@ -6188,6 +6343,31 @@ mod tests {
         assert!(page.next_continuation_token.is_none());
     }
 
+    /// #1570 review: the REST fallback must carry `<LastModified>` so the
+    /// storage reindex can tell settled ghosts from in-flight uploads on
+    /// endpoints (Alibaba OSS) that always use it.
+    #[test]
+    fn test_parse_list_response_carries_last_modified_1570() {
+        let page = parse_list_bucket_result(OSS_LIST_RESPONSE).expect("OSS sample must parse");
+        assert_eq!(page.last_modified.len(), page.keys.len());
+        assert!(page.last_modified.iter().all(Option::is_some), "{page:?}");
+
+        // Either element order, and a missing/garbled value is `None`.
+        let xml = r#"<ListBucketResult>
+            <Contents><LastModified>2020-06-22T11:42:35.000Z</LastModified><Key>a</Key></Contents>
+            <Contents><Key>b</Key></Contents>
+            <Contents><Key>c</Key><LastModified>not a date</LastModified></Contents>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("must parse");
+        assert_eq!(page.keys, vec!["a", "b", "c"]);
+        assert_eq!(
+            page.last_modified[0].map(|d| d.to_rfc3339()),
+            Some("2020-06-22T11:42:35+00:00".to_string())
+        );
+        assert_eq!(page.last_modified[1], None);
+        assert_eq!(page.last_modified[2], None);
+    }
+
     #[test]
     fn test_parse_list_response_ignores_owner_and_unknown_elements_3593() {
         // <Owner><ID> sits inside <Contents> but is not a key, and a provider
@@ -6718,6 +6898,148 @@ mod tests {
                 .map(|r| (r.method.clone(), r.url.path().to_string()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Matches a request that carries no `Content-Length` header at all —
+    /// the shape Google Cloud Storage's S3 API rejects with 411 (#3737).
+    struct MissingContentLength;
+
+    impl wiremock::Match for MissingContentLength {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !request.headers.contains_key(http::header::CONTENT_LENGTH)
+        }
+    }
+
+    /// Stand up a GCS-like S3 endpoint: the source HEAD answers, a CopyObject
+    /// PUT without `Content-Length` is refused with `411 Length Required`
+    /// exactly as `storage.googleapis.com` does, and one that carries it
+    /// succeeds with a `CopyObjectResult`.
+    async fn gcs_like_copy_server(source_path: &str, dest_path: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path(source_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"deadbeef\"")
+                    .set_body_bytes(vec![0u8; 7]),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(dest_path))
+            .and(header_exists("x-amz-copy-source"))
+            .and(MissingContentLength)
+            .respond_with(ResponseTemplate::new(411).set_body_string(
+                "<?xml version='1.0' encoding='UTF-8'?><Error><Code>MissingContentLength</Code>\
+                 <Message>Length Required</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(dest_path))
+            .and(header_exists("x-amz-copy-source"))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult>\
+                 <LastModified>2026-09-28T00:00:00.000Z</LastModified>\
+                 <ETag>\"deadbeef\"</ETag></CopyObjectResult>",
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_copy_succeeds_on_endpoint_requiring_content_length_3737() {
+        let _env = SignedS3TestEnv::enter();
+        let server = gcs_like_copy_server(
+            "/example-bucket/proxy-cache-staging/abc",
+            "/example-bucket/proxy-cache/scope/pypi-remote/six.whl/__content__",
+        )
+        .await;
+
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "auto".to_string(),
+            Some(server.uri()),
+            None,
+        ))
+        .await
+        .expect("S3Backend::new");
+
+        for attempt in 0..2 {
+            backend
+                .copy(
+                    "proxy-cache-staging/abc",
+                    "proxy-cache/scope/pypi-remote/six.whl/__content__",
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "copy #{attempt} must succeed on an endpoint that requires \
+                         Content-Length on CopyObject (GCS, #3737): {e}"
+                    )
+                });
+        }
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let copies: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == http::Method::PUT)
+            .collect();
+        assert_eq!(
+            copies
+                .iter()
+                .filter(|r| !r.headers.contains_key(http::header::CONTENT_LENGTH))
+                .count(),
+            1,
+            "only the first copy may pay the rejected header-less CopyObject; the 411 \
+             latches the explicit-length form for every later copy"
+        );
+        assert_eq!(
+            copies
+                .iter()
+                .filter(|r| r
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .is_some_and(|v| v == "0"))
+                .count(),
+            2,
+            "both copies must be completed by a CopyObject carrying Content-Length: 0"
+        );
+        let signed = copies
+            .iter()
+            .find(|r| r.headers.contains_key(http::header::CONTENT_LENGTH))
+            .expect("the explicit-length CopyObject was sent");
+        assert_eq!(
+            signed
+                .headers
+                .get("x-amz-copy-source")
+                .and_then(|v| v.to_str().ok()),
+            Some("example-bucket/proxy-cache-staging/abc"),
+            "the retried CopyObject must still be server-side from the staged source"
+        );
+        assert!(
+            signed.headers.contains_key(http::header::AUTHORIZATION),
+            "the hand-rolled CopyObject must be SigV4-signed"
+        );
+    }
+
+    #[test]
+    fn test_copy_rejected_for_missing_length_matches_only_411() {
+        assert!(copy_rejected_for_missing_length(
+            "Generic S3 error: Error performing PUT https://storage.googleapis.com/b/k in 103ms \
+             - Server returned non-2xx status code: 411 Length Required: "
+        ));
+        assert!(!copy_rejected_for_missing_length(
+            "Server returned non-2xx status code: 404 Not Found"
+        ));
+        assert!(!copy_rejected_for_missing_length(
+            "Server returned non-2xx status code: 403 Forbidden: key 411"
+        ));
     }
 
     #[tokio::test]

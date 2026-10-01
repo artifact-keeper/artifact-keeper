@@ -78,6 +78,15 @@ pub struct ContentDigests {
     pub md5: String,
 }
 
+/// Where the body of a streaming upload comes from (#3916).
+pub enum UploadContent {
+    /// Bytes still to be written, e.g. re-read from a local scratch file.
+    Stream(BoxStream<'static, Result<Bytes>>),
+    /// An object already written to the upload's own storage backend under
+    /// this key (e.g. `generic-upload-staging/<uuid>`); promoted with `copy`.
+    StagedObject(String),
+}
+
 /// Incremental SHA-256 + SHA-1 + MD5 accumulator.
 ///
 /// Feed chunks with [`MultiHasher::update`], then [`MultiHasher::finalize`] into
@@ -695,6 +704,43 @@ impl ArtifactService {
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
     ) -> Result<Artifact> {
+        self.upload_content_with_sync_options(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            UploadContent::Stream(stream),
+            digests,
+            size_bytes,
+            uploaded_by,
+            enqueue_sync_tasks,
+            catalog_name,
+        )
+        .await
+    }
+
+    /// [`Self::upload_stream_with_sync_options`] generalised over where the
+    /// body comes from (#3916): a byte stream written with `put_stream`, or an
+    /// object the caller already staged on THIS service's backend, promoted to
+    /// the content-addressed key with a backend `copy` (server-side on S3 and
+    /// GCS) so the body never touches local disk. Every other semantic --
+    /// preflight, dedup-first, finalize -- is shared.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_content_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        content: UploadContent,
+        digests: ContentDigests,
+        size_bytes: i64,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
+    ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
         self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
@@ -706,15 +752,25 @@ impl ArtifactService {
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
-            let put = self.storage.put_stream(&storage_key, stream).await?;
-            // `put_stream` computes only SHA-256; guard the content-addressed
-            // invariant that the streamed bytes hash to the key we stored them
-            // under (SHA-1 / MD5 for the row come from `digests`).
-            if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
-                return Err(AppError::Validation(format!(
-                    "Streamed content SHA-256 {} does not match staged digest {}",
-                    put.checksum_sha256, digests.sha256
-                )));
+            match content {
+                UploadContent::Stream(stream) => {
+                    let put = self.storage.put_stream(&storage_key, stream).await?;
+                    // `put_stream` computes only SHA-256; guard the
+                    // content-addressed invariant that the streamed bytes hash
+                    // to the key we stored them under (SHA-1 / MD5 for the row
+                    // come from `digests`).
+                    if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
+                        return Err(AppError::Validation(format!(
+                            "Streamed content SHA-256 {} does not match staged digest {}",
+                            put.checksum_sha256, digests.sha256
+                        )));
+                    }
+                }
+                // The stager hashed these exact bytes on their way into the
+                // staged object, so `digests` already describes them.
+                UploadContent::StagedObject(staged_key) => {
+                    self.storage.copy(&staged_key, &storage_key).await?;
+                }
             }
         }
 
@@ -751,6 +807,7 @@ impl ArtifactService {
         size_bytes: i64,
         checksum_sha256: &str,
     ) -> Result<()> {
+        crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
         // Check quota
         if !self
             .repo_service
@@ -980,8 +1037,8 @@ impl ArtifactService {
             // handler whose `artifacts.name` is a normalized form of it —
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
-            let (package_name, package_version) = match catalog_name {
-                Some(catalog_name) => (catalog_name.to_string(), ver.clone()),
+            let registration = match catalog_name {
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -989,30 +1046,46 @@ impl ArtifactService {
                             RepositoryFormat::Maven | RepositoryFormat::Gradle
                         ) =>
                     {
-                        match crate::formats::maven::MavenHandler::parse_coordinates(&artifact.path)
-                        {
-                            Ok(coords) => (
-                                format!("{}:{}", coords.group_id, coords.artifact_id),
-                                coords.version,
-                            ),
-                            Err(_) => (artifact.name.clone(), ver.clone()),
+                        // #4197: `maven-metadata.xml` and checksum/signature
+                        // sidecars are repository metadata, not packages —
+                        // `parse_coordinates` would read the artifactId
+                        // directory as a version and register a bogus row.
+                        // Same skip predicate as the catalog backfill, so
+                        // publish time and backfill can never disagree.
+                        if crate::services::package_service::is_maven_sidecar(&artifact.path) {
+                            None
+                        } else {
+                            match crate::formats::maven::MavenHandler::parse_coordinates(
+                                &artifact.path,
+                            ) {
+                                Ok(coords) => Some((
+                                    format!("{}:{}", coords.group_id, coords.artifact_id),
+                                    coords.version,
+                                )),
+                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                            }
                         }
                     }
-                    _ => (artifact.name.clone(), ver.clone()),
+                    _ => Some((artifact.name.clone(), ver.clone())),
                 },
             };
-            let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
-            pkg_svc
-                .try_create_or_update_from_artifact(
-                    artifact.repository_id,
-                    &package_name,
-                    &package_version,
-                    artifact.size_bytes,
-                    &artifact.checksum_sha256,
-                    None,
-                    None,
-                )
-                .await;
+            // A metadata/sidecar upload (None) still gets its artifact row and
+            // the sync fan-out below — only catalog registration is skipped.
+            if let Some((package_name, package_version)) = registration {
+                let pkg_svc =
+                    crate::services::package_service::PackageService::new(self.db.clone());
+                pkg_svc
+                    .try_create_or_update_from_artifact(
+                        artifact.repository_id,
+                        &package_name,
+                        &package_version,
+                        artifact.size_bytes,
+                        &artifact.checksum_sha256,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
         }
 
         // Queue sync tasks for peer replication (non-blocking)
@@ -1092,31 +1165,15 @@ impl ArtifactService {
             });
         }
 
-        // Trigger scan-on-upload if scanner service is configured
-        if let Some(ref scanner) = self.scanner_service {
-            let scanner = scanner.clone();
-            let artifact_id = artifact.id;
-            let repo_id = artifact.repository_id;
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                // Check if scan_on_upload is enabled for this repository
-                let should_scan = sqlx::query_scalar!(
-                    "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-                    repo_id
-                )
-                .fetch_optional(&db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-
-                if should_scan {
-                    if let Err(e) = scanner.scan_artifact(artifact_id).await {
-                        tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
-                    }
-                }
-            });
-        }
+        // Trigger scan-on-upload if scanner service is configured. The same
+        // gate every format-native upload handler goes through (#4166).
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &self.db,
+            self.scanner_service.clone(),
+            artifact.repository_id,
+            artifact.id,
+        )
+        .await;
 
         // Trigger quality checks on upload (non-blocking)
         if let Some(ref qc) = self.quality_check_service {
@@ -5576,5 +5633,82 @@ mod tests {
         );
         assert_eq!(uploaded[0].entity_id, artifact.id.to_string());
         assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    }
+    /// #4197: uploading `maven-metadata.xml` (or a checksum/signature
+    /// sidecar) through the generic finalize path must NOT register a catalog
+    /// row — `parse_coordinates` reads the artifactId directory as the
+    /// version and would invent a bogus package (`com.acme:widget` at version
+    /// `widget`). The real asset registers the row; publish time and the
+    /// #3659 backfill now share the same skip predicate.
+    #[tokio::test]
+    async fn test_4197_maven_metadata_upload_registers_no_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        // Metadata document and a checksum sidecar of a real asset: neither is
+        // a package. The `version` argument mimics the naive path-segment
+        // derivation the generic/replication callers hand in.
+        for (path, name, version) in [
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "maven-metadata.xml",
+                "widget",
+            ),
+            (
+                "com/acme/widget/1.2.3/widget-1.2.3.jar.sha1",
+                "widget-1.2.3.jar.sha1",
+                "1.2.3",
+            ),
+        ] {
+            service
+                .upload(
+                    repo_id,
+                    path,
+                    name,
+                    Some(version),
+                    "application/octet-stream",
+                    Bytes::from_static(b"metadata-or-sidecar"),
+                    None,
+                )
+                .await
+                .expect("metadata/sidecar upload");
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count packages");
+        assert_eq!(
+            rows, 0,
+            "metadata/sidecar uploads must not register catalog rows (#4197)"
+        );
+
+        // Control: the real asset registers under groupId:artifactId (#2723).
+        service
+            .upload(
+                repo_id,
+                "com/acme/widget/1.2.3/widget-1.2.3.jar",
+                "widget-1.2.3.jar",
+                Some("1.2.3"),
+                "application/java-archive",
+                Bytes::from_static(b"jar-bytes"),
+                None,
+            )
+            .await
+            .expect("asset upload");
+        assert!(
+            tdh::catalog_row(&pool, repo_id, "com.acme:widget")
+                .await
+                .is_some(),
+            "the real asset registers com.acme:widget"
+        );
     }
 }

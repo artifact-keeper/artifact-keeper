@@ -689,14 +689,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
-    // #3647: enabling quarantine on a Remote/Virtual repository is refused at
-    // the API now, but rows written before that gate still block every uncached
-    // fetch with no release path. Warn about them once per boot; the stored
-    // config is left untouched (see `warn_unsupported_proxy_quarantine`).
+    // #3647 / #3912: enabling quarantine on a Virtual repository is refused
+    // at the API (a virtual has no cache of its own; the policy belongs on
+    // its member remotes), but rows written before that gate are dead state.
+    // Warn about them once per boot; the stored config is left untouched
+    // (see `warn_unsupported_virtual_quarantine`).
     {
         let db_pool = db_pool.clone();
         tokio::spawn(async move {
-            artifact_keeper_backend::services::quarantine_service::warn_unsupported_proxy_quarantine(
+            artifact_keeper_backend::services::quarantine_service::warn_unsupported_virtual_quarantine(
                 &db_pool,
             )
             .await;
@@ -836,8 +837,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         proxy_cache_scope.root()
     );
 
-    // Initialize proxy service for remote repository caching
-    match StorageService::from_config(&config).await {
+    // Initialize proxy service for remote repository caching. A default
+    // backend without a proxy-cache arm (Azure) gets a filesystem facade under
+    // STORAGE_PATH instead of no proxy service at all (#3923): remote
+    // repositories pinned to `storage_backend: "filesystem"` are served, and
+    // repository creation rejects remote repositories the facade cannot serve
+    // (`remote_repository_backend_error`), so a single create can no longer
+    // turn the next restart into an outage.
+    let proxy_cache_backend =
+        artifact_keeper_backend::services::storage_service::proxy_cache_backend_for(
+            &config.storage_backend,
+        )
+        .to_string();
+    match StorageService::proxy_cache_from_config(&config).await {
         Ok(storage_svc) => {
             let proxy_service = Arc::new(ProxyService::new(
                 db_pool.clone(),
@@ -845,56 +857,37 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 proxy_cache_scope,
             ));
             app_state.set_proxy_service(proxy_service);
-            tracing::info!("Proxy service initialized for remote repositories");
+            tracing::info!(
+                proxy_cache_backend = %proxy_cache_backend,
+                "Proxy service initialized for remote repositories"
+            );
+            if proxy_cache_backend != config.storage_backend {
+                warn_unservable_remote_repositories(&db_pool, &config.storage_backend).await?;
+            }
         }
         Err(e) => {
-            if artifact_keeper_backend::services::storage_service::backend_supports_proxy_cache(
-                &config.storage_backend,
-            ) {
-                // A backend that *can* back the proxy facade failed for a
-                // transient/optional reason (e.g. missing S3 credentials on a
-                // hosted-only deployment). Preserve the historical graceful
-                // degrade: remote repositories are simply disabled.
-                tracing::warn!(
-                    "Failed to initialize proxy service, remote repositories disabled: {}",
-                    e
-                );
-            } else {
-                // Structural gap (#2670/#1555): this backend has no proxy-cache
-                // StorageService arm (Azure). Booting green here silently
-                // black-holes every remote/proxy repository — the format
-                // handlers skip the upstream fetch when the proxy service is
-                // absent, so requests just fail to find packages with no error.
-                // Fail closed if any remote repository is already configured;
-                // otherwise log loudly so the gap is visible rather than silent.
-                let remote_repo_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM repositories \
-                     WHERE repo_type = 'remote'::repository_type",
-                )
-                .fetch_one(&db_pool)
-                .await?;
-
+            // Historical graceful degrade (e.g. missing S3 credentials on a
+            // hosted-only deployment): remote repositories are disabled. The
+            // one exception is the filesystem fallback of a default without a
+            // proxy arm failing while remote repositories exist: booting
+            // without a proxy service would silently black-hole them, so
+            // startup stays fail-closed there (the #2670 guard).
+            if proxy_cache_backend != config.storage_backend {
+                let remote_repo_count = count_remote_repositories(&db_pool).await?;
                 if remote_repo_count > 0 {
                     return Err(artifact_keeper_backend::error::AppError::Config(format!(
-                        "STORAGE_BACKEND={} cannot serve remote/proxy repositories \
-                         (proxy StorageService unavailable: {}), but {} remote \
-                         repository(ies) are configured. Refusing to start rather than \
-                         boot healthy and silently black-hole their upstream traffic. \
-                         See #1555 for Azure proxy-cache support.",
+                        "STORAGE_BACKEND={} keeps the proxy cache on the local filesystem \
+                         under STORAGE_PATH, but that proxy cache could not be initialized \
+                         ({}), and {} remote repository(ies) are configured. Refusing to \
+                         start rather than silently black-hole their upstream traffic.",
                         config.storage_backend, e, remote_repo_count
                     )));
                 }
-
-                tracing::error!(
-                    backend = %config.storage_backend,
-                    error = %e,
-                    "Remote/proxy repositories are NOT supported on this storage \
-                     backend: the proxy StorageService has no arm for it (#1555). No \
-                     remote repositories are configured yet, so startup continues, \
-                     but any remote repository created later will silently fail to \
-                     proxy upstream content until #1555 is resolved."
-                );
             }
+            tracing::warn!(
+                "Failed to initialize proxy service, remote repositories disabled: {}",
+                e
+            );
         }
     }
 
@@ -1767,80 +1760,62 @@ fn build_oidc_bootstrap_request(
 /// The provider named by LDAP_NAME (default `default`) is reconciled on every
 /// boot. If providers already exist but none carries that name, bootstrap skips
 /// creation and warns rather than duplicating a pre-existing provider (#1887).
+/// The reconcile writes only the fields the environment owns and preserves
+/// admin-API-set values for the rest (#3904); the rule lives in
+/// `services::ldap_env_bootstrap`.
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::{
-        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        reconcile_ldap_from_env, warn_discarded_fields, LdapEnvOutcome,
     };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
+    let wanted = req.name.clone();
 
-    // Reconcile the env-managed provider (matched by name) on every boot so
-    // changing LDAP_* env and redeploying takes effect. Other (UI-created)
-    // providers are left untouched.
-    let existing = AuthConfigService::list_ldap(db).await?;
-    let pairs: Vec<(uuid::Uuid, String)> =
-        existing.iter().map(|c| (c.id, c.name.clone())).collect();
-
-    match plan_provider_reconcile(&req.name, &pairs) {
-        ReconcileAction::Create => {
-            let config = AuthConfigService::create_ldap(db, req).await?;
-            tracing::info!(
-                "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
-                config.name,
-                config.id
-            );
-        }
-        ReconcileAction::Update(id) => {
-            let name = req.name.clone();
-            let cfg = AuthConfigService::update_ldap(db, id, req.into()).await?;
+    match reconcile_ldap_from_env(db, req).await? {
+        LdapEnvOutcome::Created { id, name } => tracing::info!(
+            "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+            name,
+            id
+        ),
+        LdapEnvOutcome::Reconciled {
+            id,
+            name,
+            discarded,
+        } => {
+            warn_discarded_fields(&name, &discarded);
             tracing::info!(
                 "Reconciled env-managed LDAP provider '{}' (id={}) from environment variables",
                 name,
-                cfg.id
+                id
             );
         }
-        ReconcileAction::Skip(existing_name) => {
-            tracing::warn!(
-                "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
-                 '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
-                 existing provider's name (or rename it to '{}') to let env vars manage it, or \
-                 unset LDAP_*.",
-                existing_name,
-                req.name,
-                req.name
-            );
-        }
+        LdapEnvOutcome::Skipped { existing_name } => tracing::warn!(
+            "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
+             '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
+             existing provider's name (or rename it to '{}') to let env vars manage it, or \
+             unset LDAP_*.",
+            existing_name,
+            wanted,
+            wanted
+        ),
     }
 
     Ok(())
 }
 
-/// Raw LDAP environment variable values for bootstrap.
-#[derive(Default)]
-struct LdapEnvVars {
-    name: Option<String>,
-    url: Option<String>,
-    base_dn: Option<String>,
-    bind_dn: Option<String>,
-    bind_password: Option<String>,
-    user_filter: Option<String>,
-    username_attr: Option<String>,
-    email_attr: Option<String>,
-    display_name_attr: Option<String>,
-    groups_attr: Option<String>,
-    group_base_dn: Option<String>,
-    group_filter: Option<String>,
-    admin_group_dn: Option<String>,
-    use_starttls: Option<String>,
-}
-
 /// Build a CreateLdapConfigRequest from LDAP_* environment variables.
-/// Returns None if any of the required env vars are missing or empty.
+/// Returns None if any of the required env vars are missing or empty. The
+/// assembly itself lives in `services::ldap_env_bootstrap` so the library's
+/// unit-test target covers it.
 fn build_ldap_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    use artifact_keeper_backend::services::ldap_env_bootstrap::{
+        build_ldap_request_from_values, LdapEnvVars,
+    };
+
     build_ldap_request_from_values(LdapEnvVars {
         name: std::env::var("LDAP_NAME").ok(),
         url: std::env::var("LDAP_URL").ok(),
@@ -1856,52 +1831,6 @@ fn build_ldap_bootstrap_request(
         group_filter: std::env::var("LDAP_GROUP_FILTER").ok(),
         admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
         use_starttls: std::env::var("LDAP_USE_STARTTLS").ok(),
-    })
-}
-
-/// Pure function that assembles a CreateLdapConfigRequest from optional values.
-/// Returns None if the LDAP server URL or base DN are missing or empty: both
-/// are required to bind and search the directory.
-fn build_ldap_request_from_values(
-    env: LdapEnvVars,
-) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
-    use artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest;
-
-    let server_url = env.url.filter(|v| !v.is_empty())?;
-    let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
-
-    let name = env
-        .name
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-
-    let use_starttls = env
-        .use_starttls
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    Some(CreateLdapConfigRequest {
-        name,
-        server_url,
-        bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
-        bind_password: env.bind_password.filter(|v| !v.is_empty()),
-        user_base_dn,
-        user_filter: env.user_filter.filter(|v| !v.is_empty()),
-        group_base_dn: env.group_base_dn.filter(|v| !v.is_empty()),
-        group_filter: env.group_filter.filter(|v| !v.is_empty()),
-        email_attribute: env.email_attr.filter(|v| !v.is_empty()),
-        display_name_attribute: env.display_name_attr.filter(|v| !v.is_empty()),
-        username_attribute: env.username_attr.filter(|v| !v.is_empty()),
-        groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
-        admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
-        use_starttls: Some(use_starttls),
-        // TLS trust for the env-bootstrapped provider stays governed by the
-        // global LDAP_INSECURE_TLS / LDAP_CA_CERT_PATH env fallback (#2782);
-        // the per-provider overrides are set via the admin SSO API.
-        insecure_skip_verify: None,
-        ca_certificate: None,
-        is_enabled: Some(true),
-        priority: Some(0),
     })
 }
 
@@ -2650,6 +2579,61 @@ async fn load_active_plugins(
     Ok(plugins)
 }
 
+/// Number of remote/proxy repositories configured on this instance.
+async fn count_remote_repositories(db_pool: &sqlx::PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repositories WHERE repo_type = 'remote'::repository_type",
+    )
+    .fetch_one(db_pool)
+    .await?)
+}
+
+/// Log, at error level, the remote repositories a proxy-cache fallback facade
+/// cannot serve faithfully (#3923).
+///
+/// When the default backend has no proxy-cache arm the facade is the
+/// filesystem under `STORAGE_PATH` (see
+/// `storage_service::proxy_cache_backend_for`), which matches only remote
+/// repositories pinned to `filesystem`. Creation rejects any other pin, so
+/// such rows predate that check. They are reported rather than made fatal:
+/// the proxy service is up and still fetches upstream for them, so there is
+/// no silent black hole to fail closed on, and refusing to start took the
+/// whole instance down over one repository.
+async fn warn_unservable_remote_repositories(
+    db_pool: &sqlx::PgPool,
+    default_backend: &str,
+) -> Result<()> {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT key FROM repositories \
+         WHERE repo_type = 'remote'::repository_type AND storage_backend <> 'filesystem' \
+         ORDER BY key",
+    )
+    .fetch_all(db_pool)
+    .await?;
+    if count_remote_repositories(db_pool).await? > 0 {
+        tracing::warn!(
+            backend = %default_backend,
+            "Remote repositories cache upstream content on the local filesystem under \
+             STORAGE_PATH because STORAGE_BACKEND={default_backend} has no proxy-cache \
+             support. With more than one replica, STORAGE_PATH must be shared storage \
+             (e.g. a ReadWriteMany volume): otherwise each replica keeps its own cache while \
+             cache records are shared, so purges, quarantine and scans reach only one \
+             replica's copy (#3923)."
+        );
+    }
+    if !keys.is_empty() {
+        tracing::error!(
+            backend = %default_backend,
+            repositories = ?keys,
+            "Remote repositories are pinned to a storage backend the proxy cache cannot use \
+             (STORAGE_BACKEND={default_backend} has no proxy-cache support, so the cache is kept \
+             under STORAGE_PATH). Their upstream content is still proxied, but cached copies are \
+             written to the local filesystem; recreate them with storage_backend \"filesystem\" (#3923)."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -3380,160 +3364,6 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_ldap_request_from_values (issue #1434)
-    // -----------------------------------------------------------------------
-
-    fn ldap_env(url: Option<&str>, base_dn: Option<&str>) -> LdapEnvVars {
-        LdapEnvVars {
-            url: url.map(String::from),
-            base_dn: base_dn.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_required_fields() {
-        let req = build_ldap_request_from_values(ldap_env(
-            Some("ldap://dc.local:389"),
-            Some("DC=domain,DC=local"),
-        ))
-        .unwrap();
-
-        assert_eq!(req.name, "default");
-        assert_eq!(req.server_url, "ldap://dc.local:389");
-        assert_eq!(req.user_base_dn, "DC=domain,DC=local");
-        // Bootstrapped providers are enabled so they show up in the SSO list.
-        assert_eq!(req.is_enabled, Some(true));
-        assert_eq!(req.priority, Some(0));
-        assert_eq!(req.use_starttls, Some(false));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_name_override() {
-        // LDAP_NAME lets operators point the env-managed provider at an
-        // existing one, mirroring OIDC_NAME (#1887).
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("Corporate AD".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "Corporate AD");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_name_defaults() {
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: Some("".to_string()),
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(req.name, "default");
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_url() {
-        let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_missing_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), None));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_url() {
-        let req = build_ldap_request_from_values(ldap_env(Some(""), Some("DC=domain,DC=local")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_base_dn() {
-        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), Some("")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_full_active_directory_config() {
-        // Mirrors the Active Directory example from issue #1434.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            name: None,
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("user@domain".to_string()),
-            bind_password: Some("superPassword".to_string()),
-            user_filter: Some("(sAMAccountName={0})".to_string()),
-            username_attr: Some("sAMAccountName".to_string()),
-            email_attr: None,
-            display_name_attr: None,
-            groups_attr: None,
-            group_base_dn: Some("OU=Groups,DC=domain,DC=local".to_string()),
-            group_filter: Some("(memberUid={0})".to_string()),
-            admin_group_dn: Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local".to_string()),
-            use_starttls: Some("false".to_string()),
-        })
-        .unwrap();
-
-        assert_eq!(req.bind_dn.as_deref(), Some("user@domain"));
-        assert_eq!(req.bind_password.as_deref(), Some("superPassword"));
-        assert_eq!(req.user_filter.as_deref(), Some("(sAMAccountName={0})"));
-        assert_eq!(req.username_attribute.as_deref(), Some("sAMAccountName"));
-        assert_eq!(
-            req.group_base_dn.as_deref(),
-            Some("OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.group_filter.as_deref(), Some("(memberUid={0})"));
-        assert_eq!(
-            req.admin_group_dn.as_deref(),
-            Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local")
-        );
-        assert_eq!(req.use_starttls, Some(false));
-        assert_eq!(req.is_enabled, Some(true));
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_starttls_truthy_values() {
-        for v in ["true", "1"] {
-            let req = build_ldap_request_from_values(LdapEnvVars {
-                url: Some("ldap://dc.local:389".to_string()),
-                base_dn: Some("DC=domain,DC=local".to_string()),
-                use_starttls: Some(v.to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-            assert_eq!(
-                req.use_starttls,
-                Some(true),
-                "value {v} should enable STARTTLS"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ldap_bootstrap_request_empty_optional_fields_become_none() {
-        // Empty strings (e.g. unset compose interpolations) must not produce
-        // empty bind DNs or filters that would break directory binds.
-        let req = build_ldap_request_from_values(LdapEnvVars {
-            url: Some("ldap://dc.local:389".to_string()),
-            base_dn: Some("DC=domain,DC=local".to_string()),
-            bind_dn: Some("".to_string()),
-            bind_password: Some("".to_string()),
-            user_filter: Some("".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-
-        assert!(req.bind_dn.is_none());
-        assert!(req.bind_password.is_none());
-        assert!(req.user_filter.is_none());
     }
 }
 // warm cache benchmark

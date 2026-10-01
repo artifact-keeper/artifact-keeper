@@ -51,6 +51,14 @@ pub const REPO_CACHE_TTL_SECS: u64 = 60;
 
 /// Cached repository metadata populated by the repo-visibility middleware
 /// and reused by format-handler resolvers to avoid a second DB round-trip.
+///
+/// The enforcement flags (`promotion_only`, `age_gate_*`, `curation_*`) ride
+/// the same entry so a cache-built [`RepoInfo`](crate::api::handlers::proxy_helpers::RepoInfo)
+/// is a faithful snapshot of the `repositories` row — a resolver that served
+/// defaults instead would silently fail those gates open (#3778). Writes to
+/// any of these columns fire the `ak_repository_changed_notify` trigger
+/// (migration 239), which evicts the entry fleet-wide; the 60-second TTL is
+/// the fallback bound.
 #[derive(Clone, Debug)]
 pub struct CachedRepo {
     pub id: Uuid,
@@ -59,10 +67,22 @@ pub struct CachedRepo {
     pub upstream_url: Option<String>,
     pub storage_path: String,
     pub storage_backend: String,
-    pub is_public: bool,
+    /// Baseline read audience. Carried instead of the deprecated `is_public`
+    /// mirror so a cache hit and a cache miss reach the same decision, and so
+    /// that narrowing a repository from `internal` to `private` is a real
+    /// change to this field -- which is what the NOTIFY trigger keys off to
+    /// evict this entry across instances (migration 245).
+    pub visibility: crate::models::repository::RepositoryVisibility,
     /// The `index_upstream_url` config value (cargo-specific; `None` for
     /// other formats or when not configured).
     pub index_upstream_url: Option<String>,
+    pub promotion_only: bool,
+    pub age_gate_enabled: bool,
+    pub age_gate_min_age_days: i32,
+    /// Age-source mode wire value (migration 191).
+    pub age_gate_mode: String,
+    pub curation_enabled: bool,
+    pub curation_default_action: String,
 }
 
 /// Thread-safe in-process cache for `CachedRepo` entries, keyed by repo key.
@@ -562,8 +582,14 @@ mod tests {
             upstream_url: None,
             storage_path: "/data/repos/my-repo".to_string(),
             storage_backend: "filesystem".to_string(),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -573,7 +599,10 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(cloned.id, original.id);
         assert_eq!(cloned.format, original.format);
-        assert_eq!(cloned.is_public, original.is_public);
+        assert_eq!(
+            cloned.visibility.allows_anonymous_read(),
+            original.visibility.allows_anonymous_read()
+        );
         assert_eq!(cloned.storage_path, original.storage_path);
     }
 
@@ -662,10 +691,10 @@ mod tests {
     #[test]
     fn test_cached_repo_private_visibility() {
         let repo = CachedRepo {
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             ..make_cached_repo()
         };
-        assert!(!repo.is_public);
+        assert!(!repo.visibility.allows_anonymous_read());
     }
 
     #[tokio::test]
@@ -712,7 +741,7 @@ mod tests {
     async fn test_repo_cache_visibility_toggle() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let private_repo = CachedRepo {
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             ..make_cached_repo()
         };
         cache
@@ -724,13 +753,13 @@ mod tests {
         {
             let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
-            assert!(!entry.is_public);
+            assert!(!entry.visibility.allows_anonymous_read());
         }
 
         // Simulate update: remove old entry, insert updated one.
         cache.write().await.remove("my-cache");
         let public_repo = CachedRepo {
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             ..make_cached_repo()
         };
         cache
@@ -743,7 +772,7 @@ mod tests {
             let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
             assert!(
-                entry.is_public,
+                entry.visibility.allows_anonymous_read(),
                 "cache should reflect the updated visibility immediately"
             );
         }
@@ -770,8 +799,18 @@ mod tests {
                     upstream_url: None,
                     storage_path: format!("/data/{}", key),
                     storage_backend: "filesystem".to_string(),
-                    is_public: i % 2 == 0,
+                    visibility: if i % 2 == 0 {
+                        crate::models::repository::RepositoryVisibility::Public
+                    } else {
+                        crate::models::repository::RepositoryVisibility::Private
+                    },
                     index_upstream_url: None,
+                    promotion_only: false,
+                    age_gate_enabled: false,
+                    age_gate_min_age_days: 7,
+                    age_gate_mode: "upstream_publish_time".to_string(),
+                    curation_enabled: false,
+                    curation_default_action: "allow".to_string(),
                 };
                 c.write().await.insert(key.clone(), (repo, Instant::now()));
                 // Hold a read guard briefly to interleave readers + writers.
