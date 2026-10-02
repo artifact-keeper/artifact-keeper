@@ -9362,6 +9362,55 @@ mod scanned_proxy_file_tests {
         assert_eq!(file.streamed.load(Ordering::SeqCst), 1);
         assert_eq!(downloads, 2);
     }
+
+    /// #3868 part 2, the reporter's exact policy: `severity_threshold =
+    /// critical`, `block_on_policy_violation = false`, and a cached
+    /// `vulnerable` verdict whose `max_severity` is `high`.
+    ///
+    /// * As configured it blocks: `block_on_policy_violation = false` means
+    ///   the threshold was never opted into, so the gate is block-on-any (the
+    ///   documented #3243/#3246 contract, not a threshold bug).
+    /// * Opting in (`block_on_policy_violation = true`) honours the critical
+    ///   threshold: a `high` verdict serves.
+    /// * The reporter's actual intent, "do not block at all", is the
+    ///   record-only action: served `recorded` with the same knobs.
+    #[tokio::test]
+    async fn issue_3868_reporter_policy_blocks_until_opted_in_or_record_only() {
+        let bytes = format!("fake-3868-psycopg2-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        seed_vulnerable(&fx, &digest, "high").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        set_scan_config(&fx, false, "critical", "fail_open").await;
+        let as_reported = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        set_scan_config(&fx, true, "critical", "fail_open").await;
+        let opted_in = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        set_scan_config(&fx, false, "critical", "record_only").await;
+        let record_only = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            as_reported.unwrap_err().status(),
+            StatusCode::FORBIDDEN,
+            "block_on_policy_violation=false never opted into the threshold"
+        );
+        let opted_in =
+            opted_in.unwrap_or_else(|r| panic!("opted-in high withheld: {}", r.status()));
+        assert_eq!(opted_in.status(), StatusCode::OK);
+        assert_eq!(scan_header(&opted_in), "clean");
+        let record_only =
+            record_only.unwrap_or_else(|r| panic!("record-only withheld: {}", r.status()));
+        assert_eq!(record_only.status(), StatusCode::OK);
+        assert_eq!(scan_header(&record_only), "recorded");
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
