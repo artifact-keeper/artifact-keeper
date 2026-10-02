@@ -234,14 +234,14 @@ mod tests {
     #[test]
     fn test_scan_on_proxy_support_per_handler() {
         use ScanOnProxySupport::*;
-        for key in ["npm", "pypi", "oci", "vscode"] {
+        for key in ["npm", "pypi", "oci", "vscode", "cargo"] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
                 Enforced,
                 "{key} gates its proxied downloads"
             );
         }
-        for key in ["maven", "cargo", "nuget", "go", "generic", "conda"] {
+        for key in ["maven", "nuget", "go", "generic", "conda"] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
                 Accepted,

@@ -8625,12 +8625,18 @@ pub(crate) trait ScannedProxyFile: Send + Sync {
     ) -> ProxyScanIdentity;
 
     /// Runs once the buffered fetch has the bytes (cache hit or fill), before
-    /// the gate. Formats that fix up the cached record hook in here.
+    /// the gate, with the SHA-256 of exactly those bytes. Formats that fix up
+    /// the cached record hook in here, as do formats holding a
+    /// registry-recorded digest the bytes must match (Cargo's index `cksum`,
+    /// #2929): `Err` refuses the bytes outright (never scanned, served or
+    /// recorded), and a virtual walk treats it as this member's miss.
     async fn after_buffered_fetch(
         &self,
         _state: &crate::api::SharedState,
         _req: &ScannedProxyRequest<'_>,
-    ) {
+        _digest: &str,
+    ) -> Result<(), Response> {
+        Ok(())
     }
 
     /// Fail-open over the scan byte cap: serve the object UNSCANNED through
@@ -8693,9 +8699,9 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         }
         Err(e) => return Err(e.into_response()),
     };
-    file.after_buffered_fetch(state, req).await;
-
     let digest = sha256_hex(&bytes);
+    file.after_buffered_fetch(state, req, &digest).await?;
+
     let identity = file.identity(req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
@@ -8761,6 +8767,17 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
     }
 }
 
+/// Test-only entry to the over-cap branch, for format suites (Cargo) that pin
+/// their own fallback through it without a 200 MiB fixture.
+#[cfg(test)]
+pub(crate) async fn serve_oversized_proxy_file_for_test<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    serve_oversized_proxy_file(state, req, file).await
+}
+
 /// Record a download served by [`serve_scanned_proxy_file`], on either arm.
 async fn record_scanned_proxy_download(
     state: &crate::api::SharedState,
@@ -8817,8 +8834,10 @@ mod scanned_proxy_file_tests {
             &self,
             _state: &crate::api::SharedState,
             _req: &ScannedProxyRequest<'_>,
-        ) {
+            _digest: &str,
+        ) -> Result<(), Response> {
             self.after_fetch.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn serve_unscanned_stream(
@@ -20697,6 +20716,21 @@ mod proxy_download_recording_tests {
         // named functions' bodies, not every branch inside them; a new
         // package-serving route must be added to this table.
         const ROUTE_PINS: &[(&str, &str, &str, usize)] = &[
+            // #4101: the Remote `.crate` arm and the Virtual member walk.
+            ("cargo.rs", "download", "serve_scanned_crate(", 1),
+            ("cargo.rs", "download", "serve_scanned_virtual_crate(", 1),
+            (
+                "cargo.rs",
+                "serve_scanned_virtual_crate",
+                "serve_scanned_crate(",
+                1,
+            ),
+            (
+                "cargo.rs",
+                "serve_scanned_crate",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
             // Direct Remote arm + the Virtual member walk.
             ("npm.rs", "serve_tarball", "serve_scanned_npm_tarball(", 2),
             (
