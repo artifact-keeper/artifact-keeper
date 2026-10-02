@@ -6193,24 +6193,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_virtual_repo_merges_prefixes_from_members() {
+    /// GET `.meta/prefixes.txt` of a virtual repo over one hosted member per
+    /// group, each holding a single artifact; `None` without a test database.
+    async fn virtual_prefixes(member_groups: &[&str]) -> Option<(StatusCode, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
 
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-
-        let (member_a_id, _member_a_key, member_a_dir) =
-            tdh::create_repo(&pool, "local", "maven").await;
-        let (member_b_id, _member_b_key, member_b_dir) =
-            tdh::create_repo(&pool, "local", "maven").await;
+        let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
-
-        insert_maven_artifact_row(&pool, member_a_id, user_id, "com.acme.prfxv", "moda").await;
-        insert_maven_artifact_row(&pool, member_b_id, user_id, "org.acme.prfxv", "modb").await;
+        let mut members = Vec::new();
+        for group in member_groups {
+            let (id, _key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+            insert_maven_artifact_row(&pool, id, user_id, group, "lib").await;
+            members.push((id, dir));
+        }
+        let member_ids: Vec<Uuid> = members.iter().map(|(id, _)| *id).collect();
 
         let virtual_id = Uuid::new_v4();
         let virtual_key = format!("v-prfxv-{}", virtual_id.simple());
@@ -6228,27 +6224,26 @@ mod tests {
         .await
         .expect("insert virtual repo");
 
-        tdh::link_virtual_member(&pool, virtual_id, member_a_id, 1).await;
-        tdh::link_virtual_member(&pool, virtual_id, member_b_id, 2).await;
+        for (priority, id) in member_ids.iter().enumerate() {
+            tdh::link_virtual_member(&pool, virtual_id, *id, priority as i32 + 1).await;
+        }
 
         // `authorize_virtual_members` filters by caller visibility (#3178);
         // publish the members so this fixture stays about merging, not authz.
         sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
-            .bind(vec![member_a_id, member_b_id])
+            .bind(&member_ids)
             .execute(&pool)
             .await
             .expect("publish virtual members");
 
-        let state = tdh::build_state(pool.clone(), member_a_dir.to_str().unwrap());
+        let state = tdh::build_state(pool.clone(), members[0].1.to_str().unwrap());
         let auth = tdh::make_auth(user_id, &username);
         let router = tdh::router_with_auth(super::router(), state.clone(), auth);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("/{}/.meta/prefixes.txt", virtual_key))
-            .body(Body::empty())
-            .expect("build GET prefixes.txt");
-        let (status, body) = tdh::send(router, req).await;
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
 
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
             .bind(virtual_id)
@@ -6258,25 +6253,37 @@ mod tests {
             .bind(virtual_id)
             .execute(&pool)
             .await;
-        tdh::cleanup_member_repo(&pool, member_a_id, &member_a_dir).await;
-        tdh::cleanup_member_repo(&pool, member_b_id, &member_b_dir).await;
+        for (id, dir) in &members {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&virtual_dir);
 
+        Some((status, String::from_utf8_lossy(&body).into_owned()))
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_merges_prefixes_from_members() {
+        let Some((status, text)) = virtual_prefixes(&["com.acme.prfxv", "org.acme.prfxv"]).await
+        else {
+            return;
+        };
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            status,
-            StatusCode::OK,
-            "expected 200 for virtual .meta/prefixes.txt"
+            text, "## repository-prefixes/2.0\n/com/acme/prfxv\n/org/acme/prfxv\n",
+            "expected merged prefixes from both members, sorted"
         );
-        let text = String::from_utf8_lossy(&body);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "## repository-prefixes/2.0");
-        assert_eq!(
-            lines[1..],
-            ["/com/acme/prfxv", "/org/acme/prfxv"],
-            "expected merged prefixes from both members, sorted: {}",
-            text
-        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_drop_group_nested_across_members() {
+        let Some((status, text)) =
+            virtual_prefixes(&["org.acme.prfxn", "org.acme.prfxn.sub"]).await
+        else {
+            return;
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "## repository-prefixes/2.0\n/org/acme/prfxn\n");
     }
 
     // -----------------------------------------------------------------------
