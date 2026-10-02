@@ -1849,6 +1849,59 @@ jobs:
   # scripts/ci/check-release-downstream-dispatch.sh pins this wiring.
   # ════════════════════════════════════════════════════════════════════════════
 
+  release-announce:
+    name: 📣 Announce the release
+    runs-on: ubuntu-latest
+    # After the Release exists: the announcement links to it, and the announce
+    # workflow refuses a tag with no published Release.
+    needs: [release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    permissions:
+      actions: write   # dispatch release-announce.yml and follow its run
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Dispatch the release announcement
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Backdated two minutes, as every dispatch here is; see
+          # scripts/ci/follow-dispatched-run.sh.
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run release-announce.yml --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" -f tag="${GITHUB_REF_NAME}"
+          echo "Dispatched release-announce.yml on ${GITHUB_REF_NAME}."
+
+      - name: Follow the announcement run to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: release-announce.yml
+          FOLLOW_REF: ${{ github.ref_name }}
+          FOLLOW_SINCE: ${{ steps.dispatch.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          run_id="${out#run_id=}"; run_id="${run_id%% *}"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Release announcement did not conclude green::${out}. The release IS published; it was NOT announced on Discord. Fix the cause (e.g. the DISCORD_RELEASE_WEBHOOK secret) and re-run this job, or dispatch it by hand: gh workflow run release-announce.yml --ref ${GITHUB_REF_NAME} -f tag=${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          {
+            echo "### Release announced"
+            echo
+            echo "- announce run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ami-build:
     name: 🖥️ Build the AMI
     runs-on: ubuntu-latest

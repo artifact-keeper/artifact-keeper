@@ -1809,6 +1809,20 @@ jobs:
       - name: Check the floating-tag gate catches what it must
         run: bash scripts/ci/test-check-floating-tag-promotion.sh
 
+      # release.yml creates the GitHub Release with GITHUB_TOKEN, so
+      # `release: published` never starts another workflow for it. The spec
+      # sync (#3789), the Discord announcement (#3897) and the AMI build
+      # (#3896) all stopped running that way with every release still green.
+      # Each is now dispatched by release.yml after the Release exists and
+      # followed to a verdict, and is dispatchable by hand; dropping any of
+      # that is silent on a green run, so it is pinned structurally here.
+      # Pure YAML inspection, no network, ~1s.
+      - name: Check post-release workflows are dispatched by release.yml
+        run: ./scripts/ci/check-release-downstream-dispatch.sh
+
+      - name: Check the post-release dispatch gate catches what it must
+        run: bash scripts/ci/test-check-release-downstream-dispatch.sh
+
       # The rule the promotion obeys: a floating tag may only name a version
       # with a published GitHub Release, and only if it is newest in that line.
       # Its interesting cases (a backport that moves :X.Y but not :latest, a

@@ -1,18 +1,47 @@
 # Curated release announcements → Discord #announcements
 #
-# Install: copy to .github/workflows/release-announce.yml in the artifact-keeper
-# (backend) repo. Create a webhook on the Discord #announcements channel
-# (Edit Channel → Integrations → Webhooks → New Webhook → Copy URL) and store it
-# as the repo secret DISCORD_RELEASE_WEBHOOK.
+# Needs the repo secret DISCORD_RELEASE_WEBHOOK: a webhook on the Discord
+# #announcements channel (Edit Channel → Integrations → Webhooks → New Webhook
+# → Copy URL). Posts a clean embed with a human title and a link to the full
+# notes, instead of dumping raw release events.
 #
-# Fires when a GitHub Release is published. Posts a clean embed with a human
-# title and a link to the full notes, instead of dumping raw release events.
+# HOW THIS WORKFLOW IS STARTED (#3897)
+#
+# `release: published` does NOT fire for a release that release.yml creates:
+# that Release is created with GITHUB_TOKEN, and an event caused by
+# GITHUB_TOKEN never starts another workflow. Every certified release (#3777)
+# is created that way, so this trigger alone announced none of them. The
+# automatic path is therefore an explicit dispatch: release.yml's
+# `release-announce` job runs
+# `gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z` after the
+# Release is published -- prereleases included, which get the amber
+# "pre-release" embed below -- and follows the run to a verdict with
+# scripts/ci/follow-dispatched-run.sh, so a missing or red announcement is a
+# red release run. workflow_dispatch is also the manual path, e.g. to announce
+# a release whose automatic run failed:
+#
+#   gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z
+#   gh workflow run release-announce.yml --ref main   -f tag=vX.Y.Z  # older tag
+#
+# Every run posts; there is no de-duplication, so re-running it posts again.
+#
+# The `release:` trigger stays for a release published BY HAND (whose event
+# does fire). Either way the release is read back over the API by tag rather
+# than from the event payload, so both paths post the same embed, and a draft
+# (invisible to this token) or a tag with no Release is refused.
+# scripts/ci/check-release-downstream-dispatch.sh pins this wiring.
 
 name: Announce release on Discord
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to announce (vX.Y.Z or vX.Y.Z-pre; must be a published GitHub Release)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,30 +50,82 @@ jobs:
   announce:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "release" ]; then
+            TAG="${EVENT_TAG}"
+          else
+            TAG="${INPUT_TAG}"
+          fi
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error title=Invalid tag::'${TAG}' is not vX.Y.Z or vX.Y.Z-pre."
+            exit 1
+          fi
+          # Dispatched on a version tag, the input must name that same tag.
+          if [[ "${GITHUB_REF}" == refs/tags/v* && "${GITHUB_REF_NAME}" != "${TAG}" ]]; then
+            echo "::error title=Tag does not match the ref::dispatched on ${GITHUB_REF_NAME} but asked to announce ${TAG}. Dispatch on ${TAG} or on main."
+            exit 1
+          fi
+          if ! rel="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json name,url,isDraft,isPrerelease)"; then
+            echo "::error title=No published release::${TAG} has no GitHub Release visible to this workflow. Only a published release is announced."
+            exit 1
+          fi
+          if [ "$(jq -r .isDraft <<<"${rel}")" != "false" ]; then
+            echo "::error title=Draft release::${TAG} is still a draft; publish it first."
+            exit 1
+          fi
+          # The name is free text (it could carry a newline), so it is written
+          # with the multi-line delimiter form rather than `name=...`.
+          delim="EOF_$(openssl rand -hex 8)"
+          {
+            echo "tag=${TAG}"
+            echo "name<<${delim}"
+            jq -r '.name // ""' <<<"${rel}"
+            echo "${delim}"
+            echo "url=$(jq -r .url <<<"${rel}")"
+            echo "prerelease=$(jq -r .isPrerelease <<<"${rel}")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Post release embed to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
-          TAG: ${{ github.event.release.tag_name }}
-          NAME: ${{ github.event.release.name }}
-          URL: ${{ github.event.release.html_url }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NAME: ${{ steps.release.outputs.name }}
+          URL: ${{ steps.release.outputs.url }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
           set -euo pipefail
 
           if [ -z "${WEBHOOK:-}" ]; then
-            echo "DISCORD_RELEASE_WEBHOOK not set; skipping."
+            echo "::warning title=Not announced::DISCORD_RELEASE_WEBHOOK is not set; ${TAG} was not announced."
             exit 0
           fi
 
-          TITLE="Artifact Keeper ${NAME:-$TAG} released"
+          # release.yml names releases "Artifact Keeper X.Y.Z"; strip that so
+          # the title does not read "Artifact Keeper Artifact Keeper X.Y.Z".
+          LABEL="${NAME#Artifact Keeper }"
+          LABEL="${LABEL:-$TAG}"
           if [ "${PRERELEASE}" = "true" ]; then
-            TITLE="Artifact Keeper ${NAME:-$TAG} (pre-release) is out"
+            TITLE="Artifact Keeper ${LABEL} (pre-release) is out"
             COLOR=16763904   # amber
+            KIND="pre-release"
           else
+            TITLE="Artifact Keeper ${LABEL} released"
             COLOR=4177711    # brand green (#3FB950)
+            KIND="release"
           fi
 
-          DESCRIPTION="A new ${PRERELEASE:+pre-}release is available. Read the full notes and upgrade instructions below.\n\n[Release notes and changelog](${URL})"
+          # A real blank line: a literal backslash-n passed through `jq --arg`
+          # reaches Discord as the two characters "\n".
+          DESCRIPTION="A new ${KIND} is available. Read the full notes and upgrade instructions below."$'\n\n'"[Release notes and changelog](${URL})"
 
           # Build payload with jq so release text is safely escaped.
           PAYLOAD=$(jq -n \

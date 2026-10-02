@@ -373,6 +373,55 @@ names the same commit.
    A backport moves only its series alias: promoting `1.7.9` while `1.8.2`
    is the newest release advances `:1.7` and leaves `:latest` alone.
 
+   **What runs after the Release is published.** The Release is created
+   with `GITHUB_TOKEN`, and an event caused by `GITHUB_TOKEN` never starts
+   another workflow, so nothing that listens for `release: published` runs
+   for it (#3789, #3896, #3897). `release.yml` therefore dispatches each
+   post-release workflow itself, on the tag, once the `release` job has
+   succeeded, and follows each run to a verdict with
+   `scripts/ci/follow-dispatched-run.sh`. A red follow job means the release
+   IS published and the images are correct; only that side effect is
+   missing. Re-run the job, or dispatch the workflow by hand:
+
+   | `release.yml` job | dispatches | runs for | by hand |
+   |---|---|---|---|
+   | `sync-openapi-spec` | `sync-openapi-spec.yml` | every release | `gh workflow run sync-openapi-spec.yml --ref vX.Y.Z -f dry_run=false` |
+   | `release-announce` | `release-announce.yml` (Discord `#announcements`, secret `DISCORD_RELEASE_WEBHOOK`) | every release; a prerelease gets the amber "pre-release" embed | `gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z` |
+   | `ami-build` | `ami-build.yml` (Packer, AWS OIDC role secret `AWS_AMI_BUILDER_ROLE_ARN`) | **stable releases only**: an AMI costs money and an `-rc.N` AMI has no consumer | `gh workflow run ami-build.yml --ref vX.Y.Z -f version=X.Y.Z` |
+
+   For a tag whose own workflow files predate the dispatch inputs (anything
+   released before this chain landed), dispatch on `main` instead, e.g.
+   `--ref main -f tag=v1.9.0`. Both inputs are validated: the version or tag
+   must be well-formed, must name a **published** GitHub Release (a draft or
+   a missing Release is refused), and, when dispatched on a version tag, must
+   name that same tag. Each announcement run posts again; there is no
+   de-duplication, so re-run it only if the post did not happen. All three
+   keep their `release: published` trigger for a Release published by hand,
+   whose event does fire (`ami-build.yml` skips a hand-published prerelease
+   there too). No PAT or App token is involved: `workflow_dispatch` is the
+   documented exception to the rule above, and the dispatching jobs use
+   `GITHUB_TOKEN` with `actions: write`.
+   `scripts/ci/check-release-downstream-dispatch.sh` (Shell Tests) fails CI
+   if any dispatch, follow, manual trigger or prerelease rule is dropped.
+
+   Re-running a failed `ami-build` job (or `ami-build.yml` itself) builds a
+   **second** AMI for the same version; there is no de-duplication, so check
+   the AMI build run's summary for an AMI ID before re-running it.
+
+   **Release prerequisites for these jobs.** They fail until two secrets are
+   in place:
+
+   - `DISCORD_RELEASE_WEBHOOK` must be a live webhook. The last two announce
+     runs (v1.7.0, v1.7.3) got HTTP 404 from Discord, so it needs rotating
+     (channel → Integrations → Webhooks → new webhook → update the secret).
+   - `AWS_AMI_BUILDER_ROLE_ARN` (repo or org secret) must name an IAM role
+     whose OIDC trust policy admits this repository's runs on `refs/tags/v*`
+     (the dispatch runs on the tag) and on `refs/heads/main` (manual runs for
+     older tags). No AMI build has ever succeeded. Until one does, the
+     `ami-build` job in `release.yml` is `continue-on-error: true`: a red AMI
+     build shows as a failed job without failing the release run. Remove that
+     line (TODO in the job) once a tagged build succeeds.
+
 9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
    style" below), not the raw auto-generated PR list, `:latest` and `:X.Y`
