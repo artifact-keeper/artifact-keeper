@@ -9470,24 +9470,52 @@ async fn blob_reblock_applies(
 /// proxy owners the STRICTEST configured gate across the set wins (the same
 /// OR-of-both-sides direction as #3025), and a config read fault fails closed
 /// to block-on-any.
+///
+/// Record-only (#3645) uses the same rule as the manifest half
+/// ([`proxy_helpers::stricter_scan_policy`]) but over a WIDER population:
+/// the manifest gate combines only the virtual and the ONE member that
+/// resolved the manifest, while this gate combines every owner in
+/// `ref_owners` (for a virtual: every gated member plus the virtual itself,
+/// because a blob digest is not tied to one member). It is record-only exactly
+/// when every owner with scanning enabled chose `record_only` and no owner is
+/// fail-closed. On a direct Remote, or a virtual whose members all agree, a
+/// layer of an image served `recorded` therefore serves too. On a virtual that
+/// mixes a record-only member with an enforcing one, the blob seam can still
+/// enforce for a manifest the record-only member served (the stricter
+/// direction). Beside an enforcing owner, a record-only owner contributes no
+/// gate of its own, so the enforcing owner's own threshold applies.
 async fn blob_severity_gate(
     scan_cfg: &crate::services::scan_config_service::ScanConfigService,
     ref_owners: &[(&str, Uuid)],
 ) -> crate::services::proxy_scan_service::ProxySeverityGate {
-    use crate::services::proxy_scan_service::ProxySeverityGate;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let mut gate: Option<ProxySeverityGate> = None;
+    let mut any_enabled = false;
+    let mut all_enabled_record_only = true;
+    let mut any_fail_closed = false;
     for (repo_type, repo_id) in ref_owners {
         if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
             return ProxySeverityGate::BlockOnAny;
         }
-        let g = scan_cfg
-            .proxy_severity_gate(*repo_id)
-            .await
-            .unwrap_or(ProxySeverityGate::BlockOnAny);
+        let (Ok(g), Ok(action), Ok(enabled)) = (
+            scan_cfg.proxy_severity_gate(*repo_id).await,
+            scan_cfg.proxy_scan_action(*repo_id).await,
+            scan_cfg.is_proxy_scan_enabled(*repo_id).await,
+        ) else {
+            return ProxySeverityGate::BlockOnAny;
+        };
+        any_fail_closed |= action == ProxyScanAction::FailClosed;
+        if enabled {
+            any_enabled = true;
+            all_enabled_record_only &= action.is_record_only();
+        }
         gate = Some(match gate {
             Some(acc) => ProxySeverityGate::stricter(acc, g),
             None => g,
         });
+    }
+    if any_enabled && all_enabled_record_only && !any_fail_closed {
+        return ProxySeverityGate::RecordOnly;
     }
     gate.unwrap_or(ProxySeverityGate::BlockOnAny)
 }
@@ -9793,10 +9821,11 @@ pub(crate) async fn oci_stage_and_scan_image(
 }
 
 /// The digest-keyed verdict gate for a proxy-served OCI image manifest.
-/// Returns `Ok(pending)` when the manifest may be served (`pending` selects
+/// Returns `Ok(served)` when the manifest may be served (`served` selects
 /// the loud `X-AK-Scan: pending` header on the fail-open
-/// serve-before-verdict path), or `Err(response)` with the fully-built OCI
-/// error (403 vulnerable / 423 inconclusive-fail-closed).
+/// serve-before-verdict path, or `X-AK-Scan: recorded` when a record-only
+/// repository serves a vulnerable verdict, #3645), or `Err(response)` with
+/// the fully-built OCI error (403 vulnerable / 423 inconclusive-fail-closed).
 async fn gate_oci_proxy_manifest_scan(
     state: &SharedState,
     repo: &OciRepoInfo,
@@ -9805,7 +9834,7 @@ async fn gate_oci_proxy_manifest_scan(
     manifest_content_type: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
-) -> Result<bool, Response> {
+) -> Result<proxy_helpers::ProxyScanServed, Response> {
     // The verdict key is the CONTENT digest computed over the bytes being
     // served — the same digest `docker pull` pins — never anything the
     // upstream index advertised.
@@ -9844,7 +9873,7 @@ async fn gate_oci_proxy_manifest_scan(
     )
     .await
     {
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => Ok(pending),
+        proxy_helpers::ProxyScanServeOutcome::Serve(served) => Ok(served),
         proxy_helpers::ProxyScanServeOutcome::Deny(resp) => {
             Err(oci_scan_deny_response(resp.status(), &image_ref))
         }
@@ -9852,8 +9881,9 @@ async fn gate_oci_proxy_manifest_scan(
 }
 
 /// Run the #3003 PR-2 inline scan gate for a Remote-repo manifest serve when
-/// it applies. `Ok(false)` = serve normally, `Ok(true)` = serve with the
-/// loud pending header, `Err(response)` = blocked/withheld.
+/// it applies. `Ok(None)` = not gated, serve normally; `Ok(Some(served))` =
+/// gated and served (see [`with_scan_header`]); `Err(response)` =
+/// blocked/withheld.
 ///
 /// Applies ONLY to Remote (proxy) repositories: hosted content is already
 /// blocked on pull by scan-on-upload + quarantine
@@ -9867,16 +9897,16 @@ async fn maybe_gate_remote_manifest_scan(
     reference: &str,
     manifest_body: &Bytes,
     manifest_content_type: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<proxy_helpers::ProxyScanServed>, Response> {
     if repo.repo_type != RepositoryType::Remote || oci_pull_is_scan_scoped(claims) {
-        return Ok(false);
+        return Ok(None);
     }
     if !crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
         .is_proxy_scan_enabled(repo.id)
         .await
         .unwrap_or(false)
     {
-        return Ok(false);
+        return Ok(None);
     }
     // #3024: a Docker schema1 (v2s1) manifest has no config descriptor, so
     // the runnable-image predicate below can never gate it AND the scanner
@@ -9896,7 +9926,7 @@ async fn maybe_gate_remote_manifest_scan(
         ));
     }
     if !oci_manifest_requires_proxy_scan(manifest_body) {
-        return Ok(false);
+        return Ok(None);
     }
     let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
     gate_oci_proxy_manifest_scan(
@@ -9909,14 +9939,24 @@ async fn maybe_gate_remote_manifest_scan(
         severity_gate,
     )
     .await
+    .map(Some)
 }
 
-/// Attach the loud fail-open `X-AK-Scan: pending` header to a manifest
-/// response served before a verdict exists.
-fn with_scan_pending_header(mut resp: Response, pending: bool) -> Response {
-    if pending {
-        resp.headers_mut()
-            .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+/// Attach `X-AK-Scan` to a gated manifest response: the loud fail-open
+/// `pending` when served before a verdict exists, or `recorded` when a
+/// record-only repository serves a vulnerable verdict (#3645). A clean (or
+/// ungated) manifest carries no header, as before.
+fn with_scan_header(
+    mut resp: Response,
+    served: Option<proxy_helpers::ProxyScanServed>,
+) -> Response {
+    if let Some(served) = served {
+        if served != proxy_helpers::ProxyScanServed::Clean {
+            resp.headers_mut().insert(
+                "X-AK-Scan",
+                axum::http::HeaderValue::from_static(served.header_value()),
+            );
+        }
     }
     resp
 }
@@ -10150,7 +10190,7 @@ async fn handle_get_manifest(
                 reindex_parent_index_packages_for_child(state, &repo, &manifest_digest).await;
             }
             record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
-            return with_scan_pending_header(
+            return with_scan_header(
                 build_local_manifest_response(&manifest_digest, &content_type, data, true),
                 scan_pending,
             );
@@ -10199,7 +10239,7 @@ async fn handle_get_manifest(
             // manifest by digest and (b) on a cold pull runs `stage_proxy_image_blobs`
             // under the member id, so the blob blocklist below has refs to find.
             // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
-            let mut scan_pending = false;
+            let mut scan_pending = None;
             if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
                 let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
@@ -10219,7 +10259,7 @@ async fn handle_get_manifest(
                     )
                     .await
                     {
-                        Ok(pending) => pending,
+                        Ok(served) => Some(served),
                         Err(resp) => return resp,
                     };
                 }
@@ -10267,7 +10307,7 @@ async fn handle_get_manifest(
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
             }
-            return with_scan_pending_header(
+            return with_scan_header(
                 build_oci_proxy_response(
                     &data,
                     content_type,
@@ -10336,7 +10376,7 @@ async fn handle_get_manifest(
         // re-sizes the PARENT's row instead of publishing one for the child.
         reindex_parent_index_packages_for_child(state, &repo, &digest).await;
         record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
-        return with_scan_pending_header(
+        return with_scan_header(
             build_oci_proxy_response(
                 &content,
                 ct,
@@ -30007,7 +30047,7 @@ mod proxy_scan_block_tests {
         fx.teardown().await;
 
         assert!(
-            matches!(exempt, Ok(false)),
+            matches!(exempt, Ok(None)),
             "a scan-scoped pull must bypass the gate entirely"
         );
         match unscoped {
@@ -33791,6 +33831,269 @@ mod proxy_scan_block_tests {
             rows.is_empty(),
             "an image the scan gate refuses to serve must not be advertised in \
              the packages catalog; got {rows:?}"
+        );
+    }
+
+    // ── #3645: record-only on the OCI manifest gate and the blob seam ──
+
+    async fn set_scan_config(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        enabled: bool,
+        block: bool,
+        threshold: &str,
+        action: &str,
+    ) {
+        crate::services::scan_config_service::ScanConfigService::new(pool.clone())
+            .upsert_config(
+                repo_id,
+                &crate::services::scan_config_service::UpsertScanConfigRequest {
+                    scan_enabled: Some(true),
+                    scan_on_upload: Some(false),
+                    scan_on_proxy: Some(enabled),
+                    block_on_policy_violation: Some(block),
+                    severity_threshold: Some(threshold.to_string()),
+                    proxy_scan_action: Some(action.to_string()),
+                },
+            )
+            .await
+            .expect("upsert scan config");
+    }
+
+    /// `with_scan_header` stamps `pending` and `recorded`; a clean or
+    /// ungated manifest carries no header, exactly as before #3645.
+    #[test]
+    fn with_scan_header_stamps_pending_and_recorded_only() {
+        use crate::api::handlers::proxy_helpers::ProxyScanServed;
+        let header = |served| {
+            with_scan_header(
+                axum::response::IntoResponse::into_response(StatusCode::OK),
+                served,
+            )
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(header(None), None);
+        assert_eq!(header(Some(ProxyScanServed::Clean)), None);
+        assert_eq!(
+            header(Some(ProxyScanServed::Pending)).as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            header(Some(ProxyScanServed::Recorded)).as_deref(),
+            Some("recorded")
+        );
+    }
+
+    /// The blob seam's severity gate under record-only: all-record-only
+    /// owners (a scanning-off owner does not veto) never block; a fail-closed
+    /// owner, a hosted owner, or an enabled fail-open owner keeps enforcing,
+    /// and a record-only owner beside an enforcing owner yields to that
+    /// owner's own threshold.
+    #[tokio::test]
+    async fn blob_severity_gate_record_only_matrix() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mk = |t: &'static str| {
+            let pool = pool.clone();
+            async move { tdh::create_repo(&pool, t, "docker").await.0 }
+        };
+        let ro = mk("remote").await;
+        let ro2 = mk("remote").await;
+        let off = mk("remote").await; // no scan_configs row: scanning off
+        let closed_off = mk("remote").await;
+        let open = mk("remote").await;
+        let open_threshold = mk("remote").await;
+        let hosted = mk("local").await;
+        set_scan_config(&pool, ro, true, false, "high", "record_only").await;
+        set_scan_config(&pool, ro2, true, true, "critical", "record_only").await;
+        set_scan_config(&pool, closed_off, false, false, "high", "fail_closed").await;
+        set_scan_config(&pool, open, true, false, "high", "fail_open").await;
+        set_scan_config(&pool, open_threshold, true, true, "high", "fail_open").await;
+
+        let cfg = crate::services::scan_config_service::ScanConfigService::new(pool.clone());
+        let r = "remote";
+        type Case<'a> = (&'a str, Vec<(&'a str, Uuid)>, ProxySeverityGate);
+        let cases: Vec<Case> = vec![
+            (
+                "all record-only",
+                vec![(r, ro), (r, ro2)],
+                ProxySeverityGate::RecordOnly,
+            ),
+            (
+                "scanning-off owner does not veto",
+                vec![(r, ro), (r, off)],
+                ProxySeverityGate::RecordOnly,
+            ),
+            (
+                "fail-closed owner (even scanning-off) enforces",
+                vec![(r, ro), (r, closed_off)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "hosted owner enforces",
+                vec![(r, ro), ("local", hosted)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "enabled fail-open owner enforces",
+                vec![(r, ro), (r, open)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "record-only yields to the enforcing owner's threshold",
+                vec![(r, ro), (r, open_threshold)],
+                ProxySeverityGate::Threshold(Severity::High),
+            ),
+        ];
+        let mut got = Vec::new();
+        for (name, owners, _) in &cases {
+            got.push((*name, blob_severity_gate(&cfg, owners).await));
+        }
+        for id in [ro, ro2, off, closed_off, open, open_threshold, hosted] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        for ((name, _, want), (_, got)) in cases.iter().zip(got) {
+            assert_eq!(got, *want, "{name}");
+        }
+    }
+
+    /// End to end on a record-only Remote: an image with a cached vulnerable
+    /// verdict is served `X-AK-Scan: recorded`, and its config and layer
+    /// blobs serve too (no layer 403 behind a served manifest). Switching the
+    /// repository to enforcement blocks the manifest AND its blobs from the
+    /// same recorded verdict.
+    #[tokio::test]
+    async fn record_only_manifest_is_recorded_and_its_blobs_serve() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let cfg_bytes = unique_fixture_bytes("ro-cfg");
+        let layer_bytes = unique_fixture_bytes("ro-layer");
+        let (manifest, config, layer) = image_manifest(&cfg_bytes, &layer_bytes);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        set_scan_config(&fx.pool, fx.repo_id, true, false, "high", "record_only").await;
+
+        record_manifest_blob_refs(&fx.pool, fx.repo_id, &format!("sha256:{digest}"), &manifest)
+            .await
+            .expect("record blob refs");
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [(&config, cfg_bytes.clone()), (&layer, layer_bytes.clone())] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let get_blob = |d: String| {
+            let state = state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(None), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let manifest_resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let ro_manifest = (
+            manifest_resp.status(),
+            manifest_resp
+                .headers()
+                .get("X-AK-Scan")
+                .map(|v| v.to_str().unwrap().to_string()),
+        );
+        let ro_blobs = (
+            get_blob(config.clone()).await,
+            get_blob(layer.clone()).await,
+        );
+
+        set_scan_config(&fx.pool, fx.repo_id, true, false, "high", "fail_open").await;
+        let enforced_manifest = pull_manifest(&state, &fx.repo_key, "latest").await.status();
+        let enforced_blobs = (
+            get_blob(config.clone()).await,
+            get_blob(layer.clone()).await,
+        );
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            ro_manifest,
+            (StatusCode::OK, Some("recorded".to_string())),
+            "record-only serves the vulnerable manifest, marked recorded"
+        );
+        assert_eq!(
+            ro_blobs,
+            (StatusCode::OK, StatusCode::OK),
+            "a manifest served recorded must not be followed by a blob 403"
+        );
+        assert_eq!(enforced_manifest, StatusCode::FORBIDDEN);
+        assert_eq!(
+            enforced_blobs,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "enforcement blocks the blobs from the same recorded verdict"
         );
     }
 }

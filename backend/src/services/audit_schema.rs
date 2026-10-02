@@ -280,6 +280,9 @@ mod tests {
                     age_gate_enabled: None,
                     age_gate_min_age_days: None,
                     age_gate_mode: None,
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
                 }),
         ];
         for entry in &entries {
@@ -336,6 +339,14 @@ mod tests {
 
     #[test]
     fn test_typed_details_validate_against_defs() {
+        let state = |action: &str| details::ScanConfigAuditState {
+            scan_enabled: true,
+            scan_on_upload: false,
+            scan_on_proxy: true,
+            block_on_policy_violation: false,
+            severity_threshold: "high".into(),
+            proxy_scan_action: action.into(),
+        };
         assert_valid_against(
             "RepositoryDetails",
             &serde_json::to_value(details::RepositoryDetails {
@@ -347,6 +358,9 @@ mod tests {
                 age_gate_enabled: Some(true),
                 age_gate_min_age_days: Some(14),
                 age_gate_mode: None,
+                scan_config: Some(state("record_only")),
+                previous_scan_config: Some(state("fail_open")),
+                scan_config_changed: Some(vec!["proxy_scan_action".into()]),
             })
             .unwrap(),
         );

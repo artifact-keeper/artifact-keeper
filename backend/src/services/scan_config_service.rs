@@ -7,21 +7,33 @@ use crate::error::{AppError, Result};
 use crate::models::security::{ScanConfig, Severity};
 use crate::services::proxy_scan_service::ProxyScanAction;
 
-/// Canonicalize a client-supplied `proxy_scan_action` (#2954), preserving the
-/// existing row's value when the patch omits it and defaulting to `fail_open`.
+/// Canonicalize a client-supplied `proxy_scan_action` (#2954, `record_only`
+/// since #3645), preserving the existing row's value when the patch omits it
+/// and defaulting to `fail_open`.
 ///
-/// Unknown values are coerced to `fail_open` rather than passed through to the
-/// DB CHECK constraint (which would surface as an opaque 500). Pure /
-/// unit-testable.
-fn normalize_proxy_scan_action(patch: Option<&str>, existing: Option<&str>) -> String {
-    let raw = patch
-        .or(existing)
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "fail_open".to_string());
-    match raw.as_str() {
-        "fail_closed" => "fail_closed".to_string(),
-        _ => "fail_open".to_string(),
+/// A value the CLIENT sent must be one of `fail_open` / `fail_closed` /
+/// `record_only` (case-insensitive, trimmed); anything else -- including the
+/// hyphenated spellings `fail-closed` / `record-only` -- is a 400, never a
+/// silent fallback to `fail_open` (which would arm the blocking gate the
+/// operator was trying to configure differently). An EXISTING row value is
+/// re-normalized leniently, so a legacy value can never wedge a later patch.
+/// Pure / unit-testable.
+fn normalize_proxy_scan_action(patch: Option<&str>, existing: Option<&str>) -> Result<String> {
+    if let Some(raw) = patch {
+        let canon = raw.trim().to_ascii_lowercase();
+        return match canon.as_str() {
+            "fail_open" | "fail_closed" | "record_only" => Ok(canon),
+            _ => Err(AppError::Validation(format!(
+                "invalid proxy_scan_action {raw:?}: expected one of \
+                 fail_open, fail_closed, record_only"
+            ))),
+        };
     }
+    Ok(
+        ProxyScanAction::from_db(existing.unwrap_or("fail_open").trim())
+            .as_db_str()
+            .to_string(),
+    )
 }
 
 /// Request to create or update a scan configuration.
@@ -46,15 +58,21 @@ pub struct UpsertScanConfigRequest {
     #[serde(default)]
     pub scan_on_proxy: Option<bool>,
     /// Opt-in that makes `severity_threshold` enforced on the proxy/OCI
-    /// inline scan gate (#3243/#3246). Default false = block on any finding.
+    /// inline scan gate (#3243/#3246). `false` (the default) does NOT mean
+    /// "don't block": it means the threshold is off and the gate blocks on
+    /// ANY finding. To scan without ever blocking, set
+    /// `proxy_scan_action = record_only`.
     #[serde(default)]
     pub block_on_policy_violation: Option<bool>,
     /// Severity floor for the inline proxy scan gate, live only when
     /// `block_on_policy_violation` is set (#3243/#3246).
     #[serde(default)]
     pub severity_threshold: Option<String>,
-    /// #2954: `'fail_open'` (default) | `'fail_closed'` for the inline proxy
-    /// scan-on-fetch action.
+    /// Inline proxy scan-on-fetch action: `'fail_open'` (default) |
+    /// `'fail_closed'` (#2954) | `'record_only'` (#3645). `record_only` is
+    /// the non-blocking mode: findings, SBOM and verdicts are recorded but no
+    /// pull is ever blocked, whatever `block_on_policy_violation` /
+    /// `severity_threshold` say. Any other value is rejected with 400.
     #[serde(default)]
     pub proxy_scan_action: Option<String>,
 }
@@ -120,51 +138,52 @@ impl ScanConfigService {
         repository_id: Uuid,
         req: &UpsertScanConfigRequest,
     ) -> Result<ScanConfig> {
-        // Defaults applied when no config row exists yet. These mirror the
-        // historical column defaults: scanning off, severity threshold "high".
-        let existing = self.get_config(repository_id).await?;
+        Ok(self
+            .upsert_config_with_previous(repository_id, req)
+            .await?
+            .current)
+    }
 
-        let scan_enabled = req
-            .scan_enabled
-            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_enabled).unwrap_or(false));
-        let scan_on_upload = req
-            .scan_on_upload
-            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_on_upload).unwrap_or(false));
-        let scan_on_proxy = req
-            .scan_on_proxy
-            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_on_proxy).unwrap_or(false));
-        let block_on_policy_violation = req.block_on_policy_violation.unwrap_or_else(|| {
-            existing
-                .as_ref()
-                .map(|c| c.block_on_policy_violation)
-                .unwrap_or(false)
-        });
-        // Validate + normalize the caller-supplied severity_threshold BEFORE the
-        // DB write. The column carries a `scan_configs_severity_threshold_check`
-        // CHECK constraint over the canonical lowercase set
-        // (critical|high|medium|low|info); passing a raw casing like "High" or a
-        // bogus value like "yolo" straight through surfaced the constraint
-        // violation as a raw DB error -> HTTP 500 (#2953). Accept case-insensitive
-        // input and aliases ("moderate" -> "medium"), normalize to the canonical
-        // form, and reject a genuinely-invalid value with a 400. An omitted field
-        // keeps the existing (already-valid) row value, or the documented default.
-        let severity_threshold = match req.severity_threshold.as_deref() {
-            Some(raw) => normalize_severity_threshold(raw)?,
-            None => existing
-                .as_ref()
-                .map(|c| c.severity_threshold.clone())
-                .unwrap_or_else(|| "high".to_string()),
-        };
-        // #2954: default fail-open (matches the column default) so operators who
-        // have not opted into fail-closed see today's behavior. A bad value is
-        // normalized to fail-open rather than tripping the DB CHECK constraint.
-        let proxy_scan_action = normalize_proxy_scan_action(
-            req.proxy_scan_action.as_deref(),
-            existing.as_ref().map(|c| c.proxy_scan_action.as_str()),
-        );
+    /// [`Self::upsert_config`], also returning the row it replaced (#3645),
+    /// for the scan-config audit trail.
+    ///
+    /// The read of the previous row and the write run in ONE transaction,
+    /// serialized per repository by a transaction-scoped advisory lock (a row
+    /// lock alone cannot cover the first insert, when there is no row to
+    /// lock), so two concurrent PUTs can never both report the same
+    /// "previous" value. Runtime (non-macro) queries, so this adds no offline
+    /// sqlx data.
+    pub async fn upsert_config_with_previous(
+        &self,
+        repository_id: Uuid,
+        req: &UpsertScanConfigRequest,
+    ) -> Result<ScanConfigWrite> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let mut tx = self.db.begin().await.map_err(db_err)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('scan_configs:' || $1::text, 0))",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let existing: Option<ScanConfig> = sqlx::query_as(
+            r#"
+            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+                   block_on_policy_violation, severity_threshold, proxy_scan_action,
+                   created_at, updated_at
+            FROM scan_configs
+            WHERE repository_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(repository_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
-        let config = sqlx::query_as!(
-            ScanConfig,
+        let m = merge_scan_config(req, existing.as_ref())?;
+        let current: ScanConfig = sqlx::query_as(
             r#"
             INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
                                       block_on_policy_violation, severity_threshold,
@@ -183,19 +202,23 @@ impl ScanConfigService {
                       block_on_policy_violation, severity_threshold, proxy_scan_action,
                       created_at, updated_at
             "#,
-            repository_id,
-            scan_enabled,
-            scan_on_upload,
-            scan_on_proxy,
-            block_on_policy_violation,
-            severity_threshold,
-            proxy_scan_action,
         )
-        .fetch_one(&self.db)
+        .bind(repository_id)
+        .bind(m.scan_enabled)
+        .bind(m.scan_on_upload)
+        .bind(m.scan_on_proxy)
+        .bind(m.block_on_policy_violation)
+        .bind(&m.severity_threshold)
+        .bind(&m.proxy_scan_action)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
 
-        Ok(config)
+        Ok(ScanConfigWrite {
+            previous: existing,
+            current,
+        })
     }
 
     /// List all scan configurations (for admin overview / filtering).
@@ -264,18 +287,22 @@ impl ScanConfigService {
     /// The severity gate the inline proxy scan gate applies to a `vulnerable`
     /// verdict for this repo (#3243 stage 3 / #3246).
     ///
-    /// `block_on_policy_violation` (DEFAULT false) is the explicit opt-in;
-    /// only when it is set does `severity_threshold` participate. An absent
-    /// `scan_configs` row — like an opted-out one — keeps the historical
-    /// block-on-any-finding posture, so no repository changes behavior without
-    /// an operator having turned the toggle on. Runtime (non-macro) query so
-    /// this adds no offline sqlx data.
+    /// `proxy_scan_action = 'record_only'` (#3645) resolves to
+    /// [`ProxySeverityGate::RecordOnly`](crate::services::proxy_scan_service::ProxySeverityGate::RecordOnly)
+    /// whatever the other two columns say: it is the one explicit
+    /// "record, never block" switch. Otherwise `block_on_policy_violation`
+    /// (DEFAULT false) is the explicit opt-in; only when it is set does
+    /// `severity_threshold` participate. An absent `scan_configs` row — like
+    /// an opted-out one — keeps the historical block-on-any-finding posture,
+    /// so no repository changes behavior without an operator having turned
+    /// the toggle on. Runtime (non-macro) query so this adds no offline sqlx
+    /// data.
     pub async fn proxy_severity_gate(
         &self,
         repository_id: Uuid,
     ) -> Result<crate::services::proxy_scan_service::ProxySeverityGate> {
-        let row: Option<(bool, String)> = sqlx::query_as(
-            r#"SELECT block_on_policy_violation, severity_threshold
+        let row: Option<(bool, String, String)> = sqlx::query_as(
+            r#"SELECT block_on_policy_violation, severity_threshold, proxy_scan_action
                FROM scan_configs WHERE repository_id = $1"#,
         )
         .bind(repository_id)
@@ -284,15 +311,107 @@ impl ScanConfigService {
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
 
         Ok(match row {
-            Some((block_on_policy_violation, severity_threshold)) => {
-                crate::services::proxy_scan_service::ProxySeverityGate::from_config(
-                    block_on_policy_violation,
-                    &severity_threshold,
-                )
+            Some((block_on_policy_violation, severity_threshold, action)) => {
+                proxy_severity_gate_for_row(block_on_policy_violation, &severity_threshold, &action)
             }
             None => crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
         })
     }
+}
+
+/// The outcome of [`ScanConfigService::upsert_config_with_previous`]: the row
+/// before the write (`None` when the repository had no config, i.e. it ran
+/// on the defaults) and the row after it.
+#[derive(Debug, Clone)]
+pub struct ScanConfigWrite {
+    pub previous: Option<ScanConfig>,
+    pub current: ScanConfig,
+}
+
+/// The six mutable columns of a scan-config write, after merging a partial
+/// patch over the existing row (or the documented defaults).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergedScanConfig {
+    pub scan_enabled: bool,
+    pub scan_on_upload: bool,
+    pub scan_on_proxy: bool,
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+    pub proxy_scan_action: String,
+}
+
+impl MergedScanConfig {
+    /// The effective config of a repository with NO `scan_configs` row: the
+    /// historical column defaults (scanning off, threshold `high`,
+    /// `fail_open`).
+    pub(crate) fn defaults() -> Self {
+        Self {
+            scan_enabled: false,
+            scan_on_upload: false,
+            scan_on_proxy: false,
+            block_on_policy_violation: false,
+            severity_threshold: "high".to_string(),
+            proxy_scan_action: "fail_open".to_string(),
+        }
+    }
+
+    pub(crate) fn of(c: &ScanConfig) -> Self {
+        Self {
+            scan_enabled: c.scan_enabled,
+            scan_on_upload: c.scan_on_upload,
+            scan_on_proxy: c.scan_on_proxy,
+            block_on_policy_violation: c.block_on_policy_violation,
+            severity_threshold: c.severity_threshold.clone(),
+            proxy_scan_action: c.proxy_scan_action.clone(),
+        }
+    }
+}
+
+/// Merge a partial scan-config patch over the existing row (B11 / #1374):
+/// an omitted field keeps the existing value, or the documented default when
+/// there is no row. Validates `severity_threshold` (#2953) and
+/// `proxy_scan_action` (#3645) so a bad value is a 400, not a DB 500.
+pub(crate) fn merge_scan_config(
+    req: &UpsertScanConfigRequest,
+    existing: Option<&ScanConfig>,
+) -> Result<MergedScanConfig> {
+    let base = existing
+        .map(MergedScanConfig::of)
+        .unwrap_or_else(MergedScanConfig::defaults);
+    let severity_threshold = match req.severity_threshold.as_deref() {
+        Some(raw) => normalize_severity_threshold(raw)?,
+        None => base.severity_threshold.clone(),
+    };
+    let proxy_scan_action = normalize_proxy_scan_action(
+        req.proxy_scan_action.as_deref(),
+        existing.map(|c| c.proxy_scan_action.as_str()),
+    )?;
+    Ok(MergedScanConfig {
+        scan_enabled: req.scan_enabled.unwrap_or(base.scan_enabled),
+        scan_on_upload: req.scan_on_upload.unwrap_or(base.scan_on_upload),
+        scan_on_proxy: req.scan_on_proxy.unwrap_or(base.scan_on_proxy),
+        block_on_policy_violation: req
+            .block_on_policy_violation
+            .unwrap_or(base.block_on_policy_violation),
+        severity_threshold,
+        proxy_scan_action,
+    })
+}
+
+/// The severity gate one `scan_configs` row resolves to (#3645): the
+/// record-only action overrides the threshold knobs; otherwise
+/// [`ProxySeverityGate::from_config`](crate::services::proxy_scan_service::ProxySeverityGate::from_config).
+/// Pure so the precedence is unit-testable without a DB.
+pub(crate) fn proxy_severity_gate_for_row(
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    proxy_scan_action: &str,
+) -> crate::services::proxy_scan_service::ProxySeverityGate {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    if ProxyScanAction::from_db(proxy_scan_action).is_record_only() {
+        return ProxySeverityGate::RecordOnly;
+    }
+    ProxySeverityGate::from_config(block_on_policy_violation, severity_threshold)
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -323,27 +442,95 @@ mod tests {
 
     #[test]
     fn test_normalize_proxy_scan_action() {
+        let n = |p, e| normalize_proxy_scan_action(p, e).unwrap();
         // Patch wins over existing.
-        assert_eq!(
-            normalize_proxy_scan_action(Some("fail_closed"), Some("fail_open")),
-            "fail_closed"
-        );
+        assert_eq!(n(Some("fail_closed"), Some("fail_open")), "fail_closed");
         // Omitted patch preserves existing.
-        assert_eq!(
-            normalize_proxy_scan_action(None, Some("fail_closed")),
-            "fail_closed"
-        );
+        assert_eq!(n(None, Some("fail_closed")), "fail_closed");
         // Neither => fail-open default.
-        assert_eq!(normalize_proxy_scan_action(None, None), "fail_open");
+        assert_eq!(n(None, None), "fail_open");
         // Case-insensitive + trimmed.
+        assert_eq!(n(Some("  FAIL_CLOSED "), None), "fail_closed");
+        // A legacy/unknown EXISTING value re-normalizes leniently.
+        assert_eq!(n(None, Some("garbage")), "fail_open");
+    }
+
+    /// #3645: `record_only` is a first-class action value (case-insensitive,
+    /// preserved when a patch omits it), and a client value outside the
+    /// three canonical tokens is a 400 rather than a silent `fail_open`.
+    #[test]
+    fn test_normalize_proxy_scan_action_record_only() {
+        let n = |p, e| normalize_proxy_scan_action(p, e).unwrap();
+        assert_eq!(n(Some(" Record_Only "), Some("fail_closed")), "record_only");
+        assert_eq!(n(None, Some("record_only")), "record_only");
+        assert_eq!(n(Some("fail_open"), Some("record_only")), "fail_open");
+        for bad in ["record-only", "fail-closed", "garbage", ""] {
+            assert!(
+                matches!(
+                    normalize_proxy_scan_action(Some(bad), Some("record_only")),
+                    Err(AppError::Validation(_))
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// The merge the transactional upsert writes: a partial patch keeps every
+    /// omitted field, an absent row merges over the documented defaults, and
+    /// a bad action is rejected before any write.
+    #[test]
+    fn test_merge_scan_config_partial_and_defaults() {
+        let patch = UpsertScanConfigRequest {
+            proxy_scan_action: Some("record_only".into()),
+            ..Default::default()
+        };
+        let m = merge_scan_config(&patch, None).unwrap();
         assert_eq!(
-            normalize_proxy_scan_action(Some("  FAIL_CLOSED "), None),
-            "fail_closed"
+            m,
+            MergedScanConfig {
+                proxy_scan_action: "record_only".into(),
+                ..MergedScanConfig::defaults()
+            }
         );
-        // Unknown value coerced to fail-open (never trips the DB CHECK).
+        let existing = sample_config();
+        let m = merge_scan_config(&patch, Some(&existing)).unwrap();
+        assert_eq!(m.severity_threshold, existing.severity_threshold);
         assert_eq!(
-            normalize_proxy_scan_action(Some("garbage"), None),
-            "fail_open"
+            m.block_on_policy_violation,
+            existing.block_on_policy_violation
+        );
+        assert_eq!(m.proxy_scan_action, "record_only");
+        let bad = UpsertScanConfigRequest {
+            proxy_scan_action: Some("record-only".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            merge_scan_config(&bad, Some(&existing)),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    /// #3645 / #3868: the record-only action overrides the threshold knobs;
+    /// without it the knobs keep their #3243/#3246 meaning, including the
+    /// #3868 reporter's `block_on_policy_violation = false` +
+    /// `severity_threshold = critical`, which never opted into the threshold
+    /// and so is block-on-any.
+    #[test]
+    fn test_proxy_severity_gate_for_row_precedence() {
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        for (block, threshold) in [(false, "critical"), (true, "critical"), (true, "info")] {
+            assert_eq!(
+                proxy_severity_gate_for_row(block, threshold, "record_only"),
+                ProxySeverityGate::RecordOnly
+            );
+        }
+        assert_eq!(
+            proxy_severity_gate_for_row(false, "critical", "fail_open"),
+            ProxySeverityGate::BlockOnAny
+        );
+        assert_eq!(
+            proxy_severity_gate_for_row(true, "critical", "fail_closed"),
+            ProxySeverityGate::Threshold(Severity::Critical)
         );
     }
 

@@ -393,6 +393,33 @@ pub mod details {
         /// decisions are honored under, so it is audit-relevant on its own.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_mode: Option<String>,
+        /// The repository's scan configuration after a scan-config write
+        /// that changed it (#3645). Every enforcement-relevant knob is
+        /// carried, so switching proxy scanning on/off, the severity
+        /// threshold, `block_on_policy_violation` or the proxy scan action
+        /// (`record_only` turns proxy-scan blocking off) is reviewable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub scan_config: Option<ScanConfigAuditState>,
+        /// The configuration that write replaced; a repository with no
+        /// config row is reported as the effective defaults.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub previous_scan_config: Option<ScanConfigAuditState>,
+        /// Names of the `scan_config` fields that changed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub scan_config_changed: Option<Vec<String>>,
+    }
+
+    /// One repository scan configuration, as carried by a
+    /// `REPOSITORY_UPDATED` scan-config change (#3645).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ScanConfigAuditState {
+        pub scan_enabled: bool,
+        pub scan_on_upload: bool,
+        pub scan_on_proxy: bool,
+        pub block_on_policy_violation: bool,
+        pub severity_threshold: String,
+        /// `fail_open` / `fail_closed` / `record_only`.
+        pub proxy_scan_action: String,
     }
 
     /// `ROLE_ASSIGNED` / `ROLE_REVOKED` / `REPOSITORY_PERMISSION_CHANGED`.
@@ -1138,6 +1165,9 @@ mod tests {
             age_gate_enabled: None,
             age_gate_min_age_days: None,
             age_gate_mode: None,
+            scan_config: None,
+            previous_scan_config: None,
+            scan_config_changed: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

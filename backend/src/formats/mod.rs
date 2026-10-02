@@ -281,6 +281,13 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// gate without being listed here, or is listed without reaching it, so the
 /// capability cannot drift from the router. Adopting the gate in a new format
 /// (#4100 Maven, #4101 Cargo, #4102 NuGet, ...) adds its key here.
+///
+/// `enforced` is a per-FORMAT capability: the format's proxy path runs the
+/// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
+/// choice (`scan_configs.proxy_scan_action`: `fail_open` / `fail_closed` /
+/// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
+/// the formats API carries no mode indicator: under `record_only` an
+/// `enforced` format still scans and records every pull, and serves it.
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &["npm", "oci", "pypi", "vscode"];
 
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?

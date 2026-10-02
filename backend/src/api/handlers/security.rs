@@ -18,6 +18,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
+use crate::services::audit_export::details as audit_details;
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::policy_service::PolicyService;
 use crate::services::proxy_catalog;
 use crate::services::proxy_scan_service::ProxyScanService;
@@ -757,16 +759,20 @@ pub struct ScanConfigResponse {
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
     /// Opt-in that makes `severity_threshold` enforced on the proxy/OCI
-    /// inline scan gate (#3243/#3246). When false (default), the gate blocks
-    /// on any finding above `info`. Hosted-artifact blocking remains
-    /// configured via scan policies.
+    /// inline scan gate (#3243/#3246). `false` (the default) does NOT mean
+    /// "don't block": the threshold is off and the gate blocks on ANY finding
+    /// above `info`. The non-blocking mode is `proxy_scan_action =
+    /// record_only`. Hosted-artifact blocking remains configured via scan
+    /// policies.
     pub block_on_policy_violation: bool,
     /// Severity floor for the inline proxy scan gate; live only when
     /// `block_on_policy_violation` is set (#3243/#3246). Findings at or above
     /// it block the pull.
     pub severity_threshold: String,
-    /// #2954: fail-open (default) / fail-closed action for the inline proxy
-    /// scan-on-fetch.
+    /// Inline proxy scan-on-fetch action: `fail_open` (default) /
+    /// `fail_closed` (#2954) / `record_only` (#3645: findings, verdicts and
+    /// SBOM data are recorded but no pull is ever blocked; overrides
+    /// `block_on_policy_violation` / `severity_threshold`).
     pub proxy_scan_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -1732,12 +1738,110 @@ async fn update_repo_security(
     // fail-closed gate as the configuration subresources fixed in #2745
     // (#2603 sibling, #2750).
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
-    let repo = repo.id;
-
     let svc = ScanConfigService::new(state.db.clone());
-    let c = svc.upsert_config(repo, &body).await?;
+    // #3645: the previous row is read in the same transaction as the write,
+    // so the audited "before" is exactly what this write replaced.
+    let write = svc.upsert_config_with_previous(repo.id, &body).await?;
 
-    Ok(Json(ScanConfigResponse::from(c)))
+    // Every change to the scan configuration is an enforcement change
+    // (scanning on/off, threshold, block_on_policy_violation, or the proxy
+    // scan action, where `record_only` turns proxy-scan blocking off), so each
+    // one is audited with both states. A no-op write is not.
+    if let Some(entry) = scan_config_change_audit(&auth, &repo, &write) {
+        if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+            tracing::warn!(
+                repo = %repo.key, error = %e,
+                "failed to record the scan-config change audit entry"
+            );
+        }
+    }
+
+    Ok(Json(ScanConfigResponse::from(write.current)))
+}
+
+/// The audit view of one scan configuration.
+fn scan_config_audit_state(
+    c: &crate::services::scan_config_service::MergedScanConfig,
+) -> audit_details::ScanConfigAuditState {
+    audit_details::ScanConfigAuditState {
+        scan_enabled: c.scan_enabled,
+        scan_on_upload: c.scan_on_upload,
+        scan_on_proxy: c.scan_on_proxy,
+        block_on_policy_violation: c.block_on_policy_violation,
+        severity_threshold: c.severity_threshold.clone(),
+        proxy_scan_action: c.proxy_scan_action.clone(),
+    }
+}
+
+/// Names of the scan-config fields that differ between two states.
+fn scan_config_changed_fields(
+    a: &crate::services::scan_config_service::MergedScanConfig,
+    b: &crate::services::scan_config_service::MergedScanConfig,
+) -> Vec<String> {
+    [
+        ("scan_enabled", a.scan_enabled != b.scan_enabled),
+        ("scan_on_upload", a.scan_on_upload != b.scan_on_upload),
+        ("scan_on_proxy", a.scan_on_proxy != b.scan_on_proxy),
+        (
+            "block_on_policy_violation",
+            a.block_on_policy_violation != b.block_on_policy_violation,
+        ),
+        (
+            "severity_threshold",
+            a.severity_threshold != b.severity_threshold,
+        ),
+        (
+            "proxy_scan_action",
+            a.proxy_scan_action != b.proxy_scan_action,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, changed)| *changed)
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
+/// The `REPOSITORY_UPDATED` audit entry for a scan-config write that changed
+/// anything (#3645), or `None` for a no-op write. A repository with no prior
+/// row is compared against the effective defaults it ran on.
+fn scan_config_change_audit(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    write: &crate::services::scan_config_service::ScanConfigWrite,
+) -> Option<AuditEntry> {
+    use crate::services::scan_config_service::MergedScanConfig;
+    let before = write
+        .previous
+        .as_ref()
+        .map(MergedScanConfig::of)
+        .unwrap_or_else(MergedScanConfig::defaults);
+    let after = MergedScanConfig::of(&write.current);
+    let changed = scan_config_changed_fields(&before, &after);
+    if changed.is_empty() {
+        return None;
+    }
+    Some(
+        AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(crate::services::repository_service::derive_format_key(
+                    &repo.format,
+                )),
+                visibility: Some(repo.visibility.as_str().to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+                age_gate_mode: None,
+                scan_config: Some(scan_config_audit_state(&after)),
+                previous_scan_config: Some(scan_config_audit_state(&before)),
+                scan_config_changed: Some(changed),
+            }),
+    )
 }
 
 #[utoipa::path(
@@ -2022,8 +2126,10 @@ pub struct ProxyScansResponse {
     /// scanning on it means pulls are blocked; with scanning off it means the
     /// artifact is served anyway and the verdict was recorded elsewhere.
     pub scan_on_proxy: bool,
-    /// `fail_open` | `fail_closed`. Lets `not_scanned` be read as "may have
-    /// been served unscanned" versus "was withheld".
+    /// `fail_open` | `fail_closed` | `record_only`. Lets `not_scanned` be
+    /// read as "may have been served unscanned" versus "was withheld"; under
+    /// `record_only` (#3645) a `vulnerable` item was recorded and still
+    /// served.
     pub proxy_scan_action: String,
     /// Omitted for a single-path (`?path=`) read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4904,6 +5010,157 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3645: `proxy_scan_action = record_only` round-trips through the
+    /// repository security API (case-insensitively, and survives a partial
+    /// PUT that omits it), resolves to the never-blocking gate, a malformed
+    /// action is a 400 that writes nothing, and EVERY scan-config change --
+    /// and only a change -- is audited with the before and after states.
+    #[tokio::test]
+    async fn record_only_proxy_scan_action_round_trips_and_is_audited_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let put = |body: UpsertScanConfigRequest| {
+            update_repo_security(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path(key.clone()),
+                Json(body),
+            )
+        };
+
+        // Opt in to record-only, with the #3868 reporter's threshold knobs.
+        let Json(resp) = put(UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            scan_on_proxy: Some(true),
+            block_on_policy_violation: Some(false),
+            severity_threshold: Some("critical".into()),
+            proxy_scan_action: Some(" RECORD_ONLY ".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("PUT record_only");
+        assert_eq!(resp.proxy_scan_action, "record_only");
+
+        let svc = ScanConfigService::new(pool.clone());
+        assert_eq!(
+            svc.proxy_scan_action(repo_id).await.unwrap(),
+            ProxyScanAction::RecordOnly
+        );
+        assert_eq!(
+            svc.proxy_severity_gate(repo_id).await.unwrap(),
+            ProxySeverityGate::RecordOnly,
+            "record_only overrides the threshold knobs"
+        );
+
+        // A malformed action is rejected and writes nothing.
+        let bad = put(UpsertScanConfigRequest {
+            proxy_scan_action: Some("fail-closed".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            matches!(bad, Err(AppError::Validation(_))),
+            "a hyphenated action must be a 400, got {bad:?}"
+        );
+
+        // A partial PUT that omits the action keeps it (threshold change).
+        let Json(resp) = put(UpsertScanConfigRequest {
+            severity_threshold: Some("high".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("partial PUT");
+        assert_eq!(resp.proxy_scan_action, "record_only");
+
+        // A no-op write is not audited.
+        let _no_op = put(UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("no-op PUT");
+
+        // Back to enforcement.
+        let Json(resp) = put(UpsertScanConfigRequest {
+            proxy_scan_action: Some("fail_closed".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("PUT fail_closed");
+        assert_eq!(resp.proxy_scan_action, "fail_closed");
+        assert_eq!(
+            svc.proxy_severity_gate(repo_id).await.unwrap(),
+            ProxySeverityGate::BlockOnAny
+        );
+
+        let rows = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT details->'previous_scan_config'->>'proxy_scan_action', \
+                    details->'scan_config'->>'proxy_scan_action', \
+                    details->>'scan_config_changed' \
+             FROM audit_log WHERE resource_id = $1 AND action = 'REPOSITORY_UPDATED' \
+             ORDER BY created_at, id",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read audit_log");
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let s = |v: &str| Some(v.to_string());
+        let changed = |names: &[&str]| Some(serde_json::json!(names).to_string());
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(a, b, c)| {
+                let c = c.map(|c| {
+                    serde_json::from_str::<serde_json::Value>(&c)
+                        .unwrap()
+                        .to_string()
+                });
+                (a, b, c)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    s("fail_open"),
+                    s("record_only"),
+                    changed(&[
+                        "scan_enabled",
+                        "scan_on_proxy",
+                        "severity_threshold",
+                        "proxy_scan_action"
+                    ])
+                ),
+                (
+                    s("record_only"),
+                    s("record_only"),
+                    changed(&["severity_threshold"])
+                ),
+                (
+                    s("record_only"),
+                    s("fail_closed"),
+                    changed(&["proxy_scan_action"])
+                ),
+            ],
+            "every change -- and only a change -- is audited with both states"
+        );
     }
 
     /// Admin gate on the GLOBAL security-policy write handlers. The global

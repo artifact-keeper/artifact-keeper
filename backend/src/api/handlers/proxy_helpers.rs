@@ -3329,6 +3329,14 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
 /// — OR on a member yields blocking, and a fail-closed member is never
 /// downgraded to fail-open by a fail-open virtual. Pure so the stricter-of-two
 /// logic is unit-testable without a DB.
+///
+/// Record-only (#3645) is the weakest action and results only when EVERY side
+/// that has proxy scanning enabled chose it (and neither side is fail-closed).
+/// A side with scanning disabled asserts no enforcement of its own (a direct
+/// pull of it is served unscanned), so it does not veto a record-only choice
+/// made on the other side; an enabled fail-open side does. A record-only
+/// member behind a virtual that enforces a threshold therefore yields to the
+/// virtual's threshold (see [`combined_severity_gate`]), and vice versa.
 pub fn stricter_scan_policy(
     virtual_enabled: bool,
     virtual_action: crate::services::proxy_scan_service::ProxyScanAction,
@@ -3341,10 +3349,32 @@ pub fn stricter_scan_policy(
         || matches!(member_action, ProxyScanAction::FailClosed)
     {
         ProxyScanAction::FailClosed
+    } else if enabled
+        && (!virtual_enabled || virtual_action.is_record_only())
+        && (!member_enabled || member_action.is_record_only())
+    {
+        ProxyScanAction::RecordOnly
     } else {
         ProxyScanAction::FailOpen
     };
     (enabled, action)
+}
+
+/// The severity gate that goes with a combined proxy-scan action (#3645): a
+/// record-only combination never blocks, whatever the sides' threshold knobs
+/// say; anything else is the stricter-of-two gate, where a side's own
+/// record-only gate yields to the other side.
+pub(crate) fn combined_severity_gate(
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    a: crate::services::proxy_scan_service::ProxySeverityGate,
+    b: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> crate::services::proxy_scan_service::ProxySeverityGate {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    if action.is_record_only() {
+        ProxySeverityGate::RecordOnly
+    } else {
+        ProxySeverityGate::stricter(a, b)
+    }
 }
 
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
@@ -3395,7 +3425,7 @@ pub async fn effective_virtual_scan_policy(
     (
         enabled,
         action,
-        ProxySeverityGate::stricter(virtual_gate, member_gate),
+        combined_severity_gate(action, virtual_gate, member_gate),
     )
 }
 
@@ -8187,13 +8217,43 @@ pub(crate) enum ProxyScanIdentity {
     NotApplicable,
 }
 
+/// What a served proxy pull's `X-AK-Scan` header reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyScanServed {
+    /// A verdict exists and lets these bytes through: no findings, or
+    /// findings below the repository's opted-in severity threshold.
+    Clean,
+    /// Served before a verdict exists (fail-open / record-only first pull, or
+    /// an over-cap object); an async scan records the verdict.
+    Pending,
+    /// Record-only (#3645): the verdict is `vulnerable` and recorded, but the
+    /// repository does not enforce it, so the bytes are served anyway.
+    Recorded,
+}
+
+impl ProxyScanServed {
+    /// The `X-AK-Scan` header value for this serve.
+    pub(crate) fn header_value(self) -> &'static str {
+        match self {
+            ProxyScanServed::Clean => "clean",
+            ProxyScanServed::Pending => "pending",
+            ProxyScanServed::Recorded => "recorded",
+        }
+    }
+
+    pub(crate) fn is_pending(self) -> bool {
+        matches!(self, ProxyScanServed::Pending)
+    }
+}
+
 /// Outcome of [`gate_proxy_scan_serve`], mapped by the caller onto its
-/// format-specific 200 response (`pending` selects the `X-AK-Scan` header
+/// format-specific 200 response (`served` selects the `X-AK-Scan` header
 /// value) or returned as the block/lock response as-is.
 pub(crate) enum ProxyScanServeOutcome {
-    /// Serve the buffered bytes; `pending: true` means fail-open served
-    /// before a verdict (loud `X-AK-Scan: pending`, async scan running).
-    Serve { pending: bool },
+    /// Serve the buffered bytes. `Pending` means served before a verdict
+    /// (loud `X-AK-Scan: pending`, async scan running); `Recorded` means a
+    /// record-only repository served a vulnerable verdict (#3645).
+    Serve(ProxyScanServed),
     /// The pull is blocked (403 vulnerable) or locked (423 inconclusive
     /// under fail-closed); the response is fully built.
     Deny(Response),
@@ -8262,7 +8322,10 @@ fn scan_inline_serve_decision(
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
-        Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.is_record_only() => {
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded)
+        }
+        Ok(_) => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         // Inconclusive under fail-closed => 423, never unscanned bytes.
         Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
     }
@@ -8309,18 +8372,28 @@ pub(crate) async fn gate_proxy_scan_serve(
             // #3243 stage 3 / #3246: a repo that explicitly opted in via
             // `block_on_policy_violation` applies its `severity_threshold` to
             // the stored verdict — see [`stored_verdict_blocks_under_gate`].
+            if severity_gate.is_record_only() {
+                // #3645: the verdict stays recorded (and reported by the
+                // proxy-scans endpoint); a record-only repo never withholds.
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    "serving proxy pull: cached vulnerable verdict recorded, not \
+                     enforced (record-only proxy scan, #3645)"
+                );
+                return ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded);
+            }
             if !stored_verdict_blocks_under_gate(row.as_ref(), severity_gate) {
                 tracing::info!(
                     repo_id = %repo_id, file = %filename, digest = %digest,
                     "serving proxy pull: cached vulnerable verdict is below this \
                      repo's configured severity threshold (#3243)"
                 );
-                return ProxyScanServeOutcome::Serve { pending: false };
+                return ProxyScanServeOutcome::Serve(ProxyScanServed::Clean);
             }
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
-        ServeDecision::ServeCached => ProxyScanServeOutcome::Serve { pending: false },
+        ServeDecision::ServeCached => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         ServeDecision::ScanInline => {
             // Fail-closed: scan inline before serving a single byte.
             //
@@ -8377,7 +8450,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 // posture) but do not run a scan whose only possible result
                 // would be an unfounded `clean` row for this digest.
                 ProxyScanIdentity::Unestablished => {
-                    return ProxyScanServeOutcome::Serve { pending: true }
+                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
@@ -8396,7 +8469,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 )
                 .await;
             });
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         }
     }
 }
@@ -8640,7 +8713,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     .await
     {
         ProxyScanServeOutcome::Deny(resp) => Err(resp),
-        ProxyScanServeOutcome::Serve { pending } => {
+        ProxyScanServeOutcome::Serve(served) => {
             record_scanned_proxy_download(state, req).await;
             let body = ScannedProxyBody {
                 bytes,
@@ -8648,10 +8721,10 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
                 content_encoding,
                 digest,
             };
-            let mut resp = file.scanned_response(req, body, pending);
+            let mut resp = file.scanned_response(req, body, served.is_pending());
             resp.headers_mut().insert(
                 "X-AK-Scan",
-                axum::http::HeaderValue::from_static(if pending { "pending" } else { "clean" }),
+                axum::http::HeaderValue::from_static(served.header_value()),
             );
             Ok(resp)
         }
@@ -9052,6 +9125,243 @@ mod scanned_proxy_file_tests {
         assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
         fx.teardown().await;
     }
+
+    // ── #3645: record-only proxy scan mode ──
+    //
+    // These drive the gate from a REAL `scan_configs` row through
+    // `direct_scan_policy`, so the config -> (action, gate) resolution is
+    // covered along with the serve decision.
+
+    /// Write the repository's scan config through the same service the
+    /// `PUT /repositories/{key}/security` handler uses.
+    async fn set_scan_config(fx: &tdh::Fixture, block: bool, threshold: &str, action: &str) {
+        crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone())
+            .upsert_config(
+                fx.repo_id,
+                &crate::services::scan_config_service::UpsertScanConfigRequest {
+                    scan_enabled: Some(true),
+                    scan_on_upload: Some(false),
+                    scan_on_proxy: Some(true),
+                    block_on_policy_violation: Some(block),
+                    severity_threshold: Some(threshold.to_string()),
+                    proxy_scan_action: Some(action.to_string()),
+                },
+            )
+            .await
+            .expect("upsert scan config");
+    }
+
+    async fn seed_vulnerable(fx: &tdh::Fixture, digest: &str, max_severity: &str) {
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                i32::from(max_severity == "critical"),
+                i32::from(max_severity == "high"),
+                0,
+                0,
+                Some(max_severity),
+                Some("grype-3645-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+    }
+
+    async fn cleanup_verdict(fx: &tdh::Fixture, digest: &str) {
+        for sql in [
+            "DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1",
+            "DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(digest).execute(&fx.pool).await;
+        }
+    }
+
+    /// One pull through the wrapper under the repository's CURRENT config.
+    async fn pull_under_config(
+        fx: &tdh::Fixture,
+        state: &crate::api::SharedState,
+        proxy: &ProxyService,
+        base: &str,
+        file: &FakeFormat,
+    ) -> Result<Response, Response> {
+        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, base, action);
+        req.severity_gate = gate;
+        req.ctx = Some(&ctx);
+        serve_scanned_proxy_file(state, proxy, &req, file).await
+    }
+
+    fn scan_header(resp: &Response) -> &str {
+        resp.headers()["X-AK-Scan"].to_str().unwrap()
+    }
+
+    /// The #3645 acceptance criteria on a cached vulnerable (critical) verdict:
+    /// record-only serves it on every pull with `X-AK-Scan: recorded` and the
+    /// verdict row stays `vulnerable`; switching enforcement on blocks the
+    /// SAME digest from the SAME row, and switching back serves again --
+    /// the mode changes only blocking, never what is recorded.
+    #[tokio::test]
+    async fn record_only_serves_a_vulnerable_digest_and_the_mode_only_changes_blocking() {
+        let bytes = format!("fake-3645-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        seed_vulnerable(&fx, &digest, "critical").await;
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        let before = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        set_scan_config(&fx, false, "high", "record_only").await;
+        for pull in 1..=2 {
+            let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+                .await
+                .unwrap_or_else(|r| panic!("record-only pull {pull} withheld: {}", r.status()));
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(scan_header(&resp), "recorded");
+            assert_eq!(resp.headers()["X-Fake-Pending"], "false");
+            assert_eq!(&body_of(resp).await[..], &bytes[..]);
+        }
+        assert_eq!(recorded(&fx).await, 2, "every served pull is recorded");
+
+        // Enforcement on (default knobs): the same verdict now blocks.
+        set_scan_config(&fx, false, "high", "fail_open").await;
+        let denied = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // And fail-closed blocks it too.
+        set_scan_config(&fx, false, "high", "fail_closed").await;
+        let denied = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        set_scan_config(&fx, false, "high", "record_only").await;
+        let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only withheld after switch-back: {}", r.status()));
+        assert_eq!(scan_header(&resp), "recorded");
+
+        let after = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+        let (before, after) = (before.unwrap(), after.unwrap());
+        assert_eq!(after.verdict, "vulnerable");
+        assert_eq!(after.max_severity.as_deref(), Some("critical"));
+        assert_eq!(
+            after.scanned_at, before.scanned_at,
+            "switching the mode never rewrites the recorded verdict"
+        );
+    }
+
+    /// Record-only first pull with a CVE engine that flags the bytes: served
+    /// at once (pending), the async scan records a `vulnerable` verdict WITH
+    /// its findings, and the next pull is served `recorded` instead of 403.
+    #[tokio::test]
+    async fn record_only_records_findings_from_the_async_scan_and_keeps_serving() {
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let bytes = format!("fake-3645-async-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, _state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage,
+            vec![Arc::new(VersionedCveScanner::new(
+                Some("grype-3645-live"),
+                MockCveRescan::Vulnerable,
+            ))],
+        );
+        set_scan_config(&fx, true, "low", "record_only").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        let first = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only first pull withheld: {}", r.status()));
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(scan_header(&first), "pending");
+
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        // The verdict row lands before its per-CVE findings; wait for both.
+        let (mut row, mut findings) = (None, 0i64);
+        for _ in 0..150 {
+            row = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+            findings = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_scan_findings WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            if row.is_some() && findings > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let second = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        cleanup_verdict(&fx, &digest).await;
+        let downloads = recorded(&fx).await;
+        fx.teardown().await;
+
+        let row = row.expect("the async record-only scan records a verdict");
+        assert_eq!(row.verdict, "vulnerable");
+        assert_eq!(row.max_severity.as_deref(), Some("critical"));
+        assert!(findings >= 1, "the findings are recorded with the verdict");
+        let second = second.unwrap_or_else(|r| panic!("second pull withheld: {}", r.status()));
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(scan_header(&second), "recorded");
+        assert_eq!(downloads, 2);
+    }
+
+    /// Record-only never withholds on an inconclusive outcome either: with no
+    /// scanner wired the first pull serves pending (fail-closed 423s the same
+    /// pull, `fail_closed_unscannable_first_pull_is_locked`), and an object
+    /// over the scan byte cap streams pending instead of 423.
+    #[tokio::test]
+    async fn record_only_inconclusive_and_over_cap_pulls_are_served() {
+        let bytes = format!("fake-3645-unscannable-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        set_scan_config(&fx, true, "critical", "record_only").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only unscannable pull withheld: {}", r.status()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(scan_header(&resp), "pending");
+        assert_eq!(&body_of(resp).await[..], &bytes[..]);
+
+        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let mut over = request(fx.repo_id, &fx.repo_key, &base, action);
+        over.severity_gate = gate;
+        over.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &over, &file).await;
+        let downloads = recorded(&fx).await;
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(action, ProxyScanAction::RecordOnly);
+        let resp = resp.unwrap_or_else(|r| panic!("record-only over-cap withheld: {}", r.status()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 1);
+        assert_eq!(downloads, 2);
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -9377,7 +9687,7 @@ mod tests {
                 StatusCode::LOCKED,
                 "inconclusive under fail-closed must 423, never serve unscanned bytes"
             ),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on an inconclusive scan")
             }
         }
@@ -9385,7 +9695,7 @@ mod tests {
         assert!(
             matches!(
                 run_gate(&fx.state, ProxyScanAction::FailOpen).await,
-                ProxyScanServeOutcome::Serve { pending: true }
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
             ),
             "inconclusive under fail-open must still serve loudly pending"
         );
@@ -9413,7 +9723,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
         match run_gate(&fail_closed_state, ProxyScanAction::FailClosed).await {
             ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve when the scan errored")
             }
         }
@@ -9422,7 +9732,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
         assert!(matches!(
             run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         ));
     }
 
@@ -9447,7 +9757,7 @@ mod tests {
     //
     // fail-open is proven end-to-end with a real, UNPAUSED clock and is safe
     // to do so: `ServePendingScanAsync` fires the scan in a background
-    // `tokio::spawn` and returns `Serve { pending: true }` without ever
+    // `tokio::spawn` and returns `Serve(ProxyScanServed::Pending)` without ever
     // looking at its outcome (see that arm in `gate_proxy_scan_serve`), so
     // the assertion below returns long before the mock's hang could matter --
     // there is no timer this test needs to wait out, paused or otherwise.
@@ -9466,7 +9776,7 @@ mod tests {
             "deadbeef",
         ) {
             ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on a budget-exceeded scan")
             }
         }
@@ -9495,7 +9805,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);
         assert!(matches!(
             run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         ));
     }
 
@@ -9640,6 +9950,53 @@ mod tests {
             ProxyScanAction::FailOpen,
         );
         assert_eq!(action, ProxyScanAction::FailOpen);
+    }
+
+    /// #3645: record-only results only when every side with scanning enabled
+    /// chose it; an enabled fail-open/fail-closed side wins, and a side with
+    /// scanning off does not veto. The combined gate follows the action.
+    #[test]
+    fn stricter_scan_policy_record_only_needs_every_enabled_side() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+        let ro = ProxyScanAction::RecordOnly;
+        let open = ProxyScanAction::FailOpen;
+        let closed = ProxyScanAction::FailClosed;
+        assert_eq!(stricter_scan_policy(true, ro, true, ro), (true, ro));
+        // Member scanning off (its default action): the virtual's choice holds.
+        assert_eq!(stricter_scan_policy(true, ro, false, open), (true, ro));
+        assert_eq!(stricter_scan_policy(false, open, true, ro), (true, ro));
+        // An enabled enforcing side wins.
+        assert_eq!(stricter_scan_policy(true, ro, true, open), (true, open));
+        assert_eq!(stricter_scan_policy(true, open, true, ro), (true, open));
+        assert_eq!(stricter_scan_policy(true, ro, true, closed), (true, closed));
+        // Fail-closed anywhere still dominates, as before.
+        assert_eq!(
+            stricter_scan_policy(true, ro, false, closed),
+            (true, closed)
+        );
+        // Nothing enabled: not record-only.
+        assert_eq!(stricter_scan_policy(false, ro, false, ro), (false, open));
+
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(
+            combined_severity_gate(
+                ro,
+                ProxySeverityGate::RecordOnly,
+                ProxySeverityGate::BlockOnAny
+            ),
+            ProxySeverityGate::RecordOnly,
+            "a record-only combination never blocks, whatever a scanning-off side's row says"
+        );
+        assert_eq!(
+            combined_severity_gate(open, ProxySeverityGate::RecordOnly, high),
+            high,
+            "an enforcing combination keeps the enforcing side's gate"
+        );
+        assert_eq!(
+            combined_severity_gate(open, high, ProxySeverityGate::BlockOnAny),
+            ProxySeverityGate::BlockOnAny
+        );
     }
 
     // ── Global buffered-metadata byte budget (#2665) ─────────────────
