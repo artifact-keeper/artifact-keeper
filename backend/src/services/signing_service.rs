@@ -4,7 +4,9 @@
 //! for Debian/APT, RPM/YUM, Alpine/APK, and Conda repositories.
 
 use crate::error::{AppError, Result};
-use crate::models::signing_key::{RepositorySigningConfig, SigningKey, SigningKeyPublic};
+use crate::models::signing_key::{
+    RepositorySigningConfig, SigningKey, SigningKeyPublic, SigningKeyTrustAttestation,
+};
 use crate::services::encryption::CredentialEncryption;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use pgp::composed::cleartext::CleartextSignedMessage;
@@ -518,6 +520,25 @@ pub struct CreateKeyRequest {
     pub created_by: Option<Uuid>,
 }
 
+/// Canonical trust-attestation challenge for one signing key.
+pub struct SigningKeyTrustChallenge {
+    pub signing_key_id: Uuid,
+    pub payload: String,
+    pub key_public_key_armored: String,
+    pub key_fingerprint: Option<String>,
+    pub key_type: String,
+    pub algorithm: String,
+}
+
+/// Input used to verify and persist an external trust attestation.
+pub struct VerifyTrustAttestationRequest {
+    pub signing_key_id: Uuid,
+    pub issuer_name: Option<String>,
+    pub issuer_public_key_armored: String,
+    pub signature_armored: String,
+    pub created_by: Option<Uuid>,
+}
+
 /// Freshly generated (and at-rest-encrypted) key material, ready to be
 /// inserted as a `signing_keys` row.
 ///
@@ -736,6 +757,199 @@ impl SigningService {
         .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
 
         Ok(key.into())
+    }
+
+    fn signing_key_attestation_payload(key: &SigningKey) -> String {
+        let public_key_sha256 = hex::encode(Sha256::digest(key.public_key_pem.as_bytes()));
+        format!(
+            "AK-SIGNING-ATTESTATION-V1\n\
+signing_key_id:{id}\n\
+fingerprint:{fingerprint}\n\
+key_id:{key_id}\n\
+key_type:{key_type}\n\
+algorithm:{algorithm}\n\
+public_key_sha256:{public_key_sha256}\n\
+created_at:{created_at}\n",
+            id = key.id,
+            fingerprint = key.fingerprint.as_deref().unwrap_or(""),
+            key_id = key.key_id.as_deref().unwrap_or(""),
+            key_type = key.key_type,
+            algorithm = key.algorithm,
+            public_key_sha256 = public_key_sha256,
+            created_at = key.created_at.to_rfc3339(),
+        )
+    }
+
+    async fn get_signing_key_full(&self, key_id: Uuid) -> Result<SigningKey> {
+        let key = sqlx::query_as::<_, SigningKey>("SELECT * FROM signing_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
+        Ok(key)
+    }
+
+    /// Build a deterministic challenge payload that must be signed by an
+    /// external issuer key (for example a root key kept on a hardware token).
+    pub async fn get_trust_attestation_challenge(
+        &self,
+        key_id: Uuid,
+    ) -> Result<SigningKeyTrustChallenge> {
+        let key = self.get_signing_key_full(key_id).await?;
+        let payload = Self::signing_key_attestation_payload(&key);
+        Ok(SigningKeyTrustChallenge {
+            signing_key_id: key.id,
+            payload,
+            key_public_key_armored: key.public_key_pem,
+            key_fingerprint: key.fingerprint,
+            key_type: key.key_type,
+            algorithm: key.algorithm,
+        })
+    }
+
+    /// Verify an externally-produced OpenPGP detached signature for a signing
+    /// key attestation payload and persist it.
+    ///
+    /// The stored status is `signature_valid`: the issuer primary key verified
+    /// the payload. That is **not** a PKI trust decision — we do not pin
+    /// issuers to trust anchors, and subkeys in the armored blob are not
+    /// treated as independently trusted (#2462). Replacing an existing
+    /// attestation with a *different* issuer is refused.
+    pub async fn verify_and_store_trust_attestation(
+        &self,
+        req: VerifyTrustAttestationRequest,
+    ) -> Result<SigningKeyTrustAttestation> {
+        use sqlx::Row;
+        let key = self.get_signing_key_full(req.signing_key_id).await?;
+        if !key.is_active {
+            return Err(AppError::Validation(
+                "Cannot attest a revoked or inactive signing key".to_string(),
+            ));
+        }
+        let payload = Self::signing_key_attestation_payload(&key);
+
+        let (issuer_public, _) = SignedPublicKey::from_string(&req.issuer_public_key_armored)
+            .map_err(|e| {
+                AppError::Validation(format!("Invalid issuer OpenPGP public key: {}", e))
+            })?;
+        issuer_public.verify().map_err(|e| {
+            AppError::Validation(format!(
+                "Issuer public key self-signature is invalid: {}",
+                e
+            ))
+        })?;
+
+        let (signature, _) = StandaloneSignature::from_string(&req.signature_armored)
+            .map_err(|e| AppError::Validation(format!("Invalid detached signature: {}", e)))?;
+        // Verify against the provided primary key. Subkeys are not a trust
+        // path; a signature that only verifies as a subkey is rejected here.
+        signature
+            .verify(&issuer_public, payload.as_bytes())
+            .map_err(|e| {
+                AppError::Validation(format!(
+                    "Detached signature does not match attestation payload: {}",
+                    e
+                ))
+            })?;
+
+        let issuer_fingerprint = hex::encode(issuer_public.fingerprint().as_bytes());
+        if let Some(existing) = self.get_trust_attestation(req.signing_key_id).await? {
+            if existing.issuer_fingerprint != issuer_fingerprint {
+                return Err(AppError::Conflict(
+                    "A trust attestation from a different issuer already exists for this signing key"
+                        .to_string(),
+                ));
+            }
+        }
+        let now = Utc::now();
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO signing_key_trust_attestations
+                (signing_key_id, issuer_name, issuer_public_key_armored,
+                 issuer_fingerprint, payload, signature_armored, signature_type,
+                 verification_status, verified_at, created_by)
+            VALUES
+                ($1, $2, $3, $4, $5, $6, 'openpgp_detached', 'signature_valid', $7, $8)
+            ON CONFLICT (signing_key_id) DO UPDATE SET
+                issuer_name = EXCLUDED.issuer_name,
+                issuer_public_key_armored = EXCLUDED.issuer_public_key_armored,
+                payload = EXCLUDED.payload,
+                signature_armored = EXCLUDED.signature_armored,
+                signature_type = EXCLUDED.signature_type,
+                verification_status = EXCLUDED.verification_status,
+                verified_at = EXCLUDED.verified_at,
+                created_by = EXCLUDED.created_by
+            WHERE signing_key_trust_attestations.issuer_fingerprint = EXCLUDED.issuer_fingerprint
+            RETURNING
+                id, signing_key_id, issuer_name, issuer_public_key_armored,
+                issuer_fingerprint, payload, signature_armored, signature_type,
+                verification_status, verified_at, created_at, created_by
+            "#,
+        )
+        .bind(req.signing_key_id)
+        .bind(req.issuer_name)
+        .bind(req.issuer_public_key_armored)
+        .bind(&issuer_fingerprint)
+        .bind(payload)
+        .bind(req.signature_armored)
+        .bind(now)
+        .bind(req.created_by)
+        .fetch_optional(&self.db)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(AppError::Conflict(
+                "A trust attestation from a different issuer already exists for this signing key"
+                    .to_string(),
+            ));
+        };
+
+        self.audit_key_action(
+            key.id,
+            "trust_attestation_verified",
+            req.created_by,
+            Some(serde_json::json!({
+                "issuer_fingerprint": row.get::<String, _>("issuer_fingerprint"),
+            })),
+        )
+        .await?;
+
+        Ok(SigningKeyTrustAttestation {
+            id: row.get("id"),
+            signing_key_id: row.get("signing_key_id"),
+            issuer_name: row.get("issuer_name"),
+            issuer_public_key_armored: row.get("issuer_public_key_armored"),
+            issuer_fingerprint: row.get("issuer_fingerprint"),
+            payload: row.get("payload"),
+            signature_armored: row.get("signature_armored"),
+            signature_type: row.get("signature_type"),
+            verification_status: row.get("verification_status"),
+            verified_at: row.get("verified_at"),
+            created_at: row.get("created_at"),
+            created_by: row.get("created_by"),
+        })
+    }
+
+    /// Get trust attestation for a signing key, if configured.
+    pub async fn get_trust_attestation(
+        &self,
+        key_id: Uuid,
+    ) -> Result<Option<SigningKeyTrustAttestation>> {
+        sqlx::query_as::<_, SigningKeyTrustAttestation>(
+            r#"
+            SELECT
+                id, signing_key_id, issuer_name, issuer_public_key_armored,
+                issuer_fingerprint, payload, signature_armored, signature_type,
+                verification_status, verified_at, created_at, created_by
+            FROM signing_key_trust_attestations
+            WHERE signing_key_id = $1
+            "#,
+        )
+        .bind(key_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Get the active signing key for a repository.
@@ -3529,5 +3743,163 @@ mod tests {
             .expect("rotating an ordinary signing key must still succeed");
         assert_ne!(new.id, old);
         assert_eq!(active_key_ids(&pool, repo).await, vec![new.id]);
+    }
+
+    #[tokio::test]
+    async fn trust_attestation_is_signature_valid_and_refuses_a_second_issuer() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key = service
+            .create_key(CreateKeyRequest {
+                repository_id: Some(repo),
+                name: format!("attest-target-{}", Uuid::new_v4().as_simple()),
+                key_type: "gpg".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK Key".to_string()),
+                uid_email: Some("ak@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+
+        let issuer = generate_test_openpgp_signing_key(TEST_PASSPHRASE).await;
+        let issuer_svc = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
+            signature_expiry_seconds: 0,
+        };
+        let challenge = service
+            .get_trust_attestation_challenge(key.id)
+            .await
+            .expect("challenge");
+        let signature = issuer_svc
+            .sign_openpgp_detached_with_key(&issuer, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+
+        let stored = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: Some("root-issuer".into()),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature.clone(),
+                created_by: None,
+            })
+            .await
+            .expect("verify");
+        assert_eq!(stored.verification_status, "signature_valid");
+        assert_eq!(stored.signing_key_id, key.id);
+
+        let again = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: Some("root-issuer".into()),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature,
+                created_by: None,
+            })
+            .await
+            .expect("same issuer is idempotent");
+        assert_eq!(again.id, stored.id);
+
+        let other = generate_test_openpgp_signing_key(TEST_PASSPHRASE).await;
+        let other_svc = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
+            signature_expiry_seconds: 0,
+        };
+        let other_sig = other_svc
+            .sign_openpgp_detached_with_key(&other, challenge.payload.as_bytes())
+            .await
+            .expect("other issuer signature");
+        let err = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: Some("intruder".into()),
+                issuer_public_key_armored: other.public_key_pem,
+                signature_armored: other_sig,
+                created_by: None,
+            })
+            .await
+            .expect_err("different issuer must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_attestation_rejects_revoked_keys_and_bad_signatures() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key = service
+            .create_key(CreateKeyRequest {
+                repository_id: Some(repo),
+                name: format!("attest-revoked-{}", Uuid::new_v4().as_simple()),
+                key_type: "gpg".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK Key".to_string()),
+                uid_email: Some("ak@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+
+        let issuer = generate_test_openpgp_signing_key(TEST_PASSPHRASE).await;
+        let issuer_svc = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
+            signature_expiry_seconds: 0,
+        };
+        let challenge = service
+            .get_trust_attestation_challenge(key.id)
+            .await
+            .expect("challenge");
+        let bad_sig = issuer_svc
+            .sign_openpgp_detached_with_key(&issuer, b"not-the-challenge")
+            .await
+            .expect("wrong-payload signature");
+        let err = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: None,
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: bad_sig,
+                created_by: None,
+            })
+            .await
+            .expect_err("wrong payload must not verify");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+
+        service.revoke_key(key.id, None).await.expect("revoke");
+        let good_sig = issuer_svc
+            .sign_openpgp_detached_with_key(&issuer, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+        let err = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: None,
+                issuer_public_key_armored: issuer.public_key_pem,
+                signature_armored: good_sig,
+                created_by: None,
+            })
+            .await
+            .expect_err("revoked key must not be attestable");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
     }
 }

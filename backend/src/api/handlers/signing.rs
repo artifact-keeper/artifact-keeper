@@ -14,9 +14,14 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
-use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
+use crate::models::signing_key::{
+    RepositorySigningConfig, SigningKeyPublic, SigningKeyTrustAttestation,
+};
 use crate::services::repository_service::RepositoryService;
-use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
+use crate::services::signing_service::{
+    normalize_key_type, CreateKeyRequest, SigningKeyTrustChallenge, SigningService,
+    VerifyTrustAttestationRequest,
+};
 
 /// Create signing key management routes.
 pub fn router() -> Router<SharedState> {
@@ -27,6 +32,18 @@ pub fn router() -> Router<SharedState> {
         .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/keys/:key_id/rotate", post(rotate_key))
         .route("/keys/:key_id/public", get(get_public_key))
+        .route(
+            "/keys/:key_id/trust-attestation",
+            get(get_key_trust_attestation),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/challenge",
+            get(get_key_trust_attestation_challenge),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/verify",
+            post(verify_key_trust_attestation),
+        )
         // Repository signing config
         .route(
             "/repositories/:repo_id/config",
@@ -81,6 +98,23 @@ pub struct SigningConfigResponse {
     pub sign_packages: bool,
     pub require_signatures: bool,
     pub key: Option<SigningKeyPublic>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrustAttestationChallengeResponse {
+    pub signing_key_id: Uuid,
+    pub payload: String,
+    pub key_public_key_armored: String,
+    pub key_fingerprint: Option<String>,
+    pub key_type: String,
+    pub algorithm: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyTrustAttestationPayload {
+    pub issuer_name: Option<String>,
+    pub issuer_public_key_armored: String,
+    pub signature_armored: String,
 }
 
 // --- Handlers ---
@@ -364,6 +398,107 @@ async fn get_public_key(
     Ok(key.public_key_pem)
 }
 
+/// Get the stored trust attestation for a signing key, if any.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored trust attestation, or null", body = Option<SigningKeyTrustAttestation>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<Option<SigningKeyTrustAttestation>>> {
+    let svc = signing_service(&state);
+    let _ = svc.get_key(key_id).await?;
+    let attestation = svc.get_trust_attestation(key_id).await?;
+    Ok(Json(attestation))
+}
+
+/// Challenge payload an external issuer key must sign.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation/challenge",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Attestation challenge", body = TrustAttestationChallengeResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation_challenge(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<TrustAttestationChallengeResponse>> {
+    let svc = signing_service(&state);
+    let challenge: SigningKeyTrustChallenge = svc.get_trust_attestation_challenge(key_id).await?;
+    Ok(Json(TrustAttestationChallengeResponse {
+        signing_key_id: challenge.signing_key_id,
+        payload: challenge.payload,
+        key_public_key_armored: challenge.key_public_key_armored,
+        key_fingerprint: challenge.key_fingerprint,
+        key_type: challenge.key_type,
+        algorithm: challenge.algorithm,
+    }))
+}
+
+/// Verify a detached OpenPGP signature over the challenge payload and store it.
+///
+/// Success means the signature is cryptographically valid (`signature_valid`),
+/// not that the issuer is a pinned trust anchor (#2462).
+#[utoipa::path(
+    post,
+    path = "/keys/{key_id}/trust-attestation/verify",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = VerifyTrustAttestationPayload,
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored attestation", body = SigningKeyTrustAttestation),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "A different issuer already attested this key", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn verify_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+    Json(payload): Json<VerifyTrustAttestationPayload>,
+) -> Result<Json<SigningKeyTrustAttestation>> {
+    require_signing_admin(&auth)?;
+    let svc = signing_service(&state);
+    let attestation = svc
+        .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+            signing_key_id: key_id,
+            issuer_name: payload.issuer_name,
+            issuer_public_key_armored: payload.issuer_public_key_armored,
+            signature_armored: payload.signature_armored,
+            created_by: Some(auth.user_id),
+        })
+        .await?;
+    Ok(Json(attestation))
+}
+
 /// Get signing configuration for a repository.
 #[utoipa::path(
     get,
@@ -610,6 +745,9 @@ fn signing_config_fields(
         revoke_key,
         rotate_key,
         get_public_key,
+        get_key_trust_attestation,
+        get_key_trust_attestation_challenge,
+        verify_key_trust_attestation,
         get_repo_signing_config,
         update_repo_signing_config,
         get_repo_public_key,
@@ -621,6 +759,9 @@ fn signing_config_fields(
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
+        TrustAttestationChallengeResponse,
+        VerifyTrustAttestationPayload,
+        SigningKeyTrustAttestation,
         SignArtifactResponse,
     ))
 )]
@@ -843,6 +984,7 @@ mod tests {
             "rotate_key",
             "update_repo_signing_config",
             "sign_artifact",
+            "verify_key_trust_attestation",
         ] {
             assert!(
                 signing_handler_body(name).contains("require_signing_admin"),
