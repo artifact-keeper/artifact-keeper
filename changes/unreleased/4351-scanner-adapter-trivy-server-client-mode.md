@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4351]
+---
+- **The scanner-adapter can run its scans as a client of a shared `trivy server`** (#4351). Every adapter downloaded and held its own copy of the trivy vulnerability DB and analyzed every image layer itself, even when several adapters run side by side. Setting `SCANNER_TRIVY_SERVER` now runs every image and filesystem scan with `--server`: the server holds the DB and does the matching, image layers already analyzed by any client are neither pulled nor re-analyzed, and the adapter skips its startup DB download. Readiness stays fail-closed: `/probe/ready` is 200 only while the server answers `/version` with a loaded DB and the same trivy release as the bundled CLI, since trivy accepts a mismatched client silently. Because trivy keys an image layer's cached analysis by the diff ID the image config claims, without re-hashing the layer, adapters that should not trust each other's cache entries can set distinct `SCANNER_TRIVY_CACHE_PARTITION` values and still share the DB. Unset, nothing changes. The adapter is 1.3.0.

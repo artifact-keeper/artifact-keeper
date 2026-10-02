@@ -55,6 +55,27 @@ type Config struct {
 	JobTTL time.Duration
 	// LogLevel is "debug" | "info" (anything != debug is treated as info).
 	LogLevel string
+	// TrivyServer, when set, runs every trivy invocation (image and filesystem)
+	// in client mode against this trivy server (`--server`). The server holds
+	// the vulnerability DB and does the vulnerability matching; the adapter
+	// still pulls and analyzes what it scans. In this mode the adapter does not
+	// download a local vulnerability DB at startup, and readiness follows the
+	// server (GET <server>/version must answer with a loaded DB and the same
+	// trivy version as the bundled CLI). An authenticated server is reached by
+	// setting trivy's own TRIVY_TOKEN (and TRIVY_TOKEN_HEADER) in the adapter's
+	// environment, which every trivy invocation inherits. Must include the
+	// scheme, e.g. "http://trivy:4954". Empty keeps standalone mode.
+	TrivyServer string
+	// CachePartition, when set, partitions trivy's analysis-cache keys: the
+	// adapter adds a `--skip-dirs` entry derived from this value that never
+	// matches a real path but is part of every cache key trivy computes. Two
+	// adapters with different partitions sharing one trivy server therefore
+	// never reuse each other's cached layer analysis, while still sharing the
+	// server's vulnerability DB. Use it when the adapters sharing a server
+	// should not trust each other's cache entries (image-layer cache keys are
+	// derived from the diff IDs an image's config CLAIMS, which trivy does not
+	// re-verify against the layer content). Empty means no partition.
+	CachePartition string
 	// ScannerVersion is the trivy version reported in the Harbor report's
 	// `scanner.version`. Empty at construction; filled by ProbeVersion at
 	// startup (or overridden via SCANNER_SCANNER_VERSION).
@@ -85,6 +106,8 @@ func LoadConfig() *Config {
 		JobTTL:           getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		LogLevel:         getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:   os.Getenv("SCANNER_SCANNER_VERSION"),
+		TrivyServer:      strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
+		CachePartition:   strings.TrimSpace(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION")),
 	}
 }
 

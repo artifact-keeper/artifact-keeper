@@ -43,7 +43,16 @@ func main() {
 	// (a FALSE CLEAN); staying not-ready makes the backend fail every scan closed
 	// instead. When DB updates are enabled, download it now so it is present
 	// before the readiness flag flips (rather than racing the first scan).
-	if versionOK {
+	if versionOK && cfg.TrivyServer != "" {
+		// Client mode: the vulnerability DB and the matching live on the trivy
+		// server, so no local DB is downloaded. Readiness is re-checked against
+		// the server on every /probe/ready (cached briefly; see remote.go).
+		srv.MarkReady()
+		log.Printf("trivy client mode: server %s holds the vuln DB; readiness follows it (trivy=%s)", cfg.TrivyServer, cfg.ScannerVersion)
+		if cfg.CachePartition != "" {
+			log.Printf("trivy analysis cache partitioned (%s)", cachePartitionDir(cfg.CachePartition))
+		}
+	} else if versionOK {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.ScanTimeout)
 		if !cfg.SkipDBUpdate {
 			if err := DownloadDB(ctx, cfg); err != nil {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -76,8 +78,34 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
+	args = append(args, s.cfg.clientArgs()...)
 	args = append(args, imageRef)
 	return args
+}
+
+// clientArgs returns the flags shared by every scan invocation for the
+// client/server settings: `--server` when a trivy server is configured, and the
+// cache-partition `--skip-dirs` entry when a partition is configured.
+func (c *Config) clientArgs() []string {
+	var args []string
+	if c.TrivyServer != "" {
+		args = append(args, "--server", c.TrivyServer)
+	}
+	if c.CachePartition != "" {
+		args = append(args, "--skip-dirs", cachePartitionDir(c.CachePartition))
+	}
+	return args
+}
+
+// cachePartitionDir maps a cache partition to the `--skip-dirs` pattern that
+// carries it. trivy folds the skip-dirs list into every analysis cache key, so
+// distinct partitions yield disjoint keys. The pattern is a hash, so it is
+// glob-safe whatever the partition string contains, and it names a directory
+// no real image or workspace has; if one ever did, only that directory of that
+// scan would be skipped.
+func cachePartitionDir(partition string) string {
+	sum := sha256.Sum256([]byte(partition))
+	return "/.scanner-cache-partition-" + hex.EncodeToString(sum[:8])
 }
 
 // registryToken extracts the bare token from a "Bearer <token>" authorization
@@ -321,7 +349,7 @@ const fsSeverity = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
 // `--list-all-pkgs` is load-bearing: the backend's SBOM package inventory
 // (#903) reads the Packages blocks it adds to the native JSON report.
 func (s *Scanner) buildFsArgs(dir string) []string {
-	return []string{
+	args := []string{
 		"filesystem",
 		"--format", "json",
 		"--list-all-pkgs",
@@ -329,8 +357,9 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 		"--timeout", s.cfg.FsScanTimeout.String(),
 		"--cache-dir", s.cfg.CacheDir,
 		"--quiet",
-		dir,
 	}
+	args = append(args, s.cfg.clientArgs()...)
+	return append(args, dir)
 }
 
 // ScanFilesystem runs `trivy filesystem` over an untarred workspace dir and

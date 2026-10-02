@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 )
 
 // Server holds the adapter's HTTP state.
@@ -18,15 +19,25 @@ type Server struct {
 	// returns 503 until then so the backend fails scans closed rather than
 	// dispatching to a half-initialized adapter.
 	ready atomic.Bool
+	// remote is the trivy-server readiness gate in client mode
+	// (cfg.TrivyServer set); nil in standalone mode.
+	remote *remoteGate
 }
 
 // NewServer constructs a Server. It is NOT ready until MarkReady is called.
 func NewServer(cfg *Config) *Server {
-	return &Server{
+	s := &Server{
 		cfg:     cfg,
 		jobs:    NewJobStore(cfg.JobTTL),
 		scanner: NewScanner(cfg),
 	}
+	if cfg.TrivyServer != "" {
+		client := &http.Client{Timeout: 5 * time.Second}
+		s.remote = newRemoteGate(10*time.Second, func(ctx context.Context) error {
+			return checkTrivyServer(ctx, client, cfg.TrivyServer, cfg.ScannerVersion)
+		})
+	}
+	return s
 }
 
 // MarkReady flips the readiness gate on (called after a successful version probe).
@@ -67,10 +78,19 @@ func (s *Server) debugf(format string, args ...any) {
 }
 
 // handleReady is the readiness probe called before every scan.
-func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+// In client mode it also requires the trivy server check to pass (cached for a
+// few seconds), so a missing, DB-less or mismatched server fails scans closed.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if !s.ready.Load() {
 		http.Error(w, "scanner starting", http.StatusServiceUnavailable)
 		return
+	}
+	if s.remote != nil {
+		if err := s.remote.Ready(r.Context()); err != nil {
+			log.Printf("not ready: %v", err)
+			http.Error(w, "trivy server not ready", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
