@@ -360,6 +360,7 @@ pub mod projects;
 pub mod promotion;
 pub mod promotion_rules;
 pub mod protobuf;
+pub mod protobuf_bsr;
 pub mod proxy_helpers;
 pub mod pub_registry;
 pub mod puppet;

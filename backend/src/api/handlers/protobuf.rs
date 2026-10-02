@@ -19,7 +19,7 @@ use std::io::Write;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{HeaderMap, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -86,7 +86,18 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/buf.registry.module.v1.ResourceService/GetResources",
             post(get_resources),
         )
+        .route("/:repo_key/*bsr_path", post(catch_all_bsr))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+}
+
+async fn catch_all_bsr(
+    State(state): State<SharedState>,
+    Path((repo_key, bsr_path)): Path<(String, String)>,
+    headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    super::protobuf_bsr::dispatch_unknown_bsr(state, repo_key, bsr_path, headers, body, auth).await
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +405,10 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
 // Repository resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+pub(crate) async fn resolve_protobuf_repo(
+    db: &PgPool,
+    repo_key: &str,
+) -> Result<RepoInfo, Response> {
     use sqlx::Row;
     let row = sqlx::query(
         r#"SELECT id, key, storage_backend, storage_path, format::text AS format, repo_type::text AS repo_type, upstream_url, promotion_only
