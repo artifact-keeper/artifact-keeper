@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::api::dto::Pagination;
 use crate::api::handlers::promotion::validate_promotion_repos;
-use crate::api::handlers::repositories::{require_repo_id_visible, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_id_visible, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -65,8 +67,17 @@ pub struct ApprovalResponse {
     pub target_repository: String,
     pub status: String,
     pub requested_by: Uuid,
+    /// Usernames of the principals on either side of the request (#4238).
+    /// `requested_by` / `reviewed_by` alone are bare ids, so a promotion
+    /// approval could not say who asked for it or who granted it without a
+    /// lookup per row — and a service account, which is what a CI-driven
+    /// promotion uses, was indistinguishable from a person. `promotion_history`
+    /// already hydrates `promoted_by_username` the same way. Both are `None`
+    /// when the account has since been deleted; the audit log keeps the record.
+    pub requested_by_username: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub reviewed_by: Option<Uuid>,
+    pub reviewed_by_username: Option<String>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub review_notes: Option<String>,
     #[schema(value_type = Option<Object>)]
@@ -128,9 +139,22 @@ struct ApprovalRow {
     // Joined columns
     source_repo_key: Option<String>,
     target_repo_key: Option<String>,
+    requested_by_username: Option<String>,
+    reviewed_by_username: Option<String>,
 }
 
 impl ApprovalRow {
+    /// [`Self::into_response`], without the actor usernames unless
+    /// `names_visible` (see [`actor_names_visible`]).
+    fn into_response_for(self, names_visible: bool) -> ApprovalResponse {
+        let mut response = self.into_response();
+        if !names_visible {
+            response.requested_by_username = None;
+            response.reviewed_by_username = None;
+        }
+        response
+    }
+
     fn into_response(self) -> ApprovalResponse {
         ApprovalResponse {
             id: self.id,
@@ -139,8 +163,10 @@ impl ApprovalRow {
             target_repository: self.target_repo_key.unwrap_or_default(),
             status: self.status,
             requested_by: self.requested_by,
+            requested_by_username: self.requested_by_username,
             requested_at: self.requested_at,
             reviewed_by: self.reviewed_by,
+            reviewed_by_username: self.reviewed_by_username,
             reviewed_at: self.reviewed_at,
             review_notes: self.review_notes,
             policy_result: self.policy_result,
@@ -338,6 +364,30 @@ pub(crate) async fn require_and_consume_approval(
     Err(approval_required_conflict(&outcome))
 }
 
+/// Whether this caller may see WHO requested and reviewed approvals whose
+/// source is `source_repo_id` (#4238).
+///
+/// Only an instance administrator or an administrator of that repository. The
+/// read paths are gated by the source repository's visibility alone, so on a
+/// public or `internal` source repository any signed-in user can read its approvals; showing
+/// them usernames would let them enumerate the instance's admin and CI
+/// accounts, where they previously saw only ids. Everyone else still gets the
+/// ids, exactly as before. `None` is the unfiltered listing, which is already
+/// instance-admin-only. Fails CLOSED: a permission-lookup error hides the
+/// names rather than failing an otherwise-authorized read.
+async fn actor_names_visible(
+    state: &SharedState,
+    auth: &AuthExtension,
+    source_repo_id: Option<Uuid>,
+) -> bool {
+    match source_repo_id {
+        None => auth.is_admin,
+        Some(repo_id) => require_repo_admin(auth, repo_id, &state.permission_service)
+            .await
+            .is_ok(),
+    }
+}
+
 const SELECT_APPROVAL: &str = r#"
     SELECT
         pa.id,
@@ -353,10 +403,14 @@ const SELECT_APPROVAL: &str = r#"
         pa.policy_result,
         pa.notes,
         sr.key AS source_repo_key,
-        tr.key AS target_repo_key
+        tr.key AS target_repo_key,
+        requester.username AS requested_by_username,
+        reviewer.username AS reviewed_by_username
     FROM promotion_approvals pa
     LEFT JOIN repositories sr ON sr.id = pa.source_repo_id
     LEFT JOIN repositories tr ON tr.id = pa.target_repo_id
+    LEFT JOIN users requester ON requester.id = pa.requested_by
+    LEFT JOIN users reviewer ON reviewer.id = pa.reviewed_by
 "#;
 
 // ---------------------------------------------------------------------------
@@ -546,8 +600,10 @@ pub async fn request_approval(
             target_repository: req.target_repository,
             status: "pending".to_string(),
             requested_by: auth.user_id,
+            requested_by_username: Some(auth.username.clone()),
             requested_at: now,
             reviewed_by: None,
+            reviewed_by_username: None,
             reviewed_at: None,
             review_notes: None,
             policy_result,
@@ -586,7 +642,9 @@ pub async fn list_pending_approvals(
         auth.require_admin()?;
     }
 
-    let (rows, total): (Vec<ApprovalRow>, i64) = if let Some(ref source_key) =
+    let (rows, total, source_repo_id): (Vec<ApprovalRow>, i64, Option<Uuid>) = if let Some(
+        ref source_key,
+    ) =
         query.source_repository
     {
         let repo_service = RepositoryService::new(state.db.clone());
@@ -620,7 +678,7 @@ pub async fn list_pending_approvals(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        (rows, total.0)
+        (rows, total.0, Some(source.id))
     } else {
         let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
             "{} WHERE pa.status = 'pending' ORDER BY pa.requested_at DESC LIMIT $1 OFFSET $2",
@@ -639,13 +697,17 @@ pub async fn list_pending_approvals(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        (rows, total.0)
+        (rows, total.0, None)
     };
 
     let total_pages = compute_approval_total_pages(total, per_page);
+    let names_visible = actor_names_visible(&state, &auth, source_repo_id).await;
 
     Ok(Json(ApprovalListResponse {
-        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        items: rows
+            .into_iter()
+            .map(|r| r.into_response_for(names_visible))
+            .collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -698,7 +760,8 @@ pub async fn get_approval(
     )
     .await?;
 
-    Ok(Json(row.into_response()))
+    let names_visible = actor_names_visible(&state, &auth, Some(row.source_repo_id)).await;
+    Ok(Json(row.into_response_for(names_visible)))
 }
 
 /// Approve a pending promotion request. Admin-only.
@@ -1191,9 +1254,13 @@ pub async fn list_approval_history(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let total_pages = compute_approval_total_pages(total, per_page);
+    let names_visible = actor_names_visible(&state, &auth, source_repo_id).await;
 
     Ok(Json(ApprovalListResponse {
-        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        items: rows
+            .into_iter()
+            .map(|r| r.into_response_for(names_visible))
+            .collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -1547,8 +1614,10 @@ mod tests {
             target_repository: "release-npm".to_string(),
             status: "pending".to_string(),
             requested_by: Uuid::nil(),
+            requested_by_username: Some("ci-promoter".to_string()),
             requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
             reviewed_by: None,
+            reviewed_by_username: None,
             reviewed_at: None,
             review_notes: None,
             policy_result: None,
@@ -1570,8 +1639,10 @@ mod tests {
             target_repository: "release".to_string(),
             status: "approved".to_string(),
             requested_by: Uuid::nil(),
+            requested_by_username: Some("ci-promoter".to_string()),
             requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
             reviewed_by: Some(reviewer),
+            reviewed_by_username: Some("release-captain".to_string()),
             reviewed_at: Some(DateTime::from_timestamp(1700001000, 0).unwrap()),
             review_notes: Some("LGTM".to_string()),
             policy_result: Some(serde_json::json!({"passed": true})),
@@ -1651,12 +1722,17 @@ mod tests {
             notes: Some("test notes".to_string()),
             source_repo_key: Some("staging-maven".to_string()),
             target_repo_key: Some("release-maven".to_string()),
+            requested_by_username: Some("ci-promoter".to_string()),
+            reviewed_by_username: None,
         };
         let resp = row.into_response();
         assert_eq!(resp.source_repository, "staging-maven");
         assert_eq!(resp.target_repository, "release-maven");
         assert_eq!(resp.status, "pending");
         assert_eq!(resp.notes.as_deref(), Some("test notes"));
+        // #4238: the joined actor names survive the row -> response mapping.
+        assert_eq!(resp.requested_by_username.as_deref(), Some("ci-promoter"));
+        assert!(resp.reviewed_by_username.is_none());
     }
 
     #[test]
@@ -1676,12 +1752,20 @@ mod tests {
             notes: None,
             source_repo_key: None,
             target_repo_key: None,
+            requested_by_username: None,
+            reviewed_by_username: Some("release-captain".to_string()),
         };
         let resp = row.into_response();
         assert_eq!(resp.source_repository, "");
         assert_eq!(resp.target_repository, "");
         assert_eq!(resp.status, "rejected");
         assert_eq!(resp.review_notes.as_deref(), Some("Not ready"));
+        // A deleted requester leaves the id but no name; the reviewer is named.
+        assert!(resp.requested_by_username.is_none());
+        assert_eq!(
+            resp.reviewed_by_username.as_deref(),
+            Some("release-captain")
+        );
     }
 
     #[test]
@@ -2718,6 +2802,82 @@ mod tests {
                 "public source, no grant: the request must be filed: {filed:?}"
             );
             assert_eq!(n, 1);
+        }
+
+        /// #4238: WHO requested and reviewed an approval is shown only to an
+        /// administrator of its source repository. A member who can read the
+        /// approval still gets the ids, as before, but not the usernames — on
+        /// a public source repository that member is any signed-in user.
+        #[tokio::test]
+        async fn test_approval_actor_names_need_source_repo_admin_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4238-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4238-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s4238", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t4238", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let requester = make_requester(&pool, "4238").await;
+            let member = make_requester(&pool, "4238m").await;
+            let owner = make_requester(&pool, "4238a").await;
+            grant_repo(&pool, member, src).await;
+            grant_repo(&pool, owner, src).await;
+            tdh::grant_repo_admin(&pool, src, owner).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg4238").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let as_member = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(member, "m4238")),
+                Path(approval),
+            )
+            .await
+            .expect("a member of the source repo may read the approval")
+            .0;
+            assert_eq!(as_member.requested_by, requester, "the id is still shown");
+            assert!(
+                as_member.requested_by_username.is_none(),
+                "a non-admin member must not be shown usernames"
+            );
+
+            let as_owner = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(owner, "a4238")),
+                Path(approval),
+            )
+            .await
+            .expect("a source repo admin may read the approval")
+            .0;
+            assert!(
+                as_owner.requested_by_username.is_some(),
+                "a source repo admin is shown who requested it"
+            );
+
+            // The filtered listing applies the same rule.
+            let listed = list_pending_approvals(
+                State(state),
+                Extension(tdh::make_auth(member, "m4238")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: Some(src_key.clone()),
+                }),
+            )
+            .await
+            .expect("a member may list the source repo's pending approvals")
+            .0;
+            assert!(listed
+                .items
+                .iter()
+                .all(|a| a.requested_by_username.is_none()));
+
+            cleanup(&pool, &[src, tgt], requester).await;
+            cleanup_user(&pool, member).await;
+            cleanup_user(&pool, owner).await;
         }
 
         /// #2443: the unfiltered pending-approvals aggregate is admin-only; a

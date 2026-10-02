@@ -180,7 +180,20 @@
         "format": { "type": "string" },
         "visibility": { "type": "string" },
         "age_gate_enabled": { "type": "boolean" },
-        "age_gate_min_age_days": { "type": "integer", "minimum": 0 }
+        "age_gate_min_age_days": { "type": "integer", "minimum": 0 },
+        "age_gate_change": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["previous_enabled", "previous_min_age_days", "previous_mode", "actor_tier", "relaxed"],
+          "description": "Present on an age-gate policy change: the policy it replaced, the tier of administrator who made it, and whether it weakened the gate (disabled it, lowered the minimum age, or switched the age source).",
+          "properties": {
+            "previous_enabled": { "type": "boolean" },
+            "previous_min_age_days": { "type": "integer", "minimum": 0 },
+            "previous_mode": { "type": "string", "enum": ["upstream_publish_time", "first_seen"] },
+            "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
+            "relaxed": { "type": "boolean" }
+          }
+        }
       }
     },
     "PermissionDetails": {

@@ -129,6 +129,8 @@ impl AuditAction {
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
+            | AuditAction::AgeGateLockSet
+            | AuditAction::AgeGateLockReleased
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished
@@ -393,6 +395,25 @@ pub mod details {
         /// decisions are honored under, so it is audit-relevant on its own.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_mode: Option<String>,
+        /// What an age-gate policy change REPLACED and who made it (#4238).
+        /// Present only on the age-gate policy endpoint: since repository
+        /// admins can change the gate, a weakening has to be visible in the
+        /// trail, not just the values it ended at.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub age_gate_change: Option<AgeGateChangeDetails>,
+    }
+
+    /// The prior policy and the actor's tier for one age-gate policy change.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct AgeGateChangeDetails {
+        pub previous_enabled: bool,
+        pub previous_min_age_days: i32,
+        pub previous_mode: String,
+        /// `instance_admin` or `repository_admin`.
+        pub actor_tier: String,
+        /// The change made the gate less strict: disabled it, lowered the
+        /// minimum age, or switched the age source.
+        pub relaxed: bool,
     }
 
     /// `ROLE_ASSIGNED` / `ROLE_REVOKED` / `REPOSITORY_PERMISSION_CHANGED`.
@@ -1138,6 +1159,7 @@ mod tests {
             age_gate_enabled: None,
             age_gate_min_age_days: None,
             age_gate_mode: None,
+            age_gate_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

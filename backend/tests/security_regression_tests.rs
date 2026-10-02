@@ -722,8 +722,16 @@ mod qc_metadata_leak_2437 {
 //         per-repo access, no admin — so ANY authenticated read-scope caller
 //         (e.g. a read-only API token) could read gate posture
 //         (`enabled` + `min_age_days`) for every repository. The PUT and all
-//         four /admin review endpoints were already admin-only; the GET now
-//         matches them with `require_admin()`.
+//         four /admin review endpoints were already admin-only; the GET was
+//         brought up to the same tier.
+//         Since #4238 that tier is repository administration rather than
+//         instance administration — `require_repo_write_access` +
+//         `require_repo_admin`, the chain every other repository-configuration
+//         subresource uses — so a repository's own admins qualify. Neither
+//         caller below holds any grant on the repository, so what this pin
+//         asserts is unchanged: reaching gate posture still takes an
+//         administrative grant, and merely being authenticated (or holding a
+//         read scope) is still not one.
 // Asserts: a read-scope API token and a plain non-admin user both get 403
 //         with no config fields in the body; an admin still gets 200 with the
 //         config row (migration-146 defaults for a fresh repo).
