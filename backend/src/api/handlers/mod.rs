@@ -326,6 +326,7 @@ pub mod cran;
 pub mod curation;
 pub mod debian;
 pub mod dependency_track;
+pub mod download_holds;
 pub mod email_subscriptions;
 pub mod environments;
 pub mod events;
