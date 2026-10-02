@@ -180,6 +180,15 @@ fn parse_cidr_list_env(key: &str) -> Vec<crate::api::middleware::rate_limit::Cid
         .unwrap_or_default()
 }
 
+/// Trimmed, non-empty value of an optional repository-key setting; blank
+/// means "not configured".
+fn parse_optional_repo_key(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse an opt-in boolean flag from an optional env value.
 ///
 /// Returns `true` only for `"true"` / `"1"` (case-insensitive, trimmed);
@@ -503,6 +512,16 @@ pub struct Config {
     /// deployment that had not set `ENVIRONMENT=production` served them to
     /// anonymous callers.
     pub swagger_enabled: bool,
+
+    /// Repository key of the hosted Terraform/OpenTofu repository that answers
+    /// host-level service discovery (`GET /.well-known/terraform.json`).
+    /// Terraform and OpenTofu discover a registry per *host*, so an address
+    /// like `registry.example.com/ns/type` can only resolve to a repository
+    /// when the host itself names one. Unset (the default) leaves that route
+    /// answering 404, which is the behaviour before it existed; per-repository
+    /// discovery under `/terraform/{repo}/.well-known/terraform.json` is
+    /// unaffected either way. Env: `TERRAFORM_DEFAULT_REPO`.
+    pub terraform_default_repo: Option<String>,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -1141,6 +1160,7 @@ redacted_debug!(Config {
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
+    show terraform_default_repo,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
@@ -1276,6 +1296,7 @@ impl Default for Config {
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            terraform_default_repo: None,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
@@ -1484,6 +1505,9 @@ impl Config {
             // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
             // longer enables it).
             swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
+            terraform_default_repo: parse_optional_repo_key(
+                env::var("TERRAFORM_DEFAULT_REPO").ok().as_deref(),
+            ),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -3254,6 +3278,45 @@ mod tests {
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("ENABLE_SWAGGER", saved_flag);
         restore_env("ENVIRONMENT", saved_env);
+    }
+
+    #[test]
+    fn test_parse_optional_repo_key() {
+        assert_eq!(parse_optional_repo_key(None), None);
+        assert_eq!(parse_optional_repo_key(Some("")), None);
+        assert_eq!(parse_optional_repo_key(Some("  \t ")), None);
+        assert_eq!(
+            parse_optional_repo_key(Some("  tf-hosted ")),
+            Some("tf-hosted".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_terraform_default_repo_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_repo = env::var("TERRAFORM_DEFAULT_REPO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("TERRAFORM_DEFAULT_REPO");
+        assert_eq!(Config::from_env().unwrap().terraform_default_repo, None);
+        env::set_var("TERRAFORM_DEFAULT_REPO", "   ");
+        assert_eq!(Config::from_env().unwrap().terraform_default_repo, None);
+        env::set_var("TERRAFORM_DEFAULT_REPO", " tf-hosted ");
+        assert_eq!(
+            Config::from_env()
+                .unwrap()
+                .terraform_default_repo
+                .as_deref(),
+            Some("tf-hosted")
+        );
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("TERRAFORM_DEFAULT_REPO", saved_repo);
     }
 
     #[test]

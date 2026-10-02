@@ -19,16 +19,33 @@
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/versions
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/download/{os}/{arch}
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/binary/{os}/{arch}
+//!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/SHA256SUMS
+//!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/SHA256SUMS.sig
 //!   PUT  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/{os}/{arch}
+//!
+//! Host-level discovery (mounted by `crate::api::routes`, not by [`router`]):
+//!   GET  /.well-known/terraform.json   (see [`host_service_discovery`])
 //!
 //! Note the two distinct provider endpoints, which the Provider Registry
 //! Protocol keeps separate: `.../download/{os}/{arch}` returns the JSON
 //! *package document*, whose `download_url` field then points at
 //! `.../binary/{os}/{arch}`, which streams the `.zip` itself.
+//!
+//! # Hosted repos as an origin provider registry
+//!
+//! A hosted repo can be used directly as `host/namespace/type` (no
+//! `network_mirror`). For that, the package document also carries
+//! `shasums_url`, `shasums_signature_url` and `signing_keys`: `SHA256SUMS` is
+//! computed from the stored packages and signed per request with the
+//! repository's active OpenPGP signing key (the same key and service that sign
+//! Debian/RPM metadata). A repo with no usable key never gets a signing-less
+//! `SHA256SUMS`: those routes fail closed, and the package document falls back
+//! to its legacy shape. See `docs/terraform-registry.md`.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -50,6 +67,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -114,6 +132,17 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/v1/providers/:namespace/:type_name/:version/binary/:os/:arch",
             get(download_provider_binary),
+        )
+        // Provider registry - checksum list and its detached signature, the
+        // locations `download_provider`'s `shasums_url` /
+        // `shasums_signature_url` advertise (hosted repos only).
+        .route(
+            "/:repo_key/v1/providers/:namespace/:type_name/:version/SHA256SUMS",
+            get(provider_shasums),
+        )
+        .route(
+            "/:repo_key/v1/providers/:namespace/:type_name/:version/SHA256SUMS.sig",
+            get(provider_shasums_signature),
         )
         // Provider upload
         .route(
@@ -210,13 +239,66 @@ fn build_service_discovery_json(repo_key: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Response> {
-    let json = build_service_discovery_json(&repo_key);
+    Ok(service_discovery_response(&repo_key))
+}
 
-    Ok(Response::builder()
+fn service_discovery_response(repo_key: &str) -> Response {
+    let json = build_service_discovery_json(repo_key);
+
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// GET /.well-known/terraform.json — host-level Service Discovery
+//
+// Terraform/OpenTofu discover a registry per *host*: for the source address
+// `artifacts.example.com/ns/type` the client fetches
+// `https://artifacts.example.com/.well-known/terraform.json`, with no
+// repository key anywhere in the request. The per-repo document above can only
+// be reached by a client that already knows the repo key, so it cannot serve an
+// origin-registry source address on its own.
+//
+// The host document therefore points at ONE operator-chosen repository
+// (`TERRAFORM_DEFAULT_REPO`). Unset, the route answers 404, exactly as before
+// this route existed. The route is mounted by `crate::api::routes`.
+// ---------------------------------------------------------------------------
+
+/// The response for an unconfigured or unusable default repo. One generic body
+/// for every reason, so the anonymous route cannot be used to probe which
+/// repository keys exist or what format they are.
+fn host_discovery_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "No default Terraform registry is configured on this host",
+    )
+        .into_response()
+}
+
+pub async fn host_service_discovery(
+    State(state): State<SharedState>,
+) -> Result<Response, Response> {
+    let Some(repo_key) = state.config.terraform_default_repo.as_deref() else {
+        return Err(host_discovery_not_configured());
+    };
+
+    // Advertise the repo only while it still resolves to a Terraform repo, so a
+    // stale setting never points clients at a registry that does not exist.
+    match resolve_terraform_repo(&state.db, repo_key).await {
+        Ok(_) => Ok(service_discovery_response(repo_key)),
+        Err(resp)
+            if matches!(
+                resp.status(),
+                StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+            ) =>
+        {
+            Err(host_discovery_not_configured())
+        }
+        Err(resp) => Err(resp),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -982,18 +1064,164 @@ async fn download_provider(
     let download_url =
         build_provider_binary_url(&repo_key, &namespace, &type_name, &version, &os, &arch);
 
+    // Protocols the uploader declared (or the manifest in the archive did); a
+    // package stored before this was recorded keeps the legacy default.
+    let metadata: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(crate::api::handlers::db_err)?;
+    let protocols = provider_protocols_from_metadata(metadata.as_ref());
+
+    // Only a hosted repo can vouch for its packages: it holds the bytes the
+    // checksum list is computed from. A repo with no usable OpenPGP key keeps
+    // the legacy, unsigned package document (see the module docs).
+    let signing = if classify_mirror_repo(&repo.repo_type, false, false) == MirrorGuard::Local {
+        active_openpgp_key(&state, repo.id)
+            .await?
+            .map(|key| provider_signing_doc(&key, &repo_key, &namespace, &type_name, &version))
+    } else {
+        None
+    };
+
     let json = build_provider_download_json(
         &os,
         &arch,
         &filename,
         &download_url,
         &artifact.checksum_sha256,
+        &protocols,
+        signing.as_ref(),
     );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/providers/{namespace}/{type}/{version}/SHA256SUMS[.sig]
+//
+// The signed checksum list an origin registry must publish. Hosted repos only,
+// computed from the stored packages on every request (no stored copy to go
+// stale, nothing to backfill for packages uploaded before these routes), and
+// signed with the repository's active OpenPGP key.
+// ---------------------------------------------------------------------------
+
+/// The repo's active signing key if it can sign OpenPGP; `None` when the repo
+/// has no active key or the key is not a `gpg` one. A lookup failure is an
+/// (already stabilised, #3667) error response, never a silent downgrade.
+async fn active_openpgp_key(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+) -> Result<Option<crate::models::signing_key::SigningKey>, Response> {
+    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    match svc.get_active_key_for_repo(repo_id).await {
+        Ok(key) => Ok(key.filter(|k| k.supports_openpgp())),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to load repository signing key");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load signing key",
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Everything both checksum routes need: the key that signs and the exact
+/// document that is signed. Fails closed — no key, no document.
+async fn load_provider_shasums(
+    state: &SharedState,
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> Result<(crate::models::signing_key::SigningKey, String), Response> {
+    let repo = resolve_terraform_repo(&state.db, repo_key).await?;
+    if classify_mirror_repo(&repo.repo_type, false, false) != MirrorGuard::Local {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Provider checksums are only published by hosted Terraform repositories",
+        )
+            .into_response());
+    }
+
+    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let key = crate::api::handlers::error_helpers::require_signing_key(
+        svc.get_active_key_for_repo(repo.id).await,
+    )?;
+    let key = crate::api::handlers::error_helpers::require_openpgp_capable_key(key)?;
+
+    let packages = local_provider_packages(&state.db, &repo, namespace, type_name, version).await?;
+    if packages.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Provider version not found").into_response());
+    }
+    Ok((key, build_provider_shasums(type_name, version, &packages)))
+}
+
+async fn provider_shasums(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let (_key, shasums) =
+        load_provider_shasums(&state, &repo_key, &namespace, &type_name, &version).await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(shasums))
+        .unwrap())
+}
+
+/// Convert an ASCII-armored detached signature into the binary OpenPGP packet
+/// stream. Terraform/OpenTofu read `SHA256SUMS.sig` as raw packets (the same
+/// bytes `gpg --detach-sign` writes without `--armor`) and reject armor.
+fn dearmor_signature(armored: &str) -> crate::error::Result<Vec<u8>> {
+    use pgp::composed::{Deserializable, StandaloneSignature};
+    use pgp::ser::Serialize;
+    let (signature, _) = StandaloneSignature::from_string(armored)
+        .map_err(|e| crate::error::AppError::Internal(format!("Invalid signature armor: {e}")))?;
+    signature.to_bytes().map_err(|e| {
+        crate::error::AppError::Internal(format!("Failed to serialize signature: {e}"))
+    })
+}
+
+async fn provider_shasums_signature(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let (key, shasums) =
+        load_provider_shasums(&state, &repo_key, &namespace, &type_name, &version).await?;
+
+    // No signature expiry: this signature is served separately from the data
+    // and fetched at `init` time by clients that may cache the lock.
+    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = svc
+        .sign_openpgp_detached_with_key(&key, shasums.as_bytes())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::internal_err_message("Failed to sign provider checksums", &e),
+            )
+                .into_response()
+        })?;
+    let _ = svc.mark_key_used(key.id).await;
+    let signature = dearmor_signature(&signature).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to encode provider signature", &e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-signature")
+        .body(Body::from(signature))
         .unwrap())
 }
 
@@ -1125,6 +1353,7 @@ async fn upload_provider(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1132,6 +1361,8 @@ async fn upload_provider(
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
+    let declared_protocols = parse_protocols_header(&headers)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())?;
     let provider_name = build_provider_name(&namespace, &type_name);
     let platform = build_platform(&os, &arch);
 
@@ -1177,6 +1408,14 @@ async fn upload_provider(
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
+    // Header wins; otherwise the registry manifest shipped inside the archive
+    // (the file `terraform-provider-*` release zips carry); otherwise nothing
+    // is recorded and the package keeps the legacy default.
+    let protocols = match declared_protocols {
+        Some(p) => Some(p),
+        None => read_manifest_protocols(staged.path().to_path_buf()).await,
+    };
+
     let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
 
     // Store the file, streamed from the staged scratch file.
@@ -1219,7 +1458,14 @@ async fn upload_provider(
     .await;
 
     // Store metadata
-    let metadata = build_provider_metadata(&namespace, &type_name, &version, &os, &arch);
+    let metadata = build_provider_metadata(
+        &namespace,
+        &type_name,
+        &version,
+        &os,
+        &arch,
+        protocols.as_deref(),
+    );
 
     let _ = sqlx::query!(
         r#"
@@ -1273,6 +1519,7 @@ async fn upload_provider(
                 "os": os,
                 "arch": arch,
                 "checksum": checksum,
+                "protocols": protocols.unwrap_or_else(default_provider_protocols),
             }))
             .unwrap(),
         ))
@@ -1539,11 +1786,18 @@ fn provider_platform_from(
 fn provider_versions_from_rows(
     rows: &[(String, Option<serde_json::Value>, String)],
 ) -> Vec<serde_json::Value> {
-    let mut version_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+    type VersionEntry = (Vec<serde_json::Value>, Vec<String>);
+    let mut version_map: std::collections::BTreeMap<String, VersionEntry> =
         std::collections::BTreeMap::new();
 
     for (version, metadata, path) in rows {
-        let platforms = version_map.entry(version.clone()).or_default();
+        let (platforms, protocols) = version_map.entry(version.clone()).or_default();
+        // A version advertises every protocol any of its packages speaks.
+        for protocol in provider_protocols_from_metadata(metadata.as_ref()) {
+            if !protocols.contains(&protocol) {
+                protocols.push(protocol);
+            }
+        }
         if let Some((os, arch)) = provider_platform_from(metadata.as_ref(), path) {
             let platform = serde_json::json!({ "os": os, "arch": arch });
             if !platforms.contains(&platform) {
@@ -1554,10 +1808,12 @@ fn provider_versions_from_rows(
 
     version_map
         .into_iter()
-        .map(|(version, platforms)| {
+        .map(|(version, (platforms, protocols))| {
+            let protocols = normalize_protocols(protocols.iter().map(String::as_str))
+                .unwrap_or_else(default_provider_protocols);
             serde_json::json!({
                 "version": version,
-                "protocols": ["5.0"],
+                "protocols": protocols,
                 "platforms": platforms,
             })
         })
@@ -2216,15 +2472,22 @@ fn build_provider_metadata(
     version: &str,
     os: &str,
     arch: &str,
+    protocols: Option<&[String]>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         "kind": "provider",
         "namespace": namespace,
         "type": type_name,
         "version": version,
         "os": os,
         "arch": arch,
-    })
+    });
+    // Recorded only when actually declared, so a package without a declaration
+    // stays indistinguishable from one uploaded before protocols were tracked.
+    if let Some(protocols) = protocols {
+        metadata["protocols"] = serde_json::json!(protocols);
+    }
+    metadata
 }
 
 /// Build the version list JSON for a module.
@@ -2242,15 +2505,23 @@ fn build_version_list_json(versions: &[String]) -> serde_json::Value {
 
 /// Build the provider download JSON response (the Provider Registry Protocol
 /// package *document*; `download_url` points at the separate binary route).
+///
+/// With `signing`, the document additionally advertises the signed checksum
+/// list (`shasums_url` / `shasums_signature_url`) and the public key that
+/// verifies it — everything OpenTofu/Terraform need to authenticate the
+/// package against an origin registry. Without it the legacy shape (empty
+/// `gpg_public_keys`, no checksum URLs) is produced.
 fn build_provider_download_json(
     os: &str,
     arch: &str,
     filename: &str,
     download_url: &str,
     shasum: &str,
+    protocols: &[String],
+    signing: Option<&ProviderSigningDoc>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "protocols": ["5.0"],
+    let mut doc = serde_json::json!({
+        "protocols": protocols,
         "os": os,
         "arch": arch,
         "filename": filename,
@@ -2259,7 +2530,214 @@ fn build_provider_download_json(
         "signing_keys": {
             "gpg_public_keys": []
         },
+    });
+    if let Some(signing) = signing {
+        doc["shasums_url"] = serde_json::json!(signing.shasums_url);
+        doc["shasums_signature_url"] = serde_json::json!(signing.shasums_signature_url);
+        doc["signing_keys"]["gpg_public_keys"] = serde_json::json!([{
+            "key_id": signing.key_id,
+            "ascii_armor": signing.ascii_armor,
+        }]);
+    }
+    doc
+}
+
+/// The signing-related fields of a provider package document.
+struct ProviderSigningDoc {
+    key_id: String,
+    /// ASCII-armored OpenPGP *public* key.
+    ascii_armor: String,
+    shasums_url: String,
+    shasums_signature_url: String,
+}
+
+/// Path-absolute location of a provider version's checksum list.
+fn build_provider_shasums_url(
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> String {
+    format!(
+        "{}/{}/v1/providers/{}/{}/{}/SHA256SUMS",
+        MOUNT_PREFIX, repo_key, namespace, type_name, version
+    )
+}
+
+/// Assemble [`ProviderSigningDoc`] for the repo's active signing key. Only the
+/// public half of the key is ever read here.
+fn provider_signing_doc(
+    key: &crate::models::signing_key::SigningKey,
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> ProviderSigningDoc {
+    let shasums_url = build_provider_shasums_url(repo_key, namespace, type_name, version);
+    ProviderSigningDoc {
+        key_id: key
+            .key_id
+            .clone()
+            .or_else(|| key.fingerprint.clone())
+            .unwrap_or_default(),
+        ascii_armor: key.public_key_pem.clone(),
+        shasums_signature_url: format!("{shasums_url}.sig"),
+        shasums_url,
+    }
+}
+
+/// Build the `SHA256SUMS` document for one provider version: one
+/// `<sha256>  <filename>` line per published platform archive, sorted by
+/// filename and de-duplicated, so the same stored packages always yield the
+/// same bytes (and therefore a signature over a stable payload).
+fn build_provider_shasums(
+    type_name: &str,
+    version: &str,
+    packages: &[LocalProviderPackage],
+) -> String {
+    let mut lines: Vec<(String, String)> = packages
+        .iter()
+        .map(|pkg| {
+            (
+                build_provider_filename(type_name, version, &build_platform(&pkg.os, &pkg.arch)),
+                pkg.shasum.to_ascii_lowercase(),
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+        .into_iter()
+        .map(|(filename, sha)| format!("{sha}  {filename}\n"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Provider protocol versions
+//
+// The registry protocol version(s) a provider speaks ("5.0", "6.0") are listed
+// in the `versions` document and in each package document. A hosted upload may
+// declare them with `X-Terraform-Protocols: 5.0,6.0` or by carrying the
+// standard `terraform-registry-manifest.json` in the archive.
+// ---------------------------------------------------------------------------
+
+const PROTOCOLS_HEADER: &str = "x-terraform-protocols";
+const REGISTRY_MANIFEST_NAME: &str = "terraform-registry-manifest.json";
+/// A manifest is a few dozen bytes; refuse to inflate anything larger.
+const REGISTRY_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+const MAX_PROTOCOL_VERSIONS: usize = 8;
+
+/// What a package is assumed to speak when nothing was declared — the value
+/// every package was advertised under before protocols were tracked.
+fn default_provider_protocols() -> Vec<String> {
+    vec!["5.0".to_string()]
+}
+
+/// `major.minor` as numbers, or `None` for anything else.
+fn parse_protocol_version(raw: &str) -> Option<(u32, u32)> {
+    let (major, minor) = raw.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Validate, de-duplicate and numerically sort protocol versions. `None` when
+/// the list is empty, too long or contains a malformed entry.
+fn normalize_protocols<'a>(raw: impl IntoIterator<Item = &'a str>) -> Option<Vec<String>> {
+    let mut parsed = Vec::new();
+    for item in raw {
+        let version = parse_protocol_version(item.trim())?;
+        if !parsed.contains(&version) {
+            parsed.push(version);
+        }
+        if parsed.len() > MAX_PROTOCOL_VERSIONS {
+            return None;
+        }
+    }
+    if parsed.is_empty() {
+        return None;
+    }
+    parsed.sort_unstable();
+    Some(
+        parsed
+            .into_iter()
+            .map(|(major, minor)| format!("{major}.{minor}"))
+            .collect(),
+    )
+}
+
+/// Read the optional `X-Terraform-Protocols` upload header. `Ok(None)` when
+/// absent; an error message when present but malformed (rejecting is safer than
+/// silently advertising a different protocol than the uploader declared).
+fn parse_protocols_header(headers: &HeaderMap) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = headers.get(PROTOCOLS_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|v| normalize_protocols(v.split(',')))
+        .map(Some)
+        .ok_or_else(|| {
+            "Invalid X-Terraform-Protocols header: expected a comma-separated list of \
+             'major.minor' versions, e.g. '5.0' or '5.0,6.0'"
+                .to_string()
+        })
+}
+
+/// Extract `metadata.protocol_versions` from the text of a
+/// `terraform-registry-manifest.json`.
+fn protocols_from_manifest_json(raw: &[u8]) -> Option<Vec<String>> {
+    let doc: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let versions = doc.get("metadata")?.get("protocol_versions")?.as_array()?;
+    normalize_protocols(
+        versions
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Option<Vec<_>>>()?,
+    )
+}
+
+/// Best-effort read of the registry manifest from the staged archive. Any
+/// failure (not a zip, no manifest, oversized, malformed) yields `None`: the
+/// manifest is an optional hint, never a reason to reject an upload.
+async fn read_manifest_protocols(zip_path: std::path::PathBuf) -> Option<Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let file = std::fs::File::open(zip_path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let entry = archive.by_name(REGISTRY_MANIFEST_NAME).ok()?;
+        if entry.size() > REGISTRY_MANIFEST_MAX_BYTES {
+            return None;
+        }
+        let mut raw = Vec::new();
+        entry
+            .take(REGISTRY_MANIFEST_MAX_BYTES)
+            .read_to_end(&mut raw)
+            .ok()?;
+        protocols_from_manifest_json(&raw)
     })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Protocols recorded in a package's metadata, or the legacy default.
+fn provider_protocols_from_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    metadata
+        .and_then(|m| m.get("protocols"))
+        .and_then(|p| p.as_array())
+        .and_then(|items| {
+            normalize_protocols(
+                items
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        })
+        .unwrap_or_else(default_provider_protocols)
 }
 
 /// Parse a module name into (namespace, name, provider).
@@ -2911,12 +3389,22 @@ mod tests {
 
     #[test]
     fn test_build_provider_metadata() {
-        let meta = build_provider_metadata("hashicorp", "aws", "5.0.0", "linux", "amd64");
+        let meta = build_provider_metadata("hashicorp", "aws", "5.0.0", "linux", "amd64", None);
         assert_eq!(meta["kind"], "provider");
         assert_eq!(meta["namespace"], "hashicorp");
         assert_eq!(meta["type"], "aws");
         assert_eq!(meta["os"], "linux");
         assert_eq!(meta["arch"], "amd64");
+        // Undeclared protocols are not recorded, so the package stays
+        // indistinguishable from one uploaded before protocols were tracked.
+        assert!(meta.get("protocols").is_none());
+    }
+
+    #[test]
+    fn test_build_provider_metadata_records_declared_protocols() {
+        let protocols = vec!["5.0".to_string(), "6.0".to_string()];
+        let meta = build_provider_metadata("a", "b", "1.0.0", "linux", "arm64", Some(&protocols));
+        assert_eq!(meta["protocols"], serde_json::json!(["5.0", "6.0"]));
     }
 
     // -----------------------------------------------------------------------
@@ -2957,6 +3445,8 @@ mod tests {
             "terraform-provider-aws_5.0.0_linux_amd64.zip",
             "/download/url",
             "sha256hash",
+            &default_provider_protocols(),
+            None,
         );
         assert_eq!(json["os"], "linux");
         assert_eq!(json["arch"], "amd64");
@@ -2973,7 +3463,15 @@ mod tests {
 
     #[test]
     fn test_build_provider_download_json_darwin() {
-        let json = build_provider_download_json("darwin", "arm64", "file.zip", "/url", "hash");
+        let json = build_provider_download_json(
+            "darwin",
+            "arm64",
+            "file.zip",
+            "/url",
+            "hash",
+            &default_provider_protocols(),
+            None,
+        );
         assert_eq!(json["os"], "darwin");
         assert_eq!(json["arch"], "arm64");
     }
@@ -4662,5 +5160,666 @@ mod catalog_registration_tests {
         let row = row.expect("a terraform provider upload must write a packages row (#3659)");
         assert_eq!(row.version, "2.0.0");
         assert_eq!(row.versions, vec!["2.0.0".to_string()]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Origin provider registry: signed SHA256SUMS, package-document signing
+// fields, protocol versions and host-level discovery.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod origin_registry_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::{verify_detached, CreateKeyRequest};
+    use axum::http::Request;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn dearmor_signature_rejects_garbage() {
+        assert!(dearmor_signature("not a signature").is_err());
+    }
+
+    fn pkg(os: &str, arch: &str, shasum: &str) -> LocalProviderPackage {
+        LocalProviderPackage {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            shasum: shasum.to_string(),
+        }
+    }
+
+    fn protocols(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn mounted() -> Router<SharedState> {
+        Router::new().nest(MOUNT_PREFIX, router())
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    // -- SHA256SUMS builder --------------------------------------------------
+
+    #[test]
+    fn shasums_has_one_sorted_line_per_platform_archive() {
+        let doc = build_provider_shasums(
+            "contrail",
+            "0.5.0",
+            &[
+                pkg("linux", "arm64", "BBBB"),
+                pkg("darwin", "amd64", "cccc"),
+                pkg("linux", "amd64", "aaaa"),
+            ],
+        );
+        assert_eq!(
+            doc,
+            "cccc  terraform-provider-contrail_0.5.0_darwin_amd64.zip\n\
+             aaaa  terraform-provider-contrail_0.5.0_linux_amd64.zip\n\
+             bbbb  terraform-provider-contrail_0.5.0_linux_arm64.zip\n"
+        );
+    }
+
+    #[test]
+    fn shasums_is_independent_of_input_order_and_duplicates() {
+        let a = pkg("linux", "amd64", "aa");
+        let b = pkg("linux", "arm64", "bb");
+        let forward = build_provider_shasums("t", "1.0.0", &[a.clone_pkg(), b.clone_pkg()]);
+        let backward = build_provider_shasums("t", "1.0.0", &[b.clone_pkg(), a.clone_pkg(), a]);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.lines().count(), 2);
+    }
+
+    impl LocalProviderPackage {
+        fn clone_pkg(&self) -> Self {
+            pkg(&self.os, &self.arch, &self.shasum)
+        }
+    }
+
+    #[test]
+    fn shasums_line_format_is_two_spaces_between_hash_and_name() {
+        let hash = "0".repeat(64);
+        let doc = build_provider_shasums("t", "1.0.0", &[pkg("linux", "amd64", &hash)]);
+        assert_eq!(
+            doc,
+            format!("{hash}  terraform-provider-t_1.0.0_linux_amd64.zip\n")
+        );
+    }
+
+    #[test]
+    fn shasums_url_is_under_the_mount_point() {
+        assert_eq!(
+            build_provider_shasums_url("tf", "ns", "type", "1.2.3"),
+            "/terraform/tf/v1/providers/ns/type/1.2.3/SHA256SUMS"
+        );
+    }
+
+    // -- package document ----------------------------------------------------
+
+    fn signing_doc() -> ProviderSigningDoc {
+        ProviderSigningDoc {
+            key_id: "ABCD1234".to_string(),
+            ascii_armor:
+                "-----BEGIN PGP PUBLIC KEY BLOCK-----\nx\n-----END PGP PUBLIC KEY BLOCK-----\n"
+                    .to_string(),
+            shasums_url: "/terraform/tf/v1/providers/ns/t/1.0.0/SHA256SUMS".to_string(),
+            shasums_signature_url: "/terraform/tf/v1/providers/ns/t/1.0.0/SHA256SUMS.sig"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn download_json_without_signing_keeps_legacy_shape() {
+        let json = build_provider_download_json(
+            "linux",
+            "amd64",
+            "f.zip",
+            "/u",
+            "h",
+            &protocols(&["5.0"]),
+            None,
+        );
+        assert!(json.get("shasums_url").is_none());
+        assert!(json.get("shasums_signature_url").is_none());
+        assert!(json["signing_keys"]["gpg_public_keys"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn download_json_with_signing_advertises_checksums_and_key() {
+        let signing = signing_doc();
+        let json = build_provider_download_json(
+            "linux",
+            "amd64",
+            "f.zip",
+            "/u",
+            "h",
+            &protocols(&["5.0", "6.0"]),
+            Some(&signing),
+        );
+        assert_eq!(json["protocols"], serde_json::json!(["5.0", "6.0"]));
+        assert_eq!(json["shasums_url"], signing.shasums_url);
+        assert_eq!(json["shasums_signature_url"], signing.shasums_signature_url);
+        let keys = json["signing_keys"]["gpg_public_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["key_id"], "ABCD1234");
+        assert_eq!(keys[0]["ascii_armor"], signing.ascii_armor);
+    }
+
+    fn test_key(
+        key_id: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> crate::models::signing_key::SigningKey {
+        crate::models::signing_key::SigningKey {
+            id: uuid::Uuid::new_v4(),
+            repository_id: None,
+            name: "k".to_string(),
+            key_type: "gpg".to_string(),
+            fingerprint: fingerprint.map(str::to_string),
+            key_id: key_id.map(str::to_string),
+            public_key_pem: "PUBLIC".to_string(),
+            private_key_enc: b"never-served-private-material".to_vec(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: None,
+            uid_email: None,
+            expires_at: None,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn signing_doc_prefers_key_id_then_fingerprint_and_only_exposes_public_half() {
+        let doc = provider_signing_doc(
+            &test_key(Some("KID"), Some("FPR")),
+            "tf",
+            "ns",
+            "t",
+            "1.0.0",
+        );
+        assert_eq!(doc.key_id, "KID");
+        assert_eq!(doc.ascii_armor, "PUBLIC");
+        assert_eq!(
+            doc.shasums_signature_url,
+            format!("{}.sig", doc.shasums_url)
+        );
+        let serialised =
+            build_provider_download_json("l", "a", "f", "u", "h", &protocols(&["5.0"]), Some(&doc))
+                .to_string();
+        assert!(!serialised.contains("never-served-private-material"));
+
+        let doc = provider_signing_doc(&test_key(None, Some("FPR")), "tf", "ns", "t", "1.0.0");
+        assert_eq!(doc.key_id, "FPR");
+        let doc = provider_signing_doc(&test_key(None, None), "tf", "ns", "t", "1.0.0");
+        assert_eq!(doc.key_id, "");
+    }
+
+    // -- protocols -------------------------------------------------------------
+
+    #[test]
+    fn protocol_normalisation_sorts_numerically_and_dedups() {
+        assert_eq!(
+            normalize_protocols(["6.0", "5.0", " 5.0 ", "10.1"]),
+            Some(protocols(&["5.0", "6.0", "10.1"]))
+        );
+    }
+
+    #[test]
+    fn protocol_normalisation_rejects_malformed_empty_and_oversized() {
+        assert_eq!(normalize_protocols(["5"]), None);
+        assert_eq!(normalize_protocols(["5.x"]), None);
+        assert_eq!(normalize_protocols(["a.b"]), None);
+        assert_eq!(normalize_protocols(["5.0", ""]), None);
+        assert_eq!(normalize_protocols(["99999.0"]), None);
+        assert_eq!(normalize_protocols(Vec::<&str>::new()), None);
+        let many: Vec<String> = (0..=MAX_PROTOCOL_VERSIONS)
+            .map(|i| format!("{i}.0"))
+            .collect();
+        assert_eq!(normalize_protocols(many.iter().map(String::as_str)), None);
+    }
+
+    #[test]
+    fn protocols_header_absent_valid_and_malformed() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_protocols_header(&headers), Ok(None));
+        headers.insert(PROTOCOLS_HEADER, "6.0, 5.0".parse().unwrap());
+        assert_eq!(
+            parse_protocols_header(&headers),
+            Ok(Some(protocols(&["5.0", "6.0"])))
+        );
+        headers.insert(PROTOCOLS_HEADER, "five".parse().unwrap());
+        assert!(parse_protocols_header(&headers)
+            .unwrap_err()
+            .contains("X-Terraform-Protocols"));
+    }
+
+    #[test]
+    fn protocols_from_manifest_json_reads_metadata_protocol_versions() {
+        let raw = br#"{"version":1,"metadata":{"protocol_versions":["6.0","5.0"]}}"#;
+        assert_eq!(
+            protocols_from_manifest_json(raw),
+            Some(protocols(&["5.0", "6.0"]))
+        );
+        assert_eq!(protocols_from_manifest_json(b"not json"), None);
+        assert_eq!(protocols_from_manifest_json(br#"{"version":1}"#), None);
+        assert_eq!(
+            protocols_from_manifest_json(br#"{"metadata":{"protocol_versions":[6]}}"#),
+            None
+        );
+    }
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in entries {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(body).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn scratch_file(name: &str, body: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tf-origin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn manifest_protocols_are_read_from_the_archive() {
+        let zip = zip_with(&[
+            ("terraform-provider-x_v1.0.0", b"placeholder"),
+            (
+                REGISTRY_MANIFEST_NAME,
+                br#"{"version":1,"metadata":{"protocol_versions":["6.0"]}}"#,
+            ),
+        ]);
+        let path = scratch_file("p.zip", &zip);
+        assert_eq!(
+            read_manifest_protocols(path.clone()).await,
+            Some(protocols(&["6.0"]))
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn manifest_protocols_are_none_for_missing_oversized_or_non_zip() {
+        let no_manifest = scratch_file("a.zip", &zip_with(&[("terraform-provider-x_v1", b"x")]));
+        assert_eq!(read_manifest_protocols(no_manifest.clone()).await, None);
+
+        let big = vec![b' '; (REGISTRY_MANIFEST_MAX_BYTES + 1) as usize];
+        let oversized = scratch_file("b.zip", &zip_with(&[(REGISTRY_MANIFEST_NAME, &big)]));
+        assert_eq!(read_manifest_protocols(oversized.clone()).await, None);
+
+        let not_zip = scratch_file("c.zip", b"definitely not a zip");
+        assert_eq!(read_manifest_protocols(not_zip.clone()).await, None);
+
+        assert_eq!(
+            read_manifest_protocols(std::path::PathBuf::from("/nonexistent/nope.zip")).await,
+            None
+        );
+        for p in [no_manifest, oversized, not_zip] {
+            std::fs::remove_dir_all(p.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn protocols_from_metadata_default_for_legacy_or_garbage() {
+        assert_eq!(provider_protocols_from_metadata(None), protocols(&["5.0"]));
+        let legacy = serde_json::json!({"kind": "provider"});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&legacy)),
+            protocols(&["5.0"])
+        );
+        let garbage = serde_json::json!({"protocols": ["x"]});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&garbage)),
+            protocols(&["5.0"])
+        );
+        let recorded = serde_json::json!({"protocols": ["6.0"]});
+        assert_eq!(
+            provider_protocols_from_metadata(Some(&recorded)),
+            protocols(&["6.0"])
+        );
+    }
+
+    #[test]
+    fn version_list_unions_protocols_across_platform_packages() {
+        let rows = vec![
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({"os":"linux","arch":"amd64","protocols":["6.0"]})),
+                "ns/t/1.0.0/linux/amd64".to_string(),
+            ),
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({"os":"linux","arch":"arm64"})),
+                "ns/t/1.0.0/linux/arm64".to_string(),
+            ),
+        ];
+        let versions = provider_versions_from_rows(&rows);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["protocols"], serde_json::json!(["5.0", "6.0"]));
+    }
+
+    // -- host-level discovery ----------------------------------------------------
+
+    fn discovery_router(state: SharedState) -> Router {
+        Router::new()
+            .route("/.well-known/terraform.json", get(host_service_discovery))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn host_discovery_is_404_when_no_default_repo_is_configured() {
+        // Never touches the database: the unset case short-circuits.
+        let state = tdh::build_state(tdh::lazy_pool(), "/nonexistent-storage");
+        let (status, body) = tdh::send(
+            discovery_router(state),
+            tdh::get("/.well-known/terraform.json".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body).contains("No default Terraform registry"));
+    }
+
+    #[tokio::test]
+    async fn host_discovery_points_at_the_configured_terraform_repo() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let state = tdh::build_state_with(
+            fx.pool.clone(),
+            &fx.storage_dir.to_string_lossy(),
+            move |c| c.terraform_default_repo = Some(key),
+        );
+        let (status, body) = tdh::send(
+            discovery_router(state),
+            tdh::get("/.well-known/terraform.json".to_string()),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["providers.v1"],
+            format!("/terraform/{}/v1/providers/", fx.repo_key)
+        );
+        assert_eq!(doc, build_service_discovery_json(&fx.repo_key));
+    }
+
+    #[tokio::test]
+    async fn host_discovery_hides_missing_and_non_terraform_repos_behind_one_404() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut bodies = Vec::new();
+        for configured in [fx.repo_key.clone(), "no-such-repo-key".to_string()] {
+            let state = tdh::build_state_with(
+                fx.pool.clone(),
+                &fx.storage_dir.to_string_lossy(),
+                move |c| c.terraform_default_repo = Some(configured),
+            );
+            let (status, body) = tdh::send(
+                discovery_router(state),
+                tdh::get("/.well-known/terraform.json".to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            bodies.push(body);
+        }
+        fx.teardown().await;
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the 404 must not reveal which case it was"
+        );
+    }
+
+    // -- hosted registry end to end (router level) ----------------------------------
+
+    async fn attach_key(fx: &tdh::Fixture, key_type: &str) -> String {
+        let svc = SigningService::new(fx.pool.clone(), &fx.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: Some(fx.repo_id),
+                name: format!("tf-sign-{}", fx.repo_key),
+                key_type: key_type.to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK Terraform".to_string()),
+                uid_email: Some("tf@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(fx.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+        key.public_key_pem
+    }
+
+    async fn upload(
+        fx: &tdh::Fixture,
+        version: &str,
+        platform: &str,
+        body: &[u8],
+        protocols_header: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder().method("PUT").uri(format!(
+            "{}/{}/v1/providers/ns/ty/{}/{}",
+            MOUNT_PREFIX, fx.repo_key, version, platform
+        ));
+        if let Some(value) = protocols_header {
+            req = req.header(PROTOCOLS_HEADER, value);
+        }
+        let (status, _) = tdh::send(
+            fx.router_with_auth(mounted()),
+            req.body(axum::body::Body::from(body.to_vec())).unwrap(),
+        )
+        .await;
+        status
+    }
+
+    async fn get_path(fx: &tdh::Fixture, suffix: &str) -> (StatusCode, bytes::Bytes) {
+        tdh::send(
+            fx.router_anon(mounted()),
+            tdh::get(format!(
+                "{}/{}/v1/providers/ns/ty/{}",
+                MOUNT_PREFIX, fx.repo_key, suffix
+            )),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn hosted_origin_registry_serves_verifiable_signed_checksums() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let amd64: &[u8] = b"PK placeholder provider zip amd64";
+        let arm64: &[u8] = b"PK placeholder provider zip arm64";
+        assert!(upload(&fx, "1.0.0", "linux/amd64", amd64, Some("6.0"))
+            .await
+            .is_success());
+        assert!(upload(&fx, "1.0.0", "linux/arm64", arm64, None)
+            .await
+            .is_success());
+
+        // A package uploaded before any key existed: legacy document, no URLs.
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let legacy: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(legacy.get("shasums_url").is_none());
+        assert_eq!(legacy["protocols"], serde_json::json!(["6.0"]));
+
+        // Fail closed without a signing key.
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Attaching a key needs no re-upload: the document is computed from the
+        // stored artifacts.
+        let public_key = attach_key(&fx, "gpg").await;
+
+        let (status, sums) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = build_provider_shasums(
+            "ty",
+            "1.0.0",
+            &[
+                pkg("linux", "amd64", &sha256_hex(amd64)),
+                pkg("linux", "arm64", &sha256_hex(arm64)),
+            ],
+        );
+        assert_eq!(String::from_utf8_lossy(&sums), expected);
+        assert_eq!(expected.lines().count(), 2);
+
+        // Deterministic bytes across requests.
+        let (_, again) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(sums, again);
+
+        // The detached signature verifies against the advertised key.
+        let (status, sig) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        // Binary packets (what OpenTofu expects), not ASCII armor.
+        assert!(!sig.starts_with(b"-----BEGIN"));
+        assert_eq!(sig[0] & 0x80, 0x80, "must start with an OpenPGP packet tag");
+        let armored_sig = {
+            use pgp::composed::{Deserializable, StandaloneSignature};
+            use pgp::ArmorOptions;
+            StandaloneSignature::from_bytes(&sig[..])
+                .unwrap()
+                .to_armored_string(ArmorOptions::default())
+                .unwrap()
+        };
+        verify_detached(&public_key, &sums, &armored_sig).expect("signature must verify");
+        // ... and not against different data.
+        assert!(verify_detached(&public_key, b"tampered", &armored_sig).is_err());
+
+        // The package document now advertises everything a client needs.
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["shasums_url"],
+            format!(
+                "/terraform/{}/v1/providers/ns/ty/1.0.0/SHA256SUMS",
+                fx.repo_key
+            )
+        );
+        assert_eq!(
+            doc["shasums_signature_url"],
+            format!("{}.sig", doc["shasums_url"].as_str().unwrap())
+        );
+        assert_eq!(doc["shasum"], sha256_hex(amd64));
+        let keys = doc["signing_keys"]["gpg_public_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["ascii_armor"], public_key);
+        assert!(!keys[0]["key_id"].as_str().unwrap().is_empty());
+
+        // The advertised URLs resolve against the document's own URL.
+        let doc_url = format!(
+            "http://h{}/{}/v1/providers/ns/ty/1.0.0/download/linux/amd64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let advertised = resolve_url(&doc_url, doc["shasums_url"].as_str().unwrap());
+        let (status, via_doc) = tdh::send(fx.router_anon(mounted()), tdh::get(advertised)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(via_doc, sums);
+
+        // Unknown version.
+        let (status, _) = get_path(&fx, "9.9.9/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
+    }
+
+    fn resolve_url(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).unwrap();
+        base.join(advertised).unwrap()[url::Position::BeforePath..].to_string()
+    }
+
+    #[tokio::test]
+    async fn non_openpgp_key_fails_closed_and_keeps_the_legacy_document() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert!(upload(&fx, "1.0.0", "linux/amd64", b"zip", None)
+            .await
+            .is_success());
+        attach_key(&fx, "rsa").await;
+
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, body) = get_path(&fx, "1.0.0/download/linux/amd64").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc.get("shasums_url").is_none());
+        assert!(doc["signing_keys"]["gpg_public_keys"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_malformed_protocols_header_and_records_manifest_protocols() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert_eq!(
+            upload(&fx, "1.0.0", "linux/amd64", b"zip", Some("bogus")).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let manifest_zip = zip_with(&[
+            ("terraform-provider-ty_v2.0.0", b"placeholder"),
+            (
+                REGISTRY_MANIFEST_NAME,
+                br#"{"version":1,"metadata":{"protocol_versions":["6.0"]}}"#,
+            ),
+        ]);
+        assert!(upload(&fx, "2.0.0", "linux/amd64", &manifest_zip, None)
+            .await
+            .is_success());
+        let (status, body) = get_path(&fx, "versions").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = doc["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1, "the rejected upload must not be stored");
+        assert_eq!(versions[0]["version"], "2.0.0");
+        assert_eq!(versions[0]["protocols"], serde_json::json!(["6.0"]));
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn checksums_are_not_published_for_non_hosted_repos() {
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        fx.teardown().await;
     }
 }
