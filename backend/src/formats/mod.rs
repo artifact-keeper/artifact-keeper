@@ -271,7 +271,9 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 
 /// Core handler keys whose Remote/Virtual download path enforces the inline
 /// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
-/// through `proxy_helpers::serve_scanned_proxy_file` (npm, PyPI, VS Code) or,
+/// through `proxy_helpers::serve_scanned_proxy_file` (npm, PyPI, VS Code, and
+/// since #4100 the Maven and sbt package archives — the `maven` key also
+/// serves `gradle` repositories) or,
 /// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
 ///
 /// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
@@ -280,8 +282,23 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// reads every format handler's source and fails when a handler reaches the
 /// gate without being listed here, or is listed without reaching it, so the
 /// capability cannot drift from the router. Adopting the gate in a new format
-/// (#4100 Maven, #4101 Cargo, #4102 NuGet, ...) adds its key here.
-pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &["npm", "oci", "pypi", "vscode"];
+/// (#4101 Cargo, #4102 NuGet, ...) adds its key here, one key per line.
+///
+/// `enforced` is per handler, not per file type. Maven/sbt scan every proxied
+/// file except an allowlist of non-package files (POMs, `.xml` metadata,
+/// Gradle `.module`, checksums, signatures, and `-sources`/`-javadoc` jars,
+/// skipped by name). Only `.jar`/`.war`/`.ear` carry an identity pin, and
+/// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
+/// they are scanned as raw files, not unpacked (#4100).
+#[rustfmt::skip]
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "maven",
+    "npm",
+    "oci",
+    "pypi",
+    "sbt",
+    "vscode",
+];
 
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
 pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
