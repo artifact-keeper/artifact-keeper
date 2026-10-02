@@ -152,7 +152,14 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/healthz", get(handlers::health::health_check))
         .route("/ready", get(handlers::health::readiness_check))
         .route("/readyz", get(handlers::health::readiness_check))
-        .route("/livez", get(handlers::health::liveness_check));
+        .route("/livez", get(handlers::health::liveness_check))
+        // Host-level Terraform/OpenTofu service discovery. Clients look this
+        // up per host, so it cannot live under `/terraform/{repo}`; it 404s
+        // unless `TERRAFORM_DEFAULT_REPO` is configured.
+        .route(
+            "/.well-known/terraform.json",
+            get(handlers::terraform::host_service_discovery),
+        );
 
     // Only mount Swagger UI and the OpenAPI spec when explicitly enabled
     if swagger_enabled {

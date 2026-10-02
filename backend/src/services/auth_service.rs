@@ -4310,6 +4310,7 @@ mod tests {
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            terraform_default_repo: None,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
