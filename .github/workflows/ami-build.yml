@@ -1,12 +1,34 @@
 name: Build AMI
 
+# HOW THIS WORKFLOW IS STARTED (#3896)
+#
+# `release: published` does NOT fire for a release that release.yml creates:
+# that Release is created with GITHUB_TOKEN, and an event caused by
+# GITHUB_TOKEN never starts another workflow. Every certified release (#3777)
+# is created that way, so this trigger alone built no AMI for any of them. The
+# automatic path is therefore an explicit dispatch: release.yml's `ami-build`
+# job runs `gh workflow run ami-build.yml --ref vX.Y.Z -f version=X.Y.Z` after
+# the Release is published (STABLE releases only -- an AMI costs money and an
+# RC has no Marketplace consumer) and follows the run to a verdict with
+# scripts/ci/follow-dispatched-run.sh, so a missing or red build is a red
+# release run. workflow_dispatch also IS the manual path:
+#
+#   gh workflow run ami-build.yml --ref vX.Y.Z -f version=X.Y.Z
+#   gh workflow run ami-build.yml --ref main   -f version=X.Y.Z   # older tag
+#
+# The `release:` trigger stays for a release published BY HAND (whose event
+# does fire), with the same stable-only rule. Drafts never reach it: a draft
+# does not emit `published`, and a dispatched version must name a published
+# Release (checked below). scripts/ci/check-release-downstream-dispatch.sh pins
+# this wiring.
+
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       version:
-        description: "Artifact Keeper version to bake into the AMI"
+        description: "Artifact Keeper version to bake into the AMI (X.Y.Z or vX.Y.Z; must be a published GitHub Release)"
         required: true
         type: string
       regions:
@@ -19,10 +41,24 @@ permissions:
   id-token: write
   contents: read
 
+# One AMI build per version at a time; a second dispatch queues behind the
+# first instead of baking the same version twice in parallel.
+concurrency:
+  # Normalised to a leading `v` so a dispatch (`-f version=X.Y.Z`) and a
+  # hand-published release (`vX.Y.Z`) of the same version share one group.
+  group: ami-build-${{ startsWith(inputs.version || github.event.release.tag_name, 'v') && (inputs.version || github.event.release.tag_name) || format('v{0}', inputs.version || github.event.release.tag_name) }}
+  cancel-in-progress: false
+
 jobs:
   build-ami:
     name: Build Artifact Keeper AMI
     runs-on: ubuntu-latest
+    # Under release.yml's 120-minute follower, so a hung build ends here
+    # with its own verdict rather than outliving the job waiting for it.
+    timeout-minutes: 110
+    # A hand-published PRERELEASE does not get an AMI automatically, matching
+    # release.yml's dispatch; a maintainer who wants one dispatches by hand.
+    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,14 +69,49 @@ jobs:
           repository: artifact-keeper/artifact-keeper-iac
           path: iac
 
-      - name: Determine version
+      # Inputs reach the shell through env, never `${{ }}` inside the script,
+      # and are validated before anything uses them: `version` ends up in a
+      # Packer -var and `regions` in an HCL list literal.
+      - name: Determine and validate version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REGIONS: ${{ inputs.regions }}
+          ROLE_ARN: ${{ secrets.AWS_AMI_BUILDER_ROLE_ARN }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            VERSION="${VERSION#v}"
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "release" ]; then
+            VERSION="${RELEASE_TAG#v}"
           else
-            VERSION="${{ inputs.version }}"
+            VERSION="${INPUT_VERSION#v}"
+          fi
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error title=Invalid version::'${VERSION}' is not X.Y.Z or X.Y.Z-pre (a leading v is accepted)."
+            exit 1
+          fi
+          # Dispatched on a version tag, the input must name that same tag, so
+          # a run on vA cannot be told to bake vB.
+          if [[ "${GITHUB_REF}" == refs/tags/v* && "${GITHUB_REF_NAME}" != "v${VERSION}" ]]; then
+            echo "::error title=Version does not match the ref::dispatched on ${GITHUB_REF_NAME} but asked to build ${VERSION}. Dispatch on v${VERSION} or on main."
+            exit 1
+          fi
+          if [ -n "${INPUT_REGIONS}" ] && ! [[ "${INPUT_REGIONS}" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+(,[a-z]{2}(-[a-z]+)+-[0-9]+)*$ ]]; then
+            echo "::error title=Invalid regions::'${INPUT_REGIONS}' is not a comma-separated list of AWS region names (e.g. us-west-2,eu-west-1)."
+            exit 1
+          fi
+          # Only a PUBLISHED Release is baked: a draft is invisible to this
+          # token (contents: read), and a tag with no Release has no images.
+          draft="$(gh release view "v${VERSION}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          if [ "${draft}" != "false" ]; then
+            echo "::error title=No published release::v${VERSION} has no published GitHub Release (state: ${draft}). An AMI is only built for a published release."
+            exit 1
+          fi
+          if [ -z "${ROLE_ARN}" ]; then
+            echo "::error title=AWS_AMI_BUILDER_ROLE_ARN is not set::the AMI build assumes this role through GitHub OIDC. Configure the secret (repo or org) before dispatching."
+            exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -61,37 +132,48 @@ jobs:
 
       - name: Packer Validate
         working-directory: iac/packer
-        run: packer validate -var "artifact_keeper_version=${{ steps.version.outputs.version }}" .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: packer validate -var "artifact_keeper_version=${VERSION}" .
 
       - name: Packer Build
         working-directory: iac/packer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGIONS: ${{ inputs.regions }}
         run: |
-          REGIONS_ARG=""
-          if [ -n "${{ inputs.regions }}" ]; then
-            REGIONS_ARG="-var ami_regions=[$(echo '${{ inputs.regions }}' | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]"
+          set -o pipefail
+          REGIONS_ARG=()
+          if [ -n "${REGIONS}" ]; then
+            REGIONS_ARG=(-var "ami_regions=[\"${REGIONS//,/\",\"}\"]")
           fi
 
           packer build \
-            -var "artifact_keeper_version=${{ steps.version.outputs.version }}" \
+            -var "artifact_keeper_version=${VERSION}" \
             -color=false \
-            ${REGIONS_ARG} \
+            "${REGIONS_ARG[@]}" \
             . 2>&1 | tee /tmp/packer-output.log
 
       - name: Extract AMI ID
         id: ami
         run: |
-          AMI_ID=$(grep -oP 'ami-[a-f0-9]+' /tmp/packer-output.log | tail -1)
+          AMI_ID=$(grep -oP 'ami-[a-f0-9]+' /tmp/packer-output.log | tail -1 || true)
+          if [ -z "${AMI_ID}" ]; then
+            echo "::error title=No AMI ID::packer build exited 0 but printed no ami- ID."
+            exit 1
+          fi
           echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
-          echo "### AMI Built Successfully" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| AMI ID | \`${AMI_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Version | \`${{ steps.version.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Region | \`us-east-1\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### AMI Built Successfully"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| AMI ID | \`${AMI_ID}\` |"
+            echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Region | \`us-east-1\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update AMI manifest
-        if: github.event_name == 'release'
         run: |
           mkdir -p iac/packer
           cat > iac/packer/ami-manifest.json <<EOF

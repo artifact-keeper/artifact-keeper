@@ -1822,6 +1822,92 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ════════════════════════════════════════════════════════════════════════════
+  # ANNOUNCE THE RELEASE AND BUILD THE AMI  (issues #3896, #3897)
+  #
+  # release-announce.yml and ami-build.yml trigger on `release: published`,
+  # which -- exactly as for sync-openapi-spec above -- never fires for the
+  # Release this workflow creates with GITHUB_TOKEN. So since the certified
+  # flow (#3777) no release was announced and no AMI was built, silently. Both
+  # are dispatched here, on the tag, after the Release is published, and
+  # followed to a verdict by scripts/ci/follow-dispatched-run.sh. GITHUB_TOKEN
+  # with `actions: write` is enough: `workflow_dispatch` is the documented
+  # exception to the no-recursive-trigger rule, so no PAT or App token is
+  # needed. Both workflows keep `release:` for a release published by hand,
+  # and both take a manual `workflow_dispatch` input (see RELEASING.md).
+  #
+  #   * release-announce runs for EVERY release, prereleases included: the
+  #     announce workflow has always rendered a distinct amber "pre-release"
+  #     embed, i.e. it was written to announce them.
+  #   * ami-build runs for STABLE releases only: an AMI build costs money and
+  #     an AWS OIDC session per run, and an `-rc.N` AMI has no consumer. A
+  #     maintainer who wants one dispatches ami-build.yml by hand. ami-build.yml
+  #     applies the same rule to a hand-published prerelease.
+  #
+  # A red follow here means the release IS published and the images are
+  # correct; only the downstream side effect is missing. Re-run the job or
+  # dispatch the workflow by hand with the command in its error.
+  # scripts/ci/check-release-downstream-dispatch.sh pins this wiring.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  ami-build:
+    name: 🖥️ Build the AMI
+    runs-on: ubuntu-latest
+    needs: [release]
+    # Stable tags only (see above): a prerelease tag is the one carrying `-`,
+    # the same test the `release` job uses for `prerelease:`.
+    if: ${{ !cancelled() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
+    # NON-BLOCKING for now: no ami-build run has ever succeeded, and it needs
+    # the AWS_AMI_BUILDER_ROLE_ARN secret plus an OIDC trust for refs/tags/v*
+    # (RELEASING.md, "Release prerequisites"). Until one build is known good,
+    # a red follow here shows as a failed job but does not fail the release
+    # run. TODO(#3896): drop this once an AMI build has succeeded from a tag.
+    continue-on-error: true
+    permissions:
+      actions: write   # dispatch ami-build.yml and follow its run
+      contents: read
+    # A Packer build plus the AMI copy; the follower polls until it concludes.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Dispatch the AMI build
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run ami-build.yml --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" -f version="${GITHUB_REF_NAME#v}"
+          echo "Dispatched ami-build.yml on ${GITHUB_REF_NAME}."
+
+      - name: Follow the AMI build to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: ami-build.yml
+          FOLLOW_REF: ${{ github.ref_name }}
+          FOLLOW_SINCE: ${{ steps.dispatch.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          run_id="${out#run_id=}"; run_id="${run_id%% *}"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=AMI build did not conclude green::${out}. The release IS published and the images are correct; no AMI exists for ${GITHUB_REF_NAME}. Fix the cause (e.g. the AWS_AMI_BUILDER_ROLE_ARN secret) and re-run this job, or dispatch it by hand: gh workflow run ami-build.yml --ref ${GITHUB_REF_NAME} -f version=${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+          {
+            echo "### AMI built"
+            echo
+            echo "- AMI build run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # NOTE: Docker images are published by .github/workflows/docker-publish.yml,
   # which already triggers on `tags: ['v*']`. We previously had a redundant
   # `docker-release` job here that re-dispatched docker-publish via
