@@ -110,17 +110,42 @@ impl Fixture {
         bearer: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let authorization = bearer.map(|token| format!("Bearer {token}"));
+        match body {
+            Some(b) => {
+                self.send_raw(
+                    method,
+                    uri,
+                    authorization,
+                    Some("application/json"),
+                    b.to_string().into_bytes(),
+                )
+                .await
+            }
+            None => {
+                self.send_raw(method, uri, authorization, None, Vec::new())
+                    .await
+            }
+        }
+    }
+
+    /// Send one request with an arbitrary `Authorization` header and body.
+    async fn send_raw(
+        &self,
+        method: &str,
+        uri: &str,
+        authorization: Option<String>,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder().method(method).uri(uri);
-        if let Some(token) = bearer {
-            req = req.header("authorization", format!("Bearer {token}"));
+        if let Some(value) = authorization {
+            req = req.header("authorization", value);
         }
-        let req = match body {
-            Some(b) => req
-                .header("content-type", "application/json")
-                .body(Body::from(b.to_string())),
-            None => req.body(Body::empty()),
+        if let Some(value) = content_type {
+            req = req.header("content-type", value);
         }
-        .unwrap();
+        let req = req.body(Body::from(body)).unwrap();
         let resp = create_router(self.state.clone())
             .oneshot(req)
             .await
@@ -141,17 +166,19 @@ impl Fixture {
     }
 
     async fn create_provider(&self, issuer: &str) -> Uuid {
+        self.create_provider_with(json!({
+            "name": format!("gitlab-e2e-{}", Uuid::new_v4()),
+            "provider_type": "gitlab",
+            "issuer_url": issuer,
+            "audience": AUDIENCE,
+        }))
+        .await
+    }
+
+    /// Create a provider from a full admin-API body.
+    async fn create_provider_with(&self, body: Value) -> Uuid {
         let created = self
-            .admin(
-                "POST",
-                "/api/v1/admin/ci-oidc",
-                Some(json!({
-                    "name": format!("gitlab-e2e-{}", Uuid::new_v4()),
-                    "provider_type": "gitlab",
-                    "issuer_url": issuer,
-                    "audience": AUDIENCE,
-                })),
-            )
+            .admin("POST", "/api/v1/admin/ci-oidc", Some(body))
             .await;
         Uuid::parse_str(created["id"].as_str().unwrap()).unwrap()
     }
@@ -159,10 +186,18 @@ impl Fixture {
     /// Create a mapping through the admin API, returning the response — which
     /// carries the service account an operator would grant.
     async fn create_mapping(&self, claim_filters: Value) -> Value {
+        self.create_mapping_on(
+            self.provider_id,
+            json!({ "name": "e2e", "claim_filters": claim_filters }),
+        )
+        .await
+    }
+
+    async fn create_mapping_on(&self, provider_id: Uuid, body: Value) -> Value {
         self.admin(
             "POST",
-            &format!("/api/v1/admin/ci-oidc/{}/mappings", self.provider_id),
-            Some(json!({ "name": "e2e", "claim_filters": claim_filters })),
+            &format!("/api/v1/admin/ci-oidc/{provider_id}/mappings"),
+            Some(body),
         )
         .await
     }
@@ -199,17 +234,23 @@ impl Fixture {
 
     /// A private generic repository (only a grant makes it visible).
     async fn private_repo(&mut self) -> String {
+        self.private_repo_of("generic").await
+    }
+
+    /// A private repository of `format`.
+    async fn private_repo_of(&mut self, format: &str) -> String {
         let id = Uuid::new_v4();
         let key = format!("ci-e2e-{id}");
         let dir = std::env::temp_dir().join(&key);
         std::fs::create_dir_all(&dir).expect("repo dir");
         sqlx::query(
             "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
-             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'generic'::repository_format)",
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, $4::repository_format)",
         )
         .bind(id)
         .bind(&key)
         .bind(dir.to_string_lossy().into_owned())
+        .bind(format)
         .execute(&self.pool)
         .await
         .expect("create private repo");
@@ -220,6 +261,17 @@ impl Fixture {
     /// Grant `account` read on `repo_key` the way an operator does: a group,
     /// its membership, and a group-principal permission, all via the API.
     async fn grant_via_group(&mut self, account: Uuid, repo_key: &str) {
+        let group_id = self.group_granting(repo_key).await;
+        self.admin(
+            "POST",
+            &format!("/api/v1/groups/{group_id}/members"),
+            Some(json!({ "user_ids": [account] })),
+        )
+        .await;
+    }
+
+    /// A group holding read and write on `repo_key`, created via the API.
+    async fn group_granting(&mut self, repo_key: &str) -> Uuid {
         let group = self
             .admin(
                 "POST",
@@ -229,12 +281,6 @@ impl Fixture {
             .await;
         let group_id = Uuid::parse_str(group["id"].as_str().unwrap()).unwrap();
         self.groups.push(group_id);
-        self.admin(
-            "POST",
-            &format!("/api/v1/groups/{group_id}/members"),
-            Some(json!({ "user_ids": [account] })),
-        )
-        .await;
         let repo_id: Uuid = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
             .bind(repo_key)
             .fetch_one(&self.pool)
@@ -252,6 +298,7 @@ impl Fixture {
             })),
         )
         .await;
+        group_id
     }
 
     async fn teardown(self) {
@@ -644,5 +691,271 @@ async fn a_valid_token_matching_no_mapping_is_refused() {
         .issuer
         .gitlab_claims(AUDIENCE, "group/other", "branch", "main");
     assert_refused(&fx, &fx.issuer.sign(&claims), "no mapping").await;
+    fx.teardown().await;
+}
+
+// ===========================================================================
+// 3. Kubernetes provider (add-ci-oidc-kubernetes-provider, #1246)
+//
+// A kubelet presents a pod-bound ServiceAccount token. The provider type
+// makes the exchanged credential pull-only and non-renewable; the key source
+// decides whether the issuer is contacted at all.
+// ===========================================================================
+
+/// A dedicated audience, never the API server's own. Distinct from
+/// [`AUDIENCE`], so a Kubernetes provider on the same mock issuer as the
+/// fixture's gitlab one is resolved by audience without `provider_id`.
+const K8S_AUDIENCE: &str = "https://artifacts.e2e.test/k8s";
+
+/// kubeadm's default issuer: not resolvable from here.
+const ONPREM_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+
+/// A kubelet-issued ServiceAccount token's claims for pod `api-7d9f` of
+/// `namespace/api`, valid for ten minutes.
+fn k8s_claims(issuer: &str, namespace: &str) -> Value {
+    let now = chrono::Utc::now().timestamp();
+    json!({
+        "iss": issuer,
+        "aud": [K8S_AUDIENCE],
+        "sub": format!("system:serviceaccount:{namespace}:api"),
+        "iat": now,
+        "nbf": now,
+        "exp": now + 600,
+        "kubernetes.io": {
+            "namespace": namespace,
+            "serviceaccount": {"name": "api", "uid": Uuid::new_v4()},
+            "pod": {"name": "api-7d9f", "uid": Uuid::new_v4()},
+            "node": {"name": "node-3", "uid": Uuid::new_v4()},
+        },
+    })
+}
+
+fn basic(username: &str, password: &str) -> String {
+    use base64::Engine;
+    let pair = format!("{username}:{password}");
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(pair)
+    )
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+}
+
+impl Fixture {
+    /// A `kubernetes` provider with `key_source`, on `issuer`.
+    async fn kubernetes_provider(&mut self, issuer: &str, static_jwks: Option<&Value>) -> Uuid {
+        let mut body = json!({
+            "name": format!("k8s-e2e-{}", Uuid::new_v4()),
+            "provider_type": "kubernetes",
+            "issuer_url": issuer,
+            "audience": K8S_AUDIENCE,
+        });
+        if let Some(jwks) = static_jwks {
+            body["key_source"] = json!("static");
+            body["static_jwks"] = jwks.clone();
+        }
+        let id = self.create_provider_with(body).await;
+        self.extra_providers.push(id);
+        id
+    }
+
+    /// Push a one-blob OCI image `app:v1` into `repo` as the admin, so there
+    /// is something to pull.
+    async fn seed_image(&self, repo: &str) {
+        let admin = Some(format!("Bearer {}", self.admin_bearer));
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let config_digest = sha256_digest(&config);
+        let (status, body) = self
+            .send_raw(
+                "POST",
+                &format!("/v2/{repo}/app/blobs/uploads/?digest={config_digest}"),
+                admin.clone(),
+                Some("application/octet-stream"),
+                config.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed config blob: {body}");
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [],
+        });
+        let (status, body) = self
+            .send_raw(
+                "PUT",
+                &format!("/v2/{repo}/app/manifests/v1"),
+                admin,
+                Some("application/vnd.oci.image.manifest.v1+json"),
+                manifest.to_string().into_bytes(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed manifest: {body}");
+    }
+
+    async fn refresh_rows(&self, user_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+}
+
+/// 6.1 — a Kubernetes token through a `discovery` provider: a namespace
+/// pointer mapping matches it, the exchanged credential pulls, cannot push
+/// through either the Basic password or a `/v2/token` bearer although its
+/// group grants write, and left no refresh-token row behind.
+#[tokio::test]
+#[ignore]
+async fn kubernetes_token_pulls_but_cannot_push() {
+    let Some(mut fx) = Fixture::new().await else {
+        return;
+    };
+    let issuer = fx.issuer.issuer().to_string();
+    let provider = fx.kubernetes_provider(&issuer, None).await;
+    let repo = fx.private_repo_of("docker").await;
+    let group = fx.group_granting(&repo).await;
+    fx.create_mapping_on(
+        provider,
+        json!({
+            "name": "payments",
+            "claim_filters": {"/kubernetes.io/namespace": "payments"},
+            "group_binding_ids": [group],
+        }),
+    )
+    .await;
+    fx.seed_image(&repo).await;
+
+    // Another namespace does not match the pointer filter.
+    let (status, body) = fx
+        .exchange(&fx.issuer.sign(&k8s_claims(&issuer, "payments-sandbox")))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = fx
+        .exchange(&fx.issuer.sign(&k8s_claims(&issuer, "payments")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let username = body["username"].as_str().unwrap().to_string();
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+    assert_eq!(body.get("refresh_token"), None, "response shape unchanged");
+    let password = basic(&username, &access_token);
+
+    // Pull: the manifest, with the exchanged token as the Docker password.
+    let (status, body) = fx
+        .send_raw(
+            "GET",
+            &format!("/v2/{repo}/app/manifests/v1"),
+            Some(password.clone()),
+            None,
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "pull with the Basic password: {body}"
+    );
+
+    // Push through the Basic password: refused.
+    let push = format!("/v2/{repo}/app/blobs/uploads/");
+    let (status, body) = fx
+        .send_raw("POST", &push, Some(password.clone()), None, Vec::new())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "push via Basic: {body}");
+
+    // Push through a bearer swapped at /v2/token: the ceiling survives it.
+    let (status, body) = fx
+        .send_raw(
+            "GET",
+            &format!("/v2/token?service=artifact-keeper&scope=repository:{repo}/app:pull,push"),
+            Some(password),
+            None,
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "/v2/token: {body}");
+    assert_eq!(
+        body.get("refresh_token"),
+        None,
+        "no renewable token: {body}"
+    );
+    let bearer = format!("Bearer {}", body["token"].as_str().unwrap());
+    let (status, body) = fx
+        .send_raw(
+            "GET",
+            &format!("/v2/{repo}/app/manifests/v1"),
+            Some(bearer.clone()),
+            None,
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "pull with the swapped bearer: {body}"
+    );
+    let (status, body) = fx
+        .send_raw("POST", &push, Some(bearer), None, Vec::new())
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "push via /v2/token bearer: {body}"
+    );
+
+    let account: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+        .bind(&username)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(fx.refresh_rows(account).await, 0, "no refresh-token row");
+    fx.teardown().await;
+}
+
+/// 6.2 — a `static` provider on an issuer that cannot be resolved: the
+/// exchange verifies against the stored JWKS without contacting it, and a
+/// token under a `kid` the set does not hold is refused with 401.
+#[tokio::test]
+#[ignore]
+async fn static_kubernetes_provider_needs_no_reachable_issuer() {
+    let Some(mut fx) = Fixture::new().await else {
+        return;
+    };
+    let jwks = fx.issuer.jwks().clone();
+    let provider = fx.kubernetes_provider(ONPREM_ISSUER, Some(&jwks)).await;
+    fx.create_mapping_on(
+        provider,
+        json!({
+            "name": "payments",
+            "claim_filters": {"/kubernetes.io/namespace": "payments"},
+        }),
+    )
+    .await;
+
+    let claims = k8s_claims(ONPREM_ISSUER, "payments");
+    let (status, body) = fx.exchange(&fx.issuer.sign(&claims)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "static JWKS, unreachable issuer: {body}"
+    );
+
+    let (status, body) = fx
+        .exchange(&fx.issuer.sign_with_kid(&claims, "rotated-kid"))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body.to_string().contains("rotated-kid"),
+        "the refusal names the missing kid: {body}"
+    );
     fx.teardown().await;
 }
