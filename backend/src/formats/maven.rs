@@ -228,8 +228,9 @@ impl MavenHandler {
     /// violates its constraints (too long, non-ASCII, forbidden characters),
     /// so a single malformed groupId anywhere in the repo would otherwise
     /// silently disable filtering for the whole file. Dropping only the
-    /// offending line(s) is safe: omitting a prefix only ever widens what
-    /// Resolver still asks for, never narrows it.
+    /// offending line(s) keeps the rest of the file in force, at the cost of
+    /// Resolver denying that groupId's paths: the file is an allowlist.
+    /// Nested entries are dropped last ([`drop_nested_prefixes`]).
     pub fn generate_prefixes_txt(mut group_paths: Vec<String>) -> String {
         group_paths.sort();
         group_paths.dedup();
@@ -245,7 +246,7 @@ impl MavenHandler {
         }
 
         let mut out = String::from("## repository-prefixes/2.0\n");
-        for p in group_paths {
+        for p in drop_nested_prefixes(group_paths) {
             out.push_str(&p);
             out.push('\n');
         }
@@ -327,6 +328,24 @@ fn collapse_prefix_depth(path: &str, depth: usize) -> String {
         out.push_str(segment);
     }
     out
+}
+
+/// Drop prefixes that have a listed ancestor: Resolver accepts a path only if it
+/// reaches a leaf, so `/org/acme/sub` would hide every other `org/acme/...` path.
+fn drop_nested_prefixes(sorted: Vec<String>) -> Vec<String> {
+    let nested: Vec<bool> = sorted
+        .iter()
+        .map(|p| {
+            p.match_indices('/')
+                .skip(1)
+                .any(|(i, _)| sorted.binary_search_by(|s| s.as_str().cmp(&p[..i])).is_ok())
+        })
+        .collect();
+    sorted
+        .into_iter()
+        .zip(nested)
+        .filter_map(|(p, nested)| (!nested).then_some(p))
+        .collect()
 }
 
 #[async_trait]
@@ -975,6 +994,63 @@ mod tests {
                 line
             );
         }
+    }
+
+    /// Resolver 2.x `PrefixTree.acceptedPath`: walk the path down the tree and
+    /// accept only on reaching a leaf.
+    fn resolver_accepts(prefix_file: &str, path: &str) -> bool {
+        let prefixes: Vec<&str> = prefix_file.lines().filter(|l| l.starts_with('/')).collect();
+        let mut node = String::new();
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            node.push('/');
+            node.push_str(segment);
+            let child = format!("{node}/");
+            if !prefixes.iter().any(|p| *p == node || p.starts_with(&child)) {
+                return false;
+            }
+            if !prefixes.iter().any(|p| p.starts_with(&child)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_drops_nested_prefixes() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![
+            "/org/acme/sub/deep".to_string(),
+            "/org/acme".to_string(),
+            "/org/acme-x".to_string(),
+            "/org/acme/sub".to_string(),
+            "/org/acmex/y".to_string(),
+            "/com/x".to_string(),
+        ]);
+        let lines: Vec<&str> = txt.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            ["/com/x", "/org/acme", "/org/acme-x", "/org/acmex/y"]
+        );
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_lets_resolver_reach_every_stored_group() {
+        let groups = ["/org/acme", "/org/acme/sub", "/org/acme-x", "/com/x"];
+        let txt = MavenHandler::generate_prefixes_txt(groups.map(String::from).to_vec());
+        for group in groups {
+            let path = format!("{group}/lib/1.0/lib-1.0.jar");
+            assert!(resolver_accepts(&txt, &path), "{path} rejected by:\n{txt}");
+        }
+        assert!(!resolver_accepts(&txt, "/org/other/lib/1.0/lib-1.0.jar"));
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_collapse_does_not_leave_nested_prefixes() {
+        let mut paths: Vec<String> = (0..MAVEN_PREFIX_MAX_ENTRIES + 1)
+            .map(|i| format!("/com/example/g{}/a{}", i, i))
+            .collect();
+        paths.push("/com".to_string());
+        let txt = MavenHandler::generate_prefixes_txt(paths);
+        assert_eq!(txt, "## repository-prefixes/2.0\n/com\n");
     }
 
     #[test]
