@@ -23,7 +23,9 @@ use crate::services::audit_service::{
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
+use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
 use crate::services::service_account_service::{ServiceAccountService, ServiceAccountSummary};
+use crate::services::token_scope_service::{self, UnreachableVirtual};
 use crate::services::token_service::TokenService;
 
 /// Create service account routes (all require admin)
@@ -38,6 +40,10 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/:id/tokens", get(list_tokens).post(create_token))
         .route("/:id/tokens/:token_id", axum::routing::delete(revoke_token))
+        .route(
+            "/:id/tokens/:token_id/scope-analysis",
+            get(token_scope_analysis),
+        )
         .route(
             "/repo-selector/preview",
             axum::routing::post(preview_repo_selector),
@@ -136,6 +142,11 @@ pub struct CreateTokenResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TokenInfoResponse {
+    /// How many virtual-repository members this token cannot reach (#4215).
+    /// A count, not a list: the detail is one request away at
+    /// `GET /{id}/tokens/{token_id}/scope-analysis`, and a row only needs the
+    /// number to flag itself.
+    pub unreachable_member_count: usize,
     pub id: Uuid,
     pub name: String,
     pub token_prefix: String,
@@ -157,6 +168,11 @@ pub struct PreviewRepoSelectorRequest {
     /// The repository selector to evaluate.
     #[schema(value_type = Object)]
     pub repo_selector: serde_json::Value,
+    /// The service account the token is being minted for (#4215). Optional,
+    /// and only used to report what the scope would not reach: without it the
+    /// preview cannot say whether the account is entitled to a member, so it
+    /// reports the match alone, exactly as before.
+    pub service_account_id: Option<Uuid>,
 }
 
 /// Response for the repo selector preview endpoint.
@@ -164,6 +180,20 @@ pub struct PreviewRepoSelectorRequest {
 pub struct PreviewRepoSelectorResponse {
     pub matched_repositories: Vec<MatchedRepoResponse>,
     pub total: usize,
+    /// Members of a matched virtual repository this scope would not reach
+    /// (#4215). Empty unless the preview was asked on behalf of a service
+    /// account, since the entitlement half needs to know whose grants apply.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreachable: Vec<UnreachableVirtual>,
+}
+
+/// Response for the per-token scope analysis (#4215).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TokenScopeAnalysisResponse {
+    pub unreachable: Vec<UnreachableVirtual>,
+    /// Sum of the members across `unreachable`, matching
+    /// `TokenInfoResponse::unreachable_member_count`.
+    pub unreachable_member_count: usize,
 }
 
 /// A single matched repository in the preview response.
@@ -195,6 +225,54 @@ pub(crate) fn validate_create_token_exclusivity(
     Ok(())
 }
 
+/// The repository scope one token actually presents: its explicit ids, or its
+/// selector resolved the way authentication resolves it, or unrestricted
+/// (#4215). Selector resolution touches the database, so this returns the
+/// inputs and [`resolve_scopes`] does the work.
+fn resolved_token_scope(
+    _state: &SharedState,
+    explicit: Vec<Uuid>,
+    selector: Option<serde_json::Value>,
+) -> PendingScope {
+    if !explicit.is_empty() {
+        return PendingScope::Fixed(Some(explicit));
+    }
+    match selector {
+        Some(value) => PendingScope::Selector(value),
+        None => PendingScope::Fixed(None),
+    }
+}
+
+/// A token scope that may still need the selector service to resolve it.
+enum PendingScope {
+    Fixed(token_scope_service::TokenScope),
+    Selector(serde_json::Value),
+}
+
+/// Resolve every pending selector once, so the caller ends up with concrete
+/// scopes it can analyse. A selector that fails to parse or resolve is treated
+/// as unrestricted, which is what `validate_api_token` does with it.
+async fn resolve_scopes(
+    state: &SharedState,
+    subjects: Vec<(Uuid, PendingScope)>,
+) -> Result<Vec<(Uuid, token_scope_service::TokenScope)>> {
+    let svc = RepoSelectorService::new(state.db.clone());
+    let mut out = Vec::with_capacity(subjects.len());
+    for (key, pending) in subjects {
+        let scope = match pending {
+            PendingScope::Fixed(scope) => scope,
+            PendingScope::Selector(value) => match serde_json::from_value::<RepoSelector>(value) {
+                Ok(selector) if !RepoSelectorService::is_empty(&selector) => {
+                    Some(svc.resolve_ids(&selector).await.unwrap_or_default())
+                }
+                _ => None,
+            },
+        };
+        out.push((key, scope));
+    }
+    Ok(out)
+}
+
 pub(crate) fn build_repo_map(
     rows: Vec<(Uuid, Uuid)>,
 ) -> std::collections::HashMap<Uuid, Vec<Uuid>> {
@@ -218,6 +296,7 @@ pub(crate) fn build_selector_map(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_token_info_response(
+    unreachable_member_count: usize,
     id: Uuid,
     name: String,
     token_prefix: String,
@@ -230,6 +309,7 @@ pub(crate) fn build_token_info_response(
     selector: Option<serde_json::Value>,
 ) -> TokenInfoResponse {
     TokenInfoResponse {
+        unreachable_member_count,
         id,
         name,
         token_prefix,
@@ -498,13 +578,35 @@ pub async fn list_tokens(
             .collect(),
     );
 
+    // #4215: one analysis for every token on the page, three queries in total,
+    // so a row can be flagged without a fan-out.
+    let subjects: Vec<(Uuid, PendingScope)> = tokens
+        .iter()
+        .map(|t| {
+            let explicit = repo_map.get(&t.id).cloned().unwrap_or_default();
+            let selector = selector_map.get(&t.id).and_then(|s| s.clone());
+            (t.id, resolved_token_scope(&state, explicit, selector))
+        })
+        .collect();
+    let subjects = resolve_scopes(&state, subjects).await?;
+    let unreachable_counts = token_scope_service::analyze_many(&state.db, Some(id), subjects)
+        .await
+        .map(|m| {
+            m.into_iter()
+                .map(|(token_id, v)| (token_id, token_scope_service::total_members(&v)))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     Ok(Json(TokenListResponse {
         items: tokens
             .into_iter()
             .map(|t| {
                 let repo_ids = repo_map.remove(&t.id).unwrap_or_default();
                 let selector = selector_map.get(&t.id).and_then(|s| s.clone());
+                let unreachable_member_count = unreachable_counts.get(&t.id).copied().unwrap_or(0);
                 build_token_info_response(
+                    unreachable_member_count,
                     t.id,
                     t.name,
                     t.token_prefix,
@@ -674,8 +776,7 @@ pub async fn preview_repo_selector(
 ) -> Result<Json<PreviewRepoSelectorResponse>> {
     auth.require_admin()?;
 
-    use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-
+    let service_account_id = payload.service_account_id;
     let selector: RepoSelector = serde_json::from_value(payload.repo_selector)
         .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
 
@@ -683,6 +784,7 @@ pub async fn preview_repo_selector(
     let matched = svc.resolve(&selector).await?;
 
     let total = matched.len();
+    let matched_ids: Vec<Uuid> = matched.iter().map(|r| r.id).collect();
     let items: Vec<MatchedRepoResponse> = matched
         .into_iter()
         .map(|r| MatchedRepoResponse {
@@ -692,9 +794,79 @@ pub async fn preview_repo_selector(
         })
         .collect();
 
+    // #4215: answer "would this scope reach anything?" before the token is
+    // minted, which is where the mistake is actually made. Without an account
+    // the entitlement half is unknowable, so the preview stays as it was.
+    let unreachable = match service_account_id {
+        Some(account_id) => {
+            token_scope_service::analyze(&state.db, Some(account_id), Some(matched_ids))
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+
     Ok(Json(PreviewRepoSelectorResponse {
         matched_repositories: items,
         total,
+        unreachable,
+    }))
+}
+
+/// Which members of a virtual repository this token cannot reach, and why
+#[utoipa::path(
+    get,
+    path = "/{id}/tokens/{token_id}/scope-analysis",
+    context_path = "/api/v1/service-accounts",
+    tag = "service_accounts",
+    params(
+        ("id" = Uuid, Path, description = "Service account ID"),
+        ("token_id" = Uuid, Path, description = "Token ID"),
+    ),
+    responses(
+        (status = 200, description = "Members this token cannot reach", body = TokenScopeAnalysisResponse),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn token_scope_analysis(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((id, token_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TokenScopeAnalysisResponse>> {
+    auth.require_admin()?;
+
+    // The token must belong to the account in the path, or one account's id
+    // would answer for another's token.
+    let token_selector: Option<serde_json::Value> =
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT repo_selector FROM api_tokens WHERE id = $1 AND user_id = $2",
+        )
+        .bind(token_id)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Token not found".to_string()))?;
+
+    let explicit: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT repo_id FROM api_token_repositories WHERE token_id = $1",
+    )
+    .bind(token_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let pending = resolved_token_scope(&state, explicit, token_selector);
+    let mut resolved = resolve_scopes(&state, vec![(token_id, pending)]).await?;
+    let scope = resolved.pop().map(|(_, scope)| scope).unwrap_or(None);
+
+    let unreachable = token_scope_service::analyze(&state.db, Some(id), scope).await?;
+    let unreachable_member_count = token_scope_service::total_members(&unreachable);
+
+    Ok(Json(TokenScopeAnalysisResponse {
+        unreachable,
+        unreachable_member_count,
     }))
 }
 
@@ -1090,6 +1262,7 @@ mod tests {
         let repo_id = Uuid::new_v4();
         let selector = serde_json::json!({"match_labels": {"env": "prod"}});
         let resp = build_token_info_response(
+            0,
             id,
             "deploy-token".to_string(),
             "ak_abc".to_string(),
@@ -1119,6 +1292,7 @@ mod tests {
         let id = Uuid::new_v4();
         let now = Utc::now();
         let resp = build_token_info_response(
+            0,
             id,
             "ci-token".to_string(),
             "ak_xyz".to_string(),
@@ -1363,6 +1537,7 @@ mod tests {
         let now = Utc::now();
         let repo_id = Uuid::new_v4();
         let resp = TokenInfoResponse {
+            unreachable_member_count: 0,
             id: Uuid::nil(),
             name: "deploy-token".to_string(),
             token_prefix: "ak_abc".to_string(),
@@ -1387,6 +1562,7 @@ mod tests {
     fn test_token_info_response_serialize_minimal() {
         let now = Utc::now();
         let resp = TokenInfoResponse {
+            unreachable_member_count: 0,
             id: Uuid::nil(),
             name: "read-only".to_string(),
             token_prefix: "ak_xyz".to_string(),
@@ -1454,6 +1630,7 @@ mod tests {
     #[test]
     fn test_preview_response_serialize() {
         let resp = PreviewRepoSelectorResponse {
+            unreachable: Vec::new(),
             matched_repositories: vec![
                 MatchedRepoResponse {
                     id: Uuid::nil(),
@@ -1480,6 +1657,7 @@ mod tests {
     #[test]
     fn test_preview_response_serialize_empty() {
         let resp = PreviewRepoSelectorResponse {
+            unreachable: Vec::new(),
             matched_repositories: vec![],
             total: 0,
         };
@@ -1828,6 +2006,7 @@ mod tests {
             "admin".to_string(),
         ];
         let resp = build_token_info_response(
+            0,
             id,
             "multi-scope".to_string(),
             "ak_ms".to_string(),
@@ -1851,6 +2030,7 @@ mod tests {
         let r2 = Uuid::new_v4();
         let r3 = Uuid::new_v4();
         let resp = build_token_info_response(
+            0,
             id,
             "multi-repo".to_string(),
             "ak_mr".to_string(),
@@ -1976,6 +2156,7 @@ mod tests {
         let resp = TokenListResponse {
             items: vec![
                 TokenInfoResponse {
+                    unreachable_member_count: 0,
                     id: Uuid::new_v4(),
                     name: "token-a".to_string(),
                     token_prefix: "ak_aaa".to_string(),
@@ -1988,6 +2169,7 @@ mod tests {
                     repository_ids: vec![],
                 },
                 TokenInfoResponse {
+                    unreachable_member_count: 0,
                     id: Uuid::new_v4(),
                     name: "token-b".to_string(),
                     token_prefix: "ak_bbb".to_string(),
@@ -2050,6 +2232,7 @@ mod tests {
     fn test_preview_response_round_trip_with_items() {
         let id = Uuid::new_v4();
         let resp = PreviewRepoSelectorResponse {
+            unreachable: Vec::new(),
             matched_repositories: vec![MatchedRepoResponse {
                 id,
                 key: "npm-releases".to_string(),
