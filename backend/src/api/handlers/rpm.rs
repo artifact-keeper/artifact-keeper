@@ -72,9 +72,15 @@ pub fn router() -> Router<SharedState> {
 
 async fn root_repodata(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    // Optional so a router mounted without the auth middleware (integration
+    // tests, embedded uses) degrades to an anonymous caller instead of a 500.
+    // Anonymous is the fail-closed reading: a virtual then lists only its
+    // public members (#4346), and hosted repodata does not depend on the
+    // caller at all.
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
+    let auth = auth.and_then(|Extension(auth)| auth);
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     if rpm_layout::depth(&state.db, repo.id)
         .await
