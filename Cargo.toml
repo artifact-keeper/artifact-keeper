@@ -183,8 +183,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.16", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.16"
+wasmtime = { version = "36.0.17", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.17"
 
 # Git operations
 git2 = "0.21"
