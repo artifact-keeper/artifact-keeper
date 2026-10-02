@@ -11,8 +11,11 @@ CREATE TABLE signing_key_trust_attestations (
     payload TEXT NOT NULL,
     signature_armored TEXT NOT NULL,
     signature_type VARCHAR(32) NOT NULL DEFAULT 'openpgp_detached',
-    verification_status VARCHAR(32) NOT NULL DEFAULT 'verified'
-        CHECK (verification_status IN ('verified', 'invalid', 'unverified')),
+    -- Cryptographic check of the detached signature only — not a PKI trust
+    -- decision (#2462). `signature_valid` means the issuer key verified the
+    -- payload; it is not an anchored "verified" identity.
+    verification_status VARCHAR(32) NOT NULL DEFAULT 'signature_valid'
+        CHECK (verification_status IN ('signature_valid', 'invalid', 'unverified')),
     verified_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     created_by UUID REFERENCES users(id) ON DELETE SET NULL

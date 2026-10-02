@@ -110,6 +110,9 @@ pub struct SigningKeyTrustAttestation {
     pub payload: String,
     pub signature_armored: String,
     pub signature_type: String,
+    /// Cryptographic result only (`signature_valid` / `invalid` / `unverified`).
+    /// This is not a PKI trust decision: we do not pin issuer keys to anchors
+    /// and we do not treat issuer subkeys as independently trusted (#2462).
     pub verification_status: String,
     pub verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
