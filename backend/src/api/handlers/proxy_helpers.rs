@@ -8552,11 +8552,15 @@ pub(crate) trait ScannedProxyFile: Send + Sync {
     ) -> ProxyScanIdentity;
 
     /// Runs once the buffered fetch has the bytes (cache hit or fill), before
-    /// the gate. Formats that fix up the cached record hook in here.
+    /// the gate. Formats that fix up the cached record hook in here, as do
+    /// formats that verify the cached bytes against an upstream-published
+    /// digest the buffered fetch cannot gate its commit on (Maven's `.sha1`
+    /// sidecar, #4100).
     async fn after_buffered_fetch(
         &self,
         _state: &crate::api::SharedState,
         _req: &ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
     ) {
     }
 
@@ -8620,7 +8624,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         }
         Err(e) => return Err(e.into_response()),
     };
-    file.after_buffered_fetch(state, req).await;
+    file.after_buffered_fetch(state, req, &bytes).await;
 
     let digest = sha256_hex(&bytes);
     let identity = file.identity(req, &bytes, &digest);
@@ -8698,6 +8702,183 @@ async fn record_scanned_proxy_download(
     }
 }
 
+/// The scan-on-proxy policy each member of a Virtual walk is served under
+/// (#4100): `Some((action, severity_gate))` for a Remote member with an
+/// upstream whose stricter-of-two policy enables scanning, `None` for every
+/// member that keeps the unscanned path (hosted members, Remote members that
+/// do not scan).
+///
+/// Exactly [`effective_virtual_scan_policy`] per member, but from ONE
+/// `scan_configs` read for the virtual and all its Remote members instead of
+/// six queries per member on every archive request. No Remote member, no
+/// query. A missing row is disabled / fail-open / block-on-any. An
+/// UNREADABLE config fails closed with a retryable 503: whether any side is
+/// fail-closed is exactly what cannot be read, so serving the walk unscanned
+/// could hand out a fail-closed member's unscanned bytes.
+#[allow(clippy::type_complexity)]
+pub(crate) async fn virtual_member_scan_policies(
+    db: &PgPool,
+    virtual_id: Uuid,
+    members: &[Repository],
+) -> Result<
+    Vec<
+        Option<(
+            crate::services::proxy_scan_service::ProxyScanAction,
+            crate::services::proxy_scan_service::ProxySeverityGate,
+        )>,
+    >,
+    Response,
+> {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let scannable =
+        |m: &Repository| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some();
+    if !members.iter().any(scannable) {
+        return Ok(vec![None; members.len()]);
+    }
+    let mut ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| scannable(m))
+        .map(|m| m.id)
+        .collect();
+    ids.push(virtual_id);
+    let rows: Vec<(Uuid, bool, String, bool, String)> = match sqlx::query_as(
+        r#"SELECT repository_id, scan_on_proxy, proxy_scan_action,
+                  block_on_policy_violation, severity_threshold
+           FROM scan_configs WHERE repository_id = ANY($1)"#,
+    )
+    .bind(&ids)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                virtual_id = %virtual_id, error = %e,
+                "could not read member scan-on-proxy configs; failing the walk closed"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "scan-on-proxy configuration is temporarily unreadable".to_string(),
+            )
+            .into_response());
+        }
+    };
+    let config = |id: Uuid| {
+        rows.iter()
+            .find(|row| row.0 == id)
+            .map(|(_, enabled, action, block, threshold)| {
+                (
+                    *enabled,
+                    ProxyScanAction::from_db(action),
+                    ProxySeverityGate::from_config(*block, threshold),
+                )
+            })
+            .unwrap_or((
+                false,
+                ProxyScanAction::FailOpen,
+                ProxySeverityGate::BlockOnAny,
+            ))
+    };
+    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
+    Ok(members
+        .iter()
+        .map(|member| {
+            if !scannable(member) {
+                return None;
+            }
+            let (member_enabled, member_action, member_gate) = config(member.id);
+            let (enabled, action) = stricter_scan_policy(
+                virtual_enabled,
+                virtual_action,
+                member_enabled,
+                member_action,
+            );
+            enabled.then(|| {
+                (
+                    action,
+                    ProxySeverityGate::stricter(virtual_gate, member_gate),
+                )
+            })
+        })
+        .collect())
+}
+
+/// A Virtual download walk with scan-on-proxy (#4100), over an
+/// already-authorized member list.
+///
+/// `None` when no member scans: the caller then takes its untouched resolver,
+/// so a virtual with scanning off everywhere sees no change. Otherwise members
+/// are walked in strict priority order. Each run of members that do not scan
+/// goes through `unscanned_run` (the caller's existing resolver over just
+/// that run; `None` is a miss), and each scanning Remote member through
+/// `scanned` (the format's [`serve_scanned_proxy_file`] call). A 403
+/// (vulnerable or a member's policy block), 409 (quarantine hold) or 423
+/// (inconclusive under fail-closed) from a scanning member is that member's
+/// verdict on bytes it holds and ends the walk; any other failure falls
+/// through to the next member. So a lower-priority remote can never shadow a
+/// hosted copy, and no unscanned path ever serves a scanning member's bytes.
+pub(crate) async fn walk_virtual_members_with_scan<U, UFut, S, SFut>(
+    db: &PgPool,
+    virtual_id: Uuid,
+    members: Vec<Repository>,
+    mut unscanned_run: U,
+    mut scanned: S,
+) -> Option<Result<Response, Response>>
+where
+    U: FnMut(Vec<Repository>) -> UFut,
+    UFut: Future<Output = Option<Result<Response, Response>>>,
+    S: FnMut(
+        Repository,
+        (
+            crate::services::proxy_scan_service::ProxyScanAction,
+            crate::services::proxy_scan_service::ProxySeverityGate,
+        ),
+    ) -> SFut,
+    SFut: Future<Output = Result<Response, Response>>,
+{
+    let policies = match virtual_member_scan_policies(db, virtual_id, &members).await {
+        Ok(policies) => policies,
+        Err(resp) => return Some(Err(resp)),
+    };
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut unscanned = Vec::new();
+    for (member, policy) in members.into_iter().zip(policies) {
+        let Some(policy) = policy else {
+            unscanned.push(member);
+            continue;
+        };
+        let run = std::mem::take(&mut unscanned);
+        if !run.is_empty() {
+            if let Some(served) = unscanned_run(run).await {
+                return Some(served);
+            }
+        }
+        let member_key = member.key.clone();
+        match scanned(member, policy).await {
+            Ok(resp) => return Some(Ok(resp)),
+            Err(resp)
+                if is_member_policy_block_response(&resp)
+                    || resp.status() == StatusCode::LOCKED =>
+            {
+                return Some(Err(resp))
+            }
+            Err(resp) => {
+                tracing::debug!(
+                    member_key = %member_key, status = %resp.status(),
+                    "scanned virtual member did not serve; trying next member"
+                );
+            }
+        }
+    }
+    if !unscanned.is_empty() {
+        if let Some(served) = unscanned_run(unscanned).await {
+            return Some(served);
+        }
+    }
+    Some(Err(member_miss_response()))
+}
+
 /// #4098: the generic scan-on-proxy wrapper, driven through a fake format so
 /// the shared sequence is pinned independently of npm / PyPI / VS Code (whose
 /// own end-to-end suites prove the ports kept their behaviour).
@@ -8744,6 +8925,7 @@ mod scanned_proxy_file_tests {
             &self,
             _state: &crate::api::SharedState,
             _req: &ScannedProxyRequest<'_>,
+            _bytes: &Bytes,
         ) {
             self.after_fetch.fetch_add(1, Ordering::SeqCst);
         }
@@ -20359,6 +20541,44 @@ mod proxy_download_recording_tests {
                 "oci_v2.rs",
                 "handle_get_blob",
                 "enforce_blob_scan_reblock(",
+                1,
+            ),
+            // #4100: Maven (and Gradle) direct Remote arm + the Virtual walk.
+            (
+                "maven.rs",
+                "serve_artifact",
+                "serve_scanned_maven_archive(",
+                2,
+            ),
+            (
+                "maven.rs",
+                "serve_scanned_maven_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4100: sbt's Ivy route, direct Remote arm + the Virtual walk.
+            (
+                "sbt.rs",
+                "download_by_path",
+                "serve_scanned_sbt_archive(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "download_by_path",
+                "serve_scanned_sbt_virtual(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "serve_scanned_sbt_virtual",
+                "serve_scanned_sbt_archive(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "serve_scanned_sbt_archive",
+                "serve_scanned_proxy_file(",
                 1,
             ),
         ];

@@ -1355,6 +1355,11 @@ impl ScanWorkspace {
             // `info/index.json` before use and recorded as the scan's
             // `pin_identity`, and an empty catalog keeps failing closed.
             ComponentEcosystem::Conda => Ok(()),
+            // Maven (#4100): deliberately NO pin file either. The archive's
+            // own `pom.properties` — which the serve path has already checked
+            // agrees with the pin — is what the engine catalogs it from; see
+            // [`ComponentEcosystem::Maven`].
+            ComponentEcosystem::Maven => Ok(()),
         }
     }
 
@@ -2522,6 +2527,106 @@ fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &
             Some((name, version)) => pin_agrees_with(pin, &name, &version),
             None => false,
         },
+        ComponentEcosystem::Maven => {
+            let Some((group_id, artifact_id)) = pin.name.rsplit_once(':') else {
+                return false;
+            };
+            matches!(
+                maven_archive_claim(content, group_id, artifact_id),
+                MavenArchiveClaim::Declares { group_id: g, artifact_id: a, version: v }
+                    if g == group_id && a == artifact_id && pin_agrees_with(pin, &pin.name, &v)
+            )
+        }
+    }
+}
+
+/// Entry-count ceiling for [`maven_archive_claim`]. Far above the ingest
+/// readers' 10,000: ordinary JVM archives legitimately carry tens of thousands
+/// of class entries (an SDK bundle jar well over 100,000), and the archive is
+/// already buffered under the proxy scan byte cap, so the count only bounds
+/// the central-directory walk. Refusing a real jar here would read as
+/// "unreadable" and withhold it under fail-closed.
+const MAVEN_ARCHIVE_MAX_ENTRIES: u64 = 1_000_000;
+
+/// Read ceiling for the one `pom.properties` entry (a few hundred bytes in
+/// practice).
+const MAVEN_POM_PROPERTIES_MAX_BYTES: u64 = 64 * 1024;
+
+/// What a Maven-layout JVM archive says about ITSELF (#4100): the
+/// `META-INF/maven/<groupId>/<artifactId>/pom.properties` entry Maven's
+/// archiver writes for the project being packaged, which is also what syft's
+/// java-archive cataloger names the component from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MavenArchiveClaim {
+    /// The archive carries the requested coordinate's own `pom.properties`,
+    /// which declares this `(groupId, artifactId, version)`.
+    Declares {
+        group_id: String,
+        artifact_id: String,
+        version: String,
+    },
+    /// A readable archive with no `pom.properties` for the requested
+    /// `groupId:artifactId` — typical of Gradle- and sbt-built jars, which do
+    /// not write one. Nothing in the bytes names the coordinate.
+    Absent,
+    /// Not a readable ZIP (or over the bounded-reader caps), or the entry is
+    /// present but does not parse into all three fields.
+    Unreadable,
+}
+
+/// Read the requested coordinate's own `pom.properties` out of a JVM archive
+/// (#4100), through the shared bounded ZIP reader (unmatched entries are never
+/// inflated; the matched one is read under [`MAVEN_POM_PROPERTIES_MAX_BYTES`]).
+/// Only the EXACT entry for `group_id`/`artifact_id` is consulted: a shaded
+/// jar also carries the `pom.properties` of every dependency it bundles, and
+/// none of those says what the archive itself is.
+pub(crate) fn maven_archive_claim(
+    content: &Bytes,
+    group_id: &str,
+    artifact_id: &str,
+) -> MavenArchiveClaim {
+    let entry = format!("META-INF/maven/{group_id}/{artifact_id}/pom.properties");
+    let body = match bounded_archive::read_metadata_from_zip_limited(
+        std::io::Cursor::new(&content[..]),
+        |n| n == entry,
+        MAVEN_ARCHIVE_MAX_ENTRIES,
+        MAVEN_POM_PROPERTIES_MAX_BYTES,
+    ) {
+        Ok(Some(body)) => body,
+        Ok(None) => return MavenArchiveClaim::Absent,
+        Err(_) => return MavenArchiveClaim::Unreadable,
+    };
+    let Ok(text) = String::from_utf8(body) else {
+        return MavenArchiveClaim::Unreadable;
+    };
+    let (mut g, mut a, mut v) = (None, None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(['=', ':']) else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "groupId" => g = Some(value),
+            "artifactId" => a = Some(value),
+            "version" => v = Some(value),
+            _ => {}
+        }
+    }
+    match (g, a, v) {
+        (Some(group_id), Some(artifact_id), Some(version))
+            if !group_id.is_empty() && !artifact_id.is_empty() && !version.is_empty() =>
+        {
+            MavenArchiveClaim::Declares {
+                group_id,
+                artifact_id,
+                version,
+            }
+        }
+        _ => MavenArchiveClaim::Unreadable,
     }
 }
 
@@ -3934,6 +4039,20 @@ pub enum ComponentEcosystem {
     /// `format_expects_pin` answers honestly for conda and an untrustworthy
     /// pin downgrades the scan to PARTIAL.
     Conda,
+    /// Maven-layout JVM archive (`.jar` / `.war` / `.ear`), served through a
+    /// Maven or sbt proxy (#4100). The pin is the component identity only —
+    /// no pin file is written, because the archive catalogs ITSELF: syft's
+    /// java-archive cataloger reads the archive's own
+    /// `META-INF/maven/<groupId>/<artifactId>/pom.properties` and reports the
+    /// component as `artifactId@version` (the groupId goes in a separate
+    /// CycloneDX field). A written record would only duplicate that entry.
+    /// The serve path pins ONLY when that very `pom.properties` agrees with
+    /// the requested `groupId:artifactId:version`
+    /// ([`maven_archive_claim`]), so the assessment gate then demands the
+    /// engine actually graded the served coordinate. `name` is
+    /// `groupId:artifactId`; catalog matching compares the `artifactId` half
+    /// (see [`ExpectedComponent::normalize_name`]).
+    Maven,
 }
 
 /// The identity a proxied artifact is being SERVED AS — derived from the
@@ -3997,9 +4116,19 @@ impl ExpectedComponent {
     ///   on upload, so the fold only protects against a mixed-case registry
     ///   row; `-`, `_` and `.` are all distinct (`py-opencv` and `py_opencv`
     ///   are different packages on a channel).
+    /// * **Maven** — the `artifactId` half of `groupId:artifactId`, lowercased
+    ///   (#4100). syft's CycloneDX catalog names a jar by its `artifactId` and
+    ///   carries the groupId in a separate field the catalog side channel
+    ///   does not keep, so the comparable part of the pin is the artifactId.
+    ///   The groupId is still checked, against the archive's own
+    ///   `pom.properties`, before the pin is ever established.
     pub fn normalize_name(ecosystem: ComponentEcosystem, name: &str) -> String {
         let lower = name.trim().to_lowercase();
         match ecosystem {
+            ComponentEcosystem::Maven => match lower.rsplit_once(':') {
+                Some((_, artifact)) => artifact.to_string(),
+                None => lower,
+            },
             ComponentEcosystem::Npm
             | ComponentEcosystem::RubyGems
             | ComponentEcosystem::NuGet
@@ -4055,6 +4184,7 @@ impl ExpectedComponent {
             ComponentEcosystem::Cargo => "cargo",
             ComponentEcosystem::NuGet => "nuget",
             ComponentEcosystem::Conda => "conda",
+            ComponentEcosystem::Maven => "maven",
         };
         format!(
             "{}|{}|{}",
@@ -13815,6 +13945,88 @@ mod tests {
         ]))
     }
 
+    /// A Maven-built jar (#4100): a zip carrying the project's own
+    /// `META-INF/maven/<g>/<a>/pom.properties` beside a class file.
+    fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Bytes {
+        let props = format!(
+            "#Generated by Maven\nartifactId={artifact}\ngroupId={group}\nversion={version}\n"
+        );
+        Bytes::from(build_zip(&[
+            (
+                &format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+                props.into_bytes(),
+            ),
+            ("com/example/Lib.class", b"\xca\xfe\xba\xbe".to_vec()),
+        ]))
+    }
+
+    /// #4100: what a JVM archive says about itself is read from the
+    /// requested coordinate's OWN `pom.properties` only.
+    #[test]
+    fn test_maven_archive_claim() {
+        let jar = maven_jar_fixture("org.apache.logging.log4j", "log4j-core", "2.14.1");
+        assert_eq!(
+            maven_archive_claim(&jar, "org.apache.logging.log4j", "log4j-core"),
+            MavenArchiveClaim::Declares {
+                group_id: "org.apache.logging.log4j".into(),
+                artifact_id: "log4j-core".into(),
+                version: "2.14.1".into(),
+            }
+        );
+        // A shaded dependency's entry is not the archive's own: asking for a
+        // different coordinate finds nothing.
+        assert_eq!(
+            maven_archive_claim(&jar, "org.apache.logging.log4j", "log4j-api"),
+            MavenArchiveClaim::Absent
+        );
+        // A Gradle-built jar writes no pom.properties at all.
+        let gradle = Bytes::from(build_zip(&[(
+            "META-INF/MANIFEST.MF",
+            b"Manifest-Version: 1.0\n".to_vec(),
+        )]));
+        assert_eq!(
+            maven_archive_claim(&gradle, "com.squareup.okhttp3", "okhttp"),
+            MavenArchiveClaim::Absent
+        );
+        // Not an archive at all, and an entry missing a field.
+        assert_eq!(
+            maven_archive_claim(&Bytes::from_static(b"<html>"), "g", "a"),
+            MavenArchiveClaim::Unreadable
+        );
+        let partial = Bytes::from(build_zip(&[(
+            "META-INF/maven/g/a/pom.properties",
+            b"groupId=g\nartifactId=a\n".to_vec(),
+        )]));
+        assert_eq!(
+            maven_archive_claim(&partial, "g", "a"),
+            MavenArchiveClaim::Unreadable
+        );
+    }
+
+    /// #4100: a Maven pin names `groupId:artifactId`, but the engine's
+    /// CycloneDX catalog names a jar by its artifactId alone.
+    #[test]
+    fn test_maven_pin_matches_the_artifact_id_in_the_catalog() {
+        let pin = ExpectedComponent::new(
+            ComponentEcosystem::Maven,
+            "org.apache.logging.log4j:log4j-core",
+            "2.14.1",
+        );
+        assert!(pin.matches(&CatalogedComponent {
+            name: "log4j-core".into(),
+            version: "2.14.1".into(),
+        }));
+        assert!(!pin.matches(&CatalogedComponent {
+            name: "log4j-api".into(),
+            version: "2.14.1".into(),
+        }));
+        assert!(!pin.matches(&CatalogedComponent {
+            name: "log4j-core".into(),
+            version: "2.17.1".into(),
+        }));
+        assert_eq!(pin.pin_identity(), "maven|log4j-core|2.14.1");
+    }
+
     /// A conda v1 `.tar.bz2`: a bzip2 tar whose `info/index.json` declares the
     /// package's own `(name, version, build)` — the file the conda upload
     /// validator cross-checks the filename against, and the file
@@ -14041,6 +14253,13 @@ mod tests {
                 "numpy",
                 "1.26.4",
                 conda_v2_fixture("numpy", "1.26.4", "py312_0"),
+            ),
+            (
+                ComponentEcosystem::Maven,
+                "log4j-core-2.14.1.jar",
+                "org.apache.logging.log4j:log4j-core",
+                "2.14.1",
+                maven_jar_fixture("org.apache.logging.log4j", "log4j-core", "2.14.1"),
             ),
         ];
 
