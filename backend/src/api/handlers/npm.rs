@@ -5042,8 +5042,10 @@ impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
         &self,
         state: &SharedState,
         req: &proxy_helpers::ScannedProxyRequest<'_>,
-    ) {
+        _digest: &str,
+    ) -> Result<(), Response> {
         correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
+        Ok(())
     }
 
     async fn serve_unscanned_stream(

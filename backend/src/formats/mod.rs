@@ -271,7 +271,7 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 
 /// Core handler keys whose Remote/Virtual download path enforces the inline
 /// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
-/// through `proxy_helpers::serve_scanned_proxy_file` (npm, PyPI, VS Code) or,
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, npm, PyPI, VS Code) or,
 /// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
 ///
 /// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
@@ -280,7 +280,7 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// reads every format handler's source and fails when a handler reaches the
 /// gate without being listed here, or is listed without reaching it, so the
 /// capability cannot drift from the router. Adopting the gate in a new format
-/// (#4100 Maven, #4101 Cargo, #4102 NuGet, ...) adds its key here.
+/// (#4100 Maven, #4102 NuGet, ...) adds its key here.
 ///
 /// `enforced` is a per-FORMAT capability: the format's proxy path runs the
 /// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
@@ -288,7 +288,10 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
 /// the formats API carries no mode indicator: under `record_only` an
 /// `enforced` format still scans and records every pull, and serves it.
-pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &["npm", "oci", "pypi", "vscode"];
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "cargo", // #4101
+    "npm", "oci", "pypi", "vscode",
+];
 
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
 pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {

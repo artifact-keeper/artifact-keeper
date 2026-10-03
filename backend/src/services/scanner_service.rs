@@ -2492,7 +2492,11 @@ pub(crate) fn python_requirements_pin(name: &str, version: &str) -> String {
 /// bombs and already under test, so this adds a call and no parsing. Bytes
 /// that are not a readable package of that kind at all fail closed the same
 /// way a mismatch does: the caller drops the pin and records the scan PARTIAL.
-fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &str) -> bool {
+pub(crate) fn pin_agrees_with_content(
+    content: &Bytes,
+    pin: &ExpectedComponent,
+    filename: &str,
+) -> bool {
     use crate::formats::cargo::CargoHandler;
     use crate::formats::nuget::NugetHandler;
     use crate::formats::rubygems::RubygemsHandler;
