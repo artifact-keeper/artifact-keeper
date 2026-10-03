@@ -81,6 +81,7 @@ fn test_config(storage_path: &str) -> Config {
         expose_detailed_health: false,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
+        terraform_default_repo: None,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,

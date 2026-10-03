@@ -97,6 +97,11 @@ pub struct GuestAccessState {
 /// (#3854). An OCI client still learns where to authenticate, because the
 /// refusal it gets carries the token-endpoint challenge; see the module docs.
 ///
+/// `/.well-known/terraform.json` is exempt because Terraform/OpenTofu fetch
+/// host-level service discovery before they can attach credentials; it only
+/// names the registry mount point (and 404s unless `TERRAFORM_DEFAULT_REPO` is
+/// set). The registry endpoints it points at remain gated.
+///
 /// `/v2/token` is the one OCI entry, and it is not a carve-out for anonymity:
 /// it is the endpoint by which credentials are *obtained*, the OCI analogue of
 /// `/api/v1/auth/login` above, and the anonymous mint is refused inside the
@@ -117,6 +122,7 @@ fn is_allowlisted(path: &str) -> bool {
             | "/livez"
             | "/api/v1/system/config"
             | "/v2/token"
+            | "/.well-known/terraform.json"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")
@@ -312,6 +318,19 @@ mod tests {
         for p in ["/health", "/healthz", "/ready", "/readyz", "/livez"] {
             assert!(is_allowlisted(p), "{} should be allowlisted", p);
         }
+    }
+
+    #[test]
+    fn allowlist_terraform_host_discovery_exact_only() {
+        // Registry clients fetch host-level discovery before they can send
+        // credentials; the document only names the registry mount point.
+        assert!(is_allowlisted("/.well-known/terraform.json"));
+        assert!(!is_allowlisted("/.well-known/terraform.json/"));
+        assert!(!is_allowlisted("/.well-known/terraform.jsonx"));
+        assert!(!is_allowlisted("/.well-known/other.json"));
+        assert!(!is_allowlisted(
+            "/terraform/repo/.well-known/terraform.json"
+        ));
     }
 
     #[test]
