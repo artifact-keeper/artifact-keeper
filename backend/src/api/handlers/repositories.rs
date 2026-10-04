@@ -23,6 +23,9 @@ use crate::api::dto::Pagination;
 // is a drop-in replacement on response types too.
 use crate::api::extractors::Json;
 use crate::api::handlers::is_replication_request;
+use crate::api::handlers::last_promotion::{
+    fetch_last_promotions, latest_promotion, LastPromotion,
+};
 use crate::api::handlers::projects;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
@@ -1276,6 +1279,12 @@ pub struct RepositoryResponse {
     pub name: String,
     pub description: Option<String>,
     pub format: String,
+    /// Plugin format key for a WASM-plugin-backed repository (#3070). Such a
+    /// repository is stored as `format = "generic"` plus this key, so it is the
+    /// only way to tell it apart from a plain generic one. Omitted when the
+    /// repository uses the built-in handler for `format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_key: Option<String>,
     pub repo_type: String,
     /// Baseline read audience: `public`, `internal`, or `private`. This is the
     /// authoritative field; read it rather than `is_public`, which cannot
@@ -1441,6 +1450,10 @@ fn repo_to_response(
         name: repo.name,
         description: repo.description,
         format: repo.format.as_key().to_string(),
+        // db-less: `repositories.format_key` is not on the model; the
+        // single-repo handlers fill it via `with_row_presence_fields` and the
+        // listing from its batch query (#3070).
+        format_key: None,
         repo_type: repo.repo_type.as_str().to_string(),
         visibility: repo.visibility,
         allow_anonymous_access: repo.is_public,
@@ -1451,7 +1464,7 @@ fn repo_to_response(
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
-        // db-less: single-repo handlers overwrite this via `with_trusted_gpg_key`
+        // db-less: single-repo handlers overwrite this via `with_row_presence_fields`
         // and the listing sets it from a batch presence query (#2568).
         has_trusted_gpg_key: false,
         upstream_url: repo.upstream_url,
@@ -1807,21 +1820,36 @@ fn validate_trusted_gpg_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Populate `RepositoryResponse.has_trusted_gpg_key` from the repositories row
-/// (#2568). Split out like `with_custom_user_agent` so only handlers with a DB
-/// handle read the column back; the key material is never returned.
-async fn with_trusted_gpg_key(
+/// The `format_key` to expose for a repository whose built-in format key is
+/// `builtin_key` (#3070): the stored key only when it names a different
+/// handler, i.e. a WASM plugin. A NULL, blank, or redundant (equal to the
+/// built-in) stored key yields `None` so plain repositories omit the field.
+fn custom_format_key(builtin_key: &str, stored: Option<String>) -> Option<String> {
+    stored.filter(|k| {
+        let k = k.trim();
+        !k.is_empty() && !k.eq_ignore_ascii_case(builtin_key)
+    })
+}
+
+/// Populate the `RepositoryResponse` fields read straight off the repositories
+/// row but absent from the model: `has_trusted_gpg_key` (#2568; only the
+/// presence, the key material is never returned) and `format_key` (#3070).
+/// Split out like `with_custom_user_agent` so only handlers with a DB handle
+/// read the columns back.
+async fn with_row_presence_fields(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
-    let present: std::result::Result<Option<bool>, _> =
-        sqlx::query_scalar("SELECT trusted_gpg_key IS NOT NULL FROM repositories WHERE id = $1")
-            .bind(repo_id)
-            .fetch_optional(db)
-            .await;
-    if let Ok(Some(has_key)) = present {
+    let row: std::result::Result<Option<(bool, Option<String>)>, _> = sqlx::query_as(
+        "SELECT trusted_gpg_key IS NOT NULL, format_key FROM repositories WHERE id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await;
+    if let Ok(Some((has_key, format_key))) = row {
         response.has_trusted_gpg_key = has_key;
+        response.format_key = custom_format_key(&response.format, format_key);
     }
     response
 }
@@ -3075,31 +3103,35 @@ pub async fn list_repositories(
         );
     }
 
-    // Batch fetch which repos have a trusted GPG key configured (#2568) so the
-    // listing reports `has_trusted_gpg_key` accurately without an N+1. The key
-    // material is never selected — only its presence.
-    let gpg_key_ids: std::collections::HashSet<Uuid> = if !repo_ids.is_empty() {
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM repositories WHERE id = ANY($1) AND trusted_gpg_key IS NOT NULL",
-        )
-        .bind(&repo_ids)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .into_iter()
-        .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // Batch fetch which repos have a trusted GPG key configured (#2568) and
+    // any plugin `format_key` (#3070) so the listing reports both without an
+    // N+1. The key material is never selected — only its presence.
+    let row_fields: std::collections::HashMap<Uuid, (bool, Option<String>)> =
+        if !repo_ids.is_empty() {
+            sqlx::query_as::<_, (Uuid, bool, Option<String>)>(
+                "SELECT id, trusted_gpg_key IS NOT NULL, format_key FROM repositories \
+                 WHERE id = ANY($1) AND (trusted_gpg_key IS NOT NULL OR format_key IS NOT NULL)",
+            )
+            .bind(&repo_ids)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|(id, has_gpg, format_key)| (id, (has_gpg, format_key)))
+            .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
             let storage = storage_map.get(&r.id).copied().unwrap_or(0);
-            let has_gpg = gpg_key_ids.contains(&r.id);
+            let (has_gpg, format_key) = row_fields.get(&r.id).cloned().unwrap_or_default();
             let mut resp = repo_to_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
+            resp.format_key = custom_format_key(&resp.format, format_key);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
@@ -3655,7 +3687,7 @@ pub async fn create_repository(
     .await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -3719,7 +3751,7 @@ pub async fn get_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -4677,7 +4709,7 @@ pub async fn update_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -5531,6 +5563,11 @@ pub struct ArtifactResponse {
     /// (listings, historical revisions). The per-artifact metadata endpoint
     /// populates it.
     pub origin: Option<crate::services::artifact_origin::ArtifactOrigin>,
+    /// The most recent successful promotion of this artifact out of its
+    /// repository (#1758), derived from `promotion_history` rows with status
+    /// `promoted` (rejected and pending attempts never count). Always
+    /// serialized; `null` when the artifact was never promoted.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -5606,6 +5643,9 @@ pub struct DockerTagResponse {
     ///   `completed` label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_status: Option<String>,
+    /// The most recent successful promotion of this tag's manifest artifact
+    /// (#1758); same contract as `ArtifactResponse.last_promotion`.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 /// A Maven component grouped by GAV (groupId, artifactId, version).
@@ -5634,6 +5674,10 @@ pub struct MavenComponentResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Individual filenames belonging to this component.
     pub artifact_files: Vec<String>,
+    /// The most recent successful promotion of any file in this component
+    /// (#1758); same contract as `ArtifactResponse.last_promotion`. `null`
+    /// when no file of the component was ever promoted.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 /// List artifacts in repository
@@ -5913,6 +5957,14 @@ pub async fn list_artifacts(
     // names in one batched lookup, so the UI can render "uploaded by <name>"
     // without an admin-only per-artifact user fetch.
     resolve_uploader_usernames(&state.db, &mut items).await;
+    // #1758: stamp each row's latest promotion in one batched lookup.
+    let promotions = fetch_last_promotions(&state.db, &artifact_ids, auth.as_ref()).await;
+    apply_last_promotions(
+        &mut items,
+        &promotions,
+        |i| i.id,
+        |i, p| i.last_promotion = p,
+    );
 
     Ok(Json(ArtifactListResponse {
         items,
@@ -6235,6 +6287,7 @@ fn build_catalog_artifact_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6360,6 +6413,7 @@ fn build_cached_artifact_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6572,6 +6626,7 @@ fn build_artifact_response(
         quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
         quarantine_until: artifact.quarantine_until,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6637,6 +6692,21 @@ async fn resolve_uploader_usernames(db: &sqlx::PgPool, items: &mut [ArtifactResp
     apply_uploader_usernames(items, &usernames);
 }
 
+/// Stamp each listing row with its artifact's latest promotion (#1758), keyed
+/// by `id_of`. Generic over the row type so the flat listing and the Docker
+/// tag grouping share one implementation.
+fn apply_last_promotions<T>(
+    items: &mut [T],
+    promotions: &std::collections::HashMap<Uuid, LastPromotion>,
+    id_of: impl Fn(&T) -> Uuid,
+    set: impl Fn(&mut T, Option<LastPromotion>),
+) {
+    for item in items.iter_mut() {
+        let promotion = promotions.get(&id_of(item)).cloned();
+        set(item, promotion);
+    }
+}
+
 /// Build `ArtifactResponse` rows for each Maven secondary file recorded
 /// under a single primary artifact (#1092).
 ///
@@ -6695,6 +6765,7 @@ fn expand_maven_secondary_files(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin: None,
+            last_promotion: None,
         });
     }
     out
@@ -6957,6 +7028,8 @@ async fn list_artifacts_grouped_by_maven_component(
 
     let components = build_maven_components_for_keys(
         artifact_service,
+        &state.db,
+        auth,
         &repo_ids,
         repo_key,
         repo.format.as_key(),
@@ -7128,6 +7201,8 @@ fn maven_component_path_prefix(name: &str, version: &str) -> Option<String> {
 /// the key filter, so the page contents stay exactly the catalog page.
 async fn build_maven_components_for_keys(
     artifact_service: &ArtifactService,
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
     repo_ids: &[Uuid],
     repo_key: &str,
     format: &str,
@@ -7150,7 +7225,11 @@ async fn build_maven_components_for_keys(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
-    let grouped = group_maven_artifacts(&artifacts, &download_counts, repo_key, format);
+    // #1758: a component reports the latest promotion of any of its files.
+    let promotions = fetch_last_promotions(db, &artifact_ids, auth).await;
+
+    let grouped =
+        group_maven_artifacts(&artifacts, &download_counts, &promotions, repo_key, format);
     Ok(order_components_by_keys(grouped, keys))
 }
 
@@ -7440,6 +7519,7 @@ async fn maven_components_from_catalog(
             // this in from the proxy cache catalog for just the page it keeps
             // (`populate_remote_component_files`, #3270).
             artifact_files: Vec::new(),
+            last_promotion: None,
         });
     }
 
@@ -7500,6 +7580,7 @@ struct GavKey {
 fn group_maven_artifacts(
     artifacts: &[crate::models::artifact::Artifact],
     download_counts: &std::collections::HashMap<Uuid, i64>,
+    promotions: &std::collections::HashMap<Uuid, LastPromotion>,
     repo_key: &str,
     format: &str,
 ) -> Vec<MavenComponentResponse> {
@@ -7525,6 +7606,7 @@ fn group_maven_artifacts(
             .to_string();
 
         let downloads = *download_counts.get(&artifact.id).unwrap_or(&0);
+        let promotion = promotions.get(&artifact.id);
 
         groups
             .entry(key)
@@ -7535,6 +7617,7 @@ fn group_maven_artifacts(
                     comp.created_at = artifact.created_at;
                 }
                 comp.artifact_files.push(filename.clone());
+                comp.last_promotion = latest_promotion(comp.last_promotion.take(), promotion);
             })
             .or_insert_with(|| MavenComponentResponse {
                 id: artifact.id,
@@ -7547,6 +7630,7 @@ fn group_maven_artifacts(
                 download_count: downloads,
                 created_at: artifact.created_at,
                 artifact_files: vec![filename],
+                last_promotion: promotion.cloned(),
             });
     }
 
@@ -7694,10 +7778,19 @@ async fn list_artifacts_grouped_by_docker_tag(
 
     // Rows arrive in (image, tag) order straight from the keyset index; no
     // in-memory re-sort or slicing is needed.
-    let docker_tags: Vec<DockerTagResponse> = rows
+    let mut docker_tags: Vec<DockerTagResponse> = rows
         .into_iter()
         .map(|row| build_docker_tag_response(row, repo_key, &child_sizes))
         .collect();
+    // #1758: a tag reports its manifest artifact's latest promotion.
+    let manifest_ids: Vec<Uuid> = docker_tags.iter().map(|t| t.id).collect();
+    let promotions = fetch_last_promotions(&state.db, &manifest_ids, auth).await;
+    apply_last_promotions(
+        &mut docker_tags,
+        &promotions,
+        |t| t.id,
+        |t, p| t.last_promotion = p,
+    );
 
     let exact_total = if count_exact {
         Some(count_docker_tag_rows(&state.db, &repo_ids, search_query).await?)
@@ -8099,6 +8192,7 @@ fn build_docker_tag_response(
         is_index,
         last_pushed_at: row.last_pushed_at,
         scan_status: row.scan_status,
+        last_promotion: None,
     }
 }
 
@@ -8264,6 +8358,9 @@ pub async fn get_artifact_metadata(
                 .map_err(|e| AppError::Database(e.to_string()))?
                 .flatten()
                 .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v));
+        let last_promotion = fetch_last_promotions(&state.db, &[artifact.id], auth.as_ref())
+            .await
+            .remove(&artifact.id);
 
         return Ok(Json(ArtifactResponse {
             id: artifact.id,
@@ -8291,6 +8388,7 @@ pub async fn get_artifact_metadata(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin,
+            last_promotion,
         })
         .into_response());
     }
@@ -8427,6 +8525,7 @@ fn artifact_version_to_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -8966,6 +9065,7 @@ async fn persist_generic_staged_upload(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin: None,
+            last_promotion: None,
         }),
     )
         .into_response())
@@ -11595,6 +11695,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ArtifactVersionListResponse,
         MavenComponentResponse,
         DockerTagResponse,
+        LastPromotion,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -12714,6 +12815,7 @@ mod tests {
             download_count: 0,
             created_at: chrono::Utc::now(),
             artifact_files: Vec::new(),
+            last_promotion: None,
         }
     }
 
@@ -12974,6 +13076,7 @@ mod tests {
             quarantine_status: NOT_QUARANTINED.to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         }
     }
 
@@ -14185,6 +14288,31 @@ mod tests {
     /// Asserts the real stored value survives, not just that a field exists:
     /// a hardcoded `"filesystem"` would pass a presence-only check while
     /// still lying about every object-storage repository.
+    /// #3070: only a stored key naming a different handler is exposed.
+    #[test]
+    fn custom_format_key_only_surfaces_plugin_keys() {
+        assert_eq!(
+            custom_format_key("generic", Some("rpm-custom".into())),
+            Some("rpm-custom".to_string())
+        );
+        assert_eq!(custom_format_key("generic", None), None);
+        assert_eq!(custom_format_key("maven", Some("maven".into())), None);
+        assert_eq!(custom_format_key("maven", Some("MAVEN".into())), None);
+        assert_eq!(custom_format_key("generic", Some("  ".into())), None);
+    }
+
+    /// #3070: `repo_to_response` is db-less, so the field starts absent and
+    /// is skipped on the wire until a handler fills it.
+    #[test]
+    fn repository_response_omits_absent_format_key() {
+        let mut resp = repo_to_response(sample_repo(), 0);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("format_key").is_none());
+        resp.format_key = Some("pypi-custom".into());
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["format_key"], "pypi-custom");
+    }
+
     #[test]
     fn repository_response_echoes_the_stored_storage_backend() {
         for backend in ["filesystem", "s3", "azure", "gcs"] {
@@ -14609,6 +14737,7 @@ mod tests {
             name: "My Repo".to_string(),
             description: Some("desc".to_string()),
             format: "maven".to_string(),
+            format_key: None,
             repo_type: "local".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
@@ -14778,7 +14907,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "maven-central",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         let comp = &result[0];
@@ -14826,7 +14961,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "maven-central",
+            "maven",
+        );
 
         assert_eq!(result.len(), 2);
         // BTreeMap ordering: "com.google.guava" < "org.junit.jupiter"
@@ -14857,7 +14998,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, "1.0.0");
@@ -14876,7 +15023,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].artifact_id, "lib");
@@ -14895,17 +15048,87 @@ mod tests {
         downloads.insert(a1.id, 100);
         downloads.insert(a2.id, 25);
 
-        let result = group_maven_artifacts(&[a1, a2], &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &[a1, a2],
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].download_count, 125);
         assert_eq!(result[0].size_bytes, 10_500);
     }
 
+    /// #1758: a component reports the newest promotion among its files, and a
+    /// component with no promoted file reports none.
+    #[test]
+    fn test_group_maven_artifacts_folds_latest_promotion() {
+        let jar = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.jar", "lib-1.0.0.jar", 10);
+        let pom = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.pom", "lib-1.0.0.pom", 5);
+        let other = maven_artifact("org/example/other/2.0/other-2.0.jar", "other-2.0.jar", 1);
+        let promo = |at: i64, key: &str| LastPromotion {
+            target_repo_key: Some(key.to_string()),
+            promoted_at: chrono::DateTime::from_timestamp(at, 0).unwrap(),
+            status: "promoted".to_string(),
+        };
+        let mut promotions = std::collections::HashMap::new();
+        promotions.insert(jar.id, promo(100, "old-release"));
+        promotions.insert(pom.id, promo(200, "release"));
+
+        let result = group_maven_artifacts(
+            &[jar, pom, other],
+            &std::collections::HashMap::new(),
+            &promotions,
+            "staging",
+            "maven",
+        );
+        let lib = result.iter().find(|c| c.artifact_id == "lib").unwrap();
+        let other = result.iter().find(|c| c.artifact_id == "other").unwrap();
+        assert_eq!(lib.last_promotion, Some(promo(200, "release")));
+        assert_eq!(other.last_promotion, None);
+    }
+
+    /// #1758: rows are stamped by id; an unpromoted row is cleared to `None`.
+    #[test]
+    fn test_apply_last_promotions_by_id() {
+        let mut items = vec![
+            sample_artifact_response("a.txt", "a"),
+            sample_artifact_response("b.txt", "b"),
+        ];
+        items[1].last_promotion = Some(LastPromotion {
+            target_repo_key: None,
+            promoted_at: chrono::Utc::now(),
+            status: "promoted".to_string(),
+        });
+        let promoted = LastPromotion {
+            target_repo_key: Some("release".to_string()),
+            promoted_at: chrono::Utc::now(),
+            status: "promoted".to_string(),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(items[0].id, promoted.clone());
+        apply_last_promotions(&mut items, &map, |i| i.id, |i, p| i.last_promotion = p);
+        assert_eq!(items[0].last_promotion, Some(promoted));
+        assert_eq!(items[1].last_promotion, None);
+        let json = serde_json::to_value(&items[1]).unwrap();
+        assert!(
+            json["last_promotion"].is_null(),
+            "never-promoted serializes as null"
+        );
+    }
+
     #[test]
     fn test_group_maven_artifacts_empty_input() {
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&[], &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &[],
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
         assert!(result.is_empty());
     }
 
@@ -14925,6 +15148,7 @@ mod tests {
                 "junit-jupiter-api-5.11.0.jar".to_string(),
                 "junit-jupiter-api-5.11.0.pom".to_string(),
             ],
+            last_promotion: None,
         };
         let json = serde_json::to_string(&comp).unwrap();
         assert!(json.contains("\"group_id\":\"org.junit.jupiter\""));
@@ -14968,6 +15192,7 @@ mod tests {
             download_count: 0,
             created_at: chrono::Utc::now(),
             artifact_files: vec!["mylib-1.0.0.jar".to_string()],
+            last_promotion: None,
         };
         let resp = ArtifactListResponse {
             items: vec![],
@@ -15000,6 +15225,7 @@ mod tests {
             is_index: false,
             last_pushed_at: chrono::Utc::now(),
             scan_status: Some("completed".to_string()),
+            last_promotion: None,
         };
         let resp = ArtifactListResponse {
             items: vec![],
@@ -15322,6 +15548,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
@@ -15415,6 +15642,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
@@ -15919,6 +16147,7 @@ mod tests {
             name: "npm-age".to_string(),
             description: None,
             format: "npm".to_string(),
+            format_key: None,
             repo_type: "remote".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
@@ -25507,8 +25736,58 @@ mod tests {
             "plugin-backed repo must be stored as Generic format"
         );
 
-        // Verify the format_key was persisted to the DB (RepositoryResponse does
-        // not expose format_key directly).
+        // A plain generic repository alongside it, to pin that the field is
+        // omitted when no plugin key is in play (#3070).
+        let plain_key = format!("plain-generic-{}", Uuid::new_v4().simple());
+        let Json(plain_resp) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            make_create_request(&plain_key, "plain", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("create plain generic repo");
+
+        // #3070: the plugin key is echoed on create, GET and the listing.
+        let auth = Extension(Some(admin_auth(user_id, &username)));
+        let Json(got) = get_repository(State(state.clone()), auth.clone(), Path(repo_key.clone()))
+            .await
+            .expect("get plugin repo");
+        let Json(got_plain) =
+            get_repository(State(state.clone()), auth.clone(), Path(plain_key.clone()))
+                .await
+                .expect("get plain repo");
+        let list_query = |q: &str| ListRepositoriesQuery {
+            page: Some(1),
+            per_page: Some(100),
+            format: None,
+            repo_type: None,
+            q: Some(q.to_string()),
+            project: None,
+        };
+        let Json(listed) = list_repositories(
+            State(state.clone()),
+            auth.clone(),
+            Query(list_query(&repo_key)),
+        )
+        .await
+        .expect("list plugin repo");
+        let Json(listed_plain) =
+            list_repositories(State(state.clone()), auth, Query(list_query(&plain_key)))
+                .await
+                .expect("list plain repo");
+        let listed_fk = listed
+            .items
+            .iter()
+            .find(|r| r.key == repo_key)
+            .map(|r| r.format_key.clone());
+        let listed_plain_fk = listed_plain
+            .items
+            .iter()
+            .find(|r| r.key == plain_key)
+            .map(|r| r.format_key.clone());
+        let plain_json = serde_json::to_value(&got_plain).expect("serialize");
+
+        // Verify the format_key was persisted to the DB.
         let stored: Option<String> =
             sqlx::query_scalar("SELECT format_key FROM repositories WHERE key = $1")
                 .bind(&repo_key)
@@ -25517,8 +25796,8 @@ mod tests {
                 .expect("query format_key");
 
         // Cleanup after reading so we don't delete the row before asserting.
-        sqlx::query("DELETE FROM repositories WHERE key = $1")
-            .bind(&repo_key)
+        sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![repo_key.clone(), plain_key.clone()])
             .execute(&pool)
             .await
             .ok();
@@ -25534,6 +25813,16 @@ mod tests {
             stored.as_deref(),
             Some(format_key.as_str()),
             "plugin format key must be persisted to the repositories.format_key column"
+        );
+        assert_eq!(resp.format_key.as_deref(), Some(format_key.as_str()));
+        assert_eq!(got.format_key.as_deref(), Some(format_key.as_str()));
+        assert_eq!(listed_fk, Some(Some(format_key.clone())));
+        assert_eq!(plain_resp.format_key, None);
+        assert_eq!(got_plain.format_key, None);
+        assert_eq!(listed_plain_fk, Some(None));
+        assert!(
+            plain_json.get("format_key").is_none(),
+            "a plain generic repository must omit format_key entirely"
         );
     }
 
@@ -26319,6 +26608,7 @@ mod tests {
             name: "ua-serde".to_string(),
             description: None,
             format: "maven".to_string(),
+            format_key: None,
             repo_type: "remote".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,

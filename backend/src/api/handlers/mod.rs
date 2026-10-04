@@ -341,6 +341,7 @@ pub mod huggingface;
 pub mod image_builds;
 pub mod incus;
 pub mod jetbrains;
+pub mod last_promotion;
 pub mod lifecycle;
 pub mod maven;
 pub mod maven_proxy;

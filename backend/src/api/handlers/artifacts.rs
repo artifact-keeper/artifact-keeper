@@ -248,6 +248,15 @@ pub async fn get_artifact(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // #1758: the latest successful promotion, same contract as the listing.
+    let last_promotion = crate::api::handlers::last_promotion::fetch_last_promotions(
+        &state.db,
+        &[id],
+        auth.as_ref(),
+    )
+    .await
+    .remove(&id);
+
     Ok(Json(ArtifactResponse {
         id: artifact.id,
         repository_key: artifact.repository_key,
@@ -285,6 +294,7 @@ pub async fn get_artifact(
         origin: artifact
             .origin
             .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v)),
+        last_promotion,
     }))
 }
 
@@ -452,6 +462,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         }
     }
 
