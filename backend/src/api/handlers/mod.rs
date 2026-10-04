@@ -2255,7 +2255,16 @@ mod raw_error_body_class_tests {
     /// #3718's storage and IO wordings for the same class. `I/O error: {` is
     /// preventive — `upload.rs` answers a constant `"I/O error"` today — so the
     /// gate covers the spelling a future site is as likely to reach for.
-    const STORAGE_NEEDLES: &[&str] = &["\"Storage error: {", "\"IO error: {", "\"I/O error: {"];
+    ///
+    /// #3907 adds the two wordings the detailed health payload used for the
+    /// filesystem probe, which interpolated the same `std::io::Error`.
+    const STORAGE_NEEDLES: &[&str] = &[
+        "\"Storage error: {",
+        "\"IO error: {",
+        "\"I/O error: {",
+        "\"Storage path not accessible: {",
+        "\"Storage write failed: {",
+    ];
 
     /// `AppError` variants whose [`crate::error::AppError::user_message`] is a
     /// fixed string, so a `format!` passed to them never reaches a client. The
@@ -2642,6 +2651,16 @@ mod raw_error_body_class_tests {
         assert!(carries_a_needle(r#"    &format!("Storage error: {}", e),"#));
         assert!(carries_a_needle(r#"    format!("IO error: {e}"),"#));
         assert!(carries_a_needle(r#"    format!("I/O error: {}", e),"#));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage path not accessible: {}", e)),"#
+        ));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage write failed: {e}")),"#
+        ));
+        // #3907's replacement names the step without interpolating.
+        assert!(!carries_a_needle(
+            r#"    Err(e) => unhealthy_filesystem_storage("Storage write failed", &e),"#
+        ));
         // The sweep's own replacements must NOT read as offenders.
         assert!(!carries_a_needle(
             r#"    crate::api::handlers::storage_err_message(&e),"#

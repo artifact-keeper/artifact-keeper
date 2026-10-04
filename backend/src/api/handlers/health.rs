@@ -722,6 +722,23 @@ async fn probe_ldap_health(db: &sqlx::PgPool, config: &crate::config::Config) ->
 ///
 /// S3, GCS, Azure: perform a real API call via the storage backend's
 /// `health_check()` method, with a 5-second timeout.
+/// Unhealthy filesystem-storage status that names the failed step but not the
+/// error (#3907).
+///
+/// The `std::io::Error` behind a failed `canonicalize` or probe write carries
+/// the OS error text, and the step itself runs against the configured storage
+/// path, so echoing it into the detailed health payload is the same leak class
+/// #3718 closed for format handlers. The fixed `message` is enough for a probe
+/// consumer to tell the two failure modes apart; the raw error goes to the
+/// server log, at warn because a failing probe repeats on every health poll.
+fn unhealthy_filesystem_storage(message: &'static str, error: &std::io::Error) -> CheckStatus {
+    tracing::warn!(error = %error, check = "storage", "{message}");
+    CheckStatus {
+        status: STATUS_UNHEALTHY.to_string(),
+        message: Some(message.to_string()),
+    }
+}
+
 async fn probe_storage_health(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
@@ -732,12 +749,7 @@ async fn probe_storage_health(
             // canonicalize and verify the probe stays under the base dir.
             let storage_base = match std::path::Path::new(&config.storage_path).canonicalize() {
                 Ok(p) => p,
-                Err(e) => {
-                    return CheckStatus {
-                        status: STATUS_UNHEALTHY.to_string(),
-                        message: Some(format!("Storage path not accessible: {}", e)),
-                    };
-                }
+                Err(e) => return unhealthy_filesystem_storage("Storage path not accessible", &e),
             };
             // Unique per-call probe filename so concurrent /health requests
             // never share a file (which previously caused spurious 503s).
@@ -760,10 +772,7 @@ async fn probe_storage_health(
                         message: None,
                     }
                 }
-                Err(e) => CheckStatus {
-                    status: STATUS_UNHEALTHY.to_string(),
-                    message: Some(format!("Storage write failed: {}", e)),
-                },
+                Err(e) => unhealthy_filesystem_storage("Storage write failed", &e),
             }
         }
         "s3" | "gcs" | "azure" => {
@@ -1710,15 +1719,29 @@ mod tests {
         std::fs::set_permissions(dir.path(), restore).unwrap();
 
         assert_eq!(status.status, STATUS_UNHEALTHY);
-        assert!(
-            status
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Storage write failed"),
-            "unexpected message: {:?}",
-            status.message
-        );
+        // #3907: the fixed wording only, with neither the OS error text nor
+        // the storage path that the raw `std::io::Error` would have carried.
+        assert_eq!(status.message.as_deref(), Some("Storage write failed"));
+    }
+
+    /// #3907: a storage path that cannot be canonicalized reports unhealthy
+    /// with a fixed message. The raw error names the configured path and the
+    /// OS error (`No such file or directory`), neither of which may reach the
+    /// detailed health payload.
+    #[tokio::test]
+    async fn test_probe_storage_health_filesystem_missing_path_does_not_echo_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("secret-internal-mount");
+        let config = fs_config(&missing);
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+
+        let status = probe_storage_health(&config, &storage).await;
+
+        assert_eq!(status.status, STATUS_UNHEALTHY);
+        let message = status.message.unwrap_or_default();
+        assert_eq!(message, "Storage path not accessible");
+        assert!(!message.contains("secret-internal-mount"));
+        assert!(!message.contains("No such file"));
     }
 
     /// Regression guard for #2019: 40 concurrent filesystem probes against the
