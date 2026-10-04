@@ -13,6 +13,7 @@
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
 //! * `/api/v1/banners`             active maintenance banners (#2155)
+//! * `/api/v1/webhooks/jwks`       public keys webhook receivers verify with
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -105,6 +106,11 @@ pub struct GuestAccessState {
 /// (#3854). An OCI client still learns where to authenticate, because the
 /// refusal it gets carries the token-endpoint challenge; see the module docs.
 ///
+/// `/api/v1/webhooks/jwks` (#921) serves only public keys: webhook
+/// receivers hold no Artifact Keeper credentials and must still be able to
+/// verify `v2=` signatures. Exact match; the rest of `/api/v1/webhooks`
+/// stays gated.
+///
 /// `/v2/token` is the one OCI entry, and it is not a carve-out for anonymity:
 /// it is the endpoint by which credentials are *obtained*, the OCI analogue of
 /// `/api/v1/auth/login` above, and the anonymous mint is refused inside the
@@ -125,6 +131,7 @@ fn is_allowlisted(path: &str) -> bool {
             | "/livez"
             | "/api/v1/system/config"
             | "/api/v1/banners"
+            | "/api/v1/webhooks/jwks"
             | "/v2/token"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
@@ -409,6 +416,17 @@ mod tests {
                 "{p} must not ride the /v2/token entry into the allowlist"
             );
         }
+    }
+
+    #[test]
+    fn allowlist_webhook_jwks_is_exact() {
+        assert!(is_allowlisted("/api/v1/webhooks/jwks"));
+        assert!(!is_allowlisted("/api/v1/webhooks"));
+        assert!(!is_allowlisted("/api/v1/webhooks/"));
+        assert!(!is_allowlisted("/api/v1/webhooks/jwks/extra"));
+        assert!(!is_allowlisted(
+            "/api/v1/webhooks/00000000-0000-0000-0000-000000000000"
+        ));
     }
 
     #[test]

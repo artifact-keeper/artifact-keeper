@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4401, #921]
+---
+- **Webhooks can be signed with an instance Ed25519 key and verified against a public JWKS** (#4401, first slice of #921). A webhook's new `signing_mode` (`hmac`, the default; `asymmetric`; or `both`, set at create time and returned by GET/LIST) decides which tokens `X-ArtifactKeeper-Signature` carries. `asymmetric` and `both` add `v2=<kid>:<sig>`, an Ed25519 signature (base64url, no padding) over the same `<t>.<body>` message the HMAC `v1=` token signs, so receivers no longer need a shared secret. They verify it against `GET /api/v1/webhooks/jwks`, which needs no credentials and stays reachable when guest access is disabled. The `kid` is the key's RFC 7638 thumbprint. The instance key is created on first use, and its private half is encrypted at rest with `AK_WEBHOOK_SECRET_KEY`, so `asymmetric`/`both` need that key set (create returns 422 without it). Existing webhooks stay `hmac`, and their headers are byte-identical to before. Receivers that only check `v1=` ignore `v2=`. Key rotation with an overlap window and sample receivers will follow.

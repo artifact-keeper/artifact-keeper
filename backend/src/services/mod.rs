@@ -132,6 +132,7 @@ pub mod webhook_payloads;
 pub mod webhook_producer;
 pub mod webhook_secret_crypto;
 pub mod webhook_signing;
+pub mod webhook_signing_keys;
 
 // Observability & lifecycle
 pub mod age_gate_service;

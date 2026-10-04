@@ -1023,6 +1023,10 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
+        // Public webhook JWKS (#921): receivers verify `v2=` signatures
+        // against it without credentials. No auth layer; also exempt from the
+        // guest-access guard (`guest_access::is_allowlisted`).
+        .nest("/webhooks", handlers::webhooks::public_router())
         // Webhook routes with auth middleware
         .nest(
             "/webhooks",
@@ -1730,5 +1734,30 @@ mod tests {
             String::from_utf8_lossy(&spec_body).contains("\"paths\""),
             "ENABLE_SWAGGER=true must serve the real OpenAPI document"
         );
+    }
+
+    /// #921: the webhook JWKS answers an anonymous caller even with guest
+    /// access disabled (receivers hold no credentials), while the rest of
+    /// `/api/v1/webhooks` stays gated.
+    #[tokio::test]
+    async fn webhook_jwks_is_public_with_guest_access_disabled_921() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use crate::api::handlers::test_db_helpers as tdh;
+        let state = tdh::build_state_with(pool, "/tmp/jwks-921", |c| {
+            c.guest_access_enabled = false;
+        });
+        let app = super::create_router(state);
+        let (status, body) =
+            tdh::send(app.clone(), tdh::get("/api/v1/webhooks/jwks".to_string())).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("JWKS is JSON");
+        assert!(
+            doc["keys"].is_array(),
+            "JWKS must carry a keys array: {doc}"
+        );
+        let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
+        assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
     }
 }
