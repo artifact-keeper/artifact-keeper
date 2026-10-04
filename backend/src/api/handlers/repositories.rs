@@ -8664,9 +8664,8 @@ pub async fn upload_artifact(
     // instead of relying on a request-body-limit layer. An object-storage
     // repository stages on its own backend rather than local disk (#3916),
     // unless something downstream needs the body as a local file.
-    let stage_on_backend = repo.storage_backend != "filesystem"
-        && !generic_upload_needs_local_body(&state, &repo_service, &repo, &path).await?;
-    let (staged, digests) = if stage_on_backend {
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
+    let (staged, digests) = if staging.on_backend(Some(&path)) {
         let (staged, digests) = proxy_helpers::stage_stream_on_backend(
             &state,
             &repo.storage_location(),
@@ -8744,19 +8743,59 @@ impl GenericStagedBody {
     }
 }
 
-/// Whether a generic upload's body must be staged as a local file because a
-/// downstream consumer reads it from disk: the RPM header parse (#3801) or a
-/// WASM format plugin (#2517 plugin-input decision).
+/// Where a generic upload's body is staged (#3916): on the repository's own
+/// object-storage backend, unless the repository is filesystem-backed or a
+/// downstream consumer reads the body as a local file -- the RPM header parse
+/// (#3801) or a WASM format plugin (#2517 plugin-input decision).
+struct GenericStagingPlan {
+    format: crate::models::repository::RepositoryFormat,
+    location: Option<crate::storage::StorageLocation>,
+}
+
+impl GenericStagingPlan {
+    /// Resolve the plan for `repo`. `location` is `None` (always local) for a
+    /// filesystem repository or one with a WASM format plugin.
+    #[allow(clippy::result_large_err)]
+    async fn resolve(
+        state: &SharedState,
+        repo_service: &RepositoryService,
+        repo: &crate::models::repository::Repository,
+    ) -> std::result::Result<Self, Response> {
+        let object_storage = repo.storage_backend != "filesystem";
+        let plugin = object_storage && repo_has_wasm_format(state, repo_service, repo).await?;
+        Ok(Self {
+            format: repo.format.clone(),
+            location: (object_storage && !plugin).then(|| repo.storage_location()),
+        })
+    }
+
+    /// The backend to stage a body bound for `path` on, or `None` for local
+    /// scratch. A `path` not yet known (a multipart form can name it after the
+    /// file) is treated as possibly an `.rpm`, so an RPM repository spools.
+    fn backend_for(&self, path: Option<&str>) -> Option<&crate::storage::StorageLocation> {
+        let rpm_parse = match path {
+            Some(path) => super::upload::rpm_header_metadata_eligible(&self.format, path),
+            None => matches!(
+                self.format,
+                crate::models::repository::RepositoryFormat::Rpm
+            ),
+        };
+        self.location.as_ref().filter(|_| !rpm_parse)
+    }
+
+    fn on_backend(&self, path: Option<&str>) -> bool {
+        self.backend_for(path).is_some()
+    }
+}
+
+/// Whether `repo` has a registered WASM format plugin, which receives the
+/// whole upload body by value and so needs it as a local file.
 #[allow(clippy::result_large_err)]
-async fn generic_upload_needs_local_body(
+async fn repo_has_wasm_format(
     state: &SharedState,
     repo_service: &RepositoryService,
     repo: &crate::models::repository::Repository,
-    path: &str,
 ) -> std::result::Result<bool, Response> {
-    if super::upload::rpm_header_metadata_eligible(&repo.format, path) {
-        return Ok(true);
-    }
     let Some(registry) = &state.plugin_registry else {
         return Ok(false);
     };
@@ -8768,6 +8807,46 @@ async fn generic_upload_needs_local_body(
         Some(fk) => registry.has_format(&fk).await,
         None => false,
     })
+}
+
+/// Stage one multipart file field (#3916): on `backend` when given -- the
+/// field streams into a staging object through a bounded channel, since the
+/// backend's `put_stream` needs a `'static` stream and a field borrows its
+/// form -- else to a local scratch file. Digests are computed in the same
+/// pass either way.
+#[allow(clippy::result_large_err)]
+async fn stage_multipart_field(
+    state: &SharedState,
+    backend: Option<&crate::storage::StorageLocation>,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> std::result::Result<
+    (
+        GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    use futures::{SinkExt, StreamExt};
+    let Some(location) = backend else {
+        let (staged, digests) =
+            proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+        return Ok((GenericStagedBody::Local(staged), digests));
+    };
+    let (mut tx, rx) = futures::channel::mpsc::channel(2);
+    let forward = async move {
+        while let Some(chunk) = field.next().await {
+            let failed = chunk.is_err();
+            if tx.send(chunk).await.is_err() || failed {
+                break;
+            }
+        }
+    };
+    let ((), staged) = tokio::join!(
+        forward,
+        proxy_helpers::stage_stream_on_backend(state, location, rx)
+    );
+    let (staged, digests) = staged?;
+    Ok((GenericStagedBody::Backend(staged), digests))
 }
 
 /// Authorize a generic artifact write: resolve the repository and enforce the
@@ -9143,12 +9222,15 @@ async fn upload_artifact_multipart_with_path(
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
-    let (staged, digests, filename) = stage_multipart_file(&state, multipart).await?;
-    let artifact_path = if path.is_empty() || path == "/" {
-        filename
-    } else {
-        path
-    };
+    // The URL path is the artifact path unless empty, when the uploaded file
+    // name is; either is known by the time the file field streams (#3916).
+    let url_path = (!path.is_empty() && path != "/").then_some(path);
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
+    let (staged, digests, filename) = stage_multipart_file(&state, multipart, |filename| {
+        staging.backend_for(Some(url_path.as_deref().unwrap_or(filename)))
+    })
+    .await?;
+    let artifact_path = url_path.unwrap_or(filename);
     upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
@@ -9160,7 +9242,7 @@ async fn upload_artifact_multipart_with_path(
         key,
         artifact_path,
         &headers,
-        GenericStagedBody::Local(staged),
+        staged,
         digests,
     )
     .await
@@ -9189,8 +9271,11 @@ async fn upload_artifact_multipart(
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
+    // The artifact path may arrive in a `path` field after the file, so the
+    // file stages before its path is known (#3916).
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
     let (staged, digests, filename, custom_path) =
-        stage_multipart_file_and_path(&state, multipart).await?;
+        stage_multipart_file_and_path(&state, multipart, staging.backend_for(None)).await?;
     let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
@@ -9203,7 +9288,7 @@ async fn upload_artifact_multipart(
         key,
         artifact_path,
         &headers,
-        GenericStagedBody::Local(staged),
+        staged,
         digests,
     )
     .await
@@ -9234,16 +9319,18 @@ fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
     }
 }
 
-/// Stream the first file field of a multipart form to a bounded scratch file,
-/// computing SHA-256/SHA-1/MD5 in one pass (#2517). Never buffers the field in
-/// memory. Returns the staged scratch handle, its content digests, and the
-/// original filename.
-async fn stage_multipart_file(
+/// Stream the first file field of a multipart form to staging, computing
+/// SHA-256/SHA-1/MD5 in one pass (#2517). Never buffers the field in memory.
+/// `backend_for(filename)` picks the object-storage backend to stage on, or
+/// `None` for a bounded local scratch file (#3916). Returns the staged body,
+/// its content digests, and the original filename.
+async fn stage_multipart_file<'a>(
     state: &SharedState,
     mut multipart: Multipart,
+    backend_for: impl Fn(&str) -> Option<&'a crate::storage::StorageLocation>,
 ) -> std::result::Result<
     (
-        proxy_helpers::StagedUpload,
+        GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
         String,
     ),
@@ -9257,16 +9344,16 @@ async fn stage_multipart_file(
         // Accept any field that has a filename (i.e. a file upload)
         if let Some(filename) = field.file_name().map(|s| s.to_string()) {
             let (staged, digests) =
-                proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+                stage_multipart_field(state, backend_for(&filename), field).await?;
             return Ok((staged, digests, filename));
         }
     }
     Err(AppError::Validation("No file field found in multipart form".to_string()).into_response())
 }
 
-/// Streaming variant of the file+path extractor (#2517): spool the file field
-/// to a bounded scratch file (digests in one pass) and read the small optional
-/// `path` text field.
+/// Streaming variant of the file+path extractor (#2517): stage the file field
+/// on `backend` (or a bounded local scratch file when `None`, #3916), digests
+/// in one pass, and read the small optional `path` text field.
 ///
 /// Iterates the full form: a file field (one with a `filename`) is staged; a
 /// `path` field (any non-file field named `path`) yields the requested artifact
@@ -9274,9 +9361,10 @@ async fn stage_multipart_file(
 async fn stage_multipart_file_and_path(
     state: &SharedState,
     mut multipart: Multipart,
+    backend: Option<&crate::storage::StorageLocation>,
 ) -> std::result::Result<
     (
-        proxy_helpers::StagedUpload,
+        GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
         String,
         Option<String>,
@@ -9296,8 +9384,7 @@ async fn stage_multipart_file_and_path(
         if let Some(filename) = filename {
             // File upload field
             if file.is_none() {
-                let (staged, digests) =
-                    proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+                let (staged, digests) = stage_multipart_field(state, backend, field).await?;
                 file = Some((staged, digests, filename));
             }
         } else if name.as_deref() == Some("path") {
@@ -18035,6 +18122,153 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #3916: both multipart upload routes into an object-storage repository
+    /// stage the file field on the repository's backend, like the raw `PUT`,
+    /// instead of a local scratch file. Proven the same way: local scratch is
+    /// unusable (STORAGE_PATH sits under a regular file), so before the fix
+    /// both routes failed with 500 on the scratch spool.
+    #[tokio::test]
+    async fn multipart_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-mp-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+
+        // The file field precedes the `path` field, so the no-path route
+        // stages before it knows the artifact path.
+        let form = |content: &str, path_field: &str| {
+            Bytes::from(format!(
+                "--XB\r\n\
+                 Content-Disposition: form-data; name=\"file\"; filename=\"tool.bin\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\
+                 {content}\r\n\
+                 --XB\r\n\
+                 Content-Disposition: form-data; name=\"path\"\r\n\r\n\
+                 {path_field}\r\n\
+                 --XB--\r\n"
+            ))
+        };
+        let cases = [
+            (
+                format!("/{repo_key}/artifacts"),
+                "multipart body without a URL path",
+                "tool/2.0/tool.bin",
+            ),
+            (
+                format!("/{repo_key}/artifacts/tool/3.0/tool.bin"),
+                "multipart body with a URL path",
+                "ignored",
+            ),
+        ];
+        for (uri, content, path_field) in cases {
+            let router = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::admin_auth(user_id, &username),
+            );
+            let (status, resp) = tdh::send(
+                router,
+                tdh::post(
+                    uri.clone(),
+                    "multipart/form-data; boundary=XB",
+                    form(content, path_field),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{uri}: a multipart upload into an S3-backed repository must not need \
+                 local scratch: {}",
+                String::from_utf8_lossy(&resp)
+            );
+            let (storage_key, sha256): (String, String) = sqlx::query_as(
+                "SELECT storage_key, checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(format!("{:x}", Sha256::digest(content.as_bytes())))
+            .fetch_one(&pool)
+            .await
+            .expect("artifact row");
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(
+                objects.get(&storage_key).map(|b| b.to_vec()),
+                Some(content.as_bytes().to_vec()),
+                "{uri}: the bytes ({sha256}) must land at the content-addressed key"
+            );
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "{uri}: the staging object must be deleted once promoted"
+            );
+        }
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM artifacts WHERE repository_id = $1 ORDER BY path")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(paths, vec!["tool/2.0/tool.bin", "tool/3.0/tool.bin"]);
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(tracked, 0, "the staging tracking rows go with the objects");
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: which generic upload bodies stage on the repository's backend.
+    /// Filesystem repositories never do; an object-storage RPM repository
+    /// keeps `.rpm` packages (header parse) local, and a body whose path is
+    /// not yet known (a multipart form naming it after the file) local too.
+    #[test]
+    fn generic_staging_plan_backend_choice_3916() {
+        use crate::models::repository::RepositoryFormat;
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: "repo".to_string(),
+        };
+        let plan = |format: RepositoryFormat, location: Option<crate::storage::StorageLocation>| {
+            GenericStagingPlan { format, location }
+        };
+        let generic = plan(RepositoryFormat::Generic, Some(location.clone()));
+        assert!(generic.on_backend(Some("a/b.bin")));
+        assert!(generic.on_backend(None));
+        let rpm = plan(RepositoryFormat::Rpm, Some(location));
+        assert!(!rpm.on_backend(Some("x-1.0-1.noarch.rpm")));
+        assert!(rpm.on_backend(Some("repodata/repomd.xml")));
+        assert!(!rpm.on_backend(None));
+        let filesystem = plan(RepositoryFormat::Generic, None);
+        assert!(!filesystem.on_backend(Some("a/b.bin")));
+        assert!(!filesystem.on_backend(None));
+    }
+
     /// #3916: a generic staging object whose upload died before promoting or
     /// deleting it (crash, eviction, shutdown) is reclaimed by the hourly
     /// sweep once older than the threshold; a young one (possibly a live
@@ -24773,7 +25007,7 @@ mod tests {
         );
         let mp = multipart_from_body("XB", body).await;
 
-        let (staged, digests, filename) = stage_multipart_file(&state, mp)
+        let (staged, digests, filename) = stage_multipart_file(&state, mp, |_| None)
             .await
             .expect("staging should succeed");
         assert_eq!(filename, "abc.bin");
@@ -24787,7 +25021,7 @@ mod tests {
         assert_eq!(digests.sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(digests.md5, "900150983cd24fb0d6963f7d28e17f72");
         // The bytes live in the scratch file, ready to be re-streamed.
-        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        let on_disk = tokio::fs::read(staged.local_path().unwrap()).await.unwrap();
         assert_eq!(on_disk, b"abc");
     }
 
@@ -24802,7 +25036,7 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let resp = match stage_multipart_file(&state, mp).await {
+        let resp = match stage_multipart_file(&state, mp, |_| None).await {
             Ok(_) => panic!("form without a file field must be rejected"),
             Err(resp) => resp,
         };
@@ -24825,14 +25059,15 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let (staged, digests, filename, custom_path) = stage_multipart_file_and_path(&state, mp)
-            .await
-            .expect("staging should succeed");
+        let (staged, digests, filename, custom_path) =
+            stage_multipart_file_and_path(&state, mp, None)
+                .await
+                .expect("staging should succeed");
         assert_eq!(filename, "guide.pdf");
         assert_eq!(custom_path.as_deref(), Some("docs/dir/"));
         assert_eq!(staged.size_bytes(), 8);
         assert_eq!(digests.sha256.len(), 64);
-        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        let on_disk = tokio::fs::read(staged.local_path().unwrap()).await.unwrap();
         assert_eq!(on_disk, b"pdfbytes");
     }
 
@@ -24847,7 +25082,7 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let resp = match stage_multipart_file_and_path(&state, mp).await {
+        let resp = match stage_multipart_file_and_path(&state, mp, None).await {
             Ok(_) => panic!("path-only form must be rejected"),
             Err(resp) => resp,
         };
