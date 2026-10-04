@@ -262,8 +262,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     {
         use artifact_keeper_backend::api::middleware::guest_access;
         let public_repositories = guest_access::public_repository_count(&db_pool).await?;
+        // The effective value (#867): an admin may have turned guests off
+        // through the API even though the env var is unset.
+        let guest_access_enabled =
+            artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::from_config(
+                Some(db_pool.clone()),
+                &config,
+            )
+            .is_enabled()
+            .await;
         if let Some(message) =
-            guest_access::startup_notice(config.guest_access_enabled, public_repositories)
+            guest_access::startup_notice(guest_access_enabled, public_repositories)
         {
             tracing::warn!(
                 event = "guest_access_public_repositories",

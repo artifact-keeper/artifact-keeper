@@ -1398,6 +1398,7 @@ pub(crate) mod tests {
             scan_workspace_path: "/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,

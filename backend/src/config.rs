@@ -463,6 +463,14 @@ pub struct Config {
     /// token itself while this is `false`.
     pub guest_access_enabled: bool,
 
+    /// True when `AK_GUEST_ACCESS_ENABLED` was set explicitly to `true`, `1`,
+    /// `false` or `0` (#867). The env value then pins the effective setting
+    /// and the runtime `security.guest_access_enabled` row in
+    /// `system_settings` has no effect (break-glass, like `TOTP_POLICY`).
+    /// Otherwise `guest_access_enabled` is only the default the stored row
+    /// overrides; see `services::guest_access_policy`.
+    pub guest_access_env_pinned: bool,
+
     /// When true, the unauthenticated `/health` (and `/healthz`) response
     /// includes operator-only detail: the exact git commit SHA (`commit`),
     /// the prerelease/`dirty` flag, and live connection-pool internals
@@ -1137,6 +1145,7 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show guest_access_env_pinned,
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
@@ -1272,6 +1281,7 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
@@ -1456,6 +1466,12 @@ impl Config {
                 env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
                 Ok("false" | "0")
             ),
+            guest_access_env_pinned: crate::services::guest_access_policy::parse_env_pin(
+                env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
+                    .ok()
+                    .as_deref(),
+            )
+            .is_some(),
             storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
             storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
             storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),
@@ -3005,6 +3021,7 @@ mod tests {
 
         let config = Config::from_env().unwrap();
         assert!(config.guest_access_enabled);
+        assert!(!config.guest_access_env_pinned, "unset never pins (#867)");
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3104,6 +3121,24 @@ mod tests {
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "");
         assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        // #867: only the four explicit spellings pin the runtime setting;
+        // garbage and empty leave it to the admin-managed stored value.
+        for (raw, pinned) in [
+            ("false", true),
+            ("0", true),
+            ("true", true),
+            ("1", true),
+            ("yes", false),
+            ("", false),
+        ] {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", raw);
+            assert_eq!(
+                Config::from_env().unwrap().guest_access_env_pinned,
+                pinned,
+                "{raw:?}"
+            );
+        }
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);

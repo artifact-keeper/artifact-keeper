@@ -244,6 +244,11 @@ pub struct AppState {
     /// extra concurrent login starves the blocking-thread pool and the rest
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
+    /// Runtime guest-access setting (#867): env pin, else the
+    /// `system_settings` row, else the default; cached with a short TTL and
+    /// invalidated on write. Every consumer of "is anonymous access allowed"
+    /// asks this instead of `config.guest_access_enabled`.
+    pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -254,6 +259,20 @@ fn build_auth_semaphore(max: usize) -> Option<Arc<Semaphore>> {
     } else {
         Some(Arc::new(Semaphore::new(max)))
     }
+}
+
+/// The runtime guest-access handle every `AppState` constructor installs
+/// (#867): env pin and default from `config`, stored value from `db`.
+fn build_guest_access_policy(
+    db: &PgPool,
+    config: &Config,
+) -> Arc<crate::services::guest_access_policy::GuestAccessPolicy> {
+    Arc::new(
+        crate::services::guest_access_policy::GuestAccessPolicy::from_config(
+            Some(db.clone()),
+            config,
+        ),
+    )
 }
 
 impl AppState {
@@ -279,6 +298,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -306,6 +326,7 @@ impl AppState {
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -328,6 +349,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -355,6 +377,7 @@ impl AppState {
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 

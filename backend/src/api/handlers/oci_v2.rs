@@ -5261,10 +5261,10 @@ async fn token(
             // refusal above: an anonymous prober must not be able to tell from
             // the wire whether this instance runs with guest access disabled.
             // The distinction is recorded in the log instead.
-            if !state.config.guest_access_enabled {
+            if !state.guest_access_policy.is_enabled().await {
                 info!(
                     "refusing to mint the anonymous pull token: guest access is \
-                     disabled server-wide (AK_GUEST_ACCESS_ENABLED=false)"
+                     disabled server-wide"
                 );
                 return oci_error(
                     StatusCode::UNAUTHORIZED,

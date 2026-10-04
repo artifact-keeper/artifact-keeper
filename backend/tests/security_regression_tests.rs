@@ -1670,7 +1670,11 @@ mod guest_access_oci_3854 {
             ..Default::default()
         };
         GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(
+                artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::fixed(
+                    guest_access_enabled,
+                ),
+            ),
             auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
         }
     }
@@ -1850,7 +1854,11 @@ mod guest_access_oci_3854 {
     /// guest-access guard as the global outer layer in front of them.
     fn real_app(shared: SharedState, guest_access_enabled: bool) -> Router {
         let guard_state = GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(
+                artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::fixed(
+                    guest_access_enabled,
+                ),
+            ),
             auth_service: Arc::new(AuthService::new(
                 shared.db.clone(),
                 Arc::new(shared.config.clone()),

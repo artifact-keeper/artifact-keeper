@@ -66,6 +66,7 @@ fn test_config(storage_path: &str) -> Config {
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
+        guest_access_env_pinned: false,
         expose_detailed_health: false,
         grpc_reflection_enabled: false,
         swagger_enabled: false,

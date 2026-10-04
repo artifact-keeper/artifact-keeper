@@ -3267,7 +3267,7 @@ pub async fn create_repository(
     let visibility = payload.effective_visibility()?;
     require_public_visibility_allowed(
         visibility.allows_anonymous_read(),
-        state.config.guest_access_enabled,
+        state.guest_access_policy.is_enabled().await,
     )?;
 
     let repo = service
@@ -4172,7 +4172,7 @@ pub async fn update_repository(
     let visibility_update = payload.visibility_update()?;
     require_public_visibility_allowed(
         matches!(visibility_update, VisibilityUpdate::Set(v) if v.allows_anonymous_read()),
-        state.config.guest_access_enabled,
+        state.guest_access_policy.is_enabled().await,
     )?;
     let (effective_visibility, effective_is_public) = visibility_update.binds();
 

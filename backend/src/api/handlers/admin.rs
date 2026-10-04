@@ -3,6 +3,9 @@
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
+use crate::services::guest_access_policy::{
+    GuestAccessSource, ResolvedGuestAccess, GUEST_ACCESS_SETTING_KEY,
+};
 use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy, TokenPolicySource};
 use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
@@ -41,6 +44,10 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/settings/token-policy",
             get(get_token_policy).put(update_token_policy),
+        )
+        .route(
+            "/settings/system",
+            get(get_runtime_settings).patch(update_runtime_settings),
         )
         .route("/stats", get(get_system_stats))
         .route("/storage/ledger/backfill", post(backfill_storage_ledger))
@@ -1030,6 +1037,143 @@ pub async fn update_totp_policy(
     Ok(Json(
         build_totp_policy_response(&state, auth.user_id).await?,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Runtime system settings: guest access (#867)
+// ---------------------------------------------------------------------------
+
+/// Runtime-managed system settings. Today only guest access; the shape leaves
+/// room for further runtime toggles under the same endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RuntimeSettingsResponse {
+    /// Whether anonymous (unauthenticated) access is allowed right now. This
+    /// is the value the guest-access guard enforces.
+    pub guest_access_enabled: bool,
+    /// Where that value comes from: `environment` (`AK_GUEST_ACCESS_ENABLED`
+    /// set explicitly -- it wins), `database` (set through this API) or
+    /// `default` (neither; guests allowed).
+    pub guest_access_source: GuestAccessSource,
+    /// The value stored through this API, if any. Reported even while the
+    /// environment pins the setting: it takes over once the env var is unset.
+    pub guest_access_stored: Option<bool>,
+    /// Whether a `PATCH` changes the effective value now. `false` while
+    /// `AK_GUEST_ACCESS_ENABLED` pins it; the write is still stored.
+    pub guest_access_editable: bool,
+}
+
+/// Request body for `PATCH /admin/settings/system`. Omitted fields are left
+/// unchanged; unknown fields are rejected so a typo is not a silent no-op.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRuntimeSettingsRequest {
+    /// Allow (`true`) or refuse (`false`) anonymous access server-wide.
+    pub guest_access_enabled: Option<bool>,
+}
+
+fn runtime_settings_response(
+    resolved: ResolvedGuestAccess,
+    pinned: bool,
+) -> RuntimeSettingsResponse {
+    RuntimeSettingsResponse {
+        guest_access_enabled: resolved.enabled,
+        guest_access_source: resolved.source,
+        guest_access_stored: resolved.stored,
+        guest_access_editable: !pinned,
+    }
+}
+
+/// Audit `details` for a guest-access write: old -> new effective value, the
+/// stored value before/after, and the source after the write (so an entry
+/// written while the env var pins the value says it changed nothing yet).
+fn guest_access_audit_details(
+    before: ResolvedGuestAccess,
+    after: ResolvedGuestAccess,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setting": GUEST_ACCESS_SETTING_KEY,
+        "from": before.enabled,
+        "to": after.enabled,
+        "stored_from": before.stored,
+        "stored_to": after.stored,
+        "source": after.source,
+        "effective_changed": before.enabled != after.enabled,
+    })
+}
+
+/// Read the runtime system settings (guest access and its source).
+#[utoipa::path(
+    get,
+    path = "/settings/system",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Runtime system settings", body = RuntimeSettingsResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_runtime_settings(
+    State(state): State<SharedState>,
+) -> Result<Json<RuntimeSettingsResponse>> {
+    let policy = &state.guest_access_policy;
+    // Bypass the cache: an operator checking the setting wants the database's
+    // answer, not one up to a TTL old.
+    let resolved = policy.refresh().await;
+    Ok(Json(runtime_settings_response(
+        resolved,
+        policy.is_env_pinned(),
+    )))
+}
+
+/// Change runtime system settings. Takes effect immediately: the replica that
+/// serves the request enforces the new guest-access value on its next request,
+/// and other replicas within the policy cache TTL (5 s). No restart.
+///
+/// `AK_GUEST_ACCESS_ENABLED`, when set explicitly, still wins (it is the
+/// break-glass): the value is stored but `guest_access_editable` is `false`
+/// and the effective value does not change until the env var is unset.
+#[utoipa::path(
+    patch,
+    path = "/settings/system",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateRuntimeSettingsRequest,
+    responses(
+        (status = 200, description = "Settings updated", body = RuntimeSettingsResponse),
+        (status = 400, description = "No setting to update", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_runtime_settings(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateRuntimeSettingsRequest>,
+) -> Result<Json<RuntimeSettingsResponse>> {
+    let Some(enabled) = payload.guest_access_enabled else {
+        return Err(AppError::Validation(
+            "no setting to update; supported fields: guest_access_enabled".to_string(),
+        ));
+    };
+    let policy = &state.guest_access_policy;
+    let before = policy.refresh().await;
+    let after = policy.store(enabled, auth.user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .user(auth.user_id)
+            .actor_name(&auth.username)
+            .resource_name(GUEST_ACCESS_SETTING_KEY)
+            .details(guest_access_audit_details(before, after)),
+    )
+    .await;
+
+    Ok(Json(runtime_settings_response(
+        after,
+        policy.is_env_pinned(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,6 +2433,8 @@ pub async fn delete_proxy_scan_verdicts(
         update_totp_policy,
         get_token_policy,
         update_token_policy,
+        get_runtime_settings,
+        update_runtime_settings,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -2319,6 +2465,9 @@ pub async fn delete_proxy_scan_verdicts(
         UpdateTokenPolicyRequest,
         ApiTokenExpiryPolicy,
         TokenPolicySource,
+        RuntimeSettingsResponse,
+        UpdateRuntimeSettingsRequest,
+        GuestAccessSource,
         SystemStats,
         ListDownloadsQuery,
         DownloadRecord,
@@ -4306,5 +4455,187 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime guest-access toggle (#867)
+    // -----------------------------------------------------------------------
+
+    fn resolved(
+        enabled: bool,
+        source: GuestAccessSource,
+        stored: Option<bool>,
+    ) -> ResolvedGuestAccess {
+        ResolvedGuestAccess {
+            enabled,
+            source,
+            stored,
+        }
+    }
+
+    #[test]
+    fn test_runtime_settings_response_reports_source_and_editability() {
+        let r = runtime_settings_response(
+            resolved(false, GuestAccessSource::Environment, Some(true)),
+            true,
+        );
+        assert!(!r.guest_access_enabled);
+        assert_eq!(r.guest_access_source, GuestAccessSource::Environment);
+        assert_eq!(r.guest_access_stored, Some(true));
+        assert!(!r.guest_access_editable);
+        let json = serde_json::to_value(runtime_settings_response(
+            resolved(true, GuestAccessSource::Default, None),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(json["guest_access_source"], "default");
+        assert_eq!(json["guest_access_editable"], true);
+        assert!(json["guest_access_stored"].is_null());
+    }
+
+    #[test]
+    fn test_guest_access_audit_details_record_the_flip() {
+        let d = guest_access_audit_details(
+            resolved(true, GuestAccessSource::Default, None),
+            resolved(false, GuestAccessSource::Database, Some(false)),
+        );
+        assert_eq!(d["setting"], GUEST_ACCESS_SETTING_KEY);
+        assert_eq!(d["from"], true);
+        assert_eq!(d["to"], false);
+        assert!(d["stored_from"].is_null());
+        assert_eq!(d["stored_to"], false);
+        assert_eq!(d["source"], "database");
+        assert_eq!(d["effective_changed"], true);
+    }
+
+    #[test]
+    fn test_update_runtime_settings_rejects_unknown_fields() {
+        let r: std::result::Result<UpdateRuntimeSettingsRequest, _> =
+            serde_json::from_value(serde_json::json!({"guest_access": false}));
+        assert!(r.is_err());
+    }
+
+    /// The #867 acceptance test: after the admin PATCH, the guest-access guard
+    /// refuses an anonymous read on the very next request -- no restart, no
+    /// TTL wait -- and lets it through again after flipping back. Also pins
+    /// the env-var precedence and the audit trail.
+    #[tokio::test]
+    async fn test_runtime_guest_access_toggle_applies_without_restart() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::guest_access::{guest_access_guard, GuestAccessState};
+        use crate::services::guest_access_policy::GuestAccessPolicy;
+        use axum::{body::Body, http::Request, http::StatusCode, middleware::from_fn_with_state};
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // A private setting row so this test never races the real key.
+        let key = format!("test.guest_access.{}", Uuid::new_v4());
+        let mut inner = (*tdh::build_state(pool.clone(), "/tmp/admin-guest-access")).clone();
+        inner.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            None,
+            true,
+        ));
+        let state = Arc::new(inner);
+        let auth = admin_auth(user_id, &username);
+
+        let guard = GuestAccessState {
+            policy: state.guest_access_policy.clone(),
+            auth_service: Arc::new(crate::services::auth_service::AuthService::new(
+                pool.clone(),
+                Arc::new(state.config.clone()),
+            )),
+        };
+        let app = Router::new()
+            .route("/api/v1/repositories", get(|| async { "repos" }))
+            .layer(from_fn_with_state(guard, guest_access_guard));
+        let anon = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        let Json(initial) = get_runtime_settings(State(state.clone())).await.unwrap();
+        assert!(initial.guest_access_enabled);
+        assert_eq!(initial.guest_access_source, GuestAccessSource::Default);
+        assert!(initial.guest_access_editable);
+        assert_eq!(anon(app.clone()).await, StatusCode::OK);
+
+        let patch = |v: Option<bool>| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: v,
+                }),
+            )
+        };
+
+        let Json(off) = patch(Some(false)).await.expect("disable guests");
+        assert!(!off.guest_access_enabled);
+        assert_eq!(off.guest_access_source, GuestAccessSource::Database);
+        assert_eq!(anon(app.clone()).await, StatusCode::UNAUTHORIZED);
+
+        assert!(matches!(patch(None).await, Err(AppError::Validation(_))));
+
+        let Json(on) = patch(Some(true)).await.expect("re-enable guests");
+        assert!(on.guest_access_enabled);
+        assert_eq!(anon(app.clone()).await, StatusCode::OK);
+
+        // Env pin wins: a write is stored but changes nothing yet.
+        let mut pinned = (*state).clone();
+        pinned.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            Some(true),
+            true,
+        ));
+        let Json(p) = update_runtime_settings(
+            State(Arc::new(pinned)),
+            Extension(auth.clone()),
+            Json(UpdateRuntimeSettingsRequest {
+                guest_access_enabled: Some(false),
+            }),
+        )
+        .await
+        .expect("stored while pinned");
+        assert!(p.guest_access_enabled);
+        assert_eq!(p.guest_access_source, GuestAccessSource::Environment);
+        assert_eq!(p.guest_access_stored, Some(false));
+        assert!(!p.guest_access_editable);
+
+        // Every write was audited.
+        let mut audited = 0i64;
+        for _ in 0..100 {
+            audited = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE user_id = $1 AND action = 'SETTING_CHANGED'",
+            )
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            if audited >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        sqlx::query("DELETE FROM system_settings WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("cleanup setting");
+        tdh::cleanup_user(&pool, user_id).await;
+        assert_eq!(audited, 3, "each PATCH that wrote must be audited");
     }
 }

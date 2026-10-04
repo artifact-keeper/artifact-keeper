@@ -225,7 +225,9 @@ pub fn create_router(state: SharedState) -> Router {
     ));
     guest_auth_service.register_for_global_flush();
     let guest_access_state = GuestAccessState {
-        guest_access_enabled: state.config.guest_access_enabled,
+        // The same handle the admin settings endpoint writes through (#867),
+        // so a flip is enforced on the next request, without a restart.
+        policy: state.guest_access_policy.clone(),
         auth_service: guest_auth_service,
     };
     router = router.layer(middleware::from_fn_with_state(
@@ -627,6 +629,9 @@ fn api_v1_routes(
                 optional_auth_middleware,
             )),
         )
+        // Active maintenance banners (#2155): public, no auth, and on the
+        // guest-access allowlist so the login page can show them.
+        .nest("/banners", handlers::banners::public_router())
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
         // Auth routes - split into login / logout / public / protected (rate
@@ -970,6 +975,8 @@ fn api_v1_routes(
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
             .nest("/smtp", handlers::smtp::router())
+            // Maintenance banner CRUD (#2155); the public read is `/banners`.
+            .nest("/banners", handlers::banners::admin_router())
             .nest("/age-gate", handlers::age_gate::admin_router())
             // Admin quality-checks list-all (#2419). Kept inside the `/admin`
             // block so `admin_middleware` gates it; the artifact-scoped
@@ -1538,6 +1545,75 @@ mod tests {
         let ui = tdh::send(app.clone(), tdh::get("/swagger-ui/".to_string())).await;
         let spec = tdh::send(app, tdh::get("/api/v1/openapi.json".to_string())).await;
         (ui, spec)
+    }
+
+    /// #2155 / #867 through the production router: with guest access off,
+    /// the public banner list still answers anonymous callers (the login page
+    /// shows it) while the admin banner and runtime-settings surfaces stay
+    /// gated; and a runtime flip of the policy handle the router was built
+    /// with is enforced on the next request, without rebuilding anything.
+    #[tokio::test]
+    async fn banners_public_and_guest_toggle_live_through_the_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::guest_access_policy::GuestAccessPolicy;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let state = tdh::build_state_with(pool.clone(), "/tmp/banners-router-2155", |c| {
+            c.guest_access_enabled = false;
+        });
+        let app = super::create_router(state);
+        let get = |p: &str| tdh::get(p.to_string());
+        let (code, body) = tdh::send(app.clone(), get("/api/v1/banners")).await;
+        assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["banners"].is_array());
+        for gated in [
+            "/api/v1/admin/banners",
+            "/api/v1/admin/settings/system",
+            "/api/v1/repositories",
+        ] {
+            let (code, _) = tdh::send(app.clone(), get(gated)).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{gated}");
+        }
+
+        // Runtime flip, no router rebuild. A private setting key keeps this
+        // off the real row.
+        let (admin, _) = tdh::create_user(&pool).await;
+        let key = format!("test.guest_access.{}", uuid::Uuid::new_v4());
+        let mut inner = (*tdh::build_state(pool.clone(), "/tmp/guest-toggle-867")).clone();
+        let policy = std::sync::Arc::new(GuestAccessPolicy::new(
+            Some(pool.clone()),
+            key.clone(),
+            None,
+            true,
+        ));
+        inner.guest_access_policy = policy.clone();
+        let app = super::create_router(std::sync::Arc::new(inner));
+        let (open, _) = tdh::send(app.clone(), get("/api/v1/repositories")).await;
+        let (_, cfg) = tdh::send(app.clone(), get("/api/v1/system/config")).await;
+        let cfg: serde_json::Value = serde_json::from_slice(&cfg).unwrap();
+        policy.store(false, admin).await.expect("flip off");
+        let (closed, _) = tdh::send(app.clone(), get("/api/v1/repositories")).await;
+        let (_, cfg_after) = tdh::send(app.clone(), get("/api/v1/system/config")).await;
+        let cfg_after: serde_json::Value = serde_json::from_slice(&cfg_after).unwrap();
+
+        sqlx::query("DELETE FROM system_settings WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("cleanup setting");
+        tdh::cleanup_user(&pool, admin).await;
+
+        assert_eq!(open, StatusCode::OK);
+        assert_eq!(cfg["guest_access_enabled"], true);
+        assert_eq!(closed, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            cfg_after["guest_access_enabled"], false,
+            "/system/config must report the runtime value"
+        );
     }
 
     /// #3489: Swagger UI and the OpenAPI document must not be mounted unless
