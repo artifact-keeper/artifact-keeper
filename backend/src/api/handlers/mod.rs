@@ -310,6 +310,7 @@ pub mod analytics;
 pub mod ansible;
 pub mod approval;
 pub mod artifact_labels;
+pub mod artifact_presence;
 pub mod artifacts;
 pub mod auth;
 pub mod banners;

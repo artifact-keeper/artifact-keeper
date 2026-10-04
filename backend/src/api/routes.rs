@@ -726,6 +726,9 @@ fn api_v1_routes(
                 // POST/GET /repositories/{key}/environments,
                 // GET/DELETE /repositories/{key}/environments/{id}.
                 .merge(handlers::environments::repo_router())
+                // Bulk artifact presence check for air-gap imports (#3427):
+                // POST /repositories/{key}/artifacts-missing.
+                .merge(handlers::artifact_presence::repo_router())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,

@@ -164,6 +164,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "environments",
             handlers::environments::EnvironmentsApiDoc::openapi(),
         ),
+        (
+            "artifact_presence",
+            handlers::artifact_presence::ArtifactPresenceApiDoc::openapi(),
+        ),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
         ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
@@ -747,6 +751,7 @@ mod tests {
                     include_str!("handlers/security.rs"),
                     include_str!("handlers/repo_tokens.rs"),
                     include_str!("handlers/environments.rs"),
+                    include_str!("handlers/artifact_presence.rs"),
                 ],
             ),
             (

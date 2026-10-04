@@ -84,6 +84,13 @@ pub struct CreateSessionRequest {
     pub chunk_size: Option<i32>,
     /// MIME content type (default "application/octet-stream")
     pub content_type: Option<String>,
+    /// When true and a live artifact already exists at `artifact_path` with
+    /// this `checksum_sha256` and `total_size` (and its stored object is
+    /// present), respond 200 with `AlreadyPresentResponse` instead of opening
+    /// a session. Requires read access to the repository; otherwise a session
+    /// is opened as usual (#3427).
+    #[serde(default)]
+    pub skip_if_present: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -134,6 +141,7 @@ pub struct CompleteResponse {
     tag = "uploads",
     request_body = CreateSessionRequest,
     responses(
+        (status = 200, description = "`skip_if_present` was set and the artifact is already stored; no session was opened", body = super::artifact_presence::AlreadyPresentResponse),
         (status = 201, description = "Upload session created", body = CreateSessionResponse),
         (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -244,6 +252,25 @@ async fn create_session(
         .map_err(IntoResponse::into_response)?;
 
     let is_replication = super::is_replication_request(&headers);
+    if req.skip_if_present && !is_replication {
+        let declared = super::artifact_presence::DeclaredUpload {
+            path: &req.artifact_path,
+            checksum_sha256: &req.checksum_sha256,
+            total_size: req.total_size,
+            version: req.artifact_version.as_deref(),
+        };
+        if let Some(present) = super::artifact_presence::already_present_for_session(
+            &state,
+            &auth,
+            &repo_record,
+            &repo_service,
+            declared,
+        )
+        .await
+        {
+            return Ok((StatusCode::OK, Json(present)).into_response());
+        }
+    }
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
 
     if is_replication {
@@ -2343,6 +2370,7 @@ mod tests {
             checksum_sha256: "deadbeef".to_string(),
             chunk_size: None,
             content_type: None,
+            skip_if_present: false,
         }
     }
 
@@ -2920,6 +2948,7 @@ mod tests {
             checksum_sha256: "abc".into(),
             chunk_size: None,
             content_type: None,
+            skip_if_present: false,
         };
         let debug = format!("{:?}", req);
         assert!(debug.contains("CreateSessionRequest"));
