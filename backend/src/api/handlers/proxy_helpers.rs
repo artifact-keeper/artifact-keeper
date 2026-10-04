@@ -151,6 +151,12 @@ pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
 /// family's share. A family reservation draws from BOTH its sub-budget and
 /// the shared budget, so the shared total stays the process-wide memory bound,
 /// and whatever the family cannot hold stays available to every other format.
+///
+/// The family's hold on the shared budget is bounded by its share, or by one
+/// reservation when a single reservation is larger than the whole share (an
+/// operator who sizes the share below one reservation): the sub-budget charge
+/// is clamped to the share so it cannot wait forever, while the shared charge
+/// stays the full reservation, and only one such reservation fits at a time.
 /// An idle family holds nothing, so other formats can still use the whole
 /// shared budget when it is quiet.
 ///
@@ -189,6 +195,7 @@ impl MetadataBudgetFamily {
     }
 
     /// Default share of the shared budget, as `(numerator, denominator)`.
+    /// Floored by [`Self::default_floor_bytes`].
     ///
     /// Gallery: 3/8, which is 384 MiB of the default 1 GiB. One composed
     /// gallery response at full width holds four concurrent 64 MiB skeleton
@@ -201,10 +208,24 @@ impl MetadataBudgetFamily {
             MetadataBudgetFamily::VscodeGallery => (3, 8),
         }
     }
+
+    /// Smallest default share: the family's peak concurrent reservation for
+    /// ONE request, so a lone request never sheds against its own family on a
+    /// shrunken shared budget. For the gallery that is one full-width composed
+    /// response (four concurrent 64 MiB skeleton fetches); 3/8 of a shared
+    /// budget below ~683 MiB would be less than that.
+    fn default_floor_bytes(self) -> usize {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => {
+                crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES
+            }
+        }
+    }
 }
 
 /// Size of a family sub-budget: the env override when it parses to a positive
-/// byte count, else the family's default share of `shared_total`, clamped to
+/// byte count, else the family's default share of `shared_total` floored at
+/// [`MetadataBudgetFamily::default_floor_bytes`]; either way clamped to
 /// `[1, shared_total]` — a sub-budget larger than the budget it is carved out
 /// of would bound nothing.
 pub fn metadata_sub_budget_bytes(
@@ -216,7 +237,7 @@ pub fn metadata_sub_budget_bytes(
     env_value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(shared_total / den * num)
+        .unwrap_or_else(|| (shared_total / den * num).max(family.default_floor_bytes()))
         .clamp(1, shared_total.max(1))
 }
 
@@ -270,7 +291,11 @@ pub fn metadata_sub_budget(family: MetadataBudgetFamily) -> &'static MetadataSub
             env.as_deref(),
             proxy_metadata_budget().total_bytes(),
         );
-        MetadataSubBudget::new(family, bytes)
+        let sub = MetadataSubBudget::new(family, bytes);
+        // Publish 0 up front so an idle replica reports an empty share
+        // rather than no series at all.
+        sub.record_saturation();
+        sub
     })
 }
 
@@ -10415,7 +10440,23 @@ mod tests {
             gib,
             "a sub-budget never exceeds the budget it is carved out of"
         );
-        assert_eq!(metadata_sub_budget_bytes(family, None, 4), 1);
+        // Small shared budgets: the default share is floored at one
+        // full-width composed gallery response, clamped to the total.
+        let mib = 1024 * 1024;
+        let floor = crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES;
+        assert_eq!(floor, 256 * mib);
+        assert_eq!(metadata_sub_budget_bytes(family, None, 512 * mib), floor);
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, 200 * mib),
+            200 * mib
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 2 * gib), 768 * mib);
+        // An explicit override is the operator's call and is not floored.
+        assert_eq!(
+            metadata_sub_budget_bytes(family, Some("1024"), 512 * mib),
+            1024
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 4), 4);
         assert_eq!(metadata_sub_budget_bytes(family, None, 0), 1);
     }
 
@@ -10514,6 +10555,50 @@ mod tests {
         assert_eq!(sub.budget().available_bytes(), 60);
         assert_eq!(shared.available_bytes(), 60);
         drop(permit);
+    }
+
+    /// The saturation gauge is emitted per family and follows reserve and
+    /// release, including the initial 0 an idle family must report.
+    #[test]
+    fn sub_budget_saturation_gauge_tracks_reserve_and_release() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let gauge = || -> Option<f64> {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, value)| {
+                    let key = ck.key();
+                    let labelled = key
+                        .labels()
+                        .any(|l| l.key() == "family" && l.value() == "vscode_gallery");
+                    match value {
+                        DebugValue::Gauge(v)
+                            if key.name() == "ak_proxy_metadata_sub_budget_saturation_ratio"
+                                && labelled =>
+                        {
+                            Some(v.into_inner())
+                        }
+                        _ => None,
+                    }
+                })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let sub = leaked_sub_budget(100);
+            sub.record_saturation();
+            assert_eq!(gauge(), Some(0.0));
+            let shared = ProxyMetadataBudget::new(1000);
+            let permit = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25, None))
+                .unwrap_or_else(|_| panic!("fits"));
+            assert_eq!(gauge(), Some(0.25));
+            drop(permit);
+            assert_eq!(gauge(), Some(0.0));
+        });
     }
 
     #[tokio::test]

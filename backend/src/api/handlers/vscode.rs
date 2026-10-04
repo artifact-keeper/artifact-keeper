@@ -232,6 +232,12 @@ const GALLERY_VERSIONS_PER_CHANNEL: usize = 30;
 /// many extensions are in flight so a client query cannot fan out into
 /// simultaneous upstream requests and budget reservations without limit.
 const GALLERY_COMPOSITION_CONCURRENCY: usize = 4;
+/// Peak gallery-family reservation held at once by ONE request: a full-width
+/// composition's concurrent skeleton fetches. The gallery sub-budget's default
+/// is floored here so a lone composed response never sheds against itself on
+/// a small shared budget (#3914).
+pub(crate) const GALLERY_PEAK_REQUEST_RESERVATION_BYTES: usize =
+    GALLERY_COMPOSITION_CONCURRENCY * GALLERY_SKELETON_BUDGET_RESERVATION_BYTES;
 /// Composed responses admitted at once.
 ///
 /// A composed page accumulates during the fan-out, before it can be charged
@@ -5367,7 +5373,7 @@ mod tests {
             proxy_helpers::metadata_sub_budget_bytes(GALLERY_METADATA_BUDGET_FAMILY, None, total);
         assert_eq!(share, 384 * 1024 * 1024);
         assert!(
-            GALLERY_COMPOSITION_CONCURRENCY * GALLERY_SKELETON_BUDGET_RESERVATION_BYTES <= share,
+            GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share,
             "one composed response's concurrent skeleton fetches fit the gallery share, \
              so a lone composition never sheds against itself"
         );
@@ -5376,6 +5382,15 @@ mod tests {
             (total - share) / proxy_helpers::LARGE_METADATA_MAX_BYTES >= 5,
             "at least five worst-case buffers stay available to every other format"
         );
+        // A shrunken shared budget still fits one full-width composition.
+        for small in [300 * 1024 * 1024, 512 * 1024 * 1024, 682 * 1024 * 1024] {
+            let share = proxy_helpers::metadata_sub_budget_bytes(
+                GALLERY_METADATA_BUDGET_FAMILY,
+                None,
+                small,
+            );
+            assert!(GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share, "{small}");
+        }
     }
 
     #[tokio::test]
