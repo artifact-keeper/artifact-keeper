@@ -1673,9 +1673,20 @@ impl SbomService {
     /// (free-form names, SPDX expressions, "UNKNOWN"), so emit `id` only for
     /// recognized identifiers and fall back to the free-form `name` field —
     /// which DT accepts unconditionally — for everything else.
+    ///
+    /// A compound SPDX expression (`MIT AND PSF-2.0`, `Apache-2.0 WITH
+    /// LLVM-exception`, `(MIT OR ISC) AND BSD-3-Clause`) is emitted as the
+    /// CycloneDX `expression` choice instead (#3866): written as a `name`,
+    /// Dependency-Track stores it as an unresolved free-text license and
+    /// every license policy fails on it, even when each operand is approved.
+    /// CycloneDX 1.5 requires an `expression` entry to be the only element
+    /// of its `licenses` array; every caller wraps this single entry in a
+    /// one-element array, so that holds.
     fn cyclonedx_license_entry(license: &str) -> serde_json::Value {
         if Self::SPDX_COMMON_IDS.contains(&license) {
             serde_json::json!({"license": {"id": license}})
+        } else if crate::services::spdx_licenses::is_compound_spdx_expression(license) {
+            serde_json::json!({"expression": license})
         } else {
             serde_json::json!({"license": {"name": license}})
         }
@@ -2107,13 +2118,47 @@ mod tests {
         assert!(entry["license"].get("id").is_none());
     }
 
+    /// #3866: a compound SPDX expression must reach Dependency-Track as the
+    /// CycloneDX `expression` choice, never as `license.name` (unresolved
+    /// free text that fails license policy) nor `license.id` (#1474: an
+    /// out-of-enum id rejects the whole BOM).
     #[test]
-    fn test_cyclonedx_license_entry_spdx_expression_uses_name() {
-        // SPDX expressions are not bare ids and fail `license.id` enum
-        // validation; they must fall back to `name`.
-        let entry = SbomService::cyclonedx_license_entry("MIT OR Apache-2.0");
-        assert_eq!(entry["license"]["name"], "MIT OR Apache-2.0");
-        assert!(entry["license"].get("id").is_none());
+    fn test_cyclonedx_license_entry_spdx_expression_uses_expression() {
+        for expr in [
+            "MIT AND PSF-2.0",
+            "MIT OR Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "(MIT OR Apache-2.0) AND BSD-3-Clause",
+        ] {
+            let entry = SbomService::cyclonedx_license_entry(expr);
+            assert_eq!(entry, serde_json::json!({"expression": expr}), "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_prose_with_operator_words_uses_name() {
+        for text in ["GPL v2 or later", "MIT/Apache-2.0", "BSD License"] {
+            let entry = SbomService::cyclonedx_license_entry(text);
+            assert_eq!(entry["license"]["name"], text);
+            assert!(entry.get("expression").is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_compound_license_is_sole_expression() {
+        let dep = DependencyInfo {
+            name: "greenlet".to_string(),
+            version: Some("3.5.5".to_string()),
+            purl: None,
+            license: Some("MIT AND PSF-2.0".to_string()),
+            sha256: None,
+            cpe: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT AND PSF-2.0"}])
+        );
     }
 
     #[test]
