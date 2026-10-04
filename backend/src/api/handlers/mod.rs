@@ -354,6 +354,7 @@ pub mod oci_digest;
 pub mod oci_v2;
 pub mod package_analysis;
 pub mod packages;
+pub mod pacman;
 pub mod peer;
 pub mod peer_instance_labels;
 pub mod peers;

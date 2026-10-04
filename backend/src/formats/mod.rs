@@ -28,6 +28,7 @@ pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod pacman;
 pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
@@ -141,6 +142,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
+        "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
         _ => None,
     }
 }
@@ -205,6 +207,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
+        RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
     }
 }
 
@@ -364,6 +367,11 @@ fn core_handler_metadata(
         "bazel" => ("Bazel", "Bazel modules and rulesets", &[".tar.gz"]),
         "protobuf" => ("Protobuf", "Protocol Buffer schema registry", &[".proto"]),
         "incus" => ("Incus/LXC", "Incus and LXC container images", &[".tar.xz"]),
+        "pacman" => (
+            "Pacman",
+            "Arch Linux pacman packages",
+            &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.
         other => (other, "Compiled-in format handler", &[]),

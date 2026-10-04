@@ -2977,6 +2977,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "cran" => Ok(RepositoryFormat::Cran),
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
+        "pacman" => Ok(RepositoryFormat::Pacman),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
@@ -14595,6 +14596,7 @@ mod tests {
             "p2",
             "bazel",
             "protobuf",
+            "pacman",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);

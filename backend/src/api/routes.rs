@@ -96,6 +96,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/composer", handlers::composer::router())
         .nest("/conan", handlers::conan::router())
         .nest("/alpine", handlers::alpine::router())
+        .nest("/pacman", handlers::pacman::router())
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
         .nest("/swift", handlers::swift::router())

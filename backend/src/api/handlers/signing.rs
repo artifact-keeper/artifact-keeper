@@ -217,9 +217,9 @@ fn resolve_key_type_and_algorithm(
 /// signing, at key-creation (config) time rather than at anonymous request time
 /// (#2651).
 ///
-/// Debian (`InRelease`/`Release.gpg`) and RPM (`repomd.xml.asc`) metadata is
-/// signed with OpenPGP (`SigningService::sign_openpgp_*`), which can only load a
-/// `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
+/// Debian (`InRelease`/`Release.gpg`), RPM (`repomd.xml.asc`) and pacman
+/// (`{repo}.db.sig`) metadata is signed with OpenPGP
+/// (`SigningService::sign_openpgp_*`), which can only load a `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
 /// the OpenPGP path can never parse, so such a key lets the repository boot
 /// green and then fail every `apt`/`dnf` metadata poll — a fail-open config
 /// trap. This turns that latent request-time failure into an actionable 400 at
@@ -233,11 +233,15 @@ fn validate_key_type_for_repo_format(
     format: &RepositoryFormat,
     key_type: &str,
 ) -> std::result::Result<(), String> {
-    let requires_openpgp = matches!(format, RepositoryFormat::Debian | RepositoryFormat::Rpm);
+    let requires_openpgp = matches!(
+        format,
+        RepositoryFormat::Debian | RepositoryFormat::Rpm | RepositoryFormat::Pacman
+    );
     if requires_openpgp && key_type != "gpg" {
         return Err(format!(
             "key_type='{key_type}' cannot sign {format:?} repository metadata. \
-             Debian/RPM metadata (InRelease, Release.gpg, repomd.xml.asc) is OpenPGP-signed \
+             Debian/RPM/pacman metadata (InRelease, Release.gpg, repomd.xml.asc, {{repo}}.db.sig) \
+             is OpenPGP-signed \
              and requires a signing key with key_type='gpg'. Supported key_type for this \
              repository format: gpg."
         ));
@@ -701,6 +705,13 @@ mod tests {
     #[test]
     fn test_rpm_rejects_rsa_key_type() {
         assert!(validate_key_type_for_repo_format(&RepositoryFormat::Rpm, "rsa").is_err());
+    }
+
+    #[test]
+    fn test_pacman_requires_gpg_key_type() {
+        // `{repo}.db.sig` is a detached OpenPGP signature (#3343).
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Pacman, "rsa").is_err());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Pacman, "gpg").is_ok());
     }
 
     #[test]

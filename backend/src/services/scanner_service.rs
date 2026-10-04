@@ -243,6 +243,7 @@ fn format_to_purl_type(format: &str) -> &'static str {
         "rpm" => "rpm",
         "deb" | "debian" | "apt" => "deb",
         "apk" | "alpine" => "apk",
+        "pacman" | "alpm" => "alpm",
         _ => "generic",
     }
 }

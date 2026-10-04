@@ -26,12 +26,12 @@ case "$PROFILE" in
     proxy)
         TESTS=("proxy-virtual")
         ;;
-    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|pub|proxy-virtual|pub-proxy|pub-virtual|terraform-mirror|health-probes|tag-replication|curation)
+    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|pacman|pub|proxy-virtual|pub-proxy|pub-virtual|terraform-mirror|health-probes|tag-replication|curation)
         TESTS=("$PROFILE")
         ;;
     *)
         echo "ERROR: Unknown profile: $PROFILE"
-        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, pub, proxy, pub-proxy, pub-virtual, terraform-mirror, tag-replication, curation"
+        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, pacman, pub, proxy, pub-proxy, pub-virtual, terraform-mirror, tag-replication, curation"
         exit 1
         ;;
 esac
