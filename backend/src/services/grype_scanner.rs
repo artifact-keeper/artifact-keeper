@@ -851,29 +851,6 @@ async fn copy_storage_object_to_file(
 /// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
 const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
 
-/// Decide what `GRYPE_DB_CACHE_DIR` the grype child should be given, if any.
-///
-/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
-/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` on the child
-/// because a deployment config that replaces rather than appends the container
-/// env would otherwise drop the Dockerfile's values. `GRYPE_DB_CACHE_DIR` was
-/// the one that never got carried across, and it is the one with teeth: lose
-/// it and grype falls back to `$XDG_CACHE_HOME/grype/db`, then
-/// `$HOME/.cache/grype/db`. Under OpenShift's restricted-v2 SCC the process
-/// runs as a UID with no passwd entry, so `HOME` is `/` — unwritable — and
-/// grype exits 1 with EMPTY stdout, which the caller sees as a failed scan
-/// with no findings, not as a degraded one.
-///
-/// It cannot be pinned to a literal the way the other three are, because
-/// outside the image (`cargo run`, a dev laptop, CI) grype's own
-/// `$HOME/.cache/grype` default is the right answer and forcing the image path
-/// would break it. So:
-///
-/// - an explicit non-empty `GRYPE_DB_CACHE_DIR` in our own env always wins and
-///   is passed through verbatim;
-/// - otherwise, if the image's seeded DB directory is present on disk, we are
-///   running in the backend image with the env wiped — name it explicitly;
-/// - otherwise leave it unset and let grype use its own default.
 /// The DB-related env every grype child gets, scan or probe alike.
 ///
 /// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
@@ -905,6 +882,29 @@ fn grype_db_env() -> Vec<(&'static str, String)> {
 /// stamped with the old vintage within minutes, not an hour.
 const GRYPE_DB_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Decide what `GRYPE_DB_CACHE_DIR` the grype child should be given, if any.
+///
+/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
+/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` on the child
+/// because a deployment config that replaces rather than appends the container
+/// env would otherwise drop the Dockerfile's values. `GRYPE_DB_CACHE_DIR` was
+/// the one that never got carried across, and it is the one with teeth: lose
+/// it and grype falls back to `$XDG_CACHE_HOME/grype/db`, then
+/// `$HOME/.cache/grype/db`. Under OpenShift's restricted-v2 SCC the process
+/// runs as a UID with no passwd entry, so `HOME` is `/` — unwritable — and
+/// grype exits 1 with EMPTY stdout, which the caller sees as a failed scan
+/// with no findings, not as a degraded one.
+///
+/// It cannot be pinned to a literal the way the other three are, because
+/// outside the image (`cargo run`, a dev laptop, CI) grype's own
+/// `$HOME/.cache/grype` default is the right answer and forcing the image path
+/// would break it. So:
+///
+/// - an explicit non-empty `GRYPE_DB_CACHE_DIR` in our own env always wins and
+///   is passed through verbatim;
+/// - otherwise, if the image's seeded DB directory is present on disk, we are
+///   running in the backend image with the env wiped — name it explicitly;
+/// - otherwise leave it unset and let grype use its own default.
 fn resolve_grype_db_cache_dir(
     inherited: Option<String>,
     seeded_dir_exists: bool,
