@@ -2,9 +2,29 @@ name: Scheduled Tests
 
 on:
   schedule:
-    # Run every day at 2 AM UTC
+    # Nightly, 2 AM UTC: every job except duplication-report. Each job names
+    # the cron it belongs to, so the weekly entry below runs only its own job.
     - cron: '0 2 * * *'
+    # Weekly, Mondays 5 AM UTC: duplication-report only (#1619).
+    - cron: '0 5 * * 1'
   workflow_dispatch:
+    inputs:
+      job:
+        # Dispatching every job to check one costs a Windows cross-build, a
+        # backend image build and three e2e stacks, and a red nightly-e2e or
+        # windows-cross-build files an issue. Pick the one you want.
+        description: "Which job to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - nightly-e2e
+          - dependency-check
+          - security-scan
+          - windows-cross-build
+          - duplication-report
+          - mesh-e2e
+          - oci-storage-e2e
 
 permissions:
   contents: read
@@ -12,6 +32,7 @@ permissions:
 jobs:
   nightly-e2e:
     name: 🌙 Nightly E2E Tests
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "nightly-e2e"]'), inputs.job)) }}
     # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
     # (docker CLI and compose plugin come with the ak-runner-e2e image), and
     # every bind mount in the compose file is workspace-relative, which the
@@ -84,6 +105,7 @@ jobs:
 
   dependency-check:
     name: 🔍 Dependency Check
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "dependency-check"]'), inputs.job)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -107,6 +129,7 @@ jobs:
     # which is a hard gate — two jobs named "Security Scan" where one cannot
     # fail made "Security Scan is green/red" a coin flip over meaning.
     name: Security audit report (non-gating)
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "security-scan"]'), inputs.job)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -143,6 +166,7 @@ jobs:
   # windows leg of publish-binaries.yml.
   windows-cross-build:
     name: 🪟 Windows Cross-Build
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "windows-cross-build"]'), inputs.job)) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -201,6 +225,271 @@ jobs:
               repo: context.repo.repo,
               title: '🚨 Nightly Windows cross-build failed',
               body: `The nightly x86_64-pc-windows-gnu cross-build of the backend has failed.
+
+              **Workflow:** ${context.workflow}
+              **Run:** ${context.runId}
+              **SHA:** ${context.sha}
+
+              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              `,
+              labels: ['type:bug', 'automated']
+            });
+        continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Weekly whole-repo duplication report (#1619)
+  # ════════════════════════════════════════════════════════════════════════════
+  # The per-PR "Code duplication gate" (ci.yml) measures only the files a PR
+  # changes, so duplication already on main is never measured: every PR nudges
+  # a few lines of it and passes. This job measures the whole tree with the
+  # same scope and limits (.jscpd.json, inline test modules stripped) and
+  # compares it against .github/duplication-baseline.json. It is a report: a
+  # regression turns this scheduled run red, it never blocks a pull request.
+  duplication-report:
+    name: Whole-repo duplication report
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 5 * * 1') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "duplication-report"]'), inputs.job)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same Node major and jscpd major as the per-PR gate in ci.yml, so the
+      # two measure with the same detector.
+      - name: Setup Node.js for jscpd
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install jscpd
+        run: npm install -g jscpd@4 --silent
+
+      - name: Scan backend/src
+        run: bash scripts/ci/jscpd-repo-scan.sh jscpd-repo-report
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: jscpd-repo-report
+          path: |
+            jscpd-repo-report/summary.md
+            jscpd-repo-report/sources.txt
+            jscpd-repo-report/linemap.json
+            jscpd-repo-report/jscpd/jscpd-report.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Backend image for the self-contained e2e stacks below
+  # ════════════════════════════════════════════════════════════════════════════
+  # Built once from this checkout and handed to mesh-e2e and oci-storage-e2e as
+  # an artifact, so a dispatch from a branch tests that branch's backend. Same
+  # recipe as ci.yml's build-backend-image (see the rationale there): hosted
+  # runner, `ci` cargo profile, read-only registry cache.
+  backend-image:
+    name: Build backend image (e2e)
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "mesh-e2e", "oci-storage-e2e"]'), inputs.job)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build backend image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: artifact-keeper-backend:test
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          build-args: |
+            CARGO_BUILD_JOBS=4
+            CARGO_PROFILE=ci
+
+      - name: Save image
+        run: |
+          docker save artifact-keeper-backend:test | gzip > /tmp/backend-image.tar.gz
+          ls -lh /tmp/backend-image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scheduled-backend-image
+          path: /tmp/backend-image.tar.gz
+          retention-days: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Two-peer mesh replication (#1936)
+  # ════════════════════════════════════════════════════════════════════════════
+  # The release-path mesh suite needs a multi-DC Kubernetes deployment
+  # (mesh-e2e.yml, ArgoCD apps ak-mesh-*) that is not stood up anywhere, so
+  # mesh had no running signal at all. docker-compose.mesh-e2e.yml is a
+  # self-contained two-peer stack (two backends, two Postgres) that runs peer
+  # registration, sync policies, push replication, retroactive sync and
+  # heartbeats end to end: an artifact uploaded to peer-a must be downloadable
+  # from peer-b. Nightly, not a release gate; promoting it is a separate call.
+  mesh-e2e:
+    name: Mesh replication E2E (two peers)
+    needs: backend-image
+    if: ${{ !cancelled() && needs.backend-image.result == 'success' && ((github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "mesh-e2e"]'), inputs.job))) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      issues: write
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Download backend image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scheduled-backend-image
+          path: /tmp
+
+      - name: Load backend image
+        run: gunzip -c /tmp/backend-image.tar.gz | docker load
+
+      - name: Run mesh suite
+        run: |
+          docker compose -f docker-compose.mesh-e2e.yml up --no-build \
+            --abort-on-container-exit --exit-code-from mesh-test
+
+      - name: Dump peer logs
+        if: failure()
+        run: |
+          for svc in backend-peer-a backend-peer-b; do
+            echo "::group::$svc (last 300 lines)"
+            docker compose -f docker-compose.mesh-e2e.yml logs --no-color --tail=300 "$svc" || true
+            echo "::endgroup::"
+          done
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.mesh-e2e.yml down -v --remove-orphans || true
+
+      - name: Notify on failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Nightly mesh replication E2E failed',
+              body: `The nightly two-peer mesh replication suite (docker-compose.mesh-e2e.yml, #1936) has failed.
+
+              **Workflow:** ${context.workflow}
+              **Run:** ${context.runId}
+              **SHA:** ${context.sha}
+
+              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              `,
+              labels: ['type:bug', 'automated']
+            });
+        continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # OCI push/pull against object storage (#1529)
+  # ════════════════════════════════════════════════════════════════════════════
+  # Every other OCI e2e runs on the filesystem backend; the cloud backends'
+  # streaming paths were covered only by mocks. This drives the real registry
+  # HTTP path with a docker client into MinIO, including a >5 MiB layer (the
+  # multipart `put_stream` path) and a two-chunk upload (`storage_concat_stream`),
+  # with a filesystem leg of the identical suite for comparison.
+  # The docker client runs on the runner, not in the compose network: its
+  # daemon only speaks plain HTTP to loopback registries, so the backend is
+  # published on 127.0.0.1 (see docker-compose.oci-storage-e2e.yml).
+  oci-storage-e2e:
+    name: OCI push/pull E2E (${{ matrix.storage }})
+    needs: backend-image
+    if: ${{ !cancelled() && needs.backend-image.result == 'success' && ((github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "oci-storage-e2e"]'), inputs.job))) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      issues: write
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: [s3, filesystem]
+    env:
+      COMPOSE_FILE: docker-compose.oci-storage-e2e.yml
+      STORAGE_BACKEND: ${{ matrix.storage }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Download backend image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scheduled-backend-image
+          path: /tmp
+
+      - name: Load backend image
+        run: gunzip -c /tmp/backend-image.tar.gz | docker load
+
+      - name: Start stack
+        # `--wait backend` waits for the backend's healthcheck and, through
+        # its depends_on, for minio-init to have created the bucket.
+        run: docker compose up -d --no-build --wait backend
+
+      - name: Run docker push/pull suite
+        env:
+          REGISTRY_URL: localhost:18091
+        run: bash scripts/native-tests/test-docker.sh
+
+      # The suite already asserts the repository reports storage_backend=s3.
+      # This checks the other end: the large layer really is an object in the
+      # bucket, i.e. the multipart write went to MinIO and not to local disk.
+      - name: Assert a multipart-sized blob landed in MinIO
+        if: ${{ matrix.storage == 's3' }}
+        run: |
+          set -euo pipefail
+          largest=$(docker compose exec -T minio sh -c \
+              'mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc ls --recursive --json local/artifact-keeper/oci-blobs/' \
+            | jq -s '[.[].size] | max // 0')
+          echo "Largest OCI blob in MinIO: ${largest} bytes"
+          if [ "$largest" -le $((5 * 1024 * 1024)) ]; then
+            echo "::error::no OCI blob above 5 MiB in the MinIO bucket; the large-layer push did not reach S3"
+            exit 1
+          fi
+
+      - name: Dump backend logs
+        if: failure()
+        run: docker compose logs --no-color --tail=300 backend || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+      - name: Notify on failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          STORAGE: ${{ matrix.storage }}
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Nightly OCI push/pull E2E failed (${process.env.STORAGE})`,
+              body: `The nightly OCI push/pull suite against the ${process.env.STORAGE} storage backend (docker-compose.oci-storage-e2e.yml, #1529) has failed.
 
               **Workflow:** ${context.workflow}
               **Run:** ${context.runId}
