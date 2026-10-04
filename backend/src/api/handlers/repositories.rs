@@ -11187,18 +11187,31 @@ pub struct UpstreamFilterResponse {
     pub include_patterns: Vec<String>,
     /// Paths matching any of these regexes are never fetched from upstream.
     pub exclude_patterns: Vec<String>,
-    /// Whether a filter is configured (`false` when both lists are empty).
+    /// Whether a filter is enforced (`false` when none is configured). A
+    /// stored filter that can no longer be read is enforced as refuse-all, so
+    /// it reports `true` with `error` set and both lists empty.
     pub active: bool,
+    /// Set when the stored filter is unusable (only possible after a direct
+    /// database edit): every upstream fetch for this repository is refused
+    /// until a valid filter is saved or the filter is deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl UpstreamFilterResponse {
-    fn new(repository_key: String, filter: Option<UpstreamFilter>) -> Self {
-        let filter = filter.unwrap_or_default();
+    fn new(repository_key: String, stored: upstream_filter::StoredUpstreamFilter) -> Self {
+        use upstream_filter::StoredUpstreamFilter as Stored;
+        let (filter, error) = match stored {
+            Stored::None => (UpstreamFilter::default(), None),
+            Stored::Valid(filter) => (filter, None),
+            Stored::Unusable(err) => (UpstreamFilter::default(), Some(err)),
+        };
         Self {
             repository_key,
-            active: !filter.is_empty(),
+            active: !filter.is_empty() || error.is_some(),
             include_patterns: filter.include_patterns,
             exclude_patterns: filter.exclude_patterns,
+            error,
         }
     }
 }
@@ -11260,15 +11273,33 @@ pub async fn get_upstream_filter(
 ///
 /// Restricts which paths this remote repository requests from its upstream.
 /// Patterns are regular expressions (Rust `regex` syntax) matched anywhere in
-/// the upstream-relative request path, without a leading `/` (for Maven, the
-/// repository layout path such as `com/acme/lib/1.0/lib-1.0.jar`); anchor them
-/// with `^`/`$`. If `include_patterns` is non-empty a path must match one of
-/// them; a path matching any `exclude_patterns` entry is refused. A refused
-/// path answers 404 without contacting the upstream, and a virtual repository
-/// skips this member for it. Already-cached objects are not affected. At most
-/// 64 patterns per list, 512 bytes each; patterns that compile to an
-/// oversized automaton are rejected. Submitting two empty lists removes the
-/// filter.
+/// the subject; anchor them with `^`/`$`. If `include_patterns` is non-empty a
+/// path must match one of them; a path matching any `exclude_patterns` entry
+/// is refused. A refused path answers 404 without contacting the upstream, and
+/// a virtual repository skips this member for it.
+///
+/// The subject is the path as it is sent upstream, relative to the upstream
+/// URL and without a leading `/`, query string included:
+/// - Maven, Debian, OCI (`v2/<name>/manifests/<ref>`), Go and similar: the
+///   repository layout path, e.g. `com/acme/lib/1.0/lib-1.0.jar`.
+/// - npm: package metadata uses the wire form `@scope%2Fname`, tarballs
+///   `@scope/name/-/name-1.0.0.tgz`, so a scope rule should match both
+///   (`^@acme(/|%2F)`).
+/// - Formats that download from another host (PyPI files on
+///   `files.pythonhosted.org`, cargo `dl` hosts, NuGet service URLs): the full
+///   absolute URL, unless it lies under the upstream URL.
+///
+/// Not filtered in this version: npm `/-/` passthroughs (search, attestations,
+/// ping) and npm audit, curation upstream sync, change feeds, and the admin
+/// `test-upstream` probe.
+///
+/// A proxy-cache entry for a refused path is served only while it is fresh:
+/// once it expires it is neither revalidated nor served stale, and answers 404
+/// like a miss (purge it with `cache/invalidate` to hide it immediately).
+/// Limits: 64 patterns per list, 512 bytes each, each list compiled to at most
+/// 64 KiB; subjects longer than 4 KiB are refused. Submitting two empty lists
+/// removes the filter. Changes apply at once on every replica (a missed
+/// notification converges within 30 s).
 #[utoipa::path(
     put,
     path = "/{key}/upstream-filter",
@@ -11293,11 +11324,16 @@ pub async fn set_upstream_filter(
     Path(key): Path<String>,
     Json(payload): Json<UpstreamFilter>,
 ) -> Result<Json<UpstreamFilterResponse>> {
-    // Reject a bad pattern before any repository lookup or permission query.
-    payload.compile().map_err(AppError::Validation)?;
+    // Authorize first; `save_upstream_filter` then validates (naming the list
+    // and index of a bad pattern) and persists, compiling the filter once.
     let repo = upstream_filter_repo(&state, auth, &key, true).await?;
     upstream_filter::save_upstream_filter(&state.db, repo.id, &payload).await?;
-    Ok(Json(UpstreamFilterResponse::new(key, Some(payload))))
+    let stored = if payload.is_empty() {
+        upstream_filter::StoredUpstreamFilter::None
+    } else {
+        upstream_filter::StoredUpstreamFilter::Valid(payload)
+    };
+    Ok(Json(UpstreamFilterResponse::new(key, stored)))
 }
 
 /// Remove the upstream filter of a remote repository
@@ -11325,7 +11361,10 @@ pub async fn delete_upstream_filter(
 ) -> Result<Json<UpstreamFilterResponse>> {
     let repo = upstream_filter_repo(&state, auth, &key, true).await?;
     upstream_filter::delete_upstream_filter(&state.db, repo.id).await?;
-    Ok(Json(UpstreamFilterResponse::new(key, None)))
+    Ok(Json(UpstreamFilterResponse::new(
+        key,
+        upstream_filter::StoredUpstreamFilter::None,
+    )))
 }
 
 /// Load routing rules from repository_config for a given repository ID.
@@ -30351,22 +30390,48 @@ mod upstream_filter_endpoint_tests {
         };
         let (member_get, _) = tdh::send(member_app(), tdh::get(uri(&key))).await;
         let (member_put, _) = tdh::send(member_app(), put(&key, filter.clone())).await;
+        let (member_delete, _) = tdh::send(member_app(), delete(&key)).await;
         let (anon_get, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri(&key))).await;
+        // Authorization precedes validation: an anonymous caller never reaches
+        // the regex compiler, so a bad pattern still answers 401, not 400.
+        let bad_filter = serde_json::json!({"exclude_patterns": ["ok", "(unclosed"]});
+        let (anon_bad_put, _) = tdh::send(
+            fx.router_anon(super::router()),
+            put(&key, bad_filter.clone()),
+        )
+        .await;
 
         tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let app = || fx.router_with_auth(super::router());
 
         let (empty_status, empty_body) = tdh::send(app(), tdh::get(uri(&key))).await;
-        let (bad_status, bad_body) = tdh::send(
-            app(),
-            put(
-                &key,
-                serde_json::json!({"exclude_patterns": ["ok", "(unclosed"]}),
-            ),
-        )
-        .await;
+        let (bad_status, bad_body) = tdh::send(app(), put(&key, bad_filter)).await;
         let (put_status, put_body) = tdh::send(app(), put(&key, filter.clone())).await;
         let (get_status, get_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+
+        // A read-only API token of the same repository admin may read but not
+        // change or remove the filter.
+        let read_only = || {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_api_token = true;
+            auth.scopes = Some(vec!["read:repositories".to_string()]);
+            tdh::router_with_auth(super::router(), fx.state.clone(), auth)
+        };
+        let (ro_get, _) = tdh::send(read_only(), tdh::get(uri(&key))).await;
+        let (ro_put, _) = tdh::send(read_only(), put(&key, filter.clone())).await;
+        let (ro_delete, _) = tdh::send(read_only(), delete(&key)).await;
+
+        // A stored value that no longer parses (direct DB edit) is enforced as
+        // refuse-all, so GET must report it as active with an error.
+        sqlx::query(
+            "UPDATE repository_config SET value = 'not json' \
+             WHERE repository_id = $1 AND key = 'upstream_filter'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("corrupt stored filter");
+        let (corrupt_status, corrupt_body) = tdh::send(app(), tdh::get(uri(&key))).await;
         let (del_status, del_body) = tdh::send(app(), delete(&key)).await;
         let (after_status, after_body) = tdh::send(app(), tdh::get(uri(&key))).await;
 
@@ -30386,7 +30451,19 @@ mod upstream_filter_endpoint_tests {
 
         assert_eq!(member_get, StatusCode::FORBIDDEN);
         assert_eq!(member_put, StatusCode::FORBIDDEN);
+        assert_eq!(member_delete, StatusCode::FORBIDDEN);
         assert_eq!(anon_get, StatusCode::UNAUTHORIZED);
+        assert_eq!(anon_bad_put, StatusCode::UNAUTHORIZED);
+        assert_eq!(ro_get, StatusCode::OK);
+        assert_eq!(ro_put, StatusCode::FORBIDDEN);
+        assert_eq!(ro_delete, StatusCode::FORBIDDEN);
+        assert_eq!(corrupt_status, StatusCode::OK);
+        let corrupt = json(&corrupt_body);
+        assert_eq!(corrupt["active"], true, "{corrupt}");
+        assert!(
+            corrupt["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{corrupt}"
+        );
 
         assert_eq!(empty_status, StatusCode::OK);
         assert_eq!(json(&empty_body)["active"], false);
@@ -30404,6 +30481,7 @@ mod upstream_filter_endpoint_tests {
         assert_eq!(got["include_patterns"], filter["include_patterns"]);
         assert_eq!(got["exclude_patterns"], filter["exclude_patterns"]);
         assert_eq!(got["active"], true);
+        assert!(got.get("error").is_none(), "{got}");
 
         assert_eq!(del_status, StatusCode::OK);
         assert_eq!(json(&del_body)["active"], false);

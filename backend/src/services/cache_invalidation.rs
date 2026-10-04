@@ -96,6 +96,12 @@ pub enum InvalidationEvent {
         repo_keys: Vec<String>,
         package: String,
     },
+    /// A Remote repository's upstream filter was saved or removed (#4399).
+    /// Each replica drops its compiled copy so the change applies at once
+    /// rather than after the filter cache TTL.
+    ///
+    /// Emitted application-side by [`notify_upstream_filter_changed`].
+    UpstreamFilterChanged { repo_id: Uuid },
 }
 
 /// Versioned wrapper matching the exact JSON the triggers emit.
@@ -170,6 +176,9 @@ pub async fn apply_invalidation_event(
                     cache.invalidate_package(repo_key, package).await;
                 }
             }
+        }
+        InvalidationEvent::UpstreamFilterChanged { repo_id } => {
+            crate::services::upstream_filter::invalidate_cached_filter(*repo_id).await;
         }
     }
 }
@@ -337,6 +346,36 @@ pub async fn notify_npm_packument_invalidated(pool: &PgPool, repo_keys: &[String
                  other replicas converge via stale-while-revalidate"
             );
         }
+    }
+}
+
+/// Serialize one [`InvalidationEvent::UpstreamFilterChanged`] envelope.
+pub fn upstream_filter_changed_payload(repo_id: Uuid) -> String {
+    serde_json::to_string(&InvalidationEnvelope {
+        v: CACHE_INVALIDATION_VERSION,
+        event: InvalidationEvent::UpstreamFilterChanged { repo_id },
+    })
+    .expect("upstream filter invalidation envelope must serialize")
+}
+
+/// Publish an [`InvalidationEvent::UpstreamFilterChanged`] so every listening
+/// replica drops its compiled upstream filter for `repo_id` (#4399).
+/// Best-effort: on failure other replicas converge within the filter cache
+/// TTL (30 s).
+pub async fn notify_upstream_filter_changed(pool: &PgPool, repo_id: Uuid) {
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(CACHE_INVALIDATION_CHANNEL)
+        .bind(upstream_filter_changed_payload(repo_id))
+        .execute(pool)
+        .await
+    {
+        counter!("ak_cache_invalidation_notify_errors_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            repository_id = %repo_id,
+            "failed to publish upstream filter invalidation; \
+             other replicas converge within the filter cache TTL"
+        );
     }
 }
 
@@ -559,6 +598,9 @@ mod tests {
                 repo_keys: vec!["npm-local".to_string(), "npm-virtual".to_string()],
                 package: "@acme/webapp".to_string(),
             },
+            InvalidationEvent::UpstreamFilterChanged {
+                repo_id: Uuid::new_v4(),
+            },
         ];
         for event in events {
             let payload = serde_json::to_string(&InvalidationEnvelope {
@@ -570,6 +612,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("payload {payload} must parse, got: {e}"));
             assert_eq!(parsed, event, "round-trip mismatch for {payload}");
         }
+    }
+
+    /// #4399: the application-side upstream-filter event round-trips through
+    /// the listener's parser, and applying it is accepted by every replica.
+    #[tokio::test]
+    async fn upstream_filter_changed_payload_parses_and_applies() {
+        let repo_id = Uuid::new_v4();
+        let payload = upstream_filter_changed_payload(repo_id);
+        assert!(
+            payload.contains(r#""kind":"upstream_filter_changed""#),
+            "{payload}"
+        );
+        let event = parse_invalidation_payload(&payload).expect("payload parses");
+        assert_eq!(event, InvalidationEvent::UpstreamFilterChanged { repo_id });
+        apply_invalidation_event(&test_handles(), &event).await;
     }
 
     #[test]

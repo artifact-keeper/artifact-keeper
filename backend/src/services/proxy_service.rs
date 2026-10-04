@@ -3579,6 +3579,8 @@ impl ProxyService {
         body: Bytes,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
         Self::validate_relative_post_endpoint(path)?;
         let full_url = self.gated_upstream_url(repo, path).await?;
@@ -3981,6 +3983,8 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<CachedBody> {
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
@@ -5087,6 +5091,8 @@ impl ProxyService {
     /// Returns true if upstream has newer content or cache is expired.
     pub async fn check_upstream(&self, repo: &Repository, path: &str) -> Result<bool> {
         // Validate repository type
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
 
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
@@ -6922,6 +6928,16 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // #4399: the off-host URL is matched as a full absolute URL (there is
+        // no configured-upstream prefix to strip on another host).
+        crate::services::upstream_filter::ensure_upstream_allowed(
+            &self.db,
+            repo_id,
+            &repo_id.to_string(),
+            "",
+            url,
+        )
+        .await?;
         let resp = self
             .upstream_client
             .fetch_buffered(
@@ -21274,5 +21290,121 @@ mod tests {
             vec!["mine".to_string()],
             "PyPI simple index advertised another deployment's cached projects"
         );
+    }
+}
+
+/// #840 / #4399: what an upstream filter does to a proxy-cache entry for a
+/// path it refuses.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_filter_cache_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+
+    /// Write a committed cache entry (body + sidecar) for `path` straight to
+    /// the filesystem store, expiring `expires_in_secs` from now.
+    fn seed_entry(dir: &std::path::Path, repo_key: &str, path: &str, expires_in_secs: i64) {
+        let scope = ProxyCacheScope::unscoped();
+        let body = Bytes::from_static(b"<metadata><versioning/></metadata>");
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now() - chrono::Duration::seconds(3_600),
+            // A validator, so an unfiltered expired entry WOULD revalidate.
+            upstream_etag: Some("\"etag-840\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            quarantine_until: None,
+            negative_cached_until: None,
+            expires_at: Utc::now() + chrono::Duration::seconds(expires_in_secs),
+            content_type: Some("text/xml".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&body),
+        };
+        for (key, bytes) in [
+            (
+                ProxyService::cache_storage_key(&scope, repo_key, path).unwrap(),
+                body.to_vec(),
+            ),
+            (
+                ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap(),
+                serde_json::to_vec(&metadata).unwrap(),
+            ),
+        ] {
+            let file = dir.join(key);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+    }
+
+    /// A FRESH entry for a refused path is still served; an EXPIRED one is
+    /// neither revalidated nor served stale-if-error: it answers 404 like a
+    /// miss, on both the buffered and the streaming path, and the upstream
+    /// receives zero requests throughout.
+    #[tokio::test]
+    async fn refused_path_is_served_while_fresh_and_404_once_expired_840() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"etag-840\"")
+                    .set_body_string("<metadata/>"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        save_upstream_filter(
+            &pool,
+            repo_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/fringe/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let fresh = "org/acme/fresh/maven-metadata.xml";
+        let expired = "org/acme/expired/maven-metadata.xml";
+        seed_entry(&dir, &repo_key, fresh, 600);
+        seed_entry(&dir, &repo_key, expired, -600);
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+
+        let fresh_buffered = svc.fetch_artifact(&repo, fresh).await;
+        let expired_buffered = svc.fetch_artifact(&repo, expired).await;
+        let expired_streaming = svc.fetch_artifact_streaming(&repo, expired).await;
+        let hits = upstream.received_requests().await.unwrap().len();
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert!(
+            fresh_buffered.is_ok(),
+            "a fresh cached entry is served: {:?}",
+            fresh_buffered.err()
+        );
+        assert!(
+            matches!(expired_buffered, Err(AppError::NotFound(_))),
+            "buffered: {:?}",
+            expired_buffered.err()
+        );
+        assert!(
+            matches!(expired_streaming, Err(AppError::NotFound(_))),
+            "streaming: {:?}",
+            expired_streaming.err()
+        );
+        assert_eq!(hits, 0, "a refused path must never reach the upstream");
     }
 }

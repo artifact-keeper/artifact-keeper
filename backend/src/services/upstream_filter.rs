@@ -18,6 +18,16 @@
 //! fetches from an absolute URL instead (a PyPI file on
 //! `files.pythonhosted.org`, a cargo `dl` host), the subject is that full URL
 //! unless it lies under `upstream_url`, in which case the prefix is stripped.
+//! A query string is part of the subject. npm metadata is fetched as the
+//! percent-encoded `@scope%2Fname` while tarballs are `@scope/name/-/...`, so
+//! a scope rule should match both forms (`^@acme(/|%2F)`). The subject is the
+//! wire path on purpose: it is exactly what would leave the process, and
+//! changing it later would silently change existing filters.
+//!
+//! Upstream contact made outside `ProxyService` is not filtered in this first
+//! slice: the npm `/-/` passthroughs (search, attestations, ping), npm audit,
+//! the curation upstream sync, change feeds and the admin `test-upstream`
+//! probe.
 //!
 //! # Enforcement
 //!
@@ -27,19 +37,32 @@
 //! without a single byte leaving the process — and, since virtual repositories
 //! resolve Remote members through the same service, a member whose filter
 //! refuses the path is skipped without being contacted (#840: one dead fringe
-//! remote no longer stalls every `maven-metadata.xml` merge). Objects already
-//! in the proxy cache are not retroactively hidden; purge them with
-//! `POST /api/v1/repositories/{key}/cache/invalidate`.
+//! remote no longer stalls every `maven-metadata.xml` merge).
+//!
+//! # Already-cached objects
+//!
+//! A proxy-cache entry for a now-refused path is served **only while it is
+//! fresh**. Once it expires it is not revalidated (that would contact the
+//! upstream) and stale-if-error does not apply: the expired entry is refused
+//! with `NotFound` exactly like a miss. Immutable entries (released Maven
+//! artifacts, content-addressed blobs) effectively never expire, so purge them
+//! with `POST /api/v1/repositories/{key}/cache/invalidate` to hide them at once.
 //!
 //! # Validation
 //!
 //! Patterns are validated on write and bounded: at most
 //! [`MAX_PATTERNS_PER_LIST`] per list, [`MAX_PATTERN_LEN`] bytes each, and each
-//! list compiles under a [`REGEX_SIZE_LIMIT`]-byte program ceiling so a
-//! pattern such as `(a{100}){100}` that would compile to a huge automaton is
-//! rejected up front. The `regex` crate guarantees linear-time matching, so
-//! there is no backtracking blow-up to guard against beyond the size bound.
+//! list must compile to an NFA program of at most [`REGEX_SIZE_LIMIT`] bytes
+//! (so a counted repetition such as `(\w{1000}){1000}` is rejected up front).
+//! The `regex` crate has no backtracking, but its match time is still
+//! proportional to program size times subject length, so the program ceiling
+//! is deliberately small (64 KiB): the worst accepted list matches an 8 KiB
+//! path in well under a millisecond, while realistic prefix/suffix filters use
+//! a tiny fraction of it. The lazy-DFA cache uses the same bound (a cache
+//! capacity, not a compile-time check). At match time, a subject longer than
+//! [`MAX_SUBJECT_LEN`] is refused without being matched.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,9 +85,16 @@ pub const MAX_PATTERNS_PER_LIST: usize = 64;
 /// Maximum length, in bytes, of a single pattern.
 pub const MAX_PATTERN_LEN: usize = 512;
 
-/// Ceiling on the compiled size of each pattern list (bytes), applied both to
-/// the NFA program and to the lazy-DFA cache.
-pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
+/// Ceiling on the compiled NFA program size of each pattern list (bytes);
+/// also used as the lazy-DFA cache capacity. Kept small because match cost
+/// grows with program size (see the module doc).
+pub const REGEX_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Longest subject a filter will match. A longer upstream path is refused
+/// (when a filter is configured) instead of spending CPU matching it; no
+/// legitimate package path comes near this, and the proxy cache key itself is
+/// capped at 1 KiB.
+pub const MAX_SUBJECT_LEN: usize = 4096;
 
 /// Maximum syntactic nesting depth of a pattern.
 const REGEX_NEST_LIMIT: u32 = 64;
@@ -174,7 +204,7 @@ impl CompiledUpstreamFilter {
 
     /// Whether `subject` (see [`filter_subject`]) may be fetched from upstream.
     pub fn allows(&self, subject: &str) -> bool {
-        if self.deny_all {
+        if self.deny_all || subject.len() > MAX_SUBJECT_LEN {
             return false;
         }
         if let Some(include) = &self.include {
@@ -204,14 +234,21 @@ pub fn filter_subject<'a>(upstream_url: &str, fetch_path: &'a str) -> &'a str {
     fetch_path.trim_start_matches('/')
 }
 
+/// Parse and compile a stored value, keeping the parsed form for display.
+fn parse_stored(
+    raw: &str,
+) -> std::result::Result<(UpstreamFilter, CompiledUpstreamFilter), String> {
+    let filter = serde_json::from_str::<UpstreamFilter>(raw)
+        .map_err(|e| format!("stored value is not a valid upstream filter: {e}"))?;
+    let compiled = filter.compile()?;
+    Ok((filter, compiled))
+}
+
 /// Parse a stored value and compile it; a value that fails either step is
 /// mapped to a deny-all filter (fail closed) so a corrupted row cannot
 /// silently reopen a remote the operator restricted.
 fn compile_stored(repo_id: Uuid, raw: &str) -> CompiledUpstreamFilter {
-    let compiled = serde_json::from_str::<UpstreamFilter>(raw)
-        .map_err(|e| e.to_string())
-        .and_then(|filter| filter.compile());
-    compiled.unwrap_or_else(|err| {
+    parse_stored(raw).map(|(_, compiled)| compiled).unwrap_or_else(|err| {
         tracing::error!(
             repository_id = %repo_id,
             error = %err,
@@ -237,12 +274,33 @@ async fn load_raw(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
     Ok(row.map(|(v,)| v))
 }
 
-/// Load the stored filter for display. A row that does not parse reads back as
-/// `None` (the API reports "no filter"; enforcement still fails closed).
-pub async fn load_upstream_filter(db: &PgPool, repo_id: Uuid) -> Result<Option<UpstreamFilter>> {
-    Ok(load_raw(db, repo_id)
-        .await?
-        .and_then(|raw| serde_json::from_str(&raw).ok()))
+/// What is stored for a repository, as the read API reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredUpstreamFilter {
+    /// No filter configured: every path may be fetched.
+    None,
+    /// A valid filter, enforced as stored.
+    Valid(UpstreamFilter),
+    /// A stored value that no longer parses or compiles (only reachable by
+    /// editing `repository_config` directly). Enforcement treats it as
+    /// refuse-all, so the read API must not report it as "no filter".
+    Unusable(String),
+}
+
+fn classify_stored(raw: Option<&str>) -> StoredUpstreamFilter {
+    match raw {
+        None => StoredUpstreamFilter::None,
+        Some(raw) => match parse_stored(raw) {
+            Ok((filter, _)) => StoredUpstreamFilter::Valid(filter),
+            Err(err) => StoredUpstreamFilter::Unusable(err),
+        },
+    }
+}
+
+/// Load the stored filter for display, distinguishing an unusable row from
+/// "no filter" (see [`StoredUpstreamFilter::Unusable`]).
+pub async fn load_upstream_filter(db: &PgPool, repo_id: Uuid) -> Result<StoredUpstreamFilter> {
+    Ok(classify_stored(load_raw(db, repo_id).await?.as_deref()))
 }
 
 /// Validate and persist `filter`. An empty filter removes the row. The
@@ -268,7 +326,7 @@ pub async fn save_upstream_filter(
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-    invalidate_cached_filter(repo_id).await;
+    invalidate_everywhere(db, repo_id).await;
     Ok(())
 }
 
@@ -280,7 +338,7 @@ pub async fn delete_upstream_filter(db: &PgPool, repo_id: Uuid) -> Result<()> {
         .execute(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    invalidate_cached_filter(repo_id).await;
+    invalidate_everywhere(db, repo_id).await;
     Ok(())
 }
 
@@ -297,9 +355,23 @@ static FILTER_CACHE: Lazy<MokaCache<Uuid, CachedFilter>> = Lazy::new(|| {
         .build()
 });
 
-/// Drop this process's cached compiled filter for `repo_id`.
+/// Bumped on every invalidation. A loader only publishes what it read if no
+/// invalidation happened since it started, so a read that raced a PUT/DELETE
+/// can never re-insert the pre-write filter after the writer invalidated it.
+static FILTER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Drop this process's cached compiled filter for `repo_id`. Called locally by
+/// the writer and, through the `upstream_filter_changed` cache-invalidation
+/// event, on every other replica.
 pub async fn invalidate_cached_filter(repo_id: Uuid) {
+    FILTER_GENERATION.fetch_add(1, Ordering::SeqCst);
     FILTER_CACHE.invalidate(&repo_id).await;
+}
+
+/// Invalidate locally and tell the other replicas to do the same.
+async fn invalidate_everywhere(db: &PgPool, repo_id: Uuid) {
+    invalidate_cached_filter(repo_id).await;
+    crate::services::cache_invalidation::notify_upstream_filter_changed(db, repo_id).await;
 }
 
 /// The compiled filter for `repo_id`, through the short-TTL in-process cache.
@@ -309,10 +381,13 @@ async fn compiled_filter(db: &PgPool, repo_id: Uuid) -> Result<CachedFilter> {
     if let Some(hit) = FILTER_CACHE.get(&repo_id).await {
         return Ok(hit);
     }
+    let generation = FILTER_GENERATION.load(Ordering::SeqCst);
     let compiled = load_raw(db, repo_id)
         .await?
         .map(|raw| Arc::new(compile_stored(repo_id, &raw)));
-    FILTER_CACHE.insert(repo_id, compiled.clone()).await;
+    if FILTER_GENERATION.load(Ordering::SeqCst) == generation {
+        FILTER_CACHE.insert(repo_id, compiled.clone()).await;
+    }
     Ok(compiled)
 }
 
@@ -326,8 +401,10 @@ fn check_filter(
 ) -> Result<()> {
     let subject = filter_subject(upstream_url, fetch_path);
     match filter {
+        // The subject is deliberately not echoed: it can be an absolute URL,
+        // and this message reaches the proxy's 404 log line.
         Some(filter) if !filter.allows(subject) => Err(AppError::NotFound(format!(
-            "'{subject}' is excluded by the upstream filter of repository '{repo_key}'"
+            "path excluded by the upstream filter of repository '{repo_key}'"
         ))),
         _ => Ok(()),
     }
@@ -348,7 +425,6 @@ pub async fn ensure_upstream_allowed(
         tracing::debug!(
             repository_id = %repo_id,
             repo_key = %repo_key,
-            path = %fetch_path,
             "upstream fetch refused by upstream filter"
         );
     }
@@ -399,6 +475,49 @@ mod tests {
         let exclude_only = compiled(&[], &["^express/"]);
         assert!(!exclude_only.allows("express/-/express-4.0.0.tgz"));
         assert!(exclude_only.allows("fastify/-/fastify-4.0.0.tgz"));
+    }
+
+    #[test]
+    fn overlong_subject_is_refused_without_matching() {
+        let f = compiled(&[], &["^never/"]);
+        let at_limit = "a".repeat(MAX_SUBJECT_LEN);
+        assert!(f.allows(&at_limit));
+        assert!(!f.allows(&format!("{at_limit}a")));
+        // Without a filter nothing is matched, so no cap applies.
+        assert!(check_filter(None, "r", "https://u", &format!("{at_limit}a")).is_ok());
+    }
+
+    /// The program ceiling rejects the counted-repetition lists that would make
+    /// every match cost hundreds of milliseconds under a larger limit.
+    #[test]
+    fn expensive_pattern_lists_are_rejected() {
+        let costly: Vec<String> = (0..MAX_PATTERNS_PER_LIST)
+            .map(|i| format!("a{{300}}{i}"))
+            .collect();
+        let err = UpstreamFilter {
+            include_patterns: costly,
+            exclude_patterns: vec![],
+        }
+        .compile()
+        .unwrap_err();
+        assert!(err.starts_with("include_patterns"), "{err}");
+        // A realistic 64-entry prefix list stays well inside the limit.
+        let realistic: Vec<String> = (0..MAX_PATTERNS_PER_LIST)
+            .map(|i| format!("^com/group{i}/[a-z0-9._-]+/"))
+            .collect();
+        assert!(UpstreamFilter {
+            include_patterns: realistic,
+            exclude_patterns: vec![],
+        }
+        .compile()
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalidation_bumps_the_generation() {
+        let before = FILTER_GENERATION.load(Ordering::SeqCst);
+        invalidate_cached_filter(Uuid::new_v4()).await;
+        assert!(FILTER_GENERATION.load(Ordering::SeqCst) > before);
     }
 
     #[test]
@@ -479,7 +598,7 @@ mod tests {
             "/org/x/maven-metadata.xml",
         ) {
             Err(AppError::NotFound(msg)) => {
-                assert!(msg.contains("org/x/maven-metadata.xml"), "{msg}");
+                assert!(!msg.contains("org/x"), "subject must not be echoed: {msg}");
                 assert!(msg.contains("fringe-remote"), "{msg}");
             }
             other => panic!("expected NotFound, got {other:?}"),
@@ -493,6 +612,21 @@ mod tests {
         assert!(!compile_stored(id, r#"{"include_patterns":["("]}"#).allows("x"));
         let ok = compile_stored(id, r#"{"exclude_patterns":["^bad/"]}"#);
         assert!(ok.allows("good/x") && !ok.allows("bad/x"));
+    }
+
+    #[test]
+    fn classify_stored_distinguishes_absent_valid_and_unusable() {
+        assert_eq!(classify_stored(None), StoredUpstreamFilter::None);
+        assert_eq!(
+            classify_stored(Some(r#"{"include_patterns":["^a/"]}"#)),
+            StoredUpstreamFilter::Valid(filter(&["^a/"], &[]))
+        );
+        for raw in ["not json", r#"{"exclude_patterns":["("]}"#] {
+            match classify_stored(Some(raw)) {
+                StoredUpstreamFilter::Unusable(msg) => assert!(!msg.is_empty()),
+                other => panic!("{raw}: expected Unusable, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -513,14 +647,20 @@ mod tests {
         let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
         let base = "https://upstream.example";
 
-        assert_eq!(load_upstream_filter(&pool, repo_id).await.unwrap(), None);
+        assert_eq!(
+            load_upstream_filter(&pool, repo_id).await.unwrap(),
+            StoredUpstreamFilter::None
+        );
         ensure_upstream_allowed(&pool, repo_id, &repo_key, base, "org/x.pom")
             .await
             .expect("no filter allows");
 
         let f = filter(&["^com/fringe/"], &[]);
         save_upstream_filter(&pool, repo_id, &f).await.unwrap();
-        assert_eq!(load_upstream_filter(&pool, repo_id).await.unwrap(), Some(f));
+        assert_eq!(
+            load_upstream_filter(&pool, repo_id).await.unwrap(),
+            StoredUpstreamFilter::Valid(f)
+        );
         // The save invalidated the cached "no filter" verdict.
         assert!(matches!(
             ensure_upstream_allowed(&pool, repo_id, &repo_key, base, "org/x.pom").await,
@@ -541,7 +681,10 @@ mod tests {
         save_upstream_filter(&pool, repo_id, &UpstreamFilter::default())
             .await
             .unwrap();
-        assert_eq!(load_upstream_filter(&pool, repo_id).await.unwrap(), None);
+        assert_eq!(
+            load_upstream_filter(&pool, repo_id).await.unwrap(),
+            StoredUpstreamFilter::None
+        );
         ensure_upstream_allowed(&pool, repo_id, &repo_key, base, "org/x.pom")
             .await
             .expect("filter removed");
@@ -551,7 +694,10 @@ mod tests {
             .unwrap();
         delete_upstream_filter(&pool, repo_id).await.unwrap();
         delete_upstream_filter(&pool, repo_id).await.unwrap();
-        assert_eq!(load_upstream_filter(&pool, repo_id).await.unwrap(), None);
+        assert_eq!(
+            load_upstream_filter(&pool, repo_id).await.unwrap(),
+            StoredUpstreamFilter::None
+        );
 
         tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
     }
