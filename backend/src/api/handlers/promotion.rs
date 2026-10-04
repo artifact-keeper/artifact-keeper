@@ -1202,6 +1202,13 @@ pub async fn promote_artifact(
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
+    // #3939: the copy is a new artifact in the target repository, written
+    // with raw SQL rather than through `finalize_upload`, so the promotion
+    // emits the target repository's `artifact.uploaded` itself.
+    state
+        .event_bus
+        .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
+
     tracing::info!(
         source_repo = %repo_key,
         target_repo = %target_key,
@@ -1583,6 +1590,11 @@ pub async fn promote_artifacts_bulk(
             },
         )
         .await;
+
+        // #3939: same per-copy event as the single-promote path.
+        state
+            .event_bus
+            .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
 
         promoted += 1;
         results.push(PromotionResponse {
@@ -5107,6 +5119,7 @@ mod tests {
             let (artifact, path) =
                 make_artifact_with_origin(&pool, src, &storage, "o4152", &proxy_origin).await;
 
+            let mut events = state.event_bus.subscribe();
             let res = promote_artifact(
                 State(state.clone()),
                 Extension(admin_ext(user)),
@@ -5120,6 +5133,11 @@ mod tests {
             .await
             .expect("promote should succeed");
             assert!(res.0.promoted, "the promotion must succeed");
+
+            // #3939: the copy is a new artifact in the TARGET repository and
+            // fires its one artifact.uploaded there.
+            let copy_id = tdh::artifact_id_at(&pool, tgt, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, tgt, copy_id);
 
             let copied = tdh::origin_at(&pool, tgt, &path).await;
             assert_eq!(
@@ -5158,6 +5176,7 @@ mod tests {
             let (artifact, path) =
                 make_artifact_with_origin(&pool, src, &storage, "b4152", &proxy_origin).await;
 
+            let mut events = state.event_bus.subscribe();
             let res = promote_artifacts_bulk(
                 State(state.clone()),
                 Extension(admin_ext(user)),
@@ -5182,6 +5201,9 @@ mod tests {
                 proxy_origin,
                 "a bulk promotion copy must carry the source origin verbatim too"
             );
+            // #3939: one artifact.uploaded per promoted copy, on the target.
+            let copy_id = tdh::artifact_id_at(&pool, tgt, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, tgt, copy_id);
 
             cleanup(&pool, &[src, tgt], user).await;
             let _ = std::fs::remove_dir_all(&sdir);

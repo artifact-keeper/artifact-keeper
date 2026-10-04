@@ -395,6 +395,22 @@ async fn push_gem(
     )
     .await;
 
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "rubygems",
+        gem_name,
+        &gem_version_str,
+        size_bytes,
+        &computed_sha256,
+        gemspec.summary.as_deref(),
+    )
+    .await;
+
     info!(
         "RubyGems push: {} {} ({}) to repo {}",
         gem_name, gem_version, filename, repo_key
@@ -2188,6 +2204,7 @@ mod tests {
         builder.append(&header, &metadata_gz[..]).unwrap();
         let gem = builder.into_inner().unwrap();
 
+        let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());
         let req = axum::http::Request::builder()
             .method("POST")
@@ -2201,7 +2218,13 @@ mod tests {
             status,
             String::from_utf8_lossy(&body[..])
         );
+        // #3939: the push registers its catalog row and fires exactly one
+        // artifact.uploaded (it used to fire none).
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "pushgem", "1.0.0")
+            .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "pushgem").await;
         f.teardown().await;
+        assert!(row.is_some(), "a gem push must write a packages row");
     }
 }
 

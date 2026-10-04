@@ -999,6 +999,13 @@ pub async fn approve_promotion(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // #3939: the approved copy is a new artifact in the target repository,
+    // inserted with raw SQL, so this path emits its `artifact.uploaded` the
+    // same way the direct promote routes do.
+    state
+        .event_bus
+        .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
+
     tracing::info!(
         approval_id = %approval_id,
         artifact = %approval.artifact_id,
@@ -3035,6 +3042,7 @@ mod tests {
             let artifact = make_artifact(&pool, src, &storage, "sodok").await;
             let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
 
+            let mut events = state.event_bus.subscribe();
             let res = approve_promotion(
                 State(state.clone()),
                 Extension(admin_ext(approver)),
@@ -3054,6 +3062,17 @@ mod tests {
                 "a distinct-approver promotion must copy the artifact"
             );
             assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            // #3939: the approved copy fires its one artifact.uploaded on the
+            // target repository.
+            let (copy_id,): (Uuid,) = sqlx::query_as(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(tgt)
+            .fetch_one(&pool)
+            .await
+            .expect("the approved copy");
+            tdh::assert_one_artifact_uploaded_event(&mut events, tgt, copy_id);
 
             cleanup(&pool, &[src, tgt], approver).await;
             cleanup_user(&pool, requester).await;

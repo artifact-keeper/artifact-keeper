@@ -928,6 +928,12 @@ async fn complete_session_commit(
         artifact_id,
     )
     .await;
+    // #3939: and, for the same reason, its `artifact.uploaded` event. The
+    // catalog registration above goes through `PackageService` directly (as
+    // `finalize_upload`'s does), so this is the path's only emit.
+    state
+        .event_bus
+        .emit_artifact_uploaded(artifact_id, session.repository_id, Some(user_id));
 
     // Terminal transition, token-guarded. A lost lease here means the commit
     // took longer than the 6h staleness window and a newer complete request
@@ -3934,6 +3940,7 @@ mod tests {
         );
 
         // 3) PUT /:session_id/complete -- runs the new code path.
+        let mut events = f.state.event_bus.subscribe();
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(f.state.clone(), auth);
         let req = axum::http::Request::builder()
@@ -3953,6 +3960,10 @@ mod tests {
             (1, 1),
             "regular completed upload sessions remain queryable for client status"
         );
+        // #3939: the completion writes its own artifacts row, so it must fire
+        // that row's one artifact.uploaded itself.
+        let artifact_id = tdh::artifact_id_at(&f.pool, f.repo_id, "bundles/test.bin").await;
+        tdh::assert_one_artifact_uploaded_event(&mut events, f.repo_id, artifact_id);
         // #3918/#3922: the chunk was staged in the repository's backend (not
         // a replica-local temp file) and is purged once the upload completes.
         assert!(

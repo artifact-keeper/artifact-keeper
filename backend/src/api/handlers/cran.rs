@@ -402,6 +402,22 @@ async fn upload_package(
     )
     .await;
 
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "cran",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        None,
+    )
+    .await;
+
     info!(
         "CRAN upload: {} {} ({}) to repo {}",
         pkg_name, pkg_version, filename, repo_key
@@ -986,11 +1002,14 @@ mod tests {
         f.teardown().await;
     }
 
+    /// Also #3939: a CRAN upload registers its catalog row and fires exactly
+    /// one `artifact.uploaded` (it used to fire none).
     #[tokio::test]
     async fn test_cran_upload_succeeds_for_hosted() {
         let Some(f) = tdh::Fixture::setup("local", "cran").await else {
             return;
         };
+        let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());
         let body: Vec<u8> = vec![0u8; 32];
         let req = tdh::put(
@@ -999,7 +1018,14 @@ mod tests {
         );
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::OK);
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "dplyr", "1.1.0").await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "dplyr").await;
         f.teardown().await;
+        assert_eq!(
+            row.expect("a CRAN upload must write a packages row")
+                .versions,
+            vec!["1.1.0".to_string()]
+        );
     }
 
     #[tokio::test]

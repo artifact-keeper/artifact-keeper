@@ -892,6 +892,26 @@ async fn publish_package(
             .into_response());
     }
 
+    // Record the facts the signed registry has to advertise for this release:
+    // the tarball's inner checksum and its declared requirements. Both are
+    // derivable from the bytes we already hold, so capturing them here keeps
+    // the read path from re-opening the tarball on every registry fetch.
+    //
+    // #2904: required, and checked BEFORE anything is stored. `inner_checksum`
+    // is a field the client copies into `mix.lock`, so a release without a
+    // usable CHECKSUM member can never be served (`package_info` fail-closes
+    // with a 500 on it). Accepting such a tarball only moved the failure to
+    // every later read; rejecting it here with a 422 tells the publisher now
+    // and leaves no artifact row or storage object behind.
+    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_registry_facts_from_tarball(&body)
+    })
+    .map_err(|e| e.into_response())?;
+    let (inner_checksum, requirements) = publishable_registry_facts(registry_facts)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e).into_response())?;
+    let hex_metadata =
+        build_hex_publish_metadata(&pkg_name, &pkg_version, &inner_checksum, &requirements);
+
     let filename = build_hex_filename(&pkg_name, &pkg_version);
 
     // Compute SHA256
@@ -911,41 +931,6 @@ async fn publish_package(
 
     let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
-
-    // Record the facts the signed registry has to advertise for this release:
-    // the tarball's inner checksum and its declared requirements. Both are
-    // derivable from the bytes we already hold, so capturing them here keeps
-    // the read path from re-opening the tarball on every registry fetch.
-    // Best-effort: a tarball that parsed well enough to publish but carries no
-    // CHECKSUM member still publishes, and the registry falls back to reading
-    // the stored bytes.
-    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_registry_facts_from_tarball(&body)
-    })
-    .map_err(|e| e.into_response())?;
-
-    let mut hex_metadata = build_hex_metadata(&pkg_name, &pkg_version);
-    match registry_facts {
-        Ok(facts) => {
-            if let Some(obj) = hex_metadata.as_object_mut() {
-                if let Some(inner) = facts.inner_checksum_hex {
-                    obj.insert("inner_checksum".to_string(), serde_json::json!(inner));
-                }
-                obj.insert(
-                    "requirements".to_string(),
-                    serde_json::json!(facts.dependencies),
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Hex publish: could not derive registry facts for {} {}: {}",
-                pkg_name,
-                pkg_version,
-                e
-            );
-        }
-    }
 
     let size_bytes = body.len() as i64;
 
@@ -974,6 +959,22 @@ async fn publish_package(
         state.scanner_service.clone(),
         repo.id,
         artifact_id,
+    )
+    .await;
+
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "hex",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        None,
     )
     .await;
 
@@ -1714,6 +1715,21 @@ fn extract_registry_facts_from_tarball(data: &[u8]) -> Result<HexRegistryFacts, 
     })
 }
 
+/// The registry facts a publish must carry (#2904): a tarball whose facts
+/// cannot be read, or that has no `CHECKSUM` member, is refused with the
+/// returned message. A malformed CHECKSUM is already an `Err` from
+/// [`extract_registry_facts_from_tarball`].
+fn publishable_registry_facts(
+    facts: Result<HexRegistryFacts, String>,
+) -> Result<(String, Vec<hex_registry::HexDependency>), String> {
+    let facts = facts.map_err(|e| format!("Invalid hex tarball: {}", e))?;
+    let inner = facts.inner_checksum_hex.ok_or_else(|| {
+        "Invalid hex tarball: no CHECKSUM member; build the package with `mix hex.build`"
+            .to_string()
+    })?;
+    Ok((inner, facts.dependencies))
+}
+
 /// Extract a string value from Erlang term format metadata.
 ///
 /// Hex metadata.config uses Erlang term format like:
@@ -1778,6 +1794,25 @@ fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
         "version": version,
         "filename": filename,
     })
+}
+
+/// [`build_hex_metadata`] plus the registry facts recorded at publish, which
+/// `release_facts_from_metadata` reads back on the fast path.
+fn build_hex_publish_metadata(
+    name: &str,
+    version: &str,
+    inner_checksum: &str,
+    requirements: &[hex_registry::HexDependency],
+) -> serde_json::Value {
+    let mut metadata = build_hex_metadata(name, version);
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "inner_checksum".to_string(),
+            serde_json::json!(inner_checksum),
+        );
+        obj.insert("requirements".to_string(), serde_json::json!(requirements));
+    }
+    metadata
 }
 
 /// Build the JSON publish response.
@@ -2186,8 +2221,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_registry_facts_without_checksum_member_is_not_fatal() {
-        // Publish must still succeed; the registry re-derives from the bytes.
+    fn test_extract_registry_facts_without_checksum_member_reports_none() {
+        // The parser itself only reports the member as absent: the read-path
+        // backfill (`resolve_release_facts`) needs that distinction for
+        // releases stored before #2904. Refusing it is the publish path's job.
         let metadata = br#"{<<"name">>,<<"a">>}.
 {<<"version">>,<<"1.0.0">>}.
 {<<"requirements">>,[]}.
@@ -2196,6 +2233,57 @@ mod tests {
         let facts = extract_registry_facts_from_tarball(&tar).unwrap();
         assert!(facts.inner_checksum_hex.is_none());
         assert!(facts.dependencies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // publishable_registry_facts / build_hex_publish_metadata (#2904)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_publishable_registry_facts_rejects_missing_checksum_member() {
+        let metadata = br#"{<<"name">>,<<"a">>}.
+{<<"version">>,<<"1.0.0">>}.
+"#;
+        let tar = build_tar(&[("metadata.config", metadata)]);
+        let err = publishable_registry_facts(extract_registry_facts_from_tarball(&tar))
+            .expect_err("a tarball without CHECKSUM must not be publishable (#2904)");
+        assert!(err.contains("CHECKSUM"), "{err}");
+    }
+
+    #[test]
+    fn test_publishable_registry_facts_rejects_unparseable_facts() {
+        let err = publishable_registry_facts(Err("bad digest".to_string())).unwrap_err();
+        assert_eq!(err, "Invalid hex tarball: bad digest");
+    }
+
+    #[test]
+    fn test_publishable_registry_facts_returns_checksum_and_requirements() {
+        let metadata = br#"{<<"name">>,<<"dep_pkg">>}.
+{<<"version">>,<<"2.1.0">>}.
+{<<"requirements">>,[[{<<"name">>,<<"jason">>},{<<"app">>,<<"jason">>},{<<"optional">>,false},{<<"requirement">>,<<"~> 1.4">>},{<<"repository">>,<<"hexpm">>}]]}.
+"#;
+        let tar = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata),
+        ]);
+        let (inner, deps) =
+            publishable_registry_facts(extract_registry_facts_from_tarball(&tar)).unwrap();
+        assert_eq!(inner, REAL_CHECKSUM);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].package, "jason");
+    }
+
+    #[test]
+    fn test_build_hex_publish_metadata_round_trips_through_fast_path() {
+        let meta = build_hex_publish_metadata("a", "1.0.0", REAL_CHECKSUM, &[]);
+        assert_eq!(meta["format"], "hex");
+        assert_eq!(meta["filename"], "a-1.0.0.tar");
+        assert_eq!(meta["inner_checksum"], REAL_CHECKSUM);
+        assert_eq!(meta["requirements"], serde_json::json!([]));
+        // What publish records is exactly what the registry's fast path reads.
+        let (inner, deps) = release_facts_from_metadata(Some(&meta)).unwrap();
+        assert_eq!(inner.len(), 32);
+        assert!(deps.is_empty());
     }
 
     #[test]
@@ -3143,8 +3231,21 @@ mod tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// POST `tar_data` to the fixture repo's publish route as the fixture user.
+    async fn publish_hex(f: &tdh::Fixture, tar_data: Vec<u8>) -> (StatusCode, bytes::Bytes) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        tdh::send(f.router_with_auth(super::router()), req).await
+    }
+
     /// #2561: an authenticated hex publish decodes the outer tarball through
     /// the permit-scoped decode (uncontended) and stores the package.
+    ///
+    /// Also #3939: it registers the catalog row and fires exactly one
+    /// `artifact.uploaded` (a hex publish used to fire none).
     #[tokio::test]
     async fn test_hex_publish_succeeds_2561() {
         let Some(f) = tdh::Fixture::setup("local", "hex").await else {
@@ -3153,29 +3254,87 @@ mod tests {
         let metadata = r#"{<<"name">>, <<"pushpkg">>}.
 {<<"version">>, <<"1.2.3">>}.
 "#;
-        let data = metadata.as_bytes();
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_path("metadata.config").unwrap();
-        header.set_size(data.len() as u64);
-        header.set_cksum();
-        builder.append(&header, data).unwrap();
-        let tar_data = builder.into_inner().unwrap();
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
 
-        let app = f.router_with_auth(super::router());
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri(format!("/{}/publish", f.repo_key))
-            .body(axum::body::Body::from(tar_data))
-            .unwrap();
-        let (status, body) = tdh::send(app, req).await;
+        let mut events = f.state.event_bus.subscribe();
+        let (status, body) = publish_hex(&f, tar_data).await;
         assert!(
             status.is_success(),
             "hex publish must succeed: {} {:?}",
             status,
             String::from_utf8_lossy(&body[..])
         );
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "pushpkg", "1.2.3")
+            .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "pushpkg").await;
         f.teardown().await;
+        assert!(row.is_some(), "a hex publish must write a packages row");
+    }
+
+    /// #2904: a tarball whose CHECKSUM member is missing or malformed can never
+    /// be served by the registry, so publish refuses it with 422 up front and
+    /// leaves NOTHING behind: no artifacts row, no storage object, no event.
+    /// Before, the bytes were stored and the row written, and every later
+    /// `/packages/{name}` read failed with a 500.
+    #[tokio::test]
+    async fn test_hex_publish_rejects_tarball_without_usable_checksum_2904() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let metadata = r#"{<<"name">>, <<"nosum">>}.
+{<<"version">>, <<"0.1.0">>}.
+"#;
+        let missing = build_tar(&[("metadata.config", metadata.as_bytes())]);
+        let malformed = build_tar(&[
+            ("CHECKSUM", b"not-a-valid-digest"),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+
+        let mut events = f.state.event_bus.subscribe();
+        let mut outcomes = Vec::new();
+        for tar_data in [missing, malformed] {
+            let (status, body) = publish_hex(&f, tar_data).await;
+            outcomes.push((status, String::from_utf8_lossy(&body).into_owned()));
+        }
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count artifacts");
+        let stored = walkdir_file_count(&f.storage_dir);
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).count();
+        f.teardown().await;
+
+        for (status, body) in &outcomes {
+            assert_eq!(*status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+            assert!(body.contains("CHECKSUM"), "the 422 must say why: {body}");
+        }
+        assert_eq!(rows, 0, "a refused publish must not write an artifacts row");
+        assert_eq!(stored, 0, "a refused publish must not store any bytes");
+        assert_eq!(emitted, 0, "a refused publish must not emit any event");
+    }
+
+    /// Regular files under `dir`, recursively (0 when it does not exist).
+    fn walkdir_file_count(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    walkdir_file_count(&p)
+                } else {
+                    1
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]

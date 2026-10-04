@@ -1643,6 +1643,24 @@ async fn upload_collection(
     )
     .await;
 
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "ansible",
+        &full_name,
+        &collection_version,
+        size_bytes,
+        &computed_sha256,
+        ansible_metadata
+            .pointer("/collection_json/description")
+            .and_then(|d| d.as_str()),
+    )
+    .await;
+
     info!(
         "Ansible upload: {}-{} {} ({}) to repo {}",
         namespace, collection_name, collection_version, filename, repo_key
@@ -2382,6 +2400,7 @@ mod tests {
         let multipart =
             galaxy_cli_multipart("BOUNDARY", "community-hashi_vault-7.1.0.tar.gz", body, &sha);
 
+        let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());
         let req = tdh::post(
             format!("/{}/api/v3/artifacts/collections/", f.repo_key),
@@ -2399,7 +2418,22 @@ mod tests {
         assert_eq!(json["namespace"], "community");
         assert_eq!(json["name"], "hashi_vault");
         assert_eq!(json["version"], "7.1.0");
+        // #3939: the publish registers its catalog row and fires exactly one
+        // artifact.uploaded (it used to fire none).
+        tdh::assert_one_artifact_uploaded(
+            &mut events,
+            &f.pool,
+            f.repo_id,
+            "community-hashi_vault",
+            "7.1.0",
+        )
+        .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "community-hashi_vault").await;
         f.teardown().await;
+        assert!(
+            row.is_some(),
+            "an ansible publish must write a packages row"
+        );
     }
 
     #[tokio::test]

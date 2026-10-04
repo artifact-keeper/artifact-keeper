@@ -375,6 +375,35 @@ const MAPPED_WITHOUT_PRODUCER: &[(&str, &str)] = &[
 mod tests {
     // ----- producer inventory gate (#3411) -------------------------------
 
+    /// Every `.rs` file under `rel` (relative to the crate root), recursively.
+    fn rust_sources(rel: &str) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("crate src readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel),
+            &mut files,
+        );
+        files
+    }
+
+    /// A source file truncated at its `#[cfg(test)] mod tests {` marker, so
+    /// what only a test does never counts as production behaviour.
+    fn production_source(body: &str) -> &str {
+        match body.find("#[cfg(test)]\nmod tests {") {
+            Some(at) => &body[..at],
+            None => body,
+        }
+    }
+
     /// Collect every event-type string literal the tree publishes.
     ///
     /// Scans the crate source for the `EventBus` emit/publish surface and takes
@@ -411,21 +440,7 @@ mod tests {
             "DomainEvent::now(",
             "DomainEvent::now_for_repo(",
         ];
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("crate src readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let files = rust_sources("src");
         assert!(
             files.len() >= 100,
             "found only {} source files — wrong crate root?",
@@ -439,10 +454,7 @@ mod tests {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let body = std::fs::read_to_string(&path).unwrap_or_default();
-            let body = match body.find("#[cfg(test)]\nmod tests {") {
-                Some(at) => &body[..at],
-                None => &body[..],
-            };
+            let body = production_source(&body);
             for call in CALLS {
                 let mut from = 0usize;
                 while let Some(rel) = body[from..].find(call) {
@@ -541,6 +553,135 @@ mod tests {
                 by_file.get(file)
             );
         }
+    }
+
+    // ----- artifact-writer gate (#3939) ----------------------------------
+
+    /// Handler files whose production code writes an `artifacts` row but
+    /// legitimately references no `artifact.uploaded` producer, each with the
+    /// reason. Everything else that writes the table must produce the event.
+    const ARTIFACT_WRITERS_WITHOUT_PRODUCER: &[(&str, &str)] = &[
+        (
+            "proxy_helpers.rs",
+            "defines the shared `insert_artifact` chokepoint; every caller \
+             registers through `register_published_package` (scanned in its own \
+             file), so emitting here would double-deliver (#3939)",
+        ),
+        (
+            "test_db_helpers.rs",
+            "test-only fixtures that seed rows; not a publish path",
+        ),
+    ];
+
+    /// What counts as an `artifact.uploaded` producer reference in a handler:
+    /// the hosted-publish catalog registration (which emits) and the
+    /// row-holding emit used by promotion, approval, Git LFS and chunked
+    /// upload completion.
+    const ARTIFACT_UPLOADED_PRODUCER_REFS: &[&str] =
+        &["register_published_package", ".emit_artifact_uploaded("];
+
+    /// True when `src` writes the `artifacts` table: a raw
+    /// `INSERT INTO artifacts` (not `artifacts_*` / `artifact_metadata`) or a
+    /// call through the shared `insert_artifact` helper.
+    fn writes_artifacts(src: &str) -> bool {
+        const INSERT: &str = "INSERT INTO artifacts";
+        let raw = src.match_indices(INSERT).any(|(at, _)| {
+            !src[at + INSERT.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        raw || src.contains("insert_artifact(")
+    }
+
+    /// Map each `api/handlers` file that writes `artifacts` in production code
+    /// to whether it references an `artifact.uploaded` producer.
+    fn handler_artifact_writers() -> std::collections::BTreeMap<String, bool> {
+        let mut out = std::collections::BTreeMap::new();
+        for path in rust_sources("src/api/handlers") {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let src = production_source(&body);
+            if !writes_artifacts(src) {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let produces = ARTIFACT_UPLOADED_PRODUCER_REFS
+                .iter()
+                .any(|r| src.contains(r));
+            out.insert(file, produces);
+        }
+        out
+    }
+
+    /// THE #3939 gate: a handler that writes an `artifacts` row must also
+    /// produce `artifact.uploaded`, or a webhook subscriber silently hears
+    /// nothing for that format (cran, hex, ansible, puppet, rubygems, the
+    /// promotion and approval copies, Git LFS and chunked uploads all did).
+    /// The allowlist is checked in both directions so it cannot rot.
+    #[test]
+    fn every_handler_that_writes_artifacts_produces_artifact_uploaded() {
+        let writers = handler_artifact_writers();
+        let allowed: std::collections::BTreeSet<&str> = ARTIFACT_WRITERS_WITHOUT_PRODUCER
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+
+        let silent: Vec<&str> = writers
+            .iter()
+            .filter(|(file, produces)| !**produces && !allowed.contains(file.as_str()))
+            .map(|(file, _)| file.as_str())
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "these handlers write `artifacts` but never produce artifact.uploaded, \
+             so webhooks never fire for them: {silent:?}. Call \
+             package_service::register_published_package (hosted publish) or \
+             EventBus::emit_artifact_uploaded (row already in hand), or record \
+             the reason in ARTIFACT_WRITERS_WITHOUT_PRODUCER."
+        );
+
+        let stale: Vec<&str> = allowed
+            .iter()
+            .filter(|f| writers.get(**f) != Some(&false))
+            .copied()
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "ARTIFACT_WRITERS_WITHOUT_PRODUCER entries that no longer write \
+             `artifacts` silently (or no longer exist): {stale:?}. Remove them."
+        );
+    }
+
+    /// The writer gate is only as good as its scanner: it must find the
+    /// formats known to write `artifacts` both ways (raw SQL and the shared
+    /// helper), or the gate above would pass vacuously.
+    #[test]
+    fn artifact_writer_scanner_finds_known_writers() {
+        let writers = handler_artifact_writers();
+        for known in ["cargo.rs", "hex.rs", "promotion.rs", "proxy_helpers.rs"] {
+            assert!(
+                writers.contains_key(known),
+                "the artifact-writer scanner must flag {known}; it found {writers:?}"
+            );
+        }
+        assert!(writers.len() >= 25, "suspiciously few writers: {writers:?}");
+    }
+
+    #[test]
+    fn writes_artifacts_matches_the_table_not_its_neighbours() {
+        assert!(writes_artifacts(
+            "sqlx::query(\"INSERT INTO artifacts (id) VALUES ($1)\")"
+        ));
+        assert!(writes_artifacts("INSERT INTO artifacts\n"));
+        assert!(writes_artifacts("proxy_helpers::insert_artifact(&db, art)"));
+        assert!(!writes_artifacts(
+            "INSERT INTO artifact_metadata (artifact_id)"
+        ));
+        assert!(!writes_artifacts("INSERT INTO artifacts_archive (id)"));
+        assert!(!writes_artifacts("SELECT * FROM artifacts"));
     }
 
     use super::*;

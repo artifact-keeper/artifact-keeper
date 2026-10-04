@@ -1909,6 +1909,70 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
     })
 }
 
+/// Assert that the native publish just driven fired exactly ONE
+/// `artifact.uploaded` (#3411, #3939), scoped to `repo_id` and identifying the
+/// `artifacts` row it wrote for `(name, version)`.
+///
+/// Subscribe with `fx.state.event_bus.subscribe()` BEFORE sending the publish,
+/// and call this before tearing the fixture down (it reads the row). Shared by
+/// the per-format publish tests so a format that stops emitting, or starts
+/// emitting twice (a second producer on the same path), fails the same way.
+pub async fn assert_one_artifact_uploaded(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    pool: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) {
+    let artifact_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 \
+         AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .expect("the publish must have written an artifacts row");
+
+    assert_one_artifact_uploaded_event(events, repo_id, artifact_id);
+}
+
+/// [`assert_one_artifact_uploaded`] for a write path whose artifact id the test
+/// already holds (a promotion copy, a Git LFS object, a chunked upload).
+pub fn assert_one_artifact_uploaded_event(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+) {
+    let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|e| e.event_type == "artifact.uploaded")
+        .collect();
+    assert_eq!(
+        uploaded.len(),
+        1,
+        "the write of artifact {artifact_id} must emit exactly one artifact.uploaded, got {uploaded:?}"
+    );
+    assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    assert_eq!(
+        uploaded[0].entity_id,
+        artifact_id.to_string(),
+        "the event must identify the artifacts row that was written"
+    );
+}
+
+/// Id of the live `artifacts` row at `(repository, path)`.
+pub async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .expect("read artifact id at path")
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).
