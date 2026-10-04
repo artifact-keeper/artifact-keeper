@@ -409,7 +409,7 @@ async fn process_candidate(
         ));
     }
 
-    let digest = crate::api::handlers::oci_v2::compute_sha256(&body);
+    let digest = crate::api::handlers::oci_digest::compute_sha256(&body);
     // A digest-shaped reference asserts content-addressed identity; refuse
     // to register bytes that do not hash to it.
     if reference.starts_with("sha256:") && reference != digest {
@@ -611,7 +611,7 @@ async fn register_child_manifest_from_artifacts(
         .await
         .map_err(|e| format!("read child manifest bytes: {}", e))?;
 
-    let computed = crate::api::handlers::oci_v2::compute_sha256(&body);
+    let computed = crate::api::handlers::oci_digest::compute_sha256(&body);
     if computed != child_digest {
         return Err(format!(
             "child manifest content digest {} != index-referenced {}",
