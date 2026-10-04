@@ -117,7 +117,7 @@ pub struct CiOidcProvider {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-    /// [`KEY_SOURCE_DISCOVERY`] or [`KEY_SOURCE_STATIC`] (migration 248).
+    /// [`KEY_SOURCE_DISCOVERY`] or [`KEY_SOURCE_STATIC`] (migration 257).
     pub key_source: String,
     /// The JWKS a `static` provider verifies against; `None` otherwise.
     pub static_jwks: Option<serde_json::Value>,
@@ -325,6 +325,50 @@ pub struct CiOidcProviderResponse {
 pub struct ProviderUpdate {
     pub provider: CiOidcProviderResponse,
     pub key_material_changed: bool,
+    /// The previous `provider_type` when this update changed it, so the
+    /// caller can emit [`log_provider_type_change`].
+    pub previous_provider_type: Option<String>,
+}
+
+/// Provider types a create or update accepts. Only `kubernetes` changes the
+/// credentials minted (read-only, no refresh token), so an unrecognised value
+/// is refused instead of silently behaving as `generic`.
+pub const PROVIDER_TYPES: &[&str] = &["gitlab", "github", "kubernetes", "generic"];
+
+/// Trim and lowercase a requested `provider_type`, then require it to be one
+/// of [`PROVIDER_TYPES`]. `Kubernetes` is stored as `kubernetes`; `k8s` is a
+/// 400 rather than a push-capable, renewable `generic` provider.
+fn normalize_provider_type(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if PROVIDER_TYPES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(AppError::Validation(format!(
+            "Unknown provider_type '{raw}': expected one of {}",
+            PROVIDER_TYPES.join(", ")
+        )))
+    }
+}
+
+/// The `security` line for an update that changed a provider's
+/// `provider_type`. Moving off `kubernetes` lifts the read-only ceiling and
+/// the no-refresh rule for every credential the provider mints from then on.
+pub fn log_provider_type_change(
+    provider: &CiOidcProviderResponse,
+    previous: &str,
+    admin_id: Uuid,
+    admin_username: &str,
+) {
+    tracing::info!(
+        target: "security",
+        provider_id = %provider.id,
+        provider_name = %provider.name,
+        admin_id = %admin_id,
+        admin = %admin_username,
+        previous_provider_type = %previous,
+        provider_type = %provider.provider_type,
+        "CI OIDC: provider type changed"
+    );
 }
 
 /// `kid`s of a JWKS, in order; a key without one is shown as `-`.
@@ -752,7 +796,10 @@ impl CiOidcService {
     }
 
     pub async fn create(&self, req: CreateCiOidcProviderRequest) -> Result<CiOidcProviderResponse> {
-        let provider_type = req.provider_type.unwrap_or_else(|| "generic".into());
+        let provider_type = match req.provider_type.as_deref() {
+            Some(raw) => normalize_provider_type(raw)?,
+            None => "generic".to_string(),
+        };
         let audience = req.audience.unwrap_or_else(|| "artifact-keeper".into());
         let is_enabled = req.is_enabled.unwrap_or(true);
         let (key_source, static_jwks) =
@@ -786,6 +833,12 @@ impl CiOidcService {
         req: UpdateCiOidcProviderRequest,
     ) -> Result<ProviderUpdate> {
         let existing = self.get(id).await?;
+        let provider_type = match req.provider_type.as_deref() {
+            Some(raw) => normalize_provider_type(raw)?,
+            None => existing.provider_type.clone(),
+        };
+        let previous_provider_type =
+            (provider_type != existing.provider_type).then(|| existing.provider_type.clone());
         let (key_source, static_jwks) = resolve_key_material(
             req.key_source,
             req.static_jwks,
@@ -808,7 +861,7 @@ impl CiOidcService {
         )
         .bind(id)
         .bind(req.name.unwrap_or(existing.name))
-        .bind(req.provider_type.unwrap_or(existing.provider_type))
+        .bind(&provider_type)
         .bind(req.issuer_url.unwrap_or(existing.issuer_url))
         .bind(req.audience.unwrap_or(existing.audience))
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
@@ -821,6 +874,7 @@ impl CiOidcService {
         Ok(ProviderUpdate {
             provider: self.get_response(id).await?,
             key_material_changed,
+            previous_provider_type,
         })
     }
 
@@ -2066,6 +2120,27 @@ pub(crate) fn test_public_jwk(kid: &str) -> serde_json::Value {
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_type_is_normalised_and_unknown_values_refused() {
+        assert_eq!(
+            super::normalize_provider_type("Kubernetes").unwrap(),
+            "kubernetes"
+        );
+        assert_eq!(
+            super::normalize_provider_type(" GitLab ").unwrap(),
+            "gitlab"
+        );
+        for bad in ["k8s", "", "kube", "custom"] {
+            assert!(
+                matches!(
+                    super::normalize_provider_type(bad),
+                    Err(crate::error::AppError::Validation(_))
+                ),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
     use super::{
         normalize_issuer, CiOidcIdentityMapping, CiOidcProvider, CiOidcService,
         UnverifiedAssertionHints,

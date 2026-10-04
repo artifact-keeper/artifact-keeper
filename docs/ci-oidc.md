@@ -64,7 +64,7 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
 ```
 
 `issuer_url` must use HTTPS and match the token's `iss` exactly. A trailing
-slash does not matter. `provider_type` (`gitlab`, `github` or `generic`)
+slash does not matter. `provider_type` (`gitlab`, `github`, `kubernetes` or `generic`)
 only affects how the account's display name is built, except for
 `kubernetes`, which also changes what the exchange mints (see
 [Kubernetes](#kubernetes-pulling-images-with-a-serviceaccount-token)).
@@ -255,10 +255,12 @@ changes three things about an exchange:
 The kubelet caches the credential on the node, where anything with root on the
 host can read it. A leaked token that could push would let an attacker replace
 images for every consumer of the registry, which is why this ceiling is fixed
-by type and cannot be widened. The type has to be exactly `kubernetes`: any
-other value, a typo such as `k8s` included, behaves as `generic` and mints an
-unrestricted, renewable token. The admin API echoes the stored type, so check
-it after creating the provider.
+by type and cannot be widened. `provider_type` is matched case-insensitively
+and stored lowercase; a value that is not `gitlab`, `github`, `kubernetes` or
+`generic`, a typo such as `k8s` included, is refused with 400. Changing a
+provider's type, for example `kubernetes` to `generic`, is written to the
+`security` log with the acting admin, because it widens every credential the
+provider mints from then on.
 
 ### Issuer and key source per platform
 

@@ -36,8 +36,8 @@ use crate::error::Result;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::auth_service::AuthService;
 use crate::services::ci_oidc_service::{
-    log_key_source_change, CiOidcMappingResponse, CiOidcProviderResponse, CiOidcService,
-    CiOidcToggleRequest, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
+    log_key_source_change, log_provider_type_change, CiOidcMappingResponse, CiOidcProviderResponse,
+    CiOidcService, CiOidcToggleRequest, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
     GroupBindingReconcileReport, UpdateCiOidcMappingRequest, UpdateCiOidcProviderRequest,
 };
 
@@ -250,6 +250,9 @@ pub async fn update_provider(
     let updated = svc.update(id, req).await?;
     if updated.key_material_changed {
         log_key_source_change(&updated.provider, auth.user_id, &auth.username);
+    }
+    if let Some(previous) = &updated.previous_provider_type {
+        log_provider_type_change(&updated.provider, previous, auth.user_id, &auth.username);
     }
     Ok(Json(updated.provider))
 }
@@ -1053,6 +1056,44 @@ mod tests {
             assert!(line.contains(&needle), "missing {needle} in: {line}");
         }
         assert!(line.contains("security"), "target is security: {line}");
+
+        // Type changes are logged, and an unknown type is refused untouched.
+        let widened = update_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(UpdateCiOidcProviderRequest {
+                provider_type: Some("Generic".to_string()),
+                ..update(None, None)
+            }),
+        )
+        .await
+        .expect("change the provider type")
+        .0;
+        assert_eq!(widened.provider_type, "generic");
+        let logs = capture.contents();
+        let line = logs
+            .lines()
+            .rfind(|l| l.contains("CI OIDC: provider type changed"))
+            .expect("a security line for the type change");
+        for needle in [
+            "previous_provider_type=kubernetes",
+            "provider_type=generic",
+            "admin=ci-admin-test",
+        ] {
+            assert!(line.contains(needle), "missing {needle} in: {line}");
+        }
+        let refused = update_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(UpdateCiOidcProviderRequest {
+                provider_type: Some("k8s".to_string()),
+                ..update(None, None)
+            }),
+        )
+        .await;
+        assert!(refused.is_err(), "k8s must be refused");
 
         let before = capture
             .contents()
