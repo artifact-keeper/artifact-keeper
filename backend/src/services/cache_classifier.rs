@@ -49,6 +49,15 @@ pub const NEGATIVE_CACHE_TTL_SECS: i64 = 45;
 /// returning a hard error for a body we already hold.
 pub const STALE_IF_ERROR_GRACE_SECS: i64 = 3600;
 
+/// The longest cache lifetime anything in the proxy cache is ever stamped with
+/// (~10 years). It is the "effectively forever" TTL written for
+/// [`Mutability::Immutable`] paths, and also the ceiling of a repository's
+/// `cache_ttl_secs` override (#2667): an operator who wants a remote's mutable
+/// paths to stop revalidating sets the override to this value, which gives them
+/// the same lifetime an immutable artifact gets. Bounding every TTL here also
+/// keeps `now + ttl` far away from chrono's representable range.
+pub const MAX_CACHE_TTL_SECS: i64 = 315_360_000;
+
 /// Whether a proxied path's content can change upstream after it is first
 /// cached. See the module docs for the immutable-vs-mutable contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +94,64 @@ impl Mutability {
             // ~10 years. Immutable hits are short-circuited by `evaluate`, so
             // this is only a backstop for any code path that reads `expires_at`
             // directly; it must be large enough never to expire in practice.
-            Mutability::Immutable => 315_360_000,
+            Mutability::Immutable => MAX_CACHE_TTL_SECS,
             Mutability::Mutable { default_ttl_secs } => default_ttl_secs,
         }
+    }
+
+    /// Apply a repository's `cache_ttl_secs` override to this classification.
+    ///
+    /// The precedence rule (#3706, kept by #3658 and #3832): **an operator
+    /// override replaces the classifier's default for every mutable path** —
+    /// the conservative 5-minute default and the longer GitHub-release defaults
+    /// alike, in both directions — and **never touches an immutable path**,
+    /// which keeps caching forever whatever the override says. With no
+    /// override the classifier default stands.
+    ///
+    /// The override is bounded to `±MAX_CACHE_TTL_SECS`: the API never stores
+    /// more than the maximum, but `repository_config` is free text, and an
+    /// unbounded value would overflow `chrono` when stamped as `now + ttl`. A
+    /// non-positive value is passed through unchanged (it means "expire
+    /// immediately").
+    pub fn with_ttl_override(self, override_secs: Option<i64>) -> Self {
+        match (self, override_secs) {
+            (Mutability::Mutable { .. }, Some(secs)) => Mutability::Mutable {
+                default_ttl_secs: secs.clamp(-MAX_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS),
+            },
+            (other, _) => other,
+        }
+    }
+}
+
+/// The instant a cached entry stops being fresh, under the policy in force
+/// *now* rather than the one in force when it was written (#3832).
+///
+/// The sidecar records an absolute `stamped_expires_at` computed at write (or
+/// 304-revalidation) time from the TTL that applied then. When an operator
+/// later *lowers* a repository's TTL, trusting that stamp keeps every mutable
+/// entry written under the old value fresh until its original expiry — up to
+/// the old TTL later. So for a mutable path the effective expiry is
+/// `min(stamped_expires_at, cached_at + current_ttl)`: lowering the TTL takes
+/// effect immediately, measured from when the entry was cached or last
+/// confirmed current, while raising it applies from the entry's next
+/// revalidation (the stamp still caps it).
+///
+/// Immutable entries keep their stamp: whether a path is immutable is the
+/// classifier's decision at read time, never inferred from the stamped value.
+///
+/// Every freshness gate in the proxy goes through this one function, so the
+/// buffered, streaming, presign and metadata-only paths cannot disagree about
+/// when an entry expired.
+pub fn effective_expires_at(
+    mutability: Mutability,
+    cached_at: DateTime<Utc>,
+    stamped_expires_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match mutability {
+        Mutability::Immutable => stamped_expires_at,
+        Mutability::Mutable { default_ttl_secs } => chrono::Duration::try_seconds(default_ttl_secs)
+            .and_then(|ttl| cached_at.checked_add_signed(ttl))
+            .map_or(stamped_expires_at, |policy| policy.min(stamped_expires_at)),
     }
 }
 
@@ -631,13 +695,24 @@ pub const GITHUB_RELEASE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Release URLs name replaceable objects, not content digests. Cache assets
 /// (including checksum files) for a finite period and revalidate on expiry.
+///
+/// The same lifetime applies to the GitHub API's release-by-tag lookup,
+/// `repos/<owner>/<repo>/releases/tags/<tag>` (#3658), which mise's aqua
+/// backend calls even for an exactly pinned version. A tag's release JSON is
+/// nearly but not strictly immutable (notes get edited, assets re-uploaded), so
+/// it stays mutable and revalidates on expiry. The paginated release *list*
+/// (`repos/<owner>/<repo>/releases`) changes with every release and keeps the
+/// conservative default.
 fn classify_github_release(path: &str) -> Mutability {
     let segments: Vec<&str> = path.split('/').collect();
-    if segments.len() >= 6
-        && segments[2] == "releases"
-        && segments[3] == "download"
-        && segments.iter().all(|segment| !segment.is_empty())
-    {
+    let all_present = segments.iter().all(|segment| !segment.is_empty());
+    let is_release_asset =
+        segments.len() >= 6 && segments[2] == "releases" && segments[3] == "download";
+    let is_release_tag_lookup = segments.len() == 6
+        && segments[0] == "repos"
+        && segments[3] == "releases"
+        && segments[4] == "tags";
+    if all_present && (is_release_asset || is_release_tag_lookup) {
         Mutability::Mutable {
             default_ttl_secs: GITHUB_RELEASE_TTL_SECS,
         }
@@ -1118,14 +1193,27 @@ mod tests {
             "/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
             "owner/repo/releases/download/v1/subdir/asset",
             "owner/repo/releases/download/v1/sha256sum.txt",
+            // #3658: the GitHub API release-by-tag lookup (api.github.com
+            // proxied through a `github` remote) gets the same lifetime.
+            "repos/cli/cli/releases/tags/v1",
+            "/repos/jqlang/jq/releases/tags/jq-1.7.1",
         ];
         let other = [
             "cli/cli/releases/latest/download/gh.tar.gz",
             "cli/cli/releases/download/v1",
             "cli/cli/releases/download//asset",
             "mirror/cli/cli/releases/download/v1/asset",
-            "repos/cli/cli/releases/tags/v1",
+            // #3658 negatives: the paginated list, `latest`, a missing tag,
+            // extra segments and other API shapes keep the short default.
             "repos/cli/cli/releases",
+            "repos/cli/cli/releases/latest",
+            "repos/cli/cli/releases/tags",
+            "repos/cli/cli/releases/tags/",
+            "repos/cli/cli/releases/tags/v1/assets",
+            "repos//cli/releases/tags/v1",
+            "repos/cli/cli/releases/12345",
+            "repos/cli/cli/tags/v1",
+            "orgs/cli/cli/releases/tags/v1",
             "file.bin",
         ];
         for format in [
@@ -1166,6 +1254,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #3658 / #3832 / #2667 precedence rule: an operator override replaces
+    /// the classifier default on every mutable path (shorter or longer than
+    /// the default, including the GitHub-release lifetime) and never touches
+    /// an immutable one.
+    #[test]
+    fn ttl_override_replaces_mutable_defaults_and_never_touches_immutable() {
+        let tag_lookup = classify(&RepositoryFormat::Github, "repos/o/r/releases/tags/v1");
+        assert_eq!(tag_lookup.write_ttl_secs(), GITHUB_RELEASE_TTL_SECS);
+        assert_eq!(tag_lookup.with_ttl_override(Some(60)).write_ttl_secs(), 60);
+        assert_eq!(tag_lookup.with_ttl_override(None), tag_lookup);
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(86_400))
+                .write_ttl_secs(),
+            86_400
+        );
+        assert_eq!(
+            Mutability::Immutable.with_ttl_override(Some(60)),
+            Mutability::Immutable
+        );
+        // Bounded so a hand-edited row cannot overflow `now + ttl`; a
+        // non-positive value (expire immediately) passes through.
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(i64::MAX))
+                .write_ttl_secs(),
+            MAX_CACHE_TTL_SECS
+        );
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(i64::MIN))
+                .write_ttl_secs(),
+            -MAX_CACHE_TTL_SECS
+        );
+        assert_eq!(
+            Mutability::mutable_default()
+                .with_ttl_override(Some(-7200))
+                .write_ttl_secs(),
+            -7200
+        );
+        // The override ceiling IS the immutable lifetime (#2667).
+        assert_eq!(Mutability::Immutable.write_ttl_secs(), MAX_CACHE_TTL_SECS);
+    }
+
+    /// #3832: lowering the TTL is retroactive for mutable entries, raising it
+    /// is not, and immutable entries keep their stamp.
+    #[test]
+    fn effective_expiry_clamps_mutable_entries_to_the_current_ttl() {
+        let cached_at = Utc::now() - chrono::Duration::hours(1);
+        let thirty_days = cached_at + chrono::Duration::days(30);
+        let ttl = |secs| Mutability::Mutable {
+            default_ttl_secs: secs,
+        };
+
+        // Written under 30 days, TTL now 300 s: expired 55 minutes ago.
+        let lowered = effective_expires_at(ttl(300), cached_at, thirty_days);
+        assert_eq!(lowered, cached_at + chrono::Duration::seconds(300));
+        let entry = CacheEntry {
+            mutability: ttl(300),
+            expires_at: lowered,
+            negative_cached_until: None,
+        };
+        assert_eq!(evaluate(Some(&entry), Utc::now()), Freshness::Stale);
+
+        // Unchanged TTL: the stamp stands.
+        assert_eq!(
+            effective_expires_at(ttl(30 * 86_400), cached_at, thirty_days),
+            thirty_days
+        );
+        // Raised TTL: still capped by the stamp until the next revalidation.
+        let short_stamp = cached_at + chrono::Duration::seconds(300);
+        assert_eq!(
+            effective_expires_at(ttl(86_400), cached_at, short_stamp),
+            short_stamp
+        );
+        // Negative override: already expired.
+        assert!(effective_expires_at(ttl(-7200), cached_at, thirty_days) < cached_at);
+        // Immutable: the stamp, whatever it is.
+        assert_eq!(
+            effective_expires_at(Mutability::Immutable, cached_at, short_stamp),
+            short_stamp
+        );
+        // A TTL chrono cannot represent falls back to the stamp, never panics.
+        assert_eq!(
+            effective_expires_at(ttl(i64::MAX), cached_at, thirty_days),
+            thirty_days
+        );
+        assert_eq!(
+            effective_expires_at(
+                ttl(MAX_CACHE_TTL_SECS),
+                DateTime::<Utc>::MAX_UTC,
+                thirty_days
+            ),
+            thirty_days
+        );
     }
 
     #[test]

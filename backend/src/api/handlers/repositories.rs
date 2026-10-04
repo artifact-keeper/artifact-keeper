@@ -38,7 +38,7 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::cache_classifier;
-use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
@@ -1844,9 +1844,21 @@ fn ensure_single_line(value: &str, field_name: &str) -> Result<()> {
 }
 
 /// Validate that a cache TTL value (in seconds) is within the acceptable range.
-/// Minimum is 1 second, maximum is 30 days (2,592,000 seconds).
+/// Minimum is 1 second; maximum is [`MAX_CACHE_TTL_SECS`] (~10 years), the
+/// lifetime immutable artifacts are cached for (#2667). The override only
+/// applies to mutable paths (indexes, tag manifests), so the maximum is how an
+/// operator stops a remote's mutable paths from revalidating at all. It was
+/// 30 days before #2667.
 fn validate_cache_ttl(secs: i64) -> bool {
-    (1..=2_592_000).contains(&secs)
+    (1..=MAX_CACHE_TTL_SECS).contains(&secs)
+}
+
+/// The 400 message for an out-of-range `cache_ttl_seconds`.
+fn cache_ttl_range_error() -> String {
+    format!(
+        "cache_ttl_seconds must be between 1 and {MAX_CACHE_TTL_SECS} (~10 years; the maximum \
+         means mutable paths are never revalidated)"
+    )
 }
 
 /// Clamp a caller-supplied `per_page` into the valid `[1, 100]` range.
@@ -1965,6 +1977,13 @@ fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCacheTtlRequest {
+    /// Freshness lifetime, in seconds, for this remote's mutable paths
+    /// (indexes, packuments, tag manifests, GitHub release lookups); immutable
+    /// artifacts are cached forever regardless. 1 to 315360000 (~10 years);
+    /// the maximum means mutable paths are never revalidated. Lowering it also
+    /// applies to entries already cached, measured from when each was cached
+    /// or last revalidated; raising it applies from each entry's next
+    /// revalidation.
     pub cache_ttl_seconds: i64,
 }
 
@@ -2029,9 +2048,7 @@ pub async fn set_cache_ttl(
     is_cache_ttl_configurable(&repo.repo_type)?;
 
     if !validate_cache_ttl(payload.cache_ttl_seconds) {
-        return Err(AppError::Validation(
-            "cache_ttl_seconds must be between 1 and 2592000 (30 days)".to_string(),
-        ));
+        return Err(AppError::Validation(cache_ttl_range_error()));
     }
 
     // Upsert into repository_config table
@@ -2048,6 +2065,13 @@ pub async fn set_cache_ttl(
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // The proxy clamps already-cached mutable entries to the current TTL on
+    // read (#3832), so make this process see the new value at once rather
+    // than after its policy-cache TTL. Other replicas follow within that TTL.
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service.invalidate_cache_ttl_override(repo.id).await;
+    }
 
     Ok(Json(CacheTtlResponse {
         repository_key: key,
@@ -8241,11 +8265,17 @@ pub async fn get_artifact_metadata(
         let cache_lookup_path = cache_metadata_lookup_path(&artifact.path, &repo.format);
         let cache_meta = if repo.repo_type == RepositoryType::Remote {
             if let Some(proxy) = state.proxy_service.as_ref() {
-                proxy
-                    .get_cache_metadata(&key, &cache_lookup_path)
-                    .await
-                    .ok()
-                    .flatten()
+                match proxy.get_cache_metadata(&key, &cache_lookup_path).await {
+                    // #3832: report the expiry the proxy actually enforces
+                    // under the current TTL, not the stamp from write time.
+                    Ok(Some(mut m)) => {
+                        m.expires_at = proxy
+                            .effective_cache_expires_at(&key, &cache_lookup_path, &m)
+                            .await;
+                        Some(m)
+                    }
+                    _ => None,
+                }
             } else {
                 None
             }
@@ -19946,6 +19976,14 @@ mod tests {
     #[test]
     fn test_validate_cache_ttl_valid_maximum() {
         assert!(validate_cache_ttl(2_592_000));
+        // #2667: the ceiling is the immutable lifetime, not 30 days.
+        assert!(validate_cache_ttl(2_592_001));
+        assert!(validate_cache_ttl(MAX_CACHE_TTL_SECS));
+        assert_eq!(
+            MAX_CACHE_TTL_SECS,
+            crate::services::cache_classifier::Mutability::Immutable.write_ttl_secs()
+        );
+        assert!(cache_ttl_range_error().contains(&MAX_CACHE_TTL_SECS.to_string()));
     }
 
     #[test]
@@ -19960,7 +19998,8 @@ mod tests {
 
     #[test]
     fn test_validate_cache_ttl_invalid_too_large() {
-        assert!(!validate_cache_ttl(2_592_001));
+        assert!(!validate_cache_ttl(MAX_CACHE_TTL_SECS + 1));
+        assert!(!validate_cache_ttl(i64::MAX));
     }
 
     #[test]
@@ -20296,6 +20335,9 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("store cache_ttl_secs override");
+        // Written behind the API's back: drop the proxy's memoised "no
+        // override" the way `set_cache_ttl` does (#3832).
+        proxy.invalidate_cache_ttl_override(fx.repo_id).await;
         let override_reported = reported(&fx).await;
         let override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
 
