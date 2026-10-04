@@ -7,7 +7,14 @@
 //! `repository_service::permissions_grant_exists`, write plane via
 //! `permission_service::{query_actions, has_any_rules_for_target}`).
 //!
-//! All endpoints are admin-only in P1 (the project-admin role arrives in P2).
+//! Authorization (#2473, P2): list/create/delete stay global-admin-only
+//! (tenant provisioning and a destructive cascade). The five per-project
+//! management endpoints (get/update a project, list/add/remove its members)
+//! also admit a *project admin*: a principal holding `admin` in a
+//! `target_type = 'project'` grant on THAT project id (see
+//! [`require_project_admin`]). Changing a project's `quota_bytes` stays
+//! global-admin-only. The global `/api/v1/permissions` CRUD is untouched and
+//! remains the global-admin escalation boundary.
 //! Mutations mirror `handlers::permissions`: the body is taken as raw `Bytes`
 //! so the authorization gate runs BEFORE deserialization, and every mutation
 //! of the `permissions` table invalidates the permission cache.
@@ -119,6 +126,160 @@ pub(crate) fn validate_member_grant(principal_type: &str, actions: &[String]) ->
     Ok(())
 }
 
+/// The action set that makes a principal a *project admin* (#2473).
+///
+/// Action matching in `PermissionService::check_permission` is exact-string:
+/// `admin` does NOT imply `read`/`write`/`delete`. `admin` alone is the
+/// management gate (this module's endpoints and repository creation in the
+/// project); the other three carry the data-plane access every repository in
+/// the project inherits. A project-admin grant therefore carries all four.
+/// Peer access to repositories created later comes from project inheritance
+/// (`query_actions` re-resolves per request): no per-repository grant is ever
+/// written for project admins.
+pub const PROJECT_ADMIN_ACTIONS: [&str; 4] = ["admin", "read", "write", "delete"];
+
+/// Pure project-admin decision (#2473): a global admin always passes; anyone
+/// else needs an `admin` grant on the project AND a credential that is not
+/// restricted to a repository allowlist (a repo-scoped API token must not
+/// be able to rewrite project-wide membership that reaches beyond the
+/// repositories it was minted for).
+pub(crate) fn project_admin_allowed(auth: &AuthExtension, has_project_admin_grant: bool) -> bool {
+    auth.is_admin
+        || (has_project_admin_grant
+            && matches!(
+                auth.access_scope(),
+                crate::models::access_scope::AccessScope::Admin
+            ))
+}
+
+/// Gate for the per-project management endpoints (#2473): `is_admin` OR an
+/// `admin` grant on `project_id` (direct, service-account or via a group).
+///
+/// The grant lookup is bound to the path id, so a project admin of P is
+/// denied on project Q. A non-existent project yields 403 for a non-admin
+/// (never a 404 that would confirm the id), and the global-admin bypass runs
+/// before any DB work.
+pub(crate) async fn require_project_admin(
+    state: &SharedState,
+    auth: &AuthExtension,
+    project_id: Uuid,
+) -> Result<()> {
+    if auth.is_admin {
+        return Ok(());
+    }
+    // Skip the lookup entirely for a repo-restricted credential: it can never
+    // pass `project_admin_allowed`, whatever grants its principal holds.
+    let has_grant = project_admin_allowed(auth, true)
+        && state
+            .permission_service
+            .check_permission(auth.user_id, "project", project_id, "admin", false)
+            .await?;
+    if project_admin_allowed(auth, has_grant) {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Project admin access required".to_string(),
+        ))
+    }
+}
+
+/// Fields of an update that only a global admin may change (#2473). The
+/// project quota is a provisioning control: a project admin raising its own
+/// ceiling would defeat it.
+pub(crate) fn update_needs_global_admin(payload: &UpdateProjectRequest) -> bool {
+    payload.quota_bytes.is_some()
+}
+
+/// Does the caller hold repository-provisioning authority instance-wide?
+/// A global admin, or a holder of `admin` on the system sentinel (the
+/// pre-P2 gate for creating repositories anywhere).
+pub(crate) async fn has_system_repo_admin(
+    state: &SharedState,
+    auth: &AuthExtension,
+) -> Result<bool> {
+    if auth.is_admin {
+        return Ok(true);
+    }
+    state
+        .permission_service
+        .check_permission(
+            auth.user_id,
+            crate::services::permission_service::SYSTEM_TARGET_TYPE,
+            crate::services::permission_service::SYSTEM_SENTINEL_ID,
+            "admin",
+            false,
+        )
+        .await
+}
+
+/// May the caller assign a repository to `project_id` (on create, or by
+/// reassignment on update)? Instance-wide repository provisioners may assign
+/// anywhere; anyone else needs project-admin on the destination project
+/// (#2473), so a project admin can create repositories only inside the
+/// project they administer. A missing or foreign project id is a denial.
+pub(crate) async fn can_assign_to_project(
+    state: &SharedState,
+    auth: &AuthExtension,
+    project_id: Uuid,
+) -> Result<bool> {
+    if has_system_repo_admin(state, auth).await? {
+        return Ok(true);
+    }
+    match require_project_admin(state, auth, project_id).await {
+        Ok(()) => Ok(true),
+        Err(AppError::Authorization(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Pure key-prefix convention check (#2473).
+///
+/// The convention is opt-in: a repository in project `customer-a` MAY be
+/// keyed `customer-a-<name>`, and keys that do not use any project's prefix
+/// are never constrained (keys stay flat and globally unique; no routing
+/// change). What is validated is that a key which DOES take a project's
+/// prefix belongs to that project: a repository assigned to project
+/// `assigned` whose key starts with `<K>-` for one or more projects `K`
+/// (`claimed`, as `(id, key)` pairs) must be assigned to one of them. This
+/// stops a project admin from minting `customer-b-*` names inside their own
+/// project.
+pub(crate) fn check_repo_key_project_prefix(
+    repo_key: &str,
+    assigned: Uuid,
+    claimed: &[(Uuid, String)],
+) -> Result<()> {
+    let claimed: Vec<&(Uuid, String)> = claimed
+        .iter()
+        .filter(|(_, k)| repo_key.starts_with(&format!("{k}-")))
+        .collect();
+    if claimed.is_empty() || claimed.iter().any(|(id, _)| *id == assigned) {
+        return Ok(());
+    }
+    let keys: Vec<&str> = claimed.iter().map(|(_, k)| k.as_str()).collect();
+    Err(AppError::Validation(format!(
+        "Repository key '{}' uses the key prefix of project '{}' but is not assigned to it",
+        repo_key,
+        keys.join("', '")
+    )))
+}
+
+/// DB wrapper for [`check_repo_key_project_prefix`]: loads only the projects
+/// whose `<key>-` is a prefix of `repo_key` (`left()` instead of `LIKE`, since
+/// project keys may contain the `_` wildcard).
+pub(crate) async fn validate_repo_key_project_prefix(
+    state: &SharedState,
+    repo_key: &str,
+    assigned: Uuid,
+) -> Result<()> {
+    let claimed: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, key FROM projects WHERE left($1, length(key) + 1) = key || '-'")
+            .bind(repo_key)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    check_repo_key_project_prefix(repo_key, assigned, &claimed)
+}
+
 // ---------------------------------------------------------------------------
 // DTOs
 // ---------------------------------------------------------------------------
@@ -136,6 +297,7 @@ pub struct CreateProjectRequest {
 pub struct UpdateProjectRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Global admin only: a project admin sending this field gets 403.
     pub quota_bytes: Option<i64>,
 }
 
@@ -276,7 +438,7 @@ pub async fn create_project(
     responses(
         (status = 200, description = "Project details", body = Project),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Admin privileges required"),
+        (status = 403, description = "Global admin or project admin of this project required"),
         (status = 404, description = "Project not found"),
     ),
     security(("bearer_auth" = []))
@@ -287,7 +449,7 @@ pub async fn get_project(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Project>> {
     let auth = require_auth(auth)?;
-    auth.require_admin()?;
+    require_project_admin(&state, &auth, id).await?;
 
     let project: Project = sqlx::query_as(
         "SELECT id, key, name, description, quota_bytes, created_at, updated_at \
@@ -314,7 +476,7 @@ pub async fn get_project(
     responses(
         (status = 200, description = "Project updated", body = Project),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Admin privileges required"),
+        (status = 403, description = "Global admin or project admin of this project required (quota_bytes: global admin only)"),
         (status = 404, description = "Project not found"),
     ),
     security(("bearer_auth" = []))
@@ -327,10 +489,13 @@ pub async fn update_project(
 ) -> Result<Json<Project>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
-    auth.require_admin()?;
+    require_project_admin(&state, &auth, id).await?;
 
     let payload: UpdateProjectRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid project payload: {}", e)))?;
+    if update_needs_global_admin(&payload) {
+        auth.require_admin()?;
+    }
 
     let project: Project = sqlx::query_as(
         "UPDATE projects SET \
@@ -429,7 +594,7 @@ pub async fn delete_project(
     responses(
         (status = 200, description = "Project membership grants", body = ProjectMemberListResponse),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Admin privileges required"),
+        (status = 403, description = "Global admin or project admin of this project required"),
         (status = 404, description = "Project not found"),
     ),
     security(("bearer_auth" = []))
@@ -440,7 +605,7 @@ pub async fn list_project_members(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ProjectMemberListResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_admin()?;
+    require_project_admin(&state, &auth, id).await?;
 
     require_project_exists(&state, id).await?;
 
@@ -469,7 +634,7 @@ pub async fn list_project_members(
     responses(
         (status = 200, description = "Membership grant upserted", body = ProjectMemberRow),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Admin privileges required"),
+        (status = 403, description = "Global admin or project admin of this project required"),
         (status = 404, description = "Project not found"),
     ),
     security(("bearer_auth" = []))
@@ -482,7 +647,7 @@ pub async fn add_project_member(
 ) -> Result<Json<ProjectMemberRow>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
-    auth.require_admin()?;
+    require_project_admin(&state, &auth, id).await?;
 
     let payload: AddProjectMemberRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid member payload: {}", e)))?;
@@ -538,7 +703,7 @@ pub async fn add_project_member(
     responses(
         (status = 200, description = "Membership grant removed"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Admin privileges required"),
+        (status = 403, description = "Global admin or project admin of this project required"),
         (status = 404, description = "Grant not found"),
     ),
     security(("bearer_auth" = []))
@@ -551,7 +716,7 @@ pub async fn remove_project_member(
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
-    auth.require_admin()?;
+    require_project_admin(&state, &auth, id).await?;
 
     let payload: RemoveProjectMemberRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid member payload: {}", e)))?;
@@ -816,6 +981,86 @@ mod tests {
         };
         assert!(auth.require_scope("write").is_err());
         assert!(auth.require_scope("delete").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // #2473 pure helpers: project-admin decision, quota guard, key prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_project_admin_actions_carry_full_access_set() {
+        // check_permission is exact-string: `admin` alone grants no data
+        // plane access, so the role must spell out every action.
+        for a in ["admin", "read", "write", "delete"] {
+            assert!(PROJECT_ADMIN_ACTIONS.contains(&a), "missing {a}");
+        }
+    }
+
+    #[test]
+    fn test_project_admin_allowed_matrix() {
+        let admin = AuthExtension {
+            is_admin: true,
+            ..non_admin_auth()
+        };
+        assert!(project_admin_allowed(&admin, false));
+        assert!(project_admin_allowed(&non_admin_auth(), true));
+        assert!(!project_admin_allowed(&non_admin_auth(), false));
+        // A repo-restricted credential never passes, grant or not.
+        let restricted = AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..non_admin_auth()
+        };
+        assert!(!project_admin_allowed(&restricted, true));
+    }
+
+    #[test]
+    fn test_update_needs_global_admin_only_for_quota() {
+        let rename: UpdateProjectRequest = serde_json::from_str(r#"{"name":"n"}"#).unwrap();
+        assert!(!update_needs_global_admin(&rename));
+        let quota: UpdateProjectRequest = serde_json::from_str(r#"{"quota_bytes":1}"#).unwrap();
+        assert!(update_needs_global_admin(&quota));
+    }
+
+    #[test]
+    fn test_key_prefix_unprefixed_keys_unconstrained() {
+        let p = Uuid::new_v4();
+        assert!(check_repo_key_project_prefix("npm-local", p, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_key_prefix_own_project_accepted() {
+        let p = Uuid::new_v4();
+        let claimed = vec![(p, "customer-a".to_string())];
+        assert!(check_repo_key_project_prefix("customer-a-npm", p, &claimed).is_ok());
+    }
+
+    #[test]
+    fn test_key_prefix_foreign_project_rejected() {
+        let mine = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let claimed = vec![(other, "customer-b".to_string())];
+        let err = check_repo_key_project_prefix("customer-b-npm", mine, &claimed).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("customer-b")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_key_prefix_nested_project_keys() {
+        // Projects `a` and `a-b` both prefix `a-b-npm`; either owner may use it.
+        let a = Uuid::new_v4();
+        let ab = Uuid::new_v4();
+        let claimed = vec![(a, "a".to_string()), (ab, "a-b".to_string())];
+        assert!(check_repo_key_project_prefix("a-b-npm", ab, &claimed).is_ok());
+        assert!(check_repo_key_project_prefix("a-b-npm", a, &claimed).is_ok());
+        assert!(check_repo_key_project_prefix("a-b-npm", Uuid::new_v4(), &claimed).is_err());
+        // A claimed key that is not actually a `<key>-` prefix is ignored.
+        let unrelated = vec![(a, "ab".to_string())];
+        assert!(check_repo_key_project_prefix("a-b-npm", ab, &unrelated).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1406,6 +1651,7 @@ mod tests {
 
     mod http {
         use super::super::*;
+        use crate::api::extractors::Json as RJson;
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -1819,6 +2065,450 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        // -------------------------------------------------------------------
+        // #2473: project-admin role and its containment red-team
+        // -------------------------------------------------------------------
+
+        /// Two projects (P administered by the caller, Q foreign) plus a real
+        /// project-admin user holding [`PROJECT_ADMIN_ACTIONS`] on P only.
+        struct Fixture {
+            pool: PgPool,
+            state: crate::api::SharedState,
+            p: Uuid,
+            p_key: String,
+            q: Uuid,
+            q_key: String,
+            admin_user: Uuid,
+            auth: AuthExtension,
+        }
+
+        async fn fixture() -> Option<Fixture> {
+            let (pool, state) = setup().await?;
+            let tag = Uuid::new_v4().simple().to_string();
+            let p_key = format!("pa{}", &tag[..10]);
+            let q_key = format!("pb{}", &tag[..10]);
+            let (_, p) = create_via_api(&state, &p_key).await;
+            let (_, q) = create_via_api(&state, &q_key).await;
+            let p: Uuid = p["id"].as_str().unwrap().parse().unwrap();
+            let q: Uuid = q["id"].as_str().unwrap().parse().unwrap();
+            let (admin_user, username) = tdh::create_user(&pool).await;
+            grant(&pool, "user", admin_user, p, &PROJECT_ADMIN_ACTIONS).await;
+            let auth = tdh::make_auth(admin_user, &username);
+            Some(Fixture {
+                pool,
+                state,
+                p,
+                p_key,
+                q,
+                q_key,
+                admin_user,
+                auth,
+            })
+        }
+
+        async fn grant(pool: &PgPool, ptype: &str, pid: Uuid, project: Uuid, actions: &[&str]) {
+            let actions: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
+            sqlx::query(
+                "INSERT INTO permissions \
+                 (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ($1, $2, 'project', $3, $4)",
+            )
+            .bind(ptype)
+            .bind(pid)
+            .bind(project)
+            .bind(&actions)
+            .execute(pool)
+            .await
+            .expect("seed project grant");
+        }
+
+        async fn teardown(f: &Fixture) {
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id IN \
+                 (SELECT id FROM repositories WHERE project_id IN ($1, $2))",
+            )
+            .bind(f.p)
+            .bind(f.q)
+            .execute(&f.pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE project_id IN ($1, $2)")
+                .bind(f.p)
+                .bind(f.q)
+                .execute(&f.pool)
+                .await;
+            cleanup_project_rows(&f.pool, &f.p_key).await;
+            cleanup_project_rows(&f.pool, &f.q_key).await;
+            tdh::cleanup_user(&f.pool, f.admin_user).await;
+        }
+
+        async fn call(
+            state: &crate::api::SharedState,
+            auth: &AuthExtension,
+            method: &str,
+            uri: String,
+            body: &str,
+        ) -> StatusCode {
+            tdh::send(app(state, auth.clone()), req(method, &uri, body))
+                .await
+                .0
+        }
+
+        fn member_body(user: Uuid, actions: &str) -> String {
+            format!(r#"{{"principal_type":"user","principal_id":"{user}","actions":{actions}}}"#)
+        }
+
+        fn remove_body(user: Uuid) -> String {
+            format!(r#"{{"principal_type":"user","principal_id":"{user}"}}"#)
+        }
+
+        /// (e) Within-project management is intended and passes: get, rename,
+        /// list/add/remove members on the project the caller administers.
+        #[tokio::test]
+        async fn http_project_admin_manages_own_project() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let (s, a, p) = (&f.state, &f.auth, f.p);
+            assert_eq!(call(s, a, "GET", format!("/{p}"), "").await, StatusCode::OK);
+            assert_eq!(
+                call(s, a, "PUT", format!("/{p}"), r#"{"name":"renamed"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                call(s, a, "GET", format!("/{p}/members"), "").await,
+                StatusCode::OK
+            );
+            let (teammate, _) = tdh::create_user(&f.pool).await;
+            assert_eq!(
+                call(
+                    s,
+                    a,
+                    "POST",
+                    format!("/{p}/members"),
+                    &member_body(teammate, r#"["read","write"]"#)
+                )
+                .await,
+                StatusCode::OK
+            );
+            // A teammate can be promoted to peer project admin.
+            assert_eq!(
+                call(
+                    s,
+                    a,
+                    "POST",
+                    format!("/{p}/members"),
+                    &member_body(teammate, r#"["admin","read","write","delete"]"#)
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                call(
+                    s,
+                    a,
+                    "DELETE",
+                    format!("/{p}/members"),
+                    &remove_body(teammate)
+                )
+                .await,
+                StatusCode::OK
+            );
+            tdh::cleanup_user(&f.pool, teammate).await;
+            teardown(&f).await;
+        }
+
+        /// (a) A project admin of P cannot manage project Q (path-id bound),
+        /// and cannot reach the global-admin-only project endpoints or raise
+        /// its own quota.
+        #[tokio::test]
+        async fn http_project_admin_cannot_manage_other_project() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let (s, a, p, q) = (&f.state, &f.auth, f.p, f.q);
+            let (victim, _) = tdh::create_user(&f.pool).await;
+            for (method, uri, body) in [
+                ("GET", format!("/{q}"), String::new()),
+                ("PUT", format!("/{q}"), r#"{"name":"pwned"}"#.to_string()),
+                ("GET", format!("/{q}/members"), String::new()),
+                (
+                    "POST",
+                    format!("/{q}/members"),
+                    member_body(f.admin_user, r#"["admin"]"#),
+                ),
+                ("DELETE", format!("/{q}/members"), remove_body(victim)),
+                // Global-admin-only surface, even for the caller's own project.
+                ("GET", "/".to_string(), String::new()),
+                (
+                    "POST",
+                    "/".to_string(),
+                    r#"{"key":"pa-new","name":"x"}"#.to_string(),
+                ),
+                ("DELETE", format!("/{p}"), String::new()),
+                ("DELETE", format!("/{q}"), String::new()),
+                (
+                    "PUT",
+                    format!("/{p}"),
+                    r#"{"quota_bytes":999999999}"#.to_string(),
+                ),
+                // Unknown project id: 403, never a 404 confirming existence.
+                ("GET", format!("/{}", Uuid::new_v4()), String::new()),
+            ] {
+                assert_eq!(
+                    call(s, a, method, uri.clone(), &body).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri} must be denied to a project admin of another project"
+                );
+            }
+            // Nothing leaked into Q's membership.
+            let q_grants: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM permissions WHERE target_type = 'project' AND target_id = $1",
+            )
+            .bind(q)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert_eq!(q_grants, 0);
+            tdh::cleanup_user(&f.pool, victim).await;
+            teardown(&f).await;
+        }
+
+        /// The role is the `admin` action on the project: a read/write member
+        /// is not a project admin, a repo-restricted token of a real project
+        /// admin is refused, and a group-held admin grant works.
+        #[tokio::test]
+        async fn http_project_admin_grant_shape() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let (s, p) = (&f.state, f.p);
+            let (member, member_name) = tdh::create_user(&f.pool).await;
+            grant(&f.pool, "user", member, p, &["read", "write", "delete"]).await;
+            let member_auth = tdh::make_auth(member, &member_name);
+            assert_eq!(
+                call(s, &member_auth, "GET", format!("/{p}/members"), "").await,
+                StatusCode::FORBIDDEN
+            );
+
+            let restricted = AuthExtension {
+                is_api_token: true,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                    Uuid::new_v4(),
+                ]),
+                ..f.auth.clone()
+            };
+            assert_eq!(
+                call(s, &restricted, "GET", format!("/{p}"), "").await,
+                StatusCode::FORBIDDEN
+            );
+
+            let (grp_user, grp_name) = tdh::create_user(&f.pool).await;
+            let group_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(group_id)
+                .bind(format!("prj-admins-{group_id}"))
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(grp_user)
+                .bind(group_id)
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            grant(&f.pool, "group", group_id, p, &PROJECT_ADMIN_ACTIONS).await;
+            f.state.permission_service.invalidate_cache();
+            let grp_auth = tdh::make_auth(grp_user, &grp_name);
+            assert_eq!(
+                call(s, &grp_auth, "GET", format!("/{p}/members"), "").await,
+                StatusCode::OK
+            );
+
+            let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+                .bind(group_id)
+                .execute(&f.pool)
+                .await;
+            teardown(&f).await;
+            let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(group_id)
+                .execute(&f.pool)
+                .await;
+            tdh::cleanup_user(&f.pool, member).await;
+            tdh::cleanup_user(&f.pool, grp_user).await;
+        }
+
+        /// (b)+(c) No escalation: the global permissions CRUD stays
+        /// global-admin-only for a project admin, and granting `admin` on a
+        /// project never makes anyone a global admin.
+        #[tokio::test]
+        async fn http_project_admin_cannot_reach_global_permissions() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let perms = |auth: &AuthExtension| {
+                tdh::router_with_auth(
+                    crate::api::handlers::permissions::router(),
+                    f.state.clone(),
+                    auth.clone(),
+                )
+            };
+            let (status, _) = tdh::send(perms(&f.auth), tdh::get("/".into())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let body = format!(
+                r#"{{"principal_type":"user","principal_id":"{}","target_type":"system","target_id":"00000000-0000-0000-0000-000000000000","actions":["admin"]}}"#,
+                f.admin_user
+            );
+            let (status, _) = tdh::send(perms(&f.auth), req("POST", "/", &body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            // Self-grant on the own project (intended) leaves is_admin false.
+            assert_eq!(
+                call(
+                    &f.state,
+                    &f.auth,
+                    "POST",
+                    format!("/{}/members", f.p),
+                    &member_body(f.admin_user, r#"["admin","read","write","delete"]"#)
+                )
+                .await,
+                StatusCode::OK
+            );
+            let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+                .bind(f.admin_user)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+            assert!(!is_admin, "a project grant must never mint a global admin");
+            teardown(&f).await;
+        }
+
+        fn repo_body(key: &str, project: Option<Uuid>) -> Bytes {
+            let mut v = serde_json::json!({
+                "key": key, "name": key, "format": "generic", "repo_type": "local"
+            });
+            if let Some(p) = project {
+                v["project_id"] = serde_json::json!(p);
+            }
+            Bytes::from(serde_json::to_vec(&v).unwrap())
+        }
+
+        async fn create_repo_as(
+            f: &Fixture,
+            key: &str,
+            project: Option<Uuid>,
+        ) -> Result<RJson<crate::api::handlers::repositories::RepositoryResponse>> {
+            crate::api::handlers::repositories::create_repository(
+                State(f.state.clone()),
+                Extension(Some(f.auth.clone())),
+                repo_body(key, project),
+            )
+            .await
+        }
+
+        /// (d) Repository creation: a project admin creates inside their own
+        /// project (and gets data-plane access by inheritance, no per-repo
+        /// fan-out needed), but not outside it, not unassigned, and not with
+        /// another project's key prefix; nor can they move a repository into
+        /// a project they do not administer.
+        #[tokio::test]
+        async fn http_project_admin_repository_create_containment() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let own_key = format!("{}-generic", f.p_key);
+            let RJson(repo) = create_repo_as(&f, &own_key, Some(f.p))
+                .await
+                .expect("project admin creates in own project");
+            assert_eq!(repo.project_id, Some(f.p));
+            f.state.permission_service.invalidate_cache();
+            assert!(f
+                .state
+                .permission_service
+                .check_permission(f.admin_user, "repository", repo.id, "write", false)
+                .await
+                .unwrap());
+
+            // A teammate made project admin later inherits it too.
+            let (peer, _) = tdh::create_user(&f.pool).await;
+            grant(&f.pool, "user", peer, f.p, &PROJECT_ADMIN_ACTIONS).await;
+            f.state.permission_service.invalidate_cache();
+            assert!(f
+                .state
+                .permission_service
+                .check_permission(peer, "repository", repo.id, "write", false)
+                .await
+                .unwrap());
+
+            let tag = Uuid::new_v4().simple().to_string();
+            for (key, project) in [
+                (format!("x{}", &tag[..12]), Some(f.q)),
+                (format!("y{}", &tag[..12]), None),
+                (format!("z{}", &tag[..12]), Some(Uuid::new_v4())),
+            ] {
+                let err = create_repo_as(&f, &key, project).await.unwrap_err();
+                assert!(
+                    matches!(err, AppError::Authorization(_)),
+                    "create {key} in {project:?} must be 403: {err:?}"
+                );
+            }
+            // Foreign key prefix inside the own project: 400.
+            let squat = format!("{}-generic", f.q_key);
+            let err = create_repo_as(&f, &squat, Some(f.p)).await.unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+
+            // Reassignment to a foreign project is refused even though the
+            // caller holds (inherited) repository admin.
+            let move_req: crate::api::handlers::repositories::UpdateRepositoryRequest =
+                serde_json::from_value(serde_json::json!({ "project_id": f.q })).unwrap();
+            let err = crate::api::handlers::repositories::update_repository(
+                State(f.state.clone()),
+                Extension(Some(f.auth.clone())),
+                Path(own_key.clone()),
+                RJson(move_req),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
+            let still: Option<Uuid> =
+                sqlx::query_scalar("SELECT project_id FROM repositories WHERE id = $1")
+                    .bind(repo.id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(still, Some(f.p));
+
+            // Re-sending the unchanged assignment (full-form edit) is fine.
+            let same: crate::api::handlers::repositories::UpdateRepositoryRequest =
+                serde_json::from_value(
+                    serde_json::json!({ "project_id": f.p, "description": "d" }),
+                )
+                .unwrap();
+            crate::api::handlers::repositories::update_repository(
+                State(f.state.clone()),
+                Extension(Some(f.auth.clone())),
+                Path(own_key.clone()),
+                RJson(same),
+            )
+            .await
+            .expect("unchanged assignment is not a reassignment");
+
+            // Renaming into another project's prefix is refused too.
+            let rename: crate::api::handlers::repositories::UpdateRepositoryRequest =
+                serde_json::from_value(serde_json::json!({ "key": squat })).unwrap();
+            let err = crate::api::handlers::repositories::update_repository(
+                State(f.state.clone()),
+                Extension(Some(f.auth.clone())),
+                Path(own_key.clone()),
+                RJson(rename),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+
+            tdh::cleanup_user(&f.pool, peer).await;
+            teardown(&f).await;
         }
     }
 }
