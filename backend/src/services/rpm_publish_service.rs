@@ -1269,8 +1269,8 @@ mod tests {
     // Before #4307 the snapshot ran at SERIALIZABLE with a deterministic
     // backoff, so two racers could abort each other with 40001 on every attempt
     // and exhaust the retry budget under CI load. The per-repository advisory
-    // lock now serializes them; this pins that racers allocate 1 and 2 instead
-    // of one of them failing.
+    // lock now serializes them; this pins that three racers allocate 1, 2 and
+    // 3 instead of any of them failing.
     #[tokio::test]
     async fn test_create_version_concurrent_racers_both_succeed_db() {
         use crate::api::handlers::test_db_helpers as tdh;
