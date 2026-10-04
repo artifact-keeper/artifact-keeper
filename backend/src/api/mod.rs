@@ -221,6 +221,10 @@ pub struct AppState {
     /// invalidation: npm forbids republishing a version, so entries are
     /// immutable facts that age out.
     pub npm_attestation_cache: Option<Arc<NpmAttestationCache>>,
+    /// Live state of this replica's npm upstream change-feed consumer
+    /// (#3069): written by the `FeedConsumer` (`main.rs` hands it this
+    /// handle), read by `GET /api/v1/admin/npm/upstream-feed/status`.
+    pub upstream_feed_status: Arc<crate::services::upstream_feed::FeedStatus>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -302,6 +306,7 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
@@ -351,6 +356,7 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),

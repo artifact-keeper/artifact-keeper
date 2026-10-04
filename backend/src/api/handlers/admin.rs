@@ -57,6 +57,51 @@ pub fn router() -> Router<SharedState> {
             "/proxy-scan-verdicts/:digest",
             get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
         )
+        .route(
+            "/npm/upstream-feed/status",
+            get(get_npm_upstream_feed_status),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// npm upstream change-feed status (#3069)
+// ---------------------------------------------------------------------------
+
+/// Status of the npm upstream change-feed consumer (#2249): effective
+/// configuration, persisted cursor, leadership and the last feed error.
+///
+/// Read-only; the feed is configured through `NPM_UPSTREAM_FEED_ENABLED` /
+/// `NPM_UPSTREAM_FEED_URL`. `is_leader` and `last_error` describe the replica
+/// that answered; `cluster_leader_active` is cluster-wide.
+#[utoipa::path(
+    get,
+    path = "/npm/upstream-feed/status",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "npm upstream change-feed status", body = crate::services::upstream_feed::NpmUpstreamFeedStatus),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_npm_upstream_feed_status(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<crate::services::upstream_feed::NpmUpstreamFeedStatus>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+    let status = crate::services::upstream_feed::npm_feed_status(
+        &state.config,
+        &state.db,
+        &state.upstream_feed_status,
+    )
+    .await?;
+    Ok(Json(status))
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,6 +2347,7 @@ pub async fn delete_proxy_scan_verdicts(
         list_audit_logs,
         get_proxy_scan_verdicts,
         delete_proxy_scan_verdicts,
+        get_npm_upstream_feed_status,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -2336,6 +2382,7 @@ pub async fn delete_proxy_scan_verdicts(
         AuditLogListResponse,
         ProxyScanVerdictItem,
         ProxyScanVerdictListResponse,
+        crate::services::upstream_feed::NpmUpstreamFeedStatus,
     ))
 )]
 pub struct AdminApiDoc;
@@ -2652,6 +2699,56 @@ mod tests {
         let Json(settings) = get_settings(State(state)).await.unwrap();
 
         assert_eq!(settings.environment, "development");
+    }
+
+    /// #3069: the npm upstream-feed status endpoint is admin-only and reports
+    /// the persisted cursor row of the configured feed.
+    #[tokio::test]
+    async fn test_npm_upstream_feed_status_admin_only_and_reads_state_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let host = format!("feed-{}.example.test", Uuid::new_v4().simple());
+        let feed_url = format!("https://{host}/_changes");
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-npm-feed-status", |cfg| {
+            cfg.npm_upstream_feed_enabled = true;
+            cfg.npm_upstream_feed_url = feed_url.clone();
+        });
+        let feed_key = format!("npm-changes:{feed_url}");
+        sqlx::query(
+            "INSERT INTO upstream_feed_state (feed_key, last_seq, updated_at) \
+             VALUES ($1, '777', now())",
+        )
+        .bind(&feed_key)
+        .execute(&pool)
+        .await
+        .expect("seed feed state");
+
+        let mut non_admin = admin_auth(Uuid::new_v4(), "feed-viewer");
+        non_admin.is_admin = false;
+        let denied = get_npm_upstream_feed_status(State(state.clone()), Extension(non_admin)).await;
+        let admitted = get_npm_upstream_feed_status(
+            State(state),
+            Extension(admin_auth(Uuid::new_v4(), "feed-admin")),
+        )
+        .await;
+        sqlx::query("DELETE FROM upstream_feed_state WHERE feed_key = $1")
+            .bind(&feed_key)
+            .execute(&pool)
+            .await
+            .expect("cleanup feed state");
+
+        let err = denied.expect_err("non-admin must be refused");
+        assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
+        let Json(status) = admitted.expect("admin status");
+        assert!(status.enabled);
+        assert_eq!(status.feed_url, feed_url);
+        assert_eq!(status.cursor.as_deref(), Some("777"));
+        assert!(status.last_poll_at.is_some());
+        assert!(!status.is_leader && !status.cluster_leader_active);
+        assert_eq!(status.leader_term_secs, 300);
     }
 
     // -----------------------------------------------------------------------
