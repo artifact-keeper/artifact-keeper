@@ -874,6 +874,37 @@ const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
 /// - otherwise, if the image's seeded DB directory is present on disk, we are
 ///   running in the backend image with the env wiped — name it explicitly;
 /// - otherwise leave it unset and let grype use its own default.
+/// The DB-related env every grype child gets, scan or probe alike.
+///
+/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
+/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` (#1001); the
+/// fourth, `GRYPE_DB_CACHE_DIR`, has no single correct literal and is
+/// resolved by [`resolve_grype_db_cache_dir`] (#3434). One helper for both
+/// the scan spawn and the `grype db status` provenance probe (#3014): a probe
+/// that inherited only the backend's env would, in exactly the env-replacing
+/// deployments the resolver exists for, look in `$HOME/.cache/grype`, find
+/// nothing (or a different DB) and record the wrong vintage.
+fn grype_db_env() -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("GRYPE_DB_AUTO_UPDATE", "false".to_string()),
+        ("GRYPE_DB_VALIDATE_AGE", "false".to_string()),
+        ("GRYPE_CHECK_FOR_APP_UPDATE", "false".to_string()),
+    ];
+    if let Some(dir) = resolve_grype_db_cache_dir(
+        std::env::var("GRYPE_DB_CACHE_DIR").ok(),
+        Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
+    ) {
+        env.push(("GRYPE_DB_CACHE_DIR", dir));
+    }
+    env
+}
+
+/// TTL for a successful `grype db status` provenance probe (#3014). Much
+/// shorter than the binary-version TTL: an air-gapped operator can import a
+/// new DB without restarting the backend, and scans should stop being
+/// stamped with the old vintage within minutes, not an hour.
+const GRYPE_DB_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn resolve_grype_db_cache_dir(
     inherited: Option<String>,
     seeded_dir_exists: bool,
@@ -1082,6 +1113,7 @@ impl GrypeScanner {
             scan_completeness: completeness_for(truncated),
             // Registry mode does not feed the #3003 identity gate; unchanged.
             cataloged: None,
+            vuln_db: None,
         })
     }
 
@@ -1130,6 +1162,7 @@ impl GrypeScanner {
                     packages,
                     scan_completeness: completeness_for(truncated),
                     cataloged,
+                    vuln_db: None,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -1422,19 +1455,11 @@ impl GrypeScanner {
                 command.args([scan_arg, "-o", "json"]);
             }
         }
-        command
-            .env("GRYPE_DB_AUTO_UPDATE", "false")
-            .env("GRYPE_DB_VALIDATE_AGE", "false")
-            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
-        // The fourth DB-related variable, for the same reason as the three
-        // above — see the doc comment on `run_grype_target`. Unlike them it has
-        // no single correct literal, so it is resolved rather than pinned; the
-        // helper documents why.
-        if let Some(dir) = resolve_grype_db_cache_dir(
-            std::env::var("GRYPE_DB_CACHE_DIR").ok(),
-            Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
-        ) {
-            command.env("GRYPE_DB_CACHE_DIR", dir);
+        // The DB-related env (see the doc comment on `run_grype_target`),
+        // shared with the `grype db status` provenance probe (#3014) so the
+        // probe describes the DB this child actually grades against.
+        for (key, value) in grype_db_env() {
+            command.env(key, value);
         }
         // Registry-auth env for a scoped private-repo pull (#2093). Applied as
         // child-process env only — never persisted or logged. Empty for local
@@ -1887,9 +1912,10 @@ impl Scanner for GrypeScanner {
         cached_cli_version(&self.cached_version, || async {
             let raw = capture_cli_version("grype", &["--version"]).await?;
             let cli = format_grype_version(&raw)?;
-            let db_build = match crate::services::scanner_service::capture_cli_output(
+            let db_build = match crate::services::scanner_service::capture_cli_output_with_env(
                 "grype",
                 &["db", "status"],
+                &grype_db_env(),
             )
             .await
             {
@@ -1908,20 +1934,30 @@ impl Scanner for GrypeScanner {
     /// JSON form first and falls back to the text form for grype releases
     /// that predate `-o json`. `None` when no valid DB is installed.
     async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
-        let raw = cached_cli_version(&self.cached_db_status, || async {
-            match crate::services::scanner_service::capture_cli_output(
-                "grype",
-                &["db", "status", "-o", "json"],
-            )
-            .await
-            {
-                Some(json) => Some(json),
-                None => {
-                    crate::services::scanner_service::capture_cli_output("grype", &["db", "status"])
+        let raw = crate::services::scanner_service::cached_cli_version_with_hit_ttl(
+            &self.cached_db_status,
+            GRYPE_DB_STATUS_TTL,
+            || async {
+                let env = grype_db_env();
+                match crate::services::scanner_service::capture_cli_output_with_env(
+                    "grype",
+                    &["db", "status", "-o", "json"],
+                    &env,
+                )
+                .await
+                {
+                    Some(json) => Some(json),
+                    None => {
+                        crate::services::scanner_service::capture_cli_output_with_env(
+                            "grype",
+                            &["db", "status"],
+                            &env,
+                        )
                         .await
+                    }
                 }
-            }
-        })
+            },
+        )
         .await?;
         crate::services::scanner_service::parse_grype_db_status(&raw)
     }
@@ -2026,6 +2062,7 @@ impl GrypeScanner {
             packages,
             scan_completeness: completeness_for(truncated),
             cataloged,
+            vuln_db: None,
         })
     }
 
@@ -4484,10 +4521,21 @@ mod tests {
         // `/.cache/grype` and unwritable under restricted-v2 (#3434).
         let body = grype_spawn_body();
         assert!(
-            body.contains(".env(\"GRYPE_DB_CACHE_DIR\", dir)"),
-            "run_grype_with_catalog must set GRYPE_DB_CACHE_DIR on the child, \
+            body.contains("grype_db_env()") && body.contains("command.env(key, value)"),
+            "run_grype_with_catalog must apply grype_db_env() to the child, \
              not rely on it being inherited from the image ENV. Body: {}",
             body
+        );
+        let helper = {
+            let start = src
+                .find("fn grype_db_env()")
+                .expect("grype_db_env must exist");
+            let rest = &src[start..];
+            &rest[..rest.find("\n}\n").expect("grype_db_env body")]
+        };
+        assert!(
+            helper.contains("env.push((\"GRYPE_DB_CACHE_DIR\", dir))"),
+            "grype_db_env must carry the resolved GRYPE_DB_CACHE_DIR (#3434): {helper}"
         );
 
         for (var, why) in [
@@ -4505,7 +4553,7 @@ mod tests {
             ),
         ] {
             assert!(
-                src.contains(&format!(".env(\"{}\", \"false\")", var)),
+                src.contains(&format!("(\"{}\", \"false\".to_string())", var)),
                 "run_grype_target must pin {}=\"false\" at the subprocess level; \
                  removing it {}",
                 var,
@@ -4519,6 +4567,22 @@ mod tests {
     /// stay out of the way everywhere else (a dev box has no
     /// /home/artifact/.cache/grype and grype's own $HOME default is correct
     /// there).
+    #[test]
+    fn test_grype_db_env_pins_the_db_vars_for_scan_and_probe() {
+        // #3014: the provenance probe and the scan child share this env.
+        let env = grype_db_env();
+        for var in [
+            "GRYPE_DB_AUTO_UPDATE",
+            "GRYPE_DB_VALIDATE_AGE",
+            "GRYPE_CHECK_FOR_APP_UPDATE",
+        ] {
+            assert!(
+                env.iter().any(|(k, v)| *k == var && v == "false"),
+                "{var} must be pinned to false: {env:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_grype_db_cache_dir_rules() {
         // Explicit value wins, in the image or out of it.

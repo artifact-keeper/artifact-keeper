@@ -14,15 +14,18 @@
 -- Cost on a large scan_findings table:
 --   * ADD COLUMN ... NOT NULL DEFAULT <constant> is catalogue-only since
 --     PostgreSQL 11: existing rows read the default, nothing is rewritten.
---   * The CHECK is added NOT VALID (catalogue update; new rows are checked
---     immediately) and then validated, which scans the table under
---     SHARE UPDATE EXCLUSIVE and does not block writers
---     (docs/operations/online-migrations.md, rewrite 2).
+--   * The CHECK is added NOT VALID: a catalogue update, enforced on every
+--     new INSERT/UPDATE from now on, with no scan of existing rows.
+--
+-- The CHECK is deliberately NOT validated here. sqlx runs this file in one
+-- transaction, and both statements above take ACCESS EXCLUSIVE, held until
+-- commit; a VALIDATE CONSTRAINT in the same file would full-scan
+-- scan_findings while every reader and writer queues behind that lock. It
+-- also buys nothing: every pre-existing row holds the constant default
+-- 'vulnerability', which satisfies the CHECK by construction.
 ALTER TABLE scan_findings
     ADD COLUMN IF NOT EXISTS finding_class TEXT NOT NULL DEFAULT 'vulnerability';
 
 ALTER TABLE scan_findings
     ADD CONSTRAINT scan_findings_finding_class_check
     CHECK (finding_class IN ('vulnerability', 'malicious', 'policy')) NOT VALID;
-
-ALTER TABLE scan_findings VALIDATE CONSTRAINT scan_findings_finding_class_check;

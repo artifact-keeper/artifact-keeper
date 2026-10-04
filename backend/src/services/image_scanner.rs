@@ -122,9 +122,10 @@ pub struct HarborScanReport {
     pub vulnerabilities: Vec<HarborVulnerability>,
     /// Trivy vulnerability-DB metadata (#3014). An Artifact Keeper adapter
     /// extension to the Harbor report, absent from older adapters and from
-    /// third-party Harbor scanners (then `None`, stored as NULL).
+    /// third-party Harbor scanners (then `None`, stored as NULL). Raw JSON,
+    /// parsed leniently, so a foreign shape can never fail the scan.
     #[serde(default)]
-    pub vulnerability_db: Option<crate::services::scanner_service::AdapterVulnDb>,
+    pub vulnerability_db: Option<serde_json::Value>,
 }
 
 /// Identifies the scanner that produced the report. Feeds
@@ -475,10 +476,6 @@ pub struct ImageScanner {
     /// scan (e.g. `trivy-0.71.2`). The in-image `trivy --version` probe is
     /// gone (#2059), so this is the only available provenance.
     last_scanner_version: Mutex<Option<String>>,
-    /// Vulnerability-DB provenance reported by the adapter alongside that
-    /// version (#3014). `None` until a scan has run, or when the adapter
-    /// predates the `vulnerability_db` report field.
-    last_vuln_db: Mutex<Option<crate::models::security::VulnDbProvenance>>,
 }
 
 impl ImageScanner {
@@ -498,7 +495,6 @@ impl ImageScanner {
             scan_identity: None,
             scan_token_ttl_seconds: 300,
             last_scanner_version: Mutex::new(None),
-            last_vuln_db: Mutex::new(None),
         }
     }
 
@@ -872,20 +868,17 @@ impl ImageScanner {
                 }
             }
         }
-        // #3014: overwrite unconditionally, so an adapter that stops
-        // reporting DB metadata yields NULL rather than a stale vintage.
-        if let Ok(mut guard) = self.last_vuln_db.lock() {
-            *guard = report
-                .vulnerability_db
-                .as_ref()
-                .and_then(|db| db.provenance());
-        }
 
         // Source label is intentionally "trivy" (not "trivy-image") to
         // preserve back-compat with dashboards / filters that group findings
         // by `source = 'trivy'`.
         let trivy_report = harbor_report_to_trivy(&report, &reference_label);
-        let output = ScanOutput::from_trivy_report(&trivy_report, "trivy");
+        let mut output = ScanOutput::from_trivy_report(&trivy_report, "trivy");
+        // #3014: the DB this very report was graded against, carried with the
+        // findings rather than through a shared last-scan slot.
+        output.vuln_db = crate::services::scanner_service::AdapterVulnDb::lenient(
+            report.vulnerability_db.as_ref(),
+        );
 
         info!(
             "Adapter image scan complete for {}: {} vulnerabilities",
@@ -942,12 +935,6 @@ impl Scanner for ImageScanner {
             .lock()
             .ok()
             .and_then(|g| g.clone())
-    }
-
-    /// Trivy DB provenance reported by the adapter on the last successful
-    /// scan (#3014).
-    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
-        self.last_vuln_db.lock().ok().and_then(|g| g.clone())
     }
 
     async fn scan(
@@ -1464,6 +1451,45 @@ mod tests {
         assert_eq!(out.findings[0].severity, Severity::High);
         assert_eq!(out.findings[0].source, Some("trivy".to_string()));
         assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+        // An adapter that reports no DB metadata yields no provenance.
+        assert_eq!(out.vuln_db, None);
+    }
+
+    /// #3014: the Harbor report's `vulnerability_db` extension reaches the
+    /// scan output, and a malformed one is ignored rather than failing the
+    /// scan.
+    #[tokio::test]
+    async fn test_adapter_scan_carries_vulnerability_db() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (db, want) in [
+            (
+                serde_json::json!({"version": 2, "updated_at": "2026-10-04T19:39:34Z"}),
+                Some("trivy-db-v2"),
+            ),
+            (serde_json::json!({"version": "2"}), None),
+            (serde_json::json!("not an object"), None),
+        ] {
+            let server = MockServer::start().await;
+            mount_ready_and_submit(&server, "scan-db").await;
+            let report = serde_json::json!({
+                "scanner": {"name": "Trivy", "version": "0.71.2"},
+                "vulnerabilities": [],
+                "vulnerability_db": db,
+            });
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/v1/scan/.+/report$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(report))
+                .mount(&server)
+                .await;
+
+            let out = ImageScanner::new(server.uri())
+                .scan(&oci_image_artifact(), None, &Bytes::new())
+                .await
+                .expect("a malformed vulnerability_db must not fail the scan");
+            assert_eq!(out.vuln_db.map(|p| p.version).as_deref(), want);
+        }
     }
 
     /// Mirror of #888 `test_scan_fails_when_trivy_unreachable`: an unreachable

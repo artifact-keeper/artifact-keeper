@@ -3794,6 +3794,13 @@ pub struct ScanOutput {
     /// engine ran and cataloged NOTHING, so a zero-finding result means
     /// "nothing was assessed", not "clean".
     pub cataloged: Option<Vec<CatalogedComponent>>,
+    /// The vulnerability database THIS scan graded against (#3014), when the
+    /// engine reported it alongside the findings (the scanner-adapter's
+    /// `vulnerability_db`). Carried per scan rather than read back from a
+    /// shared "last scan" slot, so concurrent scans, or adapter replicas on
+    /// different DB vintages, can never stamp one scan with another's DB.
+    /// `None` falls back to [`Scanner::vuln_db`] in the orchestrator.
+    pub vuln_db: Option<VulnDbProvenance>,
 }
 
 impl ScanOutput {
@@ -3806,6 +3813,7 @@ impl ScanOutput {
             packages: Vec::new(),
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -3825,6 +3833,7 @@ impl ScanOutput {
             packages: convert_trivy_packages(report),
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -3846,6 +3855,7 @@ impl ScanOutput {
             packages: convert_trivy_packages(report),
             scan_completeness: classify_trivy_completeness(report, stderr, known_targets),
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -4884,7 +4894,7 @@ pub(crate) async fn capture_cli_version_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
-    let full = capture_cli_output_with_timeout(binary, args, timeout).await?;
+    let full = capture_cli_output_with_timeout(binary, args, timeout, &[]).await?;
     let line = full.lines().next()?.trim();
     if line.is_empty() {
         None
@@ -4898,7 +4908,19 @@ pub(crate) async fn capture_cli_version_with_timeout(
 /// safety properties as [`capture_cli_version`]: 64 KiB stdout cap, wall-clock
 /// timeout, kill+reap on every failure path, `None` on a non-zero exit.
 pub(crate) async fn capture_cli_output(binary: &str, args: &[&str]) -> Option<String> {
-    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT, &[]).await
+}
+
+/// [`capture_cli_output`] with extra child-process env vars, for probes that
+/// must see the same configuration as the scan they describe (#3014: a
+/// `grype db status` probe has to look at the DB directory the scan child
+/// is pointed at, not the backend's own `$HOME`).
+pub(crate) async fn capture_cli_output_with_env(
+    binary: &str,
+    args: &[&str],
+    env: &[(&str, String)],
+) -> Option<String> {
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT, env).await
 }
 
 /// Shared child-process capture behind [`capture_cli_version_with_timeout`]
@@ -4907,6 +4929,7 @@ pub(crate) async fn capture_cli_output_with_timeout(
     binary: &str,
     args: &[&str],
     timeout: Duration,
+    env: &[(&str, String)],
 ) -> Option<String> {
     // Always kill+reap a child before returning so we never leave a
     // zombie. `child.kill()` on Unix sends SIGKILL but does not reap;
@@ -4926,6 +4949,9 @@ pub(crate) async fn capture_cli_output_with_timeout(
     // outlive its caller, so cancellation must own the child just as it does
     // for scanner and cleanup subprocesses (#3455).
     command.kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
@@ -5088,12 +5114,28 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
+    cached_cli_version_with_hit_ttl(cell, VERSION_CACHE_HIT_TTL, probe).await
+}
+
+/// [`cached_cli_version`] with a caller-chosen TTL for successful probes.
+/// Used where the probed fact changes far more often than a binary does,
+/// e.g. the vulnerability-DB status (#3014), which an air-gapped operator
+/// can swap without restarting the backend.
+pub(crate) async fn cached_cli_version_with_hit_ttl<F, Fut>(
+    cell: &VersionCache,
+    hit_ttl: Duration,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
     // Fast path: read lock, check TTL, return cached clone.
     {
         let guard = cell.inner.read().await;
         if let Some((stored_at, ref value)) = *guard {
             let ttl = if value.is_some() {
-                VERSION_CACHE_HIT_TTL
+                hit_ttl
             } else {
                 VERSION_CACHE_MISS_TTL
             };
@@ -5114,7 +5156,7 @@ where
     // value to keep the TTL window stable.
     if let Some((stored_at, ref value)) = *guard {
         let ttl = if value.is_some() {
-            VERSION_CACHE_HIT_TTL
+            hit_ttl
         } else {
             VERSION_CACHE_MISS_TTL
         };
@@ -5363,6 +5405,16 @@ pub struct AdapterVulnDb {
 }
 
 impl AdapterVulnDb {
+    /// Parse the adapter's `vulnerability_db` field leniently (#3014): any
+    /// shape that is not the expected object (a third-party Harbor scanner
+    /// reusing the key, a string-typed version) yields `None` instead of
+    /// failing deserialization of the whole report, and with it the scan.
+    pub fn lenient(raw: Option<&serde_json::Value>) -> Option<VulnDbProvenance> {
+        serde_json::from_value::<AdapterVulnDb>(raw?.clone())
+            .ok()?
+            .provenance()
+    }
+
     /// `trivy-db-v<schema>` updated at `UpdatedAt`. `None` when the adapter
     /// sent no schema version (an older adapter, or no DB metadata).
     pub fn provenance(&self) -> Option<VulnDbProvenance> {
@@ -7230,6 +7282,7 @@ impl Scanner for DependencyScanner {
                     survivor.finding_class = survivor
                         .finding_class
                         .most_severe(Self::class_of(&advisory_match));
+                    survivor.severity = survivor.finding_class.graded_severity(survivor.severity);
                     for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
                         seen_ids.entry(dep_key(id)).or_insert(idx);
                     }
@@ -7242,6 +7295,9 @@ impl Scanner for DependencyScanner {
 
                 let cve_id = Self::cve_of(&advisory_match);
                 let finding_class = Self::class_of(&advisory_match);
+                // #3013: a known-malicious package is Critical, whatever (or
+                // however little) severity its advisory carries.
+                let severity = finding_class.graded_severity(severity);
 
                 let title = advisory_match
                     .summary
@@ -7324,6 +7380,7 @@ impl Scanner for DependencyScanner {
             packages,
             scan_completeness: completeness_for_feeds(feeds_degraded),
             cataloged: None,
+            vuln_db: None,
         })
     }
 }
@@ -8259,6 +8316,7 @@ impl ScannerService {
                     packages,
                     scan_completeness,
                     cataloged,
+                    vuln_db: output_vuln_db,
                 }) => {
                     // #4036 fail-closed: a catalog-reporting scanner that RAN
                     // successfully over a package-archive artifact whose format
@@ -8450,8 +8508,12 @@ impl ScannerService {
                     // NULL as "legacy / unknown" rather than as a hard error.
                     let scanner_version = scanner.version().await;
                     // #3014: and the vulnerability database it graded
-                    // against, probed at the same moment for the same reason.
-                    let vuln_db = scanner.vuln_db().await;
+                    // against: as reported with THIS scan's findings when the
+                    // engine reports it (the adapter), else probed now.
+                    let vuln_db = match output_vuln_db {
+                        Some(db) => Some(db),
+                        None => scanner.vuln_db().await,
+                    };
 
                     // Persist findings
                     self.scan_result_service
@@ -16637,6 +16699,18 @@ tonic-build = "0.12"
                 class_of("pillow"),
                 Some(crate::models::security::FindingClass::Vulnerability)
             );
+            let severity_of = |component: &str| {
+                out.findings
+                    .iter()
+                    .find(|f| f.affected_component.as_deref() == Some(component))
+                    .map(|f| f.severity)
+            };
+            assert_eq!(
+                severity_of("evil-pkg"),
+                Some(Severity::Critical),
+                "an ungraded MAL record must not fall back to Medium"
+            );
+            assert_eq!(severity_of("pillow"), Some(Severity::Critical));
         }
 
         /// #3013: when the `MAL-` record arrives as a duplicate of an advisory
@@ -16677,6 +16751,7 @@ tonic-build = "0.12"
                 out.findings[0].finding_class,
                 crate::models::security::FindingClass::Malicious
             );
+            assert_eq!(out.findings[0].severity, Severity::Critical);
         }
 
         /// The same positional discipline in the cache. Caching a whole
@@ -23686,6 +23761,7 @@ tonic-build = "0.12"
                 packages: Vec::new(),
                 scan_completeness: ScanCompleteness::Complete,
                 cataloged: self.cataloged.clone(),
+                vuln_db: None,
             })
         }
     }
@@ -24682,6 +24758,7 @@ tonic-build = "0.12"
                     ScanCompleteness::Partial
                 },
                 cataloged: None,
+                vuln_db: None,
             })
         }
     }
@@ -26802,6 +26879,7 @@ tonic-build = "0.12"
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: None,
+                        vuln_db: None,
                     }),
                     FakeOutcome::CompleteWithCatalog {
                         findings,
@@ -26812,6 +26890,7 @@ tonic-build = "0.12"
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: cataloged.clone(),
+                        vuln_db: None,
                     }),
                     // Displays as "Internal error: <reason>" so the reason is
                     // preserved in scan_results.error_message via fail_scan.
@@ -30667,6 +30746,24 @@ Status:    valid\n";
     }
 
     #[test]
+    fn adapter_vulnerability_db_is_parsed_leniently() {
+        let ok = serde_json::json!({"version": 2, "updated_at": "2026-10-04T19:39:34Z"});
+        assert_eq!(
+            AdapterVulnDb::lenient(Some(&ok)).map(|p| p.version),
+            Some("trivy-db-v2".to_string())
+        );
+        for bad in [
+            serde_json::json!({"version": "2"}),
+            serde_json::json!("trivy-db"),
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(AdapterVulnDb::lenient(Some(&bad)), None, "{bad}");
+        }
+        assert_eq!(AdapterVulnDb::lenient(None), None);
+    }
+
+    #[test]
     fn adapter_metadata_without_schema_is_no_provenance() {
         assert_eq!(AdapterVulnDb::default().provenance(), None);
         let zero = AdapterVulnDb {
@@ -30699,6 +30796,17 @@ Status:    valid\n";
             with_gh.vuln_db().await.map(|p| p.version),
             Some("live:osv+ghsa".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn capture_with_env_hands_the_env_to_the_child() {
+        let out = capture_cli_output_with_env(
+            "sh",
+            &["-c", "printf %s \"$AK_PROBE_ENV_3014\""],
+            &[("AK_PROBE_ENV_3014", "/seeded/grype".to_string())],
+        )
+        .await;
+        assert_eq!(out.as_deref(), Some("/seeded/grype"));
     }
 
     #[tokio::test]

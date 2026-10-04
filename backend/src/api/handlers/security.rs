@@ -1326,8 +1326,12 @@ fn build_external_findings(
                     "Every finding requires a non-empty title".to_string(),
                 ));
             }
+            // #3013: an external `MAL-*` id is a malicious package, classed
+            // (and graded) exactly as the dependency scanner classes one.
+            let finding_class =
+                crate::models::security::FindingClass::from_advisory_ids(f.cve_id.as_deref());
             Ok(RawFinding {
-                severity: Severity::from_scanner_token(&f.severity),
+                severity: finding_class.graded_severity(Severity::from_scanner_token(&f.severity)),
                 title,
                 description: f.description,
                 cve_id: f.cve_id,
@@ -1336,7 +1340,7 @@ fn build_external_findings(
                 fixed_version: f.fixed_version,
                 source: Some(f.source.unwrap_or_else(|| scanner.to_string())),
                 source_url: f.source_url,
-                finding_class: crate::models::security::FindingClass::Vulnerability,
+                finding_class,
             })
         })
         .collect()
@@ -7575,6 +7579,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // #3411: external findings ingestion.
     // -----------------------------------------------------------------------
+
+    /// #3013: an externally submitted `MAL-*` finding is classed and graded
+    /// like the dependency scanner's: malicious, Critical.
+    #[test]
+    fn test_external_mal_finding_is_malicious_and_critical() {
+        use crate::models::security::{FindingClass, Severity};
+        let input = |cve: &str| ExternalFindingInput {
+            severity: "low".to_string(),
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        };
+        let out = build_external_findings("acme", vec![input("MAL-2025-7"), input("CVE-2024-1")])
+            .expect("valid findings");
+        assert_eq!(out[0].finding_class, FindingClass::Malicious);
+        assert_eq!(out[0].severity, Severity::Critical);
+        assert_eq!(out[1].finding_class, FindingClass::Vulnerability);
+        assert_eq!(out[1].severity, Severity::Low);
+    }
 
     #[test]
     fn test_external_severity_normalization_fails_closed() {

@@ -580,6 +580,22 @@ impl FindingClass {
         }
     }
 
+    /// The severity a finding of this class is recorded at (#3013).
+    ///
+    /// A known-malicious package is graded `Critical` whatever its advisory
+    /// says. OSV `MAL-*` records usually carry no severity at all, which the
+    /// advisory path would otherwise default to `Medium`, letting a
+    /// `max_severity = high` promotion or quarantine gate pass a package that
+    /// is known to be hostile. Until a class-aware (non-overridable) gate
+    /// exists, the severity is what every existing gate reads, so it fails
+    /// closed here. Other classes keep the scanner's grade.
+    pub fn graded_severity(self, severity: Severity) -> Severity {
+        match self {
+            FindingClass::Malicious => Severity::Critical,
+            FindingClass::Vulnerability | FindingClass::Policy => severity,
+        }
+    }
+
     /// The class that wins when two findings describing the same thing are
     /// merged: hostile beats policy beats weakness, so a merge can never
     /// launder a malicious finding into an ordinary one.
@@ -1108,6 +1124,24 @@ mod tests {
             FindingClass::from_advisory_ids(["mal-2024-1"]),
             FindingClass::Vulnerability
         );
+    }
+
+    #[test]
+    fn malicious_findings_are_graded_critical() {
+        for sev in [
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+            Severity::Info,
+        ] {
+            assert_eq!(
+                FindingClass::Malicious.graded_severity(sev),
+                Severity::Critical
+            );
+            assert_eq!(FindingClass::Vulnerability.graded_severity(sev), sev);
+            assert_eq!(FindingClass::Policy.graded_severity(sev), sev);
+        }
     }
 
     #[test]

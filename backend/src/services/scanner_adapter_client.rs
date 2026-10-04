@@ -69,9 +69,17 @@ pub(crate) struct TrivyEngine {
     /// Trivy version reported by the scanner-adapter on the most recent
     /// successful scan (adapter mode); there is no local binary to probe.
     adapter_version: std::sync::Mutex<Option<String>>,
-    /// Trivy vulnerability-DB provenance the adapter reported on the most
-    /// recent successful scan (#3014). Always `None` in CLI mode.
-    adapter_vuln_db: std::sync::Mutex<Option<crate::models::security::VulnDbProvenance>>,
+}
+
+/// One completed adapter filesystem scan: trivy's native report, its stderr
+/// (partial-scan signal, #1153) and the vulnerability DB the adapter says
+/// this very scan ran against (#3014). The DB travels with the report it
+/// describes rather than through a shared slot, so concurrent scans cannot
+/// be stamped with each other's DB vintage.
+pub(crate) struct AdapterFsScan {
+    pub report: TrivyReport,
+    pub stderr: String,
+    pub vuln_db: Option<crate::models::security::VulnDbProvenance>,
 }
 
 impl TrivyEngine {
@@ -92,7 +100,6 @@ impl TrivyEngine {
         Self {
             backend,
             adapter_version: std::sync::Mutex::new(None),
-            adapter_vuln_db: std::sync::Mutex::new(None),
         }
     }
 
@@ -116,26 +123,17 @@ impl TrivyEngine {
         }
     }
 
-    /// Vulnerability-DB provenance for `scan_results` (#3014): what the
-    /// adapter reported on the last successful scan. `None` in legacy CLI
-    /// mode, where the DB lives behind `trivy --server` and is not probed.
-    pub fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
-        match &self.backend {
-            TrivyFsBackend::Cli { .. } => None,
-            TrivyFsBackend::Adapter(_) => self.adapter_vuln_db.lock().ok().and_then(|g| g.clone()),
-        }
-    }
-
     /// Adapter-path scan: tar `dir` (bounded by `cap_bytes` — over-cap
     /// degrades to `not_applicable` via `ScannerEngineUnavailable`), upload
     /// it, and return trivy's native report + stderr, recording the
-    /// adapter-reported scanner version for [`Self::version`].
+    /// adapter-reported scanner version for [`Self::version`]. The
+    /// vulnerability DB is returned with the report (#3014).
     pub async fn scan_dir_via_adapter(
         &self,
         client: &ScannerAdapterFsClient,
         dir: &Path,
         cap_bytes: u64,
-    ) -> Result<(TrivyReport, String)> {
+    ) -> Result<AdapterFsScan> {
         let tar = tar_workspace_capped_async(dir, cap_bytes).await?;
         let body = client.scan_workspace_tar(tar).await?;
         if let Some(ver) = body.scanner_version.filter(|v| !v.is_empty()) {
@@ -148,13 +146,14 @@ impl TrivyEngine {
                 *guard = Some(normalized);
             }
         }
-        if let Ok(mut guard) = self.adapter_vuln_db.lock() {
-            *guard = body
-                .vulnerability_db
-                .as_ref()
-                .and_then(|db| db.provenance());
-        }
-        Ok((body.report, body.stderr))
+        let vuln_db = crate::services::scanner_service::AdapterVulnDb::lenient(
+            body.vulnerability_db.as_ref(),
+        );
+        Ok(AdapterFsScan {
+            report: body.report,
+            stderr: body.stderr,
+            vuln_db,
+        })
     }
 }
 
@@ -170,9 +169,10 @@ pub(crate) struct FsScanReportBody {
     #[serde(default)]
     pub scanner_version: Option<String>,
     /// Trivy vulnerability-DB metadata the scan ran against (#3014); absent
-    /// from adapters older than this field.
+    /// from adapters older than this field. Kept as raw JSON and parsed
+    /// leniently: best-effort provenance must never fail the scan.
     #[serde(default)]
-    pub vulnerability_db: Option<crate::services::scanner_service::AdapterVulnDb>,
+    pub vulnerability_db: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -509,7 +509,8 @@ mod tests {
                 "Packages": [{"Name": "acme/lib", "Version": "1.0.0"}]
             }]},
             "stderr": "WARN something skipped",
-            "scanner_version": "0.71.2"
+            "scanner_version": "0.71.2",
+            "vulnerability_db": {"version": 2, "updated_at": "2026-10-04T19:39:34Z"}
         });
         mount_fs_scan_success(&server, "fs-1", body).await;
 
@@ -527,6 +528,12 @@ mod tests {
         // #1153: stderr must be carried for the partial-scan classifier.
         assert_eq!(out.stderr, "WARN something skipped");
         assert_eq!(out.scanner_version.as_deref(), Some("0.71.2"));
+        // #3014: the wire field name the adapter emits.
+        assert_eq!(
+            crate::services::scanner_service::AdapterVulnDb::lenient(out.vulnerability_db.as_ref())
+                .map(|p| p.version),
+            Some("trivy-db-v2".to_string())
+        );
     }
 
     /// An unreachable adapter is an availability state: the scan must degrade

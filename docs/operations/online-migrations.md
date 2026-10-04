@@ -122,20 +122,31 @@ file that builds two indexes has two ways to fail half-way.
 
 ### 2. Check or foreign-key constraint
 
-Two statements, and they may be in the same transactional migration:
+Two statements, in **two separate migrations**. `0300_artifacts_size_check.sql`:
 
 ```sql
 ALTER TABLE artifacts
     ADD CONSTRAINT artifacts_size_nonneg CHECK (size_bytes >= 0) NOT VALID;
+```
 
+then `0301_artifacts_size_check_validate.sql`:
+
+```sql
 ALTER TABLE artifacts VALIDATE CONSTRAINT artifacts_size_nonneg;
 ```
 
 `NOT VALID` is a catalogue update — new rows are checked immediately, existing
 rows are not. `VALIDATE CONSTRAINT` then scans under
-`SHARE UPDATE EXCLUSIVE`, which does not block writes. On a very large table,
-put the `VALIDATE` in a later migration so the two scans are separately
-restartable.
+`SHARE UPDATE EXCLUSIVE`, which does not block writes — **but only in a
+transaction of its own.** sqlx runs each migration file in one transaction and
+PostgreSQL holds locks until commit, so a `VALIDATE` in the same file as the
+`ADD CONSTRAINT … NOT VALID` (or an `ADD COLUMN`) still holds that statement's
+`ACCESS EXCLUSIVE` for the whole scan, blocking every reader and writer.
+
+If every existing row satisfies the constraint by construction — the column
+was added in the same migration with a constant default that passes the
+check — skip the `VALIDATE` entirely: the `NOT VALID` constraint already
+enforces every new write.
 
 ### 3. Unique constraint
 
