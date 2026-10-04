@@ -15,6 +15,8 @@
 //!   the `artifacts` row, so flipping `is_deleted` back would resurrect a
 //!   manifest no tag points at, possibly over layers already gone. Re-push the
 //!   image instead.
+//! * Legacy proxy-cache rows (`proxy-cache/…` keys, #3368) are refused: the
+//!   object belongs to the proxy cache catalog, which expires it on its own.
 //! * The stored object must still exist. GC removes the object before it
 //!   hard-deletes the rows, and a crash in between can leave a trashed row
 //!   whose bytes are gone; restoring that would publish a dangling artifact.
@@ -36,14 +38,15 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::api::dto::{Pagination, PaginationQuery};
 use crate::error::{AppError, Result};
 use crate::storage::{StorageLocation, StorageRegistry};
 
-/// Largest page the list endpoint returns.
-pub const MAX_TRASH_PAGE_SIZE: i64 = 500;
+/// Largest `per_page` the list endpoint honours.
+pub const MAX_TRASH_PAGE_SIZE: u32 = 500;
 
-/// Page size when the caller does not ask for one.
-pub const DEFAULT_TRASH_PAGE_SIZE: i64 = 50;
+/// `per_page` when the caller does not ask for one.
+pub const DEFAULT_TRASH_PAGE_SIZE: u32 = 50;
 
 /// Storage-key prefixes whose artifacts cannot be restored (OCI manifests and
 /// blobs; see the module docs).
@@ -53,6 +56,14 @@ const NON_RESTORABLE_KEY_PREFIXES: [&str; 2] = ["oci-manifests/", "oci-blobs/"];
 pub const OCI_RESTORE_BLOCKED_REASON: &str =
     "OCI manifests and blobs cannot be restored: deleting them also removed their tags, \
      and blob GC reclaims layers independently. Re-push the image instead.";
+
+/// Why a legacy proxy-cache row is refused (#3368): its object belongs to the
+/// proxy cache catalog (`proxy_cache_artifacts`), which `purge_repo_cache` and
+/// TTL expiry delete on their own schedule, so a restored live row would soon
+/// point at nothing.
+pub const PROXY_CACHE_RESTORE_BLOCKED_REASON: &str =
+    "Proxy cache entries cannot be restored: the cached object is owned by the proxy cache \
+     and is re-fetched from upstream on the next request.";
 
 /// One artifact in the trash.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -64,13 +75,15 @@ pub struct TrashedArtifact {
     pub name: String,
     pub version: Option<String>,
     pub size_bytes: i64,
+    pub checksum_sha256: String,
     /// When the artifact entered the trash. `null` for artifacts deleted
     /// before the trash existed (migration 261); GC treats those as expired.
     pub deleted_at: Option<DateTime<Utc>>,
     /// Earliest time storage GC may reclaim the artifact. `null` means it is
     /// already eligible (retention is 0, or `deleted_at` is unknown).
     pub purge_eligible_at: Option<DateTime<Utc>>,
-    /// Whether `POST /api/v1/admin/trash/{id}/restore` can restore it.
+    /// Whether `POST /api/v1/admin/trash/{id}/restore` can restore it
+    /// (`false` in the restore response, since it is no longer in the trash).
     pub restorable: bool,
     /// Why it cannot be restored, when `restorable` is false.
     pub restore_blocked_reason: Option<String>,
@@ -80,10 +93,8 @@ pub struct TrashedArtifact {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrashPage {
     pub items: Vec<TrashedArtifact>,
-    /// Total artifacts in the trash matching the filter.
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
+    /// Standard `page` / `per_page` metadata (`api::dto::Pagination`).
+    pub pagination: Pagination,
     /// The configured `GC_TRASH_RETENTION_DAYS`.
     pub retention_days: u32,
 }
@@ -98,6 +109,7 @@ struct TrashRow {
     name: String,
     version: Option<String>,
     size_bytes: i64,
+    checksum_sha256: String,
     storage_key: String,
     deleted_at: Option<DateTime<Utc>>,
 }
@@ -116,13 +128,29 @@ impl TrashRow {
             name: self.name,
             version: self.version,
             size_bytes: self.size_bytes,
+            checksum_sha256: self.checksum_sha256,
             deleted_at: self.deleted_at,
+        }
+    }
+
+    /// The artifact as it stands once restored: live, so no deletion time,
+    /// no purge time, and nothing left to restore.
+    fn into_restored(self) -> TrashedArtifact {
+        TrashedArtifact {
+            deleted_at: None,
+            purge_eligible_at: None,
+            restorable: false,
+            restore_blocked_reason: None,
+            ..self.into_trashed(0)
         }
     }
 }
 
 /// Why an artifact with this storage key cannot be restored, if it cannot.
 pub fn restore_blocked_reason(storage_key: &str) -> Option<&'static str> {
+    if crate::services::proxy_service::ProxyService::is_proxy_cache_key(storage_key) {
+        return Some(PROXY_CACHE_RESTORE_BLOCKED_REASON);
+    }
     NON_RESTORABLE_KEY_PREFIXES
         .iter()
         .any(|p| storage_key.starts_with(p))
@@ -142,12 +170,17 @@ pub fn purge_eligible_at(
     deleted_at.map(|at| at + Duration::days(i64::from(retention_days)))
 }
 
-/// Clamp caller-supplied paging to `[1, MAX_TRASH_PAGE_SIZE]` and `>= 0`.
-pub fn clamp_trash_paging(limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
-    let limit = limit
-        .unwrap_or(DEFAULT_TRASH_PAGE_SIZE)
-        .clamp(1, MAX_TRASH_PAGE_SIZE);
-    (limit, offset.unwrap_or(0).max(0))
+/// Normalize caller-supplied `page` / `per_page` (page >= 1, per_page in
+/// `[1, MAX_TRASH_PAGE_SIZE]`, default `DEFAULT_TRASH_PAGE_SIZE`).
+pub fn clamp_trash_paging(page: Option<u32>, per_page: Option<u32>) -> PaginationQuery {
+    PaginationQuery {
+        page: Some(page.unwrap_or(1).max(1)),
+        per_page: Some(
+            per_page
+                .unwrap_or(DEFAULT_TRASH_PAGE_SIZE)
+                .clamp(1, MAX_TRASH_PAGE_SIZE),
+        ),
+    }
 }
 
 /// Decide whether a locked trash candidate may be restored, before any
@@ -171,7 +204,7 @@ fn check_restorable(is_deleted: bool, storage_key: &str, path_taken: bool) -> Re
 }
 
 const TRASH_COLUMNS_SQL: &str = "a.id, a.repository_id, r.key AS repository_key, a.path, a.name, \
-     a.version, a.size_bytes, a.storage_key, a.deleted_at";
+     a.version, a.size_bytes, a.checksum_sha256, a.storage_key, a.deleted_at";
 
 pub struct TrashService {
     db: PgPool,
@@ -193,10 +226,12 @@ impl TrashService {
     pub async fn list(
         &self,
         repository_key: Option<&str>,
-        limit: Option<i64>,
-        offset: Option<i64>,
+        page: Option<u32>,
+        per_page: Option<u32>,
     ) -> Result<TrashPage> {
-        let (limit, offset) = clamp_trash_paging(limit, offset);
+        let paging = clamp_trash_paging(page, per_page);
+        let limit = i64::from(paging.per_page());
+        let offset = i64::from(paging.page() - 1) * limit;
         let filter = "FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
                       WHERE a.is_deleted = true AND ($1::text IS NULL OR r.key = $1)";
         let total: i64 =
@@ -219,15 +254,13 @@ impl TrashService {
                 .into_iter()
                 .map(|r| r.into_trashed(self.retention_days))
                 .collect(),
-            total,
-            limit,
-            offset,
+            pagination: Pagination::from_query_and_total(&paging, total),
             retention_days: self.retention_days,
         })
     }
 
-    /// Restore one trashed artifact. Returns the artifact as it was in the
-    /// trash; `NotFound` if it is not (or no longer) there, `Conflict` if it is
+    /// Restore one trashed artifact. Returns its post-restore state (no
+    /// `deleted_at`, no purge time); `NotFound` if it is not (or no longer) there, `Conflict` if it is
     /// OCI content, its path is taken, or its stored object is gone.
     pub async fn restore(&self, id: Uuid) -> Result<TrashedArtifact> {
         let mut tx = self.db.begin().await?;
@@ -274,7 +307,7 @@ impl TrashService {
         .await?;
         tx.commit().await?;
 
-        Ok(candidate.row.into_trashed(self.retention_days))
+        Ok(candidate.row.into_restored())
     }
 }
 
@@ -304,6 +337,10 @@ pub(crate) mod tests {
         assert!(restore_blocked_reason("oci-blobs/sha256:abc").is_some());
         assert_eq!(restore_blocked_reason("maven/com/acme/a-1.jar"), None);
         assert_eq!(restore_blocked_reason("generic/oci-manifests/x"), None);
+        assert_eq!(
+            restore_blocked_reason("proxy-cache/remote-x/simple/six/__content__"),
+            Some(PROXY_CACHE_RESTORE_BLOCKED_REASON)
+        );
     }
 
     #[test]
@@ -319,12 +356,12 @@ pub(crate) mod tests {
 
     #[test]
     fn trash_paging_is_clamped() {
-        assert_eq!(clamp_trash_paging(None, None), (DEFAULT_TRASH_PAGE_SIZE, 0));
-        assert_eq!(clamp_trash_paging(Some(0), Some(-5)), (1, 0));
-        assert_eq!(
-            clamp_trash_paging(Some(10_000), Some(7)),
-            (MAX_TRASH_PAGE_SIZE, 7)
-        );
+        let q = clamp_trash_paging(None, None);
+        assert_eq!((q.page(), q.per_page()), (1, DEFAULT_TRASH_PAGE_SIZE));
+        let q = clamp_trash_paging(Some(0), Some(0));
+        assert_eq!((q.page(), q.per_page()), (1, 1));
+        let q = clamp_trash_paging(Some(7), Some(10_000));
+        assert_eq!((q.page(), q.per_page()), (7, MAX_TRASH_PAGE_SIZE));
     }
 
     #[test]
@@ -399,7 +436,8 @@ pub(crate) mod tests {
             .expect("list other");
         fx.teardown().await;
 
-        assert_eq!(page.total, 2);
+        assert_eq!(page.pagination.total, 2);
+        assert_eq!(page.pagination.per_page, DEFAULT_TRASH_PAGE_SIZE);
         assert_eq!(page.retention_days, 14);
         let by_id = |id| page.items.iter().find(|i| i.id == id).expect("listed");
         let plain = by_id(plain);
@@ -415,7 +453,7 @@ pub(crate) mod tests {
             oci.restore_blocked_reason.as_deref(),
             Some(OCI_RESTORE_BLOCKED_REASON)
         );
-        assert_eq!(other.total, 0);
+        assert_eq!(other.pagination.total, 0);
         assert!(other.items.is_empty());
     }
 
@@ -439,7 +477,13 @@ pub(crate) mod tests {
         let missing = svc.restore(Uuid::new_v4()).await;
         fx.teardown().await;
 
-        assert_eq!(restored.expect("restore").path, path);
+        let restored = restored.expect("restore");
+        assert_eq!(restored.path, path);
+        assert_eq!(
+            restored.deleted_at, None,
+            "response is the post-restore state"
+        );
+        assert_eq!(restored.purge_eligible_at, None);
         assert_eq!(
             row,
             (false, None),

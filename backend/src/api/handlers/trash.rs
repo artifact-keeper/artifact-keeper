@@ -29,7 +29,7 @@ use crate::services::trash_service::{TrashPage, TrashService, TrashedArtifact};
 #[derive(OpenApi)]
 #[openapi(
     paths(list_trash, restore_trashed_artifact),
-    components(schemas(TrashPage, TrashedArtifact))
+    components(schemas(TrashPage, TrashedArtifact, crate::api::dto::Pagination))
 )]
 pub struct TrashApiDoc;
 
@@ -44,10 +44,10 @@ pub fn router() -> Router<SharedState> {
 pub struct TrashListQuery {
     /// Only artifacts of the repository with this key.
     pub repository: Option<String>,
-    /// Page size, 1 to 500 (default 50).
-    pub limit: Option<i64>,
-    /// Rows to skip (default 0).
-    pub offset: Option<i64>,
+    /// Page number, 1-indexed (default 1).
+    pub page: Option<u32>,
+    /// Items per page, 1 to 500 (default 50).
+    pub per_page: Option<u32>,
 }
 
 fn trash_service(state: &SharedState) -> TrashService {
@@ -83,16 +83,17 @@ pub async fn list_trash(
 ) -> Result<Json<TrashPage>> {
     auth.require_admin()?;
     let page = trash_service(&state)
-        .list(query.repository.as_deref(), query.limit, query.offset)
+        .list(query.repository.as_deref(), query.page, query.per_page)
         .await?;
     Ok(Json(page))
 }
 
 /// POST /api/v1/admin/trash/{id}/restore
 ///
-/// Put a soft-deleted artifact back. Refused with 409 for OCI manifests and
-/// blobs (their tags are not restored), when another live artifact holds the
-/// path, or when the stored object is already gone.
+/// Put a soft-deleted artifact back and return its post-restore state.
+/// Refused with 409 for proxy-cache rows, OCI manifests and blobs (their tags
+/// are not restored), when another live artifact holds the path, or when the
+/// stored object is already gone.
 #[utoipa::path(
     post,
     path = "/{id}/restore",
@@ -104,7 +105,7 @@ pub async fn list_trash(
         (status = 200, description = "Artifact restored", body = TrashedArtifact),
         (status = 403, description = "Admin privileges required"),
         (status = 404, description = "Artifact not found or not in the trash"),
-        (status = 409, description = "Artifact cannot be restored (OCI content, path taken, or object gone)"),
+        (status = 409, description = "Artifact cannot be restored (OCI or proxy-cache content, path taken, or object gone)"),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -127,7 +128,7 @@ pub async fn restore_trashed_artifact(
             name: restored.name.clone(),
             version: restored.version.clone(),
             size_bytes: u64::try_from(restored.size_bytes).ok(),
-            digest: None,
+            digest: Some(format!("sha256:{}", restored.checksum_sha256)),
             uploaded_by: None,
         });
     audit_fire_and_forget(state.db.clone(), entry).await;
@@ -172,7 +173,7 @@ mod tests {
         assert_eq!(denied_restore, StatusCode::FORBIDDEN);
         assert_eq!(list_status, StatusCode::OK);
         let page: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
-        assert_eq!(page["total"], 1, "{page}");
+        assert_eq!(page["pagination"]["total"], 1, "{page}");
         assert_eq!(page["items"][0]["path"], path);
         assert_eq!(restore_status, StatusCode::OK);
         let restored: serde_json::Value = serde_json::from_slice(&restore_body).unwrap();
