@@ -1073,6 +1073,23 @@ impl RepositoryService {
         req: CreateRepositoryRequest,
         repodata_depth: u32,
     ) -> Result<Repository> {
+        self.create_with_options(req, repodata_depth, true).await
+    }
+
+    /// Create with an explicit choice about the creator's owner auto-grant.
+    ///
+    /// `grant_owner_role = false` still records `created_by` but skips the
+    /// `repository-owner`/`developer` role assignments (#2473). A project
+    /// admin's access to a repository it creates must come only from its
+    /// revocable project grant: an owner role carries `admin`, which
+    /// `check_repository_action` honours regardless of project rules, so it
+    /// would outlive the creator's removal from the project.
+    pub async fn create_with_options(
+        &self,
+        req: CreateRepositoryRequest,
+        repodata_depth: u32,
+        grant_owner_role: bool,
+    ) -> Result<Repository> {
         crate::services::rpm_layout::validate_depth(repodata_depth)?;
         if repodata_depth > 0
             && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
@@ -1224,17 +1241,19 @@ impl RepositoryService {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
-                    sqlx::query(
-                        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-                         SELECT $1, r.id, $2 FROM roles r \
-                         WHERE r.name IN ('repository-owner', 'developer') \
-                         ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
-                    )
-                    .bind(creator_id)
-                    .bind(repo.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    if grant_owner_role {
+                        sqlx::query(
+                            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                             SELECT $1, r.id, $2 FROM roles r \
+                             WHERE r.name IN ('repository-owner', 'developer') \
+                             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+                        )
+                        .bind(creator_id)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    }
                 }
                 if repodata_depth > 0 {
                     crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)

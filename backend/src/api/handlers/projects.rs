@@ -169,7 +169,11 @@ pub(crate) async fn require_project_admin(
     }
     // Skip the lookup entirely for a repo-restricted credential: it can never
     // pass `project_admin_allowed`, whatever grants its principal holds.
-    let has_grant = project_admin_allowed(auth, true)
+    let scope_ok = matches!(
+        auth.access_scope(),
+        crate::models::access_scope::AccessScope::Admin
+    );
+    let has_grant = scope_ok
         && state
             .permission_service
             .check_permission(auth.user_id, "project", project_id, "admin", false)
@@ -225,6 +229,16 @@ pub(crate) async fn can_assign_to_project(
     if has_system_repo_admin(state, auth).await? {
         return Ok(true);
     }
+    is_project_admin(state, auth, project_id).await
+}
+
+/// [`require_project_admin`] as a boolean (a denial is `Ok(false)`, a
+/// database failure is still an error).
+pub(crate) async fn is_project_admin(
+    state: &SharedState,
+    auth: &AuthExtension,
+    project_id: Uuid,
+) -> Result<bool> {
     match require_project_admin(state, auth, project_id).await {
         Ok(()) => Ok(true),
         Err(AppError::Authorization(_)) => Ok(false),
@@ -243,10 +257,17 @@ pub(crate) async fn can_assign_to_project(
 /// (`claimed`, as `(id, key)` pairs) must be assigned to one of them. This
 /// stops a project admin from minting `customer-b-*` names inside their own
 /// project.
+///
+/// `name_projects` controls whether the 400 names the claimed projects. It
+/// is true only for global admins: a project admin probing `<guess>-x` keys
+/// must not learn other tenants' project keys from the message (the
+/// success/400 difference remains as a residual oracle, an accepted
+/// trade-off).
 pub(crate) fn check_repo_key_project_prefix(
     repo_key: &str,
     assigned: Uuid,
     claimed: &[(Uuid, String)],
+    name_projects: bool,
 ) -> Result<()> {
     let claimed: Vec<&(Uuid, String)> = claimed
         .iter()
@@ -254,6 +275,12 @@ pub(crate) fn check_repo_key_project_prefix(
         .collect();
     if claimed.is_empty() || claimed.iter().any(|(id, _)| *id == assigned) {
         return Ok(());
+    }
+    if !name_projects {
+        return Err(AppError::Validation(format!(
+            "Repository key '{repo_key}' uses another project's key prefix; \
+             use '<project key>-<name>' of the assigned project or an unprefixed key"
+        )));
     }
     let keys: Vec<&str> = claimed.iter().map(|(_, k)| k.as_str()).collect();
     Err(AppError::Validation(format!(
@@ -270,6 +297,7 @@ pub(crate) async fn validate_repo_key_project_prefix(
     state: &SharedState,
     repo_key: &str,
     assigned: Uuid,
+    name_projects: bool,
 ) -> Result<()> {
     let claimed: Vec<(Uuid, String)> =
         sqlx::query_as("SELECT id, key FROM projects WHERE left($1, length(key) + 1) = key || '-'")
@@ -277,7 +305,7 @@ pub(crate) async fn validate_repo_key_project_prefix(
             .fetch_all(&state.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-    check_repo_key_project_prefix(repo_key, assigned, &claimed)
+    check_repo_key_project_prefix(repo_key, assigned, &claimed, name_projects)
 }
 
 // ---------------------------------------------------------------------------
@@ -991,9 +1019,7 @@ mod tests {
     fn test_project_admin_actions_carry_full_access_set() {
         // check_permission is exact-string: `admin` alone grants no data
         // plane access, so the role must spell out every action.
-        for a in ["admin", "read", "write", "delete"] {
-            assert!(PROJECT_ADMIN_ACTIONS.contains(&a), "missing {a}");
-        }
+        assert_eq!(PROJECT_ADMIN_ACTIONS, ["admin", "read", "write", "delete"]);
     }
 
     #[test]
@@ -1027,14 +1053,14 @@ mod tests {
     #[test]
     fn test_key_prefix_unprefixed_keys_unconstrained() {
         let p = Uuid::new_v4();
-        assert!(check_repo_key_project_prefix("npm-local", p, &[]).is_ok());
+        assert!(check_repo_key_project_prefix("npm-local", p, &[], false).is_ok());
     }
 
     #[test]
     fn test_key_prefix_own_project_accepted() {
         let p = Uuid::new_v4();
         let claimed = vec![(p, "customer-a".to_string())];
-        assert!(check_repo_key_project_prefix("customer-a-npm", p, &claimed).is_ok());
+        assert!(check_repo_key_project_prefix("customer-a-npm", p, &claimed, false).is_ok());
     }
 
     #[test]
@@ -1042,9 +1068,19 @@ mod tests {
         let mine = Uuid::new_v4();
         let other = Uuid::new_v4();
         let claimed = vec![(other, "customer-b".to_string())];
-        let err = check_repo_key_project_prefix("customer-b-npm", mine, &claimed).unwrap_err();
+        // Global admins are told which project owns the prefix ...
+        let err =
+            check_repo_key_project_prefix("customer-b-npm", mine, &claimed, true).unwrap_err();
         assert!(
-            matches!(err, AppError::Validation(ref m) if m.contains("customer-b")),
+            matches!(err, AppError::Validation(ref m) if m.contains("project 'customer-b'")),
+            "{err:?}"
+        );
+        // ... everyone else gets a generic 400 that does not confirm the
+        // other project's key beyond the key they themselves sent.
+        let err =
+            check_repo_key_project_prefix("customer-b-npm", mine, &claimed, false).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if !m.contains("project 'customer-b'")),
             "{err:?}"
         );
     }
@@ -1055,12 +1091,12 @@ mod tests {
         let a = Uuid::new_v4();
         let ab = Uuid::new_v4();
         let claimed = vec![(a, "a".to_string()), (ab, "a-b".to_string())];
-        assert!(check_repo_key_project_prefix("a-b-npm", ab, &claimed).is_ok());
-        assert!(check_repo_key_project_prefix("a-b-npm", a, &claimed).is_ok());
-        assert!(check_repo_key_project_prefix("a-b-npm", Uuid::new_v4(), &claimed).is_err());
+        assert!(check_repo_key_project_prefix("a-b-npm", ab, &claimed, false).is_ok());
+        assert!(check_repo_key_project_prefix("a-b-npm", a, &claimed, false).is_ok());
+        assert!(check_repo_key_project_prefix("a-b-npm", Uuid::new_v4(), &claimed, false).is_err());
         // A claimed key that is not actually a `<key>-` prefix is ignored.
         let unrelated = vec![(a, "ab".to_string())];
-        assert!(check_repo_key_project_prefix("a-b-npm", ab, &unrelated).is_ok());
+        assert!(check_repo_key_project_prefix("a-b-npm", ab, &unrelated, false).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2126,6 +2162,14 @@ mod tests {
 
         async fn teardown(f: &Fixture) {
             let _ = sqlx::query(
+                "DELETE FROM role_assignments WHERE repository_id IN \
+                 (SELECT id FROM repositories WHERE project_id IN ($1, $2))",
+            )
+            .bind(f.p)
+            .bind(f.q)
+            .execute(&f.pool)
+            .await;
+            let _ = sqlx::query(
                 "DELETE FROM permissions WHERE target_type = 'repository' AND target_id IN \
                  (SELECT id FROM repositories WHERE project_id IN ($1, $2))",
             )
@@ -2399,10 +2443,36 @@ mod tests {
             key: &str,
             project: Option<Uuid>,
         ) -> Result<RJson<crate::api::handlers::repositories::RepositoryResponse>> {
+            create_repo_with(f, &f.auth, key, project).await
+        }
+
+        async fn create_repo_with(
+            f: &Fixture,
+            auth: &AuthExtension,
+            key: &str,
+            project: Option<Uuid>,
+        ) -> Result<RJson<crate::api::handlers::repositories::RepositoryResponse>> {
             crate::api::handlers::repositories::create_repository(
                 State(f.state.clone()),
-                Extension(Some(f.auth.clone())),
+                Extension(Some(auth.clone())),
                 repo_body(key, project),
+            )
+            .await
+        }
+
+        async fn update_repo_with(
+            f: &Fixture,
+            auth: &AuthExtension,
+            key: &str,
+            body: serde_json::Value,
+        ) -> Result<RJson<crate::api::handlers::repositories::RepositoryResponse>> {
+            let payload: crate::api::handlers::repositories::UpdateRepositoryRequest =
+                serde_json::from_value(body).expect("update payload");
+            crate::api::handlers::repositories::update_repository(
+                State(f.state.clone()),
+                Extension(Some(auth.clone())),
+                Path(key.to_string()),
+                RJson(payload),
             )
             .await
         }
@@ -2509,6 +2579,252 @@ mod tests {
 
             tdh::cleanup_user(&f.pool, peer).await;
             teardown(&f).await;
+        }
+
+        /// Review fix (#2473): a repository created through project admin
+        /// alone must NOT hand its creator the durable `repository-owner`
+        /// role. That role carries `admin`, which `check_repository_action`
+        /// honours regardless of project rules, so it would survive the
+        /// creator's removal from the project (and let them keep minting
+        /// repo tokens), invisibly to the project's member listing.
+        #[tokio::test]
+        async fn http_removed_project_admin_loses_created_repository() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let key = format!("{}-revoke", f.p_key);
+            let RJson(repo) = create_repo_as(&f, &key, Some(f.p))
+                .await
+                .expect("project admin creates in own project");
+            let perms = &f.state.permission_service;
+            assert!(perms
+                .check_repository_action(f.admin_user, repo.id, "write", false)
+                .await
+                .unwrap());
+            let (created_by, owner_roles): (Option<Uuid>, i64) = sqlx::query_as(
+                "SELECT r.created_by, (SELECT COUNT(*) FROM role_assignments ra \
+                 WHERE ra.repository_id = r.id AND ra.user_id = $2) \
+                 FROM repositories r WHERE r.id = $1",
+            )
+            .bind(repo.id)
+            .bind(f.admin_user)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert_eq!(created_by, Some(f.admin_user), "creator is still recorded");
+            assert_eq!(
+                owner_roles, 0,
+                "no owner/developer role for a project-admin create"
+            );
+
+            // Remove the creator from the project (as a global admin).
+            assert_eq!(
+                call(
+                    &f.state,
+                    &admin(),
+                    "DELETE",
+                    format!("/{}/members", f.p),
+                    &remove_body(f.admin_user)
+                )
+                .await,
+                StatusCode::OK
+            );
+            for action in ["read", "write", "delete", "admin"] {
+                assert!(
+                    !perms
+                        .check_repository_action(f.admin_user, repo.id, action, false)
+                        .await
+                        .unwrap(),
+                    "removed project admin must lose {action} on the repo it created"
+                );
+            }
+            let mint: crate::api::handlers::repo_tokens::CreateRepoTokenRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "after-removal", "scopes": ["write:artifacts"]
+                }))
+                .unwrap();
+            let err = crate::api::handlers::repo_tokens::create_repo_token(
+                State(f.state.clone()),
+                Extension(Some(f.auth.clone())),
+                Path(key.clone()),
+                RJson(mint),
+            )
+            .await
+            .expect_err("a removed project admin cannot mint a repo token");
+            // Private repo: existence-hidden 404, or the delegation-ceiling 403.
+            assert!(
+                matches!(err, AppError::Authorization(_) | AppError::NotFound(_)),
+                "{err:?}"
+            );
+            teardown(&f).await;
+        }
+
+        /// Backward compatibility: a system-sentinel `admin` holder (an
+        /// instance-wide repository provisioner) still creates without a
+        /// project, assigns to any project, moves repositories between
+        /// projects, and keeps the owner auto-grant.
+        #[tokio::test]
+        async fn http_sentinel_admin_keeps_provisioning_rights() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let (prov, prov_name) = tdh::create_user(&f.pool).await;
+            tdh::grant_permission(
+                &f.pool,
+                "user",
+                prov,
+                crate::services::permission_service::SYSTEM_TARGET_TYPE,
+                crate::services::permission_service::SYSTEM_SENTINEL_ID,
+                &["admin"],
+            )
+            .await;
+            let prov_auth = tdh::make_auth(prov, &prov_name);
+            let tag = Uuid::new_v4().simple().to_string();
+
+            let loose = format!("s{}", &tag[..12]);
+            let RJson(unassigned) = create_repo_with(&f, &prov_auth, &loose, None)
+                .await
+                .expect("sentinel admin creates without a project");
+            let owner_roles: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM role_assignments WHERE repository_id = $1 AND user_id = $2",
+            )
+            .bind(unassigned.id)
+            .bind(prov)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert!(owner_roles > 0, "provisioners keep the owner auto-grant");
+
+            let in_q = format!("t{}", &tag[..12]);
+            create_repo_with(&f, &prov_auth, &in_q, Some(f.q))
+                .await
+                .expect("sentinel admin assigns to any project");
+            let in_p = format!("u{}", &tag[..12]);
+            let RJson(p_repo) = create_repo_with(&f, &prov_auth, &in_p, Some(f.p))
+                .await
+                .expect("sentinel admin creates in P");
+            // PATCH itself needs repository `admin` in `permissions` (pre-P2
+            // gate, unchanged); the sentinel grant then satisfies the
+            // destination-project check without project admin on Q.
+            tdh::grant_repo_actions(&f.pool, p_repo.id, prov, &["admin"]).await;
+            f.state.permission_service.invalidate_cache();
+            let RJson(moved) = update_repo_with(
+                &f,
+                &prov_auth,
+                &in_p,
+                serde_json::json!({ "project_id": f.q }),
+            )
+            .await
+            .expect("sentinel admin moves P -> Q");
+            assert_eq!(moved.project_id, Some(f.q));
+
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+                .bind(unassigned.id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(unassigned.id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+                .bind(prov)
+                .execute(&f.pool)
+                .await;
+            teardown(&f).await;
+            tdh::cleanup_user(&f.pool, prov).await;
+        }
+
+        /// Update edge cases: re-sending the unchanged `project_id` is not a
+        /// reassignment for a repository-level admin who is NOT a project
+        /// admin, a pre-existing repository whose key squats another
+        /// project's prefix stays editable for non-key fields, and the prefix
+        /// rule binds global admins too (with a message naming the project).
+        #[tokio::test]
+        async fn http_repository_update_project_edge_cases() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            // A real users row: create records `created_by` (FK).
+            let (global_id, global_name) = tdh::create_user(&f.pool).await;
+            let global = tdh::admin_auth(global_id, &global_name);
+            let tag = Uuid::new_v4().simple().to_string();
+            let key = format!("{}-edge", f.p_key);
+            let RJson(repo) = create_repo_with(&f, &global, &key, Some(f.p))
+                .await
+                .expect("admin creates in P");
+
+            // Repo-level admin only: unchanged project_id (full-form edit) is 200,
+            // a real move is 403.
+            let (repo_admin, ra_name) = tdh::create_user(&f.pool).await;
+            tdh::grant_repo_actions(&f.pool, repo.id, repo_admin, &["admin", "read", "write"])
+                .await;
+            let ra_auth = tdh::make_auth(repo_admin, &ra_name);
+            update_repo_with(
+                &f,
+                &ra_auth,
+                &key,
+                serde_json::json!({ "project_id": f.p, "description": "full form" }),
+            )
+            .await
+            .expect("unchanged assignment by a repo-level admin is not a reassignment");
+            let err =
+                update_repo_with(&f, &ra_auth, &key, serde_json::json!({ "project_id": f.q }))
+                    .await
+                    .unwrap_err();
+            assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
+
+            // Legacy squatting row (predates P2): description-only PATCH is fine,
+            // for the project admin and a global admin alike.
+            let legacy_key = format!("{}-legacy{}", f.q_key, &tag[..6]);
+            let (legacy_id, _, _) = tdh::create_repo(&f.pool, "local", "generic").await;
+            sqlx::query("UPDATE repositories SET key = $2, project_id = $3 WHERE id = $1")
+                .bind(legacy_id)
+                .bind(&legacy_key)
+                .bind(f.p)
+                .execute(&f.pool)
+                .await
+                .unwrap();
+            f.state.permission_service.invalidate_cache();
+            update_repo_with(
+                &f,
+                &f.auth,
+                &legacy_key,
+                serde_json::json!({ "description": "d" }),
+            )
+            .await
+            .expect("legacy squatting key stays editable by the project admin");
+            update_repo_with(
+                &f,
+                &global,
+                &legacy_key,
+                serde_json::json!({ "description": "d2" }),
+            )
+            .await
+            .expect("legacy squatting key stays editable by an admin");
+
+            // The prefix rule applies to administrators as well.
+            let squat = format!("{}-admin{}", f.q_key, &tag[..6]);
+            let err = create_repo_with(&f, &global, &squat, Some(f.p))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(ref m) if m.contains(&format!("project '{}'", f.q_key))),
+                "admins get the named-project 400: {err:?}"
+            );
+            // A project admin gets the generic message instead.
+            let err = create_repo_as(&f, &squat, Some(f.p)).await.unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(ref m) if !m.contains(&format!("project '{}'", f.q_key))),
+                "{err:?}"
+            );
+
+            let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+                .bind(repo_admin)
+                .execute(&f.pool)
+                .await;
+            teardown(&f).await;
+            tdh::cleanup_user(&f.pool, repo_admin).await;
+            tdh::cleanup_user(&f.pool, global_id).await;
         }
     }
 }
