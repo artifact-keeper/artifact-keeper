@@ -138,6 +138,201 @@ pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
 }
 
 // ---------------------------------------------------------------------------
+// Per-family metadata sub-budgets (#3914)
+// ---------------------------------------------------------------------------
+
+/// A protocol family whose buffered-metadata reservations are additionally
+/// capped by a sub-budget of their own, carved out of
+/// [`proxy_metadata_budget`] (#3914).
+///
+/// The shared budget bounds total resident memory but not who holds it: one
+/// anonymously-reachable family can take all of it and park every other
+/// format's buffered fetch behind its own. A family sub-budget caps that
+/// family's share. A family reservation draws from BOTH its sub-budget and
+/// the shared budget, so the shared total stays the process-wide memory bound,
+/// and whatever the family cannot hold stays available to every other format.
+/// An idle family holds nothing, so other formats can still use the whole
+/// shared budget when it is quiet.
+///
+/// The VS Code gallery is the first family; RPM repodata (#2665) has the same
+/// shape and joins by adding a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataBudgetFamily {
+    /// Open VSX gallery queries on a VS Code Remote (#3255, #3914).
+    VscodeGallery,
+}
+
+impl MetadataBudgetFamily {
+    /// Every family, for registry sizing and tests.
+    pub const ALL: [MetadataBudgetFamily; 1] = [MetadataBudgetFamily::VscodeGallery];
+
+    fn index(self) -> usize {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => 0,
+        }
+    }
+
+    /// `family` label value on the sub-budget metrics.
+    pub fn label(self) -> &'static str {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => "vscode_gallery",
+        }
+    }
+
+    /// Env var overriding the sub-budget size in bytes. A blank, non-numeric
+    /// or zero value falls back to the default share; any value is clamped to
+    /// the shared total.
+    pub fn size_env(self) -> &'static str {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => "AK_VSCODE_GALLERY_METADATA_BUDGET_BYTES",
+        }
+    }
+
+    /// Default share of the shared budget, as `(numerator, denominator)`.
+    ///
+    /// Gallery: 3/8, which is 384 MiB of the default 1 GiB. One composed
+    /// gallery response at full width holds four concurrent 64 MiB skeleton
+    /// reservations (256 MiB), so the share admits that plus a handful of
+    /// plain queries, while at least 640 MiB — five worst-case 128 MiB
+    /// `LARGE_METADATA_MAX_BYTES` buffers — always stays available to npm,
+    /// PyPI, Debian, RPM and the rest however many gallery reads are in flight.
+    fn default_share(self) -> (usize, usize) {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => (3, 8),
+        }
+    }
+}
+
+/// Size of a family sub-budget: the env override when it parses to a positive
+/// byte count, else the family's default share of `shared_total`, clamped to
+/// `[1, shared_total]` — a sub-budget larger than the budget it is carved out
+/// of would bound nothing.
+pub fn metadata_sub_budget_bytes(
+    family: MetadataBudgetFamily,
+    env_value: Option<&str>,
+    shared_total: usize,
+) -> usize {
+    let (num, den) = family.default_share();
+    env_value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(shared_total / den * num)
+        .clamp(1, shared_total.max(1))
+}
+
+/// A family's sub-budget: a [`ProxyMetadataBudget`] tagged with the family it
+/// meters, so reservations against it can report saturation.
+pub struct MetadataSubBudget {
+    family: MetadataBudgetFamily,
+    budget: ProxyMetadataBudget,
+}
+
+impl MetadataSubBudget {
+    pub fn new(family: MetadataBudgetFamily, total_bytes: usize) -> Self {
+        Self {
+            family,
+            budget: ProxyMetadataBudget::new(total_bytes),
+        }
+    }
+
+    pub fn family(&self) -> MetadataBudgetFamily {
+        self.family
+    }
+
+    pub fn budget(&self) -> &ProxyMetadataBudget {
+        &self.budget
+    }
+
+    /// Fraction of the sub-budget currently reserved, in `[0, 1]`.
+    pub fn saturation(&self) -> f64 {
+        let total = self.budget.total_bytes();
+        total.saturating_sub(self.budget.available_bytes()) as f64 / total as f64
+    }
+
+    fn record_saturation(&self) {
+        metrics::gauge!(
+            "ak_proxy_metadata_sub_budget_saturation_ratio",
+            "family" => self.family.label()
+        )
+        .set(self.saturation());
+    }
+}
+
+/// Process-wide sub-budget for `family`, sized once from
+/// [`MetadataBudgetFamily::size_env`] against the shared budget's total.
+pub fn metadata_sub_budget(family: MetadataBudgetFamily) -> &'static MetadataSubBudget {
+    static SUB_BUDGETS: [OnceLock<MetadataSubBudget>; MetadataBudgetFamily::ALL.len()] =
+        [const { OnceLock::new() }; MetadataBudgetFamily::ALL.len()];
+    SUB_BUDGETS[family.index()].get_or_init(|| {
+        let env = std::env::var(family.size_env()).ok();
+        let bytes = metadata_sub_budget_bytes(
+            family,
+            env.as_deref(),
+            proxy_metadata_budget().total_bytes(),
+        );
+        MetadataSubBudget::new(family, bytes)
+    })
+}
+
+/// A buffered-metadata reservation: a slice of the shared budget and, for a
+/// family reservation, the matching slice of that family's sub-budget. Hold it
+/// for as long as the buffered bytes are resident; dropping it releases both
+/// and refreshes the family's saturation gauge.
+pub struct MetadataBudgetPermit {
+    _shared: OwnedSemaphorePermit,
+    family: Option<(&'static MetadataSubBudget, OwnedSemaphorePermit)>,
+}
+
+impl Drop for MetadataBudgetPermit {
+    fn drop(&mut self) {
+        if let Some((sub, permit)) = self.family.take() {
+            drop(permit);
+            sub.record_saturation();
+        }
+    }
+}
+
+/// Reserve `bytes` from `shared` and, when given, from the family sub-budget
+/// `sub` too, all inside one optional `wait` bound (503 when it elapses).
+///
+/// The sub-budget is acquired FIRST and the shared budget second, always: a
+/// family request queues on its own share before it can occupy any of the
+/// shared budget, so a family burst waits against itself instead of against
+/// every other format, and the fixed order means no cycle between the two
+/// semaphores can form.
+pub async fn reserve_metadata_budget_in(
+    shared: &ProxyMetadataBudget,
+    sub: Option<&'static MetadataSubBudget>,
+    bytes: usize,
+    wait: Option<Duration>,
+) -> Result<MetadataBudgetPermit, Response> {
+    let reserve = async {
+        let family = match sub {
+            Some(sub) => {
+                let permit = sub.budget.reserve(bytes).await;
+                sub.record_saturation();
+                Some((sub, permit))
+            }
+            None => None,
+        };
+        let shared = shared.reserve(bytes).await;
+        MetadataBudgetPermit {
+            _shared: shared,
+            family,
+        }
+    };
+    match wait {
+        None => Ok(reserve.await),
+        Some(wait) => tokio::time::timeout(wait, reserve).await.map_err(|_| {
+            if let Some(sub) = sub {
+                sub.record_saturation();
+            }
+            metadata_budget_saturated_response()
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared RepoInfo
 // ---------------------------------------------------------------------------
 
@@ -867,6 +1062,10 @@ pub struct MetadataWorkingSetLimits {
     /// anonymously-reachable protocol cannot park behind every other format's
     /// buffered metadata fetch for as long as an upstream takes (#3255).
     pub reservation_wait: Option<Duration>,
+    /// Family sub-budget the reservation is also charged against (#3914), so
+    /// one protocol's burst cannot hold the whole shared budget. `None`
+    /// reserves from the shared budget alone.
+    pub family: Option<MetadataBudgetFamily>,
 }
 
 /// 503 for a buffered-metadata reservation that could not be satisfied inside
@@ -882,19 +1081,21 @@ pub fn metadata_budget_saturated_response() -> Response {
         .into_response()
 }
 
-/// Reserve `bytes` of the shared buffered-metadata budget, optionally bounding
-/// how long the caller is willing to queue for it.
+/// Reserve `bytes` of the shared buffered-metadata budget, and of `family`'s
+/// sub-budget when given (#3914), optionally bounding how long the caller is
+/// willing to queue for it. See [`reserve_metadata_budget_in`].
 pub async fn reserve_metadata_budget_bounded(
     bytes: usize,
     wait: Option<Duration>,
-) -> Result<OwnedSemaphorePermit, Response> {
-    let reserve = proxy_metadata_budget().reserve(bytes);
-    match wait {
-        None => Ok(reserve.await),
-        Some(wait) => tokio::time::timeout(wait, reserve)
-            .await
-            .map_err(|_| metadata_budget_saturated_response()),
-    }
+    family: Option<MetadataBudgetFamily>,
+) -> Result<MetadataBudgetPermit, Response> {
+    reserve_metadata_budget_in(
+        proxy_metadata_budget(),
+        family.map(metadata_sub_budget),
+        bytes,
+        wait,
+    )
+    .await
 }
 
 /// Outcome of a capped buffered-metadata POST, keeping the byte-ceiling abort
@@ -911,7 +1112,7 @@ pub enum CappedMetadataPost {
     Buffered {
         content: Bytes,
         content_type: Option<String>,
-        budget_permit: OwnedSemaphorePermit,
+        budget_permit: MetadataBudgetPermit,
     },
     /// Upstream exceeded `limits.max_bytes`; nothing past the ceiling was ever
     /// buffered, and no truncated body is returned.
@@ -934,6 +1135,7 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     let budget_permit = reserve_metadata_budget_bounded(
         limits.reservation_bytes.max(limits.max_bytes),
         limits.reservation_wait,
+        limits.family,
     )
     .await?;
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
@@ -10181,6 +10383,148 @@ mod tests {
             budget.total_bytes() >= LARGE_METADATA_MAX_BYTES,
             "shared budget must fit at least one full RPM metadata buffer"
         );
+    }
+
+    // ── Per-family metadata sub-budgets (#3914) ─────────────────────
+
+    fn leaked_sub_budget(bytes: usize) -> &'static MetadataSubBudget {
+        Box::leak(Box::new(MetadataSubBudget::new(
+            MetadataBudgetFamily::VscodeGallery,
+            bytes,
+        )))
+    }
+
+    #[test]
+    fn metadata_sub_budget_bytes_defaults_to_the_family_share_and_clamps() {
+        let family = MetadataBudgetFamily::VscodeGallery;
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, gib),
+            384 * 1024 * 1024
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, Some(" 4096 "), gib), 4096);
+        for unusable in ["", "  ", "lots", "0", "-5"] {
+            assert_eq!(
+                metadata_sub_budget_bytes(family, Some(unusable), gib),
+                384 * 1024 * 1024,
+                "{unusable:?} falls back to the default share"
+            );
+        }
+        assert_eq!(
+            metadata_sub_budget_bytes(family, Some("999999999999"), gib),
+            gib,
+            "a sub-budget never exceeds the budget it is carved out of"
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 4), 1);
+        assert_eq!(metadata_sub_budget_bytes(family, None, 0), 1);
+    }
+
+    #[test]
+    fn metadata_budget_family_metadata_is_distinct_per_family() {
+        let labels: std::collections::HashSet<_> = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| f.label())
+            .collect();
+        let envs: std::collections::HashSet<_> = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| f.size_env())
+            .collect();
+        assert_eq!(labels.len(), MetadataBudgetFamily::ALL.len());
+        assert_eq!(envs.len(), MetadataBudgetFamily::ALL.len());
+        for (i, family) in MetadataBudgetFamily::ALL.iter().enumerate() {
+            assert_eq!(family.index(), i);
+            assert!(family.size_env().starts_with("AK_"));
+        }
+        assert_eq!(
+            metadata_sub_budget(MetadataBudgetFamily::VscodeGallery).family(),
+            MetadataBudgetFamily::VscodeGallery
+        );
+    }
+
+    /// The core #3914 property: a saturated family sub-budget sheds the
+    /// family's next reservation, holds none of the shared budget while doing
+    /// so, and leaves the rest of the shared budget to other formats.
+    #[tokio::test]
+    async fn saturated_sub_budget_sheds_family_but_admits_other_formats() {
+        let shared = ProxyMetadataBudget::new(1000);
+        let sub = leaked_sub_budget(250);
+
+        let first = reserve_metadata_budget_in(&shared, Some(sub), 250, None)
+            .await
+            .unwrap_or_else(|_| panic!("the family's first reservation fits its share"));
+        assert_eq!(sub.saturation(), 1.0);
+        assert_eq!(
+            shared.available_bytes(),
+            750,
+            "family bytes count against the shared total"
+        );
+
+        let shed =
+            reserve_metadata_budget_in(&shared, Some(sub), 10, Some(Duration::from_millis(20)))
+                .await;
+        let Err(response) = shed else {
+            panic!("a saturated family sub-budget must shed")
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shared.available_bytes(),
+            750,
+            "the shed reservation held nothing"
+        );
+
+        let npm = reserve_metadata_budget_in(&shared, None, 750, Some(Duration::from_millis(20)))
+            .await
+            .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
+        assert_eq!(shared.available_bytes(), 0);
+
+        drop(first);
+        assert_eq!(
+            sub.saturation(),
+            0.0,
+            "dropping the permit releases the family share"
+        );
+        assert_eq!(shared.available_bytes(), 250);
+        drop(npm);
+        assert_eq!(shared.available_bytes(), 1000);
+    }
+
+    /// The family share is queued on first, so when the SHARED budget is
+    /// what is saturated, a timed-out family reservation also gives its
+    /// family slice back rather than leaking it.
+    #[tokio::test]
+    async fn family_reservation_releases_its_share_when_the_shared_budget_sheds() {
+        let shared = ProxyMetadataBudget::new(100);
+        let sub = leaked_sub_budget(100);
+        let hog = shared.try_reserve(100).expect("fresh budget");
+
+        let shed =
+            reserve_metadata_budget_in(&shared, Some(sub), 40, Some(Duration::from_millis(20)))
+                .await;
+        assert!(
+            shed.is_err(),
+            "a saturated shared budget still sheds a family read"
+        );
+        assert_eq!(sub.budget().available_bytes(), 100);
+        assert_eq!(sub.saturation(), 0.0);
+        drop(hog);
+
+        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40, None)
+            .await
+            .unwrap_or_else(|_| panic!("unbounded reservation succeeds once free"));
+        assert_eq!(sub.budget().available_bytes(), 60);
+        assert_eq!(shared.available_bytes(), 60);
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn reserve_metadata_budget_bounded_without_family_uses_shared_only() {
+        let before = proxy_metadata_budget().available_bytes();
+        let permit = reserve_metadata_budget_bounded(4096, Some(Duration::from_secs(1)), None)
+            .await
+            .unwrap_or_else(|_| panic!("a small shared reservation is admitted"));
+        assert_eq!(proxy_metadata_budget().available_bytes(), before - 4096);
+        drop(permit);
+        assert_eq!(proxy_metadata_budget().available_bytes(), before);
     }
 
     /// #2665: a budgeted response body must keep its reservation debited for
