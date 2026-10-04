@@ -126,7 +126,32 @@ const _: () = assert!(prefix_matches("oci-manifests/"));
 /// upload-then-manifest gap and short enough that abandoned uploads do
 /// not waste storage indefinitely. The bound is pinned by compile-time
 /// `assert!`s in the test module to keep accidental drift out of band.
-pub(crate) const MIN_BLOB_AGE_SECS: u64 = 24 * 60 * 60;
+///
+/// This is the DEFAULT. Operators can override it with
+/// `BLOB_GC_MIN_AGE_SECS` (#2906, `Config::blob_gc_min_age_secs`), clamped by
+/// [`clamp_min_blob_age_secs`]; a service built without
+/// [`StorageGcService::with_min_blob_age_secs`] uses this value.
+pub const MIN_BLOB_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Lowest configurable minimum blob age (#2906). Short enough that a test
+/// deployment can observe a pushed blob being reclaimed, long enough that a
+/// push's own blob-then-manifest gap is never zero.
+pub const MIN_BLOB_AGE_FLOOR_SECS: u64 = 60;
+
+/// Highest configurable minimum blob age (#2906): the same seven-day ceiling
+/// the default is pinned under, so a fat-fingered value cannot switch blob GC
+/// off in practice.
+pub const MIN_BLOB_AGE_CEILING_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Below this the minimum blob age is shorter than a slow real-world push can
+/// take, so `Config` logs a warning when an operator configures less (#2906).
+pub const MIN_BLOB_AGE_RECOMMENDED_SECS: u64 = 60 * 60;
+
+/// Clamp an operator-supplied minimum blob age into
+/// [`MIN_BLOB_AGE_FLOOR_SECS`, `MIN_BLOB_AGE_CEILING_SECS`] (#2906).
+pub fn clamp_min_blob_age_secs(secs: u64) -> u64 {
+    secs.clamp(MIN_BLOB_AGE_FLOOR_SECS, MIN_BLOB_AGE_CEILING_SECS)
+}
 
 /// SQL fragment: `EXISTS (...)` — true when some `manifest_blob_refs` row
 /// still protects the outer blob row aliased `ob` (joined to its
@@ -401,8 +426,12 @@ const OCI_GC_CANDIDATE_SCAN_LIMIT: i64 = 1000;
 /// `oci_blobs` row after, so a sweep firing in that window would delete an
 /// object the pusher is about to reference. That is the same hazard
 /// [`MIN_BLOB_AGE_SECS`] exists for, so it takes the same answer and the same
-/// value; `oci_gc_candidate_grace_matches_blob_grace` pins the two together.
-const OCI_GC_CANDIDATE_MIN_AGE_SQL: &str = "INTERVAL '24 hours'";
+/// value: the interval is bound from the service's configured minimum blob age,
+/// the very field the blob-GC scan binds, so a configured
+/// `BLOB_GC_MIN_AGE_SECS` (#2906) moves both windows together. The placeholder
+/// is `$2` in [`StorageGcService::select_oci_gc_candidates`].
+/// `configured_min_blob_age_governs_both_grace_windows` pins the two together.
+const OCI_GC_CANDIDATE_MIN_AGE_SQL: &str = "make_interval(secs => $2::BIGINT)";
 
 /// One `EXISTS (...)` arm of [`OCI_GC_CANDIDATE_REFERENCED_SQL`]: some row of
 /// `table` (aliased `t`) still references the candidate object when
@@ -758,6 +787,11 @@ pub struct StorageGcService {
     /// entry point (scheduler + admin handlers), so an entry point that
     /// forgets to wire the flag fails SAFE.
     maven_flat_gc_enabled: bool,
+    /// Grace window (seconds) shielding both an unreferenced `oci_blobs` row
+    /// and a recorded OCI GC candidate from deletion (#1408, #3733). Defaults
+    /// to [`MIN_BLOB_AGE_SECS`]; set from `Config::blob_gc_min_age_secs` via
+    /// [`StorageGcService::with_min_blob_age_secs`] (#2906).
+    min_blob_age_secs: u64,
 }
 
 #[derive(Debug)]
@@ -891,7 +925,24 @@ impl StorageGcService {
             // Fail safe: the orphan Maven flat-object sweep never deletes
             // until a caller explicitly opts in (#3431).
             maven_flat_gc_enabled: false,
+            min_blob_age_secs: MIN_BLOB_AGE_SECS,
         }
+    }
+
+    /// Override the minimum blob age (#2906, `BLOB_GC_MIN_AGE_SECS`). The
+    /// value is clamped by [`clamp_min_blob_age_secs`] and governs both the
+    /// unreferenced-blob scan and the OCI GC candidate sweep, which guard the
+    /// same push-time hazard and must not drift apart.
+    #[must_use]
+    pub fn with_min_blob_age_secs(mut self, secs: u64) -> Self {
+        self.min_blob_age_secs = clamp_min_blob_age_secs(secs);
+        self
+    }
+
+    /// The minimum blob age this service enforces, as the `BIGINT` both grace
+    /// windows bind. The clamp keeps it far below `i64::MAX`.
+    fn min_blob_age_bind(&self) -> i64 {
+        self.min_blob_age_secs as i64
     }
 
     /// Opt the orphaned row-less Maven flat-object sweep into live deletion
@@ -1493,7 +1544,8 @@ impl StorageGcService {
     /// file per repo and orphan-ness is scoped to the same `storage_path`.
     /// This mirrors the cloud/filesystem branch of `ORPHAN_PREDICATE_SQL`.
     ///
-    /// Grace period (`MIN_BLOB_AGE_SECS`) shields in-flight pushes: a
+    /// Grace period (`MIN_BLOB_AGE_SECS` by default, `BLOB_GC_MIN_AGE_SECS`
+    /// when configured, #2906) shields in-flight pushes: a
     /// client first uploads blobs, then PUTs the manifest, which writes the
     /// matching `manifest_blob_refs` rows. Between those two steps the blob
     /// is "orphan" in the strict sense; skipping rows younger than the
@@ -1966,7 +2018,7 @@ impl StorageGcService {
     async fn select_orphan_blobs(&self, after: &BlobCursor) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql =
             blob_candidate_page_sql("ob.created_at < NOW() - make_interval(secs => $1::BIGINT)");
-        self.fetch_blob_candidate_page(&sql, MIN_BLOB_AGE_SECS as i64, after)
+        self.fetch_blob_candidate_page(&sql, self.min_blob_age_bind(), after)
             .await
     }
 
@@ -3518,6 +3570,7 @@ impl StorageGcService {
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_GC_CANDIDATE_SCAN_LIMIT)
+            .bind(self.min_blob_age_bind())
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -4573,13 +4626,131 @@ mod tests {
     /// The candidate sweep's grace window and the blob GC's must stay the same
     /// value: they exist for the same hazard (an object written before the row
     /// that references it), so a change to one that skips the other would
-    /// silently make this sweep the riskier of the two.
+    /// silently make this sweep the riskier of the two. Since #2906 both bind
+    /// one configurable value; this pins the default and the SQL spelling, and
+    /// `configured_min_blob_age_governs_both_grace_windows` pins the behaviour.
     #[test]
     fn oci_gc_candidate_grace_matches_blob_grace() {
         assert_eq!(MIN_BLOB_AGE_SECS, 24 * 60 * 60);
         assert_eq!(
-            OCI_GC_CANDIDATE_MIN_AGE_SQL, "INTERVAL '24 hours'",
-            "the SQL interval must spell MIN_BLOB_AGE_SECS; Postgres cannot read the Rust constant"
+            OCI_GC_CANDIDATE_MIN_AGE_SQL, "make_interval(secs => $2::BIGINT)",
+            "the candidate interval must be bound from the configured minimum blob age, \
+             not spelled as a literal that a BLOB_GC_MIN_AGE_SECS override would miss"
+        );
+    }
+
+    /// #2906: the operator knob is clamped into a sane corridor, and the
+    /// default sits inside it unchanged.
+    #[test]
+    fn min_blob_age_clamp_bounds() {
+        assert_eq!(clamp_min_blob_age_secs(0), MIN_BLOB_AGE_FLOOR_SECS);
+        assert_eq!(clamp_min_blob_age_secs(59), 60);
+        assert_eq!(clamp_min_blob_age_secs(60), 60);
+        assert_eq!(clamp_min_blob_age_secs(3600), 3600);
+        assert_eq!(
+            clamp_min_blob_age_secs(MIN_BLOB_AGE_SECS),
+            MIN_BLOB_AGE_SECS
+        );
+        assert_eq!(clamp_min_blob_age_secs(u64::MAX), MIN_BLOB_AGE_CEILING_SECS);
+        // A recommended floor above the hard floor, both under the default.
+        const _: () = assert!(MIN_BLOB_AGE_FLOOR_SECS < MIN_BLOB_AGE_RECOMMENDED_SECS);
+        const _: () = assert!(MIN_BLOB_AGE_RECOMMENDED_SECS <= MIN_BLOB_AGE_SECS);
+    }
+
+    /// #2906: a configured minimum blob age moves BOTH grace windows: the
+    /// unreferenced-`oci_blobs` scan (mark phase input) and the recorded OCI GC
+    /// candidate scan. A two-hour-old orphan blob and a two-hour-old candidate
+    /// are shielded by the 24h default and eligible under a 1h override.
+    #[tokio::test]
+    async fn configured_min_blob_age_governs_both_grace_windows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!("sha256:{}", Uuid::new_v4().simple().to_string().repeat(2));
+        let blob_key = format!("{OCI_BLOB_STORAGE_PREFIX}{digest}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, created_at) \
+             VALUES ($1, $2, 1, $3, NOW() - INTERVAL '2 hours')",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert two-hour-old orphan blob");
+        let candidate_key = format!(
+            "{OCI_BLOB_STORAGE_PREFIX}sha256:{}",
+            Uuid::new_v4().simple()
+        );
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path, recorded_at) \
+             VALUES ($1, 'filesystem', $2, NOW() - INTERVAL '2 hours')",
+        )
+        .bind(&candidate_key)
+        .bind(fx.storage_dir.to_string_lossy().to_string())
+        .execute(&fx.pool)
+        .await
+        .expect("insert two-hour-old OCI GC candidate");
+
+        let sees = |service: StorageGcService| {
+            let digest = digest.clone();
+            let candidate_key = candidate_key.clone();
+            async move {
+                // select_orphan_blobs is keyset-paged (#2524): walk every page
+                // so the answer does not depend on how many other orphans the
+                // shared test DB holds.
+                let mut blob = false;
+                let mut cursor = BlobCursor::default();
+                loop {
+                    let page = service
+                        .select_orphan_blobs(&cursor)
+                        .await
+                        .expect("orphan blob scan");
+                    if page
+                        .iter()
+                        .any(|r| r.try_get::<String, _>("digest").ok().as_deref() == Some(&digest))
+                    {
+                        blob = true;
+                        break;
+                    }
+                    match next_page_cursor(&page, service.candidate_page_size, BlobCursor::from_row)
+                    {
+                        Some(next) => cursor = next,
+                        None => break,
+                    }
+                }
+                let candidate = service
+                    .select_oci_gc_candidates()
+                    .await
+                    .expect("candidate scan")
+                    .iter()
+                    .any(|c| c.storage_key() == candidate_key);
+                (blob, candidate)
+            }
+        };
+        let registry = fx.state.storage_registry.clone();
+        let default_view = sees(StorageGcService::new(fx.pool.clone(), registry.clone())).await;
+        let configured_view =
+            sees(StorageGcService::new(fx.pool.clone(), registry).with_min_blob_age_secs(3600))
+                .await;
+
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&candidate_key)
+            .execute(&fx.pool)
+            .await
+            .expect("remove test candidate");
+        fx.teardown().await;
+
+        assert_eq!(
+            default_view,
+            (false, false),
+            "the 24h default must shield a two-hour-old blob and candidate"
+        );
+        assert_eq!(
+            configured_view,
+            (true, true),
+            "a 1h BLOB_GC_MIN_AGE_SECS must expose both to GC, together"
         );
     }
 

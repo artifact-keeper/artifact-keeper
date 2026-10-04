@@ -13925,6 +13925,7 @@ mod tests {
                 blob_gc_enabled: false,
                 maven_flat_gc_enabled: false,
                 blob_gc_sweep_grace_secs: 3600,
+                blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,

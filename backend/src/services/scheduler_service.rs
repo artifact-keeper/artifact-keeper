@@ -643,7 +643,8 @@ pub fn spawn_all(
             let service =
                 crate::services::storage_gc_service::StorageGcService::new(db, gc_registry)
                     .with_trash_retention_days(config_clone.gc_trash_retention_days)
-                    .with_maven_flat_gc_enabled(config_clone.maven_flat_gc_enabled);
+                    .with_maven_flat_gc_enabled(config_clone.maven_flat_gc_enabled)
+                    .with_min_blob_age_secs(config_clone.blob_gc_min_age_secs);
 
             let normalized = normalize_cron_expression(&config_clone.gc_schedule);
             let gc_schedule = match parse_cron_schedule(&normalized) {

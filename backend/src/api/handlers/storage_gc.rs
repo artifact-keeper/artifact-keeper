@@ -89,7 +89,8 @@ pub async fn run_storage_gc(
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
         .with_trash_retention_days(state.config.gc_trash_retention_days)
-        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
+        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled)
+        .with_min_blob_age_secs(state.config.blob_gc_min_age_secs);
     let result = service.run_gc(payload.dry_run).await?;
 
     // Post-GC storage-stats refresh (#2056/#2601): the *scheduled* GC pass
@@ -196,7 +197,8 @@ pub async fn run_repository_storage_gc(
     // hand-attributed legacy objects.
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
         .with_trash_retention_days(state.config.gc_trash_retention_days)
-        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
+        .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled)
+        .with_min_blob_age_secs(state.config.blob_gc_min_age_secs);
     let result = service
         .run_gc_for_repository(repo.id, payload.dry_run)
         .await?;

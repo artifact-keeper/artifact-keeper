@@ -179,6 +179,33 @@ fn parse_bind_ip(key: &str, raw: Option<&str>) -> Result<std::net::IpAddr> {
     })
 }
 
+/// Clamp `BLOB_GC_MIN_AGE_SECS` (#2906) and warn when the result is shorter
+/// than a slow real-world push can take. The clamp keeps a typo from either
+/// deleting a blob seconds after upload (floor) or disabling blob GC in
+/// practice (ceiling).
+fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
+    use crate::services::storage_gc_service as gc;
+    let secs = gc::clamp_min_blob_age_secs(raw);
+    if secs != raw {
+        tracing::warn!(
+            requested = raw,
+            effective = secs,
+            "BLOB_GC_MIN_AGE_SECS is outside [{}, {}] seconds and was clamped",
+            gc::MIN_BLOB_AGE_FLOOR_SECS,
+            gc::MIN_BLOB_AGE_CEILING_SECS,
+        );
+    }
+    if secs < gc::MIN_BLOB_AGE_RECOMMENDED_SECS {
+        tracing::warn!(
+            min_age_secs = secs,
+            "BLOB_GC_MIN_AGE_SECS is under one hour: a push whose manifest lands \
+             later than this after its blobs can lose a blob to GC; use only on \
+             short-lived test deployments"
+        );
+    }
+    secs
+}
+
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
 ///
 /// Whitespace around each entry is trimmed and empty entries are dropped.
@@ -661,6 +688,16 @@ pub struct Config {
     /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
     /// next pass with no extra delay.
     pub blob_gc_sweep_grace_secs: u64,
+
+    /// Minimum age (seconds) before an unreferenced OCI blob, or an OCI object
+    /// recorded as a GC candidate by a repository delete, may be reclaimed
+    /// (#2906). Shields an in-flight push whose blobs land before the manifest
+    /// that references them. Env `BLOB_GC_MIN_AGE_SECS`, default 86400 (24
+    /// hours, `storage_gc_service::MIN_BLOB_AGE_SECS`), clamped to
+    /// [60 s, 7 days]; a value under one hour is logged as a warning at
+    /// startup. Lowering it is for short-lived test deployments that need to
+    /// observe blob mark-and-sweep end to end.
+    pub blob_gc_min_age_secs: u64,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -1226,6 +1263,7 @@ redacted_debug!(Config {
     show blob_gc_enabled,
     show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
+    show blob_gc_min_age_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -1368,6 +1406,7 @@ impl Default for Config {
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -1645,6 +1684,10 @@ impl Config {
             // sweep forever; `0` is allowed (sweep on the next pass).
             blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
                 .min(7 * 24 * 60 * 60),
+            blob_gc_min_age_secs: resolve_blob_gc_min_age_secs(env_parse(
+                "BLOB_GC_MIN_AGE_SECS",
+                crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
+            )),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -4018,6 +4061,39 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOB_GC_MIN_AGE_SECS (#2906)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_blob_gc_min_age_from_env() {
+        use crate::services::storage_gc_service::MIN_BLOB_AGE_SECS;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let cases: [(Option<&str>, u64); 6] = [
+            (None, MIN_BLOB_AGE_SECS),
+            (Some("garbage"), MIN_BLOB_AGE_SECS),
+            (Some("120"), 120),
+            (Some("3600"), 3600),
+            (Some("1"), 60),
+            (Some("99999999"), 7 * 24 * 60 * 60),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => env::set_var("BLOB_GC_MIN_AGE_SECS", v),
+                None => env::remove_var("BLOB_GC_MIN_AGE_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(
+                config.blob_gc_min_age_secs, want,
+                "BLOB_GC_MIN_AGE_SECS={raw:?}"
+            );
+        }
+        env::remove_var("BLOB_GC_MIN_AGE_SECS");
+        assert_eq!(Config::default().blob_gc_min_age_secs, MIN_BLOB_AGE_SECS);
     }
 
     // -----------------------------------------------------------------------
