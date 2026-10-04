@@ -3292,6 +3292,44 @@ mod tests {
         assert!(header(&h, "X-Webhook-Signature").is_none());
     }
 
+    /// #921 regression pin: the complete header set a `signing_mode = hmac`
+    /// webhook sends, byte for byte, as it was before asymmetric signing
+    /// existed. The expected values are literals (HMAC-SHA256 computed
+    /// out-of-band over `"1700000000.<body>"`), not re-derived through the
+    /// code under test, so any drift in names, order, or token layout fails.
+    #[test]
+    fn delivery_headers_hmac_mode_are_byte_identical_to_pre_v2_wire() {
+        let secret_refs = ["whsec_current", "whsec_previous"];
+        let custom = serde_json::json!({"X-Trace": "abc"});
+        let mut inputs = sample_inputs(&secret_refs, br#"{"event":"artifact.uploaded"}"#);
+        inputs.retry_attempt = Some(3);
+        inputs.custom_headers = Some(&custom);
+        let h = build_delivery_request_headers(&inputs);
+        let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
+        let prev = "725598b0de63a47dc2a201da3fa6ac232f9d56ffa4ee9f9fb86ad5a1df0d6926";
+        let nil = "00000000-0000-0000-0000-000000000000";
+        let expected: Vec<(String, String)> = [
+            ("Content-Type", "application/json".to_string()),
+            ("X-ArtifactKeeper-Delivery", nil.to_string()),
+            ("X-ArtifactKeeper-Event", "artifact.uploaded".to_string()),
+            ("X-ArtifactKeeper-Event-Version", "2026-04-01".to_string()),
+            ("X-ArtifactKeeper-Retry-Attempt", "3".to_string()),
+            ("X-Webhook-Event", "artifact.uploaded".to_string()),
+            ("X-Webhook-Delivery", nil.to_string()),
+            ("X-Webhook-Retry-Attempt", "3".to_string()),
+            ("X-Trace", "abc".to_string()),
+            (
+                "X-ArtifactKeeper-Signature",
+                format!("t=1700000000,v1={cur},v1={prev}"),
+            ),
+            ("X-Webhook-Signature", format!("sha256={cur}")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(h, expected);
+    }
+
     // ---------------- validate_event_version ----------------
 
     #[test]
