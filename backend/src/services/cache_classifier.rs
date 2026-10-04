@@ -303,6 +303,13 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
             classify_github_release(path)
         }
 
+        // Bazel module registry (#2858): `bazel_registry.json` and
+        // `modules/<name>/metadata.json` gain versions over time, while every
+        // file under `modules/<name>/<version>/` belongs to a published
+        // version, which the BCR never changes (Bazel lockfiles pin their
+        // hashes).
+        RepositoryFormat::Bazel => classify_bazel(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -716,6 +723,21 @@ fn classify_github_release(path: &str) -> Mutability {
         Mutability::Mutable {
             default_ttl_secs: GITHUB_RELEASE_TTL_SECS,
         }
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// Bazel registry: only versioned files (`modules/<name>/<version>/<file>`)
+/// are immutable; the registry config and the per-module `metadata.json`
+/// version list are rewritten as versions are published or yanked.
+fn classify_bazel(lower: &str) -> Mutability {
+    let versioned = lower
+        .strip_prefix("modules/")
+        .map(|rest| rest.splitn(3, '/').filter(|s| !s.is_empty()).count() == 3)
+        .unwrap_or(false);
+    if versioned {
+        Mutability::Immutable
     } else {
         Mutability::mutable_default()
     }
@@ -1183,6 +1205,14 @@ mod tests {
             (Go, "github.com/foo/bar/@v/v1.2.info", false),
             (Go, "github.com/foo/bar/@v/v1.02.3.mod", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.txt", false),
+            // Bazel registry (#2858): versioned files immutable, the
+            // registry config and per-module version list mutable.
+            (Bazel, "bazel_registry.json", false),
+            (Bazel, "modules/rules_cc/metadata.json", false),
+            (Bazel, "modules/rules_cc/0.1.1/MODULE.bazel", true),
+            (Bazel, "modules/rules_cc/0.1.1/source.json", true),
+            (Bazel, "modules/rules_cc/0.1.1/patches/fix.patch", true),
+            (Bazel, "modules/rules_cc", false),
         ]
     }
 

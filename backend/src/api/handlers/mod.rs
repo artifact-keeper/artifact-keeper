@@ -313,6 +313,7 @@ pub mod artifact_labels;
 pub mod artifacts;
 pub mod auth;
 pub mod banners;
+pub mod bazel;
 pub mod builds;
 pub mod cache_headers;
 pub mod cargo;

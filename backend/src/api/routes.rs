@@ -111,6 +111,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/puppet", handlers::puppet::router())
         .nest("/ansible", handlers::ansible::router())
         .nest("/cran", handlers::cran::router())
+        .nest("/bazel", handlers::bazel::router())
         .nest("/ivy", handlers::sbt::router())
         .nest("/vscode", handlers::vscode::router())
         .nest("/proto", handlers::protobuf::router())
