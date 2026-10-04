@@ -1202,6 +1202,16 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
+        // Content bundles (#2464): an export reads whole repositories and an
+        // import provisions content into them, so the whole nest is global
+        // admin only, the same tier and reasoning as `/migrations` above.
+        .nest(
+            "/bundles",
+            handlers::bundles::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
+            )),
+        )
         // Chunked/resumable upload routes with auth middleware
         .nest(
             "/uploads",
@@ -1374,6 +1384,28 @@ mod tests {
         assert!(
             ROUTES_RS_SRC.contains("\"/dependency-track\","),
             "/dependency-track nest registration missing"
+        );
+    }
+
+    #[test]
+    fn bundles_nest_requires_admin() {
+        // #2464: bundle export reads whole repositories and import writes
+        // into them; both are operator workflows gated like `/migrations`.
+        let nest = ROUTES_RS_SRC
+            .split("handlers::bundles::router()")
+            .nth(1)
+            .expect("bundles::router() must be nested under /bundles");
+        let next_middleware = nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("bundles nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "bundle routes must be gated by admin_middleware, not auth_middleware"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains("\"/bundles\","),
+            "/bundles nest registration missing"
         );
     }
 

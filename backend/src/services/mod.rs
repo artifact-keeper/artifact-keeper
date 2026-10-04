@@ -16,6 +16,7 @@ pub mod backup_service;
 pub mod banner_service;
 pub mod binary_catalog;
 pub mod build_service;
+pub mod bundle;
 pub mod cache_classifier;
 pub mod cache_invalidation;
 pub mod ci_oidc_service;

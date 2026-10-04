@@ -58,6 +58,7 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "bundles", description = "Offline content bundle export and import"),
         (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "age-gate", description = "Age-based proxy quality gate"),
@@ -193,6 +194,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("projects", handlers::projects::ProjectsApiDoc::openapi()),
         ("migration", handlers::migration::MigrationApiDoc::openapi()),
+        ("bundles", handlers::bundles::BundlesApiDoc::openapi()),
         ("sso", handlers::sso::SsoApiDoc::openapi()),
         ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),
         ("totp", handlers::totp::TotpApiDoc::openapi()),
@@ -852,6 +854,10 @@ mod tests {
             (
                 "/api/v1/migrations/",
                 vec![include_str!("handlers/migration.rs")],
+            ),
+            (
+                "/api/v1/bundles/",
+                vec![include_str!("handlers/bundles.rs")],
             ),
             (
                 "/api/v1/curation/",
