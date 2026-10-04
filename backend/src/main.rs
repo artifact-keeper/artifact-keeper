@@ -169,6 +169,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+    artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
 
     // Log active allocator
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
@@ -1083,6 +1084,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // ownership. The clone only happens when METRICS_PORT is actually configured.
     let metrics_state = config.metrics_port.map(|_| state.clone());
 
+    // Trusted-proxy ranges for the `http_request` span builder below (#4195),
+    // shared into the per-request closure without copying the list.
+    let trace_context_trusted_proxies: std::sync::Arc<
+        [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
+    > = config.rate_limit_trusted_proxy_cidrs.clone().into();
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
@@ -1178,7 +1185,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
         .layer(TraceLayer::new_for_http().make_span_with(
-            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+            move |request: &axum::http::Request<axum::body::Body>| {
+                // Inbound W3C trace context is adopted only from trusted
+                // proxies once RATE_LIMIT_TRUSTED_PROXY_CIDRS is set (#4195).
+                artifact_keeper_backend::api::middleware::tracing::make_http_request_span(
+                    request,
+                    &trace_context_trusted_proxies,
+                )
+            },
         ));
 
     // The concrete shutdown token used by all servers and background tasks

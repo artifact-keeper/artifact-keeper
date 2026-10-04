@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#4195]
+---
+- **Inbound W3C trace context is adopted only from trusted-proxy peers once `RATE_LIMIT_TRUSTED_PROXY_CIDRS` is set** (#4195). The `http_request` span adopted an inbound `traceparent`/`tracestate` from any client (#4030), so under the default `parentbased_always_on` sampler a caller could send `sampled=00` to keep its own requests out of tracing, and under `parentbased_always_off` or `parentbased_traceidratio` an untrusted `sampled=01` forced export of traces the sampler would have dropped. The span now consults the header only when the TCP peer falls inside `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the list that already decides whether `X-Forwarded-For` is believed; any other peer starts a fresh root trace. The correlation-ID fallback from `traceparent` is unchanged. With the list empty the header is still accepted from every client, so existing deployments keep joined traces, and startup logs a warning when that combines with one of the two samplers a client can force.

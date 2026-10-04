@@ -5,7 +5,9 @@
 //! redacts sensitive query params, see #544); this middleware records the
 //! correlation ID onto that ambient span rather than opening a second one.
 
+use crate::api::middleware::rate_limit::CidrRange;
 use axum::{extract::Request, http::header::HeaderValue, middleware::Next, response::Response};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 /// The header name for correlation IDs.
@@ -230,9 +232,10 @@ impl opentelemetry::propagation::Extractor for InboundHeaderExtractor<'_> {
 ///   remote parent can only *reduce* export volume (a caller sending
 ///   `sampled=00` suppresses its own trace). Under `parentbased_always_off`
 ///   or `parentbased_traceidratio`, however, an untrusted `sampled=01` forces
-///   export of a trace the sampler would have dropped. Extraction is
-///   currently accepted from any peer; gating it on the trusted-proxy CIDR
-///   list is the planned fix.
+///   export of a trace the sampler would have dropped. That is why
+///   [`make_http_request_span`] only calls this for a peer inside
+///   `RATE_LIMIT_TRUSTED_PROXY_CIDRS` once that list is set (#4195); see
+///   [`trust_inbound_trace_context`].
 pub fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<opentelemetry::Context> {
     use opentelemetry::trace::TraceContextExt;
 
@@ -286,7 +289,16 @@ pub fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<opentelem
 /// The parent is set on THIS span rather than by opening a second one: #2308 /
 /// #2309 removed a duplicate `http_request` span and the module docs above
 /// record why it must stay removed.
-pub fn make_http_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+///
+/// The inbound context is only consulted when [`trust_inbound_trace_context`]
+/// accepts the TCP peer (from `ConnectInfo<SocketAddr>`) against
+/// `trusted_proxies`, the `RATE_LIMIT_TRUSTED_PROXY_CIDRS` list (#4195).
+/// Otherwise the span starts a fresh root trace. The correlation-ID fallback
+/// from `traceparent` in [`correlation_id_middleware`] is unaffected.
+pub fn make_http_request_span<B>(
+    request: &axum::http::Request<B>,
+    trusted_proxies: &[CidrRange],
+) -> tracing::Span {
     let uri = request.uri();
     let sanitized = crate::api::redact_sensitive_params(uri.path(), uri.query());
 
@@ -298,7 +310,17 @@ pub fn make_http_request_span<B>(request: &axum::http::Request<B>) -> tracing::S
         correlation_id = tracing::field::Empty,
     );
 
-    if let Some(parent) = remote_trace_context(request.headers()) {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let parent = if trust_inbound_trace_context(peer, trusted_proxies) {
+        remote_trace_context(request.headers())
+    } else {
+        None
+    };
+
+    if let Some(parent) = parent {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         // The only failure mode is `SetParentError::LayerNotFound` (no OTel
         // layer installed). `remote_trace_context` already returns `None` in
@@ -310,6 +332,60 @@ pub fn make_http_request_span<B>(request: &axum::http::Request<B>) -> tracing::S
     }
 
     span
+}
+
+/// Whether an inbound W3C trace context from `peer` may parent the request span
+/// (#4195).
+///
+/// The header is unauthenticated, and under a `parentbased_*` sampler its
+/// sampled flag decides whether this request is traced at all: a direct client
+/// could send `sampled=00` to hide its own requests from tracing, or (under
+/// `parentbased_always_off` / `parentbased_traceidratio`) `sampled=01` to force
+/// export. So once an operator names their reverse proxies in
+/// `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same list that decides whether
+/// `X-Forwarded-For` is believed, only those peers are trusted to hand us a
+/// parent. A request with no `ConnectInfo` (in-process tests, a non-TCP
+/// listener) has no peer to vouch for, so it is untrusted too.
+///
+/// An EMPTY list keeps the pre-#4195 accept-all behaviour, for backward
+/// compatibility: deployments that never set the list but rely on their
+/// ingress's `traceparent` keep joined traces. [`warn_if_trace_context_untrusted`]
+/// flags the configurations where that default is exploitable.
+pub fn trust_inbound_trace_context(peer: Option<IpAddr>, trusted_proxies: &[CidrRange]) -> bool {
+    if trusted_proxies.is_empty() {
+        return true;
+    }
+    peer.is_some_and(|ip| trusted_proxies.iter().any(|cidr| cidr.contains(ip)))
+}
+
+/// Whether the startup warning about accept-all trace-context extraction
+/// applies (#4195): OTel is on (otherwise no propagator is installed and
+/// extraction is inert), no trusted-proxy list is configured, and the sampler
+/// lets a remote `sampled=01` force export of a trace it would have dropped.
+fn trace_context_warning_applies(
+    otel_enabled: bool,
+    trusted_proxies_configured: bool,
+    sampler_obeys_remote_upgrade: bool,
+) -> bool {
+    otel_enabled && !trusted_proxies_configured && sampler_obeys_remote_upgrade
+}
+
+/// Log a startup warning when any client can force trace export (#4195). See
+/// [`trust_inbound_trace_context`] for why an empty list stays accept-all.
+pub fn warn_if_trace_context_untrusted(config: &crate::config::Config) {
+    if trace_context_warning_applies(
+        config.otel_exporter_otlp_endpoint.is_some(),
+        !config.rate_limit_trusted_proxy_cidrs.is_empty(),
+        crate::telemetry::sampler_obeys_remote_sampled_upgrade(),
+    ) {
+        tracing::warn!(
+            "Inbound W3C traceparent is accepted from every client because \
+             RATE_LIMIT_TRUSTED_PROXY_CIDRS is empty, and the configured \
+             OTEL_TRACES_SAMPLER honours a remote sampled flag: any caller can \
+             force export of a trace the sampler would drop. Set \
+             RATE_LIMIT_TRUSTED_PROXY_CIDRS to your reverse proxies' ranges."
+        );
+    }
 }
 
 /// Correlation ID middleware with W3C Trace Context interop.
@@ -1096,7 +1172,7 @@ mod make_http_request_span_tests {
     fn adopts_the_inbound_trace_as_the_span_parent() {
         install_propagator();
         with_otel_layer(|| {
-            let span = make_http_request_span(&request_with(&[("traceparent", VALID)]));
+            let span = make_http_request_span(&request_with(&[("traceparent", VALID)]), &[]);
             let cx = span.context();
             assert_eq!(
                 cx.span().span_context().trace_id().to_string(),
@@ -1112,7 +1188,7 @@ mod make_http_request_span_tests {
     fn without_an_inbound_context_the_span_starts_its_own_trace() {
         install_propagator();
         with_otel_layer(|| {
-            let span = make_http_request_span(&request_with(&[]));
+            let span = make_http_request_span(&request_with(&[]), &[]);
             let cx = span.context();
             assert_ne!(
                 cx.span().span_context().trace_id().to_string(),
@@ -1130,10 +1206,10 @@ mod make_http_request_span_tests {
         with_otel_layer(|| {
             // 16-char trace-id: the SDK propagator would zero-pad this into a
             // different, valid-looking id if it were not rejected first.
-            let span = make_http_request_span(&request_with(&[(
-                "traceparent",
-                "00-4bf92f3577b34da6-00f067aa0ba902b7-01",
-            )]));
+            let span = make_http_request_span(
+                &request_with(&[("traceparent", "00-4bf92f3577b34da6-00f067aa0ba902b7-01")]),
+                &[],
+            );
             let trace_id = span.context().span().span_context().trace_id().to_string();
             // Rejecting the header does not leave the span parentless-and-invalid:
             // tracing-opentelemetry still gives it a fresh trace of its own. The
@@ -1148,6 +1224,106 @@ mod make_http_request_span_tests {
                 "nor silently widened into the full-length id"
             );
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // #4195: inbound trace context only from trusted-proxy peers
+    // -----------------------------------------------------------------------
+
+    fn cidrs(list: &[&str]) -> Vec<CidrRange> {
+        list.iter()
+            .map(|c| CidrRange::parse(c).expect("valid test CIDR"))
+            .collect()
+    }
+
+    fn from_peer(mut request: Request<()>, peer: &str) -> Request<()> {
+        let addr: std::net::SocketAddr = peer.parse().expect("valid peer");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        request
+    }
+
+    fn span_trace_id(request: &Request<()>, trusted: &[CidrRange]) -> String {
+        install_propagator();
+        with_otel_layer(|| {
+            make_http_request_span(request, trusted)
+                .context()
+                .span()
+                .span_context()
+                .trace_id()
+                .to_string()
+        })
+    }
+
+    const VALID_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    #[test]
+    fn trust_inbound_trace_context_truth_table() {
+        let proxies = cidrs(&["10.0.0.0/8", "fd00::/8"]);
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        // Empty list: accept-all, for backward compatibility.
+        assert!(trust_inbound_trace_context(ip("203.0.113.9"), &[]));
+        assert!(trust_inbound_trace_context(None, &[]));
+        // Configured list: only peers inside it.
+        assert!(trust_inbound_trace_context(ip("10.1.2.3"), &proxies));
+        assert!(trust_inbound_trace_context(ip("fd12::1"), &proxies));
+        assert!(!trust_inbound_trace_context(ip("203.0.113.9"), &proxies));
+        assert!(!trust_inbound_trace_context(ip("2001:db8::1"), &proxies));
+        // No peer to vouch for: untrusted once a list is set.
+        assert!(!trust_inbound_trace_context(None, &proxies));
+    }
+
+    #[test]
+    fn a_trusted_proxy_peer_parents_the_span() {
+        let request = from_peer(request_with(&[("traceparent", VALID)]), "10.0.0.7:41000");
+        assert_eq!(
+            span_trace_id(&request, &cidrs(&["10.0.0.0/8"])),
+            VALID_TRACE_ID,
+            "a peer inside RATE_LIMIT_TRUSTED_PROXY_CIDRS keeps its caller's trace"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_peer_gets_a_fresh_root_trace() {
+        let request = from_peer(request_with(&[("traceparent", VALID)]), "203.0.113.9:41000");
+        assert_ne!(
+            span_trace_id(&request, &cidrs(&["10.0.0.0/8"])),
+            VALID_TRACE_ID,
+            "a peer outside the trusted-proxy list must not choose the trace"
+        );
+    }
+
+    #[test]
+    fn an_empty_trusted_proxy_list_keeps_accepting_every_peer() {
+        let request = from_peer(request_with(&[("traceparent", VALID)]), "203.0.113.9:41000");
+        assert_eq!(span_trace_id(&request, &[]), VALID_TRACE_ID);
+    }
+
+    #[test]
+    fn a_request_without_connect_info_does_not_panic_and_starts_fresh() {
+        // In-process tests and non-TCP listeners carry no ConnectInfo.
+        let request = request_with(&[("traceparent", VALID)]);
+        assert_ne!(
+            span_trace_id(&request, &cidrs(&["10.0.0.0/8"])),
+            VALID_TRACE_ID
+        );
+    }
+
+    #[test]
+    fn trace_context_warning_applies_only_when_exploitable() {
+        // otel on, no list, upgrade-obeying sampler: warn.
+        assert!(trace_context_warning_applies(true, false, true));
+        // Any one of the three missing: no warning.
+        assert!(!trace_context_warning_applies(false, false, true));
+        assert!(!trace_context_warning_applies(true, true, true));
+        assert!(!trace_context_warning_applies(true, false, false));
+    }
+
+    #[test]
+    fn warn_if_trace_context_untrusted_runs_on_the_default_config() {
+        // Default config has OTel off, so this must be a silent no-op.
+        warn_if_trace_context_untrusted(&crate::config::Config::test_config());
     }
 
     /// The span must still redact its URI (#544). Guards against a future edit
@@ -1183,7 +1359,7 @@ mod make_http_request_span_tests {
         let captured = Arc::new(Mutex::new(None));
         let subscriber = tracing_subscriber::registry().with(CaptureUri(captured.clone()));
         tracing::subscriber::with_default(subscriber, || {
-            let _span = make_http_request_span(&request_with(&[]));
+            let _span = make_http_request_span(&request_with(&[]), &[]);
         });
 
         let uri = captured
