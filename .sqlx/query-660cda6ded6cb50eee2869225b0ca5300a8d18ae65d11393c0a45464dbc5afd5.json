@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT\n                       AS \"ledger_bytes!\",\n                   COALESCE(ARRAY_AGG(r.id) FILTER (WHERE l.repository_id IS NULL),\n                            '{}'::uuid[]) AS \"unseeded!\"\n              FROM repositories r\n              LEFT JOIN repository_usage_ledger l ON l.repository_id = r.id\n             WHERE r.project_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ledger_bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "unseeded!",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "660cda6ded6cb50eee2869225b0ca5300a8d18ae65d11393c0a45464dbc5afd5"
+}

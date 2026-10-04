@@ -258,15 +258,15 @@ async fn create_session(
     // that legitimately predate a quota change can still replicate; the
     // `max_upload_size` cap inside `create_session` still applies in that case.
     if !is_replication {
-        let within_quota = state
+        let denied_by = state
             .create_repository_service()
-            .check_quota(repo_id, req.total_size)
+            .quota_preflight(repo_id, req.total_size)
             .await
             .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if !within_quota {
+        if let Some(scope) = denied_by {
             return Err(map_err(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Repository storage quota exceeded",
+                scope.exceeded_message(),
             ));
         }
     }
@@ -796,20 +796,13 @@ async fn complete_session_commit(
                     return Err(release_after_precommit_failure(&state.db, &session, e).await);
                 }
             };
-        if !admission.allowed {
+        if let Some(scope) = admission.denied_by {
             // Drop `tx` (rolls back). The stored blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
             drop(tx);
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                "repository storage quota exceeded",
-            )
-            .await;
-            return Err(map_err(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "Repository storage quota exceeded",
-            ));
+            let message = scope.exceeded_message();
+            UploadService::fail_committing(&state.db, &session, &message.to_lowercase()).await;
+            return Err(map_err(StatusCode::INSUFFICIENT_STORAGE, message));
         }
     }
     let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
@@ -3329,6 +3322,47 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    /// #2474: the session-create quota preflight also enforces the
+    /// repository's PROJECT quota and names that scope in the rejection.
+    #[tokio::test]
+    async fn create_session_rejects_upload_over_project_quota() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let project_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO projects (key, name, quota_bytes) VALUES ($1, $1, 100) RETURNING id",
+        )
+        .bind(format!("upl-pq-{}", Uuid::new_v4().simple()))
+        .fetch_one(&f.pool)
+        .await
+        .expect("create project");
+        sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+            .bind(f.repo_id)
+            .bind(project_id)
+            .execute(&f.pool)
+            .await
+            .expect("assign project");
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "images/over.bin",
+            "total_size": 1024_i64,
+            "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        f.teardown().await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&f.pool)
+            .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Project storage quota exceeded"), "{body}");
     }
 
     #[tokio::test]

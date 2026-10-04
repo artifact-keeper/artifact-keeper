@@ -128,7 +128,10 @@ pub struct CreateProjectRequest {
     pub key: String,
     pub name: String,
     pub description: Option<String>,
-    /// P1: stored only, NOT enforced (quota enforcement is P3).
+    /// Aggregate storage cap in bytes across every repository assigned to
+    /// the project (hosted + proxy-cache + OCI blob bytes). Enforced at
+    /// upload admission in addition to each repository's own quota (#2474).
+    /// Unset or `<= 0` means unlimited.
     pub quota_bytes: Option<i64>,
 }
 

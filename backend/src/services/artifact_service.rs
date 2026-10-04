@@ -808,15 +808,14 @@ impl ArtifactService {
         checksum_sha256: &str,
     ) -> Result<()> {
         crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
-        // Check quota
-        if !self
+        // Check quota (repository quota and, if any, its project's aggregate
+        // quota, #2474).
+        if let Some(scope) = self
             .repo_service
-            .check_quota(repository_id, size_bytes)
+            .quota_preflight(repository_id, size_bytes)
             .await?
         {
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
         // Both immutability checks live in `enforce_path_immutability` so the
@@ -906,12 +905,10 @@ impl ArtifactService {
             .repo_service
             .check_quota_locked(&mut tx, repository_id, path, size_bytes)
             .await?;
-        if !admission.allowed {
+        if let Some(scope) = admission.denied_by {
             // Drop `tx` (rolls back). The content blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
         // Create artifact record.

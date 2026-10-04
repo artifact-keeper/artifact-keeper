@@ -20,7 +20,8 @@ pub struct Project {
     pub key: String,
     pub name: String,
     pub description: Option<String>,
-    /// Storage quota in bytes. P1: stored only, NOT enforced (quotas = P3).
+    /// Aggregate storage quota in bytes across the project's repositories,
+    /// enforced at upload admission (#2474). Unset or `<= 0` = unlimited.
     pub quota_bytes: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
