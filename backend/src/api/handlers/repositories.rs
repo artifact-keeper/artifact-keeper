@@ -2378,26 +2378,18 @@ fn npm_virtual_isolate_to_store(
     }
 }
 
-/// Persist a validated isolate-mode toggle (#3767) and drop the virtual's
-/// computed packuments so the change is visible on the next read instead of
-/// after the packument cache's fresh/stale window.
-async fn apply_npm_virtual_isolate(
-    state: &SharedState,
-    repo_id: Uuid,
-    repo_key: &str,
-    value: bool,
-) -> Result<()> {
+/// Persist a validated isolate-mode toggle (#3767). No cache invalidation is
+/// needed: the toggle is part of every npm virtual packument cache key, so the
+/// next read on every replica (and the shared Redis tier) misses and
+/// recomputes under the new mode.
+async fn apply_npm_virtual_isolate(state: &SharedState, repo_id: Uuid, value: bool) -> Result<()> {
     upsert_repo_config(
         &state.db,
         repo_id,
         crate::api::handlers::npm::NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY,
         if value { "true" } else { "false" },
     )
-    .await?;
-    if let Some(cache) = state.npm_packument_cache.as_ref() {
-        cache.invalidate_repository(repo_key).await;
-    }
-    Ok(())
+    .await
 }
 
 /// Echo the npm Virtual isolate toggle (#3767) on npm Virtual repositories.
@@ -3457,7 +3449,7 @@ pub async fn create_repository(
         .await?;
     }
     if let Some(isolate) = npm_virtual_isolate {
-        apply_npm_virtual_isolate(&state, repo.id, &repo.key, isolate).await?;
+        apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
@@ -4337,7 +4329,7 @@ pub async fn update_repository(
         .await?;
     }
     if let Some(isolate) = npm_virtual_isolate {
-        apply_npm_virtual_isolate(&state, repo.id, &repo.key, isolate).await?;
+        apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {

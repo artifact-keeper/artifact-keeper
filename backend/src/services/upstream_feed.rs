@@ -681,7 +681,8 @@ impl Drop for RunningGuard {
 pub struct NpmUpstreamFeedStatus {
     /// Effective `NPM_UPSTREAM_FEED_ENABLED`.
     pub enabled: bool,
-    /// Effective `NPM_UPSTREAM_FEED_URL`, with any userinfo removed.
+    /// Effective `NPM_UPSTREAM_FEED_URL`, with userinfo and query string
+    /// removed (a placeholder when the value does not parse).
     pub feed_url: String,
     /// Last persisted feed sequence (`upstream_feed_state.last_seq`); `null`
     /// before the consumer has ever bootstrapped.
@@ -705,18 +706,32 @@ pub struct NpmUpstreamFeedStatus {
     /// this often, which bounds failover after a silently lost lock.
     pub leader_term_secs: u64,
     /// Most recent feed failure seen by the replica that answered (poll,
-    /// bootstrap, cursor read, or invalidation actions), cleared once the
-    /// feed answers again. Only the leader polls, so a non-leader replica
+    /// bootstrap, cursor read, or invalidation actions) during its current
+    /// leadership term, cleared once a poll and its actions succeed and when
+    /// the replica steps down. Only the leader polls, so a non-leader replica
     /// reports `null` here unless it failed to start the consumer.
     pub last_error: Option<String>,
 }
 
-/// The feed URL as reported to admins, and the state key it maps to (`None`
-/// for a URL that does not parse, which can never have a state row).
+/// Shown as `feed_url` when the configured value is not a usable URL: it may
+/// still carry credentials, so it is never echoed.
+const UNPARSEABLE_FEED_URL: &str = "(unparseable NPM_UPSTREAM_FEED_URL)";
+
+/// The feed URL as reported to admins (userinfo and query string removed, so
+/// neither a password nor an `?access_token=` reaches the response), and the
+/// state key it maps to (`None` for a URL that does not parse, which can never
+/// have a state row). The key is derived exactly as the adapter derives it.
 fn npm_feed_identity(configured_url: &str) -> (String, Option<String>) {
     match Url::parse(configured_url) {
-        Ok(url) => (without_userinfo(&url).to_string(), Some(npm_feed_key(&url))),
-        Err(_) => (configured_url.to_string(), None),
+        // A non-hierarchical "URL" (`user:pw@host` parses with scheme `user`)
+        // has no userinfo to strip, so it is never echoed either.
+        Ok(url) if !url.cannot_be_a_base() => {
+            let mut shown = without_userinfo(&url);
+            shown.set_query(None);
+            shown.set_fragment(None);
+            (shown.to_string(), Some(npm_feed_key(&url)))
+        }
+        _ => (UNPARSEABLE_FEED_URL.to_string(), None),
     }
 }
 
@@ -901,7 +916,11 @@ impl FeedConsumer {
             // lock silently lost to a dead connection converges back to a
             // single consumer within one term instead of persisting until
             // process restart.
+            // A former leader no longer polls, so its last error would go
+            // stale forever if another replica wins the next term; the
+            // current leader reports the live one.
             self.status.set_leader(false);
+            self.status.clear_error();
             lease.release().await;
             if self.cancel.is_cancelled() {
                 return;
@@ -919,6 +938,7 @@ impl FeedConsumer {
             Ok(None) => match self.adapter.bootstrap_cursor().await {
                 Ok(cursor) => {
                     self.note_recovery(feed_key, failures);
+                    self.status.clear_error();
                     // Persist the bootstrapped head before the first poll: at
                     // head the first poll echoes the same seq, so the
                     // `advanced`-gated save below never fires and the stored
@@ -1008,6 +1028,9 @@ impl FeedConsumer {
                         backoff = next_backoff(backoff, self.backoff_max);
                         continue;
                     }
+                    // Cleared only once the poll AND its actions succeeded,
+                    // so a replaying batch keeps its error visible.
+                    self.status.clear_error();
                     let advanced =
                         batch.last_seq.is_some() && batch.last_seq.as_deref() != since.as_deref();
                     if let Some(last_seq) = batch.last_seq {
@@ -1088,7 +1111,6 @@ impl FeedConsumer {
 
     /// Clear the failure streak, logging recovery at info when a streak ended.
     fn note_recovery(&self, feed_key: &str, failures: &mut u32) {
-        self.status.clear_error();
         if *failures > 0 {
             tracing::info!(
                 feed = feed_key,
@@ -2029,15 +2051,19 @@ mod tests {
         cancel.cancel();
         handle.await.expect("join");
         assert!(!status.is_running() && !status.is_leader());
+        // Stepping down drops the error: a non-leader no longer polls, so it
+        // would otherwise report a stale failure indefinitely.
+        assert_eq!(status.last_error(), None);
     }
 
     /// #3069: a successful poll clears a previously published error.
     #[tokio::test]
     async fn consumer_clears_last_error_on_recovery() {
-        let adapter = ScriptedAdapter::new(vec![
-            Err(AppError::Internal("feed down".to_string())),
-            batch(&["recovered-pkg"], "9"),
-        ]);
+        let mut script: Vec<Result<FeedBatch>> = (0..20)
+            .map(|_| Err(AppError::Internal("feed down".to_string())))
+            .collect();
+        script.push(batch(&["recovered-pkg"], "9"));
+        let adapter = ScriptedAdapter::new(script);
         let action = Arc::new(RecordingAction::default());
         let status = Arc::new(FeedStatus::default());
         let cancel = CancellationToken::new();
@@ -2050,6 +2076,10 @@ mod tests {
         )
         .with_status(status.clone());
         let handle = tokio::spawn(consumer.run());
+        // The error is published while the feed fails...
+        assert!(wait_until(|| status.last_error().is_some()).await);
+        assert!(action.applied().is_empty());
+        // ...and cleared once a poll and its actions succeed.
         assert!(wait_until(|| action.applied() == vec!["recovered-pkg"]).await);
         assert!(wait_until(|| status.last_error().is_none()).await);
         cancel.cancel();
@@ -2115,7 +2145,7 @@ mod tests {
     /// state row the adapter writes.
     #[test]
     fn npm_feed_identity_strips_userinfo_and_matches_the_adapter_key() {
-        let configured = "https://user:secret@replicate.example.test/_changes";
+        let configured = "https://user:secret@replicate.example.test/_changes?access_token=tok";
         let (url, key) = npm_feed_identity(configured);
         assert_eq!(url, "https://replicate.example.test/_changes");
         let adapter = NpmReplicationFeedAdapter::from_url_unchecked(configured).expect("adapter");
@@ -2124,7 +2154,11 @@ mod tests {
 
         assert_eq!(
             npm_feed_identity("not a url"),
-            ("not a url".to_string(), None)
+            (UNPARSEABLE_FEED_URL.to_string(), None)
+        );
+        assert_eq!(
+            npm_feed_identity("user:pw@feed.example.test"),
+            (UNPARSEABLE_FEED_URL.to_string(), None)
         );
     }
 

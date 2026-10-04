@@ -498,8 +498,13 @@ struct PackumentScope {
     base_url: String,
     want_abbreviated: bool,
     /// For a virtual repository: the members the caller may read, in merge
-    /// order, and their [`packument_cache::member_list_digest`].
+    /// order, and their [`packument_cache::member_list_digest`] (keyed by the
+    /// isolate toggle too, see [`Self::with_virtual`]).
     members: Option<(Arc<Vec<crate::models::repository::Repository>>, String)>,
+    /// The virtual repository's id and isolate toggle (#3767), carried so
+    /// the compute path merges exactly what the key names, with no second
+    /// lookup by key.
+    virtual_repo: Option<(uuid::Uuid, bool)>,
 }
 
 impl PackumentScope {
@@ -521,7 +526,21 @@ impl PackumentScope {
             base_url: base_url.to_string(),
             want_abbreviated,
             members,
+            virtual_repo: None,
         }
+    }
+
+    /// Bind a virtual scope to its repository and its isolate toggle (#3767).
+    /// The toggle is part of the member-list segment of the key, so flipping
+    /// it makes every replica and the shared Redis tier MISS immediately; no
+    /// repository-wide invalidation is needed (and Redis, indexed per
+    /// package, could not perform one).
+    fn with_virtual(mut self, virtual_repo_id: uuid::Uuid, isolate: bool) -> Self {
+        self.virtual_repo = Some((virtual_repo_id, isolate));
+        if let Some((_, digest)) = self.members.as_mut() {
+            *digest = isolate_keyed_member_list(digest, isolate);
+        }
+        self
     }
 
     fn member_list(&self) -> Option<&str> {
@@ -547,6 +566,17 @@ impl PackumentScope {
             self.want_abbreviated,
             &self.base_url,
         )
+    }
+}
+
+/// The member-list cache-key segment of an npm virtual, distinguished by its
+/// isolate toggle (#3767): the same members merge to different documents
+/// with isolation on and off, so the two must never share an entry.
+fn isolate_keyed_member_list(digest: &str, isolate: bool) -> String {
+    if isolate {
+        format!("{digest}i")
+    } else {
+        digest.to_string()
     }
 }
 
@@ -634,7 +664,15 @@ async fn get_package_metadata_cached(
     } else {
         None
     };
-    let scope = PackumentScope::new(repo_key, package_name, base_url, want_abbreviated, members);
+    let mut scope =
+        PackumentScope::new(repo_key, package_name, base_url, want_abbreviated, members);
+    if repo.repo_type == RepositoryType::Virtual {
+        // One indexed config read on hits too: the toggle is part of the key.
+        let isolate = fetch_npm_virtual_isolate(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        scope = scope.with_virtual(repo.id, isolate);
+    }
     let want_gzip = accepts_gzip(headers);
     let key = scope.cache_key(want_gzip);
     let flight = scope.flight_key();
@@ -734,10 +772,11 @@ async fn compute_and_store_packument(
     // packument resolves no members and is caller-independent; a virtual one
     // is computed from exactly the authorized member list its key names
     // (#4240), never from a caller.
-    let computed = match &scope.members {
-        Some((members, _)) => {
+    let computed = match (&scope.members, scope.virtual_repo) {
+        (Some((members, _)), Some(virtual_repo)) => {
             virtual_packument_response(
                 state,
+                virtual_repo,
                 &scope.repo_key,
                 members,
                 &scope.package,
@@ -746,7 +785,7 @@ async fn compute_and_store_packument(
             )
             .await
         }
-        None => {
+        _ => {
             get_package_metadata(
                 state,
                 None,
@@ -3058,13 +3097,25 @@ pub(crate) async fn fetch_npm_scope_policy(
 pub(crate) const NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY: &str = "npm_virtual_isolate_hosted_names";
 
 /// Parse the stored isolate toggle. Absent means off (the legitimate
-/// unconfigured state); a present-but-unparseable value fails closed with a
-/// 503 rather than silently reverting to union semantics (#2726's rule).
-fn parse_npm_virtual_isolate(repo_id: uuid::Uuid, stored: Option<&str>) -> Result<bool, AppError> {
+/// unconfigured state). A present-but-unparseable value is treated as ON: it
+/// must never silently revert to union semantics (#2726's rule), and ON is the
+/// restrictive reading, so this is as fail-safe as a 503 while keeping the
+/// whole virtual — including names no hosted member owns — in service. The
+/// value is only ever written as `"true"`/`"false"`, so corruption takes a
+/// manual edit, which the next update through the API overwrites.
+fn parse_npm_virtual_isolate(repo_id: uuid::Uuid, stored: Option<&str>) -> bool {
     match stored {
-        None => Ok(false),
-        Some(value) => value.parse::<bool>().map_err(|e| {
-            npm_policy_value_corrupt(repo_id, NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY, &e)
+        None => false,
+        Some(value) => value.parse::<bool>().unwrap_or_else(|e| {
+            tracing::error!(
+                repo_id = %repo_id,
+                key = NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY,
+                value,
+                error = %e,
+                "npm virtual isolate toggle present but unparseable; treating it as ON \
+                 (fail-safe) until it is rewritten (#3767)"
+            );
+            true
         }),
     }
 }
@@ -3090,7 +3141,10 @@ pub(crate) async fn fetch_npm_virtual_isolate(
         );
         AppError::ServiceUnavailable("npm virtual isolate mode temporarily unavailable".to_string())
     })?;
-    parse_npm_virtual_isolate(virtual_repo_id, stored.as_deref())
+    Ok(parse_npm_virtual_isolate(
+        virtual_repo_id,
+        stored.as_deref(),
+    ))
 }
 
 /// True when isolate mode is on for this virtual AND a non-Remote member owns
@@ -3102,10 +3156,23 @@ async fn npm_virtual_isolates_name(
     virtual_repo_id: uuid::Uuid,
     package_name: &str,
 ) -> Result<bool, Response> {
-    if !fetch_npm_virtual_isolate(db, virtual_repo_id)
+    let isolate = fetch_npm_virtual_isolate(db, virtual_repo_id)
         .await
-        .map_err(IntoResponse::into_response)?
-    {
+        .map_err(IntoResponse::into_response)?;
+    npm_virtual_owner_isolates(db, virtual_repo_id, package_name, isolate).await
+}
+
+/// [`npm_virtual_isolates_name`] for a caller that already read the toggle
+/// (the packument cache keys on it, so the merge must use that same value).
+/// Ownership is case-insensitive (`LOWER(name)`), so it covers every name a
+/// hosted publish accepts, uppercase included.
+async fn npm_virtual_owner_isolates(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+    isolate: bool,
+) -> Result<bool, Response> {
+    if !isolate {
         return Ok(false);
     }
     proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name, "npm").await
@@ -3113,7 +3180,7 @@ async fn npm_virtual_isolates_name(
 
 /// The members the packument merge walks, in priority order: all of them, or
 /// — when isolate mode withholds upstream for this name (#3767) — only the
-/// non-Remote ones. Pure so the filter is unit-testable without a database.
+/// non-Remote ones.
 fn npm_virtual_merge_members(
     members: &[crate::models::repository::Repository],
     isolated: bool,
@@ -3575,9 +3642,12 @@ async fn collect_virtual_packument(
     // so a member this caller may not read directly must not contribute its
     // versions, dist-tags, tarball URLs or shasums to it.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let isolate = fetch_npm_virtual_isolate(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     merge_virtual_member_packuments(
         state,
-        repo.id,
+        (repo.id, isolate),
         &members,
         repo_key,
         package_name,
@@ -3593,18 +3663,16 @@ async fn collect_virtual_packument(
 /// age-gate filter (a no-op here: age-gated virtuals never reach the cache).
 async fn virtual_packument_response(
     state: &SharedState,
+    virtual_repo: (uuid::Uuid, bool),
     repo_key: &str,
     members: &[crate::models::repository::Repository],
     package_name: &str,
     base_url: &str,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
-    // The cache scope carries the key, not the id; resolve the virtual so the
-    // #3767 isolate check sees the same repository the request path does.
-    let virtual_repo = resolve_npm_repo(&state.db, repo_key).await?;
     let merged = merge_virtual_member_packuments(
         state,
-        virtual_repo.id,
+        virtual_repo,
         members,
         repo_key,
         package_name,
@@ -3641,10 +3709,9 @@ async fn virtual_packument_response(
 /// member holds exactly one reservation and reserves nothing further while it
 /// holds it (the age-gate filter and the hosted-member path are DB-only), so
 /// the concurrent walk cannot form the hold-and-wait #4145/#4170 removed.
-#[allow(clippy::too_many_arguments)]
 async fn merge_virtual_member_packuments(
     state: &SharedState,
-    virtual_repo_id: uuid::Uuid,
+    (virtual_repo_id, isolate): (uuid::Uuid, bool),
     members: &[crate::models::repository::Repository],
     repo_key: &str,
     package_name: &str,
@@ -3660,7 +3727,8 @@ async fn merge_virtual_member_packuments(
     // tarball leg (`resolve_npm_virtual_ownership`) would refuse. Ownership is
     // decided over the virtual's FULL member set, exactly as the tarball leg
     // decides it, so the two legs agree for every caller.
-    let isolated = npm_virtual_isolates_name(&state.db, virtual_repo_id, package_name).await?;
+    let isolated =
+        npm_virtual_owner_isolates(&state.db, virtual_repo_id, package_name, isolate).await?;
     let members = npm_virtual_merge_members(members, isolated);
 
     // Batch-load per-member npm scope policies once per request (#2327).
@@ -4262,14 +4330,18 @@ async fn resolve_npm_virtual_ownership(
     package_name: &str,
     filename: &str,
 ) -> Result<NpmVirtualOwnership, Response> {
-    if !crate::formats::npm::is_valid_npm_name(package_name) {
-        return Ok(NpmVirtualOwnership::NotOwned);
-    }
     // #3767: isolate mode — a hosted-owned NAME withholds every Remote member
     // regardless of version or priority, matching the packument merge, which
-    // drops Remote members for that name entirely.
+    // drops Remote members for that name entirely. Checked BEFORE the
+    // `is_valid_npm_name` short-circuit below: hosted publish accepts names
+    // that check rejects (uppercase, e.g. `MyPackage`), and the packument leg
+    // isolates them case-insensitively, so skipping here would let the
+    // tarball leg serve upstream for a name the packument hides.
     if npm_virtual_isolates_name(db, virtual_repo_id, package_name).await? {
         return Ok(NpmVirtualOwnership::OwnedNameOnly);
+    }
+    if !crate::formats::npm::is_valid_npm_name(package_name) {
+        return Ok(NpmVirtualOwnership::NotOwned);
     }
     let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
         // Fail-safe (#3646): no readable version, so fall back to the
@@ -7791,15 +7863,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn npm_virtual_isolate_parse_absent_off_and_corrupt_fails_closed() {
+    fn npm_virtual_isolate_parse_absent_off_and_corrupt_fails_safe() {
         let id = uuid::Uuid::new_v4();
-        assert!(!parse_npm_virtual_isolate(id, None).unwrap());
-        assert!(parse_npm_virtual_isolate(id, Some("true")).unwrap());
-        assert!(!parse_npm_virtual_isolate(id, Some("false")).unwrap());
-        // A present-but-corrupt toggle must not silently revert to union
-        // semantics: 503, as the scope policy fails closed (#2726).
-        let err = parse_npm_virtual_isolate(id, Some("yes")).unwrap_err();
-        assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+        assert!(!parse_npm_virtual_isolate(id, None));
+        assert!(parse_npm_virtual_isolate(id, Some("true")));
+        assert!(!parse_npm_virtual_isolate(id, Some("false")));
+        // A present-but-corrupt toggle must never silently revert to union
+        // semantics; it reads as the restrictive ON (#3767, #2726's rule).
+        assert!(parse_npm_virtual_isolate(id, Some("yes")));
+        assert!(parse_npm_virtual_isolate(id, Some("")));
+    }
+
+    #[test]
+    fn npm_virtual_isolate_keys_the_member_list() {
+        assert_eq!(isolate_keyed_member_list("mabc", false), "mabc");
+        assert_eq!(isolate_keyed_member_list("mabc", true), "mabci");
     }
 
     // -----------------------------------------------------------------------
@@ -8006,14 +8084,21 @@ mod tests {
         let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
             return;
         };
-        let owned = "isolate-owned";
+        // The second owned name is uppercase: hosted publish accepts it, but
+        // `is_valid_npm_name` does not, which once let the tarball leg skip
+        // the isolate check while the packument leg hid upstream.
+        let owned_names = ["isolate-owned", "IsolateUpper"];
         let free = "isolate-free";
         let tgz = |package: &str, version: &str, origin: &str| {
             Bytes::from(format!("tgz:{origin}:{package}@{version}"))
         };
 
         let upstream = MockServer::start().await;
-        for (package, versions) in [(owned, &["1.0.0", "1.0.1"][..]), (free, &["3.0.0"][..])] {
+        for (package, versions) in [
+            (owned_names[0], &["1.0.0", "1.0.1"][..]),
+            (owned_names[1], &["1.0.0", "1.0.1"][..]),
+            (free, &["3.0.0"][..]),
+        ] {
             let mut entries = serde_json::Map::new();
             for version in versions {
                 entries.insert(
@@ -8059,20 +8144,31 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
         let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
         let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
-        let artifact_path = format!("{owned}/1.0.0/{owned}-1.0.0.tgz");
-        tdh::seed_artifact(
-            &state,
-            &fx.pool,
-            &local_repo,
-            &format!("npm/{artifact_path}"),
-            &artifact_path,
-            owned,
-            "1.0.0",
-            "application/gzip",
-            tgz(owned, "1.0.0", "hosted"),
-            fx.user_id,
-        )
-        .await;
+        for owned in owned_names {
+            let artifact_path = format!("{owned}/1.0.0/{owned}-1.0.0.tgz");
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &local_repo,
+                &format!("npm/{artifact_path}"),
+                &artifact_path,
+                owned,
+                "1.0.0",
+                "application/gzip",
+                tgz(owned, "1.0.0", "hosted"),
+                fx.user_id,
+            )
+            .await;
+        }
+        assert!(
+            state.npm_packument_cache.is_some(),
+            "the packument cache must be on, so the toggle is proven to change the cache key"
+        );
+        let admin = {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_admin = true;
+            auth
+        };
         let app = tdh::router_anon(super::router(), state.clone());
         let virtual_key = fx.repo_key.clone();
         let tarball = move |package: &str, version: &str| {
@@ -8090,52 +8186,58 @@ mod tests {
 
         let mut failures: Vec<String> = Vec::new();
         for isolate in [false, true] {
-            sqlx::query(
-                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
-                 ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+            // Toggle through the repository API, with no manual cache
+            // invalidation: the union pass warmed the packument cache, so the
+            // isolate pass only sees isolation if the toggle keys the cache.
+            let update: crate::api::handlers::repositories::UpdateRepositoryRequest =
+                serde_json::from_value(
+                    serde_json::json!({ "npm_virtual_isolate_hosted_names": isolate }),
+                )
+                .expect("update payload");
+            crate::api::handlers::repositories::update_repository(
+                axum::extract::State(state.clone()),
+                axum::extract::Extension(Some(admin.clone())),
+                axum::extract::Path(fx.repo_key.clone()),
+                crate::api::extractors::Json(update),
             )
-            .bind(fx.repo_id)
-            .bind(NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY)
-            .bind(isolate.to_string())
-            .execute(&fx.pool)
             .await
-            .expect("set isolate toggle");
-            if let Some(cache) = state.npm_packument_cache.as_ref() {
-                cache.invalidate_repository(&fx.repo_key).await;
-            }
+            .expect("toggle isolate mode through the API");
             let mode = if isolate { "isolate" } else { "union" };
+            for owned in owned_names {
+                let (status, body) =
+                    tdh::send(app.clone(), tdh::get(format!("/{}/{owned}", fx.repo_key))).await;
+                let expected: &[&str] = if isolate {
+                    &["1.0.0"]
+                } else {
+                    &["1.0.0", "1.0.1"]
+                };
+                if status != StatusCode::OK {
+                    failures.push(format!("[{mode}] packument {owned}: HTTP {status}"));
+                } else if versions_of(&body) != expected {
+                    failures.push(format!(
+                        "[{mode}] packument {owned} advertises {:?}, expected {expected:?}",
+                        versions_of(&body)
+                    ));
+                }
 
-            let (status, body) =
-                tdh::send(app.clone(), tdh::get(format!("/{}/{owned}", fx.repo_key))).await;
-            let expected: &[&str] = if isolate {
-                &["1.0.0"]
-            } else {
-                &["1.0.0", "1.0.1"]
-            };
-            if status != StatusCode::OK {
-                failures.push(format!("[{mode}] packument {owned}: HTTP {status}"));
-            } else if versions_of(&body) != expected {
-                failures.push(format!(
-                    "[{mode}] packument {owned} advertises {:?}, expected {expected:?}",
-                    versions_of(&body)
-                ));
-            }
+                let (status, bytes) =
+                    tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.1"))).await;
+                match (isolate, status) {
+                    (true, StatusCode::NOT_FOUND) => {}
+                    (false, StatusCode::OK) if bytes == tgz(owned, "1.0.1", "upstream") => {}
+                    _ => failures.push(format!("[{mode}] GET {owned}@1.0.1: HTTP {status}")),
+                }
 
-            let (status, bytes) = tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.1"))).await;
-            match (isolate, status) {
-                (true, StatusCode::NOT_FOUND) => {}
-                (false, StatusCode::OK) if bytes == tgz(owned, "1.0.1", "upstream") => {}
-                _ => failures.push(format!("[{mode}] GET {owned}@1.0.1: HTTP {status}")),
-            }
-
-            // 1.0.0: priority picks the Remote in union mode (#3955); isolate
-            // mode serves the hosted owner's bytes.
-            let origin = if isolate { "hosted" } else { "upstream" };
-            let (status, bytes) = tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.0"))).await;
-            if status != StatusCode::OK || bytes != tgz(owned, "1.0.0", origin) {
-                failures.push(format!(
-                    "[{mode}] GET {owned}@1.0.0: HTTP {status}, expected {origin} bytes"
-                ));
+                // 1.0.0: priority picks the Remote in union mode (#3955); isolate
+                // mode serves the hosted owner's bytes.
+                let origin = if isolate { "hosted" } else { "upstream" };
+                let (status, bytes) =
+                    tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.0"))).await;
+                if status != StatusCode::OK || bytes != tgz(owned, "1.0.0", origin) {
+                    failures.push(format!(
+                        "[{mode}] GET {owned}@1.0.0: HTTP {status}, expected {origin} bytes"
+                    ));
+                }
             }
 
             // A name no hosted member owns federates in both modes.
