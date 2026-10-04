@@ -796,6 +796,11 @@ pub struct CreateLifecyclePolicyRequest {
     pub config: serde_json::Value,
     pub priority: Option<i32>,
     pub cron_schedule: Option<String>,
+    /// Initial enabled state. Omitted means enabled, the historical default;
+    /// `false` creates the policy disabled so it can be reviewed (and
+    /// previewed) before any scheduled or manual run can delete with it.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Request to update a lifecycle policy.
@@ -2254,6 +2259,7 @@ mod tests {
                 config: json!({"keep": 2}),
                 priority: None,
                 cron_schedule: None,
+                enabled: None,
             })
             .await
             .expect("create lifecycle policy");
@@ -2422,6 +2428,7 @@ mod tests {
                 config: json!({"keep": 1}),
                 priority: None,
                 cron_schedule: None,
+                enabled: None,
             })
             .await
             .expect("create lifecycle policy");
@@ -2613,6 +2620,7 @@ mod tests {
                 config: json!({"days": 7}),
                 priority: None,
                 cron_schedule: None,
+                enabled: None,
             })
             .await
             .expect("create lifecycle policy")
@@ -5052,6 +5060,7 @@ mod tests {
                 priority: None,
                 // No cron + never run => due on the default cadence.
                 cron_schedule: None,
+                enabled: None,
             })
             .await
             .expect("create policy");

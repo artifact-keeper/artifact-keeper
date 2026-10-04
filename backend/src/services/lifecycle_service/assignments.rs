@@ -192,8 +192,9 @@ impl LifecycleService {
         Self::require_repositories(&ids, &found)?;
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO lifecycle_policies \
-             (applies_to_all, name, description, policy_type, config, priority, cron_schedule) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+             (applies_to_all, name, description, policy_type, config, priority, cron_schedule, \
+              enabled) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(req.applies_to_all)
         .bind(req.name)
@@ -202,6 +203,7 @@ impl LifecycleService {
         .bind(req.config)
         .bind(req.priority.unwrap_or(0))
         .bind(req.cron_schedule)
+        .bind(req.enabled.unwrap_or(true))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

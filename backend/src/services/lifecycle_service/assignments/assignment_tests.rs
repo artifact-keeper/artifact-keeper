@@ -648,3 +648,78 @@ async fn repository_deletion_and_policy_mutations_share_lock_order_3794() {
         cleanup(&pool, &[policy.id], &[]).await;
     }
 }
+
+#[test]
+fn create_request_enabled_is_optional_3869() {
+    let base = json!({"name":"test","policy_type":"max_age_days","config":{"days":90}});
+    let req: CreateLifecyclePolicyRequest = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(req.enabled, None, "omitted enabled keeps the default");
+    for (value, expected) in [(json!(false), Some(false)), (json!(true), Some(true))] {
+        let mut body = base.clone();
+        body["enabled"] = value;
+        let req: CreateLifecyclePolicyRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.enabled, expected);
+    }
+    let mut body = base;
+    body["enabled"] = json!("false");
+    assert!(serde_json::from_value::<CreateLifecyclePolicyRequest>(body).is_err());
+}
+
+/// #3869: `"enabled": false` on create used to be dropped by serde, and the
+/// INSERT fell through to the column default, so a destructive policy was
+/// live from the moment it was created. A disabled create must persist and
+/// return `enabled: false`, stay out of the scheduler's policy set, and refuse
+/// a live run while still allowing a preview.
+#[tokio::test]
+async fn create_honours_enabled_false_3869() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let svc = LifecycleService::new(pool.clone());
+    let repository = repo(&pool).await;
+    let old = artifact(&pool, repository, "old").await;
+
+    let mut disabled = request("max_age_days", json!({"days": 1}));
+    disabled.repository_ids = Some(vec![repository]);
+    disabled.enabled = Some(false);
+    let disabled = svc.create_policy(disabled).await.unwrap();
+    assert!(
+        !disabled.enabled,
+        "the create response must report disabled"
+    );
+
+    let mut default = request("max_age_days", json!({"days": 3650}));
+    default.repository_ids = Some(vec![repository]);
+    let default = svc.create_policy(default).await.unwrap();
+    assert!(default.enabled, "omitting enabled keeps enabled-by-default");
+
+    let stored: bool = sqlx::query_scalar("SELECT enabled FROM lifecycle_policies WHERE id = $1")
+        .bind(disabled.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!stored, "the persisted row must be disabled");
+
+    let scheduled: Vec<Uuid> = svc
+        .load_enabled_policies()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|policy| policy.id)
+        .collect();
+    assert!(!scheduled.contains(&disabled.id));
+    assert!(scheduled.contains(&default.id));
+
+    assert!(matches!(
+        svc.execute_policy(disabled.id, false).await,
+        Err(AppError::Validation(_))
+    ));
+    let preview = svc.execute_policy(disabled.id, true).await.unwrap();
+    assert_eq!(
+        preview.artifacts_matched, 1,
+        "a disabled policy can be previewed"
+    );
+    assert!(!deleted(&pool, old).await);
+
+    cleanup(&pool, &[disabled.id, default.id], &[repository]).await;
+}
