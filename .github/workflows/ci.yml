@@ -1871,6 +1871,14 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The weekly whole-repo duplication scan (scheduled-tests.yml,
+      # duplication-report, #1619) is only worth its red run if it reports a
+      # regression exactly when there is one, and treats a source jscpd
+      # silently skipped as "not a measurement" rather than a clean 0%.
+      # Pure python on throwaway files, ~1s.
+      - name: Check the whole-repo duplication report
+        run: bash scripts/ci/test-jscpd-repo-report.sh
+
       # The unit-test matrix runs one shard of the inline tests per leg and
       # the coverage gates read the legs' merged lcov. Both scripts fail
       # silently if wrong: an ungated test module runs in every leg, a
