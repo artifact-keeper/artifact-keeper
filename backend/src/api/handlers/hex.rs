@@ -765,7 +765,7 @@ async fn virtual_local_owns_tarball_name(
     // The hex-specific work is parsing the tarball filename into a
     // package name; the DB lookup is shared with cargo / npm / pypi /
     // maven / rubygems.
-    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name).await
+    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name, "hex").await
 }
 
 /// Serve a tarball download restricted to the virtual repo's non-Remote

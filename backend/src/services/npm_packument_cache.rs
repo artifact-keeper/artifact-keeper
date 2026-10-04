@@ -317,6 +317,11 @@ pub fn member_list_prefix(repo_key: &str, package: &str, member_list: &str) -> S
     key_head(repo_key, package, Some(member_list))
 }
 
+/// Prefix matching every cached packument of one repo (#3767).
+pub fn repository_prefix(repo_key: &str) -> String {
+    format!("{repo_key}:")
+}
+
 /// Prefix matching every cached variant (full/corgi x identity/gzip x any
 /// base URL x any member list) of one package in one repo.
 pub fn invalidation_prefix(repo_key: &str, package: &str) -> String {
@@ -1241,6 +1246,28 @@ impl NpmPackumentCache {
             *state.generations.entry(prefix.clone()).or_insert(0) += 1;
         }
         self.backend.invalidate_prefix(&prefix).await;
+    }
+
+    /// Drop every cached packument of `repo_key` — every package, variant
+    /// and member list — after a repository-level setting that changes what
+    /// the merge computes (npm Virtual isolate mode, #3767). Bumps the epoch
+    /// so no compute already in flight can re-install a pre-change document.
+    /// Repo keys cannot contain `:`, so the `"{repo_key}:"` prefix matches
+    /// this repository only. Best-effort beyond this process: the shared
+    /// Redis tier indexes entries per package and cannot enumerate a whole
+    /// repository, and other replicas' process-local entries are not fanned
+    /// out to, so those converge through the fresh TTL.
+    pub async fn invalidate_repository(&self, repo_key: &str) {
+        {
+            let mut state = self
+                .invalidation_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.epoch += 1;
+        }
+        self.backend
+            .invalidate_prefix(&repository_prefix(repo_key))
+            .await;
     }
 
     /// Drop every cached variant of `package` computed from ONE authorized

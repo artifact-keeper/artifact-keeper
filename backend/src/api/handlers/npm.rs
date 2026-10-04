@@ -3039,6 +3039,91 @@ pub(crate) async fn fetch_npm_scope_policy(
         .unwrap_or_default())
 }
 
+// ---------------------------------------------------------------------------
+// npm Virtual isolate mode (#3767)
+// ---------------------------------------------------------------------------
+
+/// `repository_config` key on an npm VIRTUAL repository holding the isolate
+/// toggle (`"true"`/`"false"`, #3767).
+///
+/// Unset (the default) keeps the union semantics of #2844/#3743: every
+/// member's versions are advertised and downloadable, with the per-version
+/// shadowing guard (#3646/#3955) deciding which member serves a version two
+/// members both hold. When set, a package NAME owned by any non-Remote member
+/// of the virtual (any non-deleted artifact of that name, nested members
+/// included) is served exclusively from those members: Remote members are
+/// dropped from the packument merge AND refused on the tarball leg, so
+/// resolution and download agree — PyPI's #1600 posture, opted into per
+/// virtual. Names no hosted member owns still federate from upstream.
+pub(crate) const NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY: &str = "npm_virtual_isolate_hosted_names";
+
+/// Parse the stored isolate toggle. Absent means off (the legitimate
+/// unconfigured state); a present-but-unparseable value fails closed with a
+/// 503 rather than silently reverting to union semantics (#2726's rule).
+fn parse_npm_virtual_isolate(repo_id: uuid::Uuid, stored: Option<&str>) -> Result<bool, AppError> {
+    match stored {
+        None => Ok(false),
+        Some(value) => value.parse::<bool>().map_err(|e| {
+            npm_policy_value_corrupt(repo_id, NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY, &e)
+        }),
+    }
+}
+
+/// Load the isolate toggle of an npm virtual repository (#3767). A DB error
+/// fails closed (503), as the scope-policy load does (#2726).
+pub(crate) async fn fetch_npm_virtual_isolate(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<bool, AppError> {
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(virtual_repo_id)
+    .bind(NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            error = %e,
+            virtual_repo_id = %virtual_repo_id,
+            "failed to load npm virtual isolate mode; failing closed (#3767)"
+        );
+        AppError::ServiceUnavailable("npm virtual isolate mode temporarily unavailable".to_string())
+    })?;
+    parse_npm_virtual_isolate(virtual_repo_id, stored.as_deref())
+}
+
+/// True when isolate mode is on for this virtual AND a non-Remote member owns
+/// `package_name`, i.e. every Remote member must be withheld for this name on
+/// both legs (#3767). The ownership query only runs when the toggle is on, so
+/// a virtual without isolate mode pays one indexed config lookup.
+async fn npm_virtual_isolates_name(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+) -> Result<bool, Response> {
+    if !fetch_npm_virtual_isolate(db, virtual_repo_id)
+        .await
+        .map_err(IntoResponse::into_response)?
+    {
+        return Ok(false);
+    }
+    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name, "npm").await
+}
+
+/// The members the packument merge walks, in priority order: all of them, or
+/// — when isolate mode withholds upstream for this name (#3767) — only the
+/// non-Remote ones. Pure so the filter is unit-testable without a database.
+fn npm_virtual_merge_members(
+    members: &[crate::models::repository::Repository],
+    isolated: bool,
+) -> Vec<&crate::models::repository::Repository> {
+    members
+        .iter()
+        .filter(|m| !isolated || m.repo_type != RepositoryType::Remote)
+        .collect()
+}
+
 /// Whether a virtual-repo member may serve as a candidate for
 /// `package_name`. Only Remote members are subject to the scope policy;
 /// Local/Staging members (and members with no stored policy) are always
@@ -3492,6 +3577,7 @@ async fn collect_virtual_packument(
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     merge_virtual_member_packuments(
         state,
+        repo.id,
         &members,
         repo_key,
         package_name,
@@ -3513,9 +3599,19 @@ async fn virtual_packument_response(
     base_url: &str,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
-    let merged =
-        merge_virtual_member_packuments(state, members, repo_key, package_name, base_url, true)
-            .await?;
+    // The cache scope carries the key, not the id; resolve the virtual so the
+    // #3767 isolate check sees the same repository the request path does.
+    let virtual_repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let merged = merge_virtual_member_packuments(
+        state,
+        virtual_repo.id,
+        members,
+        repo_key,
+        package_name,
+        base_url,
+        true,
+    )
+    .await?;
     Ok(respond_with_packument(merged, want_abbreviated))
 }
 
@@ -3545,8 +3641,10 @@ async fn virtual_packument_response(
 /// member holds exactly one reservation and reserves nothing further while it
 /// holds it (the age-gate filter and the hosted-member path are DB-only), so
 /// the concurrent walk cannot form the hold-and-wait #4145/#4170 removed.
+#[allow(clippy::too_many_arguments)]
 async fn merge_virtual_member_packuments(
     state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
     members: &[crate::models::repository::Repository],
     repo_key: &str,
     package_name: &str,
@@ -3556,6 +3654,14 @@ async fn merge_virtual_member_packuments(
     if members.is_empty() {
         return Err(proxy_helpers::no_accessible_members_response());
     }
+
+    // #3767: isolate mode drops every Remote member when a hosted member owns
+    // the name, so the packument never advertises an upstream version the
+    // tarball leg (`resolve_npm_virtual_ownership`) would refuse. Ownership is
+    // decided over the virtual's FULL member set, exactly as the tarball leg
+    // decides it, so the two legs agree for every caller.
+    let isolated = npm_virtual_isolates_name(&state.db, virtual_repo_id, package_name).await?;
+    let members = npm_virtual_merge_members(members, isolated);
 
     // Batch-load per-member npm scope policies once per request (#2327).
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
@@ -4128,10 +4234,11 @@ enum NpmVirtualOwnership {
     /// No non-Remote member owns the coordinate: Remote members serve
     /// normally.
     NotOwned,
-    /// A non-Remote member owns the NAME but the filename carried no
-    /// parseable version for it, so the guard cannot prove which versions
-    /// are owned. Fail-safe (#3646): suppress every Remote member rather
-    /// than fan out on a shape we cannot read.
+    /// A non-Remote member owns the NAME and every Remote member is
+    /// suppressed: either the filename carried no parseable version for it,
+    /// so the guard cannot prove which versions are owned (fail-safe, #3646),
+    /// or the virtual is in isolate mode, where a hosted-owned name never
+    /// resolves upstream (#3767).
     OwnedNameOnly,
     /// A non-Remote member owns this exact `name@version`; carries the
     /// smallest `virtual_repo_members.priority` among the owning members
@@ -4158,11 +4265,18 @@ async fn resolve_npm_virtual_ownership(
     if !crate::formats::npm::is_valid_npm_name(package_name) {
         return Ok(NpmVirtualOwnership::NotOwned);
     }
+    // #3767: isolate mode — a hosted-owned NAME withholds every Remote member
+    // regardless of version or priority, matching the packument merge, which
+    // drops Remote members for that name entirely.
+    if npm_virtual_isolates_name(db, virtual_repo_id, package_name).await? {
+        return Ok(NpmVirtualOwnership::OwnedNameOnly);
+    }
     let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
         // Fail-safe (#3646): no readable version, so fall back to the
         // name-only guard rather than fan out on a shape we cannot read.
         let owns_name =
-            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name).await?;
+            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name, "npm")
+                .await?;
         return Ok(if owns_name {
             NpmVirtualOwnership::OwnedNameOnly
         } else {
@@ -7673,6 +7787,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // npm Virtual isolate mode (#3767)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn npm_virtual_isolate_parse_absent_off_and_corrupt_fails_closed() {
+        let id = uuid::Uuid::new_v4();
+        assert!(!parse_npm_virtual_isolate(id, None).unwrap());
+        assert!(parse_npm_virtual_isolate(id, Some("true")).unwrap());
+        assert!(!parse_npm_virtual_isolate(id, Some("false")).unwrap());
+        // A present-but-corrupt toggle must not silently revert to union
+        // semantics: 503, as the scope policy fails closed (#2726).
+        let err = parse_npm_virtual_isolate(id, Some("yes")).unwrap_err();
+        assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
     // remote_member_outranked_by_owner (#3955)
     // -----------------------------------------------------------------------
 
@@ -7857,6 +7987,182 @@ mod tests {
                 "an invalid npm name must skip the ownership check ({filename}), got {invalid:?}"
             );
         }
+    }
+
+    /// #3767: npm Virtual isolate mode. A hosted member owns
+    /// `isolate-owned@1.0.0`; the Remote member — ranked ABOVE it, the worst
+    /// case — also serves `1.0.0` and an attacker's `1.0.1`. With the toggle
+    /// off the virtual keeps union semantics (1.0.1 advertised and served).
+    /// With it on, the owned name is served from the hosted member alone on
+    /// both legs: `1.0.1` is neither advertised nor downloadable, `1.0.0`
+    /// carries and serves the hosted bytes, and a name no hosted member owns
+    /// still federates from upstream.
+    #[tokio::test]
+    async fn test_virtual_isolate_mode_withholds_upstream_for_hosted_names_3767_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let owned = "isolate-owned";
+        let free = "isolate-free";
+        let tgz = |package: &str, version: &str, origin: &str| {
+            Bytes::from(format!("tgz:{origin}:{package}@{version}"))
+        };
+
+        let upstream = MockServer::start().await;
+        for (package, versions) in [(owned, &["1.0.0", "1.0.1"][..]), (free, &["3.0.0"][..])] {
+            let mut entries = serde_json::Map::new();
+            for version in versions {
+                entries.insert(
+                    version.to_string(),
+                    serde_json::json!({"name": package, "version": version,
+                        "dist": {"tarball": format!(
+                            "{}/{package}/-/{package}-{version}.tgz", upstream.uri())}}),
+                );
+                Mock::given(method("GET"))
+                    .and(path(format!("/{package}/-/{package}-{version}.tgz")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(tgz(package, version, "upstream").to_vec()),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path(format!("/{package}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": package, "dist-tags": {"latest": versions[versions.len() - 1]},
+                    "versions": entries
+                })))
+                .mount(&upstream)
+                .await;
+        }
+
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        // Remote at priority 1 OUTRANKS the hosted owner at priority 2.
+        for (member_id, priority) in [(remote_id, 1), (local_id, 2)] {
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, priority).await;
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let artifact_path = format!("{owned}/1.0.0/{owned}-1.0.0.tgz");
+        tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &local_repo,
+            &format!("npm/{artifact_path}"),
+            &artifact_path,
+            owned,
+            "1.0.0",
+            "application/gzip",
+            tgz(owned, "1.0.0", "hosted"),
+            fx.user_id,
+        )
+        .await;
+        let app = tdh::router_anon(super::router(), state.clone());
+        let virtual_key = fx.repo_key.clone();
+        let tarball = move |package: &str, version: &str| {
+            format!("/{virtual_key}/{package}/-/{package}-{version}.tgz")
+        };
+        let versions_of = |body: &Bytes| -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_slice(body).expect("packument");
+            let mut v: Vec<String> = json["versions"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        for isolate in [false, true] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+                 ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(fx.repo_id)
+            .bind(NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY)
+            .bind(isolate.to_string())
+            .execute(&fx.pool)
+            .await
+            .expect("set isolate toggle");
+            if let Some(cache) = state.npm_packument_cache.as_ref() {
+                cache.invalidate_repository(&fx.repo_key).await;
+            }
+            let mode = if isolate { "isolate" } else { "union" };
+
+            let (status, body) =
+                tdh::send(app.clone(), tdh::get(format!("/{}/{owned}", fx.repo_key))).await;
+            let expected: &[&str] = if isolate {
+                &["1.0.0"]
+            } else {
+                &["1.0.0", "1.0.1"]
+            };
+            if status != StatusCode::OK {
+                failures.push(format!("[{mode}] packument {owned}: HTTP {status}"));
+            } else if versions_of(&body) != expected {
+                failures.push(format!(
+                    "[{mode}] packument {owned} advertises {:?}, expected {expected:?}",
+                    versions_of(&body)
+                ));
+            }
+
+            let (status, bytes) = tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.1"))).await;
+            match (isolate, status) {
+                (true, StatusCode::NOT_FOUND) => {}
+                (false, StatusCode::OK) if bytes == tgz(owned, "1.0.1", "upstream") => {}
+                _ => failures.push(format!("[{mode}] GET {owned}@1.0.1: HTTP {status}")),
+            }
+
+            // 1.0.0: priority picks the Remote in union mode (#3955); isolate
+            // mode serves the hosted owner's bytes.
+            let origin = if isolate { "hosted" } else { "upstream" };
+            let (status, bytes) = tdh::send(app.clone(), tdh::get(tarball(owned, "1.0.0"))).await;
+            if status != StatusCode::OK || bytes != tgz(owned, "1.0.0", origin) {
+                failures.push(format!(
+                    "[{mode}] GET {owned}@1.0.0: HTTP {status}, expected {origin} bytes"
+                ));
+            }
+
+            // A name no hosted member owns federates in both modes.
+            let (status, body) =
+                tdh::send(app.clone(), tdh::get(format!("/{}/{free}", fx.repo_key))).await;
+            if status != StatusCode::OK || versions_of(&body) != ["3.0.0"] {
+                failures.push(format!("[{mode}] packument {free}: HTTP {status}"));
+            }
+            let (status, _) = tdh::send(app.clone(), tdh::get(tarball(free, "3.0.0"))).await;
+            if status != StatusCode::OK {
+                failures.push(format!("[{mode}] GET {free}@3.0.0: HTTP {status}"));
+            }
+        }
+
+        tdh::cleanup_member_repo(&fx.pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "npm virtual isolate mode (#3767):\n{}",
+            failures.join("\n")
+        );
     }
 
     /// #3955: the packument merge honours member priority but the tarball

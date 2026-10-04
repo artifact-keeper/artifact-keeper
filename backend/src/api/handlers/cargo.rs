@@ -2171,6 +2171,7 @@ async fn download(
                         repo.id,
                         &name_lower,
                         &version,
+                        "cargo",
                     )
                     .await?
                 } else {

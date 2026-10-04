@@ -244,8 +244,10 @@ async fn download_gem(
                 let suppress_upstream = if repo.repo_type == RepositoryType::Virtual {
                     match crate::formats::rubygems::package_name_from_gem_filename(filename) {
                         Some(pkg) => {
-                            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &pkg)
-                                .await?
+                            proxy_helpers::virtual_non_remote_owns_name(
+                                &state.db, repo.id, &pkg, "rubygems",
+                            )
+                            .await?
                         }
                         None => false,
                     }

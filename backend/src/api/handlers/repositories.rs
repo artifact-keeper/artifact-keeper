@@ -978,6 +978,13 @@ pub struct CreateRepositoryRequest {
     /// `npm_allowed_name_patterns`. A name is allowed if its scope is allowed
     /// OR any glob matches (e.g. `@acme/*`, `internal-*`).
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// npm Virtual isolate mode (#3767). When `true`, a package name owned by
+    /// any hosted member is served exclusively from the members: upstream
+    /// versions of that name are dropped from the merged packument and
+    /// refused on the tarball route. Only valid for npm *Virtual*
+    /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
+    /// `false` for the default union semantics.
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
     /// Debian remote (proxy) distribution/component/architecture filter
     /// (#2460, epic #2458). Only valid for Debian *Remote* repositories.
     /// Passthrough-only: allowed paths are proxied byte-for-byte; denied
@@ -1189,6 +1196,9 @@ pub struct UpdateRepositoryRequest {
     /// repository (#2424). When provided, replaces the stored
     /// `npm_allowed_name_patterns` list.
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
+    /// Virtual repositories; omit to leave it unchanged.
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
     /// Update the Debian remote proxy filter (#2460). Three-way semantics:
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
@@ -1338,6 +1348,10 @@ pub struct RepositoryResponse {
     /// `repository_config`. Omitted for non-npm repositories or when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// npm Virtual isolate mode (#3767): the effective value for npm Virtual
+    /// repositories; omitted for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
     /// Debian remote proxy filter (#2460), read back from `repository_config`.
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1446,6 +1460,7 @@ fn repo_to_response(
         npm_allowed_scopes: None,
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
+        npm_virtual_isolate_hosted_names: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
@@ -2315,8 +2330,11 @@ async fn with_npm_scope_policy(
     repo_id: Uuid,
     repo_type: &RepositoryType,
     format: &RepositoryFormat,
-    mut response: RepositoryResponse,
+    response: RepositoryResponse,
 ) -> Result<RepositoryResponse> {
+    // The npm Virtual isolate toggle (#3767) rides the same echo, so every
+    // handler that round-trips the scope policy round-trips it too.
+    let mut response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -2329,6 +2347,70 @@ async fn with_npm_scope_policy(
     }
     if !policy.allowed_name_patterns.is_empty() {
         response.npm_allowed_name_patterns = Some(policy.allowed_name_patterns);
+    }
+    Ok(response)
+}
+
+/// Whether npm Virtual isolate mode (#3767) can be configured on a repository.
+fn is_npm_virtual_repo(repo_type: &RepositoryType, format: &RepositoryFormat) -> bool {
+    repo_type == &RepositoryType::Virtual && format == &RepositoryFormat::Npm
+}
+
+/// Decide whether a supplied `npm_virtual_isolate_hosted_names` is persisted
+/// (#3767). `Ok(None)` for an absent field, and for an explicit `false` on a
+/// repository the mode does not apply to — that payload configures nothing, so
+/// it is accepted as a no-op rather than failing the whole request (the #3299
+/// rule for untouched settings forms). `true` on anything but an npm Virtual
+/// is a 400: it would store a toggle no code path reads.
+fn npm_virtual_isolate_to_store(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    requested: Option<bool>,
+) -> Result<Option<bool>> {
+    match requested {
+        None => Ok(None),
+        Some(value) if is_npm_virtual_repo(repo_type, format) => Ok(Some(value)),
+        Some(false) => Ok(None),
+        Some(true) => Err(AppError::Validation(
+            "npm_virtual_isolate_hosted_names is only configurable on npm virtual repositories"
+                .to_string(),
+        )),
+    }
+}
+
+/// Persist a validated isolate-mode toggle (#3767) and drop the virtual's
+/// computed packuments so the change is visible on the next read instead of
+/// after the packument cache's fresh/stale window.
+async fn apply_npm_virtual_isolate(
+    state: &SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    value: bool,
+) -> Result<()> {
+    upsert_repo_config(
+        &state.db,
+        repo_id,
+        crate::api::handlers::npm::NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY,
+        if value { "true" } else { "false" },
+    )
+    .await?;
+    if let Some(cache) = state.npm_packument_cache.as_ref() {
+        cache.invalidate_repository(repo_key).await;
+    }
+    Ok(())
+}
+
+/// Echo the npm Virtual isolate toggle (#3767) on npm Virtual repositories.
+async fn with_npm_virtual_isolate(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if is_npm_virtual_repo(repo_type, format) {
+        response.npm_virtual_isolate_hosted_names =
+            Some(crate::api::handlers::npm::fetch_npm_virtual_isolate(db, repo_id).await?);
     }
     Ok(response)
 }
@@ -3171,6 +3253,12 @@ pub async fn create_repository(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
+    // npm Virtual isolate mode (#3767): validated up-front for the same reason.
+    let npm_virtual_isolate = npm_virtual_isolate_to_store(
+        &repo_type,
+        &format,
+        payload.npm_virtual_isolate_hosted_names,
+    )?;
 
     // Debian remote proxy filter (#2460): validate up-front — before the
     // repository row is created — so a rejected config (wrong repo type or an
@@ -3367,6 +3455,9 @@ pub async fn create_repository(
             payload.npm_allowed_name_patterns.as_deref(),
         )
         .await?;
+    }
+    if let Some(isolate) = npm_virtual_isolate {
+        apply_npm_virtual_isolate(&state, repo.id, &repo.key, isolate).await?;
     }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
@@ -4176,6 +4267,15 @@ pub async fn update_repository(
     )?;
     let (effective_visibility, effective_is_public) = visibility_update.binds();
 
+    // npm Virtual isolate mode (#3767): validated before the update so a
+    // rejected toggle cannot leave the other fields half-applied. Repository
+    // type and format are immutable here, so `existing` decides.
+    let npm_virtual_isolate = npm_virtual_isolate_to_store(
+        &existing.repo_type,
+        &existing.format,
+        payload.npm_virtual_isolate_hosted_names,
+    )?;
+
     let repo = service
         .update_with_repodata_depth(
             existing.id,
@@ -4235,6 +4335,9 @@ pub async fn update_repository(
             payload.npm_allowed_name_patterns.as_deref(),
         )
         .await?;
+    }
+    if let Some(isolate) = npm_virtual_isolate {
+        apply_npm_virtual_isolate(&state, repo.id, &repo.key, isolate).await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -14283,6 +14386,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -15592,6 +15696,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -17790,6 +17895,132 @@ mod tests {
         // Cleanup.
         tdh::cleanup(&pool, created.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #3767: which `npm_virtual_isolate_hosted_names` values are stored.
+    #[test]
+    fn npm_virtual_isolate_to_store_matrix() {
+        let (virt, local) = (RepositoryType::Virtual, RepositoryType::Local);
+        let (npm, pypi) = (RepositoryFormat::Npm, RepositoryFormat::Pypi);
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, Some(true)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, Some(false)).unwrap(),
+            Some(false)
+        );
+        // An untouched (false) toggle elsewhere configures nothing: no-op.
+        assert_eq!(
+            npm_virtual_isolate_to_store(&local, &npm, Some(false)).unwrap(),
+            None
+        );
+        // Turning it ON where nothing reads it is rejected.
+        for (repo_type, format) in [(&local, &npm), (&virt, &pypi)] {
+            assert!(matches!(
+                npm_virtual_isolate_to_store(repo_type, format, Some(true)),
+                Err(AppError::Validation(_))
+            ));
+        }
+    }
+
+    /// #3767: the isolate toggle round-trips through create, update and the
+    /// response echo of an npm Virtual, and is refused up-front (no orphaned
+    /// row) on a repository that cannot use it.
+    #[tokio::test]
+    async fn npm_virtual_isolate_toggle_create_update_round_trip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("npm-isolate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+        let stored = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'npm_virtual_isolate_hosted_names'",
+                )
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query isolate toggle")
+            }
+        };
+
+        let virt_key = format!("npm-isolate-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &virt_key,
+                "npm isolate",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "virtual",
+                    "npm_virtual_isolate_hosted_names": true
+                }),
+            ),
+        )
+        .await
+        .expect("isolate toggle on an npm virtual create must succeed");
+        assert_eq!(created.npm_virtual_isolate_hosted_names, Some(true));
+        assert_eq!(stored(created.id).await.as_deref(), Some("true"));
+
+        let upd: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"npm_virtual_isolate_hosted_names": false}"#)
+                .expect("deserialize update payload");
+        let Json(updated) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(virt_key.clone()),
+            Json(upd),
+        )
+        .await
+        .expect("isolate toggle update must succeed");
+        assert_eq!(updated.npm_virtual_isolate_hosted_names, Some(false));
+        assert_eq!(stored(created.id).await.as_deref(), Some("false"));
+
+        // Refused up-front on an npm Local: no repository row is created.
+        let local_key = format!("npm-isolate-local-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "npm isolate local",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "npm_virtual_isolate_hosted_names": true
+                }),
+            ),
+        )
+        .await
+        .expect_err("isolate toggle on an npm local must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&local_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphan, 0,
+            "rejected create must not leave a repository behind"
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
@@ -25863,6 +26094,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),

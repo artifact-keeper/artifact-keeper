@@ -5206,6 +5206,10 @@ pub(crate) fn classify_remote_or_virtual(repo_type: &str) -> RemoteOrVirtualActi
 /// false` predicate matches the partial-index WHERE clause exactly so
 /// the planner uses the index.
 ///
+/// `format` is the caller's format label (`"hex"`, `"npm"`, ...), carried
+/// only into the fail-closed `shadowing_guard_db_error` log line so a guard
+/// failure names the format that hit it (#3767).
+///
 /// Fails closed: a database error returns 500 rather than allowing the
 /// caller to proceed without the guard. Returns false (allow proxy
 /// fan-out) on the benign "no non-Remote members" case so virtual repos
@@ -5216,8 +5220,9 @@ pub async fn virtual_non_remote_owns_name(
     db: &PgPool,
     virtual_repo_id: Uuid,
     package_name: &str,
+    format: &str,
 ) -> Result<bool, Response> {
-    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None).await
+    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None, format).await
 }
 
 /// Version-aware variant of [`virtual_non_remote_owns_name`]. When `version`
@@ -5231,6 +5236,7 @@ pub async fn virtual_non_remote_owns_name_version(
     virtual_repo_id: Uuid,
     package_name: &str,
     version: Option<&str>,
+    format: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
@@ -5257,7 +5263,7 @@ pub async fn virtual_non_remote_owns_name_version(
         .bind(package_name)
         .fetch_optional(db)
         .await
-        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
         return Ok(exists.is_some());
     };
 
@@ -5277,7 +5283,7 @@ pub async fn virtual_non_remote_owns_name_version(
     .bind(package_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
 
     Ok(pypi_version_owned(version, &stored_versions))
 }
@@ -5371,6 +5377,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     virtual_repo_id: Uuid,
     package_name: &str,
     version: &str,
+    format: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
@@ -5396,7 +5403,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     .bind(version)
     .fetch_optional(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
     Ok(exists.is_some())
 }
 
@@ -5506,7 +5513,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "pypi", e))?;
 
     if owning_ids.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
@@ -5524,7 +5531,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_one(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "pypi", e))?;
 
     if tracked > 0 {
         return Ok(None);
