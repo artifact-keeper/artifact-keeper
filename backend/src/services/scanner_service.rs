@@ -3530,7 +3530,13 @@ pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
 /// Reduce a Trivy `Licenses` array to a SPDX-safe joined expression.
 ///
 /// Each input element is run through [`crate::services::spdx_licenses::sanitize_license_term`]
-/// before joining with ` OR `. Known SPDX identifiers (case-insensitive)
+/// before joining with ` AND `. A scanner's license list is conjunctive —
+/// every license it detected in the package applies (a Debian copyright file
+/// listing GPL and MIT means both) — and it carries no evidence of a choice
+/// between them, so inferring ` OR ` would let a package carrying GPL or a
+/// proprietary `LicenseRef-` pass any policy that approves its other arm once
+/// the value is exported as an evaluable CycloneDX `expression` (#3866).
+/// Known SPDX identifiers (case-insensitive)
 /// pass through in their canonical case; unknown terms and single-element
 /// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
 /// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
@@ -3543,7 +3549,7 @@ pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" OR "))
+        Some(terms.join(" AND "))
     }
 }
 
@@ -3600,8 +3606,9 @@ pub(crate) fn convert_trivy_packages(
                         .and_then(|id| id.purl.as_deref())
                         .and_then(validate_trivy_purl),
                     // #1152: validate each license element against the SPDX
-                    // identifier list before joining with " OR ". Multi-
-                    // license packages still produce a SPDX OR expression;
+                    // identifier list before joining with " AND " (#3866:
+                    // every detected license applies, so the join is a
+                    // conjunction, never an inferred choice);
                     // hostile elements (unknown terms, smuggled pre-joined
                     // expressions) are wrapped as LicenseRef-... so a
                     // permissive-license policy check cannot green-light
@@ -22316,8 +22323,8 @@ tonic-build = "0.12"
     }
 
     /// Trivy emits `Licenses` as an array; multi-license packages must be
-    /// joined with " OR " per CycloneDX convention. Empty licenses must
-    /// not produce empty strings.
+    /// joined with " AND " (#3866: a detected list is conjunctive, never an
+    /// inferred choice). Empty licenses must not produce empty strings.
     #[test]
     fn test_convert_trivy_packages_license_join_and_empty_handling() {
         use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
@@ -22354,7 +22361,7 @@ tonic-build = "0.12"
         let pkgs = convert_trivy_packages(&report);
 
         let log4j = pkgs.iter().find(|p| p.name == "log4j-core").unwrap();
-        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 OR MIT"));
+        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 AND MIT"));
 
         let no_lic = pkgs.iter().find(|p| p.name == "no-license-pkg").unwrap();
         assert!(

@@ -2135,6 +2135,39 @@ mod tests {
         }
     }
 
+    /// #3866 end to end for scanner-derived licenses: a package Trivy (or
+    /// Grype, through the same sanitizer) reports with two licenses must
+    /// export as their CONJUNCTION. Exported as `OR`, Dependency-Track would
+    /// pass the package on its approved arm alone, so GPL or a proprietary
+    /// `LicenseRef-` riding along with MIT would fail open.
+    #[test]
+    fn test_scanner_multi_license_package_exports_as_and_expression() {
+        use crate::services::scanner_service::sanitize_trivy_licenses;
+        for (raw, expected) in [
+            (vec!["MIT", "GPL-3.0-only"], "MIT AND GPL-3.0-only"),
+            (
+                vec!["mit", "Custom Commercial"],
+                "MIT AND LicenseRef-Custom-Commercial",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            let license = sanitize_trivy_licenses(&raw).expect("non-empty list");
+            assert_eq!(license, expected);
+            let dep = DependencyInfo {
+                name: "pkg".to_string(),
+                version: Some("1.0.0".to_string()),
+                purl: None,
+                license: Some(license),
+                sha256: None,
+                cpe: None,
+            };
+            assert_eq!(
+                build_cyclonedx_component(&dep)["licenses"],
+                serde_json::json!([{"expression": expected}])
+            );
+        }
+    }
+
     #[test]
     fn test_cyclonedx_license_entry_prose_with_operator_words_uses_name() {
         for text in ["GPL v2 or later", "MIT/Apache-2.0", "BSD License"] {
@@ -2731,23 +2764,11 @@ mod tests {
     /// Helper to create a mock SbomService for testing SBOM generation
     /// without a database connection.
     fn generate_test_cyclonedx(deps: &[DependencyInfo]) -> serde_json::Value {
-        let mut components = Vec::new();
-        for dep in deps {
-            let mut comp = serde_json::json!({
-                "type": "library",
-                "name": dep.name,
-            });
-            if let Some(v) = &dep.version {
-                comp["version"] = serde_json::json!(v);
-            }
-            if let Some(p) = &dep.purl {
-                comp["purl"] = serde_json::json!(p);
-            }
-            if let Some(l) = &dep.license {
-                comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
-            }
-            components.push(comp);
-        }
+        // Components go through the real builder, so these document-level
+        // tests cannot drift from what the exporter actually emits (the
+        // hand-built copy this replaced pinned `license.id` for an SPDX
+        // expression, the output #1474 and #3866 both forbid).
+        let components: Vec<_> = deps.iter().map(build_cyclonedx_component).collect();
 
         serde_json::json!({
             "bomFormat": "CycloneDX",
@@ -3201,7 +3222,10 @@ mod tests {
         assert_eq!(comp["name"], "serde");
         assert_eq!(comp["version"], "1.0.195");
         assert_eq!(comp["purl"], "pkg:cargo/serde@1.0.195");
-        assert_eq!(comp["licenses"][0]["license"]["id"], "MIT OR Apache-2.0");
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT OR Apache-2.0"}])
+        );
     }
 
     #[test]

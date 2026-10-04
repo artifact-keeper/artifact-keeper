@@ -82,8 +82,8 @@ pub struct TrivyPackage {
     #[serde(rename = "Version", default)]
     pub version: String,
     /// Trivy emits `Licenses` as an array of strings. Multi-license packages
-    /// produce multiple entries; persistence joins them with `" OR "` per
-    /// CycloneDX convention.
+    /// produce multiple entries; persistence joins them with `" AND "`
+    /// because every detected license applies (#3866).
     #[serde(rename = "Licenses", default)]
     pub licenses: Option<Vec<String>>,
     #[serde(rename = "Identifier", default)]

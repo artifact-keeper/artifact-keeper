@@ -1,7 +1,8 @@
 //! SPDX license identifier validation (#1152).
 //!
 //! Trivy returns license arrays per package; the scan_packages persistence
-//! path joins multi-license entries with " OR " (a valid SPDX operator)
+//! path joins multi-license entries into one SPDX expression (with " AND "
+//! since #3866; it was " OR ", which inferred a choice the scanner never saw)
 //! without verifying each element is a valid SPDX identifier. A package
 //! shipping `Licenses: ["MIT", "Custom Commercial - see LICENSE"]` would
 //! produce `"MIT OR Custom Commercial - see LICENSE"`, which a lenient
@@ -513,9 +514,11 @@ impl SpdxExpressionParser<'_, '_> {
 
 /// True when `input` is a syntactically valid SPDX license expression
 /// (SPDX 2.3 Annex D) that is *compound*: it combines licenses with `AND`
-/// / `OR`, attaches an exception with `WITH`, or groups with parentheses.
+/// / `OR` or attaches an exception with `WITH`.
 ///
-/// A lone identifier returns `false`: whether it belongs in a CycloneDX
+/// A lone identifier returns `false`, parenthesised or not — `(MIT)` is
+/// valid SPDX, but a `(c)` license field is free text, not an expression
+/// for a license named `c`: whether it belongs in a CycloneDX
 /// `license.id` or `license.name` is a separate question (#1474), and
 /// this function only answers "is this a structured expression that must
 /// not be flattened into free text?" (#3866). Operands are checked for
@@ -527,7 +530,10 @@ pub fn is_compound_spdx_expression(input: &str) -> bool {
     let Some(tokens) = tokenize_spdx_expression(input) else {
         return false;
     };
-    if tokens.len() < 2 {
+    if !tokens
+        .iter()
+        .any(|t| matches!(t, SpdxToken::And | SpdxToken::Or | SpdxToken::With))
+    {
         return false;
     }
     let mut parser = SpdxExpressionParser {
@@ -653,7 +659,6 @@ mod tests {
             "Apache-2.0 WITH LLVM-exception",
             "GPL-2.0-only WITH Classpath-exception-2.0 OR MIT",
             "(MIT OR Apache-2.0) AND BSD-3-Clause",
-            "((MIT))",
             "LGPL-2.1+ AND LicenseRef-custom-1",
             "DocumentRef-spdx-tool-1.2:LicenseRef-MIT-Style-2 OR MIT",
             "(MIT AND(Apache-2.0 OR ISC))",
@@ -670,6 +675,9 @@ mod tests {
             "GPL-2.0+",
             "LicenseRef-foo",
             "UNKNOWN",
+            "(MIT)",
+            "((MIT))",
+            "(c)",
             "",
         ] {
             assert!(!is_compound_spdx_expression(term), "{term}");
