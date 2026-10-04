@@ -275,7 +275,7 @@ pub async fn preprovision_oidc_group(
         .acquire()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let group_id = ensure_federated_group(&mut *conn, provider_id, "oidc", &req.name).await?;
+    let group_id = ensure_federated_group(&mut conn, provider_id, "oidc", &req.name).await?;
     let Some(group_id) = group_id else {
         return Err(AppError::Conflict(format!(
             "Group name '{}' is already owned outside OIDC provider {provider_id}",
