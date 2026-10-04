@@ -1196,7 +1196,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .unwrap_or_else(|_| "9090".to_string())
         .parse::<u16>()
         .unwrap_or(9090);
-    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
+    // (`::1`) needs no brackets (#2161).
+    let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1271,10 +1273,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
+            bind_ip = %config.metrics_bind_ip,
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
+        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
         tokio::spawn(async move {
             let metrics_app = Router::new()

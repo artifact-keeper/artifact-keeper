@@ -629,6 +629,8 @@ fn cfg(storage_path: &str) -> Config {
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
+        grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+        metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
         database_max_connections: 20,
         database_min_connections: 5,
         database_acquire_timeout_secs: 30,

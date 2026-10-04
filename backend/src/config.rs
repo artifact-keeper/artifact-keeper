@@ -151,6 +151,34 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Default listen IP for the gRPC and metrics listeners (#2161): every
+/// interface, which is what both listeners hard-coded before they were
+/// configurable.
+pub const DEFAULT_LISTENER_BIND_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// Parse the listen IP for a secondary listener from env var `key` (#2161).
+///
+/// Unset or blank means [`DEFAULT_LISTENER_BIND_IP`]. IPv6 literals are
+/// accepted bare (`::1`) or bracketed (`[::1]`), since operators copy them out
+/// of `host:port` strings. Anything else is a hard startup error rather than
+/// a silent fall-back to `0.0.0.0`: an operator who asked for loopback-only
+/// and got every interface would be exposed without knowing it.
+fn parse_bind_ip(key: &str, raw: Option<&str>) -> Result<std::net::IpAddr> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_LISTENER_BIND_IP);
+    };
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    unbracketed.parse().map_err(|_| {
+        AppError::Config(format!(
+            "{key} must be an IP address such as 127.0.0.1 or ::1 (no port), got {value:?}"
+        ))
+    })
+}
+
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
 ///
 /// Whitespace around each entry is trimmed and empty entries are dropped.
@@ -728,6 +756,17 @@ pub struct Config {
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
 
+    /// IP address the gRPC listener (`GRPC_PORT`) binds (#2161). Env
+    /// `GRPC_BIND_IP`, default `0.0.0.0` (every interface). Set `127.0.0.1`
+    /// (or `::1`) to keep the listener off the network, e.g. behind a
+    /// service-mesh sidecar. An invalid value fails startup.
+    pub grpc_bind_ip: std::net::IpAddr,
+
+    /// IP address the unauthenticated metrics listener ([`Self::metrics_port`])
+    /// binds (#2161). Env `METRICS_BIND_IP`, default `0.0.0.0`. An invalid
+    /// value fails startup.
+    pub metrics_bind_ip: std::net::IpAddr,
+
     /// Maximum number of connections in the PostgreSQL pool.
     /// Defaults to 20. Increase for higher concurrency, decrease for
     /// databases with restricted connection budgets (e.g., shared RDS).
@@ -1198,6 +1237,8 @@ redacted_debug!(Config {
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
+    show grpc_bind_ip,
+    show metrics_bind_ip,
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
@@ -1338,6 +1379,8 @@ impl Default for Config {
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
@@ -1661,6 +1704,11 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            grpc_bind_ip: parse_bind_ip("GRPC_BIND_IP", env::var("GRPC_BIND_IP").ok().as_deref())?,
+            metrics_bind_ip: parse_bind_ip(
+                "METRICS_BIND_IP",
+                env::var("METRICS_BIND_IP").ok().as_deref(),
+            )?,
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
@@ -3970,6 +4018,86 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GRPC_BIND_IP / METRICS_BIND_IP (#2161)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bind_ip_defaults_to_every_interface_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_bind_ip("GRPC_BIND_IP", raw).unwrap(),
+                DEFAULT_LISTENER_BIND_IP,
+                "{raw:?} must keep the historical 0.0.0.0 bind"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_accepts_ipv4_and_ipv6_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let cases: [(&str, IpAddr); 5] = [
+            ("127.0.0.1", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            (" 10.1.2.3 ", IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
+            ("::1", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("[::1]", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_bind_ip("METRICS_BIND_IP", Some(raw)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_rejects_garbage_ports_and_hostnames() {
+        for raw in [
+            "localhost",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "999.0.0.1",
+            "[::1",
+        ] {
+            let err = parse_bind_ip("GRPC_BIND_IP", Some(raw))
+                .expect_err(&format!("{raw:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("GRPC_BIND_IP"), "error names the var: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_config_listener_bind_ips_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
+
+        let config = Config::from_env().expect("defaults load");
+        assert_eq!(config.grpc_bind_ip, DEFAULT_LISTENER_BIND_IP);
+        assert_eq!(config.metrics_bind_ip, DEFAULT_LISTENER_BIND_IP);
+
+        env::set_var("GRPC_BIND_IP", "127.0.0.1");
+        env::set_var("METRICS_BIND_IP", "::1");
+        let config = Config::from_env().expect("valid bind IPs load");
+        assert_eq!(config.grpc_bind_ip.to_string(), "127.0.0.1");
+        assert_eq!(config.metrics_bind_ip.to_string(), "::1");
+        assert_eq!(
+            std::net::SocketAddr::new(config.metrics_bind_ip, 9091).to_string(),
+            "[::1]:9091",
+            "an IPv6 bind IP must combine with the port without manual brackets"
+        );
+
+        // An invalid value fails startup instead of silently binding 0.0.0.0.
+        env::set_var("METRICS_BIND_IP", "not-an-ip");
+        assert!(Config::from_env().is_err());
+        env::set_var("METRICS_BIND_IP", "::1");
+        env::set_var("GRPC_BIND_IP", "127.0.0.1:9090");
+        assert!(Config::from_env().is_err());
+
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
     }
 
     #[test]

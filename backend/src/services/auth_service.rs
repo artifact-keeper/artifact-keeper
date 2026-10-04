@@ -4340,6 +4340,8 @@ mod tests {
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
