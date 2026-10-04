@@ -4285,6 +4285,8 @@ mod tests {
             s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
             signature_expiry_seconds: 604_800,
+            signing_key_rotation_overlap_secs: 1_209_600,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,

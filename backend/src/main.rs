@@ -704,6 +704,22 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #1331: name every signing key that is bound to Debian/RPM metadata
+    // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
+    // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
+    // with a fresh key_type='gpg' key. Backgrounded: keygen is slow and this
+    // must never delay or fail startup.
+    {
+        let signing = artifact_keeper_backend::services::signing_service::SigningService::new(
+            db_pool.clone(),
+            &config.jwt_secret,
+        );
+        let auto_migrate = config.signing_auto_migrate_legacy_keys;
+        tokio::spawn(async move {
+            signing.run_legacy_key_scan(auto_migrate).await;
+        });
+    }
+
     // Initialize security scanner service
     let advisory_client = {
         let mut client = AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok());

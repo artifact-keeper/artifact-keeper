@@ -355,6 +355,19 @@ pub struct Config {
     /// [`crate::services::signing_service::signature_expiry_duration`].
     pub signature_expiry_seconds: u64,
 
+    /// Rotation overlap window, in seconds (`SIGNING_KEY_ROTATION_OVERLAP_SECS`,
+    /// #1329). For this long after a signing key is rotated, Debian/RPM
+    /// metadata is signed by both the old and the new key and the public-key
+    /// endpoints serve both, so clients that still trust only the old key keep
+    /// verifying. Defaults to 14 days; `0` retires the old key immediately.
+    pub signing_key_rotation_overlap_secs: u64,
+
+    /// Replace legacy signing keys that are bound to Debian/RPM metadata
+    /// signing but cannot produce OpenPGP signatures with fresh
+    /// `key_type='gpg'` keys at startup (`SIGNING_AUTO_MIGRATE_LEGACY_KEYS`,
+    /// #1331). Off by default: the startup scan then only WARNs.
+    pub signing_auto_migrate_legacy_keys: bool,
+
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
 
@@ -1250,6 +1263,9 @@ impl Default for Config {
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            signing_key_rotation_overlap_secs:
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1412,6 +1428,13 @@ impl Config {
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
+            signing_key_rotation_overlap_secs: env_parse(
+                "SIGNING_KEY_ROTATION_OVERLAP_SECS",
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            ),
+            signing_auto_migrate_legacy_keys: parse_opt_in_flag(
+                env::var("SIGNING_AUTO_MIGRATE_LEGACY_KEYS").ok().as_deref(),
             ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),

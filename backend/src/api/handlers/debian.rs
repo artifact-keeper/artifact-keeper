@@ -56,7 +56,7 @@ use crate::services::package_analysis_service::{
 use crate::services::package_service::PackageService;
 use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::{
-    signed_cache_entry_is_fresh, signed_cache_max_age, SigningService,
+    signed_cache_entry_is_fresh, signed_cache_max_age, signer_set_fingerprint, SigningService,
 };
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
@@ -1959,6 +1959,27 @@ async fn require_active_signing_key(
     require_signing_key(signing_svc.get_active_key_for_repo(repo_id).await)
 }
 
+/// Resolve the keys that sign a repository's `Release` (#1329): the active key
+/// (404 when none, as above) followed by any rotation predecessor still in its
+/// overlap window, plus the signer-set fingerprint for the signed-Release cache
+/// key. Outside an overlap window that is just the active key and its
+/// fingerprint, so the cache keys are unchanged.
+async fn release_signers(
+    signing_svc: &SigningService,
+    repo_id: uuid::Uuid,
+) -> Result<(Vec<SigningKey>, String), Response> {
+    let key = require_active_signing_key(signing_svc, repo_id).await?;
+    let signers = signing_svc.openpgp_signers(key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to resolve signing keys", &e),
+        )
+            .into_response()
+    })?;
+    let fingerprint = signer_set_fingerprint(&signers);
+    Ok((signers, fingerprint))
+}
+
 /// Apply a Virtual repo member's own P2 dist/component/architecture filter to
 /// the requested `dists/` path, exactly as if the request had been served
 /// directly from that Remote member (#2727).
@@ -2327,16 +2348,15 @@ async fn in_release_file(
     // none is configured and (b) include the fingerprint in the cache key.
     // The previous `.unwrap_or(release)` fallback silently served unsigned
     // bytes, which is a security footgun (#1236 review).
-    let key = require_active_signing_key(&signing_svc, repo.id).await?;
-    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id).await?;
     let cache_key =
-        signed_release_cache_key(SignedReleaseVariant::InRelease, &release, fingerprint);
+        signed_release_cache_key(SignedReleaseVariant::InRelease, &release, &fingerprint);
 
     let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
         cached
     } else {
         let armored = signing_svc
-            .sign_openpgp_cleartext_with_key(&key, &release)
+            .sign_openpgp_cleartext_with_keys(&signers, &release)
             .await
             .map_err(|e| {
                 (
@@ -2347,7 +2367,7 @@ async fn in_release_file(
             })?;
         // Best-effort `last_used_at` stamp; we don't fail the request if the
         // audit update errors (the sign already succeeded).
-        let _ = signing_svc.mark_key_used(key.id).await;
+        let _ = signing_svc.mark_key_used(signers[0].id).await;
         let bytes = Bytes::from(armored.into_bytes());
         signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
         bytes
@@ -2389,16 +2409,15 @@ async fn release_gpg(
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
-    let key = require_active_signing_key(&signing_svc, repo.id).await?;
-    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id).await?;
     let cache_key =
-        signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, fingerprint);
+        signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, &fingerprint);
 
     let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
         cached
     } else {
         let armored = signing_svc
-            .sign_openpgp_detached_with_key(&key, release.as_bytes())
+            .sign_openpgp_detached_with_keys(&signers, release.as_bytes())
             .await
             .map_err(|e| {
                 (
@@ -2407,7 +2426,7 @@ async fn release_gpg(
                 )
                     .into_response()
             })?;
-        let _ = signing_svc.mark_key_used(key.id).await;
+        let _ = signing_svc.mark_key_used(signers[0].id).await;
         let bytes = Bytes::from(armored.into_bytes());
         signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
         bytes
@@ -2432,8 +2451,10 @@ async fn gpg_key_asc(
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    // #1329: during a rotation overlap window this is a keyring holding the
+    // new and the previous key, matching the dual-signed InRelease.
     let public_key = signing_svc
-        .get_repo_public_key(repo.id)
+        .get_repo_public_keyring(repo.id)
         .await
         .map_err(|e| {
             (

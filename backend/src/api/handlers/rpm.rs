@@ -36,6 +36,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rpm::RpmHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::signing_key::SigningKey;
 use crate::services::cache_classifier;
 use crate::services::conda_scripts::{make_inline_script, InstallScript, ScriptKind};
 use crate::services::package_analysis_service::{
@@ -43,7 +44,7 @@ use crate::services::package_analysis_service::{
 };
 use crate::services::rpm_layout;
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
-use crate::services::signing_service::SigningService;
+use crate::services::signing_service::{openpgp_public_keyring, SigningService};
 
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]
@@ -1773,8 +1774,12 @@ async fn sign_repomd(
              produce an OpenPGP signature (requires key_type='gpg')",
         );
     })?;
+    // #1329: during a rotation overlap window the predecessor co-signs, so
+    // clients that only trust the old key keep verifying.
+    let signers = openpgp_signers_or_500(&signing_svc, key).await?;
+    let key = &signers[0];
     let armored = signing_svc
-        .sign_openpgp_detached_with_key(&key, &repomd_content)
+        .sign_openpgp_detached_with_keys(&signers, &repomd_content)
         .await
         .map_err(|e| {
             // A key that cannot sign is a server-side failure, not a missing
@@ -1850,12 +1855,41 @@ async fn public_key(state: &SharedState, repo: &RepoInfo) -> Result<Response, Re
         );
     })?;
 
+    // #1329: serve the predecessor too while it co-signs repomd.xml.asc.
+    let signers = openpgp_signers_or_500(&signing_svc, key).await?;
+    let keyring = openpgp_public_keyring(&signers).map_err(|e| {
+        error!(repo_id = %repo.id, error = %e, "failed to build the repository's public keyring");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to build repository public key",
+        )
+            .into_response()
+    })?;
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/pgp-keys")
-        .header(CONTENT_LENGTH, key.public_key_pem.len().to_string())
-        .body(Body::from(key.public_key_pem))
+        .header(CONTENT_LENGTH, keyring.len().to_string())
+        .body(Body::from(keyring))
         .unwrap())
+}
+
+/// The active key plus any rotation predecessor still in its overlap window
+/// (#1329). A lookup failure is a 500 with the detail logged only: these
+/// routes are anonymous on a public repository (#3718).
+async fn openpgp_signers_or_500(
+    signing_svc: &SigningService,
+    key: SigningKey,
+) -> Result<Vec<SigningKey>, Response> {
+    let key_id = key.id;
+    signing_svc.openpgp_signers(key).await.map_err(|e| {
+        error!(key_id = %key_id, error = %e, "failed to resolve rotation-overlap signing keys");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve signing keys",
+        )
+            .into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------

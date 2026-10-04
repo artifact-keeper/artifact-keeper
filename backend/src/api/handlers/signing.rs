@@ -16,7 +16,9 @@ use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
-use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
+use crate::services::signing_service::{
+    normalize_key_type, validate_key_spec, CreateKeyRequest, SigningService,
+};
 
 /// Create signing key management routes.
 pub fn router() -> Router<SharedState> {
@@ -183,6 +185,9 @@ async fn create_key(
 ///   `algorithm`, the variant is used as the algorithm so the requested key
 ///   size is honored.
 /// - Defaults (`rsa` / `rsa4096`) are preserved when fields are omitted.
+/// - The pair must be one the service can generate (`validate_key_spec`):
+///   `gpg` + `ed25519` is an Ed25519 OpenPGP key (#1326); `ed25519` as a
+///   key_type is refused rather than silently producing an RSA key.
 fn resolve_key_type_and_algorithm(
     key_type: Option<String>,
     algorithm: Option<String>,
@@ -198,6 +203,7 @@ fn resolve_key_type_and_algorithm(
             "rsa4096".to_string()
         }
     });
+    validate_key_spec(&family, &algorithm).map_err(AppError::Validation)?;
     Ok((family, algorithm))
 }
 
@@ -483,6 +489,7 @@ async fn get_repo_public_key(
 
 fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
+        .with_rotation_overlap(state.config.signing_key_rotation_overlap_secs)
 }
 
 /// Response from a deliberate per-artifact signing action (#2535).
@@ -683,9 +690,9 @@ mod tests {
 
     #[test]
     fn test_debian_rejects_ed25519_key_type() {
-        // ed25519 is not an OpenPGP key either (and is not even generated as a
-        // real ed25519 key — it falls through to RSA keygen), so it also cannot
-        // satisfy the Debian/RPM OpenPGP metadata path.
+        // A legacy key_type='ed25519' row holds RSA material (new ones are
+        // refused, #1326), so it cannot satisfy the Debian/RPM OpenPGP
+        // metadata path. An Ed25519 OpenPGP key is key_type='gpg'.
         assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "ed25519").is_err());
     }
 
@@ -1056,10 +1063,32 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ed25519_key_type_preserved() {
-        let (key_type, _) =
-            resolve_key_type_and_algorithm(Some("ed25519".to_string()), None).unwrap();
-        assert_eq!(key_type, "ed25519");
+    fn test_resolve_ed25519_key_type_is_rejected() {
+        // key_type='ed25519' used to fall through to RSA keygen and store an
+        // RSA keypair labelled ed25519 (#1326). It is now a clean 400 that
+        // points at the real Ed25519 option.
+        let err = resolve_key_type_and_algorithm(Some("ed25519".to_string()), None).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("key_type='gpg'"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_gpg_ed25519_pair_accepted() {
+        let (key_type, algorithm) =
+            resolve_key_type_and_algorithm(Some("gpg".to_string()), Some("ed25519".to_string()))
+                .unwrap();
+        assert_eq!(key_type, "gpg");
+        assert_eq!(algorithm, "ed25519");
+    }
+
+    #[test]
+    fn test_resolve_rsa_family_rejects_ed25519_algorithm() {
+        let err =
+            resolve_key_type_and_algorithm(Some("rsa".to_string()), Some("ed25519".to_string()))
+                .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[test]

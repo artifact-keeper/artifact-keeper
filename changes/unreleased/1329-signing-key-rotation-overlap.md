@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#1329]
+---
+- **Rotating a Debian/RPM signing key no longer breaks clients that still trust the old key: both keys sign metadata during an overlap window** (#1329). apt and dnf verify against a static keyring, so after `POST /api/v1/signing/keys/{id}/rotate` every client that had not yet imported the new key failed `apt update` with a signature error. Now, for `SIGNING_KEY_ROTATION_OVERLAP_SECS` after a rotation (default 14 days, `0` turns it off), InRelease, Release.gpg and repomd.xml.asc carry one signature from the new key and one from the old key. `gpg-key.asc` and `repomd.xml.key` serve both public keys in one armored block. apt, gpgv and sqv accept the metadata if any one signature verifies, so clients holding either key keep working while operators roll out the new one. The old key's `expires_at` records when its overlap ends, and the rotation audit entry includes it as `overlap_ends_at`. Revoking the old key ends its overlap at once. Keys rotated before this release are unaffected. Published RPM `@N` snapshots keep the key they were frozen with.
