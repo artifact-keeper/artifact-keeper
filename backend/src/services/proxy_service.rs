@@ -3579,9 +3579,9 @@ impl ProxyService {
         body: Bytes,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
-        let upstream_url = Self::remote_target(repo)?;
+        Self::remote_target(repo)?;
         Self::validate_relative_post_endpoint(path)?;
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .upstream_client
             .post_json_buffered(&full_url, repo.id, body, max)
@@ -3981,7 +3981,7 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<CachedBody> {
-        let upstream_url = Self::remote_target(repo)?;
+        Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -4015,6 +4015,10 @@ impl ProxyService {
             }
             CacheReadOutcome::Miss => { /* fall through to single-flight upstream fetch */ }
         }
+
+        // #840: a miss on a path the upstream filter refuses ends here, before
+        // the single-flight lease, without contacting upstream.
+        let full_url = self.gated_upstream_url(repo, fetch_path).await?;
 
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
         // #1631 layer 1: buffered single-flight via the injected coordinator
@@ -4066,7 +4070,6 @@ impl ProxyService {
                 Ok(cached)
             },
             || async {
-                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
                 let upstream_result = self
                     .fetch_from_upstream_with_accept(&full_url, repo.id, accept, max)
                     .await;
@@ -4776,8 +4779,7 @@ impl ProxyService {
         // path refused outright here, before the fetch, so the release-date
         // window was never honoured on the streaming path.)
 
-        let upstream_url = Self::remote_target(repo)?;
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+        let full_url = self.gated_upstream_url(repo, fetch_path).await?;
         let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
             Err(err) => {
@@ -5085,7 +5087,7 @@ impl ProxyService {
     /// Returns true if upstream has newer content or cache is expired.
     pub async fn check_upstream(&self, repo: &Repository, path: &str) -> Result<bool> {
         // Validate repository type
-        let upstream_url = Self::remote_target(repo)?;
+        Self::remote_target(repo)?;
 
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -5102,7 +5104,7 @@ impl ProxyService {
 
         // If we have an ETag, do a conditional request
         if let Some(ref etag) = metadata.upstream_etag {
-            let full_url = Self::build_upstream_url(upstream_url, path);
+            let full_url = self.gated_upstream_url(repo, path).await?;
             // No content negotiation on this probe path (#3290): callers pass
             // a plain artifact path fetched without an `Accept`.
             return self
@@ -5129,9 +5131,7 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, String)> {
-        let upstream_url = Self::remote_target(repo)?;
-
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        let full_url = self.gated_upstream_url(repo, path).await?;
         // #2192 / #1608 Phase 4c: use the 16 MiB LARGE ceiling, not the 8 MiB
         // DEFAULT. The sole caller is the PyPI download-URL-resolution simple-
         // index fetch (`resolve_pypi_remote_fetch_target`); its *primary*
@@ -5168,9 +5168,7 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<DirectUpstreamBody> {
-        let upstream_url = Self::remote_target(repo)?;
-
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
             .await?;
@@ -5312,6 +5310,8 @@ impl ProxyService {
         let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
             AppError::Config("Remote repository missing upstream_url".to_string())
         })?;
+        self.ensure_upstream_allowed(repo, upstream_url, path)
+            .await?;
         let full_url = Self::build_upstream_url(upstream_url, path);
 
         // Try conditional request if we have an ETag
@@ -6106,6 +6106,44 @@ impl ProxyService {
             .ok_or_else(|| AppError::Config("Remote repository missing upstream_url".to_string()))
     }
 
+    /// The single upstream-contact gate (#840): validate that `repo` is a
+    /// remote proxy, refuse `fetch_path` with [`AppError::NotFound`] when the
+    /// repository's upstream filter does not admit it, and otherwise return
+    /// the full upstream URL.
+    ///
+    /// Every `ProxyService` code path that sends a request to a repository's
+    /// configured upstream builds its URL here (buffered and streaming
+    /// misses, stale revalidation, the uncached direct fetches, the JSON POST
+    /// and the `check_upstream` probe), so the ~20 public `fetch_*` variants
+    /// and every virtual-member resolver inherit the filter without a
+    /// per-variant check. A refused path never reaches the network and never
+    /// writes a negative-cache entry, so lifting the filter takes effect on
+    /// the next request.
+    async fn gated_upstream_url(&self, repo: &Repository, fetch_path: &str) -> Result<String> {
+        let upstream_url = Self::remote_target(repo)?;
+        self.ensure_upstream_allowed(repo, upstream_url, fetch_path)
+            .await?;
+        Ok(Self::build_upstream_url(upstream_url, fetch_path))
+    }
+
+    /// Filter half of [`Self::gated_upstream_url`], for the one caller that
+    /// resolves the upstream base itself.
+    async fn ensure_upstream_allowed(
+        &self,
+        repo: &Repository,
+        upstream_url: &str,
+        fetch_path: &str,
+    ) -> Result<()> {
+        crate::services::upstream_filter::ensure_upstream_allowed(
+            &self.db,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            fetch_path,
+        )
+        .await
+    }
+
     /// Build full upstream URL for an artifact path.
     ///
     /// If `path` is already an absolute URL (starts with `http://` or
@@ -6600,10 +6638,11 @@ impl ProxyService {
             return RevalidationVerdict::Refill;
         };
 
-        let Ok(upstream_url) = Self::remote_target(repo) else {
+        // A refused path (#840) is not revalidated; the refill it falls to is
+        // refused by the same gate on the miss path.
+        let Ok(full_url) = self.gated_upstream_url(repo, fetch_path).await else {
             return RevalidationVerdict::Refill;
         };
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
 
         match self
             .check_etag_changed(&full_url, &etag, repo.id, accept)

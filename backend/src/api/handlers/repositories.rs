@@ -48,6 +48,7 @@ use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
+use crate::services::upstream_filter::{self, UpstreamFilter};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -805,6 +806,13 @@ pub fn router() -> Router<SharedState> {
             get(get_routing_rules)
                 .post(set_routing_rules)
                 .delete(delete_routing_rules),
+        )
+        // Per-remote upstream include/exclude filter (#840)
+        .route(
+            "/:key/upstream-filter",
+            get(get_upstream_filter)
+                .put(set_upstream_filter)
+                .delete(delete_upstream_filter),
         )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
@@ -11167,6 +11175,159 @@ pub async fn delete_routing_rules(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Upstream filter CRUD (#840)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpstreamFilterResponse {
+    pub repository_key: String,
+    /// When non-empty, only paths matching at least one of these regexes are
+    /// fetched from upstream.
+    pub include_patterns: Vec<String>,
+    /// Paths matching any of these regexes are never fetched from upstream.
+    pub exclude_patterns: Vec<String>,
+    /// Whether a filter is configured (`false` when both lists are empty).
+    pub active: bool,
+}
+
+impl UpstreamFilterResponse {
+    fn new(repository_key: String, filter: Option<UpstreamFilter>) -> Self {
+        let filter = filter.unwrap_or_default();
+        Self {
+            repository_key,
+            active: !filter.is_empty(),
+            include_patterns: filter.include_patterns,
+            exclude_patterns: filter.exclude_patterns,
+        }
+    }
+}
+
+/// Resolve `key` to a Remote repository the caller administers. The upstream
+/// filter is a supply-chain control on the same tier as routing rules and the
+/// egress proxy (#2603), so reading and changing it both require the
+/// repository `admin` action.
+async fn upstream_filter_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+    write: bool,
+) -> Result<crate::models::repository::Repository> {
+    let auth = require_auth(auth)?;
+    auth.require_scope(if write {
+        "write:repositories"
+    } else {
+        "read:repositories"
+    })?;
+    let repo = load_remote_repo(state, &auth, key).await?;
+    if write {
+        let repo_service = RepositoryService::new(state.db.clone());
+        require_repo_write_access(&auth, &repo, &repo_service).await?;
+    }
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    Ok(repo)
+}
+
+/// Get the upstream filter of a remote repository
+#[utoipa::path(
+    get,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current upstream filter", body = UpstreamFilterResponse),
+        (status = 400, description = "Repository is not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    let repo = upstream_filter_repo(&state, auth, &key, false).await?;
+    let filter = upstream_filter::load_upstream_filter(&state.db, repo.id).await?;
+    Ok(Json(UpstreamFilterResponse::new(key, filter)))
+}
+
+/// Set the upstream filter of a remote repository
+///
+/// Restricts which paths this remote repository requests from its upstream.
+/// Patterns are regular expressions (Rust `regex` syntax) matched anywhere in
+/// the upstream-relative request path, without a leading `/` (for Maven, the
+/// repository layout path such as `com/acme/lib/1.0/lib-1.0.jar`); anchor them
+/// with `^`/`$`. If `include_patterns` is non-empty a path must match one of
+/// them; a path matching any `exclude_patterns` entry is refused. A refused
+/// path answers 404 without contacting the upstream, and a virtual repository
+/// skips this member for it. Already-cached objects are not affected. At most
+/// 64 patterns per list, 512 bytes each; patterns that compile to an
+/// oversized automaton are rejected. Submitting two empty lists removes the
+/// filter.
+#[utoipa::path(
+    put,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpstreamFilter,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream filter saved", body = UpstreamFilterResponse),
+        (status = 400, description = "Invalid pattern, too many patterns, or not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<UpstreamFilter>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    // Reject a bad pattern before any repository lookup or permission query.
+    payload.compile().map_err(AppError::Validation)?;
+    let repo = upstream_filter_repo(&state, auth, &key, true).await?;
+    upstream_filter::save_upstream_filter(&state.db, repo.id, &payload).await?;
+    Ok(Json(UpstreamFilterResponse::new(key, Some(payload))))
+}
+
+/// Remove the upstream filter of a remote repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream filter removed", body = UpstreamFilterResponse),
+        (status = 400, description = "Repository is not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    let repo = upstream_filter_repo(&state, auth, &key, true).await?;
+    upstream_filter::delete_upstream_filter(&state.db, repo.id).await?;
+    Ok(Json(UpstreamFilterResponse::new(key, None)))
+}
+
 /// Load routing rules from repository_config for a given repository ID.
 /// Returns an empty Vec if no rules are configured.
 async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
@@ -11219,6 +11380,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_routing_rules,
         set_routing_rules,
         delete_routing_rules,
+        get_upstream_filter,
+        set_upstream_filter,
+        delete_upstream_filter,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
@@ -11263,6 +11427,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         SetRoutingRulesRequest,
         RoutingRulesResponse,
         RoutingRule,
+        UpstreamFilter,
+        UpstreamFilterResponse,
         DebianRepositoryConfig,
         DebianConfigPatch,
         crate::formats::debian::DebianMetadataStrategy,
@@ -30131,5 +30297,120 @@ mod virtual_member_authz_tests {
             String::from_utf8_lossy(&granted_body)
         );
         assert!(granted_row);
+    }
+}
+
+/// `GET/PUT/DELETE /:key/upstream-filter` (#840).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod upstream_filter_endpoint_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+
+    fn uri(key: &str) -> String {
+        format!("/{key}/upstream-filter")
+    }
+
+    fn put(key: &str, body: serde_json::Value) -> Request<Body> {
+        tdh::put_json(uri(key), Bytes::from(body.to_string()))
+    }
+
+    fn delete(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri(key))
+            .body(Body::empty())
+            .expect("build DELETE request")
+    }
+
+    fn json(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).expect("JSON body")
+    }
+
+    #[tokio::test]
+    async fn upstream_filter_crud_is_admin_gated_and_validated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let filter = serde_json::json!({
+            "include_patterns": ["^com/fringe/"],
+            "exclude_patterns": ["-SNAPSHOT/"],
+        });
+
+        // A plain repository member may neither read nor change the filter.
+        let (member_id, member_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, member_id).await;
+        let member_app = || {
+            tdh::router_with_auth(
+                super::router(),
+                fx.state.clone(),
+                tdh::make_auth(member_id, &member_name),
+            )
+        };
+        let (member_get, _) = tdh::send(member_app(), tdh::get(uri(&key))).await;
+        let (member_put, _) = tdh::send(member_app(), put(&key, filter.clone())).await;
+        let (anon_get, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri(&key))).await;
+
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+
+        let (empty_status, empty_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (bad_status, bad_body) = tdh::send(
+            app(),
+            put(
+                &key,
+                serde_json::json!({"exclude_patterns": ["ok", "(unclosed"]}),
+            ),
+        )
+        .await;
+        let (put_status, put_body) = tdh::send(app(), put(&key, filter.clone())).await;
+        let (get_status, get_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (del_status, del_body) = tdh::send(app(), delete(&key)).await;
+        let (after_status, after_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+
+        // The filter only makes sense on a Remote repository.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "maven").await;
+        tdh::grant_repo_access(&fx.pool, local_id, fx.user_id).await;
+        tdh::grant_repo_admin(&fx.pool, local_id, fx.user_id).await;
+        let (local_status, _) = tdh::send(app(), put(&local_key, filter.clone())).await;
+
+        tdh::cleanup_member_repo(&fx.pool, local_id, &local_dir).await;
+        tdh::cleanup_user(&fx.pool, member_id).await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_get, StatusCode::FORBIDDEN);
+        assert_eq!(member_put, StatusCode::FORBIDDEN);
+        assert_eq!(anon_get, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(empty_status, StatusCode::OK);
+        assert_eq!(json(&empty_body)["active"], false);
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        let bad = String::from_utf8_lossy(&bad_body);
+        assert!(bad.contains("exclude_patterns[1]"), "{bad}");
+
+        assert_eq!(put_status, StatusCode::OK);
+        let put_json = json(&put_body);
+        assert_eq!(put_json["active"], true);
+        assert_eq!(put_json["repository_key"], key.as_str());
+        assert_eq!(get_status, StatusCode::OK);
+        let got = json(&get_body);
+        assert_eq!(got["include_patterns"], filter["include_patterns"]);
+        assert_eq!(got["exclude_patterns"], filter["exclude_patterns"]);
+        assert_eq!(got["active"], true);
+
+        assert_eq!(del_status, StatusCode::OK);
+        assert_eq!(json(&del_body)["active"], false);
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(json(&after_body)["active"], false);
+        assert_eq!(json(&after_body)["include_patterns"], serde_json::json!([]));
+
+        assert_eq!(local_status, StatusCode::BAD_REQUEST);
     }
 }

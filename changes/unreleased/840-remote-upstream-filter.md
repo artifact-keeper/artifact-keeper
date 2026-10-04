@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#840]
+---
+- **Remote repositories can restrict which paths they request from their upstream, and a virtual repository no longer waits on a member whose filter excludes the path** (#840). A new per-remote upstream filter (`GET`/`PUT`/`DELETE /api/v1/repositories/{key}/upstream-filter`, repository admin only) takes `include_patterns` and `exclude_patterns` regexes, the same shape as a peer's `replication_filter`, matched against the upstream-relative path (for Maven, `com/acme/lib/1.0/lib-1.0.jar`; anchor with `^`/`$`). A path the filter refuses answers 404 without contacting the upstream, so a virtual repository skips that member for it: a fringe Maven remote that hosts a handful of groups can be limited to them, and when it goes down it no longer stalls every `maven-metadata.xml` merge until the upstream timeout. Patterns are validated on write (at most 64 per list, 512 bytes each, compiled size bounded). Objects already in the proxy cache are not hidden; purge them with the cache invalidate endpoint. This is the first slice of the remote-repository policy work; package-name, size and vulnerability rules are not part of it.

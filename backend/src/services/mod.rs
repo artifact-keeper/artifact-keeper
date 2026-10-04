@@ -119,6 +119,7 @@ pub mod trivy_fs_scanner;
 pub mod upload_service;
 pub mod upstream_auth;
 pub mod upstream_feed;
+pub mod upstream_filter;
 pub mod upstream_metadata;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;

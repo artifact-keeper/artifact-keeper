@@ -9295,3 +9295,138 @@ mod maven_prefix_reserved_tests {
         fx.teardown().await;
     }
 }
+
+/// #840: a Remote member's upstream filter keeps a Maven virtual from ever
+/// contacting that member's upstream for a path the filter refuses. The
+/// reporter's shape: a virtual over a main remote and a fringe remote that
+/// hosts a handful of groups; with the fringe one down, every
+/// `maven-metadata.xml` merge waited on it until the upstream timeout.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod upstream_filter_virtual_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+    use axum::http::StatusCode;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn metadata_xml(group: &str, artifact: &str, version: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\
+             <groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+             <versioning><latest>{version}</latest><release>{version}</release>\
+             <versions><version>{version}</version></versions>\
+             <lastUpdated>20260101000000</lastUpdated></versioning></metadata>"
+        )
+    }
+
+    /// Requests `mock` received whose path starts with `/prefix`.
+    async fn hits(mock: &MockServer, prefix: &str) -> usize {
+        mock.received_requests()
+            .await
+            .expect("request recording enabled")
+            .iter()
+            .filter(|r| r.url.path().starts_with(prefix))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn virtual_never_contacts_a_member_whose_upstream_filter_refuses_the_path_840() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+
+        // Main remote: has org.acme metadata, nothing else (wiremock 404s).
+        let main = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/org/acme/lib/maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(metadata_xml("org.acme", "lib", "1.0")),
+            )
+            .mount(&main)
+            .await;
+
+        // Fringe remote: would answer EVERYTHING (so any request that leaks
+        // through the filter changes the result), but only `com/fringe/` is
+        // admitted by its filter.
+        let fringe = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(metadata_xml("org.acme", "lib", "9.9")),
+            )
+            .mount(&fringe)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fringe-jar".to_vec()))
+            .mount(&fringe)
+            .await;
+
+        let (main_id, _, main_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &main.uri(), 1).await;
+        let (fringe_id, fringe_key, fringe_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &fringe.uri(), 2).await;
+        save_upstream_filter(
+            &fx.pool,
+            fringe_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/fringe/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .expect("save fringe upstream filter");
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let app = || {
+            tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::admin_auth(fx.user_id, &fx.username),
+            )
+        };
+        let get = |path: String| tdh::send(app(), tdh::get(path));
+
+        // 1. The metadata merge: served from `main` alone.
+        let (meta_status, meta_body) =
+            get(format!("/{}/org/acme/lib/maven-metadata.xml", fx.repo_key)).await;
+        // 2. A jar `main` does not have: the fringe member is skipped, so 404.
+        let (jar_status, _) = get(format!("/{}/org/acme/lib/1.0/lib-1.0.jar", fx.repo_key)).await;
+        // 3. The same refusal on the fringe remote addressed directly.
+        let (direct_status, _) = get(format!("/{fringe_key}/org/acme/lib/1.0/lib-1.0.jar")).await;
+        let fringe_hits_refused = hits(&fringe, "/org/").await;
+        let main_hits = hits(&main, "/org/acme/lib/maven-metadata.xml").await;
+        // 4. A path the filter admits still reaches the fringe upstream.
+        let (admitted_status, admitted_body) =
+            get(format!("/{}/com/fringe/x/1.0/x-1.0.jar", fx.repo_key)).await;
+        let fringe_hits_admitted = hits(&fringe, "/com/fringe/x/1.0/x-1.0.jar").await;
+
+        tdh::cleanup_member_repo(&fx.pool, main_id, &main_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, fringe_id, &fringe_dir).await;
+        fx.teardown().await;
+
+        let meta = String::from_utf8_lossy(&meta_body);
+        assert_eq!(meta_status, StatusCode::OK, "{meta}");
+        assert!(meta.contains("<version>1.0</version>"), "{meta}");
+        assert!(
+            !meta.contains("9.9"),
+            "the fringe member's metadata must not be merged: {meta}"
+        );
+        assert!(main_hits >= 1, "the main member serves the merge");
+        assert_eq!(jar_status, StatusCode::NOT_FOUND);
+        assert_eq!(direct_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            fringe_hits_refused, 0,
+            "the fringe upstream must receive zero requests for paths its filter refuses"
+        );
+        assert_eq!(admitted_status, StatusCode::OK);
+        assert_eq!(&admitted_body[..], b"fringe-jar");
+        assert!(
+            fringe_hits_admitted >= 1,
+            "an admitted path still reaches the fringe upstream"
+        );
+    }
+}
