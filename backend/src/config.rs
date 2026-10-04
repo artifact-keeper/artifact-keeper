@@ -1398,6 +1398,11 @@ impl Config {
 
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
+        let guest_access_pin = crate::services::guest_access_policy::parse_env_pin(
+            env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
+                .ok()
+                .as_deref(),
+        );
         let config = Self {
             database_url: env::var("DATABASE_URL")
                 .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
@@ -1462,16 +1467,10 @@ impl Config {
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
             // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
             // Any other value (including unset, garbage, or empty) keeps guests enabled.
-            guest_access_enabled: !matches!(
-                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
-                Ok("false" | "0")
-            ),
-            guest_access_env_pinned: crate::services::guest_access_policy::parse_env_pin(
-                env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
-                    .ok()
-                    .as_deref(),
-            )
-            .is_some(),
+            // One parse (#867): only `false`/`0` disable guests, as before; the
+            // four explicit spellings also pin the runtime setting.
+            guest_access_enabled: guest_access_pin.unwrap_or(true),
+            guest_access_env_pinned: guest_access_pin.is_some(),
             storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
             storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
             storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),

@@ -173,24 +173,8 @@ pub struct ValidBanner {
 /// render it as a clickable link: a `javascript:` or `data:` URL in an admin
 /// banner would be script injection into every user's session.
 pub fn validate_input(input: BannerInput) -> std::result::Result<ValidBanner, String> {
-    let title = input.title.trim().to_string();
-    if title.is_empty() {
-        return Err("title must not be empty".into());
-    }
-    if title.chars().count() > MAX_TITLE_CHARS {
-        return Err(format!(
-            "title must be at most {MAX_TITLE_CHARS} characters"
-        ));
-    }
-    let message = input.message.trim().to_string();
-    if message.is_empty() {
-        return Err("message must not be empty".into());
-    }
-    if message.chars().count() > MAX_MESSAGE_CHARS {
-        return Err(format!(
-            "message must be at most {MAX_MESSAGE_CHARS} characters"
-        ));
-    }
+    let title = clean_text("title", &input.title, MAX_TITLE_CHARS)?;
+    let message = clean_text("message", &input.message, MAX_MESSAGE_CHARS)?;
     let link_url = match input.link_url.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(validate_link_url(raw)?),
@@ -212,6 +196,32 @@ pub fn validate_input(input: BannerInput) -> std::result::Result<ValidBanner, St
     })
 }
 
+/// Trim, normalise `\r\n` to `\n`, and refuse empty, oversized, or
+/// control-character text. Only `\n` and `\t` are allowed: the CLI prints
+/// banners to terminals, where an ESC / CSI / OSC sequence in an
+/// admin-authored message would be a terminal-escape injection.
+fn clean_text(field: &str, raw: &str, max_chars: usize) -> std::result::Result<String, String> {
+    let text = raw.trim().replace("\r\n", "\n");
+    if text.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if text.chars().count() > max_chars {
+        return Err(format!("{field} must be at most {max_chars} characters"));
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(format!(
+            "{field} must not contain control characters (only newline and tab are allowed)"
+        ));
+    }
+    Ok(text)
+}
+
+/// Absolute `http`/`https` only, stored in the parser's normalised form
+/// (quotes, angle brackets and whitespace percent-encoded), so clients never
+/// depend on a safe attribute API to render it.
 fn validate_link_url(raw: &str) -> std::result::Result<String, String> {
     if raw.len() > MAX_LINK_URL_LEN {
         return Err(format!("link_url must be at most {MAX_LINK_URL_LEN} bytes"));
@@ -220,7 +230,11 @@ fn validate_link_url(raw: &str) -> std::result::Result<String, String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("link_url must be an http or https URL".into());
     }
-    Ok(raw.to_string())
+    let normalised = parsed.as_str();
+    if normalised.len() > MAX_LINK_URL_LEN {
+        return Err(format!("link_url must be at most {MAX_LINK_URL_LEN} bytes"));
+    }
+    Ok(normalised.to_string())
 }
 
 #[derive(sqlx::FromRow)]
@@ -532,6 +546,48 @@ mod tests {
             ..input()
         })
         .is_err());
+    }
+
+    #[test]
+    fn link_is_stored_normalised() {
+        let v = validate_input(BannerInput {
+            link_url: Some("https://Status.Example.com/a b\"<x>".into()),
+            ..input()
+        })
+        .expect("parseable");
+        assert_eq!(
+            v.link_url.as_deref(),
+            Some("https://status.example.com/a%20b%22%3Cx%3E")
+        );
+    }
+
+    #[test]
+    fn control_characters_are_rejected_except_newline_and_tab() {
+        for bad in [
+            "\u{1b}[31mred",
+            "bell\u{7}",
+            "osc\u{1b}]8;;x\u{7}",
+            "csi\u{9b}2J",
+            "del\u{7f}",
+        ] {
+            let err = validate_input(BannerInput {
+                message: bad.into(),
+                ..input()
+            })
+            .expect_err(bad);
+            assert!(err.contains("control characters"), "{err}");
+            assert!(validate_input(BannerInput {
+                title: bad.into(),
+                ..input()
+            })
+            .is_err());
+        }
+        let v = validate_input(BannerInput {
+            message: "line one\r\nline two\tindented".into(),
+            ..input()
+        })
+        .expect("newline and tab are fine");
+        assert_eq!(v.message, "line one\nline two\tindented");
     }
 
     #[test]

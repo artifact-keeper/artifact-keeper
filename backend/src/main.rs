@@ -256,32 +256,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
     }
 
-    // Guest access is on by default for backward compatibility; a fresh install
-    // still exposes nothing because repositories are private unless marked
-    // public. Say so, loudly and once, when both are true (#3489).
-    {
-        use artifact_keeper_backend::api::middleware::guest_access;
-        let public_repositories = guest_access::public_repository_count(&db_pool).await?;
-        // The effective value (#867): an admin may have turned guests off
-        // through the API even though the env var is unset.
-        let guest_access_enabled =
-            artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::from_config(
-                Some(db_pool.clone()),
-                &config,
-            )
-            .is_enabled()
-            .await;
-        if let Some(message) =
-            guest_access::startup_notice(guest_access_enabled, public_repositories)
-        {
-            tracing::warn!(
-                event = "guest_access_public_repositories",
-                public_repositories,
-                "{message}"
-            );
-        }
-    }
-
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
     // SSO config that the handlers actually use (fixes #238).
@@ -1007,6 +981,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
+
+    // Prime the runtime guest-access handle (#867) with a real read before
+    // serving anything. Refuse to start if it fails: an instance an admin
+    // locked down through the API must not come up on the default (open).
+    let guest_access = state.guest_access_policy.try_refresh().await.map_err(|e| {
+        artifact_keeper_backend::error::AppError::Database(format!(
+            "failed to read the guest-access setting at startup: {e}"
+        ))
+    })?;
+
+    // Guest access is on by default for backward compatibility; a fresh install
+    // still exposes nothing because repositories are private unless marked
+    // public. Say so, loudly and once, when both are true (#3489).
+    {
+        use artifact_keeper_backend::api::middleware::guest_access;
+        let public_repositories = guest_access::public_repository_count(&state.db).await?;
+        if let Some(message) =
+            guest_access::startup_notice(guest_access.enabled, public_repositories)
+        {
+            tracing::warn!(
+                event = "guest_access_public_repositories",
+                public_repositories,
+                "{message}"
+            );
+        }
+    }
 
     // Fan out authorization-cache and npm computed-packument invalidations
     // from other replicas via Postgres LISTEN/NOTIFY (migration 142 triggers

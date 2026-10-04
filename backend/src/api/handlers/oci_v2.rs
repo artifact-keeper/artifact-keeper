@@ -28304,6 +28304,7 @@ mod token_refresh_grant_tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |c| {
             c.guest_access_enabled = enabled;
+            c.guest_access_env_pinned = true;
         });
         let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         Some((pool, user_id, username, state, auth_service))

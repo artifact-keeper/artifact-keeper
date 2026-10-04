@@ -192,7 +192,7 @@ pub async fn create_banner(
 ) -> Result<(StatusCode, Json<AdminBanner>)> {
     let valid = banner_service::validate_input(input).map_err(AppError::Validation)?;
     let banner = banner_service::create(&state.db, &valid, auth.user_id).await?;
-    audit_banner(&state, &auth, "created", &banner).await;
+    audit_banner(&state, &auth, "created", None, Some(&banner)).await;
     Ok((
         StatusCode::CREATED,
         Json(AdminBanner::at(banner, Utc::now())),
@@ -222,10 +222,14 @@ pub async fn update_banner(
     Json(input): Json<BannerInput>,
 ) -> Result<Json<AdminBanner>> {
     let valid = banner_service::validate_input(input).map_err(AppError::Validation)?;
+    // The before-state, for the audit trail's from/to.
+    let before = banner_service::get(&state.db, id)
+        .await?
+        .ok_or_else(|| not_found(id))?;
     let banner = banner_service::update(&state.db, id, &valid, auth.user_id)
         .await?
         .ok_or_else(|| not_found(id))?;
-    audit_banner(&state, &auth, "updated", &banner).await;
+    audit_banner(&state, &auth, "updated", Some(&before), Some(&banner)).await;
     Ok(Json(AdminBanner::at(banner, Utc::now())))
 }
 
@@ -251,7 +255,7 @@ pub async fn delete_banner(
     let banner = banner_service::delete(&state.db, id)
         .await?
         .ok_or_else(|| not_found(id))?;
-    audit_banner(&state, &auth, "deleted", &banner).await;
+    audit_banner(&state, &auth, "deleted", Some(&banner), None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -259,28 +263,57 @@ fn not_found(id: Uuid) -> AppError {
     AppError::NotFound(format!("banner {id} not found"))
 }
 
-/// The audit `details` for a banner mutation. Pure so its shape is tested.
-fn banner_audit_details(op: &str, banner: &Banner) -> serde_json::Value {
+/// Everything a reader sees, for the audit trail. `message` and `link_url`
+/// are the fields that carry the abuse risk (a rewritten message or a
+/// phishing link reaches every user, anonymous ones included), so they are
+/// recorded in full; both are bounded by validation.
+fn banner_audit_snapshot(b: &Banner) -> serde_json::Value {
     serde_json::json!({
-        "setting": "system_banner",
-        "op": op,
-        "banner_id": banner.id,
-        "title": banner.title,
-        "severity": banner.severity.as_str(),
-        "target": banner.target.as_str(),
-        "enabled": banner.enabled,
-        "starts_at": banner.starts_at,
-        "ends_at": banner.ends_at,
+        "title": b.title,
+        "message": b.message,
+        "link_url": b.link_url,
+        "severity": b.severity.as_str(),
+        "target": b.target.as_str(),
+        "enabled": b.enabled,
+        "starts_at": b.starts_at,
+        "ends_at": b.ends_at,
     })
 }
 
-async fn audit_banner(state: &SharedState, auth: &AuthExtension, op: &str, banner: &Banner) {
+/// The audit `details` for a banner mutation: the state before (`from`, for
+/// update and delete) and after (`to`, for create and update). Pure so its
+/// shape is tested.
+fn banner_audit_details(
+    op: &str,
+    id: Uuid,
+    from: Option<&Banner>,
+    to: Option<&Banner>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setting": "system_banner",
+        "op": op,
+        "banner_id": id,
+        "from": from.map(banner_audit_snapshot),
+        "to": to.map(banner_audit_snapshot),
+    })
+}
+
+async fn audit_banner(
+    state: &SharedState,
+    auth: &AuthExtension,
+    op: &str,
+    from: Option<&Banner>,
+    to: Option<&Banner>,
+) {
+    let Some(subject) = to.or(from) else {
+        return;
+    };
     let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
         .user(auth.user_id)
         .actor_name(&auth.username)
-        .resource(banner.id)
-        .resource_name(format!("system_banner:{}", banner.title))
-        .details(banner_audit_details(op, banner));
+        .resource(subject.id)
+        .resource_name(format!("system_banner:{}", subject.title))
+        .details(banner_audit_details(op, subject.id, from, to));
     audit_fire_and_forget(state.db.clone(), entry).await;
 }
 
@@ -357,15 +390,27 @@ mod tests {
     }
 
     #[test]
-    fn audit_details_name_the_operation_and_banner() {
-        let b = sample(true);
-        let d = banner_audit_details("created", &b);
-        assert_eq!(d["op"], "created");
+    fn audit_details_record_message_link_and_from_to() {
+        let before = sample(true);
+        let mut after = before.clone();
+        after.message = "Re-enter your password at the link".into();
+        after.link_url = Some("https://phish.example/".into());
+        let d = banner_audit_details("updated", before.id, Some(&before), Some(&after));
+        assert_eq!(d["op"], "updated");
         assert_eq!(d["setting"], "system_banner");
-        assert_eq!(d["banner_id"], b.id.to_string());
-        assert_eq!(d["severity"], "critical");
-        assert_eq!(d["target"], "ui");
-        assert!(not_found(b.id).to_string().contains(&b.id.to_string()));
+        assert_eq!(d["banner_id"], before.id.to_string());
+        assert_eq!(d["from"]["message"], "Read-only tonight");
+        assert_eq!(d["from"]["link_url"], "https://status.example.com");
+        assert_eq!(d["to"]["message"], "Re-enter your password at the link");
+        assert_eq!(d["to"]["link_url"], "https://phish.example/");
+        assert_eq!(d["to"]["severity"], "critical");
+        let created = banner_audit_details("created", after.id, None, Some(&after));
+        assert!(created["from"].is_null());
+        let deleted = banner_audit_details("deleted", before.id, Some(&before), None);
+        assert!(deleted["to"].is_null());
+        assert!(not_found(before.id)
+            .to_string()
+            .contains(&before.id.to_string()));
     }
 
     /// Handler-level: admin CRUD, the public endpoint's window/target
@@ -537,6 +582,19 @@ mod tests {
         }
         // Mutations were audited.
         assert!(tdh::audit_count_eventually(&pool, api.banner.id, "SETTING_CHANGED", 3).await >= 3);
+        // The update row records the before and after content.
+        let from_to: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
+            "SELECT details->'from'->>'message', (details->'to'->>'enabled')::boolean \
+             FROM audit_log WHERE resource_id = $1 AND details->>'op' = 'updated'",
+        )
+        .bind(api.banner.id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query update audit row");
+        assert_eq!(
+            from_to,
+            Some((Some("Registry maintenance".to_string()), Some(false)))
+        );
         tdh::cleanup_user(&pool, user_id).await;
     }
 }

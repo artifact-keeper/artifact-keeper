@@ -57,7 +57,8 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 /// Refuse a request that asks for a public repository while guest access is
 /// disabled server-wide (#3855).
 ///
-/// `AK_GUEST_ACCESS_ENABLED=false` is a deliberate operator decision, and a
+/// Disabling guest access (the admin setting or `AK_GUEST_ACCESS_ENABLED=false`,
+/// #867) is a deliberate operator decision, and a
 /// create/update asking for `is_public = true` contradicts it — a
 /// configuration mistake on one side or the other. Historically the request
 /// was silently rewritten to private (issue #850): the caller got a `201`/
@@ -74,7 +75,8 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 fn require_public_visibility_allowed(requested: bool, guest_access_enabled: bool) -> Result<()> {
     if requested && !guest_access_enabled {
         return Err(AppError::Validation(
-            "guest access is disabled on this instance (AK_GUEST_ACCESS_ENABLED=false); \
+            "guest access is disabled on this instance (admin setting \
+             PATCH /api/v1/admin/settings/system, or AK_GUEST_ACCESS_ENABLED=false); \
              repositories cannot be public. Enable guest access, or choose a non-public \
              visibility."
                 .to_string(),
@@ -21051,8 +21053,9 @@ mod tests {
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("AK_GUEST_ACCESS_ENABLED=false"),
-                    "message must name the operator switch: {msg}"
+                    msg.contains("AK_GUEST_ACCESS_ENABLED=false")
+                        && msg.contains("/api/v1/admin/settings/system"),
+                    "message must name both operator switches: {msg}"
                 );
                 assert!(
                     msg.contains("cannot be public"),
@@ -24768,6 +24771,7 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
             cfg.guest_access_enabled = false;
+            cfg.guest_access_env_pinned = true;
         });
         let admin = admin_auth(user_id, &username);
 
@@ -24834,6 +24838,7 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
             cfg.guest_access_enabled = false;
+            cfg.guest_access_env_pinned = true;
         });
         let admin = admin_auth(user_id, &username);
 

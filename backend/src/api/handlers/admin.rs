@@ -1101,6 +1101,20 @@ fn guest_access_audit_details(
     })
 }
 
+/// Fresh read of the guest-access setting for the admin endpoints. A database
+/// error is a 503, never the cached or fail-closed fallback the guard serves:
+/// an admin must not be shown (or audit against) a value that was not read.
+async fn read_guest_access(
+    policy: &crate::services::guest_access_policy::GuestAccessPolicy,
+) -> Result<ResolvedGuestAccess> {
+    policy.try_refresh().await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the guest-access setting");
+        AppError::ServiceUnavailable(
+            "the guest-access setting could not be read; retry shortly".to_string(),
+        )
+    })
+}
+
 /// Read the runtime system settings (guest access and its source).
 #[utoipa::path(
     get,
@@ -1110,6 +1124,7 @@ fn guest_access_audit_details(
     responses(
         (status = 200, description = "Runtime system settings", body = RuntimeSettingsResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "The setting could not be read", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1118,8 +1133,8 @@ pub async fn get_runtime_settings(
 ) -> Result<Json<RuntimeSettingsResponse>> {
     let policy = &state.guest_access_policy;
     // Bypass the cache: an operator checking the setting wants the database's
-    // answer, not one up to a TTL old.
-    let resolved = policy.refresh().await;
+    // answer, not a cached or fallback one -- a read failure is a 503.
+    let resolved = read_guest_access(policy).await?;
     Ok(Json(runtime_settings_response(
         resolved,
         policy.is_env_pinned(),
@@ -1143,6 +1158,7 @@ pub async fn get_runtime_settings(
         (status = 200, description = "Settings updated", body = RuntimeSettingsResponse),
         (status = 400, description = "No setting to update", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "The setting could not be read", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1157,13 +1173,14 @@ pub async fn update_runtime_settings(
         ));
     };
     let policy = &state.guest_access_policy;
-    let before = policy.refresh().await;
+    let before = read_guest_access(policy).await?;
     let after = policy.store(enabled, auth.user_id).await?;
 
     audit_fire_and_forget(
         state.db.clone(),
         AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
             .user(auth.user_id)
+            .resource(auth.user_id)
             .actor_name(&auth.username)
             .resource_name(GUEST_ACCESS_SETTING_KEY)
             .details(guest_access_audit_details(before, after)),
@@ -4614,21 +4631,35 @@ mod tests {
         assert_eq!(p.guest_access_stored, Some(false));
         assert!(!p.guest_access_editable);
 
-        // Every write was audited.
-        let mut audited = 0i64;
-        for _ in 0..100 {
-            audited = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM audit_log WHERE user_id = $1 AND action = 'SETTING_CHANGED'",
-            )
-            .bind(user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count audit rows");
-            if audited >= 3 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        // Every write was audited (resource = the acting admin).
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 3).await;
+
+        // A database that cannot be read is a 503 on both admin endpoints,
+        // never a cached or guessed value.
+        let mut dead = (*state).clone();
+        dead.guest_access_policy = Arc::new(GuestAccessPolicy::new(
+            Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(std::time::Duration::from_millis(200))
+                    .connect_lazy("postgresql://localhost:1/__admin_guest_access__")
+                    .expect("lazy pool"),
+            ),
+            key.clone(),
+            None,
+            true,
+        ));
+        let dead = Arc::new(dead);
+        let get_err = get_runtime_settings(State(dead.clone())).await.err();
+        let patch_err = update_runtime_settings(
+            State(dead),
+            Extension(auth.clone()),
+            Json(UpdateRuntimeSettingsRequest {
+                guest_access_enabled: Some(false),
+            }),
+        )
+        .await
+        .err();
 
         sqlx::query("DELETE FROM system_settings WHERE key = $1")
             .bind(&key)
@@ -4637,5 +4668,13 @@ mod tests {
             .expect("cleanup setting");
         tdh::cleanup_user(&pool, user_id).await;
         assert_eq!(audited, 3, "each PATCH that wrote must be audited");
+        assert!(
+            matches!(get_err, Some(AppError::ServiceUnavailable(_))),
+            "{get_err:?}"
+        );
+        assert!(
+            matches!(patch_err, Some(AppError::ServiceUnavailable(_))),
+            "{patch_err:?}"
+        );
     }
 }

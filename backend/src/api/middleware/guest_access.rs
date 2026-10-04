@@ -89,7 +89,7 @@ use crate::services::guest_access_policy::GuestAccessPolicy;
 /// Holds the runtime policy handle and the `AuthService` needed to validate
 /// tokens. The policy is the same `Arc` the admin settings endpoint writes
 /// through (#867), so a flip is enforced on the next request without a
-/// restart: the write invalidates the handle's cache.
+/// restart: the write refreshes the handle's cache with the new value.
 #[derive(Clone)]
 pub struct GuestAccessState {
     pub policy: Arc<GuestAccessPolicy>,
@@ -295,10 +295,11 @@ pub fn startup_notice(guest_access_enabled: bool, public_repositories: i64) -> O
         "repositories are"
     };
     Some(format!(
-        "AK_GUEST_ACCESS_ENABLED is on and {public_repositories} {plural} public: anonymous \
-         clients can list and download from them. Set AK_GUEST_ACCESS_ENABLED=false to refuse \
-         anonymous access server-wide (this also coerces every repository to private), or mark \
-         the repositories private individually."
+        "Guest access is on and {public_repositories} {plural} public: anonymous clients can \
+         list and download from them. To refuse anonymous access server-wide, turn guest access \
+         off with PATCH /api/v1/admin/settings/system {{\"guest_access_enabled\": false}} \
+         (or pin it with AK_GUEST_ACCESS_ENABLED=false), or mark the repositories private \
+         individually."
     ))
 }
 
@@ -1424,8 +1425,8 @@ mod tests {
         let many = startup_notice(true, 7).expect("public repositories warn");
         assert!(many.contains("7 repositories are public"), "{many}");
         for m in [&one, &many] {
+            assert!(m.contains("PATCH /api/v1/admin/settings/system"), "{m}");
             assert!(m.contains("AK_GUEST_ACCESS_ENABLED=false"), "{m}");
-            assert!(m.contains("coerces every repository to private"), "{m}");
         }
     }
 

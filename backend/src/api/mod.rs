@@ -245,8 +245,8 @@ pub struct AppState {
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
     /// Runtime guest-access setting (#867): env pin, else the
-    /// `system_settings` row, else the default; cached with a short TTL and
-    /// invalidated on write. Every consumer of "is anonymous access allowed"
+    /// `system_settings` row, else the default; cached with a short TTL,
+    /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
     /// asks this instead of `config.guest_access_enabled`.
     pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
 }

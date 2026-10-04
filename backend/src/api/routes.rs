@@ -1563,6 +1563,7 @@ mod tests {
 
         let state = tdh::build_state_with(pool.clone(), "/tmp/banners-router-2155", |c| {
             c.guest_access_enabled = false;
+            c.guest_access_env_pinned = true;
         });
         let app = super::create_router(state);
         let get = |p: &str| tdh::get(p.to_string());
@@ -1614,6 +1615,67 @@ mod tests {
             cfg_after["guest_access_enabled"], false,
             "/system/config must report the runtime value"
         );
+    }
+
+    /// The two new admin surfaces (#2155 banner CRUD, #867 runtime settings)
+    /// must be gated by the admin block, not merely by the guest guard: an
+    /// authenticated NON-admin gets 403, and an anonymous caller with guests
+    /// ON gets 401. Pins that `/admin/banners` did not land in the public
+    /// `/banners` nest by mistake.
+    #[tokio::test]
+    async fn admin_banners_and_runtime_settings_refuse_non_admins() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-gate-867-2155", |c| {
+            c.guest_access_enabled = true;
+            c.guest_access_env_pinned = true;
+        });
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+        let req = |method: &str, uri: &str, body: serde_json::Value, auth: Option<&str>| {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(Body::from(body.to_string())).unwrap()
+        };
+        let calls = [
+            (
+                "POST",
+                "/api/v1/admin/banners",
+                serde_json::json!({"title": "t", "message": "m"}),
+            ),
+            (
+                "PATCH",
+                "/api/v1/admin/settings/system",
+                serde_json::json!({"guest_access_enabled": false}),
+            ),
+            (
+                "GET",
+                "/api/v1/admin/settings/system",
+                serde_json::json!({}),
+            ),
+        ];
+        let mut results = Vec::new();
+        for (method, uri, body) in calls.iter() {
+            let (as_user, _) =
+                tdh::send(app.clone(), req(method, uri, body.clone(), Some(&bearer))).await;
+            let (anon, _) = tdh::send(app.clone(), req(method, uri, body.clone(), None)).await;
+            results.push((*method, *uri, as_user, anon));
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+        for (method, uri, as_user, anon) in results {
+            assert_eq!(as_user, StatusCode::FORBIDDEN, "non-admin {method} {uri}");
+            assert_eq!(anon, StatusCode::UNAUTHORIZED, "anonymous {method} {uri}");
+        }
     }
 
     /// #3489: Swagger UI and the OpenAPI document must not be mounted unless
