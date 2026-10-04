@@ -347,6 +347,7 @@ pub mod migration;
 pub mod monitoring;
 pub mod npm;
 pub mod nuget;
+pub mod oci_blob_redirect;
 pub mod oci_digest;
 pub mod oci_v2;
 pub mod package_analysis;

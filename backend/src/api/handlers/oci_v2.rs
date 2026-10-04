@@ -35,6 +35,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
+use crate::api::handlers::oci_blob_redirect;
 use crate::api::handlers::oci_digest::{
     compute_sha256, is_digest_reference, verify_digest_or_fall_through,
 };
@@ -4661,19 +4662,27 @@ fn build_oci_proxy_response(
 /// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
 /// path: they are parsed JSON (blob-ref resolution) and, when referenced by
 /// digest, content-address-verified before serving, so they must be buffered.
+/// The upstream path a remote repo's blob is fetched from, which is also the
+/// key the streaming pull-through caches it under. `None` for a repo that is
+/// not a remote with an upstream URL.
+fn remote_blob_cache_path(repo: &OciRepoInfo, digest: &str) -> Option<String> {
+    if repo.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_ref()?;
+    let image = normalize_docker_image(&repo.image, upstream_url);
+    Some(upstream_blob_path(&image, digest))
+}
+
 async fn try_upstream_fetch_streaming_blob_with_range(
     repo: &OciRepoInfo,
     state: &SharedState,
     digest: &str,
     range_header: Option<&str>,
 ) -> Option<Response> {
-    if repo.repo_type != RepositoryType::Remote {
-        return None;
-    }
+    let upstream_path = remote_blob_cache_path(repo, digest)?;
     let upstream_url = repo.upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let image = normalize_docker_image(&repo.image, upstream_url);
-    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
     // UNRECORDED-PROXY-SERVE: a blob is deliberately never counted. #2260 fixed
     // the unit of a Docker "download" as the PULL, counted once at the manifest
     // (`record_oci_manifest_pull`); one pull fetches N blobs, many of them
@@ -5998,6 +6007,20 @@ async fn handle_get_blob(
                     )
                 }
             };
+            // #2894: offload the transfer to the object store with a 307 to a
+            // presigned URL when enabled. A remote repo probes for the object
+            // first, because a missing one is re-fetched from upstream below.
+            if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
+                state,
+                storage.as_ref(),
+                &b.storage_key,
+                digest,
+                repo.repo_type == RepositoryType::Remote,
+            )
+            .await
+            {
+                return redirect;
+            }
             // Stream the blob straight from the backend instead of buffering the
             // whole (potentially multi-GiB) layer in heap. Content-Length comes
             // from the authoritative oci_blobs.size_bytes column. (#1528)
@@ -6065,6 +6088,18 @@ async fn handle_get_blob(
                             )
                         }
                     };
+                    // #2894: presigned 307 for a local member's blob.
+                    if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
+                        state,
+                        storage.as_ref(),
+                        &storage_key,
+                        digest,
+                        false,
+                    )
+                    .await
+                    {
+                        return redirect;
+                    }
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
                         Ok(stream) => {
@@ -6131,6 +6166,17 @@ async fn handle_get_blob(
     // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
     // content-address-verify the digest before serving, so streaming
     // introduces no verification regression. (#2192 / #1608 Phase 4c)
+    //
+    // #2894: a blob the proxy cache already holds is redirected to a presigned
+    // URL instead; a cold cache streams (and fills the cache) as before.
+    if let Some(cache_path) = remote_blob_cache_path(&repo, digest) {
+        if let Some(redirect) =
+            oci_blob_redirect::try_proxy_cached_blob_redirect(state, &repo.key, &cache_path, digest)
+                .await
+        {
+            return redirect;
+        }
+    }
     if let Some(resp) =
         try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header).await
     {
@@ -35203,6 +35249,154 @@ mod content_encoding_forwarding_tests {
             .await;
         let _ = std::fs::remove_dir_all(&storage_path);
         let _ = std::fs::remove_dir_all(format!("/tmp/oci-ce-{}", repo_id));
+    }
+
+    /// Seed a blob into an S3-backed repo's storage plus its `oci_blobs` row.
+    async fn seed_cloud_blob(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        blob: &[u8],
+    ) -> String {
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(blob.to_vec()))
+        );
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set cloud backend");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: format!("/tmp/oci-ce-{}", repo_id),
+        };
+        let storage_key = super::blob_storage_key(&digest);
+        state
+            .storage_for_repo(&location)
+            .expect("storage backend for repo")
+            .put(&storage_key, bytes::Bytes::from(blob.to_vec()))
+            .await
+            .expect("seed blob bytes");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(blob.len() as i64)
+        .bind(&storage_key)
+        .execute(pool)
+        .await
+        .expect("insert oci_blobs row");
+        digest
+    }
+
+    /// #2894: with presigned downloads enabled on a signing backend, a blob GET
+    /// (with or without Range, direct or through a virtual repo's local member)
+    /// answers 307 to the signed URL with Docker-Content-Digest, while HEAD
+    /// keeps answering 200 with headers only (a presigned URL is bound to GET).
+    #[tokio::test]
+    async fn test_get_blob_redirects_to_presigned_url_2894() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let (virt_id, virt_key) = insert_repo(&pool, "virtual", None).await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("link member");
+        let digest = seed_cloud_blob(&state, &pool, repo_id, b"presigned oci layer").await;
+
+        let mut ranged = anon_headers();
+        ranged.insert(RANGE, "bytes=0-3".parse().unwrap());
+        let mut results = Vec::new();
+        for (image, headers) in [
+            (format!("{repo_key}/myimage"), anon_headers()),
+            (format!("{repo_key}/myimage"), ranged),
+            (format!("{virt_key}/myimage"), anon_headers()),
+        ] {
+            let resp =
+                super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+            results.push(tdh::collect_response(resp).await);
+        }
+        let head = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &format!("{repo_key}/myimage"),
+            &digest,
+        )
+        .await;
+        let (head_status, _b, head_headers) = tdh::collect_response(head).await;
+
+        for id in [virt_id, repo_id] {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        for (status, body, headers) in &results {
+            assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT, "GET must 307");
+            assert!(body.is_empty(), "a redirect carries no layer bytes");
+            let location = tdh::header_str(headers, LOCATION).unwrap_or_default();
+            assert!(
+                location.contains("X-Amz-Signature") && location.contains(&digest[7..]),
+                "must redirect to the signed blob key, got {location}"
+            );
+            assert_eq!(
+                tdh::header_str(
+                    headers,
+                    axum::http::header::HeaderName::from_static("docker-content-digest")
+                )
+                .as_deref(),
+                Some(digest.as_str())
+            );
+        }
+        assert_eq!(head_status, StatusCode::OK, "HEAD must never redirect");
+        assert!(tdh::header_str(&head_headers, LOCATION).is_none());
+    }
+
+    /// #2894 negative control: the same S3-shaped backend without the operator
+    /// opt-in keeps streaming the layer with 200.
+    #[tokio::test]
+    async fn test_get_blob_streams_when_presigned_downloads_disabled_2894() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let blob = b"streamed oci layer";
+        let digest = seed_cloud_blob(&state, &pool, repo_id, blob).await;
+        let resp = super::handle_get_blob(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &format!("{repo_key}/myimage"),
+            &digest,
+        )
+        .await;
+        let (status, body, _h) = tdh::collect_response(resp).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &blob[..]);
     }
 }
 
