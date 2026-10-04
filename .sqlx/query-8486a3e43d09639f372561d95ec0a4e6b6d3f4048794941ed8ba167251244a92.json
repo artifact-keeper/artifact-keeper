@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results\n                (artifact_id, repository_id, scan_type, status, error_message,\n                 started_at, completed_at, checksum_sha256)\n            VALUES ($1, $2, $3, 'not_applicable', $4, NOW(), NOW(), $5)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            FROM scan_results\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -222,15 +222,33 @@
             "name": "scan_completeness_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "vuln_db_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_version"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "vuln_db_published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_published_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Varchar",
-        "Text",
-        "Bpchar"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -253,8 +271,10 @@
       false,
       true,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "8a466b9875da49a135ef5a391c628a8da92d3ab463a249761e4e6e8c24c577b6"
+  "hash": "8486a3e43d09639f372561d95ec0a4e6b6d3f4048794941ed8ba167251244a92"
 }

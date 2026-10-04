@@ -197,9 +197,10 @@ func (s *Server) runFsJob(id, dir string) {
 	}
 	s.debugf("filesystem scan %s succeeded (%d report bytes)", id, len(report))
 	s.jobs.SucceedFs(id, &FsScanResult{
-		Report:         report,
-		Stderr:         stderr,
-		ScannerVersion: s.cfg.ScannerVersion,
+		Report:          report,
+		Stderr:          stderr,
+		ScannerVersion:  s.cfg.ScannerVersion,
+		VulnerabilityDB: s.scanner.vulnDBInfo(),
 	})
 }
 

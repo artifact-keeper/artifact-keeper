@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)\n            VALUES ($1, $2, $3, 'running', NOW(), $4)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            FROM scan_results\n            WHERE artifact_id = $1\n              AND checksum_sha256 = $2\n              AND scan_type = $3\n              AND status = 'completed'\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -222,14 +222,37 @@
             "name": "scan_completeness_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "vuln_db_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_version"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "vuln_db_published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_published_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Varchar",
-        "Bpchar"
+        "Bpchar",
+        "Text",
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -252,8 +275,10 @@
       false,
       true,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "6eed7022521589508539b328b18a04e8df77e5e9f3d0ecf7e4be745205f47028"
+  "hash": "3f4f35aadc3a239c318092f9b9f89d3cb99dfa45e8ae1ea0623bacf9adb4fcb5"
 }

@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed', findings_count = $2,\n                critical_count = $3, high_count = $4, medium_count = $5,\n                low_count = $6, info_count = $7, completed_at = NOW(),\n                scanner_version = COALESCE($8, scanner_version),\n                started_at = $9,\n                scan_completeness = $10,\n                pin_identity = $11,\n                scan_completeness_reason = $12,\n                vuln_db_version = $13,\n                vuln_db_published_at = $14\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Timestamptz",
+        "Varchar",
+        "Text",
+        "Text",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "42efc3d692b2372b62313b374cc0e80c3e4fd11a90ae9f786ba0cb3a00af3546"
+}

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason\n            FROM scan_results\n            WHERE id = $1\n            ",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8,\n                scanner_version = $9,\n                pin_identity = $10,\n                scan_completeness = $11,\n                scan_completeness_reason = $12,\n                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8),\n                vuln_db_version = $13,\n                vuln_db_published_at = $14\n            WHERE id = $1 AND status = 'running'\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            ",
   "describe": {
     "columns": [
       {
@@ -222,11 +222,46 @@
             "name": "scan_completeness_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "vuln_db_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_version"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "vuln_db_published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_published_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Uuid",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -249,8 +284,10 @@
       false,
       true,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "63d201e8d8495eebe2fc26c4fe7844b489b100b227cf8507070855837ef35a19"
+  "hash": "5c6e410920b157f5e62e5d9bd5f93a50909d0477ecd3a151b970c78d52b9cfdb"
 }

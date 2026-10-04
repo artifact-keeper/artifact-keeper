@@ -120,6 +120,11 @@ pub struct HarborScanReport {
     pub scanner: Option<HarborScanner>,
     #[serde(default)]
     pub vulnerabilities: Vec<HarborVulnerability>,
+    /// Trivy vulnerability-DB metadata (#3014). An Artifact Keeper adapter
+    /// extension to the Harbor report, absent from older adapters and from
+    /// third-party Harbor scanners (then `None`, stored as NULL).
+    #[serde(default)]
+    pub vulnerability_db: Option<crate::services::scanner_service::AdapterVulnDb>,
 }
 
 /// Identifies the scanner that produced the report. Feeds
@@ -470,6 +475,10 @@ pub struct ImageScanner {
     /// scan (e.g. `trivy-0.71.2`). The in-image `trivy --version` probe is
     /// gone (#2059), so this is the only available provenance.
     last_scanner_version: Mutex<Option<String>>,
+    /// Vulnerability-DB provenance reported by the adapter alongside that
+    /// version (#3014). `None` until a scan has run, or when the adapter
+    /// predates the `vulnerability_db` report field.
+    last_vuln_db: Mutex<Option<crate::models::security::VulnDbProvenance>>,
 }
 
 impl ImageScanner {
@@ -489,6 +498,7 @@ impl ImageScanner {
             scan_identity: None,
             scan_token_ttl_seconds: 300,
             last_scanner_version: Mutex::new(None),
+            last_vuln_db: Mutex::new(None),
         }
     }
 
@@ -862,6 +872,14 @@ impl ImageScanner {
                 }
             }
         }
+        // #3014: overwrite unconditionally, so an adapter that stops
+        // reporting DB metadata yields NULL rather than a stale vintage.
+        if let Ok(mut guard) = self.last_vuln_db.lock() {
+            *guard = report
+                .vulnerability_db
+                .as_ref()
+                .and_then(|db| db.provenance());
+        }
 
         // Source label is intentionally "trivy" (not "trivy-image") to
         // preserve back-compat with dashboards / filters that group findings
@@ -924,6 +942,12 @@ impl Scanner for ImageScanner {
             .lock()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    /// Trivy DB provenance reported by the adapter on the last successful
+    /// scan (#3014).
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        self.last_vuln_db.lock().ok().and_then(|g| g.clone())
     }
 
     async fn scan(
@@ -1177,6 +1201,7 @@ mod tests {
                     links: None,
                 },
             ],
+            vulnerability_db: None,
         };
 
         let findings = ImageScanner::convert_findings(&harbor_report_to_trivy(&report, "img:tag"));

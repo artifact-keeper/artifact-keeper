@@ -443,6 +443,12 @@ pub fn merge_artifact_self_findings(
             fixed_version,
             source: (!sources.is_empty()).then(|| sources.join(" + ")),
             source_url,
+            // #3013: a merge must never launder a malicious finding into an
+            // ordinary one, whichever member happened to rank first.
+            finding_class: members
+                .iter()
+                .map(|&i| findings[i].finding_class)
+                .fold(base.finding_class, |acc, c| acc.most_severe(c)),
         };
 
         merged_at.insert(members[0], merged);
@@ -536,6 +542,7 @@ mod tests {
             fixed_version: Some("9.9.9".to_string()),
             source: Some(source.to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 

@@ -306,7 +306,20 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	}
 
 	scanner := HarborScanner{Name: "Trivy", Version: s.cfg.ScannerVersion}
-	return mapTrivyToHarbor(&trivyReport, scanner), nil
+	report := mapTrivyToHarbor(&trivyReport, scanner)
+	report.VulnerabilityDB = s.vulnDBInfo()
+	return report, nil
+}
+
+// vulnDBInfo reads the trivy DB provenance after a scan (#3014). Best-effort:
+// a read failure is logged and reported as absent, never as a scan failure.
+func (s *Scanner) vulnDBInfo() *VulnDBInfo {
+	info, err := ReadVulnDBInfo(s.cfg.CacheDir)
+	if err != nil {
+		log.Printf("trivy DB provenance unavailable: %v", err)
+		return nil
+	}
+	return info
 }
 
 // fsSeverity is the severity filter for filesystem scans. It mirrors the

@@ -293,6 +293,15 @@ pub struct ScanResult {
     /// Why the scan is not `complete`, when that is known (#4154).
     #[serde(default)]
     pub scan_completeness_reason: Option<String>,
+    /// Identity of the vulnerability database the scan ran against (#3014),
+    /// e.g. `trivy-db-v2`, `grype-db-v6.0.2`, `live:osv`. `None` for scan
+    /// types without one and for rows written before migration 259.
+    #[serde(default)]
+    pub vuln_db_version: Option<String>,
+    /// When that database was built / last updated, or the query time for a
+    /// live-API scanner (#3014). `None` means unknown, never fresh.
+    #[serde(default)]
+    pub vuln_db_published_at: Option<DateTime<Utc>>,
 }
 
 /// An individual vulnerability finding within a scan.
@@ -315,6 +324,8 @@ pub struct ScanFinding {
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// `vulnerability`, `malicious` or `policy` (#3013). See [`FindingClass`].
+    pub finding_class: String,
 }
 
 /// Materialized security score for a repository.
@@ -507,6 +518,124 @@ impl PolicyPredicates {
 // Non-persisted types used by the scanner service
 // ---------------------------------------------------------------------------
 
+/// What kind of thing a finding reports (#3013), persisted as
+/// `scan_findings.finding_class` (migration 260).
+///
+/// "This dependency has a known weakness" and "this package is hostile" are
+/// categorically different facts, and a policy that must treat hostile content
+/// differently (no acknowledgement, no promotion override) needs to be able to
+/// tell them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FindingClass {
+    /// A known weakness (CVE, GHSA, ...). The default: every scanner finding
+    /// before #3013 was one of these.
+    #[default]
+    Vulnerability,
+    /// The package itself is known to be malicious, e.g. an OSV `MAL-*`
+    /// advisory sourced from ossf/malicious-packages.
+    Malicious,
+    /// A configuration / compliance rule violation (OpenSCAP).
+    Policy,
+}
+
+/// Prefix of the advisory ids OSV assigns to known-malicious packages
+/// (the ossf/malicious-packages feed, e.g. `MAL-2024-1234`).
+pub const MALICIOUS_ADVISORY_PREFIX: &str = "MAL-";
+
+impl FindingClass {
+    /// Every value the `scan_findings.finding_class` CHECK accepts.
+    pub const ALL: [FindingClass; 3] = [
+        FindingClass::Vulnerability,
+        FindingClass::Malicious,
+        FindingClass::Policy,
+    ];
+
+    /// The persisted / wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingClass::Vulnerability => "vulnerability",
+            FindingClass::Malicious => "malicious",
+            FindingClass::Policy => "policy",
+        }
+    }
+
+    /// Parse a persisted / query token (exact, lowercase).
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
+    /// Classify an advisory by its identifiers: `malicious` when the id or
+    /// any alias is an OSV malicious-package id (`MAL-*`), otherwise
+    /// `vulnerability`. Aliases matter because OSV can surface a malicious
+    /// package under a GHSA id that aliases the `MAL-` record.
+    pub fn from_advisory_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        if ids
+            .into_iter()
+            .any(|id| id.trim().starts_with(MALICIOUS_ADVISORY_PREFIX))
+        {
+            FindingClass::Malicious
+        } else {
+            FindingClass::Vulnerability
+        }
+    }
+
+    /// The class that wins when two findings describing the same thing are
+    /// merged: hostile beats policy beats weakness, so a merge can never
+    /// launder a malicious finding into an ordinary one.
+    pub fn most_severe(self, other: Self) -> Self {
+        fn rank(c: FindingClass) -> u8 {
+            match c {
+                FindingClass::Malicious => 2,
+                FindingClass::Policy => 1,
+                FindingClass::Vulnerability => 0,
+            }
+        }
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// Which vulnerability database a scan ran against (#3014), persisted as
+/// `scan_results.vuln_db_version` / `vuln_db_published_at` (migration 259).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulnDbProvenance {
+    /// Database identity, e.g. `trivy-db-v2`, `grype-db-v6.0.2`, `live:osv`.
+    pub version: String,
+    /// When the database was built / last updated (the query time for a
+    /// live-API scanner). `None` when the scanner did not report it.
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+/// Longest `vuln_db_version` the column accepts (`VARCHAR(100)`).
+pub const VULN_DB_VERSION_MAX_LEN: usize = 100;
+
+impl VulnDbProvenance {
+    /// Build a provenance record, returning `None` for an empty identity and
+    /// truncating (on a char boundary) to the column width so an unexpected
+    /// scanner string can never fail the `complete_scan` write.
+    pub fn new(version: impl Into<String>, published_at: Option<DateTime<Utc>>) -> Option<Self> {
+        let mut version: String = version.into().trim().to_string();
+        if version.is_empty() {
+            return None;
+        }
+        if version.len() > VULN_DB_VERSION_MAX_LEN {
+            let mut cut = VULN_DB_VERSION_MAX_LEN;
+            while !version.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            version.truncate(cut);
+        }
+        Some(Self {
+            version,
+            published_at,
+        })
+    }
+}
+
 /// A raw finding produced by a scanner before it is persisted.
 #[derive(Debug, Clone, Serialize)]
 pub struct RawFinding {
@@ -519,6 +648,8 @@ pub struct RawFinding {
     pub fixed_version: Option<String>,
     pub source: Option<String>,
     pub source_url: Option<String>,
+    /// What kind of finding this is (#3013).
+    pub finding_class: FindingClass,
 }
 
 /// A CVE-identified finding retained from an inline proxy scan so it can be
@@ -931,5 +1062,78 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         assert_eq!(config.threshold(), Severity::High);
+    }
+
+    // -----------------------------------------------------------------------
+    // FindingClass / VulnDbProvenance (#3013, #3014)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finding_class_tokens_round_trip_and_match_the_db_check() {
+        for class in FindingClass::ALL {
+            assert_eq!(FindingClass::parse(class.as_str()), Some(class));
+            let json = serde_json::to_string(&class).unwrap();
+            assert_eq!(json, format!("\"{}\"", class.as_str()));
+        }
+        assert_eq!(
+            FindingClass::ALL.map(FindingClass::as_str),
+            ["vulnerability", "malicious", "policy"]
+        );
+        assert_eq!(FindingClass::parse("Malicious"), None);
+        assert_eq!(FindingClass::parse(""), None);
+        assert_eq!(FindingClass::default(), FindingClass::Vulnerability);
+    }
+
+    #[test]
+    fn mal_advisory_ids_classify_malicious() {
+        assert_eq!(
+            FindingClass::from_advisory_ids(["MAL-2024-1234"]),
+            FindingClass::Malicious
+        );
+        // An alias is enough: OSV can report a GHSA that aliases the MAL id.
+        assert_eq!(
+            FindingClass::from_advisory_ids(["GHSA-xxxx-yyyy-zzzz", " MAL-2025-1"]),
+            FindingClass::Malicious
+        );
+        assert_eq!(
+            FindingClass::from_advisory_ids(["CVE-2023-4863", "GHSA-j7hp-h8jx-5ppr"]),
+            FindingClass::Vulnerability
+        );
+        assert_eq!(
+            FindingClass::from_advisory_ids(Vec::<&str>::new()),
+            FindingClass::Vulnerability
+        );
+        // Case-sensitive like the OSV namespace: `mal-` is not a MAL id.
+        assert_eq!(
+            FindingClass::from_advisory_ids(["mal-2024-1"]),
+            FindingClass::Vulnerability
+        );
+    }
+
+    #[test]
+    fn most_severe_class_never_launders_malicious() {
+        use FindingClass::*;
+        assert_eq!(Vulnerability.most_severe(Malicious), Malicious);
+        assert_eq!(Malicious.most_severe(Vulnerability), Malicious);
+        assert_eq!(Malicious.most_severe(Policy), Malicious);
+        assert_eq!(Policy.most_severe(Vulnerability), Policy);
+        assert_eq!(Vulnerability.most_severe(Policy), Policy);
+        assert_eq!(Vulnerability.most_severe(Vulnerability), Vulnerability);
+    }
+
+    #[test]
+    fn vuln_db_provenance_rejects_empty_and_fits_the_column() {
+        assert_eq!(VulnDbProvenance::new("   ", None), None);
+        let p = VulnDbProvenance::new(" trivy-db-v2 ", None).unwrap();
+        assert_eq!(p.version, "trivy-db-v2");
+
+        let long = "x".repeat(VULN_DB_VERSION_MAX_LEN + 20);
+        let p = VulnDbProvenance::new(long, None).unwrap();
+        assert_eq!(p.version.len(), VULN_DB_VERSION_MAX_LEN);
+
+        // Truncation lands on a char boundary, never mid-codepoint.
+        let multibyte = format!("{}é", "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
+        let p = VulnDbProvenance::new(multibyte, None).unwrap();
+        assert_eq!(p.version, "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
     }
 }

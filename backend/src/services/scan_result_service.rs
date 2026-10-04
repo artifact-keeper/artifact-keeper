@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::security::{
     DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
-    Severity,
+    Severity, VulnDbProvenance,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 
@@ -297,6 +297,18 @@ pub(crate) fn build_scan_reaped_audit_details(
         "threshold_secs": threshold_secs,
         "reason": "stuck_running_janitor",
     })
+}
+
+/// Optional exact-match filters for [`ScanResultService::list_findings`]
+/// (#3410, #3013). `None` leaves a column unfiltered; callers validate the
+/// closed vocabularies (`severity`, `finding_class`) before building this.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindingListFilter<'a> {
+    pub severity: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub cve_id: Option<&'a str>,
+    /// `vulnerability`, `malicious` or `policy` (#3013).
+    pub finding_class: Option<&'a str>,
 }
 
 pub struct ScanResultService {
@@ -642,7 +654,8 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -693,7 +706,8 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -763,7 +777,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE checksum_sha256 = $1
               AND scan_type = $2
@@ -820,7 +835,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE artifact_id = $1
               AND checksum_sha256 = $2
@@ -1035,7 +1051,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1066,14 +1083,17 @@ impl ScanResultService {
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
                 scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity,
-                scan_completeness, scan_completeness_reason, inventory_status
+                scan_completeness, scan_completeness_reason, inventory_status,
+                vuln_db_version, vuln_db_published_at
             )
             VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15,
-                    $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14))
+                    $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14),
+                    $18, $19)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -1095,6 +1115,10 @@ impl ScanResultService {
             // #4154: the copy inherits the source's completeness verdict.
             source.scan_completeness,
             source.scan_completeness_reason,
+            // #3014: a reused verdict is only as fresh as the database the
+            // ORIGINAL scan ran against; record that vintage, not NULL.
+            source.vuln_db_version,
+            source.vuln_db_published_at,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1106,11 +1130,11 @@ impl ScanResultService {
             INSERT INTO scan_findings (
                 scan_result_id, artifact_id, severity, title, description,
                 cve_id, affected_component, affected_version, fixed_version,
-                source, source_url
+                source, source_url, finding_class
             )
             SELECT $1, $2, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
+                   source, source_url, finding_class
             FROM scan_findings
             WHERE scan_result_id = $3
             "#,
@@ -1170,7 +1194,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1209,12 +1234,15 @@ impl ScanResultService {
                 pin_identity = $10,
                 scan_completeness = $11,
                 scan_completeness_reason = $12,
-                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8)
+                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8),
+                vuln_db_version = $13,
+                vuln_db_published_at = $14
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             target_scan_id,
             findings,
@@ -1233,6 +1261,9 @@ impl ScanResultService {
             // or a `partial` source would read as an authoritative `complete`.
             source.scan_completeness,
             source.scan_completeness_reason,
+            // #3014: and the source's vulnerability-database vintage.
+            source.vuln_db_version,
+            source.vuln_db_published_at,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -1258,11 +1289,11 @@ impl ScanResultService {
             INSERT INTO scan_findings (
                 scan_result_id, artifact_id, severity, title, description,
                 cve_id, affected_component, affected_version, fixed_version,
-                source, source_url
+                source, source_url, finding_class
             )
             SELECT $1, $2, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
+                   source, source_url, finding_class
             FROM scan_findings
             WHERE scan_result_id = $3
             "#,
@@ -1294,6 +1325,10 @@ impl ScanResultService {
     /// `scan_completeness_reason` (#4036) is the human-readable why behind a
     /// non-`complete` `scan_completeness` (e.g. which scanner cataloged no
     /// components); `None` for ordinary completions.
+    ///
+    /// `vuln_db` (#3014) is the vulnerability database the scanner graded
+    /// against; `None` (no database, or not reported) is stored as NULL in
+    /// both `vuln_db_version` and `vuln_db_published_at`.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -1309,6 +1344,7 @@ impl ScanResultService {
         scan_completeness: &str,
         pin_identity: Option<&str>,
         scan_completeness_reason: Option<&str>,
+        vuln_db: Option<&VulnDbProvenance>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1320,7 +1356,9 @@ impl ScanResultService {
                 started_at = $9,
                 scan_completeness = $10,
                 pin_identity = $11,
-                scan_completeness_reason = $12
+                scan_completeness_reason = $12,
+                vuln_db_version = $13,
+                vuln_db_published_at = $14
             WHERE id = $1
             "#,
             scan_id,
@@ -1335,6 +1373,8 @@ impl ScanResultService {
             scan_completeness,
             pin_identity,
             scan_completeness_reason,
+            vuln_db.map(|p| p.version.as_str()),
+            vuln_db.and_then(|p| p.published_at),
         )
         .execute(&self.db)
         .await
@@ -1431,7 +1471,8 @@ impl ScanResultService {
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
-                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             "#,
             artifact_id,
             repository_id,
@@ -1454,7 +1495,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE id = $1
             "#,
@@ -1490,7 +1532,8 @@ impl ScanResultService {
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason
+                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
+                      vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
@@ -1661,15 +1704,17 @@ impl ScanResultService {
         let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
         let source_urls: Vec<Option<&str>> =
             findings.iter().map(|f| f.source_url.as_deref()).collect();
+        let finding_classes: Vec<&str> =
+            findings.iter().map(|f| f.finding_class.as_str()).collect();
 
         sqlx::query!(
             r#"
             INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
                 description, cve_id, affected_component, affected_version, fixed_version,
-                source, source_url)
+                source, source_url, finding_class)
             SELECT $1, $2, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url
+                   source, source_url, finding_class
             FROM UNNEST(
                 $3::text[],
                 $4::text[],
@@ -1679,9 +1724,10 @@ impl ScanResultService {
                 $8::text[],
                 $9::text[],
                 $10::text[],
-                $11::text[]
+                $11::text[],
+                $12::text[]
             ) AS t(severity, title, description, cve_id, affected_component,
-                   affected_version, fixed_version, source, source_url)
+                   affected_version, fixed_version, source, source_url, finding_class)
             "#,
             scan_result_id,
             artifact_id,
@@ -1694,6 +1740,7 @@ impl ScanResultService {
             &fixed_versions as &[Option<&str>],
             &sources as &[Option<&str>],
             &source_urls as &[Option<&str>],
+            &finding_classes as &[&str],
         )
         .execute(&self.db)
         .await
@@ -1883,24 +1930,29 @@ impl ScanResultService {
     pub async fn list_findings(
         &self,
         scan_result_id: Uuid,
-        severity: Option<&str>,
-        source: Option<&str>,
-        cve_id: Option<&str>,
+        filter: &FindingListFilter<'_>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<ScanFinding>, i64)> {
+        let FindingListFilter {
+            severity,
+            source,
+            cve_id,
+            finding_class,
+        } = *filter;
         let findings = sqlx::query_as!(
             ScanFinding,
             r#"
             SELECT id, scan_result_id, artifact_id, severity, title, description,
                    cve_id, affected_component, affected_version, fixed_version,
                    source, source_url, is_acknowledged, acknowledged_by,
-                   acknowledged_reason, acknowledged_at, created_at
+                   acknowledged_reason, acknowledged_at, created_at, finding_class
             FROM scan_findings
             WHERE scan_result_id = $1
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
               AND ($4::text IS NULL OR cve_id = $4)
+              AND ($7::text IS NULL OR finding_class = $7)
             ORDER BY
                 CASE severity
                     WHEN 'critical' THEN 0
@@ -1918,6 +1970,7 @@ impl ScanResultService {
             cve_id,
             limit,
             offset,
+            finding_class,
         )
         .fetch_all(&self.db)
         .await
@@ -1931,11 +1984,13 @@ impl ScanResultService {
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
               AND ($4::text IS NULL OR cve_id = $4)
+              AND ($5::text IS NULL OR finding_class = $5)
             "#,
             scan_result_id,
             severity,
             source,
             cve_id,
+            finding_class,
         )
         .fetch_one(&self.db)
         .await
@@ -1961,7 +2016,7 @@ impl ScanResultService {
             RETURNING id, scan_result_id, artifact_id, severity, title, description,
                       cve_id, affected_component, affected_version, fixed_version,
                       source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at
+                      acknowledged_reason, acknowledged_at, created_at, finding_class
             "#,
             finding_id,
             user_id,
@@ -1987,7 +2042,7 @@ impl ScanResultService {
             RETURNING id, scan_result_id, artifact_id, severity, title, description,
                       cve_id, affected_component, affected_version, fixed_version,
                       source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at
+                      acknowledged_reason, acknowledged_at, created_at, finding_class
             "#,
             finding_id,
         )
@@ -2566,6 +2621,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert_eq!(result.scan_type, "dependency");
         assert_eq!(result.status, "completed");
@@ -2599,6 +2656,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["scan_type"], "image");
@@ -2631,6 +2690,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_message.as_deref(), Some("Scanner timed out"));
@@ -2660,6 +2721,8 @@ mod tests {
             source_scan_id: Some(source_id),
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         assert!(result.is_reused);
         assert_eq!(result.source_scan_id, Some(source_id));
@@ -2724,6 +2787,7 @@ mod tests {
             acknowledged_reason: None,
             acknowledged_at: None,
             created_at: chrono::Utc::now(),
+            finding_class: "vulnerability".to_string(),
         };
         assert!(!finding.is_acknowledged);
         assert_eq!(finding.severity, "critical");
@@ -2750,6 +2814,7 @@ mod tests {
             acknowledged_reason: Some("Accepted risk for legacy code".to_string()),
             acknowledged_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            finding_class: "vulnerability".to_string(),
         };
         assert!(finding.is_acknowledged);
         assert_eq!(finding.acknowledged_by, Some(user_id));
@@ -2771,6 +2836,7 @@ mod tests {
             fixed_version: Some("1.0.3".to_string()),
             source: Some("trivy".to_string()),
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2024-1234".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         assert_eq!(finding.severity, Severity::Critical);
         assert_eq!(finding.title, "CVE-2024-1234");
@@ -2788,6 +2854,7 @@ mod tests {
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.description.is_none());
@@ -2832,6 +2899,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         }
     }
 
@@ -3403,6 +3472,7 @@ mod tests {
                     fixed_version: Some("1.0.1".to_string()),
                     source: Some("test".to_string()),
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }],
             )
             .await
@@ -3418,6 +3488,7 @@ mod tests {
                 Some("test-scanner-1.0"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )
@@ -3513,6 +3584,133 @@ mod tests {
             cleanup_repo(&pool, repo_id).await;
         }
 
+        fn raw_finding(cve: &str, class: crate::models::security::FindingClass) -> RawFinding {
+            RawFinding {
+                severity: Severity::Medium,
+                title: cve.to_string(),
+                description: None,
+                cve_id: Some(cve.to_string()),
+                affected_component: Some("pkg".to_string()),
+                affected_version: Some("1.0.0".to_string()),
+                fixed_version: None,
+                source: Some("osv".to_string()),
+                source_url: None,
+                finding_class: class,
+            }
+        }
+
+        /// #3014 + #3013: the vulnerability-DB provenance written by
+        /// `complete_scan` and each finding's class survive the round trip,
+        /// the `finding_class` filter narrows the listing, and BOTH reuse
+        /// paths carry the source scan's DB vintage and finding classes onto
+        /// the reused row (a reused verdict is only as fresh as its source).
+        #[tokio::test]
+        async fn vuln_db_and_finding_class_round_trip_and_survive_reuse() {
+            use crate::models::security::{FindingClass, VulnDbProvenance};
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (src_aid, _) = insert_test_artifact(&pool, repo_id, "src").await;
+            let (copy_aid, copy_checksum) = insert_test_artifact(&pool, repo_id, "copy").await;
+            let (conv_aid, _) = insert_test_artifact(&pool, repo_id, "conv").await;
+
+            let built = chrono::DateTime::parse_from_rfc3339("2026-10-04T08:11:47Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let provenance = VulnDbProvenance::new("grype-db-v6.1.10", Some(built)).unwrap();
+
+            let scan = svc
+                .create_scan_result(src_aid, repo_id, "dependency")
+                .await
+                .expect("create scan");
+            svc.create_findings(
+                scan.id,
+                src_aid,
+                &[
+                    raw_finding("CVE-2024-1111", FindingClass::Vulnerability),
+                    raw_finding("MAL-2024-2222", FindingClass::Malicious),
+                ],
+            )
+            .await
+            .expect("create findings");
+            svc.complete_scan(
+                scan.id,
+                2,
+                0,
+                0,
+                2,
+                0,
+                0,
+                Some("grype-0.118.0"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                Some(&provenance),
+            )
+            .await
+            .expect("complete scan");
+
+            let stored = svc.get_scan(scan.id).await.expect("get scan");
+            assert_eq!(stored.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
+            assert_eq!(stored.vuln_db_published_at, Some(built));
+
+            let malicious = FindingListFilter {
+                finding_class: Some("malicious"),
+                ..Default::default()
+            };
+            let (rows, total) = svc
+                .list_findings(scan.id, &malicious, 0, 50)
+                .await
+                .expect("list malicious");
+            assert_eq!(total, 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].cve_id.as_deref(), Some("MAL-2024-2222"));
+            assert_eq!(rows[0].finding_class, "malicious");
+            let (all, all_total) = svc
+                .list_findings(scan.id, &FindingListFilter::default(), 0, 50)
+                .await
+                .expect("list all");
+            assert_eq!(all_total, 2);
+            assert!(all.iter().any(|f| f.finding_class == "vulnerability"
+                && f.cve_id.as_deref() == Some("CVE-2024-1111")));
+
+            let copied = svc
+                .copy_scan_results(
+                    scan.id,
+                    copy_aid,
+                    repo_id,
+                    "dependency",
+                    &copy_checksum,
+                    None,
+                )
+                .await
+                .expect("copy_scan_results");
+            let target = svc
+                .create_scan_result(conv_aid, repo_id, "dependency")
+                .await
+                .expect("create target");
+            let converted = svc
+                .convert_to_reused(target.id, scan.id, conv_aid, None)
+                .await
+                .expect("convert_to_reused");
+
+            for reused in [&copied, &converted] {
+                assert_eq!(reused.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
+                assert_eq!(reused.vuln_db_published_at, Some(built));
+                let (rows, total) = svc
+                    .list_findings(reused.id, &malicious, 0, 50)
+                    .await
+                    .expect("list reused malicious");
+                assert_eq!(total, 1, "the reused copy must keep the malicious class");
+                assert_eq!(rows[0].finding_class, "malicious");
+            }
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
         /// Complete a fresh `grype` scan for `artifact_id` carrying `checksum`
         /// and `pin_identity`, returning the row id.
         async fn seed_completed_scan_with_pin(
@@ -3538,6 +3736,7 @@ mod tests {
                 chrono::Utc::now(),
                 "complete",
                 pin_identity,
+                None,
                 None,
             )
             .await
@@ -3768,6 +3967,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3849,6 +4049,7 @@ mod tests {
                 "not_cataloged",
                 None,
                 Some("grype cataloged no components; artifact contents were not recognized"),
+                None,
             )
             .await
             .expect("complete scan as not_cataloged");
@@ -3903,6 +4104,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3940,6 +4142,7 @@ mod tests {
                 Some("grype-0.80"),
                 chrono::Utc::now(),
                 "partial",
+                None,
                 None,
                 None,
             )
@@ -4263,6 +4466,7 @@ mod tests {
                     fixed_version: Some(format!("2.{i}")),
                     source: Some("trivy".into()),
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 })
                 .collect();
 
@@ -4440,6 +4644,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete legacy");
@@ -4473,6 +4678,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )
@@ -4542,6 +4748,7 @@ mod tests {
                 "complete",
                 None,
                 None,
+                None,
             )
             .await
             .expect("complete old scan");
@@ -4564,6 +4771,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
                 None,
             )

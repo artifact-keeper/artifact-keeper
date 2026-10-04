@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
+use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
@@ -3478,6 +3478,7 @@ pub(crate) fn convert_trivy_findings(
                     fixed_version: vuln.fixed_version.clone(),
                     source: Some(source_label.to_string()),
                     source_url: vuln.primary_url.clone(),
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 })
         })
         .collect()
@@ -4826,6 +4827,20 @@ pub trait Scanner: Send + Sync {
     async fn version(&self) -> Option<String> {
         None
     }
+
+    /// Best-effort identity of the vulnerability database this scanner
+    /// graded against (#3014), persisted on `scan_results.vuln_db_version` /
+    /// `vuln_db_published_at`. Distinct from [`Scanner::version`]: the same
+    /// binary returns different answers about identical bytes depending on
+    /// how old its database is.
+    ///
+    /// Called by the orchestrator right after a successful scan, like
+    /// `version()`. The default `None` is correct for scanners with no
+    /// vulnerability database (OpenSCAP) and is persisted as NULL, which
+    /// means "unknown", never "fresh".
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        None
+    }
 }
 
 /// Maximum wall-clock time we will wait for a scanner CLI's `--version`
@@ -5255,6 +5270,108 @@ pub(crate) fn format_grype_db_build(raw: &str) -> Option<String> {
                 .or_else(|| t.strip_prefix("built:"))
         })
         .and_then(db_build_date_token)
+}
+
+/// Parse a vulnerability-database timestamp as scanners print it (#3014):
+/// RFC 3339 (`2026-10-04T08:11:47Z`, grype v6 / trivy metadata) or grype v5's
+/// `2024-06-01 01:31:31 +0000 UTC`. Go's zero time (`0001-01-01T00:00:00Z`,
+/// what grype prints when no DB is installed) and anything else before the
+/// Unix epoch is rejected as "no date" rather than stored as a bogus vintage.
+pub(crate) fn parse_db_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let t = raw.trim();
+    let parsed = chrono::DateTime::parse_from_rfc3339(t)
+        .or_else(|_| {
+            chrono::DateTime::parse_from_str(
+                t.strip_suffix(" UTC").unwrap_or(t).trim(),
+                "%Y-%m-%d %H:%M:%S %z",
+            )
+        })
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    (parsed.timestamp() > 0).then_some(parsed)
+}
+
+/// `grype db status -o json` (grype >= 0.88, DB schema v6), verified against
+/// grype 0.118.0:
+/// `{"schemaVersion":"v6.1.10","from":"…","built":"2026-10-04T08:11:47Z",
+/// "path":"…","valid":true}`. With no DB installed grype prints
+/// `"schemaVersion":"","valid":false,"error":"database does not exist"`.
+#[derive(Debug, Deserialize)]
+struct GrypeDbStatusJson {
+    #[serde(default, rename = "schemaVersion")]
+    schema_version: String,
+    #[serde(default)]
+    built: String,
+    #[serde(default)]
+    valid: Option<bool>,
+}
+
+/// Parse `grype db status` output (JSON or the text form) into the scan's
+/// vulnerability-database provenance (#3014): `grype-db-<schema>` built at
+/// the DB's `built` timestamp.
+///
+/// The text form (all grype releases; `-o json` is newer) is
+/// `Schema:    v6.1.10` / `Built:     2026-10-04T08:11:47Z` /
+/// `Status:    valid`, with v5 printing `Schema: 5` and
+/// `Built: 2024-06-01 01:31:31 +0000 UTC`. Returns `None` for an invalid or
+/// missing DB (no schema, or `valid: false` / `Status: invalid`): a scan
+/// against no database must not be recorded as having had one.
+pub(crate) fn parse_grype_db_status(raw: &str) -> Option<VulnDbProvenance> {
+    let (schema, built, valid) = match serde_json::from_str::<GrypeDbStatusJson>(raw.trim()) {
+        Ok(json) => (json.schema_version, json.built, json.valid.unwrap_or(true)),
+        Err(_) => {
+            let field = |name: &str| {
+                raw.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| v.trim().to_string())
+                })
+            };
+            let valid = field("Status").is_none_or(|s| s.eq_ignore_ascii_case("valid"));
+            (
+                field("Schema").unwrap_or_default(),
+                field("Built").unwrap_or_default(),
+                valid,
+            )
+        }
+    };
+    let schema = schema.trim();
+    if !valid || schema.is_empty() {
+        return None;
+    }
+    let schema = if schema.starts_with('v') {
+        schema.to_string()
+    } else {
+        format!("v{schema}")
+    };
+    VulnDbProvenance::new(format!("grype-db-{schema}"), parse_db_timestamp(&built))
+}
+
+/// Trivy's vulnerability-DB metadata as the scanner-adapter reports it
+/// (#3014): the `VulnerabilityDB` block of `trivy version --format json`,
+/// which is the content of `<cache>/db/metadata.json`, verified against
+/// trivy 0.71.2: `{"Version":2,"NextUpdate":"…","UpdatedAt":
+/// "2026-10-04T19:39:34.715623444Z","DownloadedAt":"…"}`. The adapter
+/// forwards it under `vulnerability_db` with snake_case keys.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdapterVulnDb {
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl AdapterVulnDb {
+    /// `trivy-db-v<schema>` updated at `UpdatedAt`. `None` when the adapter
+    /// sent no schema version (an older adapter, or no DB metadata).
+    pub fn provenance(&self) -> Option<VulnDbProvenance> {
+        let version = self.version.filter(|v| *v > 0)?;
+        VulnDbProvenance::new(
+            format!("trivy-db-v{version}"),
+            self.updated_at.as_deref().and_then(parse_db_timestamp),
+        )
+    }
 }
 
 /// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
@@ -6372,6 +6489,16 @@ impl DependencyScanner {
             .or_else(|| advisory.id.starts_with("CVE-").then(|| advisory.id.clone()))
     }
 
+    /// What kind of finding an advisory produces (#3013): `malicious` when
+    /// its id or an alias is an OSV malicious-package record (`MAL-*`, the
+    /// ossf/malicious-packages feed OSV ingests), `vulnerability` otherwise.
+    fn class_of(advisory: &AdvisoryMatch) -> crate::models::security::FindingClass {
+        crate::models::security::FindingClass::from_advisory_ids(
+            std::iter::once(advisory.id.as_str())
+                .chain(advisory.aliases.iter().map(String::as_str)),
+        )
+    }
+
     pub fn new(advisory: Arc<AdvisoryClient>) -> Self {
         Self { advisory, db: None }
     }
@@ -6914,6 +7041,17 @@ impl Scanner for DependencyScanner {
         "dependency"
     }
 
+    /// The advisory feeds are live APIs, not a local snapshot, so the honest
+    /// database "version" is which feeds were consulted and the honest date
+    /// is the query time (#3014). Answers served from the advisory cache are
+    /// at most `CACHE_TTL` older than this.
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        Some(live_advisory_provenance(
+            self.advisory.github_token.is_some(),
+            chrono::Utc::now(),
+        ))
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
@@ -7087,6 +7225,11 @@ impl Scanner for DependencyScanner {
                     if survivor.cve_id.is_none() {
                         survivor.cve_id = Self::cve_of(&advisory_match);
                     }
+                    // #3013: a duplicate that is a `MAL-` record must still
+                    // mark the surviving finding malicious.
+                    survivor.finding_class = survivor
+                        .finding_class
+                        .most_severe(Self::class_of(&advisory_match));
                     for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
                         seen_ids.entry(dep_key(id)).or_insert(idx);
                     }
@@ -7098,6 +7241,7 @@ impl Scanner for DependencyScanner {
                 }
 
                 let cve_id = Self::cve_of(&advisory_match);
+                let finding_class = Self::class_of(&advisory_match);
 
                 let title = advisory_match
                     .summary
@@ -7170,6 +7314,7 @@ impl Scanner for DependencyScanner {
                     fixed_version: advisory_match.fixed_version,
                     source: Some(source),
                     source_url: advisory_match.source_url,
+                    finding_class,
                 });
             }
         }
@@ -7180,6 +7325,23 @@ impl Scanner for DependencyScanner {
             scan_completeness: completeness_for_feeds(feeds_degraded),
             cataloged: None,
         })
+    }
+}
+
+/// Database provenance for the live-API dependency scanner (#3014): which
+/// feeds answered (`live:osv`, plus `+ghsa` when the GitHub Advisory feed is
+/// configured) stamped with the query time.
+pub(crate) fn live_advisory_provenance(
+    github_feed: bool,
+    queried_at: chrono::DateTime<chrono::Utc>,
+) -> crate::models::security::VulnDbProvenance {
+    crate::models::security::VulnDbProvenance {
+        version: if github_feed {
+            "live:osv+ghsa".to_string()
+        } else {
+            "live:osv".to_string()
+        },
+        published_at: Some(queried_at),
     }
 }
 
@@ -8287,6 +8449,9 @@ impl ScannerService {
                     // nullable and the silent-success migration (075) treats
                     // NULL as "legacy / unknown" rather than as a hard error.
                     let scanner_version = scanner.version().await;
+                    // #3014: and the vulnerability database it graded
+                    // against, probed at the same moment for the same reason.
+                    let vuln_db = scanner.vuln_db().await;
 
                     // Persist findings
                     self.scan_result_service
@@ -8424,6 +8589,7 @@ impl ScannerService {
                             // verdict so future reuse can require a match.
                             pin_identity.as_deref(),
                             written_reason.as_deref(),
+                            vuln_db.as_ref(),
                         )
                         .await?;
                     catalog_set.record_completed(
@@ -8457,13 +8623,14 @@ impl ScannerService {
                     }
 
                     info!(
-                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, completeness={}",
+                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, vuln_db={:?}, completeness={}",
                         scanner.name(),
                         artifact_id,
                         total,
                         critical,
                         high,
                         scanner_version,
+                        vuln_db.as_ref().map(|p| p.version.as_str()),
                         written_completeness.as_str(),
                     );
 
@@ -9696,6 +9863,7 @@ pub(crate) mod test_helpers {
                             fixed_version: None,
                             source: Some("grype".to_string()),
                             source_url: None,
+                            finding_class: crate::models::security::FindingClass::Vulnerability,
                         }],
                     ))
                 }
@@ -16424,6 +16592,93 @@ tonic-build = "0.12"
             assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
         }
 
+        /// #3013: an OSV `MAL-*` record (ossf/malicious-packages) is a
+        /// malicious package, not a weakness, and must be persisted as such;
+        /// an ordinary advisory in the same batch stays a vulnerability.
+        #[tokio::test]
+        async fn test_mal_advisory_is_classed_malicious() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [{
+                            "id": "MAL-2024-1234",
+                            "summary": "Malicious code in evil-pkg (PyPI)",
+                            "affected": [{ "ranges": [{ "events": [{ "introduced": "0" }] }] }]
+                        }] },
+                        { "vulns": [pillow_advisory()] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"evil-pkg==1.0.0\npillow==10.0.0\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 2);
+            let class_of = |component: &str| {
+                out.findings
+                    .iter()
+                    .find(|f| f.affected_component.as_deref() == Some(component))
+                    .map(|f| f.finding_class)
+            };
+            assert_eq!(
+                class_of("evil-pkg"),
+                Some(crate::models::security::FindingClass::Malicious)
+            );
+            assert_eq!(
+                class_of("pillow"),
+                Some(crate::models::security::FindingClass::Vulnerability)
+            );
+        }
+
+        /// #3013: when the `MAL-` record arrives as a duplicate of an advisory
+        /// already reported for the same dependency (it aliases it), the
+        /// surviving finding must still become malicious; the collapse must
+        /// not launder it back into an ordinary vulnerability.
+        #[tokio::test]
+        async fn test_mal_duplicate_marks_the_surviving_finding_malicious() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [
+                            { "id": "GHSA-aaaa-bbbb-cccc", "summary": "Embedded malware" },
+                            {
+                                "id": "MAL-2025-42",
+                                "summary": "Malicious code in typo-pkg (PyPI)",
+                                "aliases": ["GHSA-aaaa-bbbb-cccc"]
+                            }
+                        ] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"typo-pkg==0.0.1\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 1, "the alias collapses to one finding");
+            assert_eq!(
+                out.findings[0].finding_class,
+                crate::models::security::FindingClass::Malicious
+            );
+        }
+
         /// The same positional discipline in the cache. Caching a whole
         /// batch's matches under every dependency's key would make an
         /// unrelated package inherit its batch-mate's CVE on its next scan.
@@ -17175,6 +17430,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 
@@ -17322,6 +17578,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: source.map(str::to_string),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 
@@ -18604,6 +18861,7 @@ tonic-build = "0.12"
             fixed_version: Some("1.0.1".to_string()),
             source: Some("trivy".to_string()),
             source_url: Some("https://trivy.dev/vuln/CVE-2024-0001".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "critical");
@@ -18628,6 +18886,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "info");
@@ -18672,6 +18931,7 @@ tonic-build = "0.12"
             fixed_version: Some("2.0.1".to_string()),
             source: Some("grype".to_string()),
             source_url: Some("https://example.com".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let cloned = finding.clone();
         assert_eq!(cloned.severity, finding.severity);
@@ -22424,6 +22684,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }];
         let out = ScanOutput::findings_only(findings);
         assert_eq!(out.findings.len(), 1);
@@ -23217,6 +23478,7 @@ tonic-build = "0.12"
                         fixed_version: Some("5.4".to_string()),
                         source: Some("grype".to_string()),
                         source_url: None,
+                        finding_class: crate::models::security::FindingClass::Vulnerability,
                     }])),
                 }
             }
@@ -25103,6 +25365,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         // Three catalog entries for the uploaded component (pin + shipped
         // lockfile + staged shrinkwrap) plus one genuine transitive at a
@@ -25186,6 +25449,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
 
         let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
@@ -25317,6 +25581,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         })
         .collect();
 
@@ -25483,6 +25748,7 @@ tonic-build = "0.12"
                 fixed_version: None,
                 source: Some("grype".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }],
         });
         let service = scanner_service_with(&fx, scanner.clone());
@@ -26567,6 +26833,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.0.1".to_string()),
                 source: Some("test".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -26866,7 +27133,12 @@ tonic-build = "0.12"
 
             // Findings retrievable via the same read path the API uses.
             let (findings, total) = ScanResultService::new(fx.pool.clone())
-                .list_findings(scan_id, None, None, None, 0, 50)
+                .list_findings(
+                    scan_id,
+                    &crate::services::scan_result_service::FindingListFilter::default(),
+                    0,
+                    50,
+                )
                 .await
                 .expect("list findings");
             assert_eq!(total, 2);
@@ -28141,6 +28413,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.26.5".to_string()),
                 source: Some("osv (conda alias)".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -28157,6 +28430,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.26.5".to_string()),
                 source: Some("grype".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -30279,5 +30553,174 @@ tonic-build = "0.12"
                 ecosystem: ecosystem.to_string(),
             }
         }
+    }
+}
+
+/// Vulnerability-database provenance parsing (#3014). Fixtures are verbatim
+/// output of grype 0.118.0 and trivy 0.71.2.
+#[cfg(test)]
+mod vuln_db_provenance_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const GRYPE_STATUS_JSON: &str = r#"{
+ "schemaVersion": "v6.1.10",
+ "from": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10_2026-10-04T01:12:18Z_1791101507.tar.zst?checksum=sha256%3A2bd8",
+ "built": "2026-10-04T08:11:47Z",
+ "path": "/gc/6/vulnerability.db",
+ "valid": true
+}"#;
+
+    const GRYPE_STATUS_TEXT: &str = "Path:      /gc/6/vulnerability.db\n\
+Schema:    v6.1.10\n\
+Built:     2026-10-04T08:11:47Z\n\
+From:      https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10.tar.zst\n\
+Status:    valid\n";
+
+    const GRYPE_NO_DB_JSON: &str = r#"{
+ "schemaVersion": "",
+ "path": "/.cache/grype/db/6/vulnerability.db",
+ "valid": false,
+ "error": "database does not exist"
+}"#;
+
+    const GRYPE_NO_DB_TEXT: &str = "Path:      /.cache/grype/db/6/vulnerability.db\n\
+Schema:    \n\
+Built:     0001-01-01T00:00:00Z\n\
+Status:    invalid\n";
+
+    fn built() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 4, 8, 11, 47)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn grype_json_status_yields_schema_and_build_date() {
+        let p = parse_grype_db_status(GRYPE_STATUS_JSON).expect("valid DB");
+        assert_eq!(p.version, "grype-db-v6.1.10");
+        assert_eq!(p.published_at, Some(built()));
+    }
+
+    #[test]
+    fn grype_text_status_matches_json_status() {
+        assert_eq!(
+            parse_grype_db_status(GRYPE_STATUS_TEXT),
+            parse_grype_db_status(GRYPE_STATUS_JSON)
+        );
+    }
+
+    #[test]
+    fn grype_v5_text_status_is_understood() {
+        let raw = "Location:  /root/.cache/grype/db/5\n\
+Built:     2024-06-01 01:31:31 +0000 UTC\n\
+Schema:    5\n\
+Checksum:  sha256:abc\n\
+Status:    valid\n";
+        let p = parse_grype_db_status(raw).expect("valid v5 DB");
+        assert_eq!(p.version, "grype-db-v5");
+        assert_eq!(
+            p.published_at,
+            chrono::Utc.with_ymd_and_hms(2024, 6, 1, 1, 31, 31).single()
+        );
+    }
+
+    #[test]
+    fn grype_without_a_db_records_no_provenance() {
+        assert_eq!(parse_grype_db_status(GRYPE_NO_DB_JSON), None);
+        assert_eq!(parse_grype_db_status(GRYPE_NO_DB_TEXT), None);
+        assert_eq!(parse_grype_db_status(""), None);
+    }
+
+    #[test]
+    fn grype_db_with_unparseable_date_keeps_the_identity() {
+        let raw = r#"{"schemaVersion":"v6.0.2","built":"yesterday","valid":true}"#;
+        let p = parse_grype_db_status(raw).expect("schema present");
+        assert_eq!(p.version, "grype-db-v6.0.2");
+        assert_eq!(p.published_at, None);
+    }
+
+    #[test]
+    fn db_timestamp_rejects_zero_time_and_garbage() {
+        assert_eq!(parse_db_timestamp("0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_db_timestamp("not a date"), None);
+        assert_eq!(parse_db_timestamp(""), None);
+        assert_eq!(parse_db_timestamp(" 2026-10-04T08:11:47Z "), Some(built()));
+    }
+
+    #[test]
+    fn adapter_trivy_metadata_becomes_trivy_db_provenance() {
+        // The `vulnerability_db` block the scanner-adapter attaches, built
+        // from trivy 0.71.2's metadata.json.
+        let db: AdapterVulnDb = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "updated_at": "2026-10-04T19:39:34.715623444Z",
+            "next_update": "2026-10-05T19:39:34.715623193Z",
+            "downloaded_at": "2026-10-04T20:29:13.47226236Z"
+        }))
+        .unwrap();
+        let p = db.provenance().expect("schema present");
+        assert_eq!(p.version, "trivy-db-v2");
+        let ts = p.published_at.expect("updated_at parsed");
+        assert_eq!(ts.to_rfc3339(), "2026-10-04T19:39:34.715623444+00:00");
+    }
+
+    #[test]
+    fn adapter_metadata_without_schema_is_no_provenance() {
+        assert_eq!(AdapterVulnDb::default().provenance(), None);
+        let zero = AdapterVulnDb {
+            version: Some(0),
+            updated_at: Some("2026-10-04T19:39:34Z".into()),
+        };
+        assert_eq!(zero.provenance(), None);
+    }
+
+    #[test]
+    fn live_advisory_provenance_names_the_feeds_and_the_query_time() {
+        let at = built();
+        let osv = live_advisory_provenance(false, at);
+        assert_eq!(osv.version, "live:osv");
+        assert_eq!(osv.published_at, Some(at));
+        assert_eq!(live_advisory_provenance(true, at).version, "live:osv+ghsa");
+    }
+
+    #[tokio::test]
+    async fn dependency_scanner_reports_live_provenance() {
+        let before = chrono::Utc::now();
+        let scanner = DependencyScanner::new(Arc::new(AdvisoryClient::new(None)));
+        let p = scanner.vuln_db().await.expect("live feeds always report");
+        assert_eq!(p.version, "live:osv");
+        assert!(p.published_at.expect("query time") >= before);
+
+        let with_gh =
+            DependencyScanner::new(Arc::new(AdvisoryClient::new(Some("ghp_test".into()))));
+        assert_eq!(
+            with_gh.vuln_db().await.map(|p| p.version),
+            Some("live:osv+ghsa".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn scanners_without_a_database_default_to_none() {
+        struct NoDb;
+        #[async_trait]
+        impl Scanner for NoDb {
+            fn name(&self) -> &str {
+                "no-db"
+            }
+            fn scan_type(&self) -> &str {
+                "openscap"
+            }
+            async fn scan(
+                &self,
+                _artifact: &Artifact,
+                _metadata: Option<&ArtifactMetadata>,
+                _content: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+        assert_eq!(NoDb.vuln_db().await, None);
     }
 }

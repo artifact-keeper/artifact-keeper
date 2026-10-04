@@ -224,6 +224,11 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
 /// `scan_findings.severity` values every writer normalizes to.
 pub(crate) const KNOWN_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 
+/// Canonical finding-class vocabulary for the findings filter (#3013),
+/// matching the `scan_findings.finding_class` CHECK (migration 260) and
+/// [`crate::models::security::FindingClass::as_str`].
+pub(crate) const KNOWN_FINDING_CLASSES: &[&str] = &["vulnerability", "malicious", "policy"];
+
 /// Longest accepted value for the free-text findings filters (`source`,
 /// `cve_id`). Both columns are `VARCHAR(100)`, so anything longer cannot match
 /// a stored row and is rejected rather than run as a guaranteed-empty query.
@@ -329,6 +334,16 @@ pub struct ScanResponse {
     /// Why the scan is not `complete`, when known (e.g. which scanner
     /// cataloged nothing). `None` for complete scans.
     pub scan_completeness_reason: Option<String>,
+    /// Vulnerability database the scan ran against (#3014), distinct from
+    /// `scanner_version` (the binary): e.g. `trivy-db-v2`, `grype-db-v6.1.10`,
+    /// or `live:osv` / `live:osv+ghsa` for the dependency scanner, which
+    /// queries live advisory APIs. `null` when the scan type has no database
+    /// or the scan predates this field. A reused scan reports its source's.
+    #[schema(example = "grype-db-v6.1.10")]
+    pub vuln_db_version: Option<String>,
+    /// When that database was built / last updated (#3014); for a live-API
+    /// scanner, the query time. `null` means unknown, never fresh.
+    pub vuln_db_published_at: Option<chrono::DateTime<chrono::Utc>>,
     /// #2471: number of `not_applicable` scanner rows folded into this row.
     /// `Some(n)` marks a synthetic *summary* row that collapses `n` redundant
     /// "this scanner does not apply" results (e.g. the image-family scanners
@@ -393,6 +408,8 @@ impl ScanResponse {
             source_scan_id: s.source_scan_id,
             scan_completeness: s.scan_completeness,
             scan_completeness_reason: s.scan_completeness_reason,
+            vuln_db_version: s.vuln_db_version,
+            vuln_db_published_at: s.vuln_db_published_at,
             collapsed_not_applicable_count: None,
             collapsed_scan_types: None,
         }
@@ -493,6 +510,7 @@ impl From<crate::models::security::ScanFinding> for FindingResponse {
             acknowledged_reason: f.acknowledged_reason,
             acknowledged_at: f.acknowledged_at,
             created_at: f.created_at,
+            finding_class: f.finding_class,
         }
     }
 }
@@ -606,24 +624,29 @@ pub struct ListFindingsQuery {
     /// Matched exactly against `scan_findings.cve_id`.
     #[param(example = "CVE-2024-3094")]
     pub cve_id: Option<String>,
+    /// Restrict the listing to one finding class (#3013): `vulnerability`,
+    /// `malicious` or `policy`. Validated against [`KNOWN_FINDING_CLASSES`];
+    /// an unrecognized token is a `400`.
+    #[param(example = "malicious")]
+    pub finding_class: Option<String>,
     pub page: Option<i64>,
     pub per_page: Option<i64>,
 }
 
-/// The filters [`ListFindingsQuery`] contributes to the findings listing,
-/// validated.
-struct FindingFilters<'a> {
-    severity: Option<&'a str>,
-    source: Option<&'a str>,
-    cve_id: Option<&'a str>,
-}
-
 impl ListFindingsQuery {
-    fn validated_filters(&self) -> Result<FindingFilters<'_>> {
-        Ok(FindingFilters {
+    /// The filters this query contributes to the findings listing, validated.
+    fn validated_filters(
+        &self,
+    ) -> Result<crate::services::scan_result_service::FindingListFilter<'_>> {
+        Ok(crate::services::scan_result_service::FindingListFilter {
             severity: validate_enum_filter(self.severity.as_ref(), KNOWN_SEVERITIES, "severity")?,
             source: validate_text_filter(self.source.as_ref(), "source")?,
             cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id")?,
+            finding_class: validate_enum_filter(
+                self.finding_class.as_ref(),
+                KNOWN_FINDING_CLASSES,
+                "finding_class",
+            )?,
         })
     }
 }
@@ -653,6 +676,11 @@ pub struct FindingResponse {
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// What kind of finding this is (#3013): `vulnerability` (a known
+    /// weakness), `malicious` (the package itself is known to be hostile,
+    /// e.g. an OSV `MAL-*` advisory) or `policy` (a compliance rule failure).
+    #[schema(example = "vulnerability")]
+    pub finding_class: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1163,14 +1191,7 @@ async fn list_findings(
     let offset = (page - 1) * per_page;
 
     let (findings, total) = svc
-        .list_findings(
-            scan_id,
-            filters.severity,
-            filters.source,
-            filters.cve_id,
-            offset,
-            per_page,
-        )
+        .list_findings(scan_id, &filters, offset, per_page)
         .await?;
 
     let items: Vec<FindingResponse> = findings.into_iter().map(FindingResponse::from).collect();
@@ -1315,6 +1336,7 @@ fn build_external_findings(
                 fixed_version: f.fixed_version,
                 source: Some(f.source.unwrap_or_else(|| scanner.to_string())),
                 source_url: f.source_url,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             })
         })
         .collect()
@@ -5412,6 +5434,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         }
     }
 
@@ -5437,6 +5461,50 @@ mod tests {
         assert_eq!(resp.error_message, None);
         assert_eq!(resp.artifact_name, Some("my-artifact".to_string()));
         assert_eq!(resp.artifact_version, Some("1.0.0".to_string()));
+        assert_eq!(resp.vuln_db_version, None);
+    }
+
+    /// #3014: the vulnerability-DB provenance reaches the scan API.
+    #[test]
+    fn test_scan_response_carries_vuln_db_provenance() {
+        let built = chrono::Utc::now();
+        let scan = ScanResult {
+            vuln_db_version: Some("trivy-db-v2".to_string()),
+            vuln_db_published_at: Some(built),
+            ..make_scan_result()
+        };
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(resp.vuln_db_version.as_deref(), Some("trivy-db-v2"));
+        assert_eq!(resp.vuln_db_published_at, Some(built));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["vuln_db_version"], "trivy-db-v2");
+    }
+
+    /// #3013: the persisted class reaches the findings API.
+    #[test]
+    fn test_finding_response_carries_finding_class() {
+        let finding = crate::models::security::ScanFinding {
+            id: Uuid::new_v4(),
+            scan_result_id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            severity: "medium".to_string(),
+            title: "Malicious code in evil-pkg (PyPI)".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: Some("evil-pkg".to_string()),
+            affected_version: Some("1.0.0".to_string()),
+            fixed_version: None,
+            source: Some("osv".to_string()),
+            source_url: None,
+            is_acknowledged: false,
+            acknowledged_by: None,
+            acknowledged_reason: None,
+            acknowledged_at: None,
+            created_at: chrono::Utc::now(),
+            finding_class: "malicious".to_string(),
+        };
+        let json = serde_json::to_value(FindingResponse::from(finding)).unwrap();
+        assert_eq!(json["finding_class"], "malicious");
     }
 
     #[test]
@@ -5462,6 +5530,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.artifact_name, None);
@@ -5498,6 +5568,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, Some("lib".to_string()), None);
         assert_eq!(resp.findings_count, 100);
@@ -5532,6 +5604,8 @@ mod tests {
             source_scan_id: Some(source_id),
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, Some("artifact".into()), None);
         assert!(resp.is_reused);
@@ -5572,6 +5646,8 @@ mod tests {
             source_scan_id: Some(source_id),
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(
@@ -6675,6 +6751,7 @@ mod tests {
             acknowledged_reason: None,
             acknowledged_at: None,
             created_at: now,
+            finding_class: "vulnerability".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["severity"], "critical");
@@ -6706,6 +6783,7 @@ mod tests {
             acknowledged_reason: Some("False positive".to_string()),
             acknowledged_at: Some(now),
             created_at: now,
+            finding_class: "vulnerability".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["is_acknowledged"], true);
@@ -7259,6 +7337,36 @@ mod tests {
         let findings = ListFindingsQuery::default();
         let f = findings.validated_filters().unwrap();
         assert!(f.severity.is_none() && f.source.is_none() && f.cve_id.is_none());
+        assert!(f.finding_class.is_none());
+    }
+
+    /// #3013: the `finding_class` filter is a closed vocabulary that matches
+    /// the DB CHECK exactly; a typo is a 400, never an unfiltered page.
+    #[test]
+    fn test_finding_class_filter_accepts_vocabulary_and_rejects_typos() {
+        assert_eq!(
+            KNOWN_FINDING_CLASSES,
+            crate::models::security::FindingClass::ALL
+                .map(crate::models::security::FindingClass::as_str)
+                .as_slice()
+        );
+        for class in KNOWN_FINDING_CLASSES {
+            let q = ListFindingsQuery {
+                finding_class: Some(class.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(q.validated_filters().unwrap().finding_class, Some(*class));
+        }
+        for bad in ["Malicious", "malware", ""] {
+            let q = ListFindingsQuery {
+                finding_class: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(q.validated_filters(), Err(AppError::Validation(_))),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -7543,6 +7651,7 @@ mod tests {
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let counts = tally_severities(&[
             f(Severity::Critical),

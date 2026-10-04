@@ -646,6 +646,10 @@ pub struct GrypeScanner {
     /// does not pay an extra subprocess; failed probes expire after 60s so
     /// the field starts populating once the binary becomes available.
     cached_version: VersionCache,
+    /// Raw `grype db status` output (#3014), cached on the same hit/miss TTLs
+    /// as `cached_version` and parsed into the scan's vulnerability-database
+    /// provenance by [`crate::services::scanner_service::parse_grype_db_status`].
+    cached_db_status: VersionCache,
     /// Optional token minter for private-repo registry pulls (#2093). When
     /// wired, a registry-mode scan of a known repository injects a short-lived,
     /// single-repo-scoped JWT into grype's child process via
@@ -886,6 +890,7 @@ impl GrypeScanner {
         Self {
             scan_workspace,
             cached_version: VersionCache::new(),
+            cached_db_status: VersionCache::new(),
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,
@@ -1617,6 +1622,7 @@ impl GrypeScanner {
                         .urls
                         .as_ref()
                         .and_then(|u| u.first().cloned()),
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }
             })
             .collect()
@@ -1895,6 +1901,29 @@ impl Scanner for GrypeScanner {
             ))
         })
         .await
+    }
+
+    /// Vulnerability-database provenance from `grype db status` (#3014):
+    /// `grype-db-<schema>` built at the DB's `built` timestamp. Probes the
+    /// JSON form first and falls back to the text form for grype releases
+    /// that predate `-o json`. `None` when no valid DB is installed.
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        let raw = cached_cli_version(&self.cached_db_status, || async {
+            match crate::services::scanner_service::capture_cli_output(
+                "grype",
+                &["db", "status", "-o", "json"],
+            )
+            .await
+            {
+                Some(json) => Some(json),
+                None => {
+                    crate::services::scanner_service::capture_cli_output("grype", &["db", "status"])
+                        .await
+                }
+            }
+        })
+        .await?;
+        crate::services::scanner_service::parse_grype_db_status(&raw)
     }
 
     async fn scan(

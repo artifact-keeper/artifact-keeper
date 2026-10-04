@@ -69,6 +69,9 @@ pub(crate) struct TrivyEngine {
     /// Trivy version reported by the scanner-adapter on the most recent
     /// successful scan (adapter mode); there is no local binary to probe.
     adapter_version: std::sync::Mutex<Option<String>>,
+    /// Trivy vulnerability-DB provenance the adapter reported on the most
+    /// recent successful scan (#3014). Always `None` in CLI mode.
+    adapter_vuln_db: std::sync::Mutex<Option<crate::models::security::VulnDbProvenance>>,
 }
 
 impl TrivyEngine {
@@ -89,6 +92,7 @@ impl TrivyEngine {
         Self {
             backend,
             adapter_version: std::sync::Mutex::new(None),
+            adapter_vuln_db: std::sync::Mutex::new(None),
         }
     }
 
@@ -109,6 +113,16 @@ impl TrivyEngine {
                 crate::services::scanner_service::cached_trivy_cli_version(cli_cache).await
             }
             TrivyFsBackend::Adapter(_) => self.adapter_version.lock().ok().and_then(|g| g.clone()),
+        }
+    }
+
+    /// Vulnerability-DB provenance for `scan_results` (#3014): what the
+    /// adapter reported on the last successful scan. `None` in legacy CLI
+    /// mode, where the DB lives behind `trivy --server` and is not probed.
+    pub fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        match &self.backend {
+            TrivyFsBackend::Cli { .. } => None,
+            TrivyFsBackend::Adapter(_) => self.adapter_vuln_db.lock().ok().and_then(|g| g.clone()),
         }
     }
 
@@ -134,6 +148,12 @@ impl TrivyEngine {
                 *guard = Some(normalized);
             }
         }
+        if let Ok(mut guard) = self.adapter_vuln_db.lock() {
+            *guard = body
+                .vulnerability_db
+                .as_ref()
+                .and_then(|db| db.provenance());
+        }
         Ok((body.report, body.stderr))
     }
 }
@@ -149,6 +169,10 @@ pub(crate) struct FsScanReportBody {
     /// Adapter-probed trivy version (e.g. `0.71.2`) for provenance.
     #[serde(default)]
     pub scanner_version: Option<String>,
+    /// Trivy vulnerability-DB metadata the scan ran against (#3014); absent
+    /// from adapters older than this field.
+    #[serde(default)]
+    pub vulnerability_db: Option<crate::services::scanner_service::AdapterVulnDb>,
 }
 
 #[derive(Debug, serde::Deserialize)]

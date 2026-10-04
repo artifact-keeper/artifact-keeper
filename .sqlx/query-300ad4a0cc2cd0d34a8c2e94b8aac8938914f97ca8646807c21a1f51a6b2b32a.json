@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, scan_result_id, artifact_id, severity, title, description,\n                   cve_id, affected_component, affected_version, fixed_version,\n                   source, source_url, is_acknowledged, acknowledged_by,\n                   acknowledged_reason, acknowledged_at, created_at\n            FROM scan_findings\n            WHERE scan_result_id = $1\n              AND ($2::text IS NULL OR severity = $2)\n              AND ($3::text IS NULL OR source = $3)\n              AND ($4::text IS NULL OR cve_id = $4)\n            ORDER BY\n                CASE severity\n                    WHEN 'critical' THEN 0\n                    WHEN 'high' THEN 1\n                    WHEN 'medium' THEN 2\n                    WHEN 'low' THEN 3\n                    WHEN 'info' THEN 4\n                END,\n                created_at DESC\n            LIMIT $5 OFFSET $6\n            ",
+  "query": "\n            UPDATE scan_findings\n            SET is_acknowledged = true, acknowledged_by = $2,\n                acknowledged_reason = $3, acknowledged_at = NOW()\n            WHERE id = $1\n            RETURNING id, scan_result_id, artifact_id, severity, title, description,\n                      cve_id, affected_component, affected_version, fixed_version,\n                      source, source_url, is_acknowledged, acknowledged_by,\n                      acknowledged_reason, acknowledged_at, created_at, finding_class\n            ",
   "describe": {
     "columns": [
       {
@@ -189,16 +189,24 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 17,
+        "name": "finding_class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "finding_class"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Int8",
-        "Int8"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
@@ -218,8 +226,9 @@
       true,
       true,
       true,
+      false,
       false
     ]
   },
-  "hash": "5c26ab3fdcaf7040df63079854dc7799b82474e5dd7dcce67a8511b1bdf971e7"
+  "hash": "300ad4a0cc2cd0d34a8c2e94b8aac8938914f97ca8646807c21a1f51a6b2b32a"
 }

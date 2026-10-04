@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,\n                description, cve_id, affected_component, affected_version, fixed_version,\n                source, source_url, finding_class)\n            SELECT $1, $2, severity, title, description,\n                   cve_id, affected_component, affected_version, fixed_version,\n                   source, source_url, finding_class\n            FROM UNNEST(\n                $3::text[],\n                $4::text[],\n                $5::text[],\n                $6::text[],\n                $7::text[],\n                $8::text[],\n                $9::text[],\n                $10::text[],\n                $11::text[],\n                $12::text[]\n            ) AS t(severity, title, description, cve_id, affected_component,\n                   affected_version, fixed_version, source, source_url, finding_class)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4b614d4cade563b50c72dd84f1b5de79debb8e273609264d76f28ccb106f8d7d"
+}

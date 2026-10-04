@@ -249,6 +249,12 @@ impl Scanner for TrivyFsScanner {
         self.engine.version(&self.cached_version).await
     }
 
+    /// Adapter mode: the trivy DB provenance the adapter reported on the last
+    /// successful scan (#3014). CLI mode: `None`.
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        self.engine.vuln_db()
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
