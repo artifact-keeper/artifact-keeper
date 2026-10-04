@@ -866,12 +866,15 @@ impl ArtifactService {
         // idempotent on identical-bytes re-uploads and (b) backfill the
         // pre-existing HEAD as revision 1 on the first versioned write to a
         // coordinate that predates the feature.
-        let versioning_active = self
-            .repo_service
-            .get_by_id(repository_id)
-            .await
-            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
-            .unwrap_or(false);
+        let repo_for_upload = self.repo_service.get_by_id(repository_id).await.ok();
+        let versioning_active = repo_for_upload
+            .as_ref()
+            .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
+        // #2382: `.safetensors` uploads to Mlmodel repos get their header
+        // summarised into `artifact_metadata` once the row exists.
+        let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
+            crate::formats::mlmodel::safetensors_metadata_eligible(&r.format, path)
+        });
         let prior_head = if versioning_active {
             sqlx::query_as::<_, PriorHeadRow>(
                 "SELECT name, version, size_bytes, checksum_sha256, checksum_sha1, \
@@ -974,6 +977,17 @@ impl ArtifactService {
         // `version` coordinate doubles as the human `version_label`.
         if versioning_active {
             self.record_version(&artifact, prior_head, version).await?;
+        }
+
+        if safetensors_eligible {
+            record_safetensors_metadata(
+                &self.db,
+                self.storage.as_ref(),
+                artifact.id,
+                storage_key,
+                size_bytes,
+            )
+            .await;
         }
 
         // Apply quarantine hold if enabled for this repository. This is the
@@ -2742,6 +2756,55 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(sanitize_metadata_urls).collect())
         }
         other => other,
+    }
+}
+
+/// Extract and record the safetensors header summary of a freshly stored
+/// Mlmodel upload (#2382) in `artifact_metadata` under format `mlmodel`.
+///
+/// Shared by the service-layer finalize path (generic `PUT` / multipart) and
+/// the chunked-upload commit, so every way a `.safetensors` file reaches an
+/// Mlmodel repository surfaces the same metadata. Reads only the length
+/// prefix and the capped header through ranged storage reads
+/// (`formats::mlmodel::read_safetensors_summary`), never the tensor data.
+///
+/// Best-effort: the upload has already committed, so a failure here is
+/// logged and never fails it. A malformed header records the rejection
+/// reason (`safetensors_error`), replacing any stale summary from earlier
+/// bytes at the same path; a storage read failure records nothing. Existing
+/// `properties` on the row are preserved.
+pub(crate) async fn record_safetensors_metadata(
+    db: &PgPool,
+    storage: &dyn StorageBackend,
+    artifact_id: Uuid,
+    storage_key: &str,
+    size_bytes: i64,
+) {
+    use crate::formats::mlmodel;
+
+    let file_size = u64::try_from(size_bytes).unwrap_or(0);
+    let result = mlmodel::read_safetensors_summary(storage, storage_key, file_size).await;
+    let Some(metadata) = mlmodel::safetensors_artifact_metadata(&result) else {
+        if let Err(e) = &result {
+            tracing::warn!(%artifact_id, error = %e, "safetensors header could not be read");
+        }
+        return;
+    };
+    if let Err(e) = &result {
+        tracing::info!(%artifact_id, reason = %e, "safetensors header rejected");
+    }
+    let stored = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'mlmodel', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET \
+             format = EXCLUDED.format, metadata = EXCLUDED.metadata",
+    )
+    .bind(artifact_id)
+    .bind(sanitize_metadata_urls(metadata))
+    .execute(db)
+    .await;
+    if let Err(e) = stored {
+        tracing::warn!(%artifact_id, error = %e, "safetensors metadata could not be recorded");
     }
 }
 
@@ -4748,6 +4811,135 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- #2382 safetensors header metadata on the finalize path -----------
+
+    /// A `.safetensors` upload to an Mlmodel repo records its header summary
+    /// in `artifact_metadata` (format `mlmodel`) with dangerous URLs in
+    /// `__metadata__` sanitised; a malformed re-upload at the same path
+    /// replaces the summary with the rejection reason while keeping the
+    /// row's properties; non-safetensors files and Generic repos record
+    /// nothing. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_safetensors_upload_to_mlmodel_repo_records_header_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::mlmodel::safetensors_fixture;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "local", "mlmodel").await;
+        // Versioning (#2367) is what lets new bytes land at an occupied
+        // Mlmodel path, which the re-upload below relies on.
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+
+        let header = serde_json::json!({
+            "__metadata__": {"format": "pt", "source_url": "javascript:alert(1)"},
+            "w": {"dtype": "F16", "shape": [4, 2], "data_offsets": [0, 16]}
+        });
+        let path = "models/tiny/versions/1/artifacts/model.safetensors";
+        let upload = |bytes: Vec<u8>| {
+            svc.upload(
+                repo_id,
+                path,
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(bytes),
+                Some(user_id),
+            )
+        };
+        let artifact = upload(safetensors_fixture(&header, 16))
+            .await
+            .expect("safetensors upload succeeds");
+        let meta = svc
+            .get_metadata(artifact.id)
+            .await
+            .unwrap()
+            .expect("metadata recorded");
+        assert_eq!(meta.format, "mlmodel");
+        let st = &meta.metadata["safetensors"];
+        assert_eq!(st["total_parameters"], 8);
+        assert_eq!(st["tensors"]["w"]["dtype"], "F16");
+        assert_eq!(st["metadata"]["format"], "pt");
+        assert_eq!(st["metadata"]["source_url"], "", "dangerous URL sanitised");
+
+        // Properties set on the row survive a re-upload; a malformed header
+        // replaces the stale summary with the rejection reason.
+        sqlx::query(
+            "UPDATE artifact_metadata SET properties = '{\"k\":\"v\"}' WHERE artifact_id = $1",
+        )
+        .bind(artifact.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut broken = 4u64.to_le_bytes().to_vec();
+        broken.extend_from_slice(b"nope-and-data");
+        let again = upload(broken)
+            .await
+            .expect("malformed upload still succeeds");
+        let meta = svc.get_metadata(again.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert!(meta.metadata["safetensors_error"]
+            .as_str()
+            .unwrap()
+            .contains("not a JSON object"));
+        assert_eq!(meta.properties["k"], "v");
+
+        // A non-safetensors file in the same repo records nothing.
+        let other = svc
+            .upload(
+                repo_id,
+                "models/tiny/versions/1/artifacts/config.json",
+                "config.json",
+                Some("1"),
+                "application/json",
+                Bytes::from_static(b"{}"),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(svc.get_metadata(other.id).await.unwrap().is_none());
+
+        // The same bytes in a Generic repo record nothing either.
+        let (generic_id, _gkey, generic_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let generic_svc = ArtifactService::new(
+            pool.clone(),
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                generic_dir.clone(),
+            )),
+        );
+        let generic = generic_svc
+            .upload(
+                generic_id,
+                "tiny/1/model.safetensors",
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(safetensors_fixture(&header, 16)),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(generic_svc
+            .get_metadata(generic.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        tdh::cleanup(&pool, generic_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&generic_dir);
     }
 
     // ---- #2367 first-class versioning: pure helpers ------------------------

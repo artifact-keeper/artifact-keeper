@@ -896,6 +896,25 @@ async fn complete_session_commit(
         }
     }
 
+    // #2382: summarise a `.safetensors` header into `artifact_metadata` from
+    // the stored object (two ranged reads, never the tensor data), as the
+    // direct upload path does in `finalize_upload`. A TRUSTED replication
+    // session's own metadata (written above) is the source row's and wins.
+    if safetensors_extraction_applies(
+        &repo.format,
+        &session.artifact_path,
+        replication_trusted && session.artifact_metadata_format.is_some(),
+    ) {
+        crate::services::artifact_service::record_safetensors_metadata(
+            &state.db,
+            storage.as_ref(),
+            artifact_id,
+            &storage_key,
+            session.total_size,
+        )
+        .await;
+    }
+
     if let Some((package_name, package_version)) =
         completed_package_catalog_entry(&session, &repo.format)
     {
@@ -1205,6 +1224,18 @@ pub(crate) async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::R
         }
     }
     Ok(prefix)
+}
+
+/// Whether the chunked commit extracts safetensors header metadata (#2382):
+/// an eligible `.safetensors` path in an Mlmodel repository, unless the
+/// session is a trusted replication carrying the source row's metadata.
+fn safetensors_extraction_applies(
+    format: &crate::models::repository::RepositoryFormat,
+    path: &str,
+    trusted_replication_metadata: bool,
+) -> bool {
+    !trusted_replication_metadata
+        && crate::formats::mlmodel::safetensors_metadata_eligible(format, path)
 }
 
 /// Whether a completed generic upload should get RPM header metadata
@@ -3914,6 +3945,62 @@ mod tests {
         );
         assert!(!stored);
         assert_eq!(rows, 0);
+    }
+
+    /// #2382: a `.safetensors` file completed through the chunked flow into
+    /// an Mlmodel repository gets its header summary recorded, exactly as
+    /// the direct upload path does.
+    #[tokio::test]
+    async fn complete_records_safetensors_header_metadata_for_mlmodel() {
+        let Some(f) = tdh::Fixture::setup("local", "mlmodel").await else {
+            return;
+        };
+        let header = serde_json::json!({
+            "w": {"dtype": "BF16", "shape": [3, 5], "data_offsets": [0, 30]}
+        });
+        let payload = crate::formats::mlmodel::safetensors_fixture(&header, 30);
+        let path = "models/tiny/versions/1/artifacts/model.safetensors";
+        let (status, body, _stored, _rows) = chunked_rpm_upload(&f, &payload, path, None).await;
+        let metadata: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT am.format, am.metadata FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        f.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (format, metadata) = metadata.expect("safetensors metadata recorded");
+        assert_eq!(format, "mlmodel");
+        assert_eq!(metadata["safetensors"]["total_parameters"], 15);
+        assert_eq!(
+            metadata["safetensors"]["tensors"]["w"]["shape"],
+            serde_json::json!([3, 5])
+        );
+    }
+
+    #[test]
+    fn safetensors_extraction_skips_trusted_replication_metadata() {
+        use crate::models::repository::RepositoryFormat;
+        let path = "models/m/versions/1/artifacts/model.safetensors";
+        assert!(safetensors_extraction_applies(
+            &RepositoryFormat::Mlmodel,
+            path,
+            false
+        ));
+        assert!(!safetensors_extraction_applies(
+            &RepositoryFormat::Mlmodel,
+            path,
+            true
+        ));
+        assert!(!safetensors_extraction_applies(
+            &RepositoryFormat::Generic,
+            path,
+            false
+        ));
     }
 
     #[tokio::test]
