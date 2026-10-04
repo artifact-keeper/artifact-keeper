@@ -55,8 +55,14 @@ pub struct ListKeysQuery {
 pub struct CreateKeyPayload {
     pub repository_id: Option<Uuid>,
     pub name: String,
-    pub key_type: Option<String>,  // default "rsa"
-    pub algorithm: Option<String>, // default "rsa4096"
+    /// Key family: `gpg` (OpenPGP; required for Debian/RPM metadata signing)
+    /// or `rsa` (X.509 keypair for raw-RSA formats such as Alpine and Conda).
+    /// `rsa2048`/`rsa4096` are accepted as aliases for `rsa`. `ed25519` is
+    /// rejected; use `gpg` with `algorithm=ed25519`. Default: `rsa`.
+    pub key_type: Option<String>,
+    /// `rsa2048`, `rsa4096`, or `ed25519` (with `key_type=gpg` only).
+    /// Default: `rsa4096`, or the `key_type` alias when that names a size.
+    pub algorithm: Option<String>,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
 }
@@ -320,6 +326,15 @@ async fn revoke_key(
 }
 
 /// Rotate a signing key — generates new key, deactivates old one.
+///
+/// The successor keeps the old key's type and algorithm and takes over the
+/// repository's signing config. For an OpenPGP (`gpg`) key the old key keeps
+/// co-signing Debian/RPM metadata, and is still served from `gpg-key.asc` /
+/// `repomd.xml.key`, for `SIGNING_KEY_ROTATION_OVERLAP_SECS` (default 14 days)
+/// so clients that only trust it keep working while the new key rolls out.
+/// **If you are rotating because the old key is compromised, revoke the old
+/// key (`POST /keys/{key_id}/revoke`) right after rotating**: that ends its
+/// overlap immediately.
 #[utoipa::path(
     post,
     path = "/keys/{key_id}/rotate",

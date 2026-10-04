@@ -5591,6 +5591,102 @@ mod upload_db_tests {
 
         f.teardown().await;
     }
+
+    /// #1329 end to end through the handlers: after a rotation, InRelease and
+    /// Release.gpg carry a signature from each key (the pre-rotation cache
+    /// entry is not reused) and gpg-key.asc serves both keys.
+    #[tokio::test]
+    async fn rotation_dual_signs_inrelease_and_serves_both_keys_1329() {
+        use pgp::composed::cleartext::CleartextSignedMessage;
+        use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
+
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(crate::services::signing_service::CreateKeyRequest {
+                repository_id: Some(f.repo_id),
+                name: format!("deb-sign-{}", f.repo_key),
+                key_type: "gpg".to_string(),
+                algorithm: crate::services::signing_service::ED25519_ALGORITHM.to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(f.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+
+        let app = f.router_with_auth(super::router());
+        let deb = minimal_deb("ak-rotate", "1.0-1", "amd64", "rotation test");
+        let uri = format!(
+            "/{}/pool/main/a/ak-rotate/ak-rotate_1.0-1_amd64.deb",
+            f.repo_key
+        );
+        let (status, _) = tdh::send(app.clone(), tdh::put(uri, Bytes::from(deb))).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let fetch = |path: &'static str| {
+            let app = app.clone();
+            let uri = format!("/{}/{}", f.repo_key, path);
+            async move {
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{path}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                String::from_utf8(body.to_vec()).unwrap()
+            }
+        };
+        let inrelease_sigs = |text: &str| {
+            CleartextSignedMessage::from_string(text)
+                .unwrap()
+                .0
+                .signatures()
+                .len()
+        };
+        let detached_sigs = |text: &str| {
+            StandaloneSignature::from_string_many(text)
+                .unwrap()
+                .0
+                .count()
+        };
+        let keys = |text: &str| SignedPublicKey::from_string_many(text).unwrap().0.count();
+
+        // Warm the signed-Release cache with the single-key signature.
+        assert_eq!(inrelease_sigs(&fetch("dists/bookworm/InRelease").await), 1);
+        assert_eq!(detached_sigs(&fetch("dists/bookworm/Release.gpg").await), 1);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 1);
+
+        let new = svc.rotate_key(key.id, None).await.expect("rotate");
+
+        let inrelease = fetch("dists/bookworm/InRelease").await;
+        assert_eq!(
+            inrelease_sigs(&inrelease),
+            2,
+            "old + new signature after rotation"
+        );
+        let msg = CleartextSignedMessage::from_string(&inrelease).unwrap().0;
+        for pem in [&key.public_key_pem, &new.public_key_pem] {
+            msg.verify(&SignedPublicKey::from_string(pem).unwrap().0)
+                .expect("each key alone verifies the dual-signed InRelease");
+        }
+        assert_eq!(detached_sigs(&fetch("dists/bookworm/Release.gpg").await), 2);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 2);
+        assert_eq!(keys(&fetch("dists/bookworm/gpg-key.asc").await), 2);
+
+        // Revoking the predecessor ends the overlap on the next request.
+        svc.revoke_key(key.id, None).await.expect("revoke");
+        assert_eq!(inrelease_sigs(&fetch("dists/bookworm/InRelease").await), 1);
+        assert_eq!(keys(&fetch("gpg-key.asc").await), 1);
+
+        f.teardown().await;
+    }
 }
 
 // ---------------------------------------------------------------------------

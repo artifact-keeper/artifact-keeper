@@ -1025,3 +1025,64 @@ async fn depth_root_repodata_is_caller_independent_4346() {
     .contains("<name>pkg</name>"));
     f.teardown().await;
 }
+
+/// #1329 through the RPM handlers: after a rotation repomd.xml.asc carries a
+/// signature from each key and repomd.xml.key serves both keys.
+#[tokio::test]
+async fn rotation_dual_signs_repomd_and_serves_both_keys_1329() {
+    use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
+
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    attach_signing_key(&f).await;
+    upload(&f, &format!("a/{RPM}"), "rotate").await;
+    let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+    let old = svc
+        .get_active_key_for_repo(f.repo_id)
+        .await
+        .unwrap()
+        .expect("attached key");
+    let base = format!("/rpm/{}/a/repodata", f.repo_key);
+    let fetch = |file: &'static str| {
+        let path = format!("{base}/{file}");
+        let f = &f;
+        async move {
+            let (status, body) = get(f, &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+    let sigs = |text: &str| {
+        StandaloneSignature::from_string_many(text)
+            .unwrap()
+            .0
+            .count()
+    };
+    let keys = |text: &str| SignedPublicKey::from_string_many(text).unwrap().0.count();
+
+    assert_eq!(sigs(&fetch("repomd.xml.asc").await), 1);
+    assert_eq!(keys(&fetch("repomd.xml.key").await), 1);
+
+    let new = svc.rotate_key(old.id, None).await.expect("rotate");
+    let repomd = fetch("repomd.xml").await;
+    let asc = fetch("repomd.xml.asc").await;
+    assert_eq!(sigs(&asc), 2);
+    assert_eq!(keys(&fetch("repomd.xml.key").await), 2);
+    let signatures: Vec<StandaloneSignature> = StandaloneSignature::from_string_many(&asc)
+        .unwrap()
+        .0
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for pem in [&old.public_key_pem, &new.public_key_pem] {
+        let public = SignedPublicKey::from_string(pem).unwrap().0;
+        assert!(
+            signatures
+                .iter()
+                .any(|sig| sig.verify(&public, repomd.as_bytes()).is_ok()),
+            "each key alone verifies the dual-signed repomd.xml"
+        );
+    }
+    f.teardown().await;
+}
