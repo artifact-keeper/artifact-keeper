@@ -457,7 +457,7 @@ pub async fn publish(
     // 4. Store every blob under an immutable, per-version prefix. The detached
     //    signature and the public key are stored AS THEY ARE NOW so a later key
     //    rotation cannot retroactively invalidate this published @N.
-    let storage_prefix = format!("curation/{repo_id}/publications/{version_number}");
+    let storage_prefix = publication_prefix(repo_id, version_number);
     let repomd_key = format!("{storage_prefix}/repodata/repomd.xml");
     let asc_key = format!("{storage_prefix}/repodata/repomd.xml.asc");
     let key_key = format!("{storage_prefix}/repodata/repomd.xml.key");
@@ -485,25 +485,17 @@ pub async fn publish(
     put_blob(storage, &key_key, public_key.into_bytes()).await?;
 
     // 5. Mark the version published and make it the repo's active publication.
-    let mut tx = db.begin().await?;
-    sqlx::query(
-        r#"UPDATE repository_versions
-           SET published_at = now(), repomd_storage_key = $2,
-               storage_prefix = $3, signature_storage_key = $4
-           WHERE id = $1"#,
+    mark_published(
+        db,
+        storage,
+        repo_id,
+        version_id,
+        version_number,
+        &storage_prefix,
+        &repomd_key,
+        &asc_key,
     )
-    .bind(version_id)
-    .bind(&repomd_key)
-    .bind(&storage_prefix)
-    .bind(&asc_key)
-    .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE repositories SET active_publication_id = $2 WHERE id = $1")
-        .bind(repo_id)
-        .bind(version_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
 
     Ok(PublishSummary {
         version_number,
@@ -513,9 +505,90 @@ pub async fn publish(
     })
 }
 
+/// Mark `version_id` published under `storage_prefix` and make it the
+/// repository's active publication.
+///
+/// The repository row is locked FIRST, in the same order the version retention
+/// pass takes its locks (#2359), so the two cannot deadlock. If retention
+/// pruned this version while its blobs were being written, the UPDATE matches
+/// no row: remove the repodata just stored and fail with 409, rather than leave
+/// an unreachable prefix behind or point `active_publication_id` at a deleted
+/// version.
+#[allow(clippy::too_many_arguments)]
+async fn mark_published(
+    db: &PgPool,
+    storage: &dyn StorageBackend,
+    repo_id: Uuid,
+    version_id: Uuid,
+    version_number: i64,
+    storage_prefix: &str,
+    repomd_key: &str,
+    asc_key: &str,
+) -> Result<(), AppError> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+    let marked = sqlx::query(
+        r#"UPDATE repository_versions
+           SET published_at = now(), repomd_storage_key = $2,
+               storage_prefix = $3, signature_storage_key = $4
+           WHERE id = $1"#,
+    )
+    .bind(version_id)
+    .bind(repomd_key)
+    .bind(storage_prefix)
+    .bind(asc_key)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if marked == 0 {
+        drop(tx);
+        for name in PUBLICATION_REPODATA_FILES {
+            let _ = storage.delete(&format!("{storage_prefix}/{name}")).await;
+        }
+        return Err(AppError::Conflict(format!(
+            "Version {version_number} was removed by version retention while it was being \
+             published"
+        )));
+    }
+    sqlx::query("UPDATE repositories SET active_publication_id = $2 WHERE id = $1")
+        .bind(repo_id)
+        .bind(version_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without a DB or storage backend)
 // ---------------------------------------------------------------------------
+
+/// The storage prefix every blob of published version `version_number` of
+/// `repo_id` lives under: its signed repodata (see
+/// [`PUBLICATION_REPODATA_FILES`]) and the verified packages the `@N` serve
+/// path caches at `packages/{frozen_filename}`.
+pub(crate) fn publication_prefix(repo_id: Uuid, version_number: i64) -> String {
+    format!("{}{version_number}", publications_root(repo_id))
+}
+
+/// The parent of every [`publication_prefix`] of `repo_id`, with a trailing
+/// slash so `publications/1` never prefix-matches `publications/10`.
+pub(crate) fn publications_root(repo_id: Uuid) -> String {
+    format!("curation/{repo_id}/publications/")
+}
+
+/// The repodata blobs [`publish`] stores beneath a version's prefix.
+pub(crate) const PUBLICATION_REPODATA_FILES: [&str; 6] = [
+    "repodata/repomd.xml",
+    "repodata/repomd.xml.asc",
+    "repodata/repomd.xml.key",
+    "repodata/primary.xml.gz",
+    "repodata/filelists.xml.gz",
+    "repodata/other.xml.gz",
+];
 
 /// The compressed repodata payloads plus the repomd.xml that indexes them.
 struct Repodata {
@@ -1170,6 +1243,52 @@ mod tests {
         tdh::cleanup(&pool, remote, actor).await;
     }
 
+    // A version pruned by retention while its publish was writing blobs
+    // (#2359): marking it published matches no row, so the publish fails with
+    // 409, removes the repodata it stored, and never points the repository's
+    // active publication at the deleted version.
+    #[tokio::test]
+    async fn test_mark_published_after_prune_cleans_up_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        let prefix = publication_prefix(repo, 7);
+        for name in PUBLICATION_REPODATA_FILES {
+            put_blob(&storage, &format!("{prefix}/{name}"), b"x".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let err = mark_published(
+            &pool,
+            &storage,
+            repo,
+            Uuid::new_v4(),
+            7,
+            &prefix,
+            &format!("{prefix}/repodata/repomd.xml"),
+            &format!("{prefix}/repodata/repomd.xml.asc"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+        for name in PUBLICATION_REPODATA_FILES {
+            assert!(!storage.exists(&format!("{prefix}/{name}")).await.unwrap());
+        }
+        let active: Option<Uuid> =
+            sqlx::query_scalar("SELECT active_publication_id FROM repositories WHERE id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(active, None);
+        tdh::cleanup(&pool, repo, actor).await;
+    }
+
     // Two creates allocate monotonic, distinct version numbers (1 then 2).
     #[tokio::test]
     async fn test_create_version_monotonic_db() {
@@ -1450,14 +1569,7 @@ mod tests {
         assert_eq!(summary.package_count, 1);
 
         // Signed repodata blobs are stored and non-empty.
-        for name in [
-            "repodata/repomd.xml",
-            "repodata/repomd.xml.asc",
-            "repodata/repomd.xml.key",
-            "repodata/primary.xml.gz",
-            "repodata/filelists.xml.gz",
-            "repodata/other.xml.gz",
-        ] {
+        for name in PUBLICATION_REPODATA_FILES {
             let blob = storage
                 .get(&format!("{}/{}", summary.storage_prefix, name))
                 .await

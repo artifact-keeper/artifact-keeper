@@ -921,6 +921,51 @@ pub fn spawn_all(
         });
     }
 
+    // RPM curated-version retention (#2359): opt-in via
+    // `RPM_VERSION_RETENTION_KEEP` (unset / 0 keeps every version). Hourly,
+    // one replica at a time; the lease is renewed for the whole pass and a
+    // lost lease stops it between repositories (#3502).
+    if let Some(keep) = crate::services::rpm_version_retention::keep_from_env() {
+        use crate::services::rpm_version_retention as retention;
+        let db = db.clone();
+        let registry = storage_registry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(180)).await;
+            let mut ticker = interval(Duration::from_secs(retention::RETENTION_INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    retention::RETENTION_LEASE_NAME,
+                    retention::RETENTION_LEASE_TTL_SECS,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the RPM version retention lease");
+                    continue;
+                };
+                let (renewal, lost) = lease.spawn_renewal_with_cancellation(
+                    db.clone(),
+                    retention::RETENTION_LEASE_TTL_SECS,
+                );
+                match retention::run_retention_pass(&db, &registry, keep, None, Some(&lost)).await {
+                    Ok(r) if r.versions_pruned > 0 || r.delete_failures > 0 => tracing::info!(
+                        keep,
+                        versions_pruned = r.versions_pruned,
+                        objects_deleted = r.objects_deleted,
+                        delete_failures = r.delete_failures,
+                        "RPM version retention pass"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("RPM version retention pass failed: {}", e),
+                }
+                drop(renewal);
+                lease.release(&db).await;
+            }
+        });
+    }
+
     // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();
