@@ -563,6 +563,14 @@ pub struct Config {
     /// OpenTelemetry service name (default: "artifact-keeper").
     pub otel_service_name: String,
 
+    /// Days a soft-deleted artifact stays in the trash, restorable through
+    /// `POST /api/v1/admin/trash/{id}/restore`, before storage GC may reclaim
+    /// its row and object (#2072). Env `GC_TRASH_RETENTION_DAYS`, default `0`:
+    /// reclaimable on the next GC pass, exactly the behaviour before this
+    /// setting existed, so an upgrade never silently stops reclaiming storage.
+    /// Clamped to [0, 3650].
+    pub gc_trash_retention_days: u32,
+
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
 
@@ -1151,6 +1159,7 @@ redacted_debug!(Config {
     show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
+    show gc_trash_retention_days,
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
@@ -1286,6 +1295,7 @@ impl Default for Config {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
@@ -1529,6 +1539,11 @@ impl Config {
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
+            gc_trash_retention_days:
+                crate::services::storage_gc_service::clamp_trash_retention_days(env_parse(
+                    "GC_TRASH_RETENTION_DAYS",
+                    0u32,
+                )),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
                 .unwrap_or_else(|_| "0 0 */4 * * *".into()),

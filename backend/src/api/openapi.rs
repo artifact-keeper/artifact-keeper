@@ -178,6 +178,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "storage_integrity",
             handlers::storage_integrity::StorageIntegrityApiDoc::openapi(),
         ),
+        ("trash", handlers::trash::TrashApiDoc::openapi()),
         (
             "monitoring",
             handlers::monitoring::MonitoringApiDoc::openapi(),

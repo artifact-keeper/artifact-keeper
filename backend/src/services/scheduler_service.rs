@@ -642,6 +642,7 @@ pub fn spawn_all(
             // reports what it would reclaim and deletes nothing.
             let service =
                 crate::services::storage_gc_service::StorageGcService::new(db, gc_registry)
+                    .with_trash_retention_days(config_clone.gc_trash_retention_days)
                     .with_maven_flat_gc_enabled(config_clone.maven_flat_gc_enabled);
 
             let normalized = normalize_cron_expression(&config_clone.gc_schedule);

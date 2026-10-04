@@ -957,6 +957,8 @@ fn api_v1_routes(
             .nest("/analytics", handlers::analytics::router())
             .nest("/lifecycle", handlers::lifecycle::router())
             .nest("/storage-gc", handlers::storage_gc::router())
+            // Artifact trash (#2072): list + restore soft-deleted artifacts.
+            .nest("/trash", handlers::trash::router())
             // Storage scrub (#3910) and repository storage reindex (#1570):
             // admin-only, gated by this block's admin_middleware.
             .merge(handlers::storage_integrity::router())

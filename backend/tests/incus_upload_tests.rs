@@ -79,6 +79,7 @@ fn test_config(storage_path: &str) -> Config {
         dependency_track_enabled: false,
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
+        gc_trash_retention_days: 0,
         gc_schedule: "0 0 * * * *".into(),
         storage_stats_schedule: "0 0 */4 * * *".into(),
         blob_gc_enabled: false,

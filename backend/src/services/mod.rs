@@ -115,6 +115,7 @@ pub mod token_expiry_policy;
 pub mod token_service;
 pub mod totp_policy;
 pub mod transfer_service;
+pub mod trash_service;
 pub mod trivy_fs_scanner;
 pub mod upload_service;
 pub mod upstream_auth;

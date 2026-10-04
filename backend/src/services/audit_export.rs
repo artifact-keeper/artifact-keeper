@@ -103,6 +103,7 @@ impl AuditAction {
             | AuditAction::ArtifactDownloaded
             | AuditAction::ArtifactDeleted
             | AuditAction::ArtifactMetadataUpdated
+            | AuditAction::ArtifactRestored
             | AuditAction::BackupStarted
             | AuditAction::BackupCompleted
             | AuditAction::RestoreStarted

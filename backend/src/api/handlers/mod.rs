@@ -390,6 +390,7 @@ pub mod telemetry;
 pub mod terraform;
 pub mod totp;
 pub mod transfer;
+pub mod trash;
 pub mod tree;
 pub mod upload;
 pub mod users;

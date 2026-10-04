@@ -88,6 +88,7 @@ pub async fn run_storage_gc(
     require_admin(auth.is_admin)?;
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
+        .with_trash_retention_days(state.config.gc_trash_retention_days)
         .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
     let result = service.run_gc(payload.dry_run).await?;
 
@@ -194,6 +195,7 @@ pub async fn run_repository_storage_gc(
     // — otherwise "GC this one repository" stays a one-click way to delete
     // hand-attributed legacy objects.
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone())
+        .with_trash_retention_days(state.config.gc_trash_retention_days)
         .with_maven_flat_gc_enabled(state.config.maven_flat_gc_enabled);
     let result = service
         .run_gc_for_repository(repo.id, payload.dry_run)

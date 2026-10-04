@@ -4320,6 +4320,7 @@ mod tests {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".to_string(),
             storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
