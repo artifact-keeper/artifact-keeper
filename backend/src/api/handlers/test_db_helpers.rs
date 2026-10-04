@@ -2091,6 +2091,87 @@ impl Fixture {
         router_with_auth(router, self.state.clone(), auth)
     }
 
+    /// Drive the generic chunked upload flow (`/api/v1/uploads`: create a
+    /// session, PATCH `payload` as its one chunk, complete it) for `path` in
+    /// this fixture's repository, as the fixture user. `create_extra` fields
+    /// are merged into the create body (e.g. replication metadata) and
+    /// `replication` sets the replication header on create and complete.
+    /// Returns the completion's status and body; panics if create or the
+    /// chunk fails.
+    pub async fn chunked_upload(
+        &self,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
+        use sha2::{Digest, Sha256};
+        let app = || {
+            crate::api::handlers::upload::router()
+                .with_state(self.state.clone())
+                .layer(Extension::<AuthExtension>(make_auth(
+                    self.user_id,
+                    &self.username,
+                )))
+        };
+        let mark = |mut req: Request<Body>| {
+            if replication {
+                req.headers_mut().insert(
+                    "x-artifact-keeper-replication",
+                    axum::http::HeaderValue::from_static("true"),
+                );
+            }
+            req
+        };
+        let mut create = serde_json::json!({
+            "repository_key": self.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": hex::encode(Sha256::digest(payload)),
+            "chunk_size": 1024 * 1024_i64,
+        });
+        if let (Some(body), Some(extra)) = (create.as_object_mut(), create_extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        let create = post(
+            "/".to_string(),
+            "application/json",
+            Bytes::from(serde_json::to_vec(&create).unwrap()),
+        );
+        let (status, resp) = send(app(), mark(create)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        let chunk = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, resp) = send(app(), chunk).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+
+        let complete = Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(Body::empty())
+            .unwrap();
+        send(app(), mark(complete)).await
+    }
+
     /// Drop all rows owned by this fixture and remove the storage dir.
     pub async fn teardown(&self) {
         cleanup(&self.pool, self.repo_id, self.user_id).await;

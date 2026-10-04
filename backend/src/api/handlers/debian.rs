@@ -3122,21 +3122,26 @@ fn prepare_debian_upload(
     path: &str,
     body: &[u8],
 ) -> Result<DebianPackageUpload, Response> {
+    parse_debian_upload(component, path, body)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message).into_response())
+}
+
+/// Parse and validate a `.deb` destined for `pool/<component>/<path>`: the
+/// file name must be `{name}_{version}_{arch}.deb`, the control file must be
+/// readable, and its Package/Version/Architecture must match the file name.
+/// Every failure is a client error, returned as its message. `body` only
+/// needs to reach the end of the `control.tar` member.
+fn parse_debian_upload(
+    component: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<DebianPackageUpload, String> {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let deb_info = parse_deb_filename(filename).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb",
-        )
-            .into_response()
+        "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb".to_string()
     })?;
-    let control = DebianHandler::extract_control(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid Debian package metadata: {}", e),
-        )
-            .into_response()
-    })?;
+    let control = DebianHandler::extract_control(body)
+        .map_err(|e| format!("Invalid Debian package metadata: {}", e))?;
     validate_debian_control_matches_filename(&deb_info, &control)?;
 
     let artifact_path = format!("pool/{}/{}", component, path);
@@ -3157,40 +3162,25 @@ fn prepare_debian_upload(
     })
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_debian_control_matches_filename(
     deb_info: &DebInfo,
     control: &DebControl,
-) -> Result<(), Response> {
+) -> Result<(), String> {
+    let mismatch = |field: &str, from_name: &str, from_control: &str| {
+        format!("{field} mismatch: filename says '{from_name}' but control says '{from_control}'")
+    };
     if control.package != deb_info.name {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Package name mismatch: filename says '{}' but control says '{}'",
-                deb_info.name, control.package
-            ),
-        )
-            .into_response());
+        return Err(mismatch("Package name", &deb_info.name, &control.package));
     }
     if control.version != deb_info.version {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Version mismatch: filename says '{}' but control says '{}'",
-                deb_info.version, control.version
-            ),
-        )
-            .into_response());
+        return Err(mismatch("Version", &deb_info.version, &control.version));
     }
     if control.architecture != deb_info.arch {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Architecture mismatch: filename says '{}' but control says '{}'",
-                deb_info.arch, control.architecture
-            ),
-        )
-            .into_response());
+        return Err(mismatch(
+            "Architecture",
+            &deb_info.arch,
+            &control.architecture,
+        ));
     }
     Ok(())
 }
@@ -3299,19 +3289,53 @@ async fn persist_debian_upload(
         .await
         .map_err(|e| e.into_response())?;
 
+    record_debian_package(
+        state,
+        &artifact_service,
+        repo.id,
+        artifact.id,
+        artifact.size_bytes,
+        &artifact.checksum_sha256,
+        upload,
+        &analysis_body,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    Ok(artifact)
+}
+
+/// Everything a Debian upload records once its `artifacts` row exists: the
+/// `artifact_metadata` control document (which `Packages` renders from), the
+/// maintainer-script analysis (#4033), the package catalog row, and the
+/// repository's `updated_at` bump. Shared by the native upload routes and the
+/// generic chunked completion (#1846), so a `.deb` gets the same records
+/// whichever way it arrived. `deb_head` must reach the end of the
+/// `control.tar` member. Only the metadata write is fatal; the rest is
+/// best-effort, as on the native path.
+#[allow(clippy::too_many_arguments)]
+async fn record_debian_package(
+    state: &SharedState,
+    artifact_service: &ArtifactService,
+    repo_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    upload: &DebianPackageUpload,
+    deb_head: &[u8],
+) -> crate::error::Result<()> {
     artifact_service
         .set_metadata(
-            artifact.id,
+            artifact_id,
             "debian",
             upload.metadata.clone(),
             serde_json::json!({}),
         )
-        .await
-        .map_err(|e| e.into_response())?;
+        .await?;
 
     // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
     // (#4033). Best-effort: the artifact row is already committed.
-    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(&analysis_body);
+    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(deb_head);
     debug_assert!(
         scripts
             .iter()
@@ -3321,7 +3345,7 @@ async fn persist_debian_upload(
     );
     if let Err(e) = record_install_scripts(
         &state.db,
-        artifact.id,
+        artifact_id,
         "debian",
         scripts,
         unanalyzed,
@@ -3330,7 +3354,7 @@ async fn persist_debian_upload(
     .await
     {
         tracing::warn!(
-            artifact_id = %artifact.id,
+            artifact_id = %artifact_id,
             error = %e,
             "debian maintainer-script analysis could not be recorded"
         );
@@ -3338,11 +3362,11 @@ async fn persist_debian_upload(
 
     PackageService::new(state.db.clone())
         .try_create_or_update_from_artifact(
-            repo.id,
+            repo_id,
             &upload.control.package,
             &upload.control.version,
-            artifact.size_bytes,
-            &artifact.checksum_sha256,
+            size_bytes,
+            checksum_sha256,
             package_description(&upload.control),
             Some(build_debian_package_catalog_metadata(upload)),
         )
@@ -3350,12 +3374,156 @@ async fn persist_debian_upload(
 
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
+        repo_id,
     )
     .execute(&state.db)
     .await;
 
-    Ok(artifact)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Generic chunked completion of a `.deb` (#1846)
+// ---------------------------------------------------------------------------
+
+/// Largest `control.tar` member a chunked `.deb` completion reads into memory.
+/// Real control archives are kilobytes (maintainer scripts, `md5sums`); the
+/// native upload routes hold the whole package in memory, so this is a looser
+/// bound than theirs, not a tighter one.
+const STAGED_DEB_CONTROL_MAX: u64 = 64 * 1024 * 1024;
+
+/// ar members walked looking for `control.tar*` before giving up. dpkg
+/// requires it as the second member; a few extra allow for tooling that
+/// inserts signature members.
+const STAGED_DEB_MAX_MEMBERS: usize = 16;
+
+/// A `.deb` that arrived through the generic chunked upload flow
+/// (`/api/v1/uploads`), parsed and validated exactly as the native upload
+/// routes do, ready for [`record_staged_package`] once its `artifacts` row
+/// exists.
+pub(crate) struct StagedDebianPackage {
+    upload: DebianPackageUpload,
+    /// The package's head through the end of its `control.tar` member: all the
+    /// control parse and the maintainer-script analysis read.
+    deb_head: Vec<u8>,
+}
+
+/// Split a Debian repository artifact path into `(component, path)` when it is
+/// a binary package in the pool, the layout `Packages` indexes
+/// (`pool/<component>/.../<file>.deb`, also `.udeb`/`.ddeb`). Anything else
+/// (a source tarball, a file outside `pool/`) is not finalized as a package.
+pub(crate) fn staged_package_target(artifact_path: &str) -> Option<(&str, &str)> {
+    let (component, path) = artifact_path.strip_prefix("pool/")?.split_once('/')?;
+    let filename = path.rsplit('/').next()?;
+    let is_package = [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .any(|ext| filename.ends_with(ext));
+    (!component.is_empty() && is_package).then_some((component, path))
+}
+
+/// The `(package, version)` a pool `.deb` path names, read from its
+/// `{name}_{version}_{arch}.deb` file name. Known before the bytes are, so
+/// the chunked completion's immutability gate checks the same coordinates the
+/// row is written with ([`parse_debian_upload`] later requires the control
+/// file to agree).
+pub(crate) fn package_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let (_, path) = staged_package_target(artifact_path)?;
+    let info = parse_deb_filename(path.rsplit('/').next()?)?;
+    Some((info.name, info.version))
+}
+
+/// Read a staged `.deb`'s head through the end of its `control.tar` member,
+/// seeking past the members before it, so a multi-GiB package costs one
+/// bounded read instead of a full buffer. The result is a valid ar prefix
+/// (`!<arch>` + the control member) for [`DebianHandler::control_tar_member`].
+async fn read_deb_head(file: &std::path::Path) -> io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+
+    let mut f = tokio::fs::File::open(file).await?;
+    let mut head = vec![0u8; 8];
+    f.read_exact(&mut head)
+        .await
+        .map_err(|_| invalid("not an ar archive"))?;
+    if head != b"!<arch>\n" {
+        return Err(invalid("not an ar archive"));
+    }
+    for _ in 0..STAGED_DEB_MAX_MEMBERS {
+        let mut header = [0u8; 60];
+        if f.read_exact(&mut header).await.is_err() {
+            break;
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if name.starts_with("control.tar") {
+            if size > STAGED_DEB_CONTROL_MAX {
+                return Err(invalid("control.tar member is too large"));
+            }
+            head.extend_from_slice(&header);
+            (&mut f).take(size).read_to_end(&mut head).await?;
+            return Ok(head);
+        }
+        f.seek(io::SeekFrom::Current((size + size % 2) as i64))
+            .await?;
+    }
+    Err(invalid("control.tar not found in .deb file"))
+}
+
+/// Format-native finalize for a `.deb` completed through the generic chunked
+/// flow (#1846): parse and validate the control file of the staged package at
+/// `file` exactly as `PUT /debian/{repo}/pool/...` does. `Ok(None)` when
+/// `artifact_path` is not a pool package (nothing format-specific to record);
+/// `Err` carries the client-facing reason a package the native routes would
+/// refuse with 400 is refused.
+pub(crate) async fn finalize_from_staged(
+    artifact_path: &str,
+    file: &std::path::Path,
+) -> Result<Option<StagedDebianPackage>, String> {
+    let Some((component, path)) = staged_package_target(artifact_path) else {
+        return Ok(None);
+    };
+    let deb_head = read_deb_head(file)
+        .await
+        .map_err(|e| format!("Invalid Debian package metadata: {e}"))?;
+    let (component, path) = (component.to_string(), path.to_string());
+    tokio::task::spawn_blocking(move || {
+        parse_debian_upload(&component, &path, &deb_head)
+            .map(|upload| Some(StagedDebianPackage { upload, deb_head }))
+    })
+    .await
+    .map_err(|e| format!("Debian package parse failed: {e}"))?
+}
+
+/// Record a chunked-completed `.deb`'s control metadata, maintainer-script
+/// analysis and catalog row against its freshly written `artifacts` row: the
+/// same records [`persist_debian_upload`] writes for a native upload.
+pub(crate) async fn record_staged_package(
+    state: &SharedState,
+    artifact_service: &ArtifactService,
+    repo_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    staged: &StagedDebianPackage,
+) -> crate::error::Result<()> {
+    record_debian_package(
+        state,
+        artifact_service,
+        repo_id,
+        artifact_id,
+        size_bytes,
+        checksum_sha256,
+        &staged.upload,
+        &staged.deb_head,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5686,6 +5854,186 @@ mod upload_db_tests {
         assert_eq!(keys(&fetch("gpg-key.asc").await), 1);
 
         f.teardown().await;
+    }
+
+    /// #1846: a `.deb` pushed through the generic chunked flow
+    /// (`/api/v1/uploads`) gets the native finalize: the control-derived
+    /// `name`/`version`, the `artifact_metadata` control document and the
+    /// catalog row. Before the fix the row was named after the file, its
+    /// version was the pool directory segment, and `Packages` fell back to
+    /// the file name with "No description available" and no `Depends`.
+    #[tokio::test]
+    async fn chunked_deb_upload_runs_native_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (package, version, arch) = ("ak-chunked-deb", "2.0.1-1", "amd64");
+        let deb = minimal_deb(package, version, arch, "chunked Debian package");
+        let path = format!("pool/main/a/{package}/{package}_{version}_{arch}.deb");
+        let (status, body) = f
+            .chunked_upload(&path, &deb, serde_json::json!({}), false)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunked completion failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (artifact_id, name, row_version): (uuid::Uuid, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT id, name, version FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(f.repo_id)
+            .bind(&path)
+            .fetch_one(&f.pool)
+            .await
+            .expect("chunked artifact row");
+        assert_eq!(name, package, "named by the control Package, not the file");
+        assert_eq!(row_version.as_deref(), Some(version));
+
+        let (format, metadata): (String, serde_json::Value) =
+            sqlx::query_as("SELECT format, metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("chunked upload must write the debian artifact_metadata row");
+        assert_eq!(format, "debian");
+        assert_eq!(metadata["component"], "main");
+        assert_eq!(metadata["control"]["package"], package);
+        assert_eq!(metadata["control"]["depends"][0], "libc6 (>= 2.36)");
+
+        let catalog: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT version, metadata FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind(package)
+        .fetch_one(&f.pool)
+        .await
+        .expect("catalog row");
+        assert_eq!(catalog.0, version);
+        assert_eq!(catalog.1.expect("catalog metadata")["component"], "main");
+
+        let (status, packages_body) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::get(format!(
+                "/{}/dists/bookworm/main/binary-amd64/Packages",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let packages_text = String::from_utf8(packages_body.to_vec()).unwrap();
+        assert!(packages_text.contains(&format!("Package: {package}\n")));
+        assert!(packages_text.contains("Depends: libc6 (>= 2.36)\n"));
+        assert!(
+            packages_text.contains("Description: chunked Debian package\n"),
+            "Packages must render the control description: {packages_text}"
+        );
+
+        f.teardown().await;
+    }
+
+    /// #1846: a chunked `.deb` whose control file disagrees with its file name
+    /// is refused with 400, as the native route refuses it, and nothing is
+    /// stored.
+    #[tokio::test]
+    async fn chunked_deb_with_mismatched_control_is_rejected_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let deb = minimal_deb("ak-other-name", "1.0", "amd64", "mismatched");
+        let path = "pool/main/a/ak-named/ak-named_1.0_amd64.deb";
+        let (status, body) = f
+            .chunked_upload(path, &deb, serde_json::json!({}), false)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&body).contains("Package name mismatch"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a refused package leaves no artifact row");
+        f.teardown().await;
+    }
+
+    #[test]
+    fn staged_package_target_accepts_only_pool_packages_1846() {
+        assert_eq!(
+            staged_package_target("pool/main/h/hello/hello_1.0_amd64.deb"),
+            Some(("main", "h/hello/hello_1.0_amd64.deb"))
+        );
+        assert_eq!(
+            staged_package_target("pool/contrib/x_1_all.udeb"),
+            Some(("contrib", "x_1_all.udeb"))
+        );
+        assert_eq!(
+            staged_package_target("pool/main/h/hello/hello.tar.gz"),
+            None
+        );
+        assert_eq!(
+            staged_package_target("dists/main/hello_1.0_amd64.deb"),
+            None
+        );
+        assert_eq!(staged_package_target("pool//hello_1.0_amd64.deb"), None);
+        assert_eq!(staged_package_target("pool/hello_1.0_amd64.deb"), None);
+        assert_eq!(
+            package_coordinates_from_path("pool/main/h/hello/hello_1.0-2_amd64.deb"),
+            Some(("hello".to_string(), "1.0-2".to_string()))
+        );
+        assert_eq!(package_coordinates_from_path("pool/main/notadeb.deb"), None);
+    }
+
+    /// #1846: the staged read seeks past members ahead of `control.tar`
+    /// (here a large one) and returns only the head through the control
+    /// member, which still parses; a package without one, or not an ar
+    /// archive at all, is an error.
+    #[tokio::test]
+    async fn read_deb_head_reads_only_through_the_control_member_1846() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = "Package: big\nVersion: 1\nArchitecture: all\nDescription: d\n";
+        let mut deb = b"!<arch>\n".to_vec();
+        append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+        append_ar_member(&mut deb, "_gpgbuilder", &vec![7u8; 300_001]);
+        append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(control));
+        append_ar_member(&mut deb, "data.tar.gz", &vec![0u8; 500_000]);
+        let file = dir.path().join("big_1_all.deb");
+        std::fs::write(&file, &deb).unwrap();
+
+        let head = read_deb_head(&file).await.expect("control member found");
+        assert!(head.len() < 10_000, "only the control member is read");
+        let parsed = DebianHandler::extract_control(&head).expect("head parses");
+        assert_eq!(parsed.package, "big");
+
+        let staged = finalize_from_staged("pool/main/b/big/big_1_all.deb", &file)
+            .await
+            .expect("valid package")
+            .expect("pool package is finalized");
+        assert_eq!(staged.upload.control.package, "big");
+        assert!(finalize_from_staged("pool/main/b/big/big.tar.gz", &file)
+            .await
+            .expect("not a package")
+            .is_none());
+
+        let mut no_control = b"!<arch>\n".to_vec();
+        append_ar_member(&mut no_control, "debian-binary", b"2.0\n");
+        std::fs::write(&file, &no_control).unwrap();
+        assert!(read_deb_head(&file).await.is_err());
+        let err = finalize_from_staged("pool/main/b/big/big_1_all.deb", &file)
+            .await
+            .err()
+            .expect("no control.tar is refused");
+        assert!(err.contains("control.tar not found"), "{err}");
+
+        std::fs::write(&file, b"plain text, not a package").unwrap();
+        assert!(read_deb_head(&file).await.is_err());
     }
 }
 

@@ -662,7 +662,28 @@ async fn complete_session_commit(
     // here becomes a legal write the moment the occupying artifact is
     // deleted, so the client can retry this session instead of re-uploading
     // every chunk.
-    let derived_version = completed_format_artifact_version(&session, &repo.format);
+    // Only a TRUSTED replication session (admin or service account) may
+    // bring its own metadata instead of the server deriving it from the
+    // bytes: the replication header is client-set.
+    let replication_trusted = super::repositories::replication_exemption_trusted(
+        is_replication_request || session.is_replication,
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
+    // #1846: a format with a native finalize (incus image, debian package)
+    // gets the coordinates its native upload route writes, derived from the
+    // path before the bytes are read so the immutability gate below checks
+    // the very `version` the row is written with.
+    let native_coordinates = if replicated_metadata {
+        None
+    } else {
+        native_finalize_coordinates(&repo.format, &session.artifact_path)
+    };
+    let derived_version = match &native_coordinates {
+        Some((_, version)) => Some(version.clone()),
+        None => completed_format_artifact_version(&session, &repo.format),
+    };
     if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
         &state.db,
         session.repository_id,
@@ -696,17 +717,9 @@ async fn complete_session_commit(
     // or carrying XML-forbidden control characters, #3801) is rejected with
     // 400 instead of leaving an object behind. The parse runs on the
     // blocking pool: it is linear but proportional to an untrusted header.
-    // Replication sessions carry the source row's metadata instead, so
-    // nothing is read for them.
-    // Only a TRUSTED replication session (admin or service account) may
-    // bring its own metadata instead: the replication header is client-set.
-    let replication_trusted = super::repositories::replication_exemption_trusted(
-        is_replication_request || session.is_replication,
-        auth.is_admin,
-        auth.is_service_account,
-    );
-    let rpm_upload_metadata = if !(replication_trusted
-        && session.artifact_metadata_format.is_some())
+    // Trusted replication sessions carry the source row's metadata instead,
+    // so nothing is read for them.
+    let rpm_upload_metadata = if !replicated_metadata
         && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
     {
         match read_rpm_header_prefix(temp_path).await {
@@ -729,6 +742,23 @@ async fn complete_session_commit(
         }
     } else {
         None
+    };
+
+    // #1846: the format-native finalize for an incus image or a debian
+    // package, run over the reassembled file before any byte is stored, so a
+    // package its native route would refuse (a control file that disagrees
+    // with the file name) is refused here too, with nothing left behind.
+    let staged_native = match native_coordinates {
+        Some(_) => {
+            match stage_native_finalize(&repo.format, &session.artifact_path, temp_path).await {
+                Ok(staged) => staged,
+                Err(reason) => {
+                    UploadService::fail_committing(&state.db, &session, &reason).await;
+                    return Err(map_err(StatusCode::BAD_REQUEST, reason));
+                }
+            }
+        }
+        None => None,
     };
 
     // The key is content-addressed and every backend writes it atomically, so
@@ -767,8 +797,13 @@ async fn complete_session_commit(
     // Clean up the scratch copy now that the bytes are in final storage.
     drop(assembled);
 
-    // Create artifact record
-    let artifact_name = completed_artifact_name(&session);
+    // Create artifact record. A natively finalized format is named the way
+    // its native route names it (incus product, debian package), which is
+    // what its index generator keys on.
+    let artifact_name = match &native_coordinates {
+        Some((name, _)) => name.as_str(),
+        None => completed_artifact_name(&session),
+    };
     // #1975 (stopgap for #1846): chunked uploads to FORMAT repositories must
     // carry a non-empty `version`, otherwise format index generators that key on
     // `version` silently drop the artifact (e.g. incus `streams_images` skips any
@@ -947,7 +982,27 @@ async fn complete_session_commit(
         .await;
     }
 
-    if let Some((package_name, package_version)) =
+    if let (Some(staged), Some((name, version))) = (&staged_native, &native_coordinates) {
+        let artifact_service = state.create_artifact_service(storage.clone());
+        let recorded = record_native_finalize(
+            state,
+            &artifact_service,
+            &session,
+            artifact_id,
+            (name, version),
+            staged,
+        )
+        .await;
+        if let Err(e) = recorded {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact metadata write failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    } else if let Some((package_name, package_version)) =
         completed_package_catalog_entry(&session, &repo.format)
     {
         PackageService::new(state.db.clone())
@@ -1289,6 +1344,106 @@ async fn read_file_prefix(path: &std::path::Path, limit: u64) -> std::io::Result
     let mut buf = Vec::new();
     file.take(limit).read_to_end(&mut buf).await?;
     Ok(buf)
+}
+
+/// Format-native finalize state for a chunked completion (#1846): what the
+/// format's native upload route derives from the bytes, recorded against the
+/// artifact row once it exists.
+enum StagedNativeFinalize {
+    /// An Incus image's `artifact_metadata` document (arch/os/release), which
+    /// `streams_images` reads.
+    Incus(serde_json::Value),
+    /// A parsed and validated Debian package (control metadata, maintainer
+    /// scripts), which `Packages` renders.
+    Debian(Box<super::debian::StagedDebianPackage>),
+}
+
+/// The `(name, version)` a format's native upload route writes for
+/// `artifact_path`, when the repository format has a native finalize the
+/// chunked completion dispatches to (#1846). `None` keeps the generic
+/// behaviour: other formats, and paths their native route would not index
+/// (an incus sidecar, a debian file outside `pool/`).
+fn native_finalize_coordinates(
+    format: &crate::models::repository::RepositoryFormat,
+    artifact_path: &str,
+) -> Option<(String, String)> {
+    use crate::models::repository::RepositoryFormat;
+    match format {
+        RepositoryFormat::Incus | RepositoryFormat::Lxc => {
+            super::incus::image_coordinates_from_path(artifact_path)
+        }
+        RepositoryFormat::Debian => super::debian::package_coordinates_from_path(artifact_path),
+        _ => None,
+    }
+}
+
+/// Run the native finalize's read of the reassembled file at `file`. Called
+/// only for a path [`native_finalize_coordinates`] accepted. `Err` is a
+/// client-facing reason the upload is refused.
+async fn stage_native_finalize(
+    format: &crate::models::repository::RepositoryFormat,
+    artifact_path: &str,
+    file: &std::path::Path,
+) -> Result<Option<StagedNativeFinalize>, String> {
+    use crate::models::repository::RepositoryFormat;
+    match format {
+        RepositoryFormat::Incus | RepositoryFormat::Lxc => {
+            let (path, file) = (artifact_path.to_string(), file.to_path_buf());
+            let metadata = tokio::task::spawn_blocking(move || {
+                super::incus::extract_image_metadata(&path, &file)
+            })
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+            Ok(Some(StagedNativeFinalize::Incus(metadata)))
+        }
+        RepositoryFormat::Debian => Ok(super::debian::finalize_from_staged(artifact_path, file)
+            .await?
+            .map(|staged| StagedNativeFinalize::Debian(Box::new(staged)))),
+        _ => Ok(None),
+    }
+}
+
+/// Record a natively finalized chunked upload's format records against its
+/// committed artifact row: the `artifact_metadata` document and catalog row
+/// (plus, for debian, the maintainer-script analysis) that its native upload
+/// route writes (#1846). The catalog row is written silently: the completion
+/// emits its own `artifact.uploaded`.
+async fn record_native_finalize(
+    state: &SharedState,
+    artifact_service: &crate::services::artifact_service::ArtifactService,
+    session: &upload_service::UploadSession,
+    artifact_id: Uuid,
+    (name, version): (&str, &str),
+    staged: &StagedNativeFinalize,
+) -> Result<(), String> {
+    match staged {
+        StagedNativeFinalize::Incus(metadata) => {
+            super::incus::store_image_metadata(&state.db, artifact_id, metadata).await?;
+            PackageService::new(state.db.clone())
+                .try_create_or_update_from_artifact(
+                    session.repository_id,
+                    name,
+                    version,
+                    session.total_size,
+                    &session.checksum_sha256,
+                    None,
+                    Some(serde_json::json!({ "format": "incus" })),
+                )
+                .await;
+            Ok(())
+        }
+        StagedNativeFinalize::Debian(package) => super::debian::record_staged_package(
+            state,
+            artifact_service,
+            session.repository_id,
+            artifact_id,
+            session.total_size,
+            &session.checksum_sha256,
+            package,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+    }
 }
 
 fn artifact_name_from_path(path: &str) -> &str {
@@ -3867,61 +4022,16 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
         let checksum = hex::encode(Sha256::digest(payload));
-        let mut body = serde_json::json!({
-            "repository_key": f.repo_key,
-            "artifact_path": path,
-            "total_size": payload.len() as i64,
-            "checksum_sha256": checksum,
-            "chunk_size": 1024 * 1024_i64,
-        });
-        let req = match &replication_metadata {
-            Some((format, metadata)) => {
-                body["artifact_metadata_format"] = serde_json::json!(format);
-                body["artifact_metadata"] = metadata.clone();
-                create_replication_session_req(&body)
-            }
-            None => create_session_req(&body),
+        let extra = match &replication_metadata {
+            Some((format, metadata)) => serde_json::json!({
+                "artifact_metadata_format": format,
+                "artifact_metadata": metadata,
+            }),
+            None => serde_json::json!({}),
         };
-        let app = upload_router_with_auth(f.state.clone(), auth());
-        let (status, resp) = tdh::send(app, req).await;
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "{}",
-            String::from_utf8_lossy(&resp)
-        );
-        let session_id: Uuid = serde_json::from_value(
-            serde_json::from_slice::<serde_json::Value>(&resp).unwrap()["session_id"].clone(),
-        )
-        .unwrap();
-
-        let app = upload_router_with_auth(f.state.clone(), auth());
-        let req = axum::http::Request::builder()
-            .method("PATCH")
-            .uri(format!("/{}", session_id))
-            .header(
-                "content-range",
-                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
-            )
-            .header("content-type", "application/octet-stream")
-            .body(axum::body::Body::from(payload.to_vec()))
-            .unwrap();
-        let (status, resp) = tdh::send(app, req).await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
-
-        let app = upload_router_with_auth(f.state.clone(), auth());
-        let mut req = axum::http::Request::builder()
-            .method("PUT")
-            .uri(format!("/{}/complete", session_id))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        if replication_metadata.is_some() {
-            req.headers_mut().insert(
-                "x-artifact-keeper-replication",
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
-        let (status, resp) = tdh::send(app, req).await;
+        let (status, resp) = f
+            .chunked_upload_as(auth(), path, payload, extra, replication_metadata.is_some())
+            .await;
         let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
             &checksum,
         );

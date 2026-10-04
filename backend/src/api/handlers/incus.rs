@@ -626,6 +626,58 @@ pub(crate) fn build_streams_index_json(products: &[String]) -> serde_json::Value
     })
 }
 
+/// Extract an image's `artifact_metadata` document (file type, product,
+/// version and, for tarballs, the `metadata.yaml` arch/os/release) from the
+/// staged file at `file`. Best-effort: #2561 permit-scoped decode, so a
+/// saturated server, an unparseable path or a tarball without
+/// `metadata.yaml` all yield the `{"file_type": "unknown"}` placeholder
+/// rather than failing an upload whose bytes are already staged.
+///
+/// Shared by the monolithic and native chunked uploads and by the generic
+/// chunked completion (`/api/v1/uploads`, #1846), so all three record the
+/// same document for the same bytes. Synchronous (bounded decode); async
+/// callers that can afford it run it on the blocking pool.
+pub(crate) fn extract_image_metadata(artifact_path: &str, file: &Path) -> serde_json::Value {
+    crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(artifact_path, file).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}))
+}
+
+/// The `(product, version)` coordinates of an Incus image path laid out as
+/// `<product>/<version>/<file>` with a recognised image file name, i.e. the
+/// `name`/`version` the native upload routes write and `streams_images` keys
+/// on. `None` for anything else (a sidecar, a malformed path).
+pub(crate) fn image_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let info = IncusHandler::parse_path(artifact_path).ok()?;
+    Some((info.product?, info.version?))
+}
+
+/// Write (or replace) an image's `artifact_metadata` row, which
+/// `streams_images` reads arch/os/release from. Shared by the native upload
+/// finalize and the generic chunked completion (#1846).
+pub(crate) async fn store_image_metadata(
+    db: &PgPool,
+    artifact_id: Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'incus', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(db)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("store metadata: {e}"))
+}
+
 /// Parameters for creating or updating an artifact record.
 struct UpsertArtifactParams<'a> {
     db: &'a PgPool,
@@ -686,18 +738,7 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
 
     let artifact_id: Uuid = artifact.get("id");
 
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'incus', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(metadata)
-    .execute(db)
-    .await
-    .map_err(|e| format!("store metadata: {e}"))?;
+    store_image_metadata(db, artifact_id, metadata).await?;
 
     // Surface Incus images in the top-level package browser. The generic
     // upload path (artifact_service) and the npm/pypi/nuget handlers populate
@@ -1059,12 +1100,7 @@ async fn upload_image(
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
     // artifact is already staged, so a saturated server skips this best-effort
     // extraction rather than shedding the upload.
-    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path).ok()
-    })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
+    let metadata = extract_image_metadata(&artifact_path, &temp_path);
 
     // Record an upload session in `finalizing` state, then push to the
     // StorageBackend on a background task and return 202. Doing the
@@ -1851,12 +1887,7 @@ async fn complete_chunked_upload(
     } else {
         &final_path
     };
-    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(&session.artifact_path, metadata_source).ok()
-    })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
+    let metadata = extract_image_metadata(&session.artifact_path, metadata_source);
 
     // Finalize asynchronously: push to the StorageBackend on a background
     // task and return 202. The assembled multi-GiB push can outlive an L7
@@ -6214,6 +6245,98 @@ mod streaming_pipeline_regression_tests {
             .bind(session_id)
             .execute(&f.pool)
             .await;
+        f.teardown().await;
+    }
+
+    /// #1846: an Incus image pushed through the generic chunked flow
+    /// (`/api/v1/uploads`) gets the native finalize: the row is named after
+    /// the product (the old path named it `incus.tar.gz`, so its download URL
+    /// pointed at a product that does not exist), its `metadata.yaml`
+    /// arch/os/release land in `artifact_metadata`, and `images.json` lists
+    /// it with them.
+    #[tokio::test]
+    async fn chunked_image_upload_runs_native_finalize_1846() {
+        use std::io::Write;
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let yaml = b"architecture: aarch64\nproperties:\n  os: Debian\n  release: trixie\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(yaml.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "metadata.yaml", &yaml[..])
+            .unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar.into_inner().unwrap()).unwrap();
+        let image = gz.finish().unwrap();
+
+        let path = build_artifact_path("debian-trixie", "20261004", "incus.tar.gz");
+        let (status, body) = f
+            .chunked_upload(&path, &image, serde_json::json!({}), false)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunked completion failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (artifact_id, name, version): (Uuid, String, Option<String>) = sqlx::query_as(
+            "SELECT id, name, version FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(&path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("chunked artifact row");
+        assert_eq!(name, "debian-trixie", "named by product, not file");
+        assert_eq!(version.as_deref(), Some("20261004"));
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM artifact_metadata WHERE artifact_id = $1 AND format = 'incus'",
+        )
+        .bind(artifact_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("chunked upload must write the incus artifact_metadata row");
+        assert_eq!(metadata["image_metadata"]["os"], "Debian");
+        let catalog: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM packages WHERE repository_id = $1 AND name = 'debian-trixie'",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(catalog, 1, "the image is in the package catalog");
+
+        let req = axum::http::Request::builder()
+            .uri(format!("/{}/streams/v1/images.json", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let catalog: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let product = &catalog["products"]["debian-trixie"];
+        assert_eq!(product["arch"], "aarch64", "{catalog}");
+        assert_eq!(product["os"], "Debian");
+        assert_eq!(product["release"], "trixie");
+        let item = &product["versions"]["20261004"]["items"]["incus.tar.xz"];
+        assert_eq!(item["size"], image.len() as i64, "{catalog}");
+
+        // The SimpleStreams download URL resolves to the chunked bytes.
+        let download = item["path"].as_str().expect("item path").to_string();
+        let req = axum::http::Request::builder()
+            .uri(format!(
+                "/{}",
+                download.trim_start_matches('/').split_once('/').unwrap().1
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(status, StatusCode::OK, "download of {download}");
+        assert_eq!(&body[..], &image[..]);
+
         f.teardown().await;
     }
 }
