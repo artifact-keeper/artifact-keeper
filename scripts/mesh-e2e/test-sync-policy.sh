@@ -14,13 +14,19 @@ log()  { echo "==> $1"; }
 pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; exit 1; }
 
+# Throwaway e2e admin credential: compose injects ADMIN_PASS into the
+# mesh-test container from the repository-root .env.test (#3490).
+: "${ADMIN_PASS:?ADMIN_PASS is not set (the mesh-test service reads it from .env.test)}"
+LOGIN_BODY=$(jq -cn --arg p "$ADMIN_PASS" '{username: "admin", password: $p}')
+: "${PEER_B_API_KEY:?PEER_B_API_KEY is not set (run-all-mesh-tests.sh mints it)}"
+
 # ---------------------------------------------------------------------------
 # 1. Login to peer-a
 # ---------------------------------------------------------------------------
 log "Logging in to peer-a..."
 PEER_A_TOKEN=$(curl -sf -X POST "$PEER_A_URL/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin123"}' | jq -r '.access_token')
+  -d "$LOGIN_BODY" | jq -r '.access_token')
 
 [ -n "$PEER_A_TOKEN" ] && [ "$PEER_A_TOKEN" != "null" ] \
   && pass "peer-a login succeeded" \
@@ -53,7 +59,7 @@ curl -s -X POST "$PEER_A_URL/api/v1/peers" \
     "name": "peer-b",
     "endpoint_url": "http://backend-peer-b:8080",
     "region": "us-west-2",
-    "api_key": "peer-b-key"
+    "api_key": "'"$PEER_B_API_KEY"'"
   }' >/dev/null 2>&1 || true
 pass "peer-b registration ensured"
 

@@ -14,6 +14,41 @@ apk add --no-cache curl jq >/dev/null 2>&1
 echo "    curl and jq installed"
 echo ""
 
+# ---------------------------------------------------------------------------
+# Peer credentials (#1936)
+# ---------------------------------------------------------------------------
+# A peer's `api_key` is the bearer credential the OTHER instance presents when
+# it probes this peer (GET /api/v1/peers) and when its sync worker PUTs an
+# artifact here, so it has to be a real API token minted on this peer. The
+# scripts used to register placeholder strings ("peer-b-key"): every liveness
+# probe got 401, the peer never went `online`, and every sync task stayed
+# `pending` forever while the tests passed on "a task was queued".
+mint_peer_token() {
+    _url="$1"
+    _jwt=$(curl -sf -X POST "$_url/api/v1/auth/login" \
+        -H 'Content-Type: application/json' \
+        -d "$(jq -cn --arg p "$ADMIN_PASS" '{username: "admin", password: $p}')" \
+        | jq -r '.access_token // empty')
+    [ -n "$_jwt" ] || { echo "FATAL: admin login to $_url failed" >&2; return 1; }
+    curl -sf -X POST "$_url/api/v1/auth/tokens" \
+        -H "Authorization: Bearer $_jwt" \
+        -H 'Content-Type: application/json' \
+        -d '{"name": "mesh-e2e-peer-link", "scopes": ["admin"], "expires_in_days": 1}' \
+        | jq -r '.token // empty'
+}
+
+: "${ADMIN_PASS:?ADMIN_PASS is not set (the mesh-test service reads it from .env.test)}"
+echo "==> Minting peer-link API tokens..."
+PEER_A_API_KEY=$(mint_peer_token "http://backend-peer-a:8080")
+PEER_B_API_KEY=$(mint_peer_token "http://backend-peer-b:8080")
+if [ -z "$PEER_A_API_KEY" ] || [ -z "$PEER_B_API_KEY" ]; then
+    echo "FATAL: could not mint a peer-link API token on both peers"
+    exit 1
+fi
+export PEER_A_API_KEY PEER_B_API_KEY
+echo "    peer-a and peer-b tokens minted"
+echo ""
+
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
