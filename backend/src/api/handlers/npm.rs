@@ -5291,6 +5291,23 @@ async fn store_npm_version(
     .await
     .map_err(|e| e.into_response())?;
 
+    // Storage quota (#2474 / #2475): the repository's own quota and, when it
+    // belongs to a project with a finite quota, the project aggregate. For a
+    // publish addressed at a virtual repository `repo_id` is already the
+    // resolved deployment-target member, so the MEMBER's repository and
+    // project quotas are the ones charged. This unlocked preflight rejects
+    // before any bytes are written; the authoritative admission happens
+    // under lock in the same transaction as the artifact INSERT below.
+    let size_bytes = ver.tarball_bytes.len() as i64;
+    let repo_service = state.create_repository_service();
+    if let Some(scope) = repo_service
+        .quota_preflight(repo_id, size_bytes)
+        .await
+        .map_err(IntoResponse::into_response)?
+    {
+        return Err(scope.into_error().into_response());
+    }
+
     // Store the tarball
     let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
@@ -5300,7 +5317,19 @@ async fn store_npm_version(
         .await
         .map_err(map_storage_err)?;
 
-    let size_bytes = ver.tarball_bytes.len() as i64;
+    // Atomic quota admission, in the same transaction as the INSERT so
+    // concurrent publishes into the repository (or any sibling repository of
+    // a capped project) cannot jointly over-admit. A denial here is only
+    // reachable when a concurrent upload consumed the headroom after the
+    // preflight above.
+    let mut tx = state.db.begin().await.map_err(map_db_err)?;
+    let admission = repo_service
+        .check_quota_locked(&mut tx, repo_id, &artifact_path, size_bytes)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if let Some(scope) = admission.denied_by {
+        return Err(scope.into_error().into_response());
+    }
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -5322,9 +5351,10 @@ async fn store_npm_version(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
         .await;
@@ -12788,6 +12818,162 @@ mod tests {
         let err = published.expect_err("publish without member write must be rejected");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(in_member, 0, "nothing may land in the member");
+    }
+
+    /// #2475 / #2474: a publish through a virtual repository is charged to
+    /// the RESOLVED MEMBER's project quota, not to the virtual's own project.
+    /// The virtual sits in a different project (cross-project aggregation)
+    /// whose 1-byte cap would reject anything if it were charged. The
+    /// member's project cap (5 bytes) admits one 3-byte tarball and rejects
+    /// the next with 507 — through the virtual and, for a sibling repository
+    /// of the same project, directly — and nothing lands for a rejected
+    /// publish.
+    #[tokio::test]
+    async fn test_publish_through_virtual_charged_to_member_project_quota() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let (sibling_id, sibling_key, sibling_dir) =
+            tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&fx.pool, "virtual", "npm").await;
+        let mut projects = Vec::new();
+        for (tag, quota) in [("member", 5_i64), ("virtual", 1_i64)] {
+            let id: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO projects (key, name, quota_bytes) VALUES ($1, $1, $2) RETURNING id",
+            )
+            .bind(format!("npm-pq-{tag}-{}", uuid::Uuid::new_v4().simple()))
+            .bind(quota)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("create project");
+            projects.push(id);
+        }
+        let (member_project, virtual_project) = (projects[0], projects[1]);
+        for (repo, project) in [
+            (fx.repo_id, member_project),
+            (sibling_id, member_project),
+            (virtual_id, virtual_project),
+        ] {
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(repo)
+                .bind(project)
+                .execute(&fx.pool)
+                .await
+                .expect("assign project");
+        }
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+        tdh::grant_repo_actions(&fx.pool, virtual_id, fx.user_id, &["write"]).await;
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
+        tdh::grant_repo_actions(&fx.pool, sibling_id, fx.user_id, &["read", "write"]).await;
+
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish = |repo_key: String, package: &'static str, version: &'static str| {
+            let tarball_b64 = tarball_b64.clone();
+            let state = fx.state.clone();
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            async move {
+                super::publish_package(
+                    &state,
+                    Some(auth),
+                    &repo_key,
+                    package,
+                    &HeaderMap::new(),
+                    Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": package,
+                            "versions": { version: { "name": package, "version": version } },
+                            "_attachments": {
+                                format!("{package}-{version}.tgz"): { "data": tarball_b64 }
+                            },
+                        }))
+                        .expect("serialize publish body"),
+                    ),
+                )
+                .await
+            }
+        };
+        let first = publish(virtual_key.clone(), "widget", "1.0.0").await;
+        let second = publish(virtual_key.clone(), "widget", "1.0.1").await;
+        let sibling = publish(sibling_key.clone(), "gadget", "1.0.0").await;
+
+        let member_versions: Vec<String> = sqlx::query_scalar(
+            "SELECT version FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("member artifacts");
+        let sibling_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(sibling_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("sibling artifacts");
+        let member_ledger: Option<i64> = sqlx::query_scalar(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("member ledger");
+
+        for id in [sibling_id, virtual_id] {
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(id)
+            .execute(&fx.pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(sibling_dir);
+        let _ = std::fs::remove_dir_all(virtual_dir);
+        fx.teardown().await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = ANY($1)")
+            .bind(&projects)
+            .execute(&fx.pool)
+            .await;
+
+        assert!(
+            first.is_ok(),
+            "the first publish fits the member project's cap and must ignore the \
+             virtual's project: {:?}",
+            first.err().map(|r| r.status())
+        );
+        let quota_body = |resp: Response| async move {
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read error body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let (status, body) = quota_body(second.expect_err("over the project cap")).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("Project storage quota exceeded"), "{body}");
+        let (status, body) = quota_body(sibling.expect_err("sibling shares the cap")).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("Project storage quota exceeded"), "{body}");
+        assert_eq!(member_versions, vec!["1.0.0".to_string()]);
+        assert_eq!(sibling_rows, 0, "a rejected publish must not land");
+        assert_eq!(
+            member_ledger,
+            Some(3),
+            "the member is charged the tarball once"
+        );
     }
 
     /// #2022: a direct `npm publish` to a `promotion_only` repository must be

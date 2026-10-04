@@ -18553,6 +18553,134 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
+    // ── #2475: cross-project virtual governance ──────────────────────────
+
+    /// Projects P4 (#2475): a virtual repository may aggregate members from
+    /// OTHER projects, but each member stays governed by its own project.
+    ///
+    /// * A caller with read+write on member project A but nothing on member
+    ///   project B sees only A's member through the virtual (B's private
+    ///   member is neither listed nor resolvable), and a through-virtual
+    ///   publish resolves to A's member even though B's member has the
+    ///   higher priority.
+    /// * A caller whose only grant is on the VIRTUAL's project gets nothing
+    ///   from either member — a grant on the virtual's project must not leak
+    ///   into members of other projects — and has no deploy target.
+    #[tokio::test]
+    async fn cross_project_virtual_members_follow_their_own_project_grants() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let member_user = db_helpers::create_user(&pool).await;
+        let (virtual_only_user, _u) = tdh::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (b_id, _kb, db_) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (a_id, _ka, da) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, b_id, 1).await;
+        db_helpers::link_member(&pool, root_id, a_id, 2).await;
+
+        let mut projects = Vec::new();
+        for (tag, repo) in [("virtual", root_id), ("a", a_id), ("b", b_id)] {
+            let project: Uuid =
+                sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+                    .bind(format!("p4-{tag}-{}", Uuid::new_v4().simple()))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create project");
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(repo)
+                .bind(project)
+                .execute(&pool)
+                .await
+                .expect("assign project");
+            projects.push(project);
+        }
+        let (virtual_project, a_project) = (projects[0], projects[1]);
+        for user in [member_user, virtual_only_user] {
+            tdh::grant_permission(
+                &pool,
+                "user",
+                user,
+                "project",
+                virtual_project,
+                &["read", "write"],
+            )
+            .await;
+        }
+        tdh::grant_permission(
+            &pool,
+            "user",
+            member_user,
+            "project",
+            a_project,
+            &["read", "write"],
+        )
+        .await;
+
+        let svc = crate::services::permission_service::PermissionService::new(pool.clone());
+        let member_auth = nonadmin_auth(member_user);
+        let virtual_only_auth = nonadmin_auth(virtual_only_user);
+        let ids = |r: Result<Vec<Repository>, Response>| -> Vec<Uuid> {
+            r.map(|ms| ms.into_iter().map(|m| m.id).collect())
+                .unwrap_or_else(|e| panic!("authorize members failed: {}", e.status()))
+        };
+        let member_visible =
+            ids(authorized_virtual_members(&pool, Some(&member_auth), root_id).await);
+        let virtual_only_visible =
+            ids(authorized_virtual_members(&pool, Some(&virtual_only_auth), root_id).await);
+        let anonymous_visible = ids(authorized_virtual_members(&pool, None, root_id).await);
+        let member_target = resolve_virtual_deploy_target(&pool, &svc, &member_auth, root_id)
+            .await
+            .map(|r| r.id);
+        let virtual_only_target =
+            resolve_virtual_deploy_target(&pool, &svc, &virtual_only_auth, root_id)
+                .await
+                .map(|r| r.id);
+
+        // Clean up BEFORE asserting so a failure does not leak the fixtures.
+        let _ = sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'project' AND target_id = ANY($1)",
+        )
+        .bind(&projects)
+        .execute(&pool)
+        .await;
+        cleanup_member_graph(&pool, &[root_id, b_id, a_id], member_user, &[rd, db_, da]).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(virtual_only_user)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = ANY($1)")
+            .bind(&projects)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            member_visible,
+            vec![a_id],
+            "only the member whose project grants the caller read may aggregate"
+        );
+        assert!(
+            virtual_only_visible.is_empty(),
+            "a grant on the virtual's project must not leak other projects' members"
+        );
+        assert!(
+            anonymous_visible.is_empty(),
+            "private members never reach anonymous"
+        );
+        assert_eq!(
+            member_target.expect("A's member is writable via its project grant"),
+            a_id,
+            "the deploy target skips the higher-priority member of an ungranted project"
+        );
+        assert_eq!(
+            virtual_only_target
+                .expect_err("no member project grants write")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     /// #3813 F1: the virtual-parent byte fan-out and a direct member fetch must
     /// give an authenticated grant-less caller the SAME answer for an
     /// `internal` member.
