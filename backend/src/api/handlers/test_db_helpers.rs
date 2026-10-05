@@ -3105,3 +3105,47 @@ pub async fn collect_response(
 pub fn admin_auth_ext() -> Option<AuthExtension> {
     Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
 }
+
+/// Collects `tracing` output written while a subscriber built with it as the
+/// writer is the thread default (`tracing::subscriber::set_default`). Clone
+/// it into the subscriber and read the text back with [`LogCapture::text`].
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Install a thread-default subscriber at `level` writing into this
+    /// capture; logs are captured until the returned guard drops.
+    pub fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(level)
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    /// Everything captured so far, lossily decoded.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}

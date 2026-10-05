@@ -62,6 +62,7 @@ pub mod oci_inspect;
 pub mod oci_manifest_refs_backfill;
 pub mod oci_migration_reindex;
 pub mod oci_referenced_content;
+pub mod oci_trusted_realms;
 pub mod oidc_env_bootstrap;
 pub mod oidc_service;
 pub mod openscap_scanner;

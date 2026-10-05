@@ -2429,6 +2429,28 @@ impl CachePersister {
     }
 }
 
+/// The `security` WARN logged when a credentialed remote's OCI bearer realm is
+/// cross-origin and not trusted, so its token is requested anonymously
+/// (GHSA-78h6-3wp8-2542, #3591).
+const REALM_CREDENTIALS_WITHHELD: &str =
+    "OCI bearer realm is a different origin than the configured upstream; requesting the \
+     token WITHOUT the upstream's Basic credentials (GHSA-78h6-3wp8-2542). If this token \
+     service is trusted, add its https origin to the repository's oci_trusted_bearer_realms \
+     (#3591)";
+
+/// Outcome of the OCI bearer-realm credential-forwarding decision
+/// ([`UpstreamClient::realm_credential_forwarding`], GHSA-78h6-3wp8-2542,
+/// #3591).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealmCredentialForwarding {
+    /// The realm shares the configured upstream's origin.
+    SameOrigin,
+    /// Cross-origin, but explicitly trusted for this repository.
+    TrustedRealm,
+    /// Cross-origin and not trusted: request the token anonymously.
+    Withheld,
+}
+
 /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
 /// (#1618 S8 — the highest-risk structural extraction).
 ///
@@ -2666,7 +2688,7 @@ impl UpstreamClient {
             // helper itself never touches these headers; the closure owns that
             // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
@@ -2886,7 +2908,7 @@ impl UpstreamClient {
             // but adds NO `Accept` header, preserving the asymmetry with the
             // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     apply_custom_ua(req, custom_ua.as_deref())
                 })
                 .await?
@@ -2941,6 +2963,7 @@ impl UpstreamClient {
         &self,
         response: reqwest::Response,
         url: &str,
+        repo_id: Uuid,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
         client: &Client,
         build_request: F,
@@ -2981,21 +3004,17 @@ impl UpstreamClient {
                 // endpoints (Docker Hub's auth.docker.io among them) answer
                 // such requests, and a realm that genuinely requires the
                 // upstream's credentials simply rejects the exchange, which
-                // fails closed. There is deliberately no cross-host
-                // allowance: this codebase pins credentials to the
-                // operator-configured origin everywhere else.
-                let realm_auth = if Self::realm_matches_upstream_origin(realm, url) {
-                    upstream_auth.clone()
-                } else {
-                    tracing::warn!(
-                        target: "security",
-                        realm = %redact_url_for_diagnostics(realm),
-                        "OCI bearer realm is a different origin than the configured upstream; \
-                         requesting the token WITHOUT the upstream's Basic credentials \
-                         (GHSA-78h6-3wp8-2542)"
-                    );
-                    None
-                };
+                // fails closed.
+                //
+                // The only cross-origin allowance is the one a repository
+                // administrator configured explicitly for THIS repository
+                // (#3591): `oci_trusted_bearer_realms`, a list of exact
+                // https origins validated on write. Nothing is trusted
+                // implicitly — not even Docker Hub's registry-1 ->
+                // auth.docker.io pair. See `realm_credentials`.
+                let realm_auth = self
+                    .realm_credentials(realm, url, repo_id, upstream_auth)
+                    .await?;
 
                 let token = self
                     .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
@@ -3331,6 +3350,80 @@ impl UpstreamClient {
                     && realm.port_or_known_default() == upstream.port_or_known_default()
             }
             _ => false,
+        }
+    }
+
+    /// The credentials to send to an OCI bearer `realm`'s token endpoint
+    /// for repository `repo_id` (GHSA-78h6-3wp8-2542, #3591): the configured
+    /// upstream auth when the realm is same-origin or listed in the
+    /// repository's `oci_trusted_bearer_realms`, `None` otherwise. The list
+    /// is only read when there are credentials to forward and the realm is
+    /// cross-origin, so the same-origin and anonymous paths do no lookup.
+    async fn realm_credentials(
+        &self,
+        realm: &str,
+        url: &str,
+        repo_id: Uuid,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        let trusted = if upstream_auth.is_some() && !Self::realm_matches_upstream_origin(realm, url)
+        {
+            crate::services::oci_trusted_realms::load_trusted_realms(&self.db, repo_id).await?
+        } else {
+            Vec::new()
+        };
+        let forwarded = match Self::realm_credential_forwarding(realm, url, &trusted) {
+            RealmCredentialForwarding::SameOrigin => upstream_auth.clone(),
+            RealmCredentialForwarding::TrustedRealm => {
+                // Audit trail: credentials are leaving for another origin
+                // because an administrator said so.
+                tracing::info!(
+                    target: "security",
+                    realm = %redact_url_for_diagnostics(realm),
+                    "forwarding the upstream's credentials to a cross-origin OCI bearer realm \
+                     listed in the repository's oci_trusted_bearer_realms (#3591)"
+                );
+                upstream_auth.clone()
+            }
+            RealmCredentialForwarding::Withheld if upstream_auth.is_some() => {
+                tracing::warn!(
+                    target: "security",
+                    realm = %redact_url_for_diagnostics(realm),
+                    "{}",
+                    REALM_CREDENTIALS_WITHHELD
+                );
+                None
+            }
+            // Anonymous remote: nothing is withheld, so nothing to warn about
+            // (and the allowlist hint would not apply).
+            RealmCredentialForwarding::Withheld => {
+                tracing::debug!(
+                    realm = %redact_url_for_diagnostics(realm),
+                    "cross-origin OCI bearer realm on a remote without upstream credentials"
+                );
+                None
+            }
+        };
+        Ok(forwarded)
+    }
+
+    /// Whether the configured upstream credentials may follow an OCI bearer
+    /// `realm` to its token endpoint: same origin as the upstream request URL
+    /// (GHSA-78h6-3wp8-2542), or an origin the repository administrator
+    /// listed in `oci_trusted_bearer_realms` (#3591, exact https origin
+    /// only, see [`crate::services::oci_trusted_realms::realm_is_trusted`]).
+    /// Anything else withholds them.
+    fn realm_credential_forwarding(
+        realm: &str,
+        upstream_url: &str,
+        trusted: &[String],
+    ) -> RealmCredentialForwarding {
+        if Self::realm_matches_upstream_origin(realm, upstream_url) {
+            RealmCredentialForwarding::SameOrigin
+        } else if crate::services::oci_trusted_realms::realm_is_trusted(realm, trusted) {
+            RealmCredentialForwarding::TrustedRealm
+        } else {
+            RealmCredentialForwarding::Withheld
         }
     }
 
@@ -5586,7 +5679,7 @@ impl ProxyService {
             StatusCode::UNAUTHORIZED => {
                 if let Some(retry_response) = self
                     .upstream_client
-                    .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                    .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                         req.header(IF_NONE_MATCH, etag)
                     })
                     .await?
@@ -16836,6 +16929,309 @@ mod tests {
             "not a url",
             "https://registry.example.com/v2/x"
         ));
+    }
+
+    // -- #3591: explicitly trusted cross-origin realms ------------------------
+    //
+    // The per-repository `oci_trusted_bearer_realms` allowlist is the ONLY
+    // cross-origin allowance. These pin the decision `exchange_bearer_then`
+    // acts on: same origin forwards, a listed exact https origin forwards,
+    // everything else (unlisted, http downgrade, lookalike hosts, port
+    // mismatch) withholds the credentials exactly as before.
+
+    fn trusted(origins: &[&str]) -> Vec<String> {
+        origins.iter().map(|o| o.to_string()).collect()
+    }
+
+    const DOCKER_HUB_MANIFEST: &str =
+        "https://registry-1.docker.io/v2/acme/private/manifests/latest";
+
+    #[test]
+    fn test_realm_forwarding_same_origin_needs_no_allowlist() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://registry.example.com/token",
+                "https://registry.example.com/v2/x",
+                &[]
+            ),
+            RealmCredentialForwarding::SameOrigin
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_trusted_cross_origin_realm() {
+        // Docker Hub private repositories: the documented configuration.
+        let docker = trusted(&["https://auth.docker.io"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &docker
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+        // Split-host GitLab, with an explicit non-default port.
+        let gitlab = trusted(&["https://gitlab.example.com:8443"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://gitlab.example.com:8443/jwt/auth",
+                "https://registry.example.com/v2/group/project/manifests/1",
+                &gitlab
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_untrusted_cross_origin_realm() {
+        // Nothing is trusted implicitly: the Docker Hub pair without an
+        // allowlist entry keeps the GHSA-78h6-3wp8-2542 behavior.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &[]
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+        // An allowlist for a different origin does not help an attacker realm.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://attacker.example/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_http_realm_even_when_host_is_trusted() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "http://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_lookalike_hosts_and_ports() {
+        let list = trusted(&["https://auth.docker.io"]);
+        for realm in [
+            "https://auth.docker.io.attacker.example/token",
+            "https://evilauth.docker.io/token",
+            "https://sub.auth.docker.io/token",
+            "https://auth.docker.io@attacker.example/token",
+            "https://auth-docker.io/token",
+            "https://auth.docker.io:8443/token",
+            "not a url",
+        ] {
+            assert_eq!(
+                UpstreamClient::realm_credential_forwarding(realm, DOCKER_HUB_MANIFEST, &list),
+                RealmCredentialForwarding::Withheld,
+                "{realm} must not receive the upstream credentials"
+            );
+        }
+    }
+
+    /// End-to-end over the seam `exchange_bearer_then` calls: the stored
+    /// per-repository allowlist decides whether the configured credentials
+    /// follow a cross-origin realm (#3591), and nothing else does.
+    #[tokio::test]
+    async fn test_realm_credentials_reads_the_repository_allowlist_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::UpstreamAuthType;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let client = UpstreamClient::new(pool.clone(), Client::new());
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let realm = "https://auth.docker.io/token";
+        // Each call returns the forwarded credentials and the INFO+ log lines
+        // it emitted, so the security logging is pinned alongside the decision.
+        let call = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let client = &client;
+            async move {
+                let capture = tdh::LogCapture::default();
+                let guard = capture.install(tracing::Level::INFO);
+                let out = client
+                    .realm_credentials(realm, DOCKER_HUB_MANIFEST, repo_id, &auth)
+                    .await
+                    .expect("realm_credentials");
+                drop(guard);
+                (out, capture.text())
+            }
+        };
+        let get = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let call = &call;
+            async move { call(realm, auth).await.0 }
+        };
+
+        // No allowlist: cross-origin realm gets no credentials (GHSA-78h6),
+        // and the security WARN names the setting.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out.is_none());
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("WITHOUT")
+                && logs.contains("oci_trusted_bearer_realms"),
+            "withheld credentials must log the security warning: {logs}"
+        );
+        // Anonymous remotes: nothing withheld, so no WARN (debug only).
+        let (out, logs) = call(realm, None).await;
+        assert!(out.is_none());
+        assert!(
+            !logs.contains("WARN"),
+            "anonymous remote must not warn: {logs}"
+        );
+        // Same origin forwards without any allowlist.
+        assert!(get("https://registry-1.docker.io/token", creds.clone()).await == creds);
+
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+        // Trusted: forwarded, with an INFO audit line and no warning.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out == creds);
+        assert!(
+            logs.contains("INFO") && logs.contains("forwarding") && !logs.contains("WARN"),
+            "trusted forwarding must leave an INFO audit line: {logs}"
+        );
+        // Still withheld: http downgrade, lookalike host.
+        assert!(get("http://auth.docker.io/token", creds.clone())
+            .await
+            .is_none());
+        assert!(get(
+            "https://auth.docker.io.attacker.example/token",
+            creds.clone()
+        )
+        .await
+        .is_none());
+        // Anonymous remotes stay anonymous even when the realm is listed.
+        assert!(get(realm, None).await.is_none());
+
+        // Clearing restores the strict default.
+        save_trusted_realms(&pool, repo_id, &[])
+            .await
+            .expect("clear");
+        assert!(get(realm, creds.clone()).await.is_none());
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// End to end through `fetch_from_upstream` (pins the call site in
+    /// `exchange_bearer_then`): a credentialed remote whose registry names a
+    /// cross-origin realm that is NOT in its allowlist must request the token
+    /// with no `Authorization` header, while the registry itself still gets
+    /// the Basic credentials. Two non-loopback wiremock origins (different
+    /// ports) stand in for registry and token service. The trusted-forwarding
+    /// counterpart cannot run here: trusted entries are https-only and
+    /// wiremock serves http, so that side is pinned by
+    /// `test_realm_credentials_reads_the_repository_allowlist_db`.
+    #[tokio::test]
+    async fn test_fetch_from_upstream_withholds_credentials_from_unlisted_realm_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "anon-token",
+            })))
+            .mount(&token_service)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .and(header("authorization", "Bearer anon-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"manifest".as_ref()))
+            .with_priority(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    "Bearer realm=\"{}/token\",service=\"registry\",scope=\"repository:acme/app:pull\"",
+                    token_service.uri()
+                )
+                .as_str(),
+            ))
+            .with_priority(10)
+            .mount(&registry)
+            .await;
+
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc".to_string(),
+                password: "s3cret".to_string(),
+            }),
+        )
+        .await
+        .expect("save upstream auth");
+        // An allowlist that does not name the token service.
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+        let url = format!("{}/v2/acme/app/manifests/1", registry.uri());
+        let fetched = proxy.fetch_from_upstream(&url, repo_id, 1 << 20).await;
+
+        let token_requests = token_service.received_requests().await.expect("recorded");
+        let registry_requests = registry.received_requests().await.expect("recorded");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let fetched = fetched.expect("anonymous token exchange must complete the fetch");
+        assert_eq!(fetched.content.as_ref(), b"manifest");
+        assert_eq!(token_requests.len(), 1, "exactly one token exchange");
+        assert!(
+            token_requests[0].headers.get("authorization").is_none(),
+            "an unlisted cross-origin realm must NOT receive the upstream credentials"
+        );
+        assert!(
+            registry_requests[0]
+                .headers
+                .get("authorization")
+                .is_some_and(|v| v.to_str().unwrap_or("").starts_with("Basic ")),
+            "the registry itself is same-origin and still gets the Basic credentials"
+        );
     }
 
     #[tokio::test]
