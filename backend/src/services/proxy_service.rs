@@ -1026,7 +1026,11 @@ pub struct CachedArtifactEntry {
 /// Cache metadata for a proxied artifact
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
-    /// When the artifact was cached
+    /// When the cached body was last fetched from upstream or confirmed
+    /// current by a conditional revalidation (304). It anchors the read-time
+    /// TTL clamp in [`cache_classifier::effective_expires_at`] (#3832), so a
+    /// lowered repository TTL is measured from the last time the body was
+    /// known to match upstream.
     pub cached_at: DateTime<Utc>,
     /// ETag from upstream (if available)
     pub upstream_etag: Option<String>,
@@ -1109,9 +1113,31 @@ impl CacheMetadata {
     ) -> crate::services::cache_classifier::CacheEntry {
         crate::services::cache_classifier::CacheEntry {
             mutability,
-            expires_at: self.expires_at,
+            expires_at: self.effective_expires_at(mutability),
             negative_cached_until: self.negative_cached_until,
         }
+    }
+
+    /// When this entry stops being fresh under the repository's *current*
+    /// TTL policy (#3832) — see [`cache_classifier::effective_expires_at`].
+    /// `mutability` must already carry the repository override
+    /// ([`ProxyService::effective_mutability`]).
+    pub(crate) fn effective_expires_at(
+        &self,
+        mutability: crate::services::cache_classifier::Mutability,
+    ) -> DateTime<Utc> {
+        cache_classifier::effective_expires_at(mutability, self.cached_at, self.expires_at)
+    }
+
+    /// Expiry for a gate that may not know the path's classification: the
+    /// effective expiry when it does, else the stamped `expires_at` (an entry
+    /// of a repository that no longer exists, or a unit-test rig with no
+    /// repository row).
+    fn expires_under(
+        &self,
+        mutability: Option<crate::services::cache_classifier::Mutability>,
+    ) -> DateTime<Utc> {
+        mutability.map_or(self.expires_at, |m| self.effective_expires_at(m))
     }
 }
 
@@ -1417,12 +1443,17 @@ impl CacheStore {
     /// removes that second object-store round trip and the two reads can no
     /// longer disagree. `None` preserves the direct read for callers that do
     /// not have the sidecar in hand.
+    ///
+    /// `mutability` (#3832): the path's override-applied classification when
+    /// the caller knows it, so the fresh gate uses the effective expiry; `None`
+    /// gates on the stamped `expires_at`.
     async fn get(
         &self,
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
         preloaded_metadata: Option<CacheMetadata>,
+        mutability: Option<cache_classifier::Mutability>,
     ) -> Result<Option<CachedBody>> {
         // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
         // Only the FRESH lookup (`allow_stale == false`) is counted: that is
@@ -1470,10 +1501,10 @@ impl CacheStore {
         };
 
         // Fresh reads enforce the expiry gate; the stale fallback skips it.
-        if !allow_stale && Utc::now() > metadata.expires_at {
+        if !allow_stale && Utc::now() > metadata.expires_under(mutability) {
             tracing::debug!(
                 cache_key = %cache_key,
-                expires_at = %metadata.expires_at,
+                expires_at = %metadata.expires_under(mutability),
                 "Proxy cache miss: entry expired"
             );
             record_proxy_cache_lookup(repo_label, "miss_expired");
@@ -1578,13 +1609,19 @@ impl CacheStore {
     /// exists, is unexpired, and the content object passes ETag revalidation
     /// (or, for filesystem/legacy entries with no pinned ETag, an existence
     /// check).
-    async fn is_fresh(&self, keys: &CacheKeys) -> bool {
+    ///
+    /// `mutability` as for [`Self::get`] (#3832).
+    async fn is_fresh(
+        &self,
+        keys: &CacheKeys,
+        mutability: Option<cache_classifier::Mutability>,
+    ) -> bool {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
             return false;
         };
-        if Utc::now() > metadata.expires_at {
+        if Utc::now() > metadata.expires_under(mutability) {
             return false;
         }
 
@@ -3462,6 +3499,41 @@ pub struct ProxyService {
     /// so two deployments sharing one bucket address disjoint key spaces
     /// instead of exchanging each other's cached upstream bytes.
     cache_scope: ProxyCacheScope,
+    /// Per-process memo of the repository facts the TTL policy needs on the
+    /// read path (#3832). See [`TtlPolicyCache`].
+    ttl_policy_cache: TtlPolicyCache,
+}
+
+/// How long [`TtlPolicyCache`] trusts a looked-up value. Bounds how long a TTL
+/// change made on another replica takes to reach this one; the replica that
+/// served the `PUT /cache-ttl` invalidates its own entry immediately.
+const TTL_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Short-TTL memo of the repository facts every mutable-path freshness gate
+/// consults (#3832): the `cache_ttl_secs` override by repository id, and the
+/// `(id, format)` of a repository by key for the key-only read paths. Without
+/// it the read-time TTL clamp would add a database round trip to every
+/// mutable cache hit.
+struct TtlPolicyCache {
+    overrides: Cache<Uuid, Option<i64>>,
+    repo_by_key: Cache<String, Option<(Uuid, RepositoryFormat)>>,
+}
+
+impl TtlPolicyCache {
+    const CAPACITY: u64 = 10_000;
+
+    fn new() -> Self {
+        Self {
+            overrides: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            repo_by_key: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+        }
+    }
 }
 
 impl ProxyService {
@@ -3518,6 +3590,7 @@ impl ProxyService {
             coordinator,
             backfill_limiter,
             cache_scope,
+            ttl_policy_cache: TtlPolicyCache::new(),
         }
     }
 
@@ -3713,7 +3786,8 @@ impl ProxyService {
     /// under the given `path` (without contacting upstream).
     ///
     /// Returns `Ok(Some((content, content_type)))` on cache hit, `Ok(None)`
-    /// on cache miss or expired entry.
+    /// on cache miss or expired entry. Expiry is the effective one under the
+    /// repository's current TTL (#3832).
     pub async fn get_cached_artifact_by_path(
         &self,
         repo_key: &str,
@@ -3721,7 +3795,9 @@ impl ProxyService {
     ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
-        self.get_cached_artifact(&cache_key, &metadata_key, None)
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store
+            .get(&cache_key, &metadata_key, false, None, mutability)
             .await
     }
 
@@ -3799,7 +3875,11 @@ impl ProxyService {
         let Ok(keys) = CacheKeys::derive(&self.cache_scope, repo_key, path) else {
             return false;
         };
-        self.cache_store.is_fresh(&keys).await
+        // #3832: a lowered repository TTL must also stop the presigned-redirect
+        // fast path from handing out a mutable entry the read path would now
+        // revalidate.
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store.is_fresh(&keys, mutability).await
     }
 
     /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
@@ -4040,8 +4120,19 @@ impl ProxyService {
                 // falls back to a fresh storage read, so a leader's
                 // just-written sidecar is still observed (#3335).
                 let metadata = self.load_cache_metadata(&metadata_key).await.unwrap_or(None);
+                // #3832: gate on the effective expiry, so an entry the
+                // up-front read just judged stale under a lowered TTL is not
+                // served here on the strength of its old stamp.
+                let mutability = self.effective_mutability(repo, cache_path).await;
                 let cached = self
-                    .get_cached_artifact(&cache_key, &metadata_key, metadata.clone())
+                    .cache_store
+                    .get(
+                        &cache_key,
+                        &metadata_key,
+                        false,
+                        metadata.clone(),
+                        Some(mutability),
+                    )
                     .await?;
                 if cached.is_some() {
                     // Package Age Policy (#1770): a follower re-checking the
@@ -4674,13 +4765,15 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<StreamingCacheReadOutcome> {
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        // #3832: the repository's current TTL override is folded in, so the
+        // freshness verdict uses the effective (clamped) expiry.
+        let mutability = self.effective_mutability(repo, cache_path).await;
 
         // A sidecar read/parse error is treated as "no entry" (Miss) — the same
         // B6-safe stance as the buffered path. Waits (bounded) for an in-flight
         // tail-phase streaming publish of the same key first (#3335).
         let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key)
+            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
             .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
@@ -5103,8 +5196,9 @@ impl ProxyService {
             None => return Ok(true), // No cache, definitely need to fetch
         };
 
-        // Check if cache has expired
-        if Utc::now() > metadata.expires_at {
+        // Check if cache has expired under the current TTL (#3832)
+        let mutability = self.effective_mutability(repo, path).await;
+        if Utc::now() > metadata.effective_expires_at(mutability) {
             return Ok(true);
         }
 
@@ -5292,8 +5386,12 @@ impl ProxyService {
                 ReleaseEpochRead::Unreadable => true,
             };
 
-            // Step 3: Check TTL
-            let ttl_expired = Utc::now() > meta.expires_at;
+            // Step 3: Check TTL, through the shared effective-expiry helper
+            // (#3832) so this gate cannot drift from the others.
+            let dists_policy = cache_classifier::Mutability::Mutable {
+                default_ttl_secs: dists_ttl_secs,
+            };
+            let ttl_expired = Utc::now() > meta.effective_expires_at(dists_policy);
 
             if !epoch_expired && !ttl_expired {
                 // Cache hit — read content and verify
@@ -5997,18 +6095,88 @@ impl ProxyService {
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
     pub(crate) async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
-        match cache_classifier::classify(&repo.format, path) {
-            cache_classifier::Mutability::Immutable => {
-                cache_classifier::Mutability::Immutable.write_ttl_secs()
-            }
-            cache_classifier::Mutability::Mutable { default_ttl_secs } => {
-                // A repo-level override still applies to mutable paths; fall
-                // back to the conservative classifier default otherwise.
-                self.get_cache_ttl_override(repo.id)
-                    .await
-                    .unwrap_or(default_ttl_secs)
-            }
+        self.effective_mutability(repo, path).await.write_ttl_secs()
+    }
+
+    /// The classification every cache write AND every freshness gate uses
+    /// for `path` (#3832): the classifier's verdict with the repository's
+    /// `cache_ttl_secs` override folded in by
+    /// [`cache_classifier::Mutability::with_ttl_override`], which is where the
+    /// override-vs-default precedence rule lives. Immutable paths skip the
+    /// override lookup entirely.
+    pub(crate) async fn effective_mutability(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> cache_classifier::Mutability {
+        self.effective_mutability_for(repo.id, &repo.format, path)
+            .await
+    }
+
+    async fn effective_mutability_for(
+        &self,
+        repo_id: Uuid,
+        format: &RepositoryFormat,
+        path: &str,
+    ) -> cache_classifier::Mutability {
+        let classified = cache_classifier::classify(format, path);
+        if classified.is_immutable() {
+            return classified;
         }
+        classified.with_ttl_override(self.get_cache_ttl_override(repo_id).await)
+    }
+
+    /// [`Self::effective_mutability`] for the read paths that only have a
+    /// repository key (`get_cached_artifact_by_path`, `is_cache_fresh`).
+    /// `None` when the key names no repository, in which case those gates
+    /// fall back to the stamped expiry.
+    async fn effective_mutability_by_key(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Option<cache_classifier::Mutability> {
+        let (repo_id, format) = self.repo_identity_by_key(repo_key).await?;
+        Some(self.effective_mutability_for(repo_id, &format, path).await)
+    }
+
+    /// `(id, format)` of the repository named `repo_key`, through a short-TTL
+    /// in-process cache so a key-only cache read does not query the database
+    /// per request. A lookup error is not cached.
+    async fn repo_identity_by_key(&self, repo_key: &str) -> Option<(Uuid, RepositoryFormat)> {
+        if let Some(hit) = self.ttl_policy_cache.repo_by_key.get(repo_key).await {
+            return hit;
+        }
+        let found = sqlx::query_as::<_, (Uuid, RepositoryFormat)>(
+            "SELECT id, format FROM repositories WHERE key = $1",
+        )
+        .bind(repo_key)
+        .fetch_optional(&self.db)
+        .await
+        .ok()?;
+        self.ttl_policy_cache
+            .repo_by_key
+            .insert(repo_key.to_string(), found.clone())
+            .await;
+        found
+    }
+
+    /// The expiry the read path enforces for `metadata` (cached at `path` in
+    /// `repo_key`) under the repository's current TTL (#3832), for surfaces
+    /// that report cache freshness rather than gate on it.
+    pub async fn effective_cache_expires_at(
+        &self,
+        repo_key: &str,
+        path: &str,
+        metadata: &CacheMetadata,
+    ) -> DateTime<Utc> {
+        metadata.expires_under(self.effective_mutability_by_key(repo_key, path).await)
+    }
+
+    /// Drop this process's cached `cache_ttl_secs` override for `repo_id`, so
+    /// a TTL change made through the API applies to the very next read here
+    /// (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
+    pub async fn invalidate_cache_ttl_override(&self, repo_id: Uuid) {
+        self.ttl_policy_cache.overrides.invalidate(&repo_id).await;
     }
 
     /// Resolve the repository's configured `quota_bytes` (#2928).
@@ -6078,8 +6246,15 @@ impl ProxyService {
     /// when unset/unparseable so callers can apply the mutable classifier
     /// default, which is also what `GET /cache-ttl` reports for such a
     /// repository (#3706).
+    ///
+    /// Read on every mutable-path freshness check since #3832, so it goes
+    /// through a short-TTL in-process cache ([`TTL_POLICY_CACHE_TTL`]); a
+    /// database error is not cached and degrades to "no override".
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
-        let result = sqlx::query_scalar!(
+        if let Some(hit) = self.ttl_policy_cache.overrides.get(&repo_id).await {
+            return hit;
+        }
+        let row = sqlx::query_scalar!(
             r#"
             SELECT value FROM repository_config
             WHERE repository_id = $1 AND key = 'cache_ttl_secs'
@@ -6088,8 +6263,13 @@ impl ProxyService {
         )
         .fetch_optional(&self.db)
         .await
-        .ok()??;
-        result.and_then(|v| v.parse().ok())
+        .ok()?;
+        let parsed = row.flatten().and_then(|v| v.parse().ok());
+        self.ttl_policy_cache
+            .overrides
+            .insert(repo_id, parsed)
+            .await;
+        parsed
     }
 
     /// Validate that `repo` is a remote proxy and return its upstream URL.
@@ -6435,14 +6615,16 @@ impl ProxyService {
         metadata_key: &str,
         accept: Option<&str>,
     ) -> Result<CacheReadOutcome> {
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        // #3832: fold in the repository's current TTL override so a lowered
+        // TTL is honoured by entries written under the old one.
+        let mutability = self.effective_mutability(repo, cache_path).await;
 
         // Load the sidecar to evaluate freshness. A read/parse error is treated
         // as "no entry" (Miss) — same B6-safe stance as the fresh read path.
         // Waits (bounded) for an in-flight tail-phase streaming publish of the
         // same key so a just-cached entry is not misread as a miss (#3335).
         let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key)
+            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
             .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
@@ -6525,7 +6707,7 @@ impl ProxyService {
     ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        let mutability = self.effective_mutability(repo, cache_path).await;
         let metadata = self
             .load_cache_metadata(&metadata_key)
             .await
@@ -6666,6 +6848,11 @@ impl ProxyService {
             Err(err) => {
                 // Upstream unreachable mid-revalidation: stale-if-error within
                 // the grace window, else fall through to a refill attempt.
+                // The window is deliberately measured from the STAMPED expiry,
+                // not the #3832 effective one: it is an availability
+                // fallback, and before #3832 this body would have been served
+                // as fresh until that stamp anyway, so lowering a TTL must not
+                // make an outage fail harder than it did.
                 let within_grace = Utc::now()
                     < metadata.expires_at
                         + chrono::Duration::seconds(cache_classifier::STALE_IF_ERROR_GRACE_SECS);
@@ -6693,7 +6880,13 @@ impl ProxyService {
         ttl_secs: i64,
     ) {
         let mut extended = metadata.clone();
-        extended.expires_at = Utc::now() + chrono::Duration::seconds(ttl_secs);
+        // A 304 confirms the body is current as of now, so the read-time TTL
+        // clamp (#3832) is re-anchored here too; without it a lowered TTL
+        // would keep measuring from the original fill and revalidate on every
+        // read once that window passed.
+        let now = Utc::now();
+        extended.cached_at = now;
+        extended.expires_at = now + chrono::Duration::seconds(ttl_secs);
         match serde_json::to_vec(&extended) {
             Ok(json) => {
                 if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
@@ -6787,7 +6980,13 @@ impl ProxyService {
         preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
         self.cache_store
-            .get(cache_key, metadata_key, allow_stale, preloaded_metadata)
+            .get(
+                cache_key,
+                metadata_key,
+                allow_stale,
+                preloaded_metadata,
+                None,
+            )
             .await
     }
 
@@ -6815,13 +7014,17 @@ impl ProxyService {
     /// Stale, and revalidates / refetches upstream a second time. So an
     /// expired sidecar gets the same bounded wait. A fresh sidecar never
     /// consults the registry, keeping the warm-hit path lock-free.
+    ///
+    /// `mutability` is the path's override-applied classification, so
+    /// "expired" here means expired under the current TTL (#3832).
     async fn load_cache_metadata_awaiting_publish(
         &self,
         metadata_key: &str,
+        mutability: cache_classifier::Mutability,
     ) -> Option<CacheMetadata> {
         let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
         match &metadata {
-            Some(m) if m.expires_at > Utc::now() => return metadata,
+            Some(m) if m.effective_expires_at(mutability) > Utc::now() => return metadata,
             Some(_) => {
                 // Expired: whether we waited or the writer had already
                 // finished (and invalidated the LRU) between our load and the
@@ -9648,12 +9851,14 @@ mod tests {
     }
 
     /// Build a `ProxyService` whose storage is the supplied mock. The DB
-    /// pool is a lazy connection that is never dialed because
-    /// `is_cache_fresh` does not touch the database.
+    /// pool is a lazy connection to an unresolvable host: `is_cache_fresh`
+    /// looks the repository's TTL policy up by key (#3832), and that lookup
+    /// must fail fast (falling back to the stamped expiry) rather than wait
+    /// out the pool's acquire timeout against a real local server.
     fn build_proxy_service_with_storage(
         storage: Arc<dyn crate::services::storage_service::StorageBackend>,
     ) -> ProxyService {
-        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/")
             .expect("connect_lazy should not fail");
         ProxyService::new(
             pool,
@@ -18298,14 +18503,153 @@ mod tests {
         );
         repo.id = fx.repo_id;
         let asset = "owner/repo/releases/download/v1/asset";
+        // #3658: the API release-by-tag lookup shares the release lifetime.
+        let tag_lookup = "repos/owner/repo/releases/tags/v1";
         assert_eq!(
             proxy.cache_ttl_for_path(&repo, asset).await,
             cache_classifier::GITHUB_RELEASE_TTL_SECS
         );
+        assert_eq!(
+            proxy.cache_ttl_for_path(&repo, tag_lookup).await,
+            cache_classifier::GITHUB_RELEASE_TTL_SECS
+        );
         sqlx::query("INSERT INTO repository_config (repository_id, key, value) VALUES ($1, 'cache_ttl_secs', '60') ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value")
             .bind(repo.id).execute(&fx.pool).await.unwrap();
+        proxy.invalidate_cache_ttl_override(repo.id).await;
+        // Precedence: the operator override wins on every mutable path.
         assert_eq!(proxy.cache_ttl_for_path(&repo, asset).await, 60);
+        assert_eq!(proxy.cache_ttl_for_path(&repo, tag_lookup).await, 60);
         fx.teardown().await;
+    }
+
+    /// Upsert a repository's `cache_ttl_secs` row and drop the proxy's
+    /// memoised copy, the two things `PUT /cache-ttl` does.
+    async fn set_ttl_override(proxy: &ProxyService, pool: &PgPool, repo_id: Uuid, secs: i64) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2) ON CONFLICT (repository_id, key) \
+             DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(repo_id)
+        .bind(secs.to_string())
+        .execute(pool)
+        .await
+        .expect("store cache_ttl_secs");
+        proxy.invalidate_cache_ttl_override(repo_id).await;
+    }
+
+    /// #3832 regression: lowering a remote's TTL is retroactive. An index
+    /// cached two hours ago under a 30-day TTL (stamped `expires_at` four
+    /// weeks out) is fresh while the TTL is 30 days, but once the TTL is
+    /// lowered to 300 s every gate — the buffered read, the presign probe and
+    /// the key-only read — treats it as expired, the read revalidates
+    /// upstream, and the 304 re-anchors it so the next read is fresh again
+    /// without another upstream request.
+    ///
+    /// Revert-proof: with the stamped `expires_at` trusted (pre-#3832) the
+    /// HEAD is never sent and `server.verify()` fails on `expect(1)`.
+    #[tokio::test]
+    async fn lowering_the_cache_ttl_applies_to_already_cached_entries_3832() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const INDEX: &str = "simple/ruff/index.v1+json";
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // The one revalidation the lowered TTL must trigger. No GET is
+        // mounted: the cached body must be served after the 304.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{INDEX}")))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), root);
+        let mut repo =
+            wiremock_remote_repo_fmt(&fx.repo_key, &server.uri(), root, RepositoryFormat::Generic);
+        repo.id = fx.repo_id;
+
+        let now = Utc::now();
+        let body = b"index-cached-under-30-days";
+        let cached_at = now - chrono::Duration::hours(2);
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at,
+            upstream_etag: Some("\"v1\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: cached_at + chrono::Duration::days(30),
+            content_type: Some("application/json".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+        };
+        write_primed_cache_files(root, &fx.repo_key, INDEX, Some(body), &metadata);
+
+        // 30-day TTL: fresh on every gate, upstream untouched.
+        set_ttl_override(&proxy, &fx.pool, fx.repo_id, 30 * 86_400).await;
+        let fresh_under_old_ttl = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let reported_under_old_ttl = proxy
+            .effective_cache_expires_at(&fx.repo_key, INDEX, &metadata)
+            .await;
+        let fresh_body = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("fresh read");
+
+        // Lower it to 300 s: the entry is 2 h old, so it is expired now.
+        set_ttl_override(&proxy, &fx.pool, fx.repo_id, 300).await;
+        let fresh_after_lowering = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let reported_after_lowering = proxy
+            .effective_cache_expires_at(&fx.repo_key, INDEX, &metadata)
+            .await;
+        let by_path_after_lowering = proxy
+            .get_cached_artifact_by_path(&fx.repo_key, INDEX)
+            .await
+            .expect("key-only read");
+        let revalidated = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("lowered TTL must revalidate and serve the 304'd body");
+        // The 304 re-anchored the entry: fresh again, no second HEAD.
+        let fresh_after_304 = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let again = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("re-anchored read");
+
+        fx.teardown().await;
+        server.verify().await;
+        assert!(
+            fresh_under_old_ttl,
+            "fresh under the TTL it was written with"
+        );
+        assert_eq!(reported_under_old_ttl, metadata.expires_at);
+        assert_eq!(
+            reported_after_lowering,
+            cached_at + chrono::Duration::seconds(300),
+            "the reported expiry must be the one the read path enforces"
+        );
+        assert_eq!(&fresh_body.0[..], body);
+        assert!(
+            !fresh_after_lowering,
+            "presign probe must not hand out an entry the lowered TTL expired"
+        );
+        assert!(
+            by_path_after_lowering.is_none(),
+            "key-only read must treat the entry as expired under the lowered TTL"
+        );
+        assert_eq!(&revalidated.0[..], body);
+        assert!(fresh_after_304, "the 304 must re-anchor the entry");
+        assert_eq!(&again.0[..], body);
     }
 
     #[tokio::test]
@@ -20618,7 +20962,10 @@ mod tests {
         });
 
         let metadata = svc
-            .load_cache_metadata_awaiting_publish(&keys.metadata)
+            .load_cache_metadata_awaiting_publish(
+                &keys.metadata,
+                cache_classifier::Mutability::Immutable,
+            )
             .await;
         assert!(
             metadata.is_some(),
@@ -20674,7 +21021,10 @@ mod tests {
         });
 
         let metadata = svc
-            .load_cache_metadata_awaiting_publish(&keys.metadata)
+            .load_cache_metadata_awaiting_publish(
+                &keys.metadata,
+                cache_classifier::Mutability::Immutable,
+            )
             .await
             .expect("sidecar present");
         assert!(
@@ -21310,7 +21660,10 @@ mod upstream_filter_cache_tests {
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
-            cached_at: Utc::now() - chrono::Duration::seconds(3_600),
+            // Filled one minute ago: inside the 5-minute mutable default TTL,
+            // so the #3832 read-time clamp (`min(stamp, cached_at + TTL)`)
+            // leaves the stamped `expires_at` in charge of freshness.
+            cached_at: Utc::now() - chrono::Duration::seconds(60),
             // A validator, so an unfiltered expired entry WOULD revalidate.
             upstream_etag: Some("\"etag-840\"".to_string()),
             storage_etag: None,
