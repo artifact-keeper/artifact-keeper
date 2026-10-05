@@ -5870,6 +5870,7 @@ mod upload_db_tests {
         let (package, version, arch) = ("ak-chunked-deb", "2.0.1-1", "amd64");
         let deb = minimal_deb(package, version, arch, "chunked Debian package");
         let path = format!("pool/main/a/{package}/{package}_{version}_{arch}.deb");
+        let mut events = f.state.event_bus.subscribe();
         let (status, body) = f
             .chunked_upload(&path, &deb, serde_json::json!({}), false)
             .await;
@@ -5878,6 +5879,13 @@ mod upload_db_tests {
             StatusCode::OK,
             "chunked completion failed: {}",
             String::from_utf8_lossy(&body)
+        );
+        // The catalog write is silent: completion emits its one
+        // `artifact.uploaded` itself (#3939), so the finalize must not add one.
+        tdh::assert_one_artifact_uploaded_event(
+            &mut events,
+            f.repo_id,
+            tdh::artifact_id_at(&f.pool, f.repo_id, &path).await,
         );
 
         let (artifact_id, name, row_version): (uuid::Uuid, String, Option<String>) =
