@@ -2719,13 +2719,15 @@ fn pin_agrees_with(pin: &ExpectedComponent, name: &str, version: &str) -> bool {
     if declared.eq_ignore_ascii_case(pinned) {
         return true;
     }
-    if pin.ecosystem != ComponentEcosystem::Python {
-        return false;
-    }
-    match (
-        PypiHandler::canonical_version(declared),
-        PypiHandler::canonical_version(pinned),
-    ) {
+    // One version has several spellings in these two ecosystems. NuGet: the
+    // flat container addresses a package by its NORMALIZED version (`1.0.0`)
+    // while its `.nuspec` may say `1.0` or `1.0.0.0` (#4102).
+    let canonical: fn(&str) -> Option<String> = match pin.ecosystem {
+        ComponentEcosystem::Python => PypiHandler::canonical_version,
+        ComponentEcosystem::NuGet => crate::formats::nuget::NugetHandler::normalized_version,
+        _ => return false,
+    };
+    match (canonical(declared), canonical(pinned)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
@@ -14541,6 +14543,28 @@ mod tests {
             &nupkg,
             &ExpectedComponent::new(ComponentEcosystem::NuGet, "Newtonsoft-Json", "12.0.1"),
             "Newtonsoft.Json.12.0.1.nupkg"
+        ));
+
+        // #4102: the flat container addresses a package by its NORMALIZED
+        // version, which need not be the `.nuspec`'s own spelling. Different
+        // versions still disagree after normalization.
+        let short = nupkg_fixture("Widget", "1.0");
+        for (pinned, agrees) in [("1.0.0", true), ("1.0.0.0", true), ("1.0.1", false)] {
+            assert_eq!(
+                pin_agrees_with_content(
+                    &short,
+                    &ExpectedComponent::new(ComponentEcosystem::NuGet, "widget", pinned),
+                    "widget.1.0.0.nupkg"
+                ),
+                agrees,
+                "{pinned}"
+            );
+        }
+        // Normalization is NuGet's own: a Cargo version is not padded.
+        assert!(!pin_agrees_with_content(
+            &crate_fixture("smallvec", "1.6"),
+            &ExpectedComponent::new(ComponentEcosystem::Cargo, "smallvec", "1.6.0"),
+            "smallvec-1.6.0.crate"
         ));
 
         // PEP 440 spellings that mean one version agree, so a row recorded as

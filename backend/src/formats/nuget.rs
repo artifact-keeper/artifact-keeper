@@ -13,6 +13,10 @@ use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
 
+/// Read ceiling for the `.nuspec` entry of a `.nupkg`. Real manifests are a
+/// few KiB (release notes included); 4 MiB is far above any of them.
+const NUSPEC_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// NuGet format handler
 pub struct NugetHandler;
 
@@ -170,6 +174,54 @@ impl NugetHandler {
         id.to_lowercase()
     }
 
+    /// NuGet's normalized form of a version string, lowercased (#4102): what
+    /// `NuGetVersion.ToNormalizedString()` produces and the V3 flat container
+    /// addresses a package by. Build metadata (`+...`) is dropped, each numeric
+    /// part loses its leading zeros, a one- or two-part version is padded to
+    /// three, a fourth part is kept only when it is not zero, and the release
+    /// label is kept as is. So `1.0`, `1.00.0.0` and `1.0.0+abc` are all
+    /// `1.0.0`, and `1.0.0.1-Beta` is `1.0.0.1-beta`.
+    ///
+    /// `None` for anything that is not a NuGet version (no numeric part, more
+    /// than four of them, or an empty label). Callers comparing two versions
+    /// fall back to plain equality then.
+    pub fn normalized_version(version: &str) -> Option<String> {
+        let version = version.trim();
+        let version = version.split_once('+').map_or(version, |(v, _)| v);
+        let (numbers, label) = match version.split_once('-') {
+            Some((numbers, label)) => (numbers, Some(label)),
+            None => (version, None),
+        };
+        let mut parts = Vec::with_capacity(4);
+        for part in numbers.split('.') {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            parts.push(part.parse::<u64>().ok()?);
+        }
+        if parts.is_empty() || parts.len() > 4 {
+            return None;
+        }
+        parts.resize(parts.len().max(3), 0);
+        if parts.len() == 4 && parts[3] == 0 {
+            parts.pop();
+        }
+        let mut out = parts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        match label {
+            Some("") => return None,
+            Some(label) => {
+                out.push('-');
+                out.push_str(label);
+            }
+            None => {}
+        }
+        Some(out.to_ascii_lowercase())
+    }
+
     /// Extract nuspec from nupkg file
     pub fn extract_nuspec(content: &[u8]) -> Result<NuSpec> {
         let cursor = std::io::Cursor::new(content);
@@ -184,9 +236,19 @@ impl NugetHandler {
             let name = file.name().to_string();
 
             if name.ends_with(".nuspec") {
+                // Bounded (#4102): the proxy scan gate parses UPSTREAM bytes
+                // here, so a nuspec entry that inflates without limit must
+                // not be read into memory whole.
                 let mut content = String::new();
-                file.read_to_string(&mut content)
+                file.by_ref()
+                    .take(NUSPEC_MAX_BYTES + 1)
+                    .read_to_string(&mut content)
                     .map_err(|e| AppError::Validation(format!("Failed to read nuspec: {}", e)))?;
+                if content.len() as u64 > NUSPEC_MAX_BYTES {
+                    return Err(AppError::Validation(
+                        "nuspec exceeds the size limit".to_string(),
+                    ));
+                }
 
                 return Self::parse_nuspec(&content);
             }
@@ -558,6 +620,56 @@ mod tests {
     #[test]
     fn test_normalize_id_empty() {
         assert_eq!(NugetHandler::normalize_id(""), "");
+    }
+
+    // ---- normalized_version (#4102) ----
+
+    #[test]
+    fn test_normalized_version() {
+        for (raw, normalized) in [
+            ("1.0.0", "1.0.0"),
+            ("1.0", "1.0.0"),
+            ("1", "1.0.0"),
+            ("1.00.0.0", "1.0.0"),
+            ("01.2.3", "1.2.3"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("1.2.3.0", "1.2.3"),
+            ("1.0.0+abc", "1.0.0"),
+            ("1.0.0-Beta.1+sha.5", "1.0.0-beta.1"),
+            ("1.0-RC-2", "1.0.0-rc-2"),
+            (" 12.0.1 ", "12.0.1"),
+        ] {
+            assert_eq!(
+                NugetHandler::normalized_version(raw).as_deref(),
+                Some(normalized),
+                "{raw}"
+            );
+        }
+        for invalid in [
+            "",
+            "abc",
+            "1.x",
+            "1.2.3.4.5",
+            "1..2",
+            "1.0-",
+            "-beta",
+            "+meta",
+        ] {
+            assert_eq!(NugetHandler::normalized_version(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_extract_nuspec_refuses_an_oversized_manifest() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("big.nuspec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let filler = vec![b' '; (NUSPEC_MAX_BYTES + 1) as usize];
+        zip.write_all(&filler).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let err = NugetHandler::extract_nuspec(&bytes).unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
     }
 
     // ---- parse_nupkg_filename ----

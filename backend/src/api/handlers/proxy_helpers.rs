@@ -3705,6 +3705,23 @@ pub async fn direct_scan_policy(
     (action, gate)
 }
 
+/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
+/// when the repository has not enabled scan-on-proxy (#4102): the
+/// enabled-check plus [`direct_scan_policy`] that every format's Remote arm
+/// runs before choosing the gate over its streaming path. An unreadable
+/// enabled flag reads as off, the reading the npm / PyPI / Cargo / Maven
+/// arms already take (#4365 item 5 tracks failing it closed).
+pub(crate) async fn remote_scan_policy(db: &PgPool, repo_id: Uuid) -> Option<MemberScanPolicy> {
+    let enabled = crate::services::scan_config_service::ScanConfigService::new(db.clone())
+        .is_proxy_scan_enabled(repo_id)
+        .await
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    Some(direct_scan_policy(db, repo_id).await)
+}
+
 /// Edges of the membership subgraph reachable from a virtual repository root,
 /// with the member's full `repositories` row attached.
 ///
@@ -21872,6 +21889,41 @@ mod proxy_download_recording_tests {
             (
                 "sbt.rs",
                 "serve_scanned_sbt_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4102: NuGet (and Chocolatey / PowerShell). The V3 Remote arm
+            // and the row-repair arm pass the repository's policy into the
+            // flat-container fetch, which gates package files; the V2
+            // `package/` Remote arm; the Virtual walk (both routes).
+            (
+                "nuget.rs",
+                "flatcontainer_download",
+                "remote_scan_policy(",
+                2,
+            ),
+            (
+                "nuget.rs",
+                "proxy_v3_flatcontainer",
+                "serve_scanned_nupkg(",
+                1,
+            ),
+            ("nuget.rs", "v2_download", "serve_scanned_v2_nupkg(", 1),
+            (
+                "nuget.rs",
+                "serve_scanned_v2_nupkg",
+                "serve_scanned_nupkg(",
+                1,
+            ),
+            (
+                "nuget.rs",
+                "virtual_member_download",
+                "walk_virtual_members_with_scan(",
+                1,
+            ),
+            (
+                "nuget.rs",
+                "serve_scanned_nupkg",
                 "serve_scanned_proxy_file(",
                 1,
             ),

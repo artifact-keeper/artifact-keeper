@@ -2004,11 +2004,251 @@ async fn rematerialize_row_blob_from_proxy_cache(
 /// unverified stream: see the repair arm in `flatcontainer_download`.
 const VERIFIED_NUPKG_REPAIR_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// #4102: scan-on-proxy for `.nupkg` downloads (on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// Refuse a proxied NuGet coordinate the upstream request could read as a
+/// different file than the one classified and cached (#4102).
+///
+/// The id, version and file name arrive DECODED from the route and are joined
+/// into the upstream URL as they are. An encoded `/` (`%2F`) adds a path
+/// segment, and a `?` or `#` turns the rest into a query or fragment, so
+/// `GET .../flatcontainer/{id}%2F{version}%2F{file}.nupkg%23/index.json` used
+/// to fetch the `.nupkg` itself through the METADATA route, which serves its
+/// body verbatim and never reaches the scan gate. Each segment must be one
+/// path segment (no `/` or `\`, not `.` or `..`) and pass the shared
+/// [`reject_ambiguous_proxy_path`](crate::api::handlers::maven::reject_ambiguous_proxy_path)
+/// rule Maven and sbt use (`?`, `#`, `;`, `%`, space, control characters, a
+/// trailing `.`). No valid NuGet id, version or package file name contains
+/// any of them. Applied to Remote and Virtual repositories only: a hosted
+/// repository answers from its own rows and never builds an upstream URL.
+#[allow(clippy::result_large_err)]
+fn reject_ambiguous_nuget_coordinate(segments: &[&str]) -> Result<(), Response> {
+    for segment in segments {
+        if segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || segment.contains(['/', '\\'])
+        {
+            return Err(crate::error::AppError::Validation(
+                "NuGet package id, version and file name must each be one path segment".to_string(),
+            )
+            .into_response());
+        }
+        crate::api::handlers::maven::reject_ambiguous_proxy_path(segment)?;
+    }
+    Ok(())
+}
+
+/// [`reject_ambiguous_nuget_coordinate`] for a Remote or Virtual repository;
+/// a no-op for a hosted one.
+#[allow(clippy::result_large_err)]
+fn reject_ambiguous_proxied_coordinate(repo: &RepoInfo, segments: &[&str]) -> Result<(), Response> {
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        return reject_ambiguous_nuget_coordinate(segments);
+    }
+    Ok(())
+}
+
+/// Whether a flat-container file goes through the scan gate (#4102). Every
+/// file does except the `.nuspec` manifest, which is metadata: it names the
+/// package's dependencies, each graded when its own `.nupkg` is pulled.
+/// Deciding by exclusion means an unexpected file name is scanned rather than
+/// passed through.
+fn nuget_file_is_scanned(filename: &str) -> bool {
+    !filename.to_ascii_lowercase().ends_with(".nuspec")
+}
+
+/// What a proxied `.nupkg` is served as (#3003 for #4102), from the REQUEST:
+/// the requested id (lowercased) and version. It is pinned only when the
+/// package's own `.nuspec` agrees, through the one agreement rule every
+/// ecosystem uses ([`pin_agrees_with_content`](crate::services::scanner_service::pin_agrees_with_content),
+/// which compares NuGet ids case-insensitively and versions in NuGet's
+/// normalized form). Anything else is unestablished: a package served under a
+/// coordinate it does not declare, bytes that are not a readable `.nupkg`, or
+/// a file the flat container should not hold, cannot be graded as the package
+/// the client asked for (fail-closed 423, fail-open loudly pending).
+fn nupkg_identity(
+    filename: &str,
+    id_lower: &str,
+    version: &str,
+    bytes: &bytes::Bytes,
+) -> proxy_helpers::ProxyScanIdentity {
+    use crate::services::scanner_service::{hosted_upload_pin, pin_agrees_with_content};
+    match hosted_upload_pin("nuget", filename, id_lower, Some(version)) {
+        Some(pin) if pin_agrees_with_content(bytes, &pin, filename) => {
+            proxy_helpers::ProxyScanIdentity::Established(pin)
+        }
+        _ => proxy_helpers::ProxyScanIdentity::Unestablished,
+    }
+}
+
+/// The 200 for a `.nupkg` the scan gate let through: the buffered bytes,
+/// verbatim, so the coding they arrived under is declared (#3149/#3184). The
+/// content type is upstream's when it sent one, as on the streaming arm.
+fn scanned_nupkg_response(filename: &str, body: proxy_helpers::ScannedProxyBody) -> Response {
+    let content_type = body
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, body.bytes.len().to_string());
+    if let Some(enc) = body.content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(body.bytes)).unwrap()
+}
+
+/// The NuGet half of the generic proxy scan gate.
+struct NugetScannedPackage<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    id_lower: &'a str,
+    version: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for NugetScannedPackage<'_> {
+    const LABEL: &'static str = "nuget package";
+
+    fn synthetic_content_type(_filename: &str) -> String {
+        "application/octet-stream".to_string()
+    }
+
+    fn identity(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &bytes::Bytes,
+        digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        let identity = nupkg_identity(req.filename, self.id_lower, self.version, bytes);
+        if matches!(identity, proxy_helpers::ProxyScanIdentity::Unestablished) {
+            warn!(
+                repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+                requested = %format!("{}@{}", self.id_lower, self.version),
+                "nuget proxy package does not declare the identity it is served as"
+            );
+        }
+        identity
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // fail-open fallback after it resolves (#4098). Needed because the
+        // #3446 gate attributes this call to the impl method around it.
+        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            req.fetch_base,
+            req.source_path,
+            req.cache_path,
+            "application/octet-stream",
+            RepositoryFormat::Nuget,
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        _pending: bool,
+    ) -> Response {
+        scanned_nupkg_response(req.filename, body)
+    }
+}
+
+/// One `.nupkg` (or other flat-container file) a Remote repository, or a
+/// Virtual's Remote member, serves: where it is fetched from and cached.
+struct NupkgFetch<'a> {
+    repo_id: uuid::Uuid,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    /// Absolute upstream URL (the discovered PackageBaseAddress, or a V2
+    /// feed's `package/{id}/{version}`).
+    fetch_url: &'a str,
+    cache_path: &'a str,
+    id_lower: &'a str,
+    version: &'a str,
+    filename: &'a str,
+}
+
+/// Inline scan-and-block for one proxied `.nupkg` (#4102), on the generic
+/// gate. Cached under the same key the streaming arm writes, so the buffered
+/// and streaming arms share one cache entry and one catalog row. `ctx` is
+/// `None` for the row-repair arm, which counts the row's own download.
+async fn serve_scanned_nupkg(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch: &NupkgFetch<'_>,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+) -> Result<Response, Response> {
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id: fetch.repo_id,
+        repo_key: fetch.repo_key,
+        fetch_base: fetch.upstream_url,
+        format: RepositoryFormat::Nuget,
+        source_path: fetch.fetch_url,
+        cache_path: fetch.cache_path,
+        filename: fetch.filename,
+        action,
+        severity_gate,
+        ctx,
+    };
+    let file = NugetScannedPackage {
+        proxy,
+        id_lower: fetch.id_lower,
+        version: fetch.version,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// [`serve_scanned_nupkg`] for the legacy V2 `package/{id}/{version}` route
+/// of a Remote repository (#4102), from the URL and cache key that route
+/// resolved.
+async fn serve_scanned_v2_nupkg(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo, repo_key, upstream_url): (&RepoInfo, &str, &str),
+    (fetch_url, cache_path): (&str, &str),
+    (id, version): (&str, &str),
+    policy: proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let id_lower = id.to_lowercase();
+    let filename = build_nupkg_filename(&id_lower, version);
+    let fetch = NupkgFetch {
+        repo_id: repo.id,
+        repo_key,
+        upstream_url,
+        fetch_url,
+        cache_path,
+        id_lower: &id_lower,
+        version,
+        filename: &filename,
+    };
+    serve_scanned_nupkg(state, proxy, &fetch, policy, Some(ctx)).await
+}
+
 /// Proxy an upstream V3 flat-container document (version list or `.nupkg`).
 /// `sub_path` is the portion after the package-content base, e.g.
 /// `{id}/index.json` or `{id}/{version}/{file}`. Version lists carry no URLs so
 /// no rewriting is needed. Downloads stream (never buffered) under a stable
-/// cache key.
+/// cache key, unless `scan` carries a scan-on-proxy policy: then a package
+/// file goes through the scan gate instead (#4102), buffered, under the same
+/// cache key. `scan` is ignored for a version list.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_v3_flatcontainer(
     state: &SharedState,
@@ -2019,10 +2259,26 @@ async fn proxy_v3_flatcontainer(
     sub_path: &str,
     streaming: bool,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    scan: Option<proxy_helpers::MemberScanPolicy>,
 ) -> Result<Response, Response> {
     let (fetch_url, cache_path) =
         flatcontainer_fetch_target(proxy, fetch_repo_id, fetch_repo_key, upstream_url, sub_path)
             .await?;
+    let (id_lower, version, filename) =
+        split_flatcontainer_sub_path(sub_path).unwrap_or(("", "", sub_path));
+    if let Some(policy) = scan.filter(|_| streaming && nuget_file_is_scanned(filename)) {
+        let fetch = NupkgFetch {
+            repo_id: fetch_repo_id,
+            repo_key: fetch_repo_key,
+            upstream_url,
+            fetch_url: &fetch_url,
+            cache_path: &cache_path,
+            id_lower,
+            version,
+            filename,
+        };
+        return serve_scanned_nupkg(state, proxy, &fetch, policy, ctx).await;
+    }
     if streaming {
         let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
             proxy,
@@ -2840,6 +3096,8 @@ async fn flatcontainer_versions(
     Path((repo_key, package_id)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
+    // #4102: the id is joined into the upstream version-list URL.
+    reject_ambiguous_proxied_coordinate(&repo, &[&package_id])?;
     let package_id_lower = package_id.to_lowercase();
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
@@ -2947,7 +3205,8 @@ async fn flatcontainer_versions(
                     versions.sort_by(|a, b| version_compare(a, b).cmp(&0));
                     return Ok(json_versions_response(&versions));
                 }
-                // Version LIST: metadata, never a download (#3446).
+                // Version LIST: metadata, never a download (#3446), and never
+                // scanned (#4102).
                 return proxy_v3_flatcontainer(
                     &state,
                     proxy,
@@ -2956,6 +3215,7 @@ async fn flatcontainer_versions(
                     upstream_url,
                     &sub_path,
                     false,
+                    None,
                     None,
                 )
                 .await;
@@ -2998,6 +3258,14 @@ fn json_versions_response(versions: &[String]) -> Response {
 /// Shared by the V3 flat-container route and the legacy V2 `package/` route
 /// (#4021), so both honour the same member priority, the same
 /// caller-authorized member set, and the same terminal-policy rule.
+///
+/// #4102: when any Remote member scans on proxy (the stricter of the
+/// virtual's and the member's policy), the walk runs through
+/// [`proxy_helpers::walk_virtual_members_with_scan`], the walk Maven and sbt
+/// use: each run of members that do not scan is resolved exactly as before
+/// ([`walk_unscanned_nuget_members`]), and each scanning member serves through
+/// the scan gate, whose 403/409/423 ends the walk while any other failure
+/// moves to the next member. With scanning off everywhere nothing changes.
 async fn virtual_member_download(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -3032,7 +3300,81 @@ async fn virtual_member_download(
             .await
         }
     };
+    let walk = NugetMemberWalk {
+        state,
+        sub_path: &sub_path,
+        upstream_path: &upstream_path,
+        filename,
+        ctx,
+    };
+    let unscanned_run = |run: Vec<crate::models::repository::Repository>| {
+        walk_unscanned_nuget_members(&walk, run, &local_fetch)
+    };
 
+    if let Some(proxy) = state.proxy_service.as_deref() {
+        let walk = &walk;
+        let scanned = |member: crate::models::repository::Repository,
+                       policy: proxy_helpers::MemberScanPolicy| async move {
+            let upstream_url = member.upstream_url.clone().unwrap_or_default();
+            proxy_v3_flatcontainer(
+                walk.state,
+                proxy,
+                member.id,
+                &member.key,
+                &upstream_url,
+                walk.sub_path,
+                true,
+                Some(walk.ctx),
+                Some(policy),
+            )
+            .await
+        };
+        if let Some(served) = proxy_helpers::walk_virtual_members_with_scan(
+            &state.db,
+            repo_id,
+            members.clone(),
+            unscanned_run,
+            scanned,
+        )
+        .await
+        {
+            return served;
+        }
+    }
+
+    unscanned_run(members)
+        .await
+        .unwrap_or_else(|| Err(proxy_helpers::member_miss_response()))
+}
+
+/// What one Virtual download walk asks every member for.
+struct NugetMemberWalk<'a> {
+    state: &'a SharedState,
+    /// `{id}/{version}/{file}` below a Remote member's PackageBaseAddress.
+    sub_path: &'a str,
+    /// `v3/flatcontainer/{id}/{version}/{file}`, the hosted resolver's path.
+    upstream_path: &'a str,
+    filename: &'a str,
+    ctx: &'a crate::api::middleware::download_telemetry::DownloadContext,
+}
+
+/// Walk a run of members that do not scan on proxy, in order (#3980): a run
+/// of hosted members goes through the shared priority-preserving resolver,
+/// and a Remote member is asked through the NuGet-specific proxy leg, which
+/// that resolver's path-concatenating leg cannot do (#2775). `None` when no
+/// member serves, so a scan-aware walk moves on to its next member.
+async fn walk_unscanned_nuget_members<F, Fut>(
+    walk: &NugetMemberWalk<'_>,
+    members: Vec<crate::models::repository::Repository>,
+    local_fetch: &F,
+) -> Option<Result<Response, Response>>
+where
+    F: Fn(uuid::Uuid, StorageLocation) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>,
+    >,
+{
+    let state = walk.state;
     let mut idx = 0;
     while idx < members.len() {
         if members[idx].repo_type == RepositoryType::Remote {
@@ -3050,13 +3392,14 @@ async fn virtual_member_download(
                 member.id,
                 &member.key,
                 upstream_url,
-                &sub_path,
+                walk.sub_path,
                 true,
-                Some(ctx),
+                Some(walk.ctx),
+                None,
             )
             .await
             {
-                return Ok(resp);
+                return Some(Ok(resp));
             }
             continue;
         }
@@ -3069,27 +3412,28 @@ async fn virtual_member_download(
         match proxy_helpers::resolve_virtual_download_from_members(
             members[run_start..idx].to_vec(),
             None,
-            &upstream_path,
-            &local_fetch,
+            walk.upstream_path,
+            local_fetch,
         )
         .await
         {
             Ok(result) => {
-                return proxy_helpers::stream_fetch_result(
+                return Some(proxy_helpers::stream_fetch_result(
                     result,
                     "application/octet-stream",
-                    Some(filename),
-                )
+                    Some(walk.filename),
+                ))
             }
             // A member refusing what it HOLDS is terminal (#3220): falling
             // through would serve the blocked package from a later member or
             // upstream instead.
-            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => return Err(resp),
+            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
+                return Some(Err(resp))
+            }
             Err(_) => {}
         }
     }
-
-    Err(proxy_helpers::member_miss_response())
+    None
 }
 
 async fn flatcontainer_download(
@@ -3099,6 +3443,9 @@ async fn flatcontainer_download(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
+    // #4102: a coordinate the upstream could read as a different file than
+    // the one classified and cached is refused before anything else.
+    reject_ambiguous_proxied_coordinate(&repo, &[&package_id, &version, &filename])?;
     let package_id_lower = package_id.to_lowercase();
 
     // Curation enforcement (#2930): block a curated package before it is
@@ -3134,7 +3481,8 @@ async fn flatcontainer_download(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     // Resolve the upstream `PackageBaseAddress` from the service
-                    // index and stream the .nupkg from there (#2775).
+                    // index and stream the .nupkg from there (#2775), through
+                    // the scan gate when this repository scans on proxy (#4102).
                     let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
                     return proxy_v3_flatcontainer(
                         &state,
@@ -3145,6 +3493,7 @@ async fn flatcontainer_download(
                         &sub_path,
                         true,
                         Some(&ctx),
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await,
                     )
                     .await;
                 }
@@ -3409,6 +3758,11 @@ async fn flatcontainer_download(
                             // just below. Passing a context here would
                             // double-count the same download in both the
                             // hosted and the proxy statistics table (#3446).
+                            //
+                            // #4102: these are fresh upstream bytes with no
+                            // recorded digest to hold them to, so a repository
+                            // that scans on proxy gates them like any other
+                            // proxied package.
                             let response = proxy_v3_flatcontainer(
                                 &state,
                                 proxy,
@@ -3418,6 +3772,7 @@ async fn flatcontainer_download(
                                 &sub_path,
                                 true,
                                 None,
+                                proxy_helpers::remote_scan_policy(&state.db, repo.id).await,
                             )
                             .await?;
                             // Recorded after the upstream body is open so a
@@ -3941,6 +4296,8 @@ async fn v2_download(
     // block rule holds regardless of whether the client uses the V3 flat
     // container or the legacy V2 package route. No-op for hosted / curation off.
     proxy_helpers::enforce_curation(&state.db, repo, &id.to_lowercase(), Some(version)).await?;
+    // #4102: the id and version are joined into the upstream package URL.
+    reject_ambiguous_proxied_coordinate(repo, &[id, version])?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
@@ -3969,6 +4326,19 @@ async fn v2_download(
                         format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version),
                     ),
                 };
+            // #4102: through the scan gate when this repository scans on proxy.
+            if let Some(policy) = proxy_helpers::remote_scan_policy(&state.db, repo.id).await {
+                return serve_scanned_v2_nupkg(
+                    state,
+                    proxy,
+                    (repo, repo_key, upstream_url),
+                    (&fetch_url, &cache_path),
+                    (id, version),
+                    policy,
+                    ctx,
+                )
+                .await;
+            }
             let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                 proxy,
                 repo.id,
@@ -8314,7 +8684,7 @@ mod virtual_federation_tests {
 
     /// Link a remote member carrying `upstream_url` into the fixture's virtual
     /// repository and grant the fixture user read access.
-    async fn link_remote_member(
+    pub(super) async fn link_remote_member(
         fx: &tdh::Fixture,
         upstream_url: String,
         priority: i32,
@@ -9289,7 +9659,7 @@ mod virtual_member_authz_tests {
     /// WINNING row's own repository storage location (#3329), so the blob is
     /// written under the MEMBER's `member_dir` at the row's `storage_key` —
     /// exactly where a push to that member would have placed it.
-    async fn seed_member_nupkg(
+    pub(super) async fn seed_member_nupkg(
         pool: &sqlx::PgPool,
         member_id: uuid::Uuid,
         member_dir: &std::path::Path,
@@ -10363,5 +10733,660 @@ mod remote_discovery_tests {
         );
         assert!(!body.contains(&healthy.uri()), "{body}");
         assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+}
+
+/// #4102: scan-on-proxy for NuGet (and Chocolatey / PowerShell) packages on
+/// the V3 flat container, the legacy V2 `package/` route and the Virtual
+/// member walk.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+    use bytes::Bytes;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ID: &str = "widget";
+    const VERSION: &str = "1.0.0";
+    const FILE: &str = "widget.1.0.0.nupkg";
+    const FLAT: &str = "v3/flatcontainer/widget/1.0.0/widget.1.0.0.nupkg";
+    const V2_KEY: &str = "v2/package/widget/1.0.0/package.nupkg";
+
+    /// A `.nupkg` declaring `id@version` in its `.nuspec`. A nonce entry keeps
+    /// every fixture's digest unique: proxy scan verdicts are global and keyed
+    /// on the content digest.
+    fn nupkg(id: &str, version: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file(format!("{id}.nuspec"), opts).unwrap();
+        write!(
+            zip,
+            "<package><metadata><id>{id}</id><version>{version}</version>\
+             <authors>a</authors><description>d</description></metadata></package>"
+        )
+        .unwrap();
+        zip.start_file("nonce.txt", opts).unwrap();
+        zip.write_all(Uuid::new_v4().as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// A V3 upstream advertising `{uri}/flat/` as its PackageBaseAddress.
+    async fn v3_upstream() -> MockServer {
+        let server = MockServer::start().await;
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": format!("{}/flat/", server.uri()), "@type": "PackageBaseAddress/3.0.0"},
+            ],
+        });
+        Mock::given(method("GET"))
+            .and(wpath("/v3/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(index.to_string()),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn v3_index_url(server: &MockServer) -> String {
+        format!("{}/v3/index.json", server.uri())
+    }
+
+    /// Serve `body` at `route` with `status`, expecting `times` hits.
+    async fn mount(
+        server: &MockServer,
+        route: &str,
+        status: u16,
+        body: Vec<u8>,
+        times: impl Into<wiremock::Times>,
+    ) {
+        Mock::given(method("GET"))
+            .and(wpath(route.to_string()))
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(body))
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_flat(server: &MockServer, body: Vec<u8>, times: u64) {
+        mount(
+            server,
+            &format!("/flat/{ID}/{VERSION}/{FILE}"),
+            200,
+            body,
+            times,
+        )
+        .await;
+    }
+
+    async fn pull(app: axum::Router, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+        tdh::send_with_headers(app, tdh::get(uri)).await
+    }
+
+    async fn pull_anon(
+        state: &SharedState,
+        repo_key: &str,
+        route: &str,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        pull(
+            tdh::router_anon(super::router(), state.clone()),
+            format!("/{repo_key}/{route}"),
+        )
+        .await
+    }
+
+    /// A state whose proxy service caches under a fresh temp dir.
+    fn proxy_state(fx: &tdh::Fixture) -> (SharedState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+        (state, dir)
+    }
+
+    fn assert_scan_blocked(status: StatusCode, body: &Bytes, file: &str) {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], file);
+    }
+
+    // -- pure helpers ------------------------------------------------------
+
+    #[test]
+    fn ambiguous_coordinates_are_rejected() {
+        for bad in [
+            &["widget/1.0.0/widget.1.0.0.nupkg#"][..],
+            &["widget", "1.0.0/x"],
+            &["widget", "1.0.0", "widget.1.0.0.nupkg?x"],
+            &["widget", "1.0.0", "a\\b.nupkg"],
+            &["widget#", "1.0.0"],
+            &["widget;x", "1.0.0"],
+            &["wid get", "1.0.0"],
+            &["widget%2e", "1.0.0"],
+            &["widget", "1.0.0\t"],
+            &["widget", "1.0."],
+            &["..", "1.0.0"],
+            &[".", "1.0.0"],
+            &["", "1.0.0"],
+        ] {
+            let resp = reject_ambiguous_nuget_coordinate(bad).expect_err(&format!("{bad:?}"));
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        for ok in [
+            &["Newtonsoft.Json", "12.0.1", "newtonsoft.json.12.0.1.nupkg"][..],
+            &["my_pkg-x", "1.0.0-beta.1+sha.5"],
+            &["widget"],
+        ] {
+            assert!(reject_ambiguous_nuget_coordinate(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_nuspec_passes_unscanned() {
+        for scanned in [
+            FILE,
+            "WIDGET.1.0.0.NUPKG",
+            "widget.1.0.0.snupkg",
+            "readme.txt",
+        ] {
+            assert!(nuget_file_is_scanned(scanned), "{scanned}");
+        }
+        for passthrough in ["widget.nuspec", "Widget.NUSPEC"] {
+            assert!(!nuget_file_is_scanned(passthrough), "{passthrough}");
+        }
+    }
+
+    #[test]
+    fn identity_is_pinned_only_when_the_nuspec_agrees() {
+        use proxy_helpers::ProxyScanIdentity as Id;
+        let ours = Bytes::from(nupkg("Widget", VERSION));
+        match nupkg_identity(FILE, ID, VERSION, &ours) {
+            Id::Established(pin) => assert_eq!(
+                pin,
+                ExpectedComponent::new(ComponentEcosystem::NuGet, ID, VERSION)
+            ),
+            _ => panic!("an agreeing .nuspec establishes the coordinate"),
+        }
+        // The flat container's normalized version against a nuspec that
+        // spells it `1.0`.
+        let short = Bytes::from(nupkg("widget", "1.0"));
+        assert!(matches!(
+            nupkg_identity(FILE, ID, VERSION, &short),
+            Id::Established(_)
+        ));
+        for (what, bytes, file) in [
+            (
+                "another version",
+                Bytes::from(nupkg("widget", "2.0.0")),
+                FILE,
+            ),
+            (
+                "another package",
+                Bytes::from(nupkg("gadget", VERSION)),
+                FILE,
+            ),
+            ("not a package", Bytes::from_static(b"<html>"), FILE),
+            ("not a .nupkg name", ours.clone(), "widget.txt"),
+        ] {
+            assert!(
+                matches!(nupkg_identity(file, ID, VERSION, &bytes), Id::Unestablished),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanned_response_forwards_the_coding_and_upstream_type() {
+        let body = proxy_helpers::ScannedProxyBody {
+            bytes: Bytes::from_static(b"abc"),
+            content_type: None,
+            content_encoding: Some("gzip".to_string()),
+            digest: "d".to_string(),
+        };
+        let resp = scanned_nupkg_response(FILE, body);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(resp.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(resp.headers()[CONTENT_LENGTH], "3");
+        let body = proxy_helpers::ScannedProxyBody {
+            bytes: Bytes::from_static(b"abc"),
+            content_type: Some("application/zip".to_string()),
+            content_encoding: None,
+            digest: "d".to_string(),
+        };
+        let resp = scanned_nupkg_response(FILE, body);
+        assert_eq!(resp.headers()[CONTENT_TYPE], "application/zip");
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    // -- Remote ------------------------------------------------------------
+
+    /// Vulnerable package: 403 `scan_blocked` on the V3 and the V2 route,
+    /// nothing recorded.
+    #[tokio::test]
+    async fn remote_vulnerable_package_is_blocked_on_v3_and_v2() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        let bytes = nupkg(ID, VERSION);
+        mount_flat(&server, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, body, _) = pull_anon(
+            &state,
+            &fx.repo_key,
+            &format!("v3/flatcontainer/{ID}/{VERSION}/{FILE}"),
+        )
+        .await;
+        assert_scan_blocked(status, &body, FILE);
+        // The V2 route shares the V3 client's cached body (#4122) and its
+        // verdict: no second upstream hit.
+        let (status, body, _) =
+            pull_anon(&state, &fx.repo_key, &format!("v2/package/{ID}/{VERSION}")).await;
+        assert_scan_blocked(status, &body, FILE);
+        assert_eq!(
+            tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, FLAT).await,
+            0
+        );
+
+        server.verify().await;
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// Clean package: served with `X-AK-Scan: clean`, the second pull reuses
+    /// the verdict and the cache (one upstream hit), each serve records once.
+    #[tokio::test]
+    async fn remote_clean_package_is_served_and_recorded_once_per_pull() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        let bytes = nupkg(ID, VERSION);
+        mount_flat(&server, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+
+        for pulls in 1..=2 {
+            let (status, body, headers) = pull_anon(&state, &fx.repo_key, FLAT).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], &bytes[..]);
+            assert_eq!(headers["X-AK-Scan"], "clean");
+            assert_eq!(
+                tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, FLAT).await,
+                pulls
+            );
+        }
+
+        server.verify().await;
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// No verdict yet and no scanner: fail-open and record-only serve loudly
+    /// pending, fail-closed withholds (423) and records nothing. A package
+    /// that does not declare the coordinate it is served as is inconclusive
+    /// too. Record-only serves even a vulnerable verdict, marked `recorded`.
+    #[tokio::test]
+    async fn remote_package_honours_the_repository_action() {
+        for (action, declared, vulnerable, expect, header) in [
+            ("fail_open", VERSION, None, StatusCode::OK, Some("pending")),
+            (
+                "record_only",
+                VERSION,
+                None,
+                StatusCode::OK,
+                Some("pending"),
+            ),
+            (
+                "record_only",
+                VERSION,
+                Some(true),
+                StatusCode::OK,
+                Some("recorded"),
+            ),
+            ("fail_closed", VERSION, None, StatusCode::LOCKED, None),
+            ("fail_closed", "9.9.9", None, StatusCode::LOCKED, None),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+                return;
+            };
+            let server = v3_upstream().await;
+            let bytes = nupkg(ID, declared);
+            mount_flat(&server, bytes.clone(), 1).await;
+            let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+            tdh::enable_proxy_scan(&fx.pool, fx.repo_id, action).await;
+            let mut digests = Vec::new();
+            if let Some(vulnerable) = vulnerable {
+                digests
+                    .push(tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, vulnerable).await);
+            }
+
+            let (status, body, headers) = pull_anon(&state, &fx.repo_key, FLAT).await;
+            assert_eq!(status, expect, "{action} {declared}");
+            let served = status == StatusCode::OK;
+            if served {
+                assert_eq!(&body[..], &bytes[..]);
+            }
+            assert_eq!(
+                headers.get("X-AK-Scan").map(|v| v.to_str().unwrap()),
+                header,
+                "{action}"
+            );
+            assert_eq!(
+                tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, FLAT).await,
+                i64::from(served),
+                "{action}"
+            );
+            tdh::drop_proxy_verdicts(&fx.pool, &digests).await;
+            drop(server);
+            fx.teardown().await;
+        }
+    }
+
+    /// A V2 (Chocolatey) upstream: the `package/{id}/{version}` route is
+    /// gated under its own cache key, and so is the flat container answered
+    /// from that V2 upstream.
+    #[tokio::test]
+    async fn remote_v2_upstream_package_is_gated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "chocolatey").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = nupkg(ID, VERSION);
+        mount(
+            &server,
+            &format!("/api/v2/package/{ID}/{VERSION}"),
+            200,
+            bytes.clone(),
+            1,
+        )
+        .await;
+        let (state, _cache) =
+            tdh::rewire_remote_proxy(&fx, &format!("{}/api/v2", server.uri())).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, body, _) =
+            pull_anon(&state, &fx.repo_key, &format!("v2/package/{ID}/{VERSION}")).await;
+        assert_scan_blocked(status, &body, FILE);
+        let (status, body, _) = pull_anon(&state, &fx.repo_key, FLAT).await;
+        assert_scan_blocked(status, &body, FILE);
+        assert_eq!(
+            tdh::proxy_downloads_recorded(&fx.pool, fx.repo_id, V2_KEY).await,
+            0
+        );
+
+        server.verify().await;
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// With scan-on-proxy off nothing changes: the package streams, with no
+    /// `X-AK-Scan`, even when its bytes carry a vulnerable verdict.
+    #[tokio::test]
+    async fn remote_without_scan_on_proxy_streams_unchanged() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        let bytes = nupkg(ID, VERSION);
+        mount_flat(&server, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, body, headers) = pull_anon(&state, &fx.repo_key, FLAT).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &bytes[..]);
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// The `.nuspec` manifest is metadata and passes through unscanned.
+    #[tokio::test]
+    async fn remote_nuspec_passes_through() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        let nuspec = format!(
+            "<package><metadata><id>{ID}</id>{}</metadata></package>",
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        mount(
+            &server,
+            &format!("/flat/{ID}/{VERSION}/{ID}.nuspec"),
+            200,
+            nuspec.clone(),
+            1,
+        )
+        .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &nuspec, fx.repo_id, true).await;
+
+        let route = format!("v3/flatcontainer/{ID}/{VERSION}/{ID}.nuspec");
+        let (status, body, headers) = pull_anon(&state, &fx.repo_key, &route).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &nuspec[..]);
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        server.verify().await;
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// An encoded `/` plus `#` in the id used to fetch the `.nupkg` through
+    /// the version-list route, which serves upstream bytes verbatim and never
+    /// reaches the gate. Every proxied route refuses such a coordinate before
+    /// any upstream request.
+    #[tokio::test]
+    async fn ambiguous_coordinates_never_reach_upstream() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        mount_flat(&server, nupkg(ID, VERSION), 0).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        for route in [
+            format!("v3/flatcontainer/{ID}%2F{VERSION}%2F{FILE}%23/index.json"),
+            format!("v3/flatcontainer/{ID}/{VERSION}%2F{FILE}%3F/{ID}.nuspec"),
+            format!("v3/flatcontainer/{ID}/{VERSION}/{FILE}%3Fx"),
+            format!("v2/package/{ID}/{VERSION}/extra"),
+            format!("v2/package/{ID}%23/{VERSION}"),
+        ] {
+            let (status, _, _) = pull_anon(&state, &fx.repo_key, &route).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        }
+
+        server.verify().await;
+        fx.teardown().await;
+    }
+
+    // -- Virtual -----------------------------------------------------------
+
+    /// A Virtual fixture with its proxy-backed state and the caller's auth.
+    async fn virtual_fixture() -> Option<(tdh::Fixture, SharedState, tempfile::TempDir)> {
+        let fx = tdh::Fixture::setup("virtual", "nuget").await?;
+        let (state, dir) = proxy_state(&fx);
+        Some((fx, state, dir))
+    }
+
+    async fn pull_virtual(
+        fx: &tdh::Fixture,
+        state: &SharedState,
+        route: &str,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        pull(
+            tdh::router_with_auth(super::router(), state.clone(), auth),
+            format!("/{}/{route}", fx.repo_key),
+        )
+        .await
+    }
+
+    /// The common layout: hosted packages first, a scanning nuget.org proxy
+    /// after. The hosted copy wins and the scanning member is never asked.
+    #[tokio::test]
+    async fn virtual_hosted_member_before_a_scanning_remote_serves_first() {
+        const HOSTED: &[u8] = b"hosted widget nupkg #4102";
+        let Some((fx, state, _cache)) = virtual_fixture().await else {
+            return;
+        };
+        let (hosted_id, _key, hosted_dir) = tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        super::virtual_member_authz_tests::seed_member_nupkg(
+            &fx.pool,
+            hosted_id,
+            &hosted_dir,
+            ID,
+            VERSION,
+            HOSTED,
+            fx.user_id,
+        )
+        .await;
+        let server = v3_upstream().await;
+        mount_flat(&server, nupkg(ID, VERSION), 0).await;
+        let (remote_id, remote_dir) =
+            super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&server), 2)
+                .await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+
+        let (status, body, headers) = pull_virtual(&fx, &state, FLAT).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], HOSTED);
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        server.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+    }
+
+    /// A scanning member that misses (404) or whose upstream fails (5xx)
+    /// falls through to the next member, which serves unscanned.
+    #[tokio::test]
+    async fn virtual_scanning_member_miss_or_failure_falls_through() {
+        for upstream_status in [404u16, 500] {
+            let Some((fx, state, _cache)) = virtual_fixture().await else {
+                return;
+            };
+            let first = v3_upstream().await;
+            mount(
+                &first,
+                &format!("/flat/{ID}/{VERSION}/{FILE}"),
+                upstream_status,
+                Vec::new(),
+                1..,
+            )
+            .await;
+            let second = v3_upstream().await;
+            let bytes = nupkg(ID, VERSION);
+            mount_flat(&second, bytes.clone(), 1).await;
+            let (first_id, first_dir) =
+                super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&first), 1)
+                    .await;
+            let (second_id, second_dir) =
+                super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&second), 2)
+                    .await;
+            tdh::enable_proxy_scan(&fx.pool, first_id, "fail_closed").await;
+
+            let (status, body, headers) = pull_virtual(&fx, &state, FLAT).await;
+            assert_eq!(status, StatusCode::OK, "{upstream_status}");
+            assert_eq!(&body[..], &bytes[..], "{upstream_status}");
+            assert!(headers.get("X-AK-Scan").is_none(), "{upstream_status}");
+
+            second.verify().await;
+            tdh::cleanup_member_repo(&fx.pool, first_id, &first_dir).await;
+            tdh::cleanup_member_repo(&fx.pool, second_id, &second_dir).await;
+            fx.teardown().await;
+        }
+    }
+
+    /// A scanning member's verdict ends the walk on both routes: the next
+    /// member, which holds the same coordinate, is never asked.
+    #[tokio::test]
+    async fn virtual_scanning_member_verdict_ends_the_walk_on_v3_and_v2() {
+        let Some((fx, state, _cache)) = virtual_fixture().await else {
+            return;
+        };
+        let first = v3_upstream().await;
+        let bytes = nupkg(ID, VERSION);
+        mount_flat(&first, bytes.clone(), 1).await;
+        let second = v3_upstream().await;
+        mount_flat(&second, nupkg(ID, VERSION), 0).await;
+        let (first_id, first_dir) =
+            super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&first), 1).await;
+        let (second_id, second_dir) =
+            super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&second), 2)
+                .await;
+        tdh::enable_proxy_scan(&fx.pool, first_id, "fail_open").await;
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, first_id, true).await;
+
+        let (status, body, _) = pull_virtual(&fx, &state, FLAT).await;
+        assert_scan_blocked(status, &body, FILE);
+        let (status, body, _) =
+            pull_virtual(&fx, &state, &format!("v2/package/{ID}/{VERSION}")).await;
+        assert_scan_blocked(status, &body, FILE);
+
+        first.verify().await;
+        second.verify().await;
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        tdh::cleanup_member_repo(&fx.pool, first_id, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second_id, &second_dir).await;
+        fx.teardown().await;
+    }
+
+    /// The stricter policy wins: a fail-closed virtual scans a member that
+    /// has no scan config of its own, and withholds an unscanned package.
+    #[tokio::test]
+    async fn virtual_policy_is_the_stricter_of_virtual_and_member() {
+        let Some((fx, state, _cache)) = virtual_fixture().await else {
+            return;
+        };
+        let server = v3_upstream().await;
+        mount_flat(&server, nupkg(ID, VERSION), 1).await;
+        let (member_id, member_dir) =
+            super::virtual_federation_tests::link_remote_member(&fx, v3_index_url(&server), 1)
+                .await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let (status, _, _) = pull_virtual(&fx, &state, FLAT).await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(
+            tdh::proxy_downloads_recorded(&fx.pool, member_id, FLAT).await,
+            0
+        );
+
+        server.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
     }
 }
