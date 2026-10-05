@@ -1323,6 +1323,21 @@ pub(crate) struct CacheKeys {
     pub(crate) metadata: String,
 }
 
+/// The path a proxy-cache entry is keyed on: the request path with every
+/// leading and trailing `/` removed (the only normalization
+/// [`ProxyService::validate_cache_path`] applies; dot and empty segments are
+/// rejected there rather than rewritten).
+///
+/// Exposed so a serve path that classifies a request (e.g. "is this a
+/// package archive the scan gate must see?", #4100) classifies EXACTLY the
+/// key the cache will read and write. Classifying the raw path instead let
+/// `.../widget-1.0.jar/` (empty file name, so "not an archive") stream
+/// unscanned from the same cache entry `.../widget-1.0.jar` had just been
+/// refused for.
+pub(crate) fn normalize_cache_path(path: &str) -> &str {
+    path.trim_start_matches('/').trim_end_matches('/')
+}
+
 impl CacheKeys {
     /// Derive both the content and metadata storage keys for a proxy-cache
     /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
@@ -6506,7 +6521,7 @@ impl ProxyService {
     /// suspenders so a future call site that bypasses the storage check
     /// still cannot escape (#1018 R3-7 / #1052).
     fn validate_cache_path(path: &str) -> Result<&str> {
-        let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+        let trimmed = normalize_cache_path(path);
 
         if trimmed.is_empty() {
             return Err(AppError::Validation(
