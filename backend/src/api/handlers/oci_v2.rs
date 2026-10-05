@@ -2766,6 +2766,21 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
         .await?;
     }
 
+    // 4. First-class manifest existence record (#1683 / #4433), in the SAME
+    //    transaction, so a manifest the registry acknowledged always has its
+    //    `oci_manifests` row and a rolled-back commit leaves none. Write-only
+    //    for now: no reader consults the table yet.
+    crate::services::oci_manifests::upsert_in_tx(
+        tx,
+        repo_id,
+        manifest_digest,
+        &crate::services::oci_manifests::ManifestRecord::from_body(
+            manifest_content_type,
+            manifest_body,
+        ),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -12267,6 +12282,13 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
         .bind(digest)
         .execute(&mut **tx)
         .await?;
+    }
+
+    // #1683 / #4433: an explicit `DELETE .../manifests/<digest>` deletes the
+    // manifest itself, so forget its existence record. A tag-name delete only
+    // removes a tag; the manifest stays addressable by digest and keeps its row.
+    if scope == OciIndexDeleteScope::ContentAddressed {
+        crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
     }
 
     Ok(())

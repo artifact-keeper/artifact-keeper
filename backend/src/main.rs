@@ -624,6 +624,25 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // One-shot backfill of the first-class `oci_manifests` existence table
+    // (#1683 / #4433) for manifests committed before migration 265. Every
+    // push/cache since then records its row inline. Backgrounded: nothing
+    // reads the table yet, the pass is additive and idempotent (no-op once
+    // every manifest has a row), and it reads each body from storage, so it
+    // must not delay the HTTP listener bind. Failures are logged inside and
+    // retried on the next start.
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::oci_manifests::run_backfill(
+                &db_pool,
+                storage_registry,
+            )
+            .await;
+        });
+    }
+
     // One-shot repair for Docker/OCI artifacts imported by migration runs
     // that pre-date #2457: those runs stored manifest/blob bytes under
     // generic CAS keys with only `artifacts` rows, so migrated tags were

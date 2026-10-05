@@ -60,6 +60,7 @@ pub mod npm_attestation_cache;
 pub mod npm_packument_cache;
 pub mod oci_inspect;
 pub mod oci_manifest_refs_backfill;
+pub mod oci_manifests;
 pub mod oci_migration_reindex;
 pub mod oci_referenced_content;
 pub mod oidc_env_bootstrap;
