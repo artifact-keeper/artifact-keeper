@@ -50,6 +50,7 @@ use serde::Deserialize;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
 use crate::services::upstream_auth::UpstreamAuthType;
+use crate::services::upstream_tracing::send_upstream;
 
 /// `upstream_auth_type` value selecting the Amazon ECR provider.
 pub const AUTH_TYPE_ECR: &str = "aws_ecr";
@@ -730,7 +731,7 @@ async fn signed_post(
         outgoing = outgoing.header(name, value);
     }
 
-    outgoing.send().await.map_err(|e| {
+    send_upstream(outgoing).await.map_err(|e| {
         AppError::Config(format!(
             "{service} GetAuthorizationToken request to {} failed: {e}. Check that the configured \
              region is correct and that the endpoint is reachable.",

@@ -79,7 +79,10 @@ pub fn record_artifact_download(repo_key: &str, format: &str) {
 /// which branch is responsible for slow repeat requests. The repository
 /// label keeps cardinality bounded by the operator's repo count, which
 /// matches the existing `ak_artifact_downloads_total` shape.
-pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
+pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
+    // The same outcome tags the request's trace (#4455), as a span attribute
+    // only: the repository label above is the metric's only per-repo series.
+    crate::api::middleware::request_span::record_cache_outcome(result);
     counter!(
         "ak_proxy_cache_lookups_total",
         "repository" => repo_key.to_string(),

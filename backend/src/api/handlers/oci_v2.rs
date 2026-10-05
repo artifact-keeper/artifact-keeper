@@ -3182,6 +3182,9 @@ async fn resolve_repo_inner(
     };
 
     let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
+    // `/v2` does not pass through the repository-visibility middleware, so
+    // the resolved repository is recorded on the request span here (#4455).
+    crate::api::middleware::request_span::record_repository_key(&resolved_key);
     let format: String = repo.try_get("format").map_err(map_db_err)?;
 
     let location = crate::storage::StorageLocation {

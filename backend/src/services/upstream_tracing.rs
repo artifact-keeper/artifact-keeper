@@ -2,9 +2,13 @@
 //!
 //! Every upstream request made by `services::proxy_service` (artifact and
 //! metadata fetches, conditional revalidations, the OCI bearer-token exchange
-//! and its retry) goes through [`send_upstream`]. Upstream calls made outside
-//! the proxy service (`services::upstream_metadata`, `services::upstream_feed`,
-//! the npm and goproxy handlers) do not yet, and are follow-ups on #3954. It wraps the send in an
+//! and its retry) goes through [`send_upstream`], and so do the upstream calls
+//! made outside it (#4455): the PyPI JSON publish-time lookup
+//! (`services::upstream_metadata`), the npm change-feed consumer
+//! (`services::upstream_feed`), the npm audit and `/-/` meta passthroughs, the
+//! Go sumdb proxy, and the AWS token exchange in
+//! `services::aws_upstream_auth` (its SigV4 signature does not cover the
+//! injected headers, which are added after signing). It wraps the send in an
 //! `otel.kind = "client"` span carrying the stable HTTP client semantic
 //! conventions (`http.request.method`, `url.full`, `server.address`,
 //! `server.port`, `http.response.status_code`, `error.type`) and injects the

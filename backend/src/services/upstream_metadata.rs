@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::http_client;
+use crate::services::upstream_tracing::send_upstream;
 
 const PYPI_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -72,10 +73,7 @@ impl UpstreamMetadataCache {
         }
 
         let url = pypi_json_url(upstream_url, project);
-        let response = client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
+        let response = send_upstream(client.get(&url).header("Accept", "application/json"))
             .await
             .map_err(|e| AppError::BadGateway(format!("PyPI metadata fetch failed: {e}")))?;
 

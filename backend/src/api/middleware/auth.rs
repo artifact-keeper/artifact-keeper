@@ -1178,6 +1178,11 @@ pub(crate) enum AuthOutcome {
 /// `username:password` logins are unaffected in BOTH modes. The discrimination is
 /// per-middleware (structural), never request-path string matching — axum's
 /// nest-prefix stripping makes path matching unreliable here.
+///
+/// Runs in an `INTERNAL` `authenticate` span (#4455), so a trace shows how
+/// much of a request went to credential validation (JWT, API-token lookup,
+/// bcrypt). The span records no credential material.
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
@@ -2506,6 +2511,10 @@ pub async fn repo_visibility_middleware(
         // may not see" stay indistinguishable for authenticated callers too.
         return not_found_response();
     };
+
+    // The key names a real repository: tag the request's trace with it so
+    // traces can be filtered per repository (#4455). Span attribute only.
+    crate::api::middleware::request_span::record_repository_key(&repo_key);
 
     let visibility = repo.visibility;
     // The VS Code gallery query is a protocol-mandated POST that is purely a

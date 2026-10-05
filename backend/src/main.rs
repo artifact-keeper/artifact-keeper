@@ -1213,6 +1213,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     &trace_context_trusted_proxies,
                 )
             },
+        )
+        // Status, body size and 5xx error status onto the same span (#4455),
+        // then the default DEBUG "finished processing request" event.
+        .on_response(
+            artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
 
     // The concrete shutdown token used by all servers and background tasks

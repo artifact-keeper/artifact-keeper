@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
+use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
@@ -4164,6 +4165,12 @@ impl ProxyService {
     /// result because reqwest no longer decodes upstream bodies, so a buffered
     /// metadata document may itself be content coded and the handler has to
     /// declare that when it serves the bytes on.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "buffered")
+    )]
     pub async fn fetch_artifact_with_cache_path_and_accept_capped(
         &self,
         repo: &Repository,
@@ -4619,6 +4626,17 @@ impl ProxyService {
 
     /// The single-flight streaming body shared by every digest-gated public
     /// variant.
+    ///
+    /// This and [`Self::fetch_artifact_with_cache_path_and_accept_capped`] are
+    /// the two funnels of the proxy fetch, so each runs in an `INTERNAL`
+    /// `proxy_fetch` phase span (#4455) holding the cache lookup, the
+    /// upstream `CLIENT` span and the cache write.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "streaming")
+    )]
     async fn streaming_gated_fetch(
         &self,
         repo: &Repository,
@@ -4757,6 +4775,7 @@ impl ProxyService {
             .await?
         {
             StreamingCacheReadOutcome::Hit(result, metadata) => {
+                record_cache_outcome("hit");
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
@@ -4776,11 +4795,17 @@ impl ProxyService {
                 );
                 Ok(Some(result))
             }
-            StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
-                "Upstream returned 404 (negative-cached) for {}",
-                cache_path
-            ))),
-            StreamingCacheReadOutcome::Miss => Ok(None),
+            StreamingCacheReadOutcome::NegativeHit => {
+                record_cache_outcome("negative_hit");
+                Err(AppError::NotFound(format!(
+                    "Upstream returned 404 (negative-cached) for {}",
+                    cache_path
+                )))
+            }
+            StreamingCacheReadOutcome::Miss => {
+                record_cache_outcome("miss");
+                Ok(None)
+            }
         }
     }
 

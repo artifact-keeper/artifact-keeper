@@ -51,6 +51,7 @@ use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
 use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
+use crate::services::upstream_tracing::send_upstream;
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
 /// `PROXY_HYDRATION_LOCK_CLASS` (0x1609) and the scheduler locks
@@ -434,7 +435,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
     /// genesis (replaying the registry's entire change history).
     async fn bootstrap_cursor(&self) -> Result<Option<String>> {
         let root = feed_root_url(&self.url)?;
-        let response = self.http.get(root).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(root)).await.map_err(|e| {
             AppError::Internal(format!(
                 "npm feed bootstrap request failed: {}",
                 e.without_url()
@@ -468,7 +469,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
                 query.append_pair("since", since);
             }
         }
-        let response = self.http.get(url).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(url)).await.map_err(|e| {
             AppError::Internal(format!("npm feed request failed: {}", e.without_url()))
         })?;
         if !response.status().is_success() {

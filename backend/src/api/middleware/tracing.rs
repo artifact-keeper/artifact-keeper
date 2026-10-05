@@ -302,12 +302,24 @@ pub fn make_http_request_span<B>(
     let uri = request.uri();
     let sanitized = crate::api::redact_sensitive_params(uri.path(), uri.query());
 
+    // The response and request-class attributes start empty and are filled in
+    // later by `api::middleware::request_span` (#4455): `http.route` after
+    // routing, the status / body size / error status from the `TraceLayer`
+    // `on_response` hook, and the repository key and cache outcome from deep
+    // inside the request.
     let span = tracing::info_span!(
         "http_request",
         otel.kind = "server",
         method = %request.method(),
         uri = %sanitized,
         correlation_id = tracing::field::Empty,
+        http.route = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+        http.response.body.size = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        artifact_keeper.repository.key = tracing::field::Empty,
+        artifact_keeper.cache.outcome = tracing::field::Empty,
     );
 
     let peer = request
@@ -426,7 +438,17 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
 
     request.extensions_mut().insert(correlation_id.clone());
 
-    tracing::Span::current().record("correlation_id", tracing::field::display(&correlation_id));
+    // The ambient span is the `http_request` span the outer `TraceLayer`
+    // opened. This middleware runs after routing, so the matched route pattern
+    // is known here (#4455); a request no route matched leaves it unset.
+    let request_span = tracing::Span::current();
+    request_span.record("correlation_id", tracing::field::display(&correlation_id));
+    if let Some(route) = request.extensions().get::<axum::extract::MatchedPath>() {
+        request_span.record(
+            crate::api::middleware::request_span::HTTP_ROUTE_FIELD,
+            route.as_str(),
+        );
+    }
 
     // Kubernetes polls the health/readiness/liveness probes on a tight loop
     // forever; their per-request "Request completed" lines bury real request
@@ -434,11 +456,13 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
     // LOG_PROBE_REQUESTS, except a non-success response always logs (see
     // should_log_completed). Decided after the response so the status is known.
     let is_probe = is_probe_path(request.uri().path());
+    let correlation_id_for_scope = correlation_id.clone();
 
-    // Scope the task-local around the whole downstream future so audit
+    // Scope the task-locals around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
-    // the span carries and the response header echoes (#2414).
-    with_correlation_scope(correlation_id.clone(), async move {
+    // the span carries and the response header echoes (#2414), and so code
+    // deep in the request can record onto the `http_request` span (#4455).
+    let downstream = async move {
         let mut response = next.run(request).await;
 
         if let Ok(value) = HeaderValue::from_str(correlation_id.as_str()) {
@@ -458,7 +482,11 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
         }
 
         response
-    })
+    };
+    with_correlation_scope(
+        correlation_id_for_scope,
+        crate::api::middleware::request_span::with_request_span(request_span, downstream),
+    )
     .await
 }
 
