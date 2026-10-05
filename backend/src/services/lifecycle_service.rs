@@ -1133,6 +1133,8 @@ pub struct LifecycleService {
     /// Owner of the proxy-cache store, for evicting Remote repositories'
     /// cached objects (#3734). See [`LifecycleService::with_proxy_service`].
     proxy_service: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
+    /// Candidates per page of a live proxy-cache sweep.
+    proxy_cache_page_size: i64,
 }
 
 impl LifecycleService {
@@ -1140,6 +1142,7 @@ impl LifecycleService {
         Self {
             db,
             proxy_service: None,
+            proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
         }
     }
 
@@ -1177,6 +1180,18 @@ impl LifecycleService {
     /// A crash between tx2 and bookkeeping leaves `last_run_at` stale, so
     /// the policy runs again on the next tick — same idempotent cascade.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
+        self.execute_policy_until(id, dry_run, &CancellationToken::new())
+            .await
+    }
+
+    /// [`Self::execute_policy`] that stops a long proxy-cache sweep between
+    /// pages once `abort` fires (the scheduler's lease-loss token, #3502).
+    async fn execute_policy_until(
+        &self,
+        id: Uuid,
+        dry_run: bool,
+        abort: &CancellationToken,
+    ) -> Result<PolicyExecutionResult> {
         let mut policy = self.get_policy(id).await?;
 
         if !policy.enabled && !dry_run {
@@ -1206,7 +1221,7 @@ impl LifecycleService {
             result.bytes_matched += current.bytes_matched;
             result.bytes_freed += current.bytes_freed;
             let cache = self
-                .run_proxy_cache_arm(&policy, repository_id, dry_run, &mut result.errors)
+                .run_proxy_cache_arm(&policy, repository_id, dry_run, abort, &mut result.errors)
                 .await?;
             result.proxy_cache.absorb(cache);
         }
@@ -1334,8 +1349,9 @@ impl LifecycleService {
         &self,
         policy: LifecyclePolicy,
         results: &mut Vec<PolicyExecutionResult>,
+        abort: &CancellationToken,
     ) {
-        match self.execute_policy(policy.id, false).await {
+        match self.execute_policy_until(policy.id, false, abort).await {
             Ok(result) => results.push(result),
             Err(e) => {
                 tracing::error!(
@@ -1363,8 +1379,9 @@ impl LifecycleService {
         let policies = self.load_enabled_policies().await?;
 
         let mut results = Vec::new();
+        let never = CancellationToken::new();
         for policy in policies {
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, &never).await;
         }
 
         Ok(results)
@@ -1425,7 +1442,7 @@ impl LifecycleService {
                 continue;
             }
 
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, abort).await;
         }
 
         Ok(results)

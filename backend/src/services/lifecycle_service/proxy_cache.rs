@@ -22,11 +22,19 @@
 //! (and is refused for an explicit Remote assignment) rather than deleting
 //! what it was written to protect.
 //!
+//! Only a policy explicitly assigned to a Remote repository reaches its
+//! cache. A global (`applies_to_all`) policy is skipped there with a reason:
+//! existing global policies were written for hosted cleanup, and the cache
+//! may hold the only copy of content gone upstream, so an upgrade must not
+//! turn them into cache wipes.
+//!
 //! The dry run counts and the live run selects through one predicate,
 //! [`proxy_cache_retention_where!`], and both report under
 //! [`PolicyExecutionResult::proxy_cache`], separately from `artifacts`.
 
 use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -157,7 +165,7 @@ pub(crate) const PROXY_CACHE_COUNT_SQL: &str = concat!(
 /// (`$5` the last id seen, `$6` the page size) so a failed entry is skipped
 /// rather than re-selected forever within one run.
 pub(crate) const PROXY_CACHE_CANDIDATES_SQL: &str = concat!(
-    "SELECT p.id, p.path, p.storage_key, p.metadata_key, p.size_bytes\n",
+    "SELECT p.id, p.path, p.storage_key, p.metadata_key, p.size_bytes, p.cached_at\n",
     "FROM proxy_cache_artifacts p\n",
     proxy_cache_retention_where!(),
     "    AND p.id > $5\n",
@@ -165,13 +173,36 @@ pub(crate) const PROXY_CACHE_CANDIDATES_SQL: &str = concat!(
     "LIMIT $6\n"
 );
 
-/// Candidates fetched per page of a live run.
-const EVICTION_PAGE_SIZE: i64 = 500;
+/// Per-entry re-check over the same predicate, run immediately before an
+/// entry is evicted (`$5` its id, `$6` the `cached_at` the page read). An
+/// entry served or re-cached since its page was read is no longer a
+/// candidate and is left alone.
+pub(crate) const PROXY_CACHE_RECHECK_SQL: &str = concat!(
+    "SELECT EXISTS (\n",
+    "SELECT 1 FROM proxy_cache_artifacts p\n",
+    proxy_cache_retention_where!(),
+    "    AND p.id = $5 AND p.cached_at = $6\n",
+    ")\n"
+);
 
-/// Storage failures tolerated in one repository before its sweep stops. An
-/// unreachable object store would otherwise fail every entry, one round trip
-/// and one error line at a time.
+/// Candidates fetched per page of a live run.
+pub(super) const EVICTION_PAGE_SIZE: i64 = 500;
+
+/// Consecutive storage failures tolerated in one repository before its sweep
+/// stops. An unreachable object store would otherwise fail every entry, one
+/// round trip and one error line at a time. Consecutive rather than total, so
+/// a handful of permanently undeletable entries (object lock, a denied
+/// prefix) at the low end of the id range cannot stall the sweep forever.
 const MAX_EVICTION_FAILURES: usize = 10;
+
+/// Reported for a global policy on a Remote repository.
+pub(crate) const GLOBAL_POLICY_REASON: &str =
+    "global policies do not reach a Remote repository's proxy cache; assign the policy to \
+     the repository explicitly to evict cached entries";
+
+/// Reported when there is nothing to evict with.
+const NO_PROXY_STORE_REASON: &str =
+    "this instance has no proxy cache store, so a live run evicts nothing";
 
 /// Proxy-cache side of a policy run (#3734), reported separately from the
 /// `artifacts` counters.
@@ -184,7 +215,9 @@ pub struct ProxyCacheExecutionResult {
     pub entries_removed: i64,
     /// Bytes held by `entries_matched`.
     pub bytes_matched: i64,
-    /// Bytes reclaimed by `entries_removed`. Always zero for a dry run.
+    /// Bytes reclaimed by `entries_removed`: the catalogued size of each
+    /// removed entry whose objects were actually present and deleted. Always
+    /// zero for a dry run.
     pub bytes_freed: i64,
     /// Set when a Remote repository in scope was not swept, and why (the
     /// policy type or config has no proxy-cache meaning, or this instance has
@@ -212,6 +245,16 @@ impl ProxyCacheExecutionResult {
     }
 }
 
+/// What one repository's live sweep works with.
+#[derive(Clone, Copy)]
+struct Sweep<'a> {
+    proxy: &'a ProxyService,
+    repository_key: &'a str,
+    repository_id: Uuid,
+    rule: &'a ProxyCacheRule,
+    abort: &'a CancellationToken,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct EvictionCandidate {
     id: Uuid,
@@ -219,6 +262,7 @@ struct EvictionCandidate {
     storage_key: String,
     metadata_key: String,
     size_bytes: i64,
+    cached_at: DateTime<Utc>,
 }
 
 /// Bind a [`ProxyCacheRule`] to `$1..$4` of a [`proxy_cache_retention_where!`]
@@ -291,6 +335,14 @@ impl LifecycleService {
         }
     }
 
+    /// Test hook: shrink the live sweep's page size so a few entries exercise
+    /// keyset continuation.
+    #[cfg(test)]
+    pub(super) fn with_proxy_cache_page_size(mut self, page_size: i64) -> Self {
+        self.proxy_cache_page_size = page_size;
+        self
+    }
+
     /// Run `policy`'s proxy-cache arm in one repository. Non-Remote
     /// repositories have no cache and return an empty result. Per-entry
     /// storage failures are appended to `errors` and leave the entry (row and
@@ -300,23 +352,36 @@ impl LifecycleService {
         policy: &LifecyclePolicy,
         repository_id: Uuid,
         dry_run: bool,
+        abort: &CancellationToken,
         errors: &mut Vec<String>,
     ) -> Result<ProxyCacheExecutionResult> {
-        let repository: Option<(String, RepositoryType)> =
-            sqlx::query_as("SELECT key, repo_type FROM repositories WHERE id = $1")
+        let repository: Option<(String, RepositoryType, RepositoryFormat)> =
+            sqlx::query_as("SELECT key, repo_type, format FROM repositories WHERE id = $1")
                 .bind(repository_id)
                 .fetch_optional(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
-        let Some((repository_key, RepositoryType::Remote)) = repository else {
+        let Some((repository_key, RepositoryType::Remote, format)) = repository else {
             return Ok(ProxyCacheExecutionResult::default());
         };
         let rule = match proxy_cache_arm(&policy.policy_type, &policy.config)? {
             ProxyCacheArm::Applies(rule) => rule,
+            // An OCI remote keeps `artifacts` rows the policy does act on, so
+            // there is nothing to warn about.
+            ProxyCacheArm::Unsupported(_) if remote_keeps_artifact_rows(&format) => {
+                return Ok(ProxyCacheExecutionResult::default())
+            }
             ProxyCacheArm::Unsupported(reason) => {
                 return Ok(ProxyCacheExecutionResult::skipped(reason))
             }
         };
+        // Upgrade safety: a global policy written for hosted cleanup must not
+        // start evicting every Remote cache, which may be the only surviving
+        // copy of content gone upstream. Only an explicit assignment opts a
+        // Remote repository's cache in.
+        if policy.applies_to_all {
+            return Ok(ProxyCacheExecutionResult::skipped(GLOBAL_POLICY_REASON));
+        }
 
         let matched = bind_proxy_cache_rule!(
             sqlx::query_as::<_, CountBytes>(PROXY_CACHE_COUNT_SQL),
@@ -331,70 +396,25 @@ impl LifecycleService {
             bytes_matched: matched.bytes,
             ..ProxyCacheExecutionResult::default()
         };
+        // Checked for the preview too, so it does not promise an eviction the
+        // live run cannot perform.
+        let Some(proxy) = self.proxy_service.as_ref() else {
+            if matched.count > 0 {
+                result.skipped_reason = Some(NO_PROXY_STORE_REASON.to_string());
+            }
+            return Ok(result);
+        };
         if dry_run || matched.count == 0 {
             return Ok(result);
         }
-        let Some(proxy) = self.proxy_service.as_ref() else {
-            result.skipped_reason =
-                Some("this instance has no proxy cache store; nothing was evicted".to_string());
-            return Ok(result);
+        let sweep = Sweep {
+            proxy,
+            repository_key: &repository_key,
+            repository_id,
+            rule: &rule,
+            abort,
         };
-
-        let mut after = Uuid::nil();
-        let mut failures = 0usize;
-        loop {
-            let page: Vec<EvictionCandidate> = bind_proxy_cache_rule!(
-                sqlx::query_as(PROXY_CACHE_CANDIDATES_SQL),
-                repository_id,
-                rule
-            )
-            .bind(after)
-            .bind(EVICTION_PAGE_SIZE)
-            .fetch_all(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            let Some(last) = page.last() else {
-                break;
-            };
-            after = last.id;
-
-            for entry in &page {
-                let recorded = [entry.storage_key.as_str(), entry.metadata_key.as_str()];
-                if let Err(e) = proxy
-                    .evict_cached_entry(&repository_key, &entry.path, recorded)
-                    .await
-                {
-                    failures += 1;
-                    errors.push(format!(
-                        "proxy-cache entry '{}' in '{repository_key}' was kept: {e}",
-                        entry.path
-                    ));
-                    if failures >= MAX_EVICTION_FAILURES {
-                        errors.push(format!(
-                            "stopped the proxy-cache sweep of '{repository_key}' after \
-                             {failures} storage failures"
-                        ));
-                        return Ok(result);
-                    }
-                    continue;
-                }
-                // Objects first, row second: a crash in between leaves a row
-                // the next run re-selects, never an object nothing reclaims.
-                let deleted = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE id = $1")
-                    .bind(entry.id)
-                    .execute(&self.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?
-                    .rows_affected();
-                if deleted > 0 {
-                    result.entries_removed += 1;
-                    result.bytes_freed += entry.size_bytes;
-                }
-            }
-            if (page.len() as i64) < EVICTION_PAGE_SIZE {
-                break;
-            }
-        }
+        self.sweep_proxy_cache(&sweep, &mut result, errors).await?;
         if result.entries_removed > 0 {
             tracing::info!(
                 policy = %policy.name,
@@ -405,6 +425,112 @@ impl LifecycleService {
             );
         }
         Ok(result)
+    }
+
+    /// The live sweep: page through the candidates, re-check each one, evict
+    /// its objects, then delete its row.
+    async fn sweep_proxy_cache(
+        &self,
+        sweep: &Sweep<'_>,
+        result: &mut ProxyCacheExecutionResult,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Sweep {
+            proxy,
+            repository_key,
+            repository_id,
+            rule,
+            abort,
+        } = *sweep;
+        let mut after = Uuid::nil();
+        let mut consecutive_failures = 0usize;
+        loop {
+            // Scheduler lease lost (#3502): another replica may be running
+            // the same sweep. Deletes are idempotent, but stop rather than
+            // duplicate the work.
+            if abort.is_cancelled() {
+                errors.push(format!(
+                    "stopped the proxy-cache sweep of '{repository_key}': scheduler lease lost"
+                ));
+                return Ok(());
+            }
+            let page: Vec<EvictionCandidate> = bind_proxy_cache_rule!(
+                sqlx::query_as(PROXY_CACHE_CANDIDATES_SQL),
+                repository_id,
+                rule
+            )
+            .bind(after)
+            .bind(self.proxy_cache_page_size)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = last.id;
+
+            for entry in &page {
+                let still_candidate: bool = bind_proxy_cache_rule!(
+                    sqlx::query_scalar(PROXY_CACHE_RECHECK_SQL),
+                    repository_id,
+                    rule
+                )
+                .bind(entry.id)
+                .bind(entry.cached_at)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                if !still_candidate {
+                    continue;
+                }
+                let recorded = [entry.storage_key.as_str(), entry.metadata_key.as_str()];
+                let objects = match proxy
+                    .evict_cached_entry(repository_key, &entry.path, recorded)
+                    .await
+                {
+                    Ok(objects) => objects,
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        errors.push(format!(
+                            "proxy-cache entry '{}' in '{repository_key}' was kept: {e}",
+                            entry.path
+                        ));
+                        if consecutive_failures >= MAX_EVICTION_FAILURES {
+                            errors.push(format!(
+                                "stopped the proxy-cache sweep of '{repository_key}' after \
+                                 {consecutive_failures} consecutive storage failures"
+                            ));
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                consecutive_failures = 0;
+                // Objects first, row second: a crash in between leaves a row
+                // the next run re-selects, never an object nothing reclaims.
+                // Guarded on `cached_at` so a re-cache that upserted the row
+                // (same id) while we deleted is not erased with it.
+                let deleted = sqlx::query(
+                    "DELETE FROM proxy_cache_artifacts WHERE id = $1 AND cached_at = $2",
+                )
+                .bind(entry.id)
+                .bind(entry.cached_at)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .rows_affected();
+                if deleted > 0 {
+                    result.entries_removed += 1;
+                    if objects > 0 {
+                        result.bytes_freed += entry.size_bytes;
+                    }
+                }
+            }
+            if (page.len() as i64) < self.proxy_cache_page_size {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

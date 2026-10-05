@@ -213,6 +213,12 @@ impl ProxyCacheScope {
     /// can legally equal the segment (both are drawn from `[A-Za-z0-9._-]`);
     /// repository creation rejects the collision, this guard covers
     /// repositories that predate that check.
+    ///
+    /// It cannot cover the same collision with ANOTHER deployment's segment
+    /// on a shared bucket: that ambiguity is inherent to the legacy layout.
+    /// Callers that delete through these roots either list the repository's
+    /// own tree on repository delete, or (lifecycle, #3734) only touch the two
+    /// leaf objects a catalogue row names.
     pub fn repo_roots(&self, repo_key: &str) -> Vec<String> {
         let mut roots = vec![self.repo_root(repo_key)];
         if self.segment() != Some(repo_key) {

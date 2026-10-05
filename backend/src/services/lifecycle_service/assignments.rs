@@ -262,7 +262,9 @@ impl LifecycleService {
             req.repository_ids
                 .unwrap_or_else(|| existing.repository_ids.clone()),
         )?;
-        let config_changed = req.config.is_some();
+        // Compared, not `is_some()`: a client that always re-sends the stored
+        // config is not changing it.
+        let config_changed = req.config.as_ref().is_some_and(|c| *c != existing.config);
         let config = req.config.unwrap_or(existing.config);
         self.validate_policy_config(&existing.policy_type, &config)?;
         // A new config is checked against every assignment; otherwise only

@@ -5325,17 +5325,22 @@ impl ProxyService {
     /// The lifecycle sweep's sibling of [`Self::invalidate_cache_by_key`]. It
     /// targets the same keys ([`CacheKeys::derive`] for `(repo_key, path)`),
     /// plus the keys the catalog row itself recorded when they differ (an
-    /// entry cached before #3454 sits in the unscoped tree), accepted only
-    /// when [`ProxyCacheScope::owns_entry_key`] places them in this
-    /// repository's cache. It differs from invalidation in one deliberate
-    /// way: a storage error is returned instead of swallowed. Storage GC
-    /// leaves `proxy-cache/*` objects alone, so a retention sweep that
-    /// dropped the catalog row after a failed delete would strand the object
-    /// where nothing ever reclaims it. The caller deletes the row only after
-    /// this returns `Ok`, and a failed entry is retried by the next run.
+    /// entry cached before #3454 sits in the unscoped tree). It differs from
+    /// invalidation in two deliberate ways, both so a failure keeps the
+    /// catalogue row (the caller deletes it only after this returns `Ok`) and
+    /// the entry is retried or reported instead of forgotten:
     ///
-    /// Returns the number of objects actually deleted (`NotFound` is not an
-    /// error: a placeholder row may never have had a body).
+    /// * a storage error is returned instead of swallowed. Storage GC leaves
+    ///   `proxy-cache/*` objects alone, so dropping the row after a failed
+    ///   delete would strand the object where nothing ever reclaims it;
+    /// * a recorded key that [`ProxyCacheScope::owns_entry_key`] does not
+    ///   place in this repository's cache is an error and nothing is deleted.
+    ///   That is a corrupt row, or a repository renamed after the entry was
+    ///   cached (its objects still sit under the old key's root); either way
+    ///   the row is the only record of those objects.
+    ///
+    /// Returns the number of objects that existed and were deleted. Zero is
+    /// not an error: a placeholder row may never have had a body.
     pub async fn evict_cached_entry(
         &self,
         repo_key: &str,
@@ -5351,22 +5356,22 @@ impl ProxyService {
             if keys.iter().any(|k| k == recorded) {
                 continue;
             }
-            if self.cache_scope.owns_entry_key(repo_key, recorded) {
-                keys.push(recorded.to_string());
-            } else {
-                tracing::warn!(
-                    repo_key = %repo_key,
-                    storage_key = %recorded,
-                    "lifecycle: catalog row records a key outside this repository's proxy \
-                     cache; not deleting it"
-                );
+            if !self.cache_scope.owns_entry_key(repo_key, recorded) {
+                return Err(AppError::Conflict(format!(
+                    "catalogue row records '{recorded}', which is outside the proxy cache of \
+                     '{repo_key}' (renamed repository or corrupt row); entry kept"
+                )));
             }
+            keys.push(recorded.to_string());
         }
         // Bodies before sidecars, as invalidation orders them.
         keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
 
         let mut deleted = 0usize;
         for key in &keys {
+            if !self.storage.exists(key).await? {
+                continue;
+            }
             match self.storage.delete(key).await {
                 Ok(()) => deleted += 1,
                 Err(AppError::NotFound(_)) => {}

@@ -13,6 +13,7 @@ use crate::api::handlers::test_db_helpers as tdh;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_service::CacheKeys;
 use crate::services::storage_service::{FilesystemBackend, StorageService};
+use tokio_util::sync::CancellationToken;
 
 // ── pure decision table ───────────────────────────────────────────────────
 
@@ -250,6 +251,17 @@ impl RemoteCache {
         }
     }
 
+    /// An entry whose body delete fails: a non-empty directory sits where the
+    /// body file should be, so deleting it as a file is an I/O error, not
+    /// NotFound.
+    async fn stuck_entry(&self, path: &str) -> Entry {
+        let entry = self.entry(path, 90, Some(90)).await;
+        let body = self.fx.storage_dir.join(&entry.content);
+        std::fs::remove_file(&body).expect("drop body file");
+        write_object(&body, "pin", b"x");
+        entry
+    }
+
     async fn row_exists(&self, entry: &Entry) -> bool {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM proxy_cache_artifacts WHERE id = $1)",
@@ -297,6 +309,10 @@ struct Entry {
     id: Uuid,
     content: String,
     metadata: String,
+}
+
+fn never() -> CancellationToken {
+    CancellationToken::new()
 }
 
 fn write_object(root: &Path, key: &str, bytes: &[u8]) {
@@ -424,10 +440,10 @@ async fn max_age_evicts_by_cached_at_within_path_prefix_3734() {
 }
 
 /// An entry cached before #3454 records unscoped keys; the sweep reaches
-/// them. A row recording keys outside this repository's cache is dropped
-/// without deleting the foreign objects it points at.
+/// them. A row recording keys outside this repository's cache keeps its row
+/// and is reported, and the foreign objects it points at are not touched.
 #[tokio::test]
-async fn eviction_reaches_legacy_keys_and_refuses_foreign_ones_3734() {
+async fn eviction_reaches_legacy_keys_and_keeps_foreign_ones_3734() {
     let scope = ProxyCacheScope::from_deployment_id(Uuid::new_v4());
     let Some(cache) = RemoteCache::setup("pypi", scope).await else {
         return;
@@ -463,22 +479,51 @@ async fn eviction_reaches_legacy_keys_and_refuses_foreign_ones_3734() {
         .execute_policy(policy.id, false)
         .await
         .expect("run");
-    assert_eq!(run.proxy_cache.entries_removed, 2, "{:?}", run.errors);
+    assert_eq!(run.proxy_cache.entries_removed, 1, "{:?}", run.errors);
     cache
         .assert_entry(&legacy, false, "legacy unscoped entry")
         .await;
+    cache
+        .assert_entry(&foreign, true, "corrupt row and the objects it names")
+        .await;
+    assert_eq!(run.errors.len(), 1, "{:?}", run.errors);
+    assert!(run.errors[0].contains("simple/foreign"), "{:?}", run.errors);
+}
+
+/// A repository renamed after its entries were cached: the objects still sit
+/// under the old key's root. The sweep must not forget them by dropping the
+/// row (the only record of those objects); it keeps and reports the entry.
+#[tokio::test]
+async fn renamed_repository_entries_are_kept_and_reported_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let entry = cache.entry("simple/a/a-1.whl", 90, Some(90)).await;
+    let renamed = format!("{}-renamed", cache.fx.repo_key);
+    sqlx::query("UPDATE repositories SET key = $2 WHERE id = $1")
+        .bind(cache.fx.repo_id)
+        .bind(&renamed)
+        .execute(&cache.fx.pool)
+        .await
+        .expect("rename repository");
+    let policy = cache.policy("max_age_days", json!({"days": 30})).await;
+
+    let run = cache
+        .service()
+        .execute_policy(policy.id, false)
+        .await
+        .expect("run");
+    assert_eq!(run.proxy_cache.entries_matched, 1);
+    assert_eq!(run.proxy_cache.entries_removed, 0);
+    assert_eq!(run.errors.len(), 1, "{:?}", run.errors);
     assert!(
-        !cache.row_exists(&foreign).await,
-        "the corrupt row is dropped"
+        run.errors[0].contains("renamed repository"),
+        "{:?}",
+        run.errors
     );
-    assert!(
-        cache.on_disk(&foreign.content),
-        "hosted object must survive"
-    );
-    assert!(
-        cache.on_disk(&foreign.metadata),
-        "another repo's sidecar must survive"
-    );
+    cache
+        .assert_entry(&entry, true, "entry under the old key")
+        .await;
 }
 
 /// A storage delete that fails keeps the catalogue row, so the entry is
@@ -488,12 +533,7 @@ async fn storage_failure_keeps_the_catalogue_row_3734() {
     let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
         return;
     };
-    let stuck = cache.entry("simple/stuck/stuck-1.whl", 90, Some(90)).await;
-    // A non-empty directory where the body should be: deleting it as a file
-    // fails with an I/O error, not NotFound.
-    let body = cache.fx.storage_dir.join(&stuck.content);
-    std::fs::remove_file(&body).expect("drop body file");
-    write_object(&body, "pin", b"x");
+    let stuck = cache.stuck_entry("simple/stuck/stuck-1.whl").await;
     let ok = cache.entry("simple/ok/ok-1.whl", 90, Some(90)).await;
     let policy = cache.policy("max_age_days", json!({"days": 30})).await;
 
@@ -507,6 +547,10 @@ async fn storage_failure_keeps_the_catalogue_row_3734() {
     assert_eq!(run.errors.len(), 1, "{:?}", run.errors);
     assert!(run.errors[0].contains("simple/stuck/stuck-1.whl"));
     assert!(cache.row_exists(&stuck).await, "failed entry keeps its row");
+    assert!(
+        cache.on_disk(&stuck.metadata),
+        "bodies go before sidecars: a failed body delete leaves the sidecar"
+    );
     cache.assert_entry(&ok, false, "healthy entry").await;
 }
 
@@ -520,17 +564,22 @@ async fn live_run_without_proxy_store_evicts_nothing_3734() {
     let entry = cache.entry("simple/a/a-1.whl", 90, Some(90)).await;
     let policy = cache.policy("max_age_days", json!({"days": 30})).await;
 
-    let run = LifecycleService::new(cache.fx.pool.clone())
-        .execute_policy(policy.id, false)
-        .await
-        .expect("run");
-    assert_eq!(run.proxy_cache.entries_matched, 1);
-    assert_eq!(run.proxy_cache.entries_removed, 0);
-    assert!(run
-        .proxy_cache
-        .skipped_reason
-        .as_deref()
-        .is_some_and(|r| r.contains("no proxy cache store")));
+    let service = LifecycleService::new(cache.fx.pool.clone());
+    for dry_run in [true, false] {
+        let run = service
+            .execute_policy(policy.id, dry_run)
+            .await
+            .expect("run");
+        assert_eq!(run.proxy_cache.entries_matched, 1);
+        assert_eq!(run.proxy_cache.entries_removed, 0);
+        assert!(
+            run.proxy_cache
+                .skipped_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no proxy cache store")),
+            "dry_run={dry_run}: the preview must not promise an eviction"
+        );
+    }
     cache.assert_entry(&entry, true, "nothing evicted").await;
 }
 
@@ -668,7 +717,7 @@ async fn inert_arm_reports_skip_reason_for_remote_repository_3734() {
     let mut errors = Vec::new();
     let result = cache
         .service()
-        .run_proxy_cache_arm(&policy, cache.fx.repo_id, false, &mut errors)
+        .run_proxy_cache_arm(&policy, cache.fx.repo_id, false, &never(), &mut errors)
         .await
         .expect("arm");
     assert!(errors.is_empty());
@@ -678,4 +727,222 @@ async fn inert_arm_reports_skip_reason_for_remote_repository_3734() {
         .as_deref()
         .is_some_and(|r| r.contains("tag_pattern_delete")));
     cache.assert_entry(&entry, true, "untouched").await;
+}
+
+/// Ten consecutive storage failures stop the repository's sweep with a final
+/// error line; the entry after them is not attempted and keeps its row.
+#[tokio::test]
+async fn consecutive_storage_failures_stop_the_sweep_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let mut stuck = Vec::new();
+    for i in 0..=MAX_EVICTION_FAILURES {
+        stuck.push(cache.stuck_entry(&format!("simple/s{i}/s{i}-1.whl")).await);
+    }
+    let policy = cache.policy("max_age_days", json!({"days": 30})).await;
+
+    let run = cache
+        .service()
+        .execute_policy(policy.id, false)
+        .await
+        .expect("run");
+    assert_eq!(run.proxy_cache.entries_matched, 11);
+    assert_eq!(run.proxy_cache.entries_removed, 0);
+    assert_eq!(
+        run.errors.len(),
+        11,
+        "10 entries plus the stop line: {:?}",
+        run.errors
+    );
+    assert!(run.errors[10].contains("stopped the proxy-cache sweep"));
+    let attempted = run.errors[..10].join("\n");
+    for entry in &stuck {
+        assert!(
+            cache.row_exists(entry).await,
+            "every stuck entry keeps its row"
+        );
+    }
+    let untried: Vec<_> = (0..=MAX_EVICTION_FAILURES)
+        .filter(|i| !attempted.contains(&format!("simple/s{i}/")))
+        .collect();
+    assert_eq!(
+        untried.len(),
+        1,
+        "exactly the 11th entry is never attempted"
+    );
+}
+
+/// A success resets the failure count, and a sweep keeps paging past a full
+/// page: with a page size of 2, three entries need a second page.
+#[tokio::test]
+async fn sweep_pages_by_id_until_exhausted_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(
+            cache
+                .entry(&format!("simple/p{i}/p{i}-1.whl"), 90, Some(90))
+                .await,
+        );
+    }
+    // A row whose objects were never written: removed, but frees no bytes.
+    let ghost = cache.entry("simple/ghost/ghost-1.whl", 90, Some(90)).await;
+    std::fs::remove_file(cache.fx.storage_dir.join(&ghost.content)).expect("rm body");
+    std::fs::remove_file(cache.fx.storage_dir.join(&ghost.metadata)).expect("rm sidecar");
+    let policy = cache.policy("max_age_days", json!({"days": 30})).await;
+
+    let run = cache
+        .service()
+        .with_proxy_cache_page_size(2)
+        .execute_policy(policy.id, false)
+        .await
+        .expect("run");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert_eq!(run.proxy_cache.entries_removed, 4);
+    assert_eq!(
+        run.proxy_cache.bytes_freed, 300,
+        "the ghost row frees nothing"
+    );
+    for entry in entries.iter().chain([&ghost]) {
+        cache.assert_entry(entry, false, "evicted").await;
+    }
+}
+
+/// Upgrade safety: a global policy does not reach a Remote repository's
+/// cache; only an explicit assignment does.
+#[tokio::test]
+async fn global_policy_does_not_evict_remote_cache_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let entry = cache.entry("simple/a/a-1.whl", 90, Some(90)).await;
+    let mut policy = crate::services::lifecycle_service::tests::make_policy(
+        Uuid::new_v4(),
+        "global max age",
+        "max_age_days",
+    );
+    policy.applies_to_all = true;
+    policy.config = json!({"days": 30});
+    let mut errors = Vec::new();
+    let result = cache
+        .service()
+        .run_proxy_cache_arm(&policy, cache.fx.repo_id, false, &never(), &mut errors)
+        .await
+        .expect("arm");
+    assert!(errors.is_empty());
+    assert_eq!(
+        result,
+        ProxyCacheExecutionResult::skipped(GLOBAL_POLICY_REASON)
+    );
+    cache.assert_entry(&entry, true, "untouched").await;
+}
+
+/// A lost scheduler lease stops the sweep before it deletes anything more.
+#[tokio::test]
+async fn lease_loss_stops_the_sweep_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let entry = cache.entry("simple/a/a-1.whl", 90, Some(90)).await;
+    let policy = cache.policy("max_age_days", json!({"days": 30})).await;
+    let abort = CancellationToken::new();
+    abort.cancel();
+    let mut errors = Vec::new();
+    let result = cache
+        .service()
+        .run_proxy_cache_arm(&policy, cache.fx.repo_id, false, &abort, &mut errors)
+        .await
+        .expect("arm");
+    assert_eq!(result.entries_matched, 1);
+    assert_eq!(result.entries_removed, 0);
+    assert!(
+        errors.iter().any(|e| e.contains("scheduler lease lost")),
+        "{errors:?}"
+    );
+    cache.assert_entry(&entry, true, "untouched").await;
+}
+
+/// On an OCI remote the hosted executors act on pulled manifests, so a policy
+/// type with no proxy-cache meaning is not reported as skipped there.
+#[tokio::test]
+async fn oci_remote_reports_no_skip_for_artifact_policies_3734() {
+    let Some(cache) = RemoteCache::setup("docker", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let policy = cache.policy("max_versions", json!({"keep": 1})).await;
+    let mut errors = Vec::new();
+    let result = cache
+        .service()
+        .run_proxy_cache_arm(&policy, cache.fx.repo_id, false, &never(), &mut errors)
+        .await
+        .expect("arm");
+    assert_eq!(result, ProxyCacheExecutionResult::default());
+}
+
+/// A policy assigned to a pypi remote before #3734 (inserted directly; the API
+/// now refuses it) can still be renamed, disabled, or re-sent its unchanged
+/// config; a real config change is checked and refused.
+#[tokio::test]
+async fn legacy_inert_assignment_can_be_renamed_and_disabled_3734() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let service = cache.service();
+    let config = json!({"pattern": ".*"});
+    let policy = service
+        .create_policy(create("tag_pattern_delete", config.clone(), vec![]))
+        .await
+        .expect("dormant policy");
+    sqlx::query(
+        "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
+    )
+    .bind(policy.id)
+    .bind(cache.fx.repo_id)
+    .execute(&cache.fx.pool)
+    .await
+    .expect("legacy assignment");
+
+    for (label, req) in [
+        (
+            "rename",
+            UpdateLifecyclePolicyRequest {
+                name: Some(format!("renamed-{}", Uuid::new_v4())),
+                ..Default::default()
+            },
+        ),
+        (
+            "disable",
+            UpdateLifecyclePolicyRequest {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        ),
+        (
+            "unchanged config re-sent",
+            UpdateLifecyclePolicyRequest {
+                config: Some(config.clone()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        service
+            .update_policy(policy.id, req)
+            .await
+            .unwrap_or_else(|e| panic!("{label} must succeed: {e:?}"));
+    }
+    assert_inert(
+        service
+            .update_policy(
+                policy.id,
+                UpdateLifecyclePolicyRequest {
+                    config: Some(json!({"pattern": "^tmp"})),
+                    ..Default::default()
+                },
+            )
+            .await,
+        "a real config change on a legacy inert assignment",
+    );
 }
