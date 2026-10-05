@@ -66,6 +66,19 @@ pub(crate) use reindex_manifest_path_shape_sql;
 /// indistinguishable from a never-indexed migrated manifest, and the repair
 /// would re-register the deleted image on the next start. The time bound
 /// keeps a manifest written again after the delete repairable.
+///
+/// The guard only works when that digest-path row exists, i.e. when the image
+/// was also pushed (or imported) by digest. A by-digest delete made before the
+/// fix, or served by an older replica during the rollout, of an image pushed
+/// only by tag (`skopeo copy --all` pushes an index that way) leaves no marker
+/// at all, so its tag row is still a candidate. Gating the repair to rows the
+/// migration worker imported is tracked in #4465.
+///
+/// A REST/UI delete of a by-digest row (`delete_artifact`, one-row semantics)
+/// leaves the same marker. That is accepted: its sibling tag rows keep their
+/// `oci_tags` entries (the REST unwind is `NamedReference`), so they are not
+/// candidates in the first place; the marker only matters if such a sibling
+/// later loses its index row by some other route.
 const SELECT_UNREGISTERED_MANIFESTS_SQL: &str = concat!(
     r#"
         SELECT a.repository_id AS repository_id,
@@ -1630,6 +1643,210 @@ mod tests {
         .unwrap();
         rig.restart().await;
         assert_eq!(rig.tag("app", "v1").await.as_deref(), Some(&*digest));
+
+        rig.teardown().await;
+    }
+
+    /// Insert a raw `artifacts` row for the sweep-scope tests; returns its id.
+    async fn insert_row_4450(
+        pool: &PgPool,
+        repo_id: Uuid,
+        path: &str,
+        hex: &str,
+        deleted_at: Option<&str>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             storage_key, content_type, is_deleted, deleted_at) \
+             VALUES ($1, $2, $2, 10, $3, 'oci-manifests/sha256:' || $3, \
+             'application/octet-stream', $4::TIMESTAMPTZ IS NOT NULL, $4::TIMESTAMPTZ) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(hex)
+        .bind(deleted_at)
+        .fetch_one(pool)
+        .await
+        .expect("insert artifacts row")
+    }
+
+    async fn row_state_4450(pool: &PgPool, id: Uuid) -> (bool, Option<String>) {
+        sqlx::query_as(
+            "SELECT is_deleted, to_char(deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') \
+             FROM artifacts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("row state")
+    }
+
+    /// The edges of `SOFT_DELETE_MANIFEST_ARTIFACTS_SQL`: a by-digest delete
+    /// tombstones older source-layout `manifest.json` / `list.manifest.json`
+    /// rows for the digest, never touches a non-manifest row with the same
+    /// checksum or the same digest in ANOTHER repository, and leaves rows
+    /// already in the trash (and their `deleted_at`) alone.
+    #[tokio::test]
+    async fn digest_delete_sweep_scope_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool.clone(), "reidx4450scp").await;
+        let other_repo = Rig4450::setup(pool.clone(), "reidx4450oth").await;
+
+        let body = image_manifest_4450("scope");
+        let digest = rig.push("app", "v1", &body, OCI_MANIFEST_CT).await;
+        let hex = digest.strip_prefix("sha256:").unwrap().to_string();
+        // The same manifest pushed to a second repository.
+        other_repo.push("app", "v1", &body, OCI_MANIFEST_CT).await;
+
+        let legacy = insert_row_4450(
+            &pool,
+            rig.repo_id,
+            "legacy/app/v1/manifest.json",
+            &hex,
+            None,
+        )
+        .await;
+        let legacy_list = insert_row_4450(
+            &pool,
+            rig.repo_id,
+            "legacy/app/v1/list.manifest.json",
+            &hex,
+            None,
+        )
+        .await;
+        let blob_shaped = insert_row_4450(
+            &pool,
+            rig.repo_id,
+            &format!("v2/app/blobs/{digest}"),
+            &hex,
+            None,
+        )
+        .await;
+        let trashed = insert_row_4450(
+            &pool,
+            rig.repo_id,
+            "v2/app/manifests/old",
+            &hex,
+            Some("2020-01-02T00:00:00Z"),
+        )
+        .await;
+
+        rig.delete("app", &digest, &digest).await;
+
+        assert!(
+            row_state_4450(&pool, legacy).await.0,
+            "manifest.json row must be swept"
+        );
+        assert!(
+            row_state_4450(&pool, legacy_list).await.0,
+            "list.manifest.json row must be swept"
+        );
+        assert!(
+            !row_state_4450(&pool, blob_shaped).await.0,
+            "a non-manifest row with the same checksum must stay live"
+        );
+        assert_eq!(
+            row_state_4450(&pool, trashed).await,
+            (true, Some("2020-01-02".to_string())),
+            "a row already in the trash keeps its deleted_at"
+        );
+
+        // The other repository is untouched.
+        assert_eq!(other_repo.tag("app", "v1").await.as_deref(), Some(&*digest));
+        assert_eq!(other_repo.live_artifacts_for(&digest).await, 1);
+        assert_eq!(other_repo.manifest_record(&digest).await, 1);
+
+        rig.teardown().await;
+        other_repo.teardown().await;
+    }
+
+    /// Current behaviour of the REST/UI delete of a by-digest row
+    /// (`repositories::delete_artifact`): one-row semantics, a
+    /// `NamedReference` unwind of that row's own index entry, and the
+    /// soft-delete of that one row in the same transaction. The sibling tag
+    /// stays indexed and live, so the reindex never considers it, even though
+    /// the tombstoned digest row is the same marker a `/v2` by-digest delete
+    /// leaves. Should the sibling ever lose its index row by another route,
+    /// the guard then keeps it from being re-registered (accepted, see #4464).
+    #[tokio::test]
+    async fn rest_delete_of_digest_row_leaves_marker_and_siblings_indexed_db() {
+        use crate::api::handlers::oci_v2 as v2;
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool.clone(), "reidx4450rst").await;
+
+        let body = image_manifest_4450("rest");
+        let digest = rig.push("app", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push("app", &digest, &body, OCI_MANIFEST_CT).await;
+        let hex = digest.strip_prefix("sha256:").unwrap();
+
+        // The REST delete of `v2/app/manifests/<digest>`, step for step.
+        let digest_row: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rig.repo_id)
+                .bind(format!("v2/app/manifests/{digest}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let indexed = v2::resolve_indexed_manifest_digest(&mut *tx, rig.repo_id, "app", &digest)
+            .await
+            .unwrap();
+        let unwind = v2::rest_unwind_digest(indexed.as_deref(), hex).expect("owns its index row");
+        v2::delete_oci_manifest_content_in_tx(
+            &mut tx,
+            rig.repo_id,
+            "app",
+            &digest,
+            unwind,
+            v2::OciIndexDeleteScope::NamedReference,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
+             WHERE id = $1 AND is_deleted = false",
+        )
+        .bind(digest_row)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        rig.restart().await;
+
+        // The marker exists, and the sibling tag is still indexed and live.
+        assert!(row_state_4450(&pool, digest_row).await.0);
+        assert_eq!(rig.tag("app", &digest).await, None);
+        assert_eq!(rig.tag("app", "v1").await.as_deref(), Some(&*digest));
+        assert_eq!(rig.live_artifacts_for(&digest).await, 1);
+        assert_eq!(rig.manifest_record(&digest).await, 1);
+
+        // If v1 later lost its index row by another route, the marker keeps
+        // the reindex from re-registering it.
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND tag = 'v1'")
+            .bind(rig.repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET updated_at = NOW() - INTERVAL '1 hour' \
+             WHERE repository_id = $1 AND path = 'v2/app/manifests/v1'",
+        )
+        .bind(rig.repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        rig.restart().await;
+        assert_eq!(rig.tag("app", "v1").await, None);
 
         rig.teardown().await;
     }

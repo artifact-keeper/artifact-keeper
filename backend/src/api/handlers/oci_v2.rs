@@ -12071,10 +12071,11 @@ async fn handle_delete_manifest(
     )
     .await
     {
+        // The raw sqlx text is logged, never returned (#3667).
         return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
-            &e.to_string(),
+            crate::api::handlers::db_err_message(&e),
         );
     }
 
