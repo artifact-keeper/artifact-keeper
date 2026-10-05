@@ -532,10 +532,11 @@ jobs:
 
       # The `sha-<sha>` tags are content-addressed anchors written by every
       # main build. Their digests are what the gate tests and what the
-      # certification names. (The scanner adapter's certified digest is settled
-      # below, by its exact-version decision: #4076.) The adoption gate release.yml applies to a
-      # promoted image (#3640) is applied here in its strict form: the
-      # published image's recorded revision must BE this commit.
+      # certification names. (The scanner adapter's certified digest is
+      # settled below, by its exact-version decision: #4076.) The adoption
+      # gate release.yml applies to a promoted image (#3640) is applied here
+      # in its strict form: the published image's recorded revision must BE
+      # this commit.
       - name: Resolve the sha-tag digests and their provenance
         id: digests
         env:
@@ -597,15 +598,14 @@ jobs:
         run: scripts/ci/assert-adapter-exact-version.sh
 
       # ── the adapter the release ships (#4076) ───────────────────────────────
-      # On "new" the promote creates `:VERSION` from this commit's sha-<sha>
-      # image, so that rebuild is what ships. On "stays" `:VERSION` keeps the
-      # digest it was published with from the owning commit, and this commit's
-      # rebuild of the same sources ships NOWHERE: certifying it would name an
-      # adapter the release does not contain (1.10.0 shipped 1.2.11 =
-      # sha-7f55ff2 while the certification named sha-75e8cd5). So on "stays"
-      # the digest certified, attested and recorded is the published one: it
-      # must be what the owner's sha tag names (provenance), and Docker Hub's
-      # `:VERSION` must be absent or the same bytes.
+      # On "new" the release ships this commit's sha-<sha> rebuild; on "stays"
+      # it ships the published `:VERSION` digest, which is then what gets
+      # certified (checked against the owner's sha tag and Docker Hub). The
+      # logic and its rationale live in scripts/ci/pin-adapter-digest.sh,
+      # tested by test-pin-adapter-digest.sh. It also refuses "stays" when the
+      # certified commit's own assert-candidate-certified.sh predates #4076:
+      # release.yml runs that copy on the tag and would refuse the
+      # certification after the tag exists (backport first).
       #
       # The Release Gate cannot be pinned to this image yet: release-gate.yml
       # (artifact-keeper-test) takes no adapter input and deploys the chart's
@@ -616,50 +616,13 @@ jobs:
         env:
           GHCR_TOKEN: ${{ github.token }}
           SHORT: ${{ needs.resolve.outputs.short }}
+          CERT_SHA: ${{ needs.resolve.outputs.sha }}
+          CERTIFIED_BRANCH: ${{ needs.resolve.outputs.certified_branch }}
           DECISION: ${{ steps.adapter_decision.outputs.decision }}
           OWNER_REV: ${{ steps.adapter_decision.outputs.owner_rev }}
           ADAPTER_VERSION: ${{ steps.digests.outputs.adapter_version }}
           REBUILD_DIGEST: ${{ steps.digests.outputs.adapter_digest }}
-        run: |
-          set -euo pipefail
-          name="${ADAPTER_IMAGE#ghcr.io/}"
-          case "$DECISION" in
-            new)
-              digest="$REBUILD_DIGEST"; tag="sha-${SHORT}"
-              echo "  scanner-adapter ${ADAPTER_VERSION} is new: the release ships this commit's ${tag} (${digest})."
-              ;;
-            stays)
-              if [[ ! "$OWNER_REV" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "::error title=Scanner adapter owner unknown::the exact-version decision said 'stays' but named no owning revision (got '${OWNER_REV}')."
-                exit 1
-              fi
-              digest="$(.github/scripts/registry-tag-digest.sh ghcr.io "$name" "$ADAPTER_VERSION" 2>/dev/null || true)"
-              if [[ ! "$digest" =~ ^sha256: ]]; then
-                echo "::error title=Published scanner adapter unreadable::ghcr.io/${name}:${ADAPTER_VERSION} is '${digest:-unreadable}', though the decision found it published."
-                exit 1
-              fi
-              owner_digest="$(.github/scripts/registry-tag-digest.sh ghcr.io "$name" "sha-${OWNER_REV:0:7}" 2>/dev/null || true)"
-              if [[ "$owner_digest" != "$digest" ]]; then
-                echo "::error title=Published scanner adapter provenance mismatch::ghcr.io/${name}:${ADAPTER_VERSION} is ${digest}, but sha-${OWNER_REV:0:7} (the commit it records as its source) is '${owner_digest:-unreadable}'. Refusing to certify bytes whose build cannot be traced."
-                exit 1
-              fi
-              .github/scripts/assert-version-digest-consistent.sh "$ADAPTER_VERSION" "$digest" \
-                "ghcr.io|${name}" "docker.io|artifactkeeper/scanner-adapter"
-              tag="$ADAPTER_VERSION"
-              echo "  scanner-adapter ${ADAPTER_VERSION} stays: the release ships :${tag} (${digest}, built from ${OWNER_REV:0:7}), not this commit's rebuild ${REBUILD_DIGEST}."
-              ;;
-            *)
-              echo "::error title=Scanner adapter decision unreadable::assert-adapter-exact-version.sh passed but wrote decision='${DECISION}'."
-              exit 1
-              ;;
-          esac
-          {
-            echo "adapter_digest=${digest}"
-            echo "adapter_tag=${tag}"
-            echo "adapter_image_ref=${ADAPTER_IMAGE}:${tag}@${digest}"
-            echo "adapter_decision=${DECISION}"
-            echo "adapter_owner_rev=${OWNER_REV}"
-          } >> "$GITHUB_OUTPUT"
+        run: scripts/ci/pin-adapter-digest.sh
 
   # ── the gate, exactly as release.yml runs it ─────────────────────────────────
   release-gate:

@@ -59,7 +59,9 @@ chmod +x "$STUB/state" "$STUB/rev"
 # <label> <want-rc> <sha> <needle>
 expect() {
   local label="$1" want="$2" sha="$3" needle="$4" got=0 out
-  out="$( cd "$REPO" && ADAPTER_SHA="$sha" \
+  # GITHUB_OUTPUT cleared: the script appends its decision there, and these
+  # cases must not write into the CI step's own output file.
+  out="$( cd "$REPO" && ADAPTER_SHA="$sha" GITHUB_OUTPUT='' \
       ADAPTER_TAG_STATE_CMD="$STUB/state" ADAPTER_TAG_REVISION_CMD="$STUB/rev" \
       bash "$SCRIPT" 2>&1 )" || got=$?
   if [ "$got" = "$want" ] && printf '%s' "$out" | grep -qF -- "$needle"; then

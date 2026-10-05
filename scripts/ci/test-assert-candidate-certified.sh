@@ -278,7 +278,7 @@ fi
 
 # "new": anchored at sha-<sha> as before, decision passed through.
 : > "$WORK/out"
-FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 new "$D_ADAPTER" 1.3.0 "")" \
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 new "$D_ADAPTER" "sha-${SHA_A:0:7}" "")" \
   expect "decision new -> CERTIFIED at the sha-tag digest" 0 "CERTIFIED"
 grep -qx "scanner_adapter_decision=new" "$WORK/out" && pass "decision new is emitted" || fail "decision new not emitted"
 
@@ -304,6 +304,13 @@ fi
 FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_OTHER" FAKE_PREDICATES_adapter_stays="[${STAYS}]" \
 FAKE_GH_NONE_DIGESTS="$D_ADAPTER $D_OTHER" \
   expect "stays, exact tag now serves other bytes -> BLOCKED" 1 "nor on the published exact tag"
+# The published digest carries only the OWNER's certification (the realistic
+# shape when this commit was never certified at that digest): certified, but
+# not for this commit, so nothing anchors the adapter.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${OWNER_CERT}]" \
+  expect "stays, published digest certified only for its owner -> BLOCKED" 1 "nor on the published exact tag"
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${OWNER_CERT}]" \
+  expect "...and says the digest is certified, but not for this commit" 1 "is certified, but not for ${SHA_A}"
 # ...or is gone.
 FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag=absent \
   expect "stays, exact tag absent -> BLOCKED" 1 "nor on the published exact tag"
@@ -317,15 +324,27 @@ FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" \
 FAKE_PREDICATES_adapter_stays="[$(decided_predicate "$SHA_A" 5150 stays "$D_PUB")]" \
   expect "stays digest certified by a different run -> BLOCKED" 1 "certified by ONE run or not at all"
 
-# The tag must be the adapter's own VERSION, nothing else.
-BADTAG="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" latest)"
+# The tag must be the adapter's own exact VERSION, nothing else.
+BADTAG="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" 1.3.1)"
 FAKE_PREDICATE="$BADTAG" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${BADTAG}]" \
-  expect "stays anchored at a floating tag -> BLOCKED" 1 "not its scanner_adapter_version"
-FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" '../x')" \
-  expect "stays anchored at a malformed tag -> BLOCKED" 1 "not a valid image tag"
+  expect "stays anchored at another version's tag -> BLOCKED" 1 "not its scanner_adapter_version"
+for t in latest 1.3 '../x'; do
+  FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" "$t" "$SHA_B" "$t")" \
+    expect "stays anchored at the non-exact tag '${t}' -> BLOCKED" 1 "not an exact X.Y.Z adapter version"
+done
+
+# owner_rev reaches a shell in the promote: a sha on "stays", empty otherwise.
+for o in "" "abc" '$(id)'; do
+  BADOWNER="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" 1.3.0 "$o")"
+  FAKE_PREDICATE="$BADOWNER" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${BADOWNER}]" \
+    expect "stays with owner_rev '${o}' -> BLOCKED" 1 "not a 40-character commit sha"
+done
 unset FAKE_STAYS_DIGEST FAKE_GH_NONE_DIGESTS
 
-FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 maybe "$D_ADAPTER")" \
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 new "$D_ADAPTER" "sha-${SHA_A:0:7}" "$SHA_B")" \
+  expect "decision new with an owner_rev -> BLOCKED" 1 "only \"stays\" has an owner"
+
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 maybe "$D_ADAPTER" 1.3.0 "")" \
   expect "unknown adapter decision -> BLOCKED" 1 "unknown scanner-adapter decision 'maybe'"
 
 # ── the DERIVED release line (maintenance-branch candidates) ───────────────

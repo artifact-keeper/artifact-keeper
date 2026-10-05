@@ -254,8 +254,10 @@ for key in "${keys[@]}"; do
     certs_for "$key" "$ref" "${digest_of[$key]}" "sha-${SHORT}" soft
     all="$CERTS"
     while IFS= read -r tag; do
-      [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] \
-        || blocked "a certification for ${SHA} anchors ${key} at the tag '${tag}', which is not a valid image tag."
+      # An exact X.Y.Z version only: the adapter's floating tags (`1`, `1.3`,
+      # `latest`) move, so they can never be the anchor of a certification.
+      [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || blocked "a certification for ${SHA} anchors ${key} at the tag '${tag}', which is not an exact X.Y.Z adapter version."
       answer="$("$DIGEST_CMD" "$registry" "$repository" "$tag" 2>/dev/null)" || true
       case "$answer" in
         sha256:*)
@@ -402,6 +404,14 @@ for key in "${keys[@]}"; do
   if [[ "$key" == "$ADAPTER_KEY" ]]; then
     adapter_decision="$(jq -r '.scanner_adapter_decision.decision // empty' <<<"$p")"
     adapter_owner="$(jq -r '.scanner_adapter_decision.owner_rev // empty' <<<"$p")"
+    # owner_rev reaches the promote's tag message and summary: a commit sha
+    # on "stays", nothing otherwise, and never anything else.
+    case "$adapter_decision" in
+      stays) [[ "$adapter_owner" =~ ^[0-9a-f]{40}$ ]] \
+               || blocked "the certification says ${key} stays but records owner_rev '${adapter_owner}', which is not a 40-character commit sha." ;;
+      *)     [[ -z "$adapter_owner" ]] \
+               || blocked "the certification records owner_rev '${adapter_owner}' for scanner-adapter decision '${adapter_decision:-<none>}'; only \"stays\" has an owner." ;;
+    esac
     case "$adapter_decision" in
       ""|new) ;;
       stays)

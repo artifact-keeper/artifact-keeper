@@ -1522,6 +1522,8 @@ jobs:
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check
         run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the candidate certifies the scanner-adapter digest that ships
+        run: bash scripts/ci/test-pin-adapter-digest.sh
       - name: Check the dispatched-run follower selects the right run
         run: bash scripts/ci/test-follow-dispatched-run.sh
       - name: Check the CHANGELOG-documents-version gate
