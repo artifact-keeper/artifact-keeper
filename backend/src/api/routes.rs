@@ -1745,8 +1745,11 @@ mod tests {
             return;
         };
         use crate::api::handlers::test_db_helpers as tdh;
+        // Env-pinned so the runtime `system_settings` row (#867) cannot turn
+        // the guard back on underneath this test.
         let state = tdh::build_state_with(pool, "/tmp/jwks-921", |c| {
             c.guest_access_enabled = false;
+            c.guest_access_env_pinned = true;
         });
         let app = super::create_router(state);
         let (status, body) =
