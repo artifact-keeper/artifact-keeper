@@ -2105,14 +2105,30 @@ impl Fixture {
         create_extra: serde_json::Value,
         replication: bool,
     ) -> (StatusCode, Bytes) {
+        let auth = make_auth(self.user_id, &self.username);
+        self.chunked_upload_as(auth, path, payload, create_extra, replication)
+            .await
+    }
+
+    /// [`Self::chunked_upload`] as `auth` (e.g. [`admin_auth`] for a trusted
+    /// replication session).
+    pub async fn chunked_upload_as(
+        &self,
+        auth: AuthExtension,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
         use sha2::{Digest, Sha256};
+        assert!(
+            !payload.is_empty(),
+            "chunked_upload needs a non-empty payload (one Content-Range chunk)"
+        );
         let app = || {
             crate::api::handlers::upload::router()
                 .with_state(self.state.clone())
-                .layer(Extension::<AuthExtension>(make_auth(
-                    self.user_id,
-                    &self.username,
-                )))
+                .layer(Extension::<AuthExtension>(auth.clone()))
         };
         let mark = |mut req: Request<Body>| {
             if replication {

@@ -3108,7 +3108,7 @@ async fn pool_download(
         .unwrap())
 }
 
-struct DebianPackageUpload {
+pub(crate) struct DebianPackageUpload {
     artifact_path: String,
     component: String,
     deb_info: DebInfo,
@@ -3309,12 +3309,12 @@ async fn persist_debian_upload(
 /// `artifact_metadata` control document (which `Packages` renders from), the
 /// maintainer-script analysis (#4033), the package catalog row, and the
 /// repository's `updated_at` bump. Shared by the native upload routes and the
-/// generic chunked completion (#1846), so a `.deb` gets the same records
-/// whichever way it arrived. `deb_head` must reach the end of the
+/// generic chunked completion (#1846, via [`StagedDebianPackage::parts`]), so
+/// a `.deb` gets the same records whichever way it arrived. `deb_head` must reach the end of the
 /// `control.tar` member. Only the metadata write is fatal; the rest is
 /// best-effort, as on the native path.
 #[allow(clippy::too_many_arguments)]
-async fn record_debian_package(
+pub(crate) async fn record_debian_package(
     state: &SharedState,
     artifact_service: &ArtifactService,
     repo_id: uuid::Uuid,
@@ -3399,13 +3399,21 @@ const STAGED_DEB_MAX_MEMBERS: usize = 16;
 
 /// A `.deb` that arrived through the generic chunked upload flow
 /// (`/api/v1/uploads`), parsed and validated exactly as the native upload
-/// routes do, ready for [`record_staged_package`] once its `artifacts` row
+/// routes do, ready for [`record_debian_package`] once its `artifacts` row
 /// exists.
 pub(crate) struct StagedDebianPackage {
     upload: DebianPackageUpload,
     /// The package's head through the end of its `control.tar` member: all the
     /// control parse and the maintainer-script analysis read.
     deb_head: Vec<u8>,
+}
+
+impl StagedDebianPackage {
+    /// The parsed upload and the package head, as [`record_debian_package`]
+    /// takes them once the artifact row exists.
+    pub(crate) fn parts(&self) -> (&DebianPackageUpload, &[u8]) {
+        (&self.upload, &self.deb_head)
+    }
 }
 
 /// Split a Debian repository artifact path into `(component, path)` when it is
@@ -3499,31 +3507,6 @@ pub(crate) async fn finalize_from_staged(
     })
     .await
     .map_err(|e| format!("Debian package parse failed: {e}"))?
-}
-
-/// Record a chunked-completed `.deb`'s control metadata, maintainer-script
-/// analysis and catalog row against its freshly written `artifacts` row: the
-/// same records [`persist_debian_upload`] writes for a native upload.
-pub(crate) async fn record_staged_package(
-    state: &SharedState,
-    artifact_service: &ArtifactService,
-    repo_id: uuid::Uuid,
-    artifact_id: uuid::Uuid,
-    size_bytes: i64,
-    checksum_sha256: &str,
-    staged: &StagedDebianPackage,
-) -> crate::error::Result<()> {
-    record_debian_package(
-        state,
-        artifact_service,
-        repo_id,
-        artifact_id,
-        size_bytes,
-        checksum_sha256,
-        &staged.upload,
-        &staged.deb_head,
-    )
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5969,6 +5952,82 @@ mod upload_db_tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "a refused package leaves no artifact row");
+        use sha2::{Digest, Sha256};
+        let key = ArtifactService::storage_key_from_checksum(&hex::encode(Sha256::digest(&deb)));
+        assert!(
+            !f.storage_dir.join(key).exists(),
+            "a refused package stores nothing at its content key"
+        );
+        f.teardown().await;
+    }
+
+    /// Chunked upload of a `.deb` whose control (`ak-src`) disagrees with its
+    /// file name, as a replication session carrying the source row's metadata.
+    async fn replicated_mismatched_deb(
+        f: &tdh::Fixture,
+        auth: AuthExtension,
+    ) -> (StatusCode, Bytes) {
+        let deb = minimal_deb("ak-src", "1.0", "amd64", "replicated");
+        let extra = serde_json::json!({
+            "artifact_name": "ak-replica",
+            "artifact_version": "1.0",
+            "artifact_metadata_format": "debian",
+            "artifact_metadata": {"format": "debian", "source": "replica-row"},
+        });
+        f.chunked_upload_as(
+            auth,
+            "pool/main/a/ak-replica/ak-replica_1.0_amd64.deb",
+            &deb,
+            extra,
+            true,
+        )
+        .await
+    }
+
+    /// #1846: a TRUSTED replication session (admin) brings the source row's
+    /// metadata, so the native finalize is skipped: the session metadata is
+    /// kept and the package is not re-validated.
+    #[tokio::test]
+    async fn trusted_replication_skips_chunked_deb_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            replicated_mismatched_deb(&f, tdh::admin_auth(f.user_id, &f.username)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (name, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.name, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("replicated row with metadata");
+        assert_eq!(name, "ak-replica", "the session's coordinates are kept");
+        assert_eq!(
+            metadata["source"], "replica-row",
+            "session metadata is kept"
+        );
+        f.teardown().await;
+    }
+
+    /// #1846: the replication header alone is client-set, so an ordinary
+    /// user's "replication" session still gets the native finalize and its
+    /// mismatched package is still refused.
+    #[tokio::test]
+    async fn untrusted_replication_still_runs_chunked_deb_finalize_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            replicated_mismatched_deb(&f, tdh::make_auth(f.user_id, &f.username)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
         f.teardown().await;
     }
 

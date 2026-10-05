@@ -16,9 +16,22 @@ finishes. This page lists which paths spool, where, and how to size the volume
 | `$STORAGE_PATH/.uploads` | completion of a chunked upload session (`/api/v1/uploads`) |
 
 `AK_UPLOAD_STAGING_DIR` lets you put upload staging on a separate volume (for
-example a dedicated `emptyDir` or ephemeral PVC) from `STORAGE_PATH`. Every
-file is removed when its upload succeeds or fails, and the hourly cleanup
-sweeps files left behind by a replica that crashed mid-upload.
+example a dedicated `emptyDir` or ephemeral PVC) from `STORAGE_PATH`. It does
+**not** move `.uploads`: chunked-upload completion always reassembles under
+`$STORAGE_PATH/.uploads`, so `STORAGE_PATH` must still be sized for concurrent
+chunked completions even when staging lives elsewhere.
+
+Every file is removed when its upload succeeds or fails. Files left behind by a
+replica that crashed mid-upload are removed by a cleanup pass that runs hourly
+but only reaps files past an age threshold, so the space does not come back
+within the hour:
+
+- staging files (`$AK_UPLOAD_STAGING_DIR` / `$STORAGE_PATH/.incoming`): older
+  than 24 hours;
+- chunked-completion scratch (`$STORAGE_PATH/.uploads`): older than 7 hours
+  (the 6-hour completion lease plus one hour);
+- objects staged on the repository's backend (`generic-upload-staging/`):
+  older than 24 hours.
 
 ## Which uploads use local scratch
 
@@ -41,9 +54,11 @@ with bounded memory):
   moved into place on the same disk).
 - Generic uploads that need the body as a local file even on object storage:
   `.rpm` packages in RPM repositories (header parse), and every upload into a
-  repository whose format is served by a WASM plugin. A multipart upload into
-  an object-storage RPM repository spools whatever the file is, because the
-  form can name its path after the file field.
+  repository whose format is served by a WASM plugin. In an object-storage RPM
+  repository, `POST /api/v1/repositories/{key}/artifacts` (path given as a form
+  field) spools every file, whatever its name, because the form can name the
+  path after the file field. `POST .../artifacts/{path}` and `PUT` know the
+  path up front and spool only `.rpm` packages.
 - **Chunked upload completion.** The staged chunks are reassembled into one
   file on the replica handling `PUT /api/v1/uploads/{id}/complete`, verified,
   and then written to the backend, so each concurrent completion needs the full
@@ -75,8 +90,11 @@ Practical guidance:
   Incus images and the spooling format routes above. Size for the largest of
   those you expect and the number you expect at once.
 - When `STORAGE_PATH` is an `emptyDir` with a `sizeLimit`, exceeding the limit
-  evicts the pod mid-upload. Leave headroom over the estimate, or point
-  `AK_UPLOAD_STAGING_DIR` at a volume sized for uploads alone.
+  evicts the pod mid-upload. Leave headroom over the estimate. Pointing
+  `AK_UPLOAD_STAGING_DIR` at a separate volume moves single-request staging
+  off `STORAGE_PATH`, but chunked completions still land on `STORAGE_PATH`, so
+  size it for those either way.
 - Watch free space on the scratch volume under load; it should return to its
   baseline once uploads finish. Space that does not return points to files left
-  by a crashed replica, which the hourly cleanup reclaims.
+  by a crashed replica, which the cleanup reclaims once they pass the age
+  thresholds above (7 or 24 hours).

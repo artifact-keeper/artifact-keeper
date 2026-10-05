@@ -2460,6 +2460,27 @@ mod tests {
     /// This file's own source, for the structural guards below.
     const INCUS_RS_SRC: &str = include_str!("incus.rs");
 
+    /// #1846: only a `<product>/<version>/<image file>` path gets native
+    /// coordinates; anything else (a sidecar, a short or malformed path)
+    /// returns `None`, which keeps the chunked completion generic.
+    #[test]
+    fn image_coordinates_from_path_table_1846() {
+        let some = |p: &str, v: &str| Some((p.to_string(), v.to_string()));
+        for (path, want) in [
+            ("ubuntu/2024/incus.tar.gz", some("ubuntu", "2024")),
+            ("ubuntu/2024/rootfs.squashfs", some("ubuntu", "2024")),
+            ("ubuntu/2024/disk.qcow2", some("ubuntu", "2024")),
+            ("ubuntu/2024/SHA256SUMS", None),
+            ("ubuntu/2024/notes.txt", None),
+            ("foo.tar.gz", None),
+            ("ubuntu/incus.tar.gz", None),
+            ("streams/v1/images.json", None),
+            ("", None),
+        ] {
+            assert_eq!(image_coordinates_from_path(path), want, "{path}");
+        }
+    }
+
     #[test]
     fn legacy_in_flight_finalize_is_not_reclaimable() {
         // The residual window: `finalizing`, no phase stamp (so it can only
@@ -6273,6 +6294,7 @@ mod streaming_pipeline_regression_tests {
         let image = gz.finish().unwrap();
 
         let path = build_artifact_path("debian-trixie", "20261004", "incus.tar.gz");
+        let mut events = f.state.event_bus.subscribe();
         let (status, body) = f
             .chunked_upload(&path, &image, serde_json::json!({}), false)
             .await;
@@ -6281,6 +6303,13 @@ mod streaming_pipeline_regression_tests {
             StatusCode::OK,
             "chunked completion failed: {}",
             String::from_utf8_lossy(&body)
+        );
+        // The catalog write is silent: completion emits its one
+        // `artifact.uploaded` itself (#3939), so the finalize must not add one.
+        tdh::assert_one_artifact_uploaded_event(
+            &mut events,
+            f.repo_id,
+            tdh::artifact_id_at(&f.pool, f.repo_id, &path).await,
         );
 
         let (artifact_id, name, version): (Uuid, String, Option<String>) = sqlx::query_as(

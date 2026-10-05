@@ -907,10 +907,17 @@ async fn complete_session_commit(
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
 
-    if let (Some(format), Some(mut metadata)) = (
-        session.artifact_metadata_format.as_deref(),
-        session.artifact_metadata.clone(),
-    ) {
+    // A natively finalized format records the document derived from the
+    // bytes below; a client-supplied one is not written first, so none of its
+    // `format`/`properties` can outlive it (#1846).
+    let session_metadata = match &staged_native {
+        Some(_) => None,
+        None => session
+            .artifact_metadata_format
+            .as_deref()
+            .zip(session.artifact_metadata.clone()),
+    };
+    if let Some((format, mut metadata)) = session_metadata {
         // #3801: a repodata block renders verbatim and bypasses every header
         // budget, so one supplied by an UNTRUSTED client is dropped; the
         // block parsed from the uploaded bytes above (if any) replaces it,
@@ -994,6 +1001,12 @@ async fn complete_session_commit(
         )
         .await;
         if let Err(e) = recorded {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                path = %session.artifact_path,
+                error = %e,
+                "chunked completion committed the artifact row but not its format metadata"
+            );
             UploadService::fail_committing(
                 &state.db,
                 &session,
@@ -1378,8 +1391,10 @@ fn native_finalize_coordinates(
 }
 
 /// Run the native finalize's read of the reassembled file at `file`. Called
-/// only for a path [`native_finalize_coordinates`] accepted. `Err` is a
-/// client-facing reason the upload is refused.
+/// only for a path [`native_finalize_coordinates`] accepted, so every arm
+/// returns `Some`: debian's `Ok(None)` (not a pool package) is unreachable
+/// here, because the coordinates came from the same `staged_package_target`
+/// check. `Err` is a client-facing reason the upload is refused.
 async fn stage_native_finalize(
     format: &crate::models::repository::RepositoryFormat,
     artifact_path: &str,
@@ -1432,17 +1447,21 @@ async fn record_native_finalize(
                 .await;
             Ok(())
         }
-        StagedNativeFinalize::Debian(package) => super::debian::record_staged_package(
-            state,
-            artifact_service,
-            session.repository_id,
-            artifact_id,
-            session.total_size,
-            &session.checksum_sha256,
-            package,
-        )
-        .await
-        .map_err(|e| e.to_string()),
+        StagedNativeFinalize::Debian(package) => {
+            let (upload, deb_head) = package.parts();
+            super::debian::record_debian_package(
+                state,
+                artifact_service,
+                session.repository_id,
+                artifact_id,
+                session.total_size,
+                &session.checksum_sha256,
+                upload,
+                deb_head,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
     }
 }
 

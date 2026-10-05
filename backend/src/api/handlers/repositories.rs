@@ -8709,9 +8709,9 @@ impl GenericStagedBody {
     }
 
     /// The staged body as a local file, for the consumers that read one (RPM
-    /// header parse, WASM plugins). [`generic_upload_needs_local_body`] keeps
-    /// those uploads on local scratch, so a backend-staged body never gets
-    /// here; it reads as an I/O error rather than a panic if it ever does.
+    /// header parse, WASM plugins). [`GenericStagingPlan`] keeps those uploads
+    /// on local scratch, so a backend-staged body never gets here; it reads as
+    /// an I/O error rather than a panic if it ever does.
     fn local_path(&self) -> std::io::Result<&std::path::Path> {
         match self {
             Self::Local(staged) => Ok(staged.path()),
@@ -8968,11 +8968,13 @@ async fn persist_generic_staged_upload(
             auth.is_admin,
             auth.is_service_account,
         ) {
-        let prefix = match staged.local_path() {
-            Ok(local) => super::upload::read_rpm_header_prefix(local).await,
-            Err(e) => Err(e),
-        };
-        match prefix {
+        // The #3801 gate must not fail open: a `.rpm` that reached here staged
+        // on the backend means `GenericStagingPlan` disagreed with this check,
+        // which is a server bug, not a reason to skip the parse.
+        let local = staged
+            .local_path()
+            .map_err(|e| proxy_helpers::internal_error("RPM header parse needs a local body", e))?;
+        match super::upload::read_rpm_header_prefix(local).await {
             Ok(prefix) => {
                 let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
                 tokio::task::spawn_blocking(move || {
@@ -18239,6 +18241,87 @@ mod tests {
         assert_eq!(tracked, 0, "the staging tracking rows go with the objects");
 
         let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: a multipart body over `max_upload_size_bytes` on the new
+    /// backend-staging path is refused with 413, and its partial staging
+    /// object and tracking row are cleaned up, not left for the sweep.
+    #[tokio::test]
+    async fn multipart_over_size_limit_on_backend_staging_leaves_nothing_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .max_upload_size_bytes = 1024;
+        let content = "x".repeat(4096);
+        let form = Bytes::from(format!(
+            "--XB\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n\
+             {content}\r\n\
+             --XB--\r\n"
+        ));
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::admin_auth(user_id, &username));
+        let (status, resp) = tdh::send(
+            router,
+            tdh::post(
+                format!("/{repo_key}/artifacts/big/1.0/big.bin"),
+                "multipart/form-data; boundary=XB",
+                form,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        // The discard is synchronous on this path; allow the armed-drop
+        // fallback a moment in case it ever is not.
+        for _ in 0..50 {
+            if mem.objects.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            mem.objects.lock().unwrap().is_empty(),
+            "no staging (or any) object may remain"
+        );
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(tracked, 0, "no staging tracking row may remain");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
         let _ = std::fs::remove_dir_all(&repo_dir);
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
