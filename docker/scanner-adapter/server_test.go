@@ -67,6 +67,13 @@ func newTestServer(t *testing.T, trivyPath string) *httptest.Server {
 // dir, so DB-metadata provenance (#3014) can be exercised end to end.
 func newTestServerWithCache(t *testing.T, trivyPath, cacheDir string) *httptest.Server {
 	t.Helper()
+	return newTestServerWithConfig(t, trivyPath, cacheDir, nil)
+}
+
+// newTestServerWithConfig is newTestServerWithCache with a hook that adjusts
+// the config before the Server is built (e.g. to enable client mode).
+func newTestServerWithConfig(t *testing.T, trivyPath, cacheDir string, tweak func(*Config)) *httptest.Server {
+	t.Helper()
 	cfg := LoadConfig()
 	cfg.TrivyPath = trivyPath
 	cfg.CacheDir = cacheDir
@@ -82,6 +89,9 @@ func newTestServerWithCache(t *testing.T, trivyPath, cacheDir string) *httptest.
 		t.Fatalf("stub version = %q, want 0.71.2", version)
 	}
 	cfg.ScannerVersion = version
+	if tweak != nil {
+		tweak(cfg)
+	}
 	srv := NewServer(cfg)
 	srv.MarkReady()
 	return httptest.NewServer(srv.Handler())
