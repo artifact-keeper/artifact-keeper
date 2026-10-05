@@ -124,7 +124,7 @@ have no core proxy path to gate.
 | `maven` | `maven`, `gradle` | enforced | Every proxied file on the Maven route except POMs, `.xml` metadata, Gradle `.module` files, checksums, signatures and `-sources`/`-javadoc` jars. Only `.jar`/`.war`/`.ear` carry an identity pin. |
 | `npm` | `npm`, `yarn`, `bower`, `pnpm` | enforced | Package tarballs, Remote and Virtual. |
 | `pypi` | `pypi`, `poetry`, `jupyter` | enforced | Package files (wheels and sdists), Remote and Virtual. |
-| `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned. |
+| `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned; against a V2 upstream, which has no separate manifest, the flat container answers only the `.nupkg` itself. |
 | `go` | `go` | accepted | |
 | `rubygems` | `rubygems` | accepted | |
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
@@ -177,7 +177,15 @@ have no core proxy path to gate.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
-- **NuGet row repair with a recorded digest.** When a Remote NuGet repository
-  holds a package row whose stored blob has gone missing, and the row records a
-  SHA-256, the re-fetched bytes are checked against that digest instead of
-  being scanned. A row without a digest is repaired through the gate.
+- **NuGet package rows in a Remote repository.** A Remote NuGet repository
+  can hold `artifacts` rows of its own (from before proxied content stopped
+  being recorded as rows, from replication, or from a publish into the
+  remote). A row whose blob is present is served from storage without the
+  gate. If the blob has gone missing:
+  - and the row records a SHA-256, the re-fetched bytes are held to that
+    digest instead of being scanned, and a stored `vulnerable` verdict for
+    that digest refuses the pull (`403`);
+  - and the row records no digest, the re-fetch goes through the gate.
+- **NuGet symbols packages** (`.snupkg`) are scanned without an identity pin:
+  they hold `.pdb` files and no package identity the engine grades, so a
+  vulnerable verdict blocks them but a missing pin does not withhold them.

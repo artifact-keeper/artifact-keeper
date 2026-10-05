@@ -3707,8 +3707,9 @@ pub async fn direct_scan_policy(
 
 /// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
 /// when the repository has not enabled scan-on-proxy (#4102): the
-/// enabled-check plus [`direct_scan_policy`] that every format's Remote arm
-/// runs before choosing the gate over its streaming path. An unreadable
+/// enabled-check plus [`direct_scan_policy`] a format's Remote arm runs before
+/// choosing the gate over its streaming path. NuGet uses it; the older
+/// formats still inline the same two calls. An unreadable
 /// enabled flag reads as off, the reading the npm / PyPI / Cargo / Maven
 /// arms already take (#4365 item 5 tracks failing it closed).
 pub(crate) async fn remote_scan_policy(db: &PgPool, repo_id: Uuid) -> Option<MemberScanPolicy> {
@@ -8568,6 +8569,32 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     match row {
         None => true,
         Some(_) => severity_gate.blocks(row_max_severity),
+    }
+}
+
+/// Whether a STORED `vulnerable` verdict for `digest` refuses a pull under
+/// `severity_gate` (#4102), without fetching or scanning anything: for a
+/// serve path whose bytes are already pinned to a known digest (NuGet's
+/// digest-verified row repair). Record-only never refuses, a verdict below an
+/// opted-in severity threshold serves, and a missing or unreadable verdict
+/// does not refuse (the path is not otherwise gated).
+pub(crate) async fn stored_vulnerable_verdict_blocks(
+    db: &PgPool,
+    digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> bool {
+    use crate::services::proxy_scan_service::{verdict_blocks, ProxyScanService};
+    if severity_gate.is_record_only() {
+        return false;
+    }
+    match ProxyScanService::new(db.clone())
+        .lookup_verdict(digest, PROXY_SCAN_TYPE)
+        .await
+    {
+        Ok(Some(row)) if verdict_blocks(&row.verdict) => {
+            stored_verdict_blocks_under_gate(Some(&row), severity_gate)
+        }
+        _ => false,
     }
 }
 
@@ -21908,13 +21935,9 @@ mod proxy_download_recording_tests {
                 "serve_scanned_nupkg(",
                 1,
             ),
-            ("nuget.rs", "v2_download", "serve_scanned_v2_nupkg(", 1),
-            (
-                "nuget.rs",
-                "serve_scanned_v2_nupkg",
-                "serve_scanned_nupkg(",
-                1,
-            ),
+            ("nuget.rs", "v2_download", "remote_scan_policy(", 1),
+            ("nuget.rs", "v2_download", "proxy_v2_download(", 1),
+            ("nuget.rs", "proxy_v2_download", "serve_scanned_nupkg(", 1),
             (
                 "nuget.rs",
                 "virtual_member_download",
