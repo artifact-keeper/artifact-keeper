@@ -18,9 +18,14 @@
 //! * `artifact_keeper.db.slow_statement = true` when sqlx flagged the
 //!   statement as slow.
 //!
-//! The statement text is deliberately NOT copied onto the span: it can carry
-//! literal values when a query is built with `format!`, and it is already
-//! exported on the parent span's event for anyone who enables it.
+//! **SQL text is never exported.** The statement is not copied onto the span
+//! (it can carry literal values when a query is built with `format!`), and
+//! [`otel_export_layer`] keeps the `sqlx::query` events themselves out of the
+//! OTel export: without that filter `tracing-opentelemetry` would attach each
+//! one, with its `summary` and `db.statement` fields, as a span event on the
+//! request span. Only the stdout log layer shows SQL, and only for the
+//! statements `RUST_LOG` lets through (slow ones by default, every one with
+//! `sqlx::query=debug`).
 //!
 //! This costs no call-site changes and no new dependency, and it is bounded:
 //!
@@ -43,7 +48,8 @@ use opentelemetry::trace::{Span as _, SpanKind, TraceContextExt, Tracer};
 use opentelemetry::KeyValue;
 use tracing::dispatcher::WeakDispatch;
 use tracing::field::{Field, Visit};
-use tracing::{Dispatch, Event, Subscriber};
+use tracing::{Dispatch, Event, Metadata, Subscriber};
+use tracing_subscriber::filter::{filter_fn, FilterFn, Filtered};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -53,6 +59,35 @@ const SQLX_QUERY_TARGET: &str = "sqlx::query";
 
 /// Longest identifier accepted as a table name; anything longer is not one.
 const MAX_IDENTIFIER_LEN: usize = 63;
+
+/// Whether `metadata` may reach the OTel export layer: everything except
+/// sqlx's per-statement events (target `sqlx::query`), which carry the SQL
+/// text. Spans always pass, so the span tree is unchanged.
+pub(crate) fn exported_to_otel(metadata: &Metadata<'_>) -> bool {
+    !(metadata.is_event() && metadata.target().starts_with(SQLX_QUERY_TARGET))
+}
+
+/// The OTel export layer behind its [`exported_to_otel`] filter.
+pub(crate) type OtelExportLayer<S> = Filtered<
+    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>,
+    FilterFn<fn(&Metadata<'_>) -> bool>,
+    S,
+>;
+
+/// The OTel export layer for `tracer`, with [`exported_to_otel`] as its
+/// per-layer filter. The stdout log layer and [`DbQuerySpanLayer`] are not
+/// behind this filter and still see the `sqlx::query` events.
+pub(crate) fn otel_export_layer<S>(
+    tracer: opentelemetry_sdk::trace::SdkTracer,
+) -> OtelExportLayer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let keep: fn(&Metadata<'_>) -> bool = exported_to_otel;
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(filter_fn(keep))
+}
 
 /// Converts `sqlx::query` events into backdated OTel `CLIENT` spans.
 pub(crate) struct DbQuerySpanLayer<T> {
@@ -280,7 +315,7 @@ fn table_identifier(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+    use crate::testing::otel::{attr, ExportedSpans};
     use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
@@ -365,8 +400,13 @@ mod tests {
         exported
     }
 
+    /// The production layering: the filtered export layer plus the DB span
+    /// layer, which must still resolve the parent's OTel context through the
+    /// filter.
     fn subscriber(exported: &ExportedSpans) -> impl tracing::Subscriber + Send + Sync {
-        otel_subscriber(exported).with(DbQuerySpanLayer::new(exported.tracer()))
+        tracing_subscriber::registry()
+            .with(otel_export_layer(exported.tracer()))
+            .with(DbQuerySpanLayer::new(exported.tracer()))
     }
 
     /// An event shaped exactly like sqlx's `QueryLogger::finish` output.
@@ -476,6 +516,46 @@ mod tests {
             );
         });
         assert!(exported.named("SELECT").is_empty());
+    }
+
+    /// SQL text never reaches the export (#4455): behind the production
+    /// export filter, an sqlx statement event still becomes a DB span, but the
+    /// request span carries no event with its `summary` / `db.statement`.
+    #[test]
+    fn sqlx_events_are_not_exported_but_still_become_db_spans() {
+        let exported = ExportedSpans::default();
+        tracing::subscriber::with_default(subscriber(&exported), || {
+            let _entered = tracing::info_span!("http_request").entered();
+            emit_sqlx_event(
+                "SELECT id, key FROM …",
+                "\n\nSELECT id, key FROM repositories WHERE key = 'literal'\n",
+                0.01,
+            );
+            tracing::info!(target: "artifact_keeper_backend::x", "an ordinary event");
+        });
+
+        let db = exported.one("SELECT repositories");
+        assert_eq!(db.span_kind, SpanKind::Client);
+        let request = exported.one("http_request");
+        assert_eq!(db.parent_span_id, request.span_context.span_id());
+        // Ordinary events are still exported; sqlx's are not.
+        assert_eq!(request.events.len(), 1, "{:?}", request.events);
+        for span in [&request, &db] {
+            assert!(span
+                .attributes
+                .iter()
+                .all(|kv| kv.key.as_str() != "db.statement"));
+            for event in span.events.iter() {
+                assert!(
+                    event
+                        .attributes
+                        .iter()
+                        .all(|kv| !matches!(kv.key.as_str(), "summary" | "db.statement")),
+                    "SQL exported on {}: {event:?}",
+                    span.name
+                );
+            }
+        }
     }
 
     /// The real thing: a query through sqlx itself, so a change in sqlx's

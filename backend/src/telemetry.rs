@@ -355,7 +355,9 @@ fn init_with_otel(
         .build();
 
     let tracer = provider.tracer("artifact-keeper");
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    // sqlx's per-statement events carry SQL text and stay out of the OTel
+    // export; stdout and the DB span layer below still see them (#4455).
+    let otel_layer = db_spans::otel_export_layer(tracer);
     // Per-query DB `CLIENT` spans from sqlx's `sqlx::query` events (#4455).
     // It sees what the filter above lets through: slow statements by default,
     // every statement with `sqlx::query=debug`.
