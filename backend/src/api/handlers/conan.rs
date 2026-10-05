@@ -10035,6 +10035,7 @@ mod not_found_3887 {
 ///
 /// Through the real `repo_visibility_middleware`. The account holds a write
 /// grant on the member, so only the TOKEN's scope can refuse the write.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod read_expansion_through_authenticate_4213 {
     use super::tests::test_helpers::*;

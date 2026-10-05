@@ -5356,12 +5356,16 @@ async fn token(
                         // so this keyless fallback cannot re-widen a restricted
                         // token (#2430/#2290). Cap at the presented token's
                         // `exp` (#3460): the re-mint must not extend lifetime.
-                        let tokens = match auth_service.generate_tokens_with_scope_capped(
-                            &user,
-                            claims.scopes.clone(),
-                            claims.allowed_repo_ids.clone(),
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
-                        ) {
+                        // #4213 review: and carry the read expansion across,
+                        // like the other two JWT re-mints on this route.
+                        let tokens = match auth_service
+                            .generate_tokens_with_scope_capped_read_expansion(
+                                &user,
+                                claims.scopes.clone(),
+                                claims.allowed_repo_ids.clone(),
+                                claims.read_expansion_repo_ids.clone().unwrap_or_default(),
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
+                            ) {
                             Ok(t) => t,
                             Err(_) => {
                                 return oci_error(

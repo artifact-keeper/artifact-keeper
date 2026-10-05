@@ -1039,6 +1039,7 @@ mod public_read_repo_scope_3704 {
 /// on a write, so this gate refuses them without knowing the rule exists. This
 /// test pins that, using the principal the middleware builds for each kind of
 /// request.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod read_expansion_never_reaches_a_write_4213 {
     use super::*;

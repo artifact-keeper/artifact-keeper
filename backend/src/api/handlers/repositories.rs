@@ -453,14 +453,11 @@ pub(crate) async fn members_hidden_by_token_scope(
     members
         .iter()
         .filter(|m| {
-            granted.contains(&m.id) && !member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+            granted.contains(&m.id) && !member_passes_token_scope(auth, repo.id, m.id, m.visibility)
         })
         .count()
 }
 
-/// Attach the #4130 notice to an artifact listing when token scope dropped
-/// members the caller is entitled to. Applied to every `list_artifacts`
-/// return, so the flat, grouped and remote-cache branches all report it.
 /// The #4130 notices for a repository, empty unless token scope dropped
 /// members this caller is entitled to.
 pub(crate) async fn member_scope_notices(
@@ -475,6 +472,9 @@ pub(crate) async fn member_scope_notices(
     }
 }
 
+/// Attach the #4130 notice to an artifact listing when token scope dropped
+/// members the caller is entitled to. Applied to the grouped `list_artifacts`
+/// returns; the flat branch calls [`member_scope_notices`] directly.
 async fn with_member_scope_notice(
     result: Result<Json<ArtifactListResponse>>,
     db: &sqlx::PgPool,
@@ -30499,6 +30499,44 @@ mod virtual_member_visibility_tests {
         assert!(
             full_json["notices"].is_null(),
             "a token scoped to the member has nothing to be told: {full_json}"
+        );
+    }
+
+    /// #4213 review, after #3813: an INTERNAL member is not exempt from token
+    /// scope the way a public one is (an anonymous caller gets nothing from
+    /// it, so there is no baseline to protect). Dropped by the token's scope,
+    /// it must be reported like a private one, while the public member, which
+    /// passes the scope, is not counted.
+    #[tokio::test]
+    async fn notice_counts_an_internal_member_like_a_private_one() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.private_id)
+            .execute(&pool)
+            .await
+            .expect("make the member internal");
+
+        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
+        let (status, json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
+            .await;
+
+        fx.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["notices"][0]["code"].as_str(),
+            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
+            "an internal member dropped by token scope is reported: {json}"
+        );
+        assert!(
+            json["notices"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("1 member")),
+            "only the internal member counts; the public one passes the scope: {json}"
         );
     }
 

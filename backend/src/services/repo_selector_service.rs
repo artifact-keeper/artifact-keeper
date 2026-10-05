@@ -45,9 +45,11 @@ pub struct RepoSelector {
     /// re-minting.
     ///
     /// Not a filter: on its own it matches nothing, and [`Self::is_empty`]
-    /// still reports such a selector as empty. Expansion is one level deep —
-    /// a virtual that is itself a member contributes only itself, matching
-    /// every read path, none of which recurse into a nested virtual.
+    /// still reports such a selector as empty. Expansion follows nested
+    /// virtual repositories (#4263) through the same walk the read paths use,
+    /// with its cycle guard and its depth cap (`MAX_VIRTUAL_DEPTH`): every
+    /// leaf a read through the virtual reaches, plus the nested virtuals in
+    /// between.
     ///
     /// # For reads only
     ///
@@ -244,29 +246,54 @@ impl RepoSelectorService {
             return Ok((matched, Vec::new()));
         }
         let matched_ids: Vec<Uuid> = matched.iter().map(|r| r.id).collect();
-        let members: Vec<RepoRow> = sqlx::query_as(
-            r#"
-            SELECT r.id, r.key, r.format::TEXT
-            FROM repositories r
-            INNER JOIN virtual_repo_members vrm ON vrm.member_repo_id = r.id
-            WHERE vrm.virtual_repo_id = ANY($1)
-            "#,
+        let virtual_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM repositories WHERE id = ANY($1) AND repo_type = 'virtual'",
         )
         .bind(&matched_ids)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Recursive, cycle-safe and depth-capped, through the SAME walk the
+        // read paths use since #4263, so a token reaches exactly what a read
+        // through the virtual reaches: the leaves, plus the nested virtuals in
+        // between so each stays readable by its own key. A walk that fails
+        // fails the validation rather than widening or silently narrowing.
+        let mut reached: Vec<Uuid> = Vec::new();
+        for virtual_id in virtual_ids {
+            let expansion =
+                crate::api::handlers::proxy_helpers::expand_virtual_members(&self.db, virtual_id)
+                    .await
+                    .map_err(|_| {
+                        AppError::Database(format!(
+                            "could not expand the members of virtual repository {virtual_id}"
+                        ))
+                    })?;
+            if expansion.cycle_edge_skipped || expansion.depth_limit_reached {
+                tracing::warn!(
+                    virtual_repo_id = %virtual_id,
+                    cycle_edge_skipped = expansion.cycle_edge_skipped,
+                    depth_limit_reached = expansion.depth_limit_reached,
+                    "include_virtual_members: membership graph truncated; the token reaches only the repositories the walk returned"
+                );
+            }
+            reached.extend(expansion.nested_virtuals);
+            reached.extend(expansion.members.into_iter().map(|m| m.repo.id));
+        }
+
         // `seen` starts as the DIRECT matches, so a member that is also a
         // direct match is never counted as expansion-added.
         let mut seen: std::collections::HashSet<Uuid> = matched_ids.into_iter().collect();
+        let added: Vec<Uuid> = reached.into_iter().filter(|id| seen.insert(*id)).collect();
         let mut rows = matched;
-        let mut added = Vec::new();
-        for member in members {
-            if seen.insert(member.id) {
-                added.push(member.id);
-                rows.push(member);
-            }
+        if !added.is_empty() {
+            let members: Vec<RepoRow> =
+                sqlx::query_as("SELECT id, key, format::TEXT FROM repositories WHERE id = ANY($1)")
+                    .bind(&added)
+                    .fetch_all(&self.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            rows.extend(members);
         }
         Ok((rows, added))
     }
@@ -1000,6 +1027,7 @@ mod tests {
 /// (#4213 review): a real minted token, validated the way a request validates
 /// it, so the expansion is exercised where it actually runs rather than only
 /// in `resolve_ids`.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod token_validation_tests {
     use std::sync::Arc;
@@ -1238,6 +1266,113 @@ mod token_validation_tests {
         assert!(
             write.can_access_repo(virtual_id),
             "the named parent is unaffected"
+        );
+    }
+
+    /// #4213 review: since #4263 a read through a virtual repository follows
+    /// NESTED virtuals, so the expansion must too, or a flagged token is
+    /// refused exactly the leaves the read path now serves. Virtual A holds
+    /// leaf D and virtual B, which holds leaf C. The nested virtual B joins
+    /// the expansion as well, so it stays readable by its own key.
+    #[tokio::test]
+    async fn expansion_follows_nested_virtual_repositories() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mut fx, members) = Repos::build(pool.clone(), 1).await;
+        let leaf_d = members[0];
+        let (nested_b, _bk, bdir) = tdh::create_repo(&pool, "virtual", "generic").await;
+        fx.ids.push(nested_b);
+        fx.dirs.push(bdir);
+        let leaf_c = fx.extra().await;
+        tdh::link_virtual_member(&pool, fx.virtual_id, nested_b, 2).await;
+        tdh::link_virtual_member(&pool, nested_b, leaf_c, 1).await;
+
+        let selector =
+            serde_json::json!({ "match_repos": [fx.virtual_id], "include_virtual_members": true });
+        let (scope, expansion) = validate_with(&pool, fx.user_id, selector.clone()).await;
+        let (auth, token) = mint(&pool, fx.user_id, &selector).await;
+        let principal = |outcome: AuthOutcome| match outcome {
+            AuthOutcome::Resolved(ext) => ext,
+            other => panic!("token must resolve, got {other:?}"),
+        };
+        let read = principal(
+            try_resolve_auth_outcome(&auth, ExtractedToken::Bearer(&token), true, true).await,
+        );
+        let write = principal(
+            try_resolve_auth_outcome(&auth, ExtractedToken::Bearer(&token), true, false).await,
+        );
+        let virtual_id = fx.virtual_id;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(nested_b)
+            .execute(&pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(scope, vec![virtual_id], "the base scope is unchanged");
+        for (name, id) in [
+            ("leaf D", leaf_d),
+            ("nested virtual B", nested_b),
+            ("nested leaf C", leaf_c),
+        ] {
+            assert!(
+                expansion.contains(&id),
+                "{name} joins the read expansion: {expansion:?}"
+            );
+        }
+        assert!(
+            read.can_access_repo(leaf_c),
+            "a read reaches the nested leaf"
+        );
+        assert!(!write.can_access_repo(leaf_c), "a write does not");
+    }
+
+    /// A cycle in the stored membership graph (only possible by editing the
+    /// table directly: the write-time guard refuses one) must not hang token
+    /// validation. The shared walk skips the closing edge.
+    #[tokio::test]
+    async fn expansion_terminates_on_a_membership_cycle() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mut fx, _members) = Repos::build(pool.clone(), 0).await;
+        let (nested_b, _bk, bdir) = tdh::create_repo(&pool, "virtual", "generic").await;
+        fx.ids.push(nested_b);
+        fx.dirs.push(bdir);
+        tdh::link_virtual_member(&pool, fx.virtual_id, nested_b, 1).await;
+        // B -> A closes the cycle, bypassing the guard on purpose.
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(nested_b)
+        .bind(fx.virtual_id)
+        .execute(&pool)
+        .await
+        .expect("insert the cycle-closing edge");
+
+        let validated = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            validate_with(
+                &pool,
+                fx.user_id,
+                serde_json::json!({ "match_repos": [fx.virtual_id], "include_virtual_members": true }),
+            ),
+        )
+        .await;
+        let virtual_id = fx.virtual_id;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(nested_b)
+            .execute(&pool)
+            .await;
+        fx.teardown().await;
+
+        let (scope, expansion) = validated.expect("validation must not hang on a cycle");
+        assert_eq!(scope, vec![virtual_id]);
+        assert_eq!(
+            expansion,
+            vec![nested_b],
+            "the parent is never added to its own expansion"
         );
     }
 

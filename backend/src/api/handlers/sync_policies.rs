@@ -205,7 +205,8 @@ pub struct RepoSelectorSchema {
     #[serde(default)]
     pub match_repos: Vec<Uuid>,
     /// Also replicate the members of every matched virtual repository
-    /// (#4130). A virtual repository holds no content of its own, so syncing
+    /// (#4130), following nested virtual repositories (#4263). A virtual
+    /// repository holds no content of its own, so syncing
     /// one alone replicates nothing; this is how a policy names "what this
     /// virtual serves". Membership is re-read on every run, so whoever edits
     /// the virtual's members changes what this policy replicates. Not a

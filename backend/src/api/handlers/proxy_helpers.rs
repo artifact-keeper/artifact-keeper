@@ -3772,6 +3772,11 @@ pub(crate) struct ExpandedMember {
 pub(crate) struct VirtualMemberExpansion {
     /// Leaf (non-virtual) members, de-duplicated, in DFS pre-order priority.
     pub members: Vec<ExpandedMember>,
+    /// The nested virtual repositories the walk went through (the root
+    /// excluded), each once, under the same cycle and depth rules as
+    /// `members`. A token's `include_virtual_members` adds them alongside the
+    /// leaves, so a nested virtual stays readable by its own key (#4213).
+    pub nested_virtuals: Vec<Uuid>,
     /// At least one membership edge was skipped because following it would
     /// have re-entered a repository already on the current path — the stored
     /// graph contains a cycle. Unreachable through the API (the write-time
@@ -3849,6 +3854,7 @@ pub(crate) async fn expand_virtual_members(
     const MAX_DEPTH: usize = crate::services::repository_service::MAX_VIRTUAL_DEPTH;
 
     let mut members: Vec<ExpandedMember> = Vec::new();
+    let mut nested_virtuals: Vec<Uuid> = Vec::new();
     let mut expanded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut on_path: std::collections::HashSet<Uuid> =
@@ -3880,6 +3886,9 @@ pub(crate) async fn expand_virtual_members(
                 if !expanded.insert(id) {
                     // Already expanded via an earlier (better-ranked) path.
                     continue;
+                }
+                if id != virtual_repo_id {
+                    nested_virtuals.push(id);
                 }
                 on_path.insert(id);
                 stack.push(Event::Exit(id));
@@ -3914,6 +3923,7 @@ pub(crate) async fn expand_virtual_members(
 
     Ok(VirtualMemberExpansion {
         members,
+        nested_virtuals,
         cycle_edge_skipped,
         depth_limit_reached,
     })
