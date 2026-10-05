@@ -22,9 +22,15 @@
 //!   never moves backwards and a pruned `@N` number is never reissued.
 //! - Rows are deleted before objects. Once the row is gone `@N` is
 //!   unresolvable, so deleting its objects cannot break a client mid-download
-//!   of anything still advertised. Objects a crash or a racing `@N` cache fill
-//!   leaves behind are collected by the stray-prefix sweep on the next pass
-//!   (backends that can list keys).
+//!   of anything still advertised.
+//! - On backends that can list keys (filesystem, S3, GCS) objects are found by
+//!   listing `curation/{repo}/publications/` and deleting every key whose
+//!   version number has no row (and is not newer than the newest row). Every
+//!   repository with a version row is visited on every pass, so objects a
+//!   crash or a racing `@N` cache fill leave behind are collected on the next
+//!   pass even when nothing new was pruned. On a backend that cannot list
+//!   (Azure), the pruned published versions' known keys (repodata plus one
+//!   cached package per member) are deleted instead.
 //! - One replica runs a pass at a time (scheduler lease, renewed for the whole
 //!   pass); a lost lease stops the pass between repositories.
 
@@ -36,7 +42,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::services::rpm_publish_service::{
-    publication_prefix, publications_root, PUBLICATION_REPODATA_FILES,
+    create_version_lock_key, publication_prefix, publications_root, PUBLICATION_REPODATA_FILES,
 };
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
@@ -142,6 +148,19 @@ pub(crate) fn is_stray_key(
     }
 }
 
+/// The version numbers of `versions` whose ids were not deleted.
+pub(crate) fn surviving_numbers(
+    versions: &[(Uuid, i64)],
+    deleted: impl IntoIterator<Item = Uuid>,
+) -> BTreeSet<i64> {
+    let deleted: BTreeSet<Uuid> = deleted.into_iter().collect();
+    versions
+        .iter()
+        .filter(|(id, _)| !deleted.contains(id))
+        .map(|(_, n)| *n)
+        .collect()
+}
+
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetentionReport {
@@ -151,25 +170,40 @@ pub struct RetentionReport {
     pub delete_failures: u64,
 }
 
-/// A version removed from the database whose objects still need deleting.
+/// A version removed from the database whose objects may still need deleting
+/// on a backend that cannot list. `member_filenames` is empty for a version
+/// that was never published: `@N` only caches packages for published versions,
+/// so only repodata a crashed publish left behind can exist under its prefix.
 #[derive(Debug)]
 struct PrunedVersion {
     prefix: String,
     member_filenames: Vec<String>,
 }
 
+/// What [`prune_rows`] removed and kept.
+#[derive(Debug, Default)]
+struct PrunedRows {
+    /// Number of `repository_versions` rows deleted.
+    deleted: u64,
+    /// The deleted versions, for the known-key fallback.
+    pruned: Vec<PrunedVersion>,
+    /// Version numbers still present after the delete, for the stray sweep.
+    surviving: BTreeSet<i64>,
+}
+
 /// Delete the prunable rows of one repository and return what their objects
 /// are, plus the surviving version numbers for the stray sweep.
-async fn prune_rows(
-    db: &PgPool,
-    repo_id: Uuid,
-    keep: u32,
-) -> Result<(Vec<PrunedVersion>, BTreeSet<i64>), AppError> {
+async fn prune_rows(db: &PgPool, repo_id: Uuid, keep: u32) -> Result<PrunedRows, AppError> {
     let mut tx = db.begin().await?;
+    // Pinned like create_version's transaction: every statement after the
+    // lock wait must see versions committed while it waited.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
     // Serialize with create_version (same key it locks under, #4307) and with
     // publish, which locks the repository row before marking a version.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("rpm-version:{repo_id}"))
+        .bind(create_version_lock_key(repo_id))
         .execute(&mut *tx)
         .await?;
     let active: Option<Option<Uuid>> = sqlx::query_scalar(
@@ -179,7 +213,7 @@ async fn prune_rows(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(active) = active else {
-        return Ok((Vec::new(), BTreeSet::new()));
+        return Ok(PrunedRows::default());
     };
 
     let versions: Vec<(Uuid, i64)> = sqlx::query_as(
@@ -189,19 +223,18 @@ async fn prune_rows(
     .fetch_all(&mut *tx)
     .await?;
     let prune = select_prunable(&versions, active, keep);
-    let surviving: BTreeSet<i64> = versions
-        .iter()
-        .filter(|(id, _)| !prune.contains(id))
-        .map(|(_, n)| *n)
-        .collect();
     if prune.is_empty() {
         tx.commit().await?;
-        return Ok((Vec::new(), surviving));
+        return Ok(PrunedRows {
+            surviving: versions.iter().map(|(_, n)| *n).collect(),
+            ..Default::default()
+        });
     }
 
     let members: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT version_id, frozen_filename FROM repository_version_packages \
-         WHERE version_id = ANY($1)",
+        "SELECT rvp.version_id, rvp.frozen_filename FROM repository_version_packages rvp \
+         JOIN repository_versions rv ON rv.id = rvp.version_id \
+         WHERE rvp.version_id = ANY($1) AND rv.published_at IS NOT NULL",
     )
     .bind(&prune)
     .fetch_all(&mut *tx)
@@ -225,6 +258,10 @@ async fn prune_rows(
     .await?;
     tx.commit().await?;
 
+    // `surviving` comes from what was actually deleted, not from the
+    // selection: a row the SQL guard spared must never look like a stray.
+    let surviving = surviving_numbers(&versions, deleted.iter().map(|(id, _, _)| *id));
+    let rows = deleted.len() as u64;
     let pruned = deleted
         .into_iter()
         .map(|(id, number, prefix)| PrunedVersion {
@@ -232,7 +269,11 @@ async fn prune_rows(
             member_filenames: by_version.remove(&id).unwrap_or_default(),
         })
         .collect();
-    Ok((pruned, surviving))
+    Ok(PrunedRows {
+        deleted: rows,
+        pruned,
+        surviving,
+    })
 }
 
 /// Delete one object, treating "already gone" as success.
@@ -259,29 +300,32 @@ pub async fn prune_repository(
     if keep == 0 {
         return Ok(());
     }
-    let (pruned, surviving) = prune_rows(db, repo_id, keep).await?;
-    report.versions_pruned += pruned.len() as u64;
+    let rows = prune_rows(db, repo_id, keep).await?;
+    report.versions_pruned += rows.deleted;
 
-    for version in &pruned {
-        for key in known_version_keys(&version.prefix, &version.member_filenames) {
-            delete_object(storage, &key, report).await;
-        }
-    }
-
-    // Stray sweep: whatever else sits under a version number that no longer
-    // has a row (an `@N` cache fill racing the delete above, a pass or a
-    // publish that crashed mid-way). Backends that cannot list skip it.
+    // Listing backends: delete every object under a version number with no
+    // row. That covers the versions just pruned and anything an earlier
+    // crash or a racing `@N` cache fill left behind, and only touches keys
+    // that exist.
     let root = publications_root(repo_id);
-    let newest = surviving.iter().next_back().copied();
+    let newest = rows.surviving.iter().next_back().copied();
     match storage.list_keys(&root).await {
         Ok(Some(listed)) => {
             for listed in listed {
-                if is_stray_key(&root, &listed.key, &surviving, newest) {
+                if is_stray_key(&root, &listed.key, &rows.surviving, newest) {
                     delete_object(storage, &listed.key, report).await;
                 }
             }
         }
-        Ok(None) => {}
+        // A backend that cannot list (Azure): delete the known keys of the
+        // versions just pruned.
+        Ok(None) => {
+            for version in &rows.pruned {
+                for key in known_version_keys(&version.prefix, &version.member_filenames) {
+                    delete_object(storage, &key, report).await;
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!(repo_id = %repo_id, error = %e, "RPM version retention: listing failed")
         }
@@ -289,8 +333,9 @@ pub async fn prune_repository(
     Ok(())
 }
 
-/// One retention pass over every repository holding more than `keep`
-/// versions (or only `only_repo`). Stops between repositories once `lost` is
+/// One retention pass over every repository holding curated versions (or
+/// only `only_repo`). Repositories already at or below `keep` are visited too,
+/// so the stray sweep can collect leftovers there. Stops between repositories once `lost` is
 /// cancelled. A failure in one repository is logged and does not stop the
 /// others.
 pub async fn run_retention_pass(
@@ -306,11 +351,10 @@ pub async fn run_retention_pass(
     }
     let repos: Vec<(Uuid, String, String)> = sqlx::query_as(
         "SELECT r.id, r.storage_backend, r.storage_path FROM repositories r \
-         WHERE (SELECT COUNT(*) FROM repository_versions rv WHERE rv.repository_id = r.id) > $1 \
-           AND ($2::uuid IS NULL OR r.id = $2) \
+         WHERE EXISTS (SELECT 1 FROM repository_versions rv WHERE rv.repository_id = r.id) \
+           AND ($1::uuid IS NULL OR r.id = $1) \
          ORDER BY r.id",
     )
-    .bind(i64::from(keep))
     .bind(only_repo)
     .fetch_all(db)
     .await?;
@@ -581,9 +625,11 @@ mod tests {
     }
 
     // The scheduled pass resolves each repository's storage through the
-    // registry, prunes it, and stops before any work once the lease is lost.
+    // registry and prunes it. A lease already lost before the pass starts
+    // means it does no work at all (the token is checked before every
+    // repository; this pins the check, not a mid-pass stop).
     #[tokio::test]
-    async fn test_retention_pass_uses_registry_and_honours_lost_lease_db() {
+    async fn test_retention_pass_uses_registry_and_skips_work_once_lease_lost_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -623,5 +669,94 @@ mod tests {
 
         tdh::cleanup(&pool, repo, actor).await;
         tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // A repository already at `keep` versions is still visited, so a leftover
+    // prefix with no row (a crashed pass or publish) is swept on the next pass
+    // even though nothing new is pruned.
+    #[tokio::test]
+    async fn test_retention_pass_sweeps_leftovers_on_repo_at_keep_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        for n in 2..=3 {
+            seed_version(&pool, repo, remote, &storage, n, true).await;
+        }
+        let stray = format!("{}/packages/old.rpm", publication_prefix(repo, 1));
+        storage
+            .put(&stray, bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        let registry = StorageRegistry::new(Default::default(), "filesystem".to_string());
+
+        let report = run_retention_pass(&pool, &registry, 2, Some(repo), None)
+            .await
+            .unwrap();
+        assert_eq!(report.repositories, 1);
+        assert_eq!(report.versions_pruned, 0);
+        assert_eq!(report.objects_deleted, 1, "{report:?}");
+        assert!(!storage.exists(&stray).await.unwrap());
+        assert!(object_exists(&storage, repo, 2).await);
+        assert!(object_exists(&storage, repo, 3).await);
+        assert_eq!(version_numbers(&pool, repo).await, vec![2, 3]);
+
+        tdh::cleanup(&pool, repo, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // On a backend that cannot list (Azure), a pruned published version's
+    // repodata and cached packages are deleted by known key, and a pruned
+    // unpublished version only has its repodata (left by a crashed publish)
+    // deleted, never a per-member package delete.
+    #[tokio::test]
+    async fn test_retention_known_key_fallback_without_listing_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, _dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = tdh::MemStorage::default();
+        assert!(storage.list_keys("x/").await.unwrap().is_none());
+        seed_version(&pool, repo, remote, &storage, 1, true).await;
+        seed_version(&pool, repo, remote, &storage, 2, false).await;
+        seed_version(&pool, repo, remote, &storage, 3, true).await;
+        // Repodata a crashed publish of version 2 left behind.
+        let leftover = format!("{}/repodata/repomd.xml", publication_prefix(repo, 2));
+        storage
+            .put(&leftover, bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+
+        let mut report = RetentionReport::default();
+        prune_repository(&pool, &storage, repo, 1, &mut report)
+            .await
+            .unwrap();
+        assert_eq!(version_numbers(&pool, repo).await, vec![3]);
+        assert_eq!(report.versions_pruned, 2);
+        // MemStorage counts every delete: 7 for version 1, 6 repodata for 2.
+        assert_eq!(report.objects_deleted, 7 + 6, "{report:?}");
+        let remaining: Vec<String> = storage.objects.lock().unwrap().keys().cloned().collect();
+        let v3 = publication_prefix(repo, 3);
+        assert_eq!(remaining.len(), 7, "{remaining:?}");
+        assert!(remaining.iter().all(|k| k.starts_with(&format!("{v3}/"))));
+
+        tdh::cleanup(&pool, repo, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    #[test]
+    fn test_surviving_numbers_follow_the_actual_delete() {
+        let versions = vec![v(1), v(2), v(3)];
+        // A row the SQL guard spared stays in `surviving`.
+        let surviving = surviving_numbers(&versions, [v(1).0]);
+        assert_eq!(surviving.into_iter().collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(surviving_numbers(&versions, []).len(), 3);
     }
 }

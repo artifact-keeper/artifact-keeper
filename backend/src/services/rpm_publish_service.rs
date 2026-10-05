@@ -99,7 +99,7 @@ fn create_version_retry_backoff(attempt: u32, jitter_fraction: f64) -> std::time
 /// Advisory-lock key text serializing [`create_version`] per repository.
 /// Hashed server-side with `hashtextextended(…, 0)`; the `rpm-version:`
 /// namespace keeps it apart from the other text-keyed advisory locks.
-fn create_version_lock_key(repo_id: Uuid) -> String {
+pub(crate) fn create_version_lock_key(repo_id: Uuid) -> String {
     format!("rpm-version:{repo_id}")
 }
 
@@ -492,8 +492,6 @@ pub async fn publish(
         version_id,
         version_number,
         &storage_prefix,
-        &repomd_key,
-        &asc_key,
     )
     .await?;
 
@@ -511,10 +509,10 @@ pub async fn publish(
 /// The repository row is locked FIRST, in the same order the version retention
 /// pass takes its locks (#2359), so the two cannot deadlock. If retention
 /// pruned this version while its blobs were being written, the UPDATE matches
-/// no row: remove the repodata just stored and fail with 409, rather than leave
+/// no row (version retention, or the repository being deleted, removed it):
+/// remove the repodata just stored and fail with 409, rather than leave
 /// an unreachable prefix behind or point `active_publication_id` at a deleted
 /// version.
-#[allow(clippy::too_many_arguments)]
 async fn mark_published(
     db: &PgPool,
     storage: &dyn StorageBackend,
@@ -522,9 +520,9 @@ async fn mark_published(
     version_id: Uuid,
     version_number: i64,
     storage_prefix: &str,
-    repomd_key: &str,
-    asc_key: &str,
 ) -> Result<(), AppError> {
+    let repomd_key = format!("{storage_prefix}/repodata/repomd.xml");
+    let asc_key = format!("{storage_prefix}/repodata/repomd.xml.asc");
     let mut tx = db.begin().await?;
     sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR NO KEY UPDATE")
         .bind(repo_id)
@@ -537,9 +535,9 @@ async fn mark_published(
            WHERE id = $1"#,
     )
     .bind(version_id)
-    .bind(repomd_key)
+    .bind(&repomd_key)
     .bind(storage_prefix)
-    .bind(asc_key)
+    .bind(&asc_key)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -549,8 +547,8 @@ async fn mark_published(
             let _ = storage.delete(&format!("{storage_prefix}/{name}")).await;
         }
         return Err(AppError::Conflict(format!(
-            "Version {version_number} was removed by version retention while it was being \
-             published"
+            "Version {version_number} no longer exists (it was removed, for example by version \
+             retention, while it was being published)"
         )));
     }
     sqlx::query("UPDATE repositories SET active_publication_id = $2 WHERE id = $1")
@@ -1256,6 +1254,15 @@ mod tests {
         let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
         let (actor, _n) = tdh::create_user(&pool).await;
         let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        // A real version, pruned after its publish started writing blobs.
+        let version_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repository_versions (repository_id, version_number) \
+             VALUES ($1, 7) RETURNING id",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let prefix = publication_prefix(repo, 7);
         for name in PUBLICATION_REPODATA_FILES {
             put_blob(&storage, &format!("{prefix}/{name}"), b"x".to_vec())
@@ -1263,18 +1270,15 @@ mod tests {
                 .unwrap();
         }
 
-        let err = mark_published(
-            &pool,
-            &storage,
-            repo,
-            Uuid::new_v4(),
-            7,
-            &prefix,
-            &format!("{prefix}/repodata/repomd.xml"),
-            &format!("{prefix}/repodata/repomd.xml.asc"),
-        )
-        .await
-        .unwrap_err();
+        sqlx::query("DELETE FROM repository_versions WHERE id = $1")
+            .bind(version_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = mark_published(&pool, &storage, repo, version_id, 7, &prefix)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
         for name in PUBLICATION_REPODATA_FILES {
             assert!(!storage.exists(&format!("{prefix}/{name}")).await.unwrap());
