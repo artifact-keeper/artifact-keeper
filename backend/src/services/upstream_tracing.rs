@@ -108,23 +108,23 @@ fn status_is_error(status: StatusCode, had_auth: bool) -> bool {
     status.is_client_error() || status.is_server_error()
 }
 
-/// Low-cardinality `error.type` for a request that produced no response.
+/// Low-cardinality `error.type` for a request that produced no response: the
+/// first matching reqwest error class, in this order, else `_OTHER`.
 fn transport_error_type(err: &reqwest::Error) -> &'static str {
-    if err.is_timeout() {
-        "timeout"
-    } else if err.is_connect() {
-        "connect"
-    } else if err.is_redirect() {
-        "redirect"
-    } else if err.is_builder() {
-        "builder"
-    } else if err.is_body() || err.is_decode() {
-        "body"
-    } else if err.is_request() {
-        "request"
-    } else {
-        "_OTHER"
-    }
+    type Class = (fn(&reqwest::Error) -> bool, &'static str);
+    const CLASSES: [Class; 7] = [
+        (reqwest::Error::is_timeout, "timeout"),
+        (reqwest::Error::is_connect, "connect"),
+        (reqwest::Error::is_redirect, "redirect"),
+        (reqwest::Error::is_builder, "builder"),
+        (reqwest::Error::is_body, "body"),
+        (reqwest::Error::is_decode, "body"),
+        (reqwest::Error::is_request, "request"),
+    ];
+    CLASSES
+        .iter()
+        .find(|(matches, _)| matches(err))
+        .map_or("_OTHER", |(_, name)| name)
 }
 
 fn record_response_status(span: &Span, status: StatusCode, had_auth: bool) {
@@ -425,6 +425,38 @@ mod tests {
         assert_eq!(transport_error_type(&err), "connect");
         assert_eq!(fields.get("error.type").as_deref(), Some("connect"));
         assert_eq!(fields.get("otel.status_code").as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn timeout_and_redirect_failures_are_classified() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/loop"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .redirect(reqwest::redirect::Policy::limited(2))
+            .build()
+            .unwrap();
+        let slow = send_upstream(client.get(format!("{}/slow", server.uri())))
+            .await
+            .expect_err("the mock answers after the timeout");
+        assert_eq!(transport_error_type(&slow), "timeout");
+        let looping = send_upstream(client.get(format!("{}/loop", server.uri())))
+            .await
+            .expect_err("the redirect limit is exceeded");
+        assert_eq!(transport_error_type(&looping), "redirect");
     }
 
     #[tokio::test]
