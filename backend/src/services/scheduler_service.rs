@@ -2192,7 +2192,12 @@ pub(crate) async fn run_curation_sync_cycle(
                                 curation_sync::parse_deb_packages_index(&content, "main")
                             }
                             _ => {
-                                tracing::warn!("DEB Packages fetch failed for {}", upstream_url);
+                                tracing::warn!(
+                                    "DEB Packages fetch failed for {}",
+                                    crate::services::proxy_service::redact_url_for_diagnostics(
+                                        upstream_url
+                                    )
+                                );
                                 continue;
                             }
                         }

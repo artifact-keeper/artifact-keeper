@@ -96,6 +96,20 @@ impl ArtifactOrigin {
     pub fn from_json(value: &serde_json::Value) -> Option<Self> {
         serde_json::from_value(value.clone()).ok()
     }
+
+    /// [`Self::from_json`] for an API response (#4452). The stored document
+    /// is derived from the repository's `upstream_url`, so an upstream URL
+    /// with embedded `user:password@` credentials is recorded verbatim; strip
+    /// the userinfo before it is returned. Policy evaluation keeps reading
+    /// the stored value through `from_json`, so allowlist matching is
+    /// unchanged.
+    pub fn for_response(value: &serde_json::Value) -> Option<Self> {
+        let mut origin = Self::from_json(value)?;
+        if let Some(url) = origin.upstream_url.as_deref() {
+            origin.upstream_url = Some(crate::services::proxy_service::strip_url_userinfo(url).0);
+        }
+        Some(origin)
+    }
 }
 
 /// Normalize an upstream URL for origin comparison — the Rust mirror of
@@ -165,6 +179,39 @@ mod tests {
     // ------------------------------------------------------------------
     // normalize_upstream_url (pure)
     // ------------------------------------------------------------------
+
+    #[test]
+    fn for_response_strips_upstream_userinfo_but_from_json_keeps_it() {
+        // #4452: the stored origin of a proxied artifact mirrors the repo's
+        // upstream_url, credentials included. The API rendering drops them;
+        // the policy read (`from_json`) still sees the stored value.
+        let stored = serde_json::json!({
+            "v": 1,
+            "kind": "proxy",
+            "repository_key": "npm-remote",
+            "upstream_url": "https://alice:s3cret@registry.example.com/npm"
+        });
+        let shown = ArtifactOrigin::for_response(&stored).expect("parses");
+        assert_eq!(
+            shown.upstream_url.as_deref(),
+            Some("https://registry.example.com/npm")
+        );
+        assert_eq!(shown.kind, "proxy");
+        assert_eq!(
+            ArtifactOrigin::from_json(&stored)
+                .unwrap()
+                .upstream_url
+                .as_deref(),
+            Some("https://alice:s3cret@registry.example.com/npm")
+        );
+        // Hosted (no upstream) and unparseable documents behave as from_json.
+        let hosted = ArtifactOrigin::hosted("local").to_json();
+        assert_eq!(
+            ArtifactOrigin::for_response(&hosted),
+            Some(ArtifactOrigin::hosted("local"))
+        );
+        assert!(ArtifactOrigin::for_response(&serde_json::json!("junk")).is_none());
+    }
 
     #[test]
     fn test_normalize_lowercases_scheme_and_authority_only() {

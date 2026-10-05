@@ -689,27 +689,38 @@ pub(crate) fn redact_url_for_diagnostics(url: &str) -> String {
 }
 
 /// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
-/// not parse. Removes a `userinfo@` segment from the authority (the part
-/// after an optional `scheme://` and before the first `/`), leaving the rest
-/// untouched.
+/// not parse. Delegates to [`strip_url_userinfo`], which works at the string
+/// level and therefore needs no successful parse.
 fn strip_userinfo_fallback(url: &str) -> String {
+    strip_url_userinfo(url).0
+}
+
+/// Remove the `userinfo@` segment (`user:password@`, or a bare `token@`) from
+/// a URL's authority and report whether one was present (#4452).
+///
+/// This is the read-back sibling of [`redact_url_for_diagnostics`]: it keeps
+/// the path, query and fragment byte-for-byte and touches nothing but the
+/// userinfo, so a credential-free URL comes back exactly as stored (no
+/// `reqwest::Url` normalization such as an added trailing `/`). It is what
+/// every API surface that echoes a Remote repository's `upstream_url` renders
+/// through, paired with the returned flag so a client can still tell that
+/// credentials are configured.
+///
+/// The authority is the text after an optional `scheme://` (or a leading
+/// `//`) up to the first `/`, `?` or `#`. Its userinfo is everything up to the
+/// LAST `@`, matching how URL parsers split `user:p@ss@host`. Working on the
+/// raw string means an unparseable value is redacted too.
+pub(crate) fn strip_url_userinfo(url: &str) -> (String, bool) {
     let (prefix, rest) = match url.find("://") {
         Some(pos) => url.split_at(pos + 3),
         None if url.starts_with("//") => url.split_at(2),
         None => ("", url),
     };
-    // The authority ends at the first path separator.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if let Some(at) = authority.rfind('@') {
-        format!(
-            "{}{}{}",
-            prefix,
-            &authority[at + 1..],
-            &rest[authority_end..]
-        )
-    } else {
-        url.to_string()
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => (format!("{prefix}{}{tail}", &authority[at + 1..]), at > 0),
+        None => (url.to_string(), false),
     }
 }
 
@@ -13727,6 +13738,72 @@ mod tests {
             redact_url_for_diagnostics("https://token@registry.example.com/v2/"),
             "https://registry.example.com/v2/"
         );
+    }
+
+    #[test]
+    fn test_strip_url_userinfo_keeps_everything_but_the_userinfo() {
+        // #4452: the read-back form drops only the userinfo; path, query and
+        // fragment survive byte-for-byte, and the flag reports the strip.
+        for (raw, want, had) in [
+            (
+                "https://alice:s3cret@registry.example.com/simple?x=1#f",
+                "https://registry.example.com/simple?x=1#f",
+                true,
+            ),
+            ("https://token@host:8443", "https://host:8443", true),
+            ("https://u:p@ss@host/a", "https://host/a", true),
+            ("//user:pass@host/path", "//host/path", true),
+            // Credential-free URLs come back exactly as stored (no parser
+            // normalization such as an added trailing slash).
+            (
+                "https://registry.npmjs.org",
+                "https://registry.npmjs.org",
+                false,
+            ),
+            ("https://host/a@b?c=d@e", "https://host/a@b?c=d@e", false),
+            ("https://host?q=a@b", "https://host?q=a@b", false),
+            ("https://@host/", "https://host/", false),
+            ("not a url", "not a url", false),
+        ] {
+            assert_eq!(strip_url_userinfo(raw), (want.to_string(), had), "{raw}");
+        }
+    }
+
+    /// #4452: redacting `upstream_url` on read must not change what the
+    /// proxy sends upstream. Userinfo embedded in a Remote's upstream URL is
+    /// still presented as HTTP Basic auth; the mock only answers 200 when the
+    /// request carries exactly those credentials.
+    #[tokio::test]
+    async fn test_fetch_sends_upstream_url_userinfo_as_basic_auth() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{basic_auth, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/base/pkg/file.txt"))
+            .and(basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"authed".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-4452-basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let upstream = server.uri().replacen("://", "://alice:s3cret@", 1) + "/base";
+        let mut repo = remote_repo_for("generic-4452", &upstream, tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Generic;
+
+        let result = proxy.fetch_artifact(&repo, "pkg/file.txt").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct) = result.expect(
+            "the upstream only answers when the URL's userinfo arrives as \
+             Basic auth; a failure means the proxy stopped sending it",
+        );
+        assert_eq!(&body[..], b"authed");
     }
 
     #[test]

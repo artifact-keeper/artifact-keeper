@@ -3851,7 +3851,9 @@ pub async fn resolve_virtual_manifest(
                     None => {
                         warn!(
                             "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
-                            member.upstream_url.as_deref().unwrap_or(""),
+                            crate::services::proxy_service::redact_url_for_diagnostics(
+                                member.upstream_url.as_deref().unwrap_or("")
+                            ),
                             reference
                         );
                         // #3836: the member HAS something under this reference,
