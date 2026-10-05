@@ -95,6 +95,16 @@ fn proxy_cache_arm_refuses_what_it_cannot_evaluate_3734() {
             json!({"days": 1, "min_keep": 3}),
             "min_keep",
         ),
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": "^1"}}),
+            "match.version_pattern",
+        ),
+        (
+            "composite",
+            json!({"conditions": [{"type": "max_age_days", "value": 1}]}),
+            "composite has no proxy-cache",
+        ),
     ] {
         match arm(policy_type, config) {
             ProxyCacheArm::Unsupported(reason) => {
@@ -945,4 +955,66 @@ async fn legacy_inert_assignment_can_be_renamed_and_disabled_3734() {
             .await,
         "a real config change on a legacy inert assignment",
     );
+}
+
+/// #2024: a `composite` policy has no proxy-cache arm, so it never evicts a
+/// cache entry. An explicit assignment to a (non-OCI) Remote repository is
+/// refused like the other inert types, a global one reports why it skipped,
+/// and an OCI remote, which keeps `artifacts` rows, accepts it.
+#[tokio::test]
+async fn composite_policy_never_evicts_proxy_cache_2024() {
+    let Some(cache) = RemoteCache::setup("pypi", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let service = cache.service();
+    let remote = cache.fx.repo_id;
+    let entry = cache.entry("simple/a/a-1.whl", 90, Some(90)).await;
+    let config = json!({"conditions": [
+        {"type": "max_age_days", "value": 1},
+        {"type": "no_downloads_days", "value": 1}
+    ]});
+
+    assert_inert(
+        service
+            .create_policy(create("composite", config.clone(), vec![remote]))
+            .await,
+        "composite on a pypi remote",
+    );
+    assert_inert(
+        service
+            .create_policy(create(
+                "max_age_days",
+                json!({"days": 1, "match": {"version_pattern": "^a"}}),
+                vec![remote],
+            ))
+            .await,
+        "match.version_pattern on a pypi remote",
+    );
+
+    let mut global = crate::services::lifecycle_service::tests::make_policy(
+        Uuid::new_v4(),
+        "global composite",
+        "composite",
+    );
+    global.applies_to_all = true;
+    global.config = config.clone();
+    let mut errors = Vec::new();
+    let result = service
+        .run_proxy_cache_arm(&global, remote, false, &never(), &mut errors)
+        .await
+        .expect("arm");
+    assert!(errors.is_empty());
+    assert_eq!(result.entries_matched, 0);
+    assert!(result
+        .skipped_reason
+        .as_deref()
+        .is_some_and(|r| r.contains("composite has no proxy-cache equivalent")));
+    cache.assert_entry(&entry, true, "untouched").await;
+
+    let (oci_remote, _, _) = tdh::create_repo(&cache.fx.pool, "remote", "docker").await;
+    let created = service
+        .create_policy(create("composite", config, vec![oci_remote]))
+        .await
+        .expect("an OCI remote accepts a composite policy");
+    assert_eq!(created.policy_type, "composite");
 }

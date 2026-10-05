@@ -17,8 +17,9 @@
 //!   window and an entry older than the window.
 //!
 //! `match.path_prefix` applies to the catalogue's logical `path`. Version
-//! exclusions and `min_keep` cannot be evaluated against a cache entry, which
-//! has no version, so a policy that carries them does not touch the cache
+//! exclusions, `match.version_pattern` and `min_keep` cannot be evaluated
+//! against a cache entry, which has no version, and a `composite` policy
+//! (#2024) has no cache arm, so a policy that carries them does not touch the cache
 //! (and is refused for an explicit Remote assignment) rather than deleting
 //! what it was written to protect.
 //!
@@ -99,6 +100,13 @@ pub(crate) fn proxy_cache_arm(
         return Ok(ProxyCacheArm::Unsupported(
             "exclude matches artifact versions, which proxy-cache entries do not carry; \
              scope the policy with match.path_prefix instead"
+                .to_string(),
+        ));
+    }
+    if filters.version_pattern.is_some() {
+        return Ok(ProxyCacheArm::Unsupported(
+            "match.version_pattern matches artifact versions, which proxy-cache entries do \
+             not carry; scope the policy with match.path_prefix instead"
                 .to_string(),
         ));
     }

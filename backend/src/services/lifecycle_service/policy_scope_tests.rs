@@ -13,7 +13,7 @@ use serde_json::json;
 
 /// Insert a 123-byte artifact at `path`, `days_ago` old, with `name` as its
 /// retention-group key (the shared helper gives every row a unique name).
-async fn artifact_named(
+pub(super) async fn artifact_named(
     conn: &mut sqlx::PgConnection,
     repository_id: Uuid,
     name: &str,
@@ -34,7 +34,7 @@ async fn artifact_named(
     id
 }
 
-fn policy(
+pub(super) fn policy(
     policy_type: &str,
     repository_id: Option<Uuid>,
     config: serde_json::Value,
@@ -47,7 +47,7 @@ fn policy(
 
 /// Run a dry run then a live run of `policy` and assert the live run removed
 /// exactly what the preview matched. Returns the preview.
-async fn preview_then_run(
+pub(super) async fn preview_then_run(
     conn: &mut sqlx::PgConnection,
     policy: &LifecyclePolicy,
 ) -> PolicyExecutionResult {
@@ -133,10 +133,7 @@ async fn match_validation_2024() {
             "match {bad} must be rejected"
         );
     }
-    assert_eq!(
-        parse_match_path_prefix(&json!({"match": {}})).unwrap(),
-        None
-    );
+    assert_eq!(parse_match(&json!({"match": {}})).unwrap(), (None, None));
     assert_eq!(
         parse_policy_filters(&json!({"days": 1})).unwrap(),
         PolicyFilters::default(),
@@ -162,8 +159,19 @@ fn every_statement_pair_carries_the_shared_filters_2024() {
             pairs.push((select, update, if scoped { "$5" } else { "$4" }));
         }
     }
+    for min_keep in [true, false] {
+        let (select, update) = super::conditions::composite_sql(min_keep);
+        pairs.push((select, update, "$6"));
+    }
     for (select, update, prefix) in pairs {
+        // `match.version_pattern` binds right after `match.path_prefix`.
+        let version_pattern = format!("${}", prefix[1..].parse::<u8>().unwrap() + 1);
         for sql in [select, update] {
+            assert!(
+                sql.contains(&format!("({version_pattern}::TEXT IS NULL OR COALESCE("))
+                    && sql.contains(&format!("version, '') ~ {version_pattern}::TEXT)")),
+                "match.version_pattern must bind at {version_pattern}:\n{sql}"
+            );
             assert!(
                 sql.contains("::TEXT IS NULL OR starts_with("),
                 "missing path_prefix predicate:\n{sql}"
@@ -182,7 +190,7 @@ fn every_statement_pair_carries_the_shared_filters_2024() {
 
 #[test]
 fn min_keep_sql_ranks_like_max_versions_and_ages_like_max_age_2024() {
-    for (scoped, keep_param) in [(true, "$6"), (false, "$5")] {
+    for (scoped, keep_param) in [(true, "$7"), (false, "$6")] {
         let (select, update) = max_age_sql(scoped, true);
         for sql in [select, update] {
             assert!(sql.contains(retention_rank!()), "{sql}");
