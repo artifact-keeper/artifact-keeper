@@ -96,19 +96,30 @@ pub(crate) fn parse_bsr_rpc(bsr_path: &str) -> Option<(&str, &str)> {
     Some((service, method))
 }
 
-/// Allowlisted read-only `buf.registry.*` RPCs (Get/List/Search/Resolve/Download).
+/// Read-only `buf.registry.module.v1` RPCs the `buf` CLI actually calls for
+/// module metadata. Owner/org/user/plugin services and `Download` are omitted:
+/// Download would skip scan-on-proxy, the age gate and quarantine (#4284).
 pub(crate) fn is_allowed_bsr_read_rpc(bsr_path: &str) -> bool {
     let Some((service, method)) = parse_bsr_rpc(bsr_path) else {
         return false;
     };
-    if !is_bsr_service(service) {
-        return false;
-    }
-    method.starts_with("Get")
-        || method.starts_with("List")
-        || method.starts_with("Search")
-        || method.starts_with("Resolve")
-        || method == "Download"
+    matches!(
+        (service, method),
+        (
+            "buf.registry.module.v1.ModuleService",
+            "GetModule" | "GetModules" | "ListModules"
+        ) | (
+            "buf.registry.module.v1.CommitService",
+            "GetCommit" | "GetCommits" | "ListCommits"
+        ) | (
+            "buf.registry.module.v1.LabelService",
+            "GetLabel" | "GetLabels" | "ListLabels"
+        ) | ("buf.registry.module.v1.GraphService", "GetGraph")
+            | (
+                "buf.registry.module.v1.ResourceService",
+                "GetResource" | "GetResources"
+            )
+    )
 }
 
 /// Connect binary protobuf codec used by the `buf` CLI.
@@ -411,10 +422,19 @@ mod tests {
             "buf.registry.module.v1.GraphService/GetGraph"
         ));
         assert!(is_allowed_bsr_read_rpc(
-            "buf.registry.module.v1beta1.DownloadService/Download"
+            "buf.registry.module.v1.ModuleService/ListModules"
         ));
         assert!(is_allowed_bsr_read_rpc(
-            "buf.registry.module.v1.ModuleService/ListModules"
+            "buf.registry.module.v1.CommitService/GetCommits"
+        ));
+        assert!(!is_allowed_bsr_read_rpc(
+            "buf.registry.module.v1.DownloadService/Download"
+        ));
+        assert!(!is_allowed_bsr_read_rpc(
+            "buf.registry.module.v1beta1.DownloadService/Download"
+        ));
+        assert!(!is_allowed_bsr_read_rpc(
+            "buf.registry.owner.v1.OwnerService/GetOwner"
         ));
         assert!(!is_allowed_bsr_read_rpc(
             "buf.registry.module.v1beta1.UploadService/Upload"
@@ -527,44 +547,86 @@ mod tests {
         .await
         .unwrap();
         assert!(out.is_none());
+        let download = maybe_proxy(
+            &state,
+            &repo,
+            "buf.registry.module.v1.DownloadService/Download",
+            &headers,
+            Bytes::from_static(b"{}"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            download.is_none(),
+            "Download must not be reverse-proxied; it has to go through proxy_service"
+        );
+    }
+
+    struct NoProxyGuard {
+        previous_upper: Option<String>,
+        previous_lower: Option<String>,
+    }
+
+    impl Drop for NoProxyGuard {
+        fn drop(&mut self) {
+            match &self.previous_upper {
+                Some(v) => std::env::set_var("NO_PROXY", v),
+                None => std::env::remove_var("NO_PROXY"),
+            }
+            match &self.previous_lower {
+                Some(v) => std::env::set_var("no_proxy", v),
+                None => std::env::remove_var("no_proxy"),
+            }
+        }
+    }
+
+    /// Keep HTTP(S)_PROXY from swallowing the wiremock listener. Restored on
+    /// drop (including panic) so it shares the same restore discipline as
+    /// [`tdh::non_loopback_mock_server`].
+    fn pin_no_proxy(server: &wiremock::MockServer) -> NoProxyGuard {
+        let host = server
+            .uri()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let previous_upper = std::env::var("NO_PROXY").ok();
+        let previous_lower = std::env::var("no_proxy").ok();
+        if !host.is_empty() {
+            let mut no_proxy = previous_upper.clone().unwrap_or_default();
+            if !no_proxy
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case(&host))
+            {
+                if !no_proxy.is_empty() && !no_proxy.ends_with(',') {
+                    no_proxy.push(',');
+                }
+                no_proxy.push_str(&host);
+                std::env::set_var("NO_PROXY", &no_proxy);
+                std::env::set_var("no_proxy", &no_proxy);
+            }
+        }
+        NoProxyGuard {
+            previous_upper,
+            previous_lower,
+        }
     }
 
     #[tokio::test]
     async fn proxy_connect_rpc_strips_cookies_creds_and_set_cookie() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{body_bytes, header, header_exists, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
 
-        static SSRF_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _lock = SSRF_LOCK.lock().await;
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        probe.connect("8.8.8.8:80").unwrap();
-        let bind_ip = probe.local_addr().unwrap().ip();
-        let previous_ssrf = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
-        std::env::set_var(
-            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
-            format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
-        );
-        let previous_no_proxy = std::env::var("NO_PROXY").ok();
-        let mut no_proxy = previous_no_proxy.clone().unwrap_or_default();
-        let bind_ip_str = bind_ip.to_string();
-        if !no_proxy
-            .split(',')
-            .any(|e| e.trim().eq_ignore_ascii_case(&bind_ip_str))
-        {
-            if !no_proxy.is_empty() && !no_proxy.ends_with(',') {
-                no_proxy.push(',');
-            }
-            no_proxy.push_str(&bind_ip_str);
-            std::env::set_var("NO_PROXY", &no_proxy);
-            std::env::set_var("no_proxy", &no_proxy);
-        }
-        let listener = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
-        let upstream = MockServer::builder().listener(listener).start().await;
+        let (upstream, _ssrf) = tdh::non_loopback_mock_server().await;
+        let _no_proxy = pin_no_proxy(&upstream);
 
         Mock::given(method("POST"))
             .and(path("/buf.registry.module.v1.GraphService/GetGraph"))
@@ -640,53 +702,20 @@ mod tests {
             ae.is_empty() || ae.eq_ignore_ascii_case("identity"),
             "client Accept-Encoding must not force gzip on upstream (got {ae:?})"
         );
-
-        match previous_ssrf {
-            Some(v) => std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", v),
-            None => std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
-        }
-        match previous_no_proxy {
-            Some(v) => std::env::set_var("NO_PROXY", v),
-            None => std::env::remove_var("NO_PROXY"),
-        }
     }
 
     #[tokio::test]
     async fn proxy_virtual_members_walks_past_hosted_member() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
         let Some(fx) = tdh::Fixture::setup("virtual", "protobuf").await else {
             return;
         };
 
-        static SSRF_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _lock = SSRF_LOCK.lock().await;
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        probe.connect("8.8.8.8:80").unwrap();
-        let bind_ip = probe.local_addr().unwrap().ip();
-        let previous_ssrf = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
-        std::env::set_var(
-            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
-            format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
-        );
-        let previous_no_proxy = std::env::var("NO_PROXY").ok();
-        let mut no_proxy = previous_no_proxy.clone().unwrap_or_default();
-        let bind_ip_str = bind_ip.to_string();
-        if !no_proxy
-            .split(',')
-            .any(|e| e.trim().eq_ignore_ascii_case(&bind_ip_str))
-        {
-            if !no_proxy.is_empty() && !no_proxy.ends_with(',') {
-                no_proxy.push(',');
-            }
-            no_proxy.push_str(&bind_ip_str);
-            std::env::set_var("NO_PROXY", &no_proxy);
-            std::env::set_var("no_proxy", &no_proxy);
-        }
-        let listener = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
-        let upstream = MockServer::builder().listener(listener).start().await;
+        let (upstream, _ssrf) = tdh::non_loopback_mock_server().await;
+        let _no_proxy = pin_no_proxy(&upstream);
         Mock::given(method("POST"))
             .and(path("/buf.registry.module.v1.GraphService/GetGraph"))
             .respond_with(
@@ -739,14 +768,65 @@ mod tests {
         remote.teardown().await;
         fx.teardown().await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
 
-        match previous_ssrf {
-            Some(v) => std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", v),
-            None => std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
-        }
-        match previous_no_proxy {
-            Some(v) => std::env::set_var("NO_PROXY", v),
-            None => std::env::remove_var("NO_PROXY"),
-        }
+    #[tokio::test]
+    async fn proxy_virtual_members_excludes_unauthorized_private_members() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "protobuf").await else {
+            return;
+        };
+
+        let (upstream, _ssrf) = tdh::non_loopback_mock_server().await;
+        let _no_proxy = pin_no_proxy(&upstream);
+        Mock::given(method("POST"))
+            .and(path("/buf.registry.module.v1.GraphService/GetGraph"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/proto")
+                    .set_body_bytes(b"\x00ok"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let remote = tdh::Fixture::setup("remote", "protobuf")
+            .await
+            .expect("private remote member");
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = false WHERE id = $2")
+            .bind(upstream.uri().as_str())
+            .bind(remote.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("private remote upstream");
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual parent");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote.repo_id, 1).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/proto"));
+        let err = proxy_virtual_members(
+            &fx.state,
+            fx.repo_id,
+            "buf.registry.module.v1.GraphService/GetGraph",
+            &headers,
+            Bytes::from_static(b"\x00graph"),
+            None,
+        )
+        .await
+        .expect_err("anonymous caller must not walk a private member");
+        let received = upstream.received_requests().await.unwrap_or_default();
+        remote.teardown().await;
+        fx.teardown().await;
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(
+            received.is_empty(),
+            "unauthorized member must not be forwarded upstream"
+        );
     }
 }

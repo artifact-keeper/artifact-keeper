@@ -1,5 +1,5 @@
 ---
 section: Added
-issues: [#4276]
+issues: [#4284]
 ---
-- **Remote Protobuf repositories reverse-proxy allowlisted BSR Connect reads** (#4276). `POST /proto/{repo}/*` forwards `buf.registry.*` Get/List/Download RPCs upstream without copying Artifact Keeper credentials or caching the body.
+- **Remote Protobuf repositories reverse-proxy allowlisted BSR Connect reads** (#4284). `POST /proto/{repo}/*` forwards explicit `buf.registry.module.v1` metadata RPCs upstream without copying Artifact Keeper credentials, caching the body, or proxying `Download`.
