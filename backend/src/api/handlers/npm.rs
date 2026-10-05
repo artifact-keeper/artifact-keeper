@@ -12372,9 +12372,13 @@ mod tests {
         });
         let client_request = serde_json::json!({"express": ["4.17.0"]});
 
+        // The audit passthrough goes through `send_upstream` (#4455): without
+        // `traceparent` the mock does not match and the test fails.
+        let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/security/advisories/bulk"))
             .and(body_json(client_request.clone()))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")
@@ -13689,8 +13693,11 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
+        // The `/-/` meta passthrough goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("GET"))
             .and(path("/-/ping"))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")

@@ -1169,6 +1169,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ecr_mint_returns_basic_credential_and_signs_sigv4() {
+        // With OTLP on, the token exchange carries `traceparent` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1216,6 +1218,23 @@ mod tests {
             ECR_TARGET
         );
         assert!(request.headers.contains_key("x-amz-date"));
+        // `traceparent` is injected AFTER signing (#4455): it reaches AWS but
+        // is not one of the signed headers, so it cannot break the signature.
+        assert!(
+            request.headers.contains_key("traceparent"),
+            "the token exchange must carry the trace context"
+        );
+        let signed_headers = authorization
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .expect("SigV4 Authorization names its SignedHeaders");
+        assert!(
+            !signed_headers
+                .split(';')
+                .any(|h| h == "traceparent" || h == "tracestate"),
+            "trace headers must stay outside SignedHeaders: {signed_headers}"
+        );
     }
 
     #[tokio::test]

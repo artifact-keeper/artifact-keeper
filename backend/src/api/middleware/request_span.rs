@@ -26,12 +26,29 @@
 //! so `correlation_id_middleware` scopes a handle to it as a task-local for the
 //! request future, the same way it scopes the correlation ID (#2414). Outside
 //! that scope (background jobs, detached tasks, unit tests without the
-//! middleware) both recorders are no-ops. When a request records a field more
-//! than once (a virtual repository probing several members), the last value
-//! wins.
+//! middleware) both recorders are no-ops.
+//!
+//! The two recorders do not write to the span directly. They keep the latest
+//! value in that task-local, and [`with_request_span`] records each field ONCE,
+//! when the request future completes. The OTel SDK appends every
+//! `set_attribute`, so recording on each call would export duplicate keys (a
+//! virtual repository probing several members looks the cache up several
+//! times, and the OCI resolver can run more than once), and the stdout log
+//! formatter would show every value in turn. Recording once makes "the last
+//! value wins" hold for both. The price: log lines emitted while the handler
+//! runs do not show these two fields, and a request cancelled mid-flight (a
+//! client disconnect) records neither.
+//!
+//! The phase spans that pair with these (`authenticate`,
+//! `resolve_virtual_members`, `proxy_fetch`) are INFO, like the storage spans.
+//! DEBUG would not keep them off the default stdout output (the default filter
+//! is `artifact_keeper_backend=debug`), and because the `EnvFilter` is global
+//! it WOULD drop them from exported traces on any deployment that sets
+//! `RUST_LOG=info`, which defeats their purpose.
 
 use axum::body::HttpBody;
 use axum::http::{header::CONTENT_LENGTH, Response, StatusCode};
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 use tower_http::trace::{DefaultOnResponse, OnResponse};
 use tracing::Span;
@@ -47,35 +64,51 @@ pub const REPOSITORY_KEY_FIELD: &str = "artifact_keeper.repository.key";
 /// The proxy-cache outcome of the request (`hit`, `miss_expired`, ...).
 pub const CACHE_OUTCOME_FIELD: &str = "artifact_keeper.cache.outcome";
 
+/// The request-class values recorded so far for the request in flight.
+#[derive(Default)]
+struct RequestAttributes {
+    repository_key: RefCell<Option<String>>,
+    cache_outcome: Cell<Option<&'static str>>,
+}
+
 tokio::task_local! {
-    /// The `http_request` span of the request currently being handled.
-    static REQUEST_SPAN: Span;
+    static REQUEST_ATTRIBUTES: RequestAttributes;
 }
 
-/// Run `fut` with [`record_repository_key`] / [`record_cache_outcome`]
-/// recording onto `span`.
+/// Run `fut` with [`record_repository_key`] / [`record_cache_outcome`] in
+/// effect, then record the latest value of each onto `span` (once each).
 pub async fn with_request_span<F: std::future::Future>(span: Span, fut: F) -> F::Output {
-    REQUEST_SPAN.scope(span, fut).await
-}
-
-fn record_on_request_span(field: &str, value: &str) {
-    let _ = REQUEST_SPAN.try_with(|span| {
-        span.record(field, value);
-    });
+    let (output, repository_key, cache_outcome) = REQUEST_ATTRIBUTES
+        .scope(RequestAttributes::default(), async {
+            let output = fut.await;
+            let (key, outcome) = REQUEST_ATTRIBUTES
+                .with(|attrs| (attrs.repository_key.take(), attrs.cache_outcome.get()));
+            (output, key, outcome)
+        })
+        .await;
+    if let Some(key) = repository_key {
+        span.record(REPOSITORY_KEY_FIELD, key.as_str());
+    }
+    if let Some(outcome) = cache_outcome {
+        span.record(CACHE_OUTCOME_FIELD, outcome);
+    }
+    output
 }
 
 /// Record the key of the repository this request resolved to. Call it only
 /// once the key names an existing repository, so the attribute never carries
 /// an arbitrary caller-typed string.
 pub fn record_repository_key(key: &str) {
-    record_on_request_span(REPOSITORY_KEY_FIELD, key);
+    let _ = REQUEST_ATTRIBUTES.try_with(|attrs| {
+        *attrs.repository_key.borrow_mut() = Some(key.to_string());
+    });
 }
 
 /// Record the proxy-cache outcome of this request. `outcome` is one of the
 /// fixed `ak_proxy_cache_lookups_total` `result` values, or `hit` / `miss` /
 /// `negative_hit` from the streaming cache probe.
 pub fn record_cache_outcome(outcome: &'static str) {
-    record_on_request_span(CACHE_OUTCOME_FIELD, outcome);
+    let _ = REQUEST_ATTRIBUTES.try_with(|attrs| attrs.cache_outcome.set(Some(outcome)));
 }
 
 /// The response body size to report: the `Content-Length` header when present
@@ -93,8 +126,10 @@ fn response_body_size<B: HttpBody>(response: &Response<B>) -> Option<u64> {
 /// Record the response attributes of `response` onto the root `span`.
 pub fn record_http_response<B: HttpBody>(span: &Span, response: &Response<B>) {
     let status = response.status();
-    span.record(HTTP_STATUS_FIELD, status.as_u16());
-    if let Some(size) = response_body_size(response) {
+    // Recorded as i64: `tracing-opentelemetry` exports a u64 field as a
+    // string, and both attributes are integers in the semantic conventions.
+    span.record(HTTP_STATUS_FIELD, i64::from(status.as_u16()));
+    if let Some(size) = response_body_size(response).and_then(|s| i64::try_from(s).ok()) {
         span.record(HTTP_BODY_SIZE_FIELD, size);
     }
     if server_span_is_error(status) {
@@ -129,56 +164,13 @@ impl<B: HttpBody> OnResponse<B> for RecordResponseOnSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::otel::{attr, otel_subscriber, ExportedSpans, SpanFields};
     use axum::body::Body;
-    use std::sync::{Arc, Mutex};
+    use opentelemetry::trace::Status;
+    use opentelemetry::Value;
     use tracing_subscriber::layer::SubscriberExt;
 
-    /// `(field, value)` pairs recorded on the `http_request` test span.
-    #[derive(Clone, Default)]
-    struct Recorded(Arc<Mutex<Vec<(String, String)>>>);
-
-    impl Recorded {
-        fn get(&self, name: &str) -> Option<String> {
-            self.0
-                .lock()
-                .unwrap()
-                .iter()
-                .rev()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-        }
-    }
-
-    impl tracing::field::Visit for Recorded {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), format!("{value:?}")));
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), value.to_string()));
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for Recorded
-    where
-        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        fn on_record(
-            &self,
-            id: &tracing::span::Id,
-            values: &tracing::span::Record<'_>,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if ctx.span(id).is_some_and(|s| s.name() == "http_request") {
-                values.record(&mut self.clone());
-            }
-        }
-    }
+    const REQUEST_SPAN_NAME: &str = "http_request";
 
     /// The real `http_request` span, so a field this module records but the
     /// span builder forgot to declare (a silent no-op in `tracing`) fails here.
@@ -187,16 +179,25 @@ mod tests {
         crate::api::middleware::tracing::make_http_request_span(&request, &[])
     }
 
-    fn capture<T>(f: impl FnOnce() -> T) -> (T, Recorded) {
-        let recorded = Recorded::default();
-        let subscriber = tracing_subscriber::registry().with(recorded.clone());
-        let out = tracing::subscriber::with_default(subscriber, f);
-        (out, recorded)
+    /// Both views of the request span: its raw `tracing` fields, and the OTel
+    /// span `tracing-opentelemetry` exports once it ends.
+    fn subscriber(
+        fields: &SpanFields,
+        exported: &ExportedSpans,
+    ) -> impl tracing::Subscriber + Send + Sync {
+        otel_subscriber(exported).with(fields.clone())
+    }
+
+    fn capture<T>(f: impl FnOnce() -> T) -> (T, SpanFields, ExportedSpans) {
+        let fields = SpanFields::new(REQUEST_SPAN_NAME);
+        let exported = ExportedSpans::default();
+        let out = tracing::subscriber::with_default(subscriber(&fields, &exported), f);
+        (out, fields, exported)
     }
 
     #[test]
     fn records_status_and_content_length_without_error_on_success() {
-        let (_, rec) = capture(|| {
+        let (_, rec, exported) = capture(|| {
             let span = request_span();
             let response = Response::builder()
                 .status(200)
@@ -209,11 +210,17 @@ mod tests {
         assert_eq!(rec.get(HTTP_BODY_SIZE_FIELD).as_deref(), Some("42"));
         assert_eq!(rec.get("otel.status_code"), None);
         assert_eq!(rec.get("error.type"), None);
+        // What the trace backend receives.
+        let span = exported.one(REQUEST_SPAN_NAME);
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Server);
+        assert_eq!(span.status, Status::Unset);
+        assert_eq!(attr(&span, HTTP_STATUS_FIELD), Some(Value::I64(200)));
+        assert_eq!(attr(&span, HTTP_BODY_SIZE_FIELD), Some(Value::I64(42)));
     }
 
     #[test]
     fn body_size_falls_back_to_the_exact_size_hint() {
-        let (_, rec) = capture(|| {
+        let (_, rec, _) = capture(|| {
             let span = request_span();
             let response = Response::builder()
                 .status(404)
@@ -229,7 +236,7 @@ mod tests {
 
     #[test]
     fn unknown_body_size_leaves_the_attribute_unset() {
-        let (_, rec) = capture(|| {
+        let (_, rec, _) = capture(|| {
             let span = request_span();
             let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(
                 bytes::Bytes::from_static(b"chunk"),
@@ -247,7 +254,7 @@ mod tests {
 
     #[test]
     fn server_error_marks_the_span_failed() {
-        let (_, rec) = capture(|| {
+        let (_, rec, exported) = capture(|| {
             let span = request_span();
             let response = Response::builder().status(503).body(Body::empty()).unwrap();
             RecordResponseOnSpan::default().on_response(&response, Duration::from_millis(3), &span);
@@ -255,6 +262,14 @@ mod tests {
         assert_eq!(rec.get(HTTP_STATUS_FIELD).as_deref(), Some("503"));
         assert_eq!(rec.get("error.type").as_deref(), Some("503"));
         assert_eq!(rec.get("otel.status_code").as_deref(), Some("error"));
+        let span = exported.one(REQUEST_SPAN_NAME);
+        assert!(
+            matches!(span.status, Status::Error { .. }),
+            "{:?}",
+            span.status
+        );
+        assert_eq!(attr(&span, HTTP_STATUS_FIELD), Some(Value::I64(503)));
+        assert_eq!(attr(&span, "error.type"), Some(Value::from("503")));
     }
 
     #[test]
@@ -268,7 +283,7 @@ mod tests {
 
     #[test]
     fn deep_recorders_write_to_the_scoped_request_span() {
-        let (_, rec) = capture(|| {
+        let (_, rec, exported) = capture(|| {
             let span = request_span();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -282,8 +297,18 @@ mod tests {
             }));
         });
         assert_eq!(rec.get(REPOSITORY_KEY_FIELD).as_deref(), Some("npm-remote"));
-        // Last write wins.
+        // Last write wins, and the exported span carries each key ONCE (the
+        // SDK appends every `set_attribute`, so recording per call would
+        // export `miss_expired` and `hit` side by side).
         assert_eq!(rec.get(CACHE_OUTCOME_FIELD).as_deref(), Some("hit"));
+        let span = exported.one(REQUEST_SPAN_NAME);
+        let outcomes: Vec<_> = span
+            .attributes
+            .iter()
+            .filter(|kv| kv.key.as_str() == CACHE_OUTCOME_FIELD)
+            .map(|kv| kv.value.clone())
+            .collect();
+        assert_eq!(outcomes, vec![Value::from("hit")]);
     }
 
     /// End to end through `correlation_id_middleware`: it records the matched
@@ -299,9 +324,9 @@ mod tests {
             "ok"
         }
 
-        let rec = Recorded::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(rec.clone()));
+        let rec = SpanFields::new(REQUEST_SPAN_NAME);
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(subscriber(&rec, &exported));
         let app = Router::new()
             .route("/maven/:repo/*path", get(handler))
             .layer(middleware::from_fn(
@@ -326,11 +351,42 @@ mod tests {
             rec.get(REPOSITORY_KEY_FIELD).as_deref(),
             Some("maven-central")
         );
+        let span = exported.one(REQUEST_SPAN_NAME);
+        assert_eq!(
+            attr(&span, HTTP_ROUTE_FIELD),
+            Some(Value::from("/maven/:repo/*path"))
+        );
+        assert_eq!(
+            attr(&span, REPOSITORY_KEY_FIELD),
+            Some(Value::from("maven-central"))
+        );
+    }
+
+    /// The production call site: the proxy-cache metric recorder also tags
+    /// the request span, and the exported span carries it.
+    #[test]
+    fn proxy_cache_metric_records_the_outcome_on_the_request_span() {
+        let (_, _, exported) = capture(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(with_request_span(request_span(), async {
+                crate::services::metrics_service::record_proxy_cache_lookup(
+                    "npm-remote",
+                    "miss_expired",
+                );
+            }));
+        });
+        let span = exported.one(REQUEST_SPAN_NAME);
+        assert_eq!(
+            attr(&span, CACHE_OUTCOME_FIELD),
+            Some(Value::from("miss_expired"))
+        );
     }
 
     #[test]
     fn deep_recorders_are_noops_outside_a_request_scope() {
-        let (_, rec) = capture(|| {
+        let (_, rec, _) = capture(|| {
             let _span = request_span().entered();
             record_repository_key("npm-remote");
             record_cache_outcome("hit");

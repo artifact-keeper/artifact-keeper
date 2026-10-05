@@ -8,7 +8,11 @@
 //! (`services::upstream_feed`), the npm audit and `/-/` meta passthroughs, the
 //! Go sumdb proxy, and the AWS token exchange in
 //! `services::aws_upstream_auth` (its SigV4 signature does not cover the
-//! injected headers, which are added after signing). It wraps the send in an
+//! injected headers, which are added after signing). Three upstream callers
+//! off the request proxy path still use a bare `.send()` and are follow-ups on
+//! #3954: the repository "test upstream" check (`api::handlers::repositories`),
+//! the curation sync cycle (`services::scheduler_service`) and the popularity
+//! source (`services::curation::popularity_source`). It wraps the send in an
 //! `otel.kind = "client"` span carrying the stable HTTP client semantic
 //! conventions (`http.request.method`, `url.full`, `server.address`,
 //! `server.port`, `http.response.status_code`, `error.type`) and injects the
@@ -164,135 +168,43 @@ impl Injector for HeaderInjector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::otel::{
+        install_w3c_propagator as install_propagator, otel_subscriber, ExportedSpans, SpanFields,
+    };
     use opentelemetry::trace::TraceContextExt;
-    use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
 
     const UPSTREAM_SPAN_NAME: &str = "upstream_request";
 
-    fn install_propagator() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+    fn fields() -> SpanFields {
+        SpanFields::new(UPSTREAM_SPAN_NAME)
     }
 
-    /// Captured `(field, value)` pairs recorded on `upstream_request` spans,
-    /// both at creation and through later `Span::record` calls.
-    #[derive(Clone, Default)]
-    struct Fields(Arc<Mutex<Vec<(String, String)>>>);
-
-    impl Fields {
-        fn get(&self, name: &str) -> Option<String> {
-            self.0
-                .lock()
-                .unwrap()
-                .iter()
-                .rev()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-        }
-    }
-
-    impl tracing::field::Visit for Fields {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), format!("{value:?}")));
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), value.to_string()));
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for Fields
-    where
-        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        fn on_new_span(
-            &self,
-            attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if attrs.metadata().name() == UPSTREAM_SPAN_NAME {
-                attrs.record(&mut self.clone());
-            }
-        }
-        fn on_record(
-            &self,
-            id: &tracing::span::Id,
-            values: &tracing::span::Record<'_>,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if ctx.span(id).is_some_and(|s| s.name() == UPSTREAM_SPAN_NAME) {
-                values.record(&mut self.clone());
-            }
-        }
-    }
-
-    /// OTel spans as the SDK hands them to an exporter, so tests can assert
-    /// the exported `Status` rather than only the tracing fields that
-    /// `tracing-opentelemetry` maps onto it.
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
-
-    impl opentelemetry_sdk::trace::SpanProcessor for Exported {
-        fn on_start(&self, _: &mut opentelemetry_sdk::trace::Span, _: &opentelemetry::Context) {}
-        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
-            self.0.lock().unwrap().push(span);
-        }
-        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
-            Ok(())
-        }
-        fn shutdown_with_timeout(
-            &self,
-            _: std::time::Duration,
-        ) -> opentelemetry_sdk::error::OTelSdkResult {
-            Ok(())
-        }
-    }
-
-    impl Exported {
-        /// The exported status of the single `upstream_request` span.
-        fn upstream_status(&self) -> opentelemetry::trace::Status {
-            let spans = self.0.lock().unwrap();
-            let client: Vec<_> = spans
-                .iter()
-                .filter(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
-                .collect();
-            assert_eq!(client.len(), 1, "exactly one CLIENT span expected");
-            client[0].status.clone()
-        }
+    /// The exported status of the single upstream span (exported under its
+    /// `otel.name`, the HTTP method).
+    fn upstream_status(exported: &ExportedSpans) -> opentelemetry::trace::Status {
+        let span = exported.one("GET");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Client);
+        span.status
     }
 
     /// A subscriber with a real `tracing-opentelemetry` layer (so spans have
     /// an OTel context to inject and are exported to `exported`) plus the
     /// field capture.
     fn subscriber_exporting(
-        fields: &Fields,
-        exported: &Exported,
+        fields: &SpanFields,
+        exported: &ExportedSpans,
     ) -> impl tracing::Subscriber + Send + Sync {
-        use opentelemetry::trace::TracerProvider as _;
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_span_processor(exported.clone())
-            .build();
-        let tracer = provider.tracer("test");
-        tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .with(fields.clone())
+        otel_subscriber(exported).with(fields.clone())
     }
 
-    fn subscriber(fields: &Fields) -> impl tracing::Subscriber + Send + Sync {
-        subscriber_exporting(fields, &Exported::default())
+    fn subscriber(fields: &SpanFields) -> impl tracing::Subscriber + Send + Sync {
+        subscriber_exporting(fields, &ExportedSpans::default())
     }
 
     #[test]
     fn span_carries_http_client_semantic_attributes_with_redacted_url() {
-        let fields = Fields::default();
+        let fields = fields();
         tracing::subscriber::with_default(subscriber(&fields), || {
             let url = Url::parse("https://user:pw@registry.example:8443/v2/x?token=s").unwrap();
             let _span = upstream_client_span(&Method::HEAD, &url);
@@ -313,7 +225,7 @@ mod tests {
 
     #[test]
     fn default_port_is_reported_for_scheme_default_urls() {
-        let fields = Fields::default();
+        let fields = fields();
         tracing::subscriber::with_default(subscriber(&fields), || {
             let url = Url::parse("https://registry.example/v2/").unwrap();
             let _span = upstream_client_span(&Method::GET, &url);
@@ -324,7 +236,7 @@ mod tests {
     #[test]
     fn injects_the_span_trace_context_as_traceparent() {
         install_propagator();
-        let fields = Fields::default();
+        let fields = fields();
         tracing::subscriber::with_default(subscriber(&fields), || {
             let url = Url::parse("https://registry.example/v2/").unwrap();
             let span = upstream_client_span(&Method::GET, &url);
@@ -377,15 +289,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let exported = Exported::default();
-        let _guard =
-            tracing::subscriber::set_default(subscriber_exporting(&Fields::default(), &exported));
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(subscriber_exporting(&fields(), &exported));
         let mut request = reqwest::Client::new().get(server.uri());
         if authenticate {
             request = request.bearer_auth("rejected-token");
         }
         send_upstream(request).await.expect("the mock answers");
-        exported.upstream_status()
+        upstream_status(&exported)
     }
 
     #[tokio::test]
@@ -421,7 +332,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let fields = Fields::default();
+        let fields = fields();
         let _guard = tracing::subscriber::set_default(subscriber(&fields));
         let err = send_upstream(reqwest::Client::new().get(format!("http://127.0.0.1:{port}/")))
             .await
@@ -478,7 +389,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fields = Fields::default();
+        let fields = fields();
         let _guard = tracing::subscriber::set_default(subscriber(&fields));
         let response =
             send_upstream(reqwest::Client::new().get(format!("{}/missing", server.uri())))
@@ -505,7 +416,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fields = Fields::default();
+        let fields = fields();
         let _guard = tracing::subscriber::set_default(subscriber(&fields));
         send_upstream(reqwest::Client::new().get(server.uri()))
             .await

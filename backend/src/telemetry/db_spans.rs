@@ -186,7 +186,7 @@ struct QuerySummary {
 
 impl QuerySummary {
     fn parse(sql: &str) -> Self {
-        let tokens: Vec<&str> = sql.split_whitespace().collect();
+        let tokens = tokens_outside_literals(sql);
         let operation = tokens
             .first()
             .filter(|t| t.len() <= 16 && t.chars().all(|c| c.is_ascii_alphabetic()))
@@ -240,6 +240,26 @@ impl QuerySummary {
     }
 }
 
+/// The whitespace-separated tokens of `sql` that lie outside single-quoted
+/// string literals, so a word inside a literal (`'a from secret b'`) can never
+/// be taken for the `FROM` keyword or a table. A token containing a quote is
+/// dropped too; it is never an identifier. `''` escapes inside a literal
+/// toggle twice and so leave the state unchanged.
+fn tokens_outside_literals(sql: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut in_literal = false;
+    for token in sql.split_whitespace() {
+        let quotes = token.matches('\'').count();
+        if !in_literal && quotes == 0 {
+            tokens.push(token);
+        }
+        if quotes % 2 == 1 {
+            in_literal = !in_literal;
+        }
+    }
+    tokens
+}
+
 /// The table name at the start of `token` (`repositories`, `public.users`,
 /// `"quoted"`), cut at the first `(`, `,` or `;`. `None` for a sub-select
 /// (`(SELECT`) or anything that is not a plain identifier, so a literal can
@@ -260,9 +280,7 @@ fn table_identifier(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanProcessor};
-    use std::sync::{Arc, Mutex};
+    use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
     use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
@@ -288,6 +306,10 @@ mod tests {
             ("BEGIN", "BEGIN"),
             ("", "postgresql"),
             ("(SELECT 1)", "postgresql"),
+            // A word inside a string literal is never the keyword or table.
+            ("SELECT 'a from secretword b' FROM t", "SELECT t"),
+            ("SELECT 'it''s from x' FROM t", "SELECT t"),
+            ("SELECT 'from' FROM t", "SELECT t"),
         ];
         for (sql, name) in cases {
             assert_eq!(QuerySummary::parse(sql).span_name(), name, "for {sql:?}");
@@ -335,53 +357,16 @@ mod tests {
         assert_eq!(QueryEventFields::default().elapsed(), None);
     }
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanProcessor for Exported {
-        fn on_start(&self, _: &mut opentelemetry_sdk::trace::Span, _: &opentelemetry::Context) {}
-        fn on_end(&self, span: SpanData) {
-            self.0.lock().unwrap().push(span);
-        }
-        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
-            Ok(())
-        }
-        fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
-            Ok(())
-        }
-    }
-
-    impl Exported {
-        fn named(&self, name: &str) -> Vec<SpanData> {
-            self.0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|s| s.name == name)
-                .cloned()
-                .collect()
-        }
-    }
-
-    fn attr(span: &SpanData, key: &str) -> Option<opentelemetry::Value> {
-        span.attributes
-            .iter()
-            .find(|kv| kv.key.as_str() == key)
-            .map(|kv| kv.value.clone())
-    }
-
     /// Run `f` under a subscriber with the real `tracing-opentelemetry` layer
     /// and the DB span layer, both exporting to the returned spans.
-    fn run_exporting(f: impl FnOnce()) -> Exported {
-        let exported = Exported::default();
-        let provider = SdkTracerProvider::builder()
-            .with_span_processor(exported.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
-            .with(DbQuerySpanLayer::new(provider.tracer("test")));
-        tracing::subscriber::with_default(subscriber, f);
+    fn run_exporting(f: impl FnOnce()) -> ExportedSpans {
+        let exported = ExportedSpans::default();
+        tracing::subscriber::with_default(subscriber(&exported), f);
         exported
+    }
+
+    fn subscriber(exported: &ExportedSpans) -> impl tracing::Subscriber + Send + Sync {
+        otel_subscriber(exported).with(DbQuerySpanLayer::new(exported.tracer()))
     }
 
     /// An event shaped exactly like sqlx's `QueryLogger::finish` output.
@@ -500,14 +485,8 @@ mod tests {
         let Some(pool) = crate::testing::try_pool_with(1).await else {
             return;
         };
-        let exported = Exported::default();
-        let provider = SdkTracerProvider::builder()
-            .with_span_processor(exported.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
-            .with(DbQuerySpanLayer::new(provider.tracer("test")));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(subscriber(&exported));
         {
             use tracing::Instrument;
             sqlx::query("SELECT 1 AS one")

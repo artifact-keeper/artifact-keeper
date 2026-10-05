@@ -7489,6 +7489,44 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// #4455: the visibility middleware tags the request span with the
+    /// repository it resolved, and credential resolution runs in an
+    /// `authenticate` child span that carries no credential material.
+    #[tokio::test]
+    async fn test_repo_visibility_records_repository_key_and_authenticate_span() {
+        use crate::api::middleware::request_span::{with_request_span, REPOSITORY_KEY_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let request = empty_get("/pypi/myrepo/simple/");
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        let resp = with_request_span(span.clone(), run_through_visibility(state, request))
+            .instrument(span)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, REPOSITORY_KEY_FIELD),
+            Some(opentelemetry::Value::from("myrepo"))
+        );
+        let authenticate = exported.one("authenticate");
+        assert_eq!(authenticate.parent_span_id, root.span_context.span_id());
+        for kv in &authenticate.attributes {
+            let key = kv.key.as_str();
+            assert!(
+                key.starts_with("code.")
+                    || key.starts_with("thread.")
+                    || matches!(key, "target" | "level" | "busy_ns" | "idle_ns"),
+                "unexpected attribute on the authenticate span: {key}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_private_read_no_auth_returns_401() {
         let key = "private";

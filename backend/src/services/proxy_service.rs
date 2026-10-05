@@ -18725,6 +18725,78 @@ mod tests {
         assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
     }
 
+    /// #4455: a buffered proxy fetch runs in a `proxy_fetch` phase span under
+    /// the request span, the upstream `CLIENT` span sits inside it, and the
+    /// cache lookup's outcome lands on the request span (last write wins:
+    /// the second, cached fetch is a `hit`).
+    #[tokio::test]
+    async fn test_buffered_fetch_traces_phase_span_and_cache_outcome() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::request_span::{with_request_span, CACHE_OUTCOME_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dl/traced.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball".as_ref()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("traced-fetch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("traced-fetch", &server.uri(), tmp.to_str().unwrap());
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let request = axum::http::Request::builder().uri("/x").body(()).unwrap();
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        with_request_span(span.clone(), async {
+            for _ in 0..2 {
+                proxy
+                    .fetch_artifact_with_cache_path(&repo, "dl/traced.tgz", "dl/traced.tgz")
+                    .await
+                    .expect("fetch (upstream, then cache)");
+            }
+        })
+        .instrument(span)
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, CACHE_OUTCOME_FIELD),
+            Some(opentelemetry::Value::from("hit"))
+        );
+        let phases = exported.named("proxy_fetch");
+        assert_eq!(phases.len(), 2, "one proxy_fetch span per fetch");
+        for phase in &phases {
+            assert_eq!(phase.parent_span_id, root.span_context.span_id());
+            assert_eq!(
+                attr(phase, "artifact_keeper.repository.key"),
+                Some(opentelemetry::Value::from("traced-fetch"))
+            );
+            assert_eq!(
+                attr(phase, "artifact_keeper.proxy.mode"),
+                Some(opentelemetry::Value::from("buffered"))
+            );
+        }
+        let upstream = exported.one("GET");
+        assert_eq!(upstream.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert!(
+            phases
+                .iter()
+                .any(|p| p.span_context.span_id() == upstream.parent_span_id),
+            "the upstream CLIENT span is a child of a proxy_fetch span"
+        );
+    }
+
     // -- parse_bearer_challenge: unquoted-value and trailing branches --------
 
     #[test]

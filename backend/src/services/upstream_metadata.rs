@@ -311,10 +311,13 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_pypi_publish_times_fetches_and_reuses_cache() {
+        // The PyPI JSON fetch goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/pypi/demo/json"))
             .and(header("Accept", "application/json"))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "releases": {
                     "1.0.0": [

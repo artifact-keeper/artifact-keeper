@@ -1318,12 +1318,15 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_polls_with_since_and_limit_only() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{header_exists, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The poll goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/_changes"))
+            .and(header_exists("traceparent"))
             .and(query_param("since", "41"))
             .and(query_param("limit", NPM_FEED_BATCH_LIMIT.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(changes_body(
@@ -1550,13 +1553,16 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_bootstraps_head_from_root_update_seq() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The bootstrap goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         // The real root shape, update_seq as a number.
         let numeric = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/"))
+            .and(header_exists("traceparent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "db_name": "registry",
                 "engine": "npm-replicate",
