@@ -451,6 +451,9 @@ else
       echo 'GITHUB_REPOSITORY=artifact-keeper/artifact-keeper'
       echo 'PUBLISH_RUN_ID=99'
       echo 'ADAPTER_VERSION=2.3.4'
+      echo 'ADAPTER_DECISION=stays'
+      echo 'ADAPTER_OWNER_REV=cccccccccccccccccccccccccccccccccccccccc'
+      echo 'ADAPTER_TAG=2.3.4'
       echo 'BACKEND_DIGEST=sha256:1111111111111111111111111111111111111111111111111111111111111111'
       echo 'OPENSCAP_DIGEST=sha256:2222222222222222222222222222222222222222222222222222222222222222'
       echo 'ADAPTER_DIGEST=sha256:3333333333333333333333333333333333333333333333333333333333333333'
@@ -478,7 +481,9 @@ else
         '.candidate_run_id == "4242"' \
         '.gate_run_id == "4242"' \
         '(.digests | keys) == ["backend","openscap","scanner_adapter"]' \
-        '.sha_tag == "sha-aaaaaaa"'
+        '.sha_tag == "sha-aaaaaaa"' \
+        '.scanner_adapter_version == "2.3.4"' \
+        '.scanner_adapter_decision == {"decision":"stays","owner_rev":"cccccccccccccccccccccccccccccccccccccccc","tag":"2.3.4"}'
       do
         if jq -e "$probe" "$pdir/certification/predicate.json" >/dev/null 2>&1; then
           pass "predicate: ${probe}"

@@ -287,7 +287,17 @@ names the same commit.
 
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
-   predicate names the commit, the version, the run and every digest. A
+   predicate names the commit, the version, the run and every digest.
+   The scanner-adapter is certified at the digest the release ships
+   (#4076): this commit's `sha-<sha>` rebuild when its
+   `docker/scanner-adapter/VERSION` is new, but the already-published
+   `:<adapter VERSION>` digest when that version stays (published from an
+   earlier commit with unchanged sources). The predicate records which
+   (`scanner_adapter_decision`: `new`/`stays`, the owning revision, the
+   tag), the verifier anchors the adapter at that tag, and the promote's tag
+   message and summary print the certified adapter digest and decision. The
+   Release Gate itself still deploys the chart's pinned adapter, since it
+   takes no adapter input yet (artifact-keeper-test#380). A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to

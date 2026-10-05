@@ -7,7 +7,10 @@
 # publish job is reproduced here against stubbed registry probes and a
 # throwaway git repository: registries disagreeing, a changed-source rebuild,
 # a VERSION collision, missing provenance, and an unreadable registry (INFRA,
-# never a pass). Offline, ~1s.
+# never a pass). Offline, ~1s. The machine-readable decision the candidate
+# and the promote consume (#4076: decision=new|stays, owner_rev, and the same
+# keys in $GITHUB_OUTPUT) is pinned here too, and so is its absence on every
+# refusing leg.
 #
 # Usage: bash scripts/ci/test-assert-adapter-exact-version.sh
 set -uo pipefail
@@ -98,6 +101,37 @@ FAKE_REV="$C4" \
   expect "published from a commit with another VERSION -> BLOCKED (collision)" 1 "$C2" "version collision"
 
 expect "malformed sha -> INFRA (exit 2)" 2 "nope" "40-character"
+
+# --- the machine-readable decision (#4076) -------------------------------------
+# <label> <sha> <want-exit> <exact GITHUB_OUTPUT contents, '' = must be empty>
+expect_output() {
+  local label="$1" sha="$2" want="$3" wantout="$4" got=0 out gho
+  gho="$WORK/gho.$RANDOM"; : > "$gho"
+  out="$( cd "$REPO" && ADAPTER_SHA="$sha" GITHUB_OUTPUT="$gho" \
+      ADAPTER_TAG_STATE_CMD="$STUB/state" ADAPTER_TAG_REVISION_CMD="$STUB/rev" \
+      bash "$SCRIPT" 2>&1 )" || got=$?
+  if [ "$got" = "$want" ] && [ "$(cat "$gho")" = "$wantout" ] \
+     && { [ -z "$wantout" ] || printf '%s\n' "$out" | grep -qxF -- "$(head -n1 <<<"$wantout")"; }; then
+    pass "$label"
+  else
+    fail "$label (wanted exit ${want}, got ${got}; GITHUB_OUTPUT was:)"
+    sed 's/^/        /' "$gho"
+  fi
+}
+
+FAKE_GHCR_STATE=absent FAKE_HUB_STATE=absent \
+  expect_output "absent on both -> decision=new, no owner, on stdout and GITHUB_OUTPUT" "$C2" 0 \
+  "$(printf 'decision=new\nowner_rev=\nadapter_version=1.2.9')"
+
+FAKE_REV="$C1" \
+  expect_output "unchanged sources -> decision=stays with the owning revision" "$C2" 0 \
+  "$(printf 'decision=stays\nowner_rev=%s\nadapter_version=1.2.9' "$C1")"
+
+FAKE_REV="$C1" \
+  expect_output "sources changed -> BLOCKED writes no decision" "$C3" 1 ""
+
+FAKE_GHCR_STATE=indeterminate \
+  expect_output "registry unreadable -> INFRA writes no decision" "$C2" 2 ""
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all assert-adapter-exact-version.sh cases passed"; exit 0; fi
