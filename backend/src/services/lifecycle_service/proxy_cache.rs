@@ -117,10 +117,9 @@ pub(crate) fn proxy_cache_arm(
                 .to_string(),
         ));
     }
-    let days = parse_i64_field(config, kind.as_wire_str(), "days")?;
     Ok(ProxyCacheArm::Applies(ProxyCacheRule {
         clock,
-        days: i32::try_from(days).unwrap_or(i32::MAX),
+        days: parse_window_days(config, kind)?,
         path_prefix: filters.path_prefix,
     }))
 }

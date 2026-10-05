@@ -9,9 +9,52 @@ Lifecycle policies use explicit repository scope:
 | `true` | `[]` | All current and future repositories |
 
 Global scope with a nonempty assignment list is rejected with HTTP 422.
-All six policy types support these scopes. Version retention groups and storage
+All seven policy types support these scopes. Version retention groups and storage
 quotas are evaluated independently in each repository. Existing `config.exclude`
 protection remains per policy; it does not protect artifacts from other policies.
+
+## Policy configuration
+
+Every policy type accepts these optional `config` keys:
+
+- `exclude`: `{"versions": [...], "version_patterns": [...]}` names versions
+  the policy never deletes.
+- `match.path_prefix` limits the policy to artifacts whose repository-relative
+  path starts with that literal string.
+- `match.version_pattern` limits the policy to artifacts whose version (the tag,
+  for container images) matches a regex. It is a **PostgreSQL** regular
+  expression, checked by PostgreSQL when the policy is created or updated. It is
+  unanchored unless you use `^` / `$`, so `sha-` also matches `release-sha-1`.
+  Use `\y`, not `\b`, for a word boundary. A version-less artifact is in scope
+  only if the pattern matches the empty string.
+
+Scope and exclusions filter before `min_keep` / `max_versions` count their kept
+versions, so out-of-scope and excluded versions never take a kept slot.
+
+`composite` deletes artifacts that meet **every** condition in `conditions`:
+
+```json
+{
+  "conditions": [
+    {"type": "max_age_days", "value": 14},
+    {"type": "no_downloads_days", "value": 7}
+  ],
+  "min_keep": 5,
+  "match": {"version_pattern": "^sha-[0-9a-f]+$"},
+  "exclude": {"versions": ["latest", "stable"]}
+}
+```
+
+- The condition types are `max_age_days` and `no_downloads_days`. Each one
+  matches exactly what the single-condition policy of that name matches.
+- Each type may appear only once.
+- `min_keep` is a top-level key, as on `max_age_days`. It keeps the newest N
+  versions of each package or image whether or not they meet the conditions.
+- Day windows are between 1 and 36500.
+
+A composite policy, like a policy with `exclude`, `min_keep` or
+`match.version_pattern`, never evicts a Remote repository's proxy cache. Assigning
+one to a non-OCI Remote repository returns 422.
 
 ## Safe rollout and compatibility
 

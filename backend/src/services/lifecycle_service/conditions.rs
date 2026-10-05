@@ -101,10 +101,11 @@ pub(crate) fn parse_conditions(config: &serde_json::Value) -> Result<CompositeCo
         let days = object
             .get("value")
             .and_then(|v| v.as_i64())
-            .filter(|days| *days > 0)
+            .and_then(|days| check_window_days(days, "").ok())
             .ok_or_else(|| {
                 conditions_error(format_args!(
-                    "conditions[{index}].value must be a positive integer number of days"
+                    "conditions[{index}].value must be a positive integer number of days, \
+                     at most {MAX_WINDOW_DAYS}"
                 ))
             })?;
         if slot.is_some() {
@@ -112,7 +113,7 @@ pub(crate) fn parse_conditions(config: &serde_json::Value) -> Result<CompositeCo
                 "lists condition '{kind}' more than once; conditions are ANDed, give each type once"
             )));
         }
-        *slot = Some(i32::try_from(days).unwrap_or(i32::MAX));
+        *slot = Some(days);
     }
     Ok(parsed)
 }

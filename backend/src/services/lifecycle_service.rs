@@ -38,7 +38,9 @@
 //! Every policy type also accepts an optional `config.match` scope:
 //! `path_prefix` limits the policy to artifacts whose repository-relative path
 //! starts with the given string, and `version_pattern` to artifacts whose
-//! version (the tag, for OCI formats) matches a regex. `max_age_days`
+//! version (the tag, for OCI formats) matches a regex. The pattern is a
+//! PostgreSQL regex (validated by PostgreSQL at create/update time) and is
+//! unanchored unless it uses `^` / `$`. `max_age_days`
 //! additionally accepts `min_keep`: the newest N artifacts of each package
 //! (grouped and ordered exactly as `max_versions` groups them) survive even
 //! when they are past the age window (#2024):
@@ -859,6 +861,36 @@ pub(crate) fn parse_pattern_field(
     Ok(pattern.to_string())
 }
 
+/// Largest day window a policy accepts (100 years). A window is bound into
+/// `make_interval(days => $N::INT)`; anything near `i32::MAX` days makes
+/// PostgreSQL raise `timestamp out of range` on every run, and an unchecked
+/// `as i32` cast of a larger value wraps to a small window that deletes far
+/// more than written. Create/update refuses anything above this.
+pub(crate) const MAX_WINDOW_DAYS: i64 = 36_500;
+
+/// Check a day window at create/update time: `1..=MAX_WINDOW_DAYS`.
+pub(crate) fn check_window_days(days: i64, label: &str) -> Result<i32> {
+    if (1..=MAX_WINDOW_DAYS).contains(&days) {
+        Ok(days as i32)
+    } else {
+        Err(AppError::Validation(format!(
+            "{label} must be a positive integer number of days, at most {MAX_WINDOW_DAYS}"
+        )))
+    }
+}
+
+/// The day window of a `max_age_days` / `no_downloads_days` config as bound
+/// at execution time, shared by both executors and the proxy-cache arm. It
+/// saturates rather than wraps, so a row stored before [`MAX_WINDOW_DAYS`]
+/// was enforced can never turn into a short window.
+pub(crate) fn parse_window_days(
+    config: &serde_json::Value,
+    policy_type: PolicyType,
+) -> Result<i32> {
+    let days = parse_i64_field(config, policy_type.as_wire_str(), "days")?;
+    Ok(i32::try_from(days).unwrap_or(i32::MAX))
+}
+
 /// Top-level `config` key carrying a policy's exclusion ("keep") list.
 pub(crate) const EXCLUDE_CONFIG_KEY: &str = "exclude";
 
@@ -990,8 +1022,10 @@ pub(crate) struct PolicyFilters {
     /// `path` starts with this string are candidates. `None` matches all.
     pub(crate) path_prefix: Option<String>,
     /// `config.match.version_pattern`: only artifacts whose `version` (the
-    /// tag, for OCI formats) matches this POSIX regex are candidates. `None`
-    /// matches all. Unlike `exclude.version_patterns` this narrows the policy
+    /// tag, for OCI formats) matches this regex are candidates. `None`
+    /// matches all. It is a PostgreSQL (ARE) regex, validated by PostgreSQL
+    /// at create/update time, and unanchored: `sha-` also matches
+    /// `release-sha-1`, so anchor with `^` / `$`. Unlike `exclude.version_patterns` this narrows the policy
     /// rather than protecting from it, and it applies before `min_keep` /
     /// `max_versions` ranking, so "keep the 5 newest" counts in-scope
     /// versions only.
@@ -1041,8 +1075,65 @@ pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>,
         regex::Regex::new(pattern).map_err(|e| {
             AppError::Validation(format!("Invalid regex in match.version_pattern: {e}"))
         })?;
+        reject_backspace_escape(pattern)?;
     }
     Ok((path_prefix, version_pattern))
+}
+
+/// `\b` and `\B` validate as word-boundary escapes in the Rust `regex` crate
+/// but mean "backspace" and "backslash" in a PostgreSQL regex, so a scope
+/// written with them would silently match nothing. PostgreSQL spells word
+/// boundaries `\y` / `\Y`.
+fn reject_backspace_escape(pattern: &str) -> Result<()> {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.next(), Some('b' | 'B')) {
+            return Err(AppError::Validation(
+                "match.version_pattern: \\b and \\B are not word boundaries in a PostgreSQL \
+                 regex; use \\y / \\Y"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// SQLSTATE `invalid_regular_expression`.
+const INVALID_REGULAR_EXPRESSION: &str = "2201B";
+
+/// Map a failed PostgreSQL regex compile to a validation error; anything else
+/// stays a database error.
+fn postgres_regex_error(code: Option<&str>, message: &str) -> AppError {
+    if code == Some(INVALID_REGULAR_EXPRESSION) {
+        AppError::Validation(format!(
+            "match.version_pattern is not a valid PostgreSQL regular expression: {message}"
+        ))
+    } else {
+        AppError::Database(message.to_string())
+    }
+}
+
+/// Compile `match.version_pattern` with the engine that runs it. The pattern
+/// is executed by PostgreSQL (`version ~ $N`), whose regex dialect differs
+/// from the Rust `regex` crate `parse_match` checks with: `\z`, `\pL`,
+/// `(?P<name>...)` or a mid-pattern `(?i)` pass the Rust check and then fail
+/// every run. Called at create/update time, inside the write transaction.
+pub(crate) async fn validate_version_pattern_in_postgres(
+    conn: &mut sqlx::PgConnection,
+    config: &serde_json::Value,
+) -> Result<()> {
+    let (_, Some(pattern)) = parse_match(config)? else {
+        return Ok(());
+    };
+    sqlx::query("SELECT '' ~ $1")
+        .bind(&pattern)
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| match e.as_database_error() {
+            Some(db) => postgres_regex_error(db.code().as_deref(), db.message()),
+            None => AppError::Database(e.to_string()),
+        })
 }
 
 /// Parse a policy's [`PolicyFilters`] from its `config`.
@@ -1635,12 +1726,12 @@ impl LifecycleService {
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
-        let days = parse_i64_field(&policy.config, PolicyType::MaxAgeDays.as_wire_str(), "days")?;
+        let days = parse_window_days(&policy.config, PolicyType::MaxAgeDays)?;
         let filters = parse_policy_filters(&policy.config)?;
         let min_keep = parse_min_keep(&policy.config)?;
         let binds = RetentionBinds {
             repository_id: policy.repository_id,
-            windows: &[Some(days as i32)],
+            windows: &[Some(days)],
             filters: &filters,
             min_keep,
         };
@@ -1777,17 +1868,13 @@ impl LifecycleService {
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
-        let days = parse_i64_field(
-            &policy.config,
-            PolicyType::NoDownloadsDays.as_wire_str(),
-            "days",
-        )?;
+        let days = parse_window_days(&policy.config, PolicyType::NoDownloadsDays)?;
 
         let repo_filter = policy.repository_id;
         let filters = parse_policy_filters(&policy.config)?;
 
         let matched = sqlx::query_as::<_, CountBytes>(NO_DOWNLOADS_SELECT_SQL);
-        let matched = bind_policy_filters!(matched.bind(repo_filter).bind(days as i32), filters)
+        let matched = bind_policy_filters!(matched.bind(repo_filter).bind(days), filters)
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1795,7 +1882,7 @@ impl LifecycleService {
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
             let update = sqlx::query(NO_DOWNLOADS_UPDATE_SQL);
-            let result = bind_policy_filters!(update.bind(repo_filter).bind(days as i32), filters)
+            let result = bind_policy_filters!(update.bind(repo_filter).bind(days), filters)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2052,11 +2139,12 @@ impl LifecycleService {
 
         match policy_type {
             "max_age_days" => {
-                read_positive_i64("days").ok_or_else(|| {
+                let days = read_positive_i64("days").ok_or_else(|| {
                     AppError::Validation(
                         "max_age_days requires 'days' (positive integer) in config".to_string(),
                     )
                 })?;
+                check_window_days(days, "max_age_days 'days'")?;
             }
             "max_versions" => {
                 read_positive_i64("keep").ok_or_else(|| {
@@ -2066,12 +2154,13 @@ impl LifecycleService {
                 })?;
             }
             "no_downloads_days" => {
-                read_positive_i64("days").ok_or_else(|| {
+                let days = read_positive_i64("days").ok_or_else(|| {
                     AppError::Validation(
                         "no_downloads_days requires 'days' (positive integer) in config"
                             .to_string(),
                     )
                 })?;
+                check_window_days(days, "no_downloads_days 'days'")?;
             }
             "tag_pattern_keep" | "tag_pattern_delete" => {
                 let pattern = config

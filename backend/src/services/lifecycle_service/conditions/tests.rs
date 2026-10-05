@@ -37,10 +37,9 @@ fn parse_conditions_reads_each_window_2024() {
         [None, Some(7)]
     );
     let huge = conditions(json!([{"type": "max_age_days", "value": i64::from(i32::MAX) + 1}]));
-    assert_eq!(
-        parse_conditions(&huge).unwrap().max_age_days,
-        Some(i32::MAX),
-        "an out-of-range window saturates instead of wrapping negative"
+    assert!(
+        parse_conditions(&huge).is_err(),
+        "an out-of-range window is refused, never wrapped or saturated"
     );
 }
 
@@ -287,20 +286,139 @@ async fn single_condition_composite_matches_its_plain_policy_2024() {
             Some(repo),
             conditions(json!([{"type": single_type, "value": days}])),
         );
-        let mut counts = Vec::new();
+        // Run each live on the same fixture and compare the exact rows
+        // deleted, not just counts.
+        let mut deleted = Vec::new();
         for policy in [plain, composite] {
-            let preview = LifecycleService::dispatch_execute(&mut tx, &policy, true)
+            preview_then_run(&mut tx, &policy).await;
+            deleted.push(deleted_ids(&mut tx, repo).await);
+            sqlx::query("UPDATE artifacts SET is_deleted = false WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&mut *tx)
                 .await
-                .expect("preview");
-            counts.push((preview.artifacts_matched, preview.bytes_matched));
+                .expect("restore fixture");
         }
-        assert_eq!(counts[0], counts[1], "{single_type}");
+        assert_eq!(deleted[0], deleted[1], "{single_type}");
         assert!(
-            counts[0].0 > 0,
+            !deleted[0].is_empty(),
             "{single_type} fixture must match something"
         );
     }
     tx.rollback().await.expect("rollback test transaction");
+}
+
+async fn deleted_ids(
+    conn: &mut sqlx::PgConnection,
+    repo: Uuid,
+) -> std::collections::BTreeSet<Uuid> {
+    sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted")
+        .bind(repo)
+        .fetch_all(conn)
+        .await
+        .expect("deleted ids")
+        .into_iter()
+        .collect()
+}
+
+/// One retention group ("pkg"), newest first. `min_keep` reserves the newest
+/// N slots whether or not a row meets the conditions; past them, a row goes
+/// only when it meets every condition.
+#[tokio::test]
+async fn composite_conditions_with_min_keep_2024() {
+    let Some(pool) = crate::testing::try_pool_with(1).await else {
+        return;
+    };
+    for (config, survivors) in [
+        // Both conditions, keep 2: fresh and old_idle hold the slots, pulled
+        // is not idle, the two oldest idle rows go.
+        (
+            {
+                let mut c = age_and_idle(60, 30);
+                c["min_keep"] = json!(2);
+                c
+            },
+            [true, true, true, false, false],
+        ),
+        // Downloads only, keep 1: fresh holds the slot; every idle row past
+        // it goes, pulled stays.
+        (
+            {
+                let mut c = conditions(json!([{"type": "no_downloads_days", "value": 30}]));
+                c["min_keep"] = json!(1);
+                c
+            },
+            [true, false, true, false, false],
+        ),
+    ] {
+        let mut tx = pool.begin().await.expect("begin test transaction");
+        let repo = insert_max_age_test_repository(&mut tx).await;
+        let mut ids = Vec::new();
+        for (label, age) in [
+            ("fresh", 1),
+            ("old-idle", 100),
+            ("pulled", 150),
+            ("older", 200),
+            ("oldest", 300),
+        ] {
+            let path = format!("pkg/{label}-{repo}");
+            ids.push(artifact_named(&mut tx, repo, "pkg", &path, label, age).await);
+        }
+        downloaded(&mut tx, ids[2], 5).await;
+        preview_then_run(&mut tx, &policy("composite", Some(repo), config.clone())).await;
+        for (id, survives) in ids.iter().zip(survivors) {
+            assert_eq!(!is_deleted(&mut tx, *id).await, survives, "{config}: {id}");
+        }
+        tx.rollback().await.expect("rollback test transaction");
+    }
+}
+
+/// `exclude` protects within a composite policy exactly as on the plain types.
+#[tokio::test]
+async fn composite_honours_exclusions_2024() {
+    let Some(pool) = crate::testing::try_pool_with(1).await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin test transaction");
+    let repo = insert_max_age_test_repository(&mut tx).await;
+    let key = || format!("generic/{}", Uuid::new_v4());
+    let stable =
+        insert_max_age_test_artifact(&mut tx, repo, &format!("s-{repo}"), "stable", &key(), 100)
+            .await;
+    let old =
+        insert_max_age_test_artifact(&mut tx, repo, &format!("o-{repo}"), "1.0", &key(), 100).await;
+    let mut config = conditions(json!([{"type": "max_age_days", "value": 30}]));
+    config["exclude"] = json!({"versions": ["stable"]});
+    let result = preview_then_run(&mut tx, &policy("composite", Some(repo), config)).await;
+    assert_eq!(result.artifacts_matched, 1, "{result:?}");
+    assert!(is_deleted(&mut tx, old).await);
+    assert!(
+        !is_deleted(&mut tx, stable).await,
+        "excluded version deleted"
+    );
+    tx.rollback().await.expect("rollback test transaction");
+}
+
+/// A version-less artifact is outside a version scope unless the pattern
+/// matches the empty string: the predicate never compares NULL.
+#[tokio::test]
+async fn version_scope_and_null_version_2024() {
+    let Some(pool) = crate::testing::try_pool_with(1).await else {
+        return;
+    };
+    for (pattern, deleted) in [("^sha-", false), ("^$|^sha-", true)] {
+        let mut tx = pool.begin().await.expect("begin test transaction");
+        let repo = insert_max_age_test_repository(&mut tx).await;
+        let id = artifact(&mut tx, repo, "unversioned", 365).await;
+        sqlx::query("UPDATE artifacts SET version = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect("null version");
+        let config = json!({"days": 1, "match": {"version_pattern": pattern}});
+        preview_then_run(&mut tx, &policy("max_age_days", Some(repo), config)).await;
+        assert_eq!(is_deleted(&mut tx, id).await, deleted, "{pattern}");
+        tx.rollback().await.expect("rollback test transaction");
+    }
 }
 
 /// The issue's use case: delete `sha-*` build images older than 14 days but
@@ -354,6 +472,8 @@ async fn match_version_pattern_scopes_every_policy_type_2024() {
         ("tag_pattern_delete", json!({"pattern": "^max-age-test-"})),
         ("max_versions", json!({"keep": 0})),
         ("size_quota_bytes", json!({"quota_bytes": 100})),
+        // Deletes every name not matching: the scope alone keeps `v1.0.0`.
+        ("tag_pattern_keep", json!({"pattern": "^nomatch$"})),
         (
             "composite",
             conditions(json!([{"type": "max_age_days", "value": 1}])),
@@ -395,4 +515,144 @@ async fn composite_requires_a_repository_2024() {
     .await
     .expect_err("no repository");
     assert!(err.to_string().contains("repository_id"), "{err}");
+}
+
+// ── day windows and the PostgreSQL regex dialect ──────────────────────────
+
+#[tokio::test]
+async fn day_windows_are_bounded_and_never_wrap_2024() {
+    let service = make_service_for_validation();
+    let over = MAX_WINDOW_DAYS + 1;
+    for (policy_type, config) in [
+        ("max_age_days", json!({"days": over})),
+        ("max_age_days", json!({"max_age_days": 4_294_967_297_i64})),
+        ("no_downloads_days", json!({"days": over})),
+        ("no_downloads_days", json!({"no_downloads_days": over})),
+        (
+            "composite",
+            conditions(json!([{"type": "max_age_days", "value": over}])),
+        ),
+        (
+            "composite",
+            conditions(json!([{"type": "no_downloads_days", "value": 4_294_967_297_i64}])),
+        ),
+    ] {
+        let err = service
+            .validate_policy_config(policy_type, &config)
+            .expect_err(&format!("{policy_type} {config} must be refused"));
+        assert!(err.to_string().contains("36500"), "{err}");
+    }
+    for (policy_type, config) in [
+        ("max_age_days", json!({"days": MAX_WINDOW_DAYS})),
+        ("no_downloads_days", json!({"days": MAX_WINDOW_DAYS})),
+        (
+            "composite",
+            conditions(json!([{"type": "max_age_days", "value": MAX_WINDOW_DAYS}])),
+        ),
+    ] {
+        service
+            .validate_policy_config(policy_type, &config)
+            .unwrap_or_else(|e| panic!("{policy_type}: {e}"));
+    }
+    // A row stored before the bound saturates instead of wrapping to 1 day.
+    assert_eq!(
+        parse_window_days(&json!({"days": 4_294_967_297_i64}), PolicyType::MaxAgeDays).unwrap(),
+        i32::MAX
+    );
+    assert_eq!(
+        parse_window_days(
+            &json!({"no_downloads_days": 30}),
+            PolicyType::NoDownloadsDays
+        )
+        .unwrap(),
+        30
+    );
+}
+
+#[tokio::test]
+async fn version_pattern_rejects_rust_only_word_boundaries_2024() {
+    let service = make_service_for_validation();
+    for pattern in [r"\bsha", r"^v\B"] {
+        let err = service
+            .validate_policy_config(
+                "max_age_days",
+                &json!({"days": 1, "match": {"version_pattern": pattern}}),
+            )
+            .expect_err(pattern);
+        assert!(err.to_string().contains(r"\y"), "{err}");
+    }
+    // An escaped backslash followed by `b` is a literal, not a boundary.
+    service
+        .validate_policy_config(
+            "max_age_days",
+            &json!({"days": 1, "match": {"version_pattern": r"^a\\b"}}),
+        )
+        .expect("escaped backslash");
+    assert!(matches!(
+        postgres_regex_error(Some("2201B"), "bad"),
+        AppError::Validation(m) if m.contains("PostgreSQL regular expression: bad")
+    ));
+    assert!(matches!(
+        postgres_regex_error(Some("57014"), "cancelled"),
+        AppError::Database(_)
+    ));
+}
+
+/// Patterns the Rust `regex` crate accepts but PostgreSQL cannot compile are
+/// refused at create and update, instead of failing every scheduled run. An
+/// escaped metacharacter, valid in both, still works end to end.
+#[tokio::test]
+async fn version_pattern_is_validated_by_postgres_2024() {
+    let Some(pool) = crate::testing::try_pool_with(1).await else {
+        return;
+    };
+    let service = LifecycleService::new(pool.clone());
+    let create = |pattern: &str| CreateLifecyclePolicyRequest {
+        name: format!("pg-regex-2024-{}", Uuid::new_v4()),
+        policy_type: "max_age_days".into(),
+        config: json!({"days": 1, "match": {"version_pattern": pattern}}),
+        ..Default::default()
+    };
+    for pattern in [r"^v\d+\z", r"\pL", r"(?P<n>sha)", r"^sha-(?i)abc"] {
+        regex::Regex::new(pattern).expect("the Rust crate accepts it");
+        match service.create_policy(create(pattern)).await {
+            Err(AppError::Validation(m)) => assert!(m.contains("PostgreSQL"), "{pattern}: {m}"),
+            other => panic!("{pattern}: expected a validation error, got {other:?}"),
+        }
+    }
+    let created = service
+        .create_policy(create(r"^v1\.0"))
+        .await
+        .expect("an escaped dot is valid in both dialects");
+    match service
+        .update_policy(
+            created.id,
+            UpdateLifecyclePolicyRequest {
+                config: Some(json!({"days": 1, "match": {"version_pattern": r"\pL"}})),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Err(AppError::Validation(m)) => assert!(m.contains("PostgreSQL"), "{m}"),
+        other => panic!("update: expected a validation error, got {other:?}"),
+    }
+    service.delete_policy(created.id).await.expect("cleanup");
+
+    let mut tx = pool.begin().await.expect("begin test transaction");
+    let repo = insert_max_age_test_repository(&mut tx).await;
+    let mut ids = Vec::new();
+    for version in ["v1.0", "v1x0"] {
+        let key = format!("generic/{}", Uuid::new_v4());
+        let path = format!("{version}-{repo}");
+        ids.push(insert_max_age_test_artifact(&mut tx, repo, &path, version, &key, 365).await);
+    }
+    let config = json!({"days": 1, "match": {"version_pattern": r"^v1\.0"}});
+    preview_then_run(&mut tx, &policy("max_age_days", Some(repo), config)).await;
+    assert!(is_deleted(&mut tx, ids[0]).await);
+    assert!(
+        !is_deleted(&mut tx, ids[1]).await,
+        "the dot must be literal"
+    );
+    tx.rollback().await.expect("rollback test transaction");
 }

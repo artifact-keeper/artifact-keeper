@@ -9,7 +9,11 @@
 -- existing row satisfies it by construction. It is added NOT VALID to skip
 -- the scan (a catalogue-only change under the brief ACCESS EXCLUSIVE lock),
 -- and no VALIDATE follows (docs/operations/online-migrations.md, section 2).
--- New and updated rows are still checked.
+-- New and updated rows are still checked. lock_timeout bounds the wait for
+-- the ACCESS EXCLUSIVE lock (for example behind a long lifecycle run) so the
+-- upgrade fails fast and retries instead of queueing every policy read.
+
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE lifecycle_policies
     DROP CONSTRAINT IF EXISTS lifecycle_policies_policy_type_check;
