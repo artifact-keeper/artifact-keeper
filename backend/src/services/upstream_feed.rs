@@ -326,20 +326,31 @@ fn feed_root_url(feed_url: &Url) -> Result<Url> {
     root.set_query(None);
     root.set_fragment(None);
     {
-        let mut segs = root.path_segments_mut().map_err(|()| {
-            AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base"))
-        })?;
+        let mut segs = root
+            .path_segments_mut()
+            .map_err(|()| not_a_base_error(feed_url))?;
         // Drop the empty segment a trailing slash leaves behind first.
         segs.pop_if_empty();
     }
     let ends_in_changes = root.path_segments().and_then(|mut s| s.next_back()) == Some("_changes");
     if ends_in_changes {
         root.path_segments_mut()
-            .map_err(|()| AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base")))?
+            .map_err(|()| not_a_base_error(feed_url))?
             .pop()
             .push("");
     }
     Ok(root)
+}
+
+/// The error for a feed URL that cannot be a base. It names only the scheme:
+/// a non-hierarchical "URL" such as `user:pw@host` parses with the secret in
+/// its path, where [`without_userinfo`] cannot strip it, and this message can
+/// reach `last_error` in the admin status response (#3069).
+fn not_a_base_error(feed_url: &Url) -> AppError {
+    AppError::Config(format!(
+        "npm feed URL (scheme '{}') cannot be a base",
+        feed_url.scheme()
+    ))
 }
 
 /// Adapter for npm's public replication feed. Polls `_changes?since&limit`
@@ -1259,6 +1270,14 @@ mod tests {
         }
         assert_eq!(failure_log_level(20), FeedLogLevel::Warn);
         assert_eq!(failure_log_level(30), FeedLogLevel::Warn);
+    }
+
+    #[test]
+    fn feed_root_url_error_never_echoes_the_configured_url() {
+        let url = Url::parse("user:s3cret@registry.example").unwrap();
+        let err = feed_root_url(&url).expect_err("non-base URL").to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+        assert!(err.contains("scheme 'user'"), "{err}");
     }
 
     #[test]
