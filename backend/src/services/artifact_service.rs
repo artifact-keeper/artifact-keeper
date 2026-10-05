@@ -979,17 +979,6 @@ impl ArtifactService {
             self.record_version(&artifact, prior_head, version).await?;
         }
 
-        if safetensors_eligible {
-            record_safetensors_metadata(
-                &self.db,
-                self.storage.as_ref(),
-                artifact.id,
-                storage_key,
-                size_bytes,
-            )
-            .await;
-        }
-
         // Apply quarantine hold if enabled for this repository. This is the
         // shared upload path (pypi/debian/incus/generic), which only ever
         // handles hosted uploads, so it calls the helper directly.
@@ -1185,6 +1174,21 @@ impl ArtifactService {
             artifact.id,
         )
         .await;
+
+        // #2382: summarise a `.safetensors` header into `artifact_metadata`.
+        // Placed after the quarantine hold and the scan trigger so its
+        // storage read and parse never widen the window in which a fresh row
+        // is visible without a hold.
+        if safetensors_eligible {
+            record_safetensors_metadata(
+                &self.db,
+                self.storage.as_ref(),
+                artifact.id,
+                storage_key,
+                size_bytes,
+            )
+            .await;
+        }
 
         // Trigger quality checks on upload (non-blocking)
         if let Some(ref qc) = self.quality_check_service {
@@ -2768,11 +2772,12 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
 /// prefix and the capped header through ranged storage reads
 /// (`formats::mlmodel::read_safetensors_summary`), never the tensor data.
 ///
-/// Best-effort: the upload has already committed, so a failure here is
-/// logged and never fails it. A malformed header records the rejection
-/// reason (`safetensors_error`), replacing any stale summary from earlier
-/// bytes at the same path; a storage read failure records nothing. Existing
-/// `properties` on the row are preserved.
+/// Best-effort: the upload has already committed, so nothing here fails it.
+/// Every outcome replaces the row's `metadata` with server-derived data: the
+/// summary, or `safetensors_error` (the bounded rejection reason, or a fixed
+/// marker when storage could not be read). A stale summary of earlier bytes
+/// at the same path, or a client-supplied document, therefore never
+/// survives. Existing `properties` on the row are preserved.
 pub(crate) async fn record_safetensors_metadata(
     db: &PgPool,
     storage: &dyn StorageBackend,
@@ -2780,19 +2785,21 @@ pub(crate) async fn record_safetensors_metadata(
     storage_key: &str,
     size_bytes: i64,
 ) {
-    use crate::formats::mlmodel;
+    use crate::formats::mlmodel::{self, SafetensorsError};
 
     let file_size = u64::try_from(size_bytes).unwrap_or(0);
     let result = mlmodel::read_safetensors_summary(storage, storage_key, file_size).await;
-    let Some(metadata) = mlmodel::safetensors_artifact_metadata(&result) else {
-        if let Err(e) = &result {
+    // Both reasons are already clipped to `SAFETENSORS_MAX_REASON_CHARS`.
+    match &result {
+        Err(SafetensorsError::Unreadable(e)) => {
             tracing::warn!(%artifact_id, error = %e, "safetensors header could not be read");
         }
-        return;
-    };
-    if let Err(e) = &result {
-        tracing::info!(%artifact_id, reason = %e, "safetensors header rejected");
+        Err(SafetensorsError::Invalid(reason)) => {
+            tracing::info!(%artifact_id, %reason, "safetensors header rejected");
+        }
+        Ok(_) => {}
     }
+    let metadata = sanitize_metadata_urls(mlmodel::safetensors_artifact_metadata(result));
     let stored = sqlx::query(
         "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
          VALUES ($1, 'mlmodel', $2) \
@@ -2800,7 +2807,7 @@ pub(crate) async fn record_safetensors_metadata(
              format = EXCLUDED.format, metadata = EXCLUDED.metadata",
     )
     .bind(artifact_id)
-    .bind(sanitize_metadata_urls(metadata))
+    .bind(metadata)
     .execute(db)
     .await;
     if let Err(e) = stored {
@@ -4882,6 +4889,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // A storage read failure clears the summary rather than leaving one
+        // that may describe earlier bytes, and keeps the properties.
+        record_safetensors_metadata(&pool, storage.as_ref(), artifact.id, "no/such/key", 64).await;
+        let meta = svc.get_metadata(artifact.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert_eq!(
+            meta.metadata["safetensors_error"],
+            crate::formats::mlmodel::SAFETENSORS_UNREADABLE_REASON
+        );
+        assert_eq!(meta.properties["k"], "v");
+
         let mut broken = 4u64.to_le_bytes().to_vec();
         broken.extend_from_slice(b"nope-and-data");
         let again = upload(broken)
@@ -4892,7 +4910,7 @@ mod tests {
         assert!(meta.metadata["safetensors_error"]
             .as_str()
             .unwrap()
-            .contains("not a JSON object"));
+            .contains("header rejected"));
         assert_eq!(meta.properties["k"], "v");
 
         // A non-safetensors file in the same repo records nothing.

@@ -132,27 +132,79 @@ impl FormatHandler for MlModelHandler {
 //
 // A `.safetensors` file is `[u64 LE header length N][N bytes of JSON][tensor
 // data]`. The JSON header maps each tensor name to `{dtype, shape,
-// data_offsets}` plus an optional free-form `__metadata__` string map, so the
+// data_offsets}` plus an optional `__metadata__` string-to-string map, so the
 // model's structure is recoverable from a bounded prefix without touching the
 // (multi-GB) tensor data. The parse below is pure; the storage read lives in
 // `read_safetensors_summary`, which issues two ranged reads and never buffers
 // the whole object.
+//
+// The header is untrusted input, so every stage is bounded: the bytes read
+// (`SAFETENSORS_MAX_HEADER_BYTES`), the reads/parses in flight
+// (`SAFETENSORS_MAX_CONCURRENT_PARSES`), the parse itself (a streaming visitor
+// straight into typed entries: no `serde_json::Value` tree is ever built),
+// the stored document (< 1 MiB through per-section budgets) and every
+// rejection reason (`SAFETENSORS_MAX_REASON_CHARS`).
 
-/// Upper bound on the JSON header we read and parse, matching the reference
-/// `safetensors` implementation's `MAX_HEADER_SIZE` (100 MB). A file
-/// declaring more is recorded as invalid instead of being read.
-pub const SAFETENSORS_MAX_HEADER_BYTES: u64 = 100_000_000;
+/// Upper bound on the JSON header we read and parse: 8 MiB. The format
+/// allows up to 100 MB, but real headers are tens of KB to a couple of MB
+/// even for models with thousands of tensors. A file declaring more is
+/// recorded as `safetensors_error` instead of being read. Measured worst
+/// case (a header packed with ~150k minimal tensor entries): about 33 MB
+/// of parse state on top of the 8 MiB buffer.
+pub const SAFETENSORS_MAX_HEADER_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Upper bound on the per-tensor entries copied into `artifact_metadata`. The
-/// counts and parameter totals still cover every tensor; only the listing is
-/// cut (alphabetically by name) and flagged `tensors_truncated`.
+/// Header reads and parses allowed at once in this process. With the header
+/// cap this bounds the feature's memory to a few tens of MiB however many
+/// uploads land together; further uploads wait for a permit.
+pub const SAFETENSORS_MAX_CONCURRENT_PARSES: usize = 2;
+
+static SAFETENSORS_PARSE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SAFETENSORS_MAX_CONCURRENT_PARSES);
+
+/// Upper bound on the per-tensor entries copied into `artifact_metadata`.
+/// The counts and parameter totals still cover every tensor; only the
+/// listing is cut (alphabetically by name) and flagged `tensors_truncated`.
 pub const SAFETENSORS_MAX_RECORDED_TENSORS: usize = 10_000;
+
+/// Serialised-size budget for the recorded per-tensor listing.
+pub const SAFETENSORS_TENSORS_BUDGET_BYTES: usize = 768 * 1024;
+
+/// Serialised-size budget for the recorded `__metadata__` map. Together with
+/// the tensor budget this keeps the stored document under 1 MiB.
+pub const SAFETENSORS_METADATA_BUDGET_BYTES: usize = 128 * 1024;
+
+/// `__metadata__` entries recorded at most; further entries, and entries
+/// whose key or value exceed the limits below, are dropped and flagged
+/// `metadata_truncated`.
+pub const SAFETENSORS_MAX_METADATA_ENTRIES: usize = 256;
+pub const SAFETENSORS_MAX_METADATA_KEY_BYTES: usize = 256;
+pub const SAFETENSORS_MAX_METADATA_VALUE_BYTES: usize = 16 * 1024;
+
+/// A header naming a tensor longer than this is rejected.
+pub const SAFETENSORS_MAX_TENSOR_NAME_BYTES: usize = 1024;
+
+/// A header with a tensor of higher rank than this is rejected.
+pub const SAFETENSORS_MAX_RANK: usize = 32;
+
+/// Rejection reasons are cut to this many characters before being stored or
+/// logged (serde echoes offending input into its messages).
+pub const SAFETENSORS_MAX_REASON_CHARS: usize = 256;
+
+/// The dtypes the safetensors format defines.
+pub const SAFETENSORS_DTYPES: &[&str] = &[
+    "BOOL", "F4", "F6_E2M3", "F6_E3M2", "U8", "I8", "F8_E5M2", "F8_E4M3", "F8_E8M0", "I16", "U16",
+    "F16", "BF16", "I32", "U32", "F32", "C64", "F64", "I64", "U64",
+];
 
 /// `artifact_metadata.metadata` key holding a parsed header summary.
 pub const SAFETENSORS_METADATA_KEY: &str = "safetensors";
 
-/// `artifact_metadata.metadata` key holding the reason a header was rejected.
+/// `artifact_metadata.metadata` key holding the reason no summary exists.
 pub const SAFETENSORS_ERROR_KEY: &str = "safetensors_error";
+
+/// The `safetensors_error` recorded when the stored object cannot be read.
+/// The storage error itself is logged, not stored.
+pub const SAFETENSORS_UNREADABLE_REASON: &str = "header could not be read from storage";
 
 /// The reserved header entry carrying free-form string metadata.
 const SAFETENSORS_FREEFORM_KEY: &str = "__metadata__";
@@ -171,7 +223,8 @@ pub fn safetensors_metadata_eligible(format: &RepositoryFormat, path: &str) -> b
 /// One tensor's dtype and shape as recorded in `artifact_metadata`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SafetensorsTensor {
-    pub dtype: String,
+    /// Interned from [`SAFETENSORS_DTYPES`]: no allocation per tensor.
+    pub dtype: &'static str,
     pub shape: Vec<u64>,
 }
 
@@ -185,25 +238,27 @@ pub struct SafetensorsSummary {
     /// Sum over all tensors of the product of their shape.
     pub total_parameters: u64,
     /// Parameter count per dtype (e.g. `{"BF16": 6738415616}`).
-    pub parameters_by_dtype: BTreeMap<String, u64>,
-    /// Per-tensor dtype/shape, by name; at most
-    /// [`SAFETENSORS_MAX_RECORDED_TENSORS`] entries.
+    pub parameters_by_dtype: BTreeMap<&'static str, u64>,
+    /// Per-tensor dtype/shape by name: an alphabetical prefix of at most
+    /// [`SAFETENSORS_MAX_RECORDED_TENSORS`] entries within
+    /// [`SAFETENSORS_TENSORS_BUDGET_BYTES`].
     pub tensors: BTreeMap<String, SafetensorsTensor>,
-    /// True when `tensors` was cut to the recording cap.
+    /// True when `tensors` is not the complete listing.
     pub tensors_truncated: bool,
-    /// The header's `__metadata__` map, if present.
+    /// The header's `__metadata__` map, if present (within the limits above).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub metadata: Option<BTreeMap<String, String>>,
+    /// True when `__metadata__` entries were dropped by those limits.
+    pub metadata_truncated: bool,
 }
 
 /// Why a safetensors header could not be summarised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SafetensorsError {
-    /// The object could not be read from storage. Transient: nothing is
-    /// recorded, so a later re-upload or backfill can still succeed.
+    /// The object could not be read from storage.
     Unreadable(String),
-    /// The bytes are not a valid safetensors header. Recorded on the
-    /// artifact so the operator can see why no model metadata exists.
+    /// The bytes are not a valid (or not an acceptably bounded) safetensors
+    /// header.
     Invalid(String),
 }
 
@@ -215,8 +270,38 @@ impl std::fmt::Display for SafetensorsError {
     }
 }
 
-fn invalid(msg: impl Into<String>) -> SafetensorsError {
-    SafetensorsError::Invalid(msg.into())
+/// `s` cut to at most `max` characters, marked with `...` when cut.
+fn clip(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
+fn invalid(msg: impl AsRef<str>) -> SafetensorsError {
+    SafetensorsError::Invalid(clip(msg.as_ref(), SAFETENSORS_MAX_REASON_CHARS))
+}
+
+fn unreadable(msg: impl AsRef<str>) -> SafetensorsError {
+    SafetensorsError::Unreadable(clip(msg.as_ref(), SAFETENSORS_MAX_REASON_CHARS))
+}
+
+/// Serialised JSON length of `value`, without materialising it.
+fn json_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // Writing to a counter cannot fail, and these types always serialise.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
 }
 
 /// Validate the header length declared by the first 8 bytes of a file of
@@ -253,6 +338,195 @@ struct RawTensorInfo {
     data_offsets: [u64; 2],
 }
 
+/// Every header entry, validated and accumulated as it is parsed.
+#[derive(Default)]
+struct HeaderEntries {
+    tensors: BTreeMap<String, SafetensorsTensor>,
+    parameters_by_dtype: BTreeMap<&'static str, u64>,
+    total_parameters: u64,
+    metadata: Option<BTreeMap<String, String>>,
+    metadata_truncated: bool,
+}
+
+impl HeaderEntries {
+    fn add_tensor(
+        &mut self,
+        name: String,
+        info: RawTensorInfo,
+        data_len: u64,
+    ) -> std::result::Result<(), String> {
+        if name.len() > SAFETENSORS_MAX_TENSOR_NAME_BYTES {
+            return Err(format!(
+                "a tensor name exceeds {SAFETENSORS_MAX_TENSOR_NAME_BYTES} bytes"
+            ));
+        }
+        let shown = clip(&name, 64);
+        if self.tensors.contains_key(&name) {
+            return Err(format!("duplicate tensor `{shown}`"));
+        }
+        let Some(dtype) = SAFETENSORS_DTYPES
+            .iter()
+            .copied()
+            .find(|known| *known == info.dtype)
+        else {
+            return Err(format!(
+                "tensor `{shown}` has unknown dtype `{}`",
+                clip(&info.dtype, 16)
+            ));
+        };
+        if info.shape.len() > SAFETENSORS_MAX_RANK {
+            return Err(format!(
+                "tensor `{shown}` has rank {} (limit {SAFETENSORS_MAX_RANK})",
+                info.shape.len()
+            ));
+        }
+        let [begin, end] = info.data_offsets;
+        if begin > end || end > data_len {
+            return Err(format!(
+                "tensor `{shown}` data_offsets [{begin}, {end}] fall outside the {data_len}-byte data region"
+            ));
+        }
+        // A rank-0 tensor (empty shape) is a scalar: one parameter.
+        let params = info
+            .shape
+            .iter()
+            .try_fold(1u64, |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| format!("tensor `{shown}` shape overflows u64"))?;
+        self.total_parameters = self
+            .total_parameters
+            .checked_add(params)
+            .ok_or("total parameter count overflows u64")?;
+        // Each per-dtype sum is bounded by the checked total above.
+        *self.parameters_by_dtype.entry(dtype).or_insert(0) += params;
+        self.tensors.insert(
+            name,
+            SafetensorsTensor {
+                dtype,
+                shape: info.shape,
+            },
+        );
+        Ok(())
+    }
+
+    /// The summary to record, with the listing and `__metadata__` cut to
+    /// their entry and size budgets.
+    fn into_summary(self, header_bytes: u64) -> SafetensorsSummary {
+        let tensor_count = self.tensors.len();
+        let mut tensors = BTreeMap::new();
+        let mut used = 0usize;
+        for (name, tensor) in self.tensors {
+            let cost = json_len(&name) + json_len(&tensor) + 2;
+            if tensors.len() >= SAFETENSORS_MAX_RECORDED_TENSORS
+                || used + cost > SAFETENSORS_TENSORS_BUDGET_BYTES
+            {
+                break;
+            }
+            used += cost;
+            tensors.insert(name, tensor);
+        }
+        let tensors_truncated = tensors.len() < tensor_count;
+
+        SafetensorsSummary {
+            header_bytes,
+            tensor_count,
+            total_parameters: self.total_parameters,
+            parameters_by_dtype: self.parameters_by_dtype,
+            tensors,
+            tensors_truncated,
+            metadata: self.metadata,
+            metadata_truncated: self.metadata_truncated,
+        }
+    }
+}
+
+/// Streams `__metadata__` entry by entry, keeping only those within the
+/// entry, key, value and size limits, so an oversized map is never held in
+/// memory. Any other shape than a string-to-string map is an error.
+struct MetadataSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for MetadataSeed {
+    type Value = (BTreeMap<String, String>, bool);
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for MetadataSeed {
+    type Value = (BTreeMap<String, String>, bool);
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a string-to-string map")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut kept = BTreeMap::new();
+        let mut truncated = false;
+        let mut used = 0usize;
+        while let Some(key) = map.next_key::<String>()? {
+            let value: String = map.next_value()?;
+            let cost = json_len(&key) + json_len(&value) + 2;
+            if kept.len() >= SAFETENSORS_MAX_METADATA_ENTRIES
+                || key.len() > SAFETENSORS_MAX_METADATA_KEY_BYTES
+                || value.len() > SAFETENSORS_MAX_METADATA_VALUE_BYTES
+                || used + cost > SAFETENSORS_METADATA_BUDGET_BYTES
+            {
+                truncated = true;
+                continue;
+            }
+            used += cost;
+            kept.insert(key, value);
+        }
+        Ok((kept, truncated))
+    }
+}
+
+/// Streams the header object entry by entry straight into typed values, so
+/// no generic JSON tree is built for untrusted input.
+struct HeaderVisitor {
+    data_len: u64,
+}
+
+impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
+    type Value = HeaderEntries;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a safetensors header object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<HeaderEntries, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error as _;
+        let mut entries = HeaderEntries::default();
+        while let Some(name) = map.next_key::<String>()? {
+            if name == SAFETENSORS_FREEFORM_KEY {
+                if entries.metadata.is_some() {
+                    return Err(A::Error::custom("duplicate `__metadata__`"));
+                }
+                let (metadata, truncated) = map.next_value_seed(MetadataSeed).map_err(|_| {
+                    A::Error::custom("`__metadata__` is not a string-to-string map")
+                })?;
+                entries.metadata = Some(metadata);
+                entries.metadata_truncated = truncated;
+                continue;
+            }
+            let info: RawTensorInfo = map.next_value()?;
+            entries
+                .add_tensor(name, info, self.data_len)
+                .map_err(A::Error::custom)?;
+        }
+        Ok(entries)
+    }
+}
+
 /// Parse a safetensors JSON header. `data_len` is the size of the tensor
 /// data region (file size minus the prefix and header) and bounds every
 /// tensor's `data_offsets`.
@@ -260,105 +534,58 @@ pub fn parse_safetensors_header(
     header: &[u8],
     data_len: u64,
 ) -> std::result::Result<SafetensorsSummary, SafetensorsError> {
-    let entries: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header)
-        .map_err(|e| invalid(format!("header is not a JSON object: {e}")))?;
-
-    let mut metadata = None;
-    let mut tensors = BTreeMap::new();
-    let mut parameters_by_dtype: BTreeMap<String, u64> = BTreeMap::new();
-    let mut total_parameters: u64 = 0;
-
-    for (name, value) in entries {
-        if name == SAFETENSORS_FREEFORM_KEY {
-            match value {
-                serde_json::Value::Object(map) => metadata = Some(map),
-                _ => return Err(invalid("`__metadata__` is not a JSON object")),
-            }
-            continue;
-        }
-        let info: RawTensorInfo = serde_json::from_value(value)
-            .map_err(|e| invalid(format!("tensor `{name}` has an invalid entry: {e}")))?;
-        let [begin, end] = info.data_offsets;
-        if begin > end || end > data_len {
-            return Err(invalid(format!(
-                "tensor `{name}` data_offsets [{begin}, {end}] fall outside the {data_len}-byte data region"
-            )));
-        }
-        // A rank-0 tensor (empty shape) is a scalar: one parameter.
-        let params = info
-            .shape
-            .iter()
-            .try_fold(1u64, |acc, dim| acc.checked_mul(*dim))
-            .ok_or_else(|| invalid(format!("tensor `{name}` shape overflows u64")))?;
-        total_parameters = total_parameters
-            .checked_add(params)
-            .ok_or_else(|| invalid("total parameter count overflows u64"))?;
-        let by_dtype = parameters_by_dtype.entry(info.dtype.clone()).or_insert(0);
-        *by_dtype = by_dtype.saturating_add(params);
-        tensors.insert(
-            name,
-            SafetensorsTensor {
-                dtype: info.dtype,
-                shape: info.shape,
-            },
-        );
-    }
-
-    let tensor_count = tensors.len();
-    let tensors_truncated = tensor_count > SAFETENSORS_MAX_RECORDED_TENSORS;
-    if tensors_truncated {
-        let cut = tensors
-            .keys()
-            .nth(SAFETENSORS_MAX_RECORDED_TENSORS)
-            .cloned()
-            .expect("more entries than the cap");
-        tensors.split_off(&cut);
-    }
-
-    Ok(SafetensorsSummary {
-        header_bytes: header.len() as u64,
-        tensor_count,
-        total_parameters,
-        parameters_by_dtype,
-        tensors,
-        tensors_truncated,
-        metadata,
-    })
+    let mut de = serde_json::Deserializer::from_slice(header);
+    let entries = serde::Deserializer::deserialize_map(&mut de, HeaderVisitor { data_len })
+        .and_then(|entries| de.end().map(|()| entries))
+        .map_err(|e| invalid(format!("header rejected: {e}")))?;
+    Ok(entries.into_summary(header.len() as u64))
 }
 
-/// The `artifact_metadata.metadata` document for a summary attempt, or
-/// `None` when nothing should be recorded (a transient storage failure).
+/// The `artifact_metadata.metadata` document for a summary attempt. A
+/// failure of either kind records `safetensors_error`, so a document can
+/// never keep a stale summary of earlier bytes at the same path.
 pub fn safetensors_artifact_metadata(
-    result: &std::result::Result<SafetensorsSummary, SafetensorsError>,
-) -> Option<serde_json::Value> {
+    result: std::result::Result<SafetensorsSummary, SafetensorsError>,
+) -> serde_json::Value {
     match result {
-        Ok(summary) => Some(serde_json::json!({ SAFETENSORS_METADATA_KEY: summary })),
+        // `to_value` consumes the summary, so only one copy is alive.
+        Ok(summary) => serde_json::json!({
+            SAFETENSORS_METADATA_KEY: serde_json::to_value(summary).unwrap_or_default()
+        }),
         Err(SafetensorsError::Invalid(reason)) => {
-            Some(serde_json::json!({ SAFETENSORS_ERROR_KEY: reason }))
+            serde_json::json!({ SAFETENSORS_ERROR_KEY: reason })
         }
-        Err(SafetensorsError::Unreadable(_)) => None,
+        Err(SafetensorsError::Unreadable(_)) => {
+            serde_json::json!({ SAFETENSORS_ERROR_KEY: SAFETENSORS_UNREADABLE_REASON })
+        }
     }
 }
 
 /// Summarise the safetensors header of the stored object `key` of
 /// `file_size` bytes with two ranged reads: the 8-byte length prefix, then
-/// exactly the (capped) header. The tensor data is never read. The JSON
-/// parse runs on the blocking pool since it is proportional to an untrusted
-/// header of up to [`SAFETENSORS_MAX_HEADER_BYTES`].
+/// exactly the (capped) header. The tensor data is never read. At most
+/// [`SAFETENSORS_MAX_CONCURRENT_PARSES`] run at once, and the JSON parse
+/// runs on the blocking pool.
 pub async fn read_safetensors_summary(
     storage: &dyn StorageBackend,
     key: &str,
     file_size: u64,
 ) -> std::result::Result<SafetensorsSummary, SafetensorsError> {
-    let unreadable = |e: AppError| SafetensorsError::Unreadable(e.to_string());
-    let prefix = storage.get_range(key, 0, 8).await.map_err(unreadable)?;
+    let _permit = SAFETENSORS_PARSE_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| unreadable("header parse limiter is closed"))?;
+    let prefix = storage
+        .get_range(key, 0, 8)
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
     let header_len = safetensors_header_len(&prefix, file_size)?;
     let header = storage
         .get_range(key, 8, header_len)
         .await
-        .map_err(unreadable)?;
+        .map_err(|e| unreadable(e.to_string()))?;
     if header.len() != header_len {
-        return Err(SafetensorsError::Unreadable(format!(
+        return Err(unreadable(format!(
             "short read: expected {header_len} header bytes, got {}",
             header.len()
         )));
@@ -366,7 +593,7 @@ pub async fn read_safetensors_summary(
     let data_len = file_size - 8 - header_len as u64;
     tokio::task::spawn_blocking(move || parse_safetensors_header(&header, data_len))
         .await
-        .map_err(|e| SafetensorsError::Unreadable(format!("header parse task failed: {e}")))?
+        .map_err(|e| unreadable(format!("header parse task failed: {e}")))?
 }
 
 /// Build a `.safetensors` byte image: the LE length prefix, `header`
@@ -566,14 +793,14 @@ mod tests {
         assert_eq!(
             s.tensors.get("model.embed.weight"),
             Some(&SafetensorsTensor {
-                dtype: "BF16".into(),
+                dtype: "BF16",
                 shape: vec![32, 8]
             })
         );
         assert_eq!(s.tensors["model.scale"].shape, Vec::<u64>::new());
         assert!(!s.tensors_truncated);
         let meta = s.metadata.as_ref().expect("__metadata__ kept");
-        assert_eq!(meta.get("format"), Some(&json!("pt")));
+        assert_eq!(meta.get("format").map(String::as_str), Some("pt"));
         assert!(!s.tensors.contains_key("__metadata__"));
     }
 
@@ -596,12 +823,13 @@ mod tests {
             Err(SafetensorsError::Invalid(m)) => m,
             other => panic!("expected Invalid, got {other:?}"),
         };
-        assert!(not_json.contains("not a JSON object"), "{not_json}");
-        assert!(parse_err(&json!([1, 2]), 0).contains("not a JSON object"));
+        assert!(not_json.contains("header rejected"), "{not_json}");
+        assert!(parse_err(&json!([1, 2]), 0).contains("safetensors header object"));
         assert!(parse_err(&json!({"__metadata__": "x"}), 0).contains("__metadata__"));
+        assert!(parse_err(&json!({"__metadata__": {"a": [0, 0]}}), 0).contains("string-to-string"));
         assert!(
             parse_err(&json!({"t": {"shape": [1], "data_offsets": [0, 1]}}), 1)
-                .contains("tensor `t`")
+                .contains("missing field `dtype`")
         );
         assert!(parse_err(
             &json!({"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 9]}}),
@@ -613,6 +841,35 @@ mod tests {
             4
         )
         .contains("outside"));
+        assert!(parse_err(
+            &json!({"t": {"dtype": "F33", "shape": [1], "data_offsets": [0, 0]}}),
+            0
+        )
+        .contains("unknown dtype `F33`"));
+        let rank33 = vec![1u64; SAFETENSORS_MAX_RANK + 1];
+        assert!(parse_err(
+            &json!({"t": {"dtype": "U8", "shape": rank33, "data_offsets": [0, 0]}}),
+            0
+        )
+        .contains("rank 33"));
+        let long_name = "n".repeat(SAFETENSORS_MAX_TENSOR_NAME_BYTES + 1);
+        let msg = parse_err(
+            &json!({long_name: {"dtype": "U8", "shape": [], "data_offsets": [0, 0]}}),
+            0,
+        );
+        assert!(msg.contains("tensor name exceeds"), "{msg}");
+        assert!(!msg.contains("nnnnnnnn"), "the name is not echoed: {msg}");
+        let dup = br#"{"t":{"dtype":"U8","shape":[],"data_offsets":[0,0]},
+                       "t":{"dtype":"U8","shape":[],"data_offsets":[0,0]}}"#;
+        match parse_safetensors_header(dup, 0) {
+            Err(SafetensorsError::Invalid(m)) => assert!(m.contains("duplicate tensor"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let dup_meta = br#"{"__metadata__":{},"__metadata__":{}}"#;
+        assert!(matches!(
+            parse_safetensors_header(dup_meta, 0),
+            Err(SafetensorsError::Invalid(_))
+        ));
         let huge = u64::MAX / 2;
         assert!(parse_err(
             &json!({"t": {"dtype": "U8", "shape": [huge, 3], "data_offsets": [0, 0]}}),
@@ -628,6 +885,22 @@ mod tests {
             0
         )
         .contains("total parameter count"));
+    }
+
+    #[test]
+    fn test_rejection_reasons_are_clipped() {
+        // serde echoes the offending string into its message: a 1 MB dtype
+        // must not become a 1 MB stored/logged reason.
+        let msg = parse_err(&json!({"t": "x".repeat(1_000_000)}), 0);
+        assert!(
+            msg.chars().count() <= SAFETENSORS_MAX_REASON_CHARS + 3,
+            "{} chars",
+            msg.len()
+        );
+        assert!(msg.ends_with("..."));
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abcd", 3), "abc...");
+        assert_eq!(clip("ééé", 2), "éé...");
     }
 
     #[test]
@@ -654,26 +927,76 @@ mod tests {
             .contains_key(&format!("t{:06}", SAFETENSORS_MAX_RECORDED_TENSORS)));
     }
 
+    /// The worst case the limits allow (long names, full rank, a maximal
+    /// `__metadata__`) still stores a document under 1 MiB, and oversize or
+    /// surplus `__metadata__` entries are dropped and flagged.
+    #[test]
+    fn test_stored_document_stays_under_one_mib() {
+        let mut entries = serde_json::Map::new();
+        let shape = vec![1u64; SAFETENSORS_MAX_RANK];
+        for i in 0..2_000 {
+            let name = format!(
+                "{i:06}{}",
+                "n".repeat(SAFETENSORS_MAX_TENSOR_NAME_BYTES - 6)
+            );
+            entries.insert(
+                name,
+                json!({"dtype": "BF16", "shape": shape, "data_offsets": [0, 0]}),
+            );
+        }
+        let mut meta = serde_json::Map::new();
+        for i in 0..400 {
+            meta.insert(format!("k{i:03}"), json!("v".repeat(8 * 1024)));
+        }
+        meta.insert(
+            "big".into(),
+            json!("v".repeat(SAFETENSORS_MAX_METADATA_VALUE_BYTES + 1)),
+        );
+        meta.insert(
+            "k".repeat(SAFETENSORS_MAX_METADATA_KEY_BYTES + 1),
+            json!("v"),
+        );
+        entries.insert("__metadata__".into(), serde_json::Value::Object(meta));
+        let bytes = serde_json::to_vec(&serde_json::Value::Object(entries)).unwrap();
+
+        let s = parse_safetensors_header(&bytes, 0).unwrap();
+        assert_eq!(s.tensor_count, 2_000);
+        assert!(s.tensors_truncated);
+        assert!(s.tensors.len() < 2_000);
+        let meta = s.metadata.as_ref().unwrap();
+        assert!(s.metadata_truncated);
+        assert!(meta.len() <= SAFETENSORS_MAX_METADATA_ENTRIES);
+        assert!(!meta.contains_key("big"));
+        let doc = safetensors_artifact_metadata(Ok(s));
+        let size = serde_json::to_vec(&doc).unwrap().len();
+        assert!(size < 1024 * 1024, "stored document is {size} bytes");
+    }
+
     #[test]
     fn test_safetensors_artifact_metadata_document_shape() {
         let bytes = serde_json::to_vec(&sample_header()).unwrap();
-        let ok = parse_safetensors_header(&bytes, 548);
-        let doc = safetensors_artifact_metadata(&ok).unwrap();
+        let doc = safetensors_artifact_metadata(parse_safetensors_header(&bytes, 548));
         assert_eq!(
             doc[SAFETENSORS_METADATA_KEY]["total_parameters"],
             json!(265)
         );
         assert_eq!(
+            doc[SAFETENSORS_METADATA_KEY]["metadata_truncated"],
+            json!(false)
+        );
+        assert_eq!(
             doc[SAFETENSORS_METADATA_KEY]["tensors"]["model.norm.weight"],
             json!({"dtype": "F32", "shape": [8]})
         );
-        let bad = Err(SafetensorsError::Invalid("broken".into()));
         assert_eq!(
-            safetensors_artifact_metadata(&bad),
-            Some(json!({SAFETENSORS_ERROR_KEY: "broken"}))
+            safetensors_artifact_metadata(Err(SafetensorsError::Invalid("broken".into()))),
+            json!({SAFETENSORS_ERROR_KEY: "broken"})
         );
-        let gone = Err(SafetensorsError::Unreadable("io".into()));
-        assert_eq!(safetensors_artifact_metadata(&gone), None);
+        assert_eq!(
+            safetensors_artifact_metadata(Err(SafetensorsError::Unreadable("io: /x/y".into()))),
+            json!({SAFETENSORS_ERROR_KEY: SAFETENSORS_UNREADABLE_REASON}),
+            "storage error details are logged, not stored"
+        );
     }
 
     /// Serves ranged reads from memory and records every request; a full
