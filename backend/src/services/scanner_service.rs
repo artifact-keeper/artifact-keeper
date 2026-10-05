@@ -14545,6 +14545,39 @@ mod tests {
             "Newtonsoft.Json.12.0.1.nupkg"
         ));
 
+        // #4102: a real manifest (BOM, `<?xml ...?>` declaration, CRLF), as
+        // `nuget pack` writes it. The hosted pin above (`hosted_upload_pin` +
+        // this function) read it through the same parser, which used to fail
+        // on the declaration, so real hosted NuGet packages lost their pin.
+        let real = Bytes::from(build_zip(&[(
+            "Newtonsoft.Json.nuspec",
+            crate::formats::nuget::real_world_nuspec().into_bytes(),
+        )]));
+        assert!(pin_agrees_with_content(
+            &real,
+            &ExpectedComponent::new(ComponentEcosystem::NuGet, "newtonsoft.json", "12.0.1"),
+            "newtonsoft.json.12.0.1.nupkg"
+        ));
+        assert_eq!(
+            hosted_upload_pin(
+                "nuget",
+                "newtonsoft.json.12.0.1.nupkg",
+                "newtonsoft.json",
+                Some("12.0.1")
+            )
+            .filter(|pin| pin_agrees_with_content(
+                &real,
+                pin,
+                "newtonsoft.json.12.0.1.nupkg"
+            )),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::NuGet,
+                "newtonsoft.json",
+                "12.0.1"
+            )),
+            "a real hosted package keeps its pin"
+        );
+
         // #4102: the flat container addresses a package by its NORMALIZED
         // version, which need not be the `.nuspec`'s own spelling. Different
         // versions still disagree after normalization.

@@ -11393,6 +11393,102 @@ mod scan_on_proxy_tests {
         fx.teardown().await;
     }
 
+    /// A `.nupkg` carrying the real Newtonsoft.Json 12.0.1 manifest exactly
+    /// as nuget.org ships it (BOM, `<?xml ...?>` declaration, CRLF), plus a
+    /// nonce so the digest is this test's own.
+    fn real_world_nupkg() -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("Newtonsoft.Json.nuspec", opts).unwrap();
+        zip.write_all(crate::formats::nuget::real_world_nuspec().as_bytes())
+            .unwrap();
+        zip.start_file("nonce.txt", opts).unwrap();
+        zip.write_all(Uuid::new_v4().as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_real_world_package_establishes_its_identity() {
+        let bytes = Bytes::from(real_world_nupkg());
+        match nupkg_identity(
+            "newtonsoft.json.12.0.1.nupkg",
+            "newtonsoft.json",
+            "12.0.1",
+            &bytes,
+        ) {
+            proxy_helpers::ProxyScanIdentity::Established(pin) => assert_eq!(
+                pin,
+                ExpectedComponent::new(ComponentEcosystem::NuGet, "newtonsoft.json", "12.0.1")
+            ),
+            _ => panic!("a real nuspec (BOM, declaration, CRLF) must establish the identity"),
+        }
+    }
+
+    /// Hardware verification found every real nuget.org package withheld
+    /// (`423` under fail-closed, never scanned under fail-open): the
+    /// manifest's XML declaration broke the nuspec parser, so the identity was
+    /// never established and the gate never scanned. With a real manifest
+    /// and a live (mock) engine, fail-closed now scans inline: a vulnerable
+    /// result is `403 scan_blocked`, a clean one `200 clean`, and the engine
+    /// ran exactly once either way.
+    #[tokio::test]
+    async fn remote_real_world_package_is_scanned_inline_under_fail_closed() {
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        const ROUTE: &str = "v3/flatcontainer/newtonsoft.json/12.0.1/newtonsoft.json.12.0.1.nupkg";
+        for (rescan, vulnerable) in [
+            (MockCveRescan::Vulnerable, true),
+            (MockCveRescan::Clean, false),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+                return;
+            };
+            let server = v3_upstream().await;
+            let bytes = real_world_nupkg();
+            mount(
+                &server,
+                "/flat/newtonsoft.json/12.0.1/newtonsoft.json.12.0.1.nupkg",
+                200,
+                bytes.clone(),
+                1,
+            )
+            .await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(v3_index_url(&server))
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await
+                .expect("point the remote at the mock");
+            tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (scanner, scans) = VersionedCveScanner::counting(Some("grype-4102-test"), rescan);
+            let state = tdh::build_scan_state_with_leaf_scanners(
+                &fx,
+                dir.path().to_str().unwrap(),
+                vec![std::sync::Arc::new(scanner)],
+            );
+
+            let (status, body, headers) = pull_anon(&state, &fx.repo_key, ROUTE).await;
+            if vulnerable {
+                assert_scan_blocked(status, &body, "newtonsoft.json.12.0.1.nupkg");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+                assert_eq!(&body[..], &bytes[..]);
+                assert_eq!(headers["X-AK-Scan"], "clean");
+            }
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the engine must actually scan a real package"
+            );
+
+            let digest = proxy_helpers::sha256_hex(&Bytes::from(bytes));
+            tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+            server.verify().await;
+            fx.teardown().await;
+        }
+    }
+
     // -- Virtual -----------------------------------------------------------
 
     /// A Virtual fixture with its proxy-backed state and the caller's auth.
