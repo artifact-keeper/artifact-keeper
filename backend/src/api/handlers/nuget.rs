@@ -446,7 +446,7 @@ const MEMBER_PROBE_ANSWER_BUDGET: std::time::Duration = std::time::Duration::fro
 /// Lowered for tests so the slow-probe cases do not add a long sleep to CI;
 /// still far above a local mock's fast answer.
 #[cfg(test)]
-const MEMBER_PROBE_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+const MEMBER_PROBE_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether a failed V3 probe still lets the V2 path be tried (#4327).
 #[derive(Clone, Copy)]
@@ -3081,18 +3081,34 @@ async fn proxy_v2_download(
         match discover_upstream_protocol(proxy, repo_id, repo_key, upstream_url).await {
             // An upstream that did not answer in time is not asked again.
             Err(resp) if !fallback.allows(started.elapsed()) => return Err(resp),
+            // `id` and `version` arrive DECODED from the route, so a `?`, `#`
+            // or `/` in them would change the upstream request if pasted into
+            // the URL as is. Each is encoded as one path segment, the way
+            // `flatcontainer_fetch_target` does. The cache keys keep the raw
+            // values they have always used, so an ordinary package's key, and
+            // the body a V3 client already cached, are unchanged.
             Ok(UpstreamProtocol::V3(resources)) => {
                 let id_lower = id.to_lowercase();
-                let sub_path = format!(
+                let file = build_nupkg_filename(&id_lower, version);
+                let encoded = format!(
                     "{}/{}/{}",
-                    id_lower,
-                    version,
-                    build_nupkg_filename(&id_lower, version)
+                    urlencoding::encode(&id_lower),
+                    urlencoding::encode(version),
+                    urlencoding::encode(&file)
                 );
-                v3_flatcontainer_target(&resources, upstream_url, &sub_path)?
+                let (url, _) = v3_flatcontainer_target(&resources, upstream_url, &encoded)?;
+                (
+                    url,
+                    flatcontainer_cache_path(&format!("{}/{}/{}", id_lower, version, file)),
+                )
             }
             Ok(UpstreamProtocol::V2 { .. }) | Err(_) => (
-                format!("{}/package/{}/{}", v2_feed_base(upstream_url), id, version),
+                format!(
+                    "{}/package/{}/{}",
+                    v2_feed_base(upstream_url),
+                    urlencoding::encode(id),
+                    urlencoding::encode(version)
+                ),
                 format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version),
             ),
         };
@@ -8657,8 +8673,10 @@ mod virtual_federation_tests {
         upstream
     }
 
-    /// Well past `MEMBER_PROBE_ANSWER_BUDGET`'s test value.
-    const SLOW_PROBE: std::time::Duration = std::time::Duration::from_millis(2500);
+    /// Well past `MEMBER_PROBE_ANSWER_BUDGET`'s test value (3 s), which in turn
+    /// sits far above a fast local answer (milliseconds), so a slow CI runner
+    /// cannot push a fast probe over the budget.
+    const SLOW_PROBE: std::time::Duration = std::time::Duration::from_secs(4);
 
     /// Every path the upstream was asked for, in order.
     async fn requested_paths(upstream: &wiremock::MockServer) -> Vec<String> {
@@ -8777,6 +8795,108 @@ mod virtual_federation_tests {
 
         assert_eq!(status, StatusCode::OK, "standalone keeps its pass-through");
         assert_eq!(&body[..], b"standalone bytes");
+    }
+
+    /// #4328 review: `id` and `version` arrive DECODED from the route, so a `?`
+    /// in them was pasted into the upstream URL as the start of a query string,
+    /// and the upstream was asked for a different path. Reachable through a
+    /// virtual repository since this PR. Only the correctly encoded path is
+    /// mounted, so a raw `?` misses it and the download fails.
+    #[tokio::test]
+    async fn v2_download_through_a_virtual_encodes_the_id_for_a_v2_member() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        // No `index.json` mounted: it 404s, so the member is a V2 upstream.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/package/a%3Fb/1.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"encoded".as_slice()))
+            .mount(&upstream)
+            .await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/package/a%3Fb/1.0.0", fx.repo_key)),
+        )
+        .await;
+        let queries: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r.url.query().map(str::to_string))
+            .collect();
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert!(
+            queries.is_empty(),
+            "no query string may be smuggled in: {queries:?}"
+        );
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"encoded");
+    }
+
+    /// The same for a member that answers V3: the V2 download is served from
+    /// its PackageBaseAddress, where every path segment is encoded too.
+    #[tokio::test]
+    async fn v2_download_through_a_virtual_encodes_the_id_for_a_v3_member() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": format!("{}/flat/", upstream.uri()), "@type": "PackageBaseAddress/3.0.0"},
+            ],
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(index.to_string()),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flat/a%3Fb/1.0.0/a%3Fb.1.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"encoded v3".as_slice()))
+            .mount(&upstream)
+            .await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/v3/index.json", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/package/a%3Fb/1.0.0", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"encoded v3");
     }
 
     /// The V3 surface keeps refusing to downgrade on a probe error (#4126): a
