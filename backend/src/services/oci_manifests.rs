@@ -522,7 +522,7 @@ async fn insert_if_still_known(
 mod tests {
     use super::*;
     use crate::api::handlers::oci_v2::{
-        delete_oci_manifest_content, persist_tag_and_refs, ManifestClass, OciIndexDeleteScope,
+        delete_oci_manifest_and_artifacts, persist_tag_and_refs, ManifestClass, OciIndexDeleteScope,
     };
     use crate::api::handlers::test_db_helpers as tdh;
     use crate::storage::StorageBackend;
@@ -710,7 +710,7 @@ mod tests {
         } else {
             OciIndexDeleteScope::NamedReference
         };
-        delete_oci_manifest_content(pool, repo_id, "app", reference, digest, scope)
+        delete_oci_manifest_and_artifacts(pool, repo_id, "app", reference, digest, scope)
             .await
             .expect("delete manifest content");
     }

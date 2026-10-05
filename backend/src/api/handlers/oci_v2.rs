@@ -12061,9 +12061,15 @@ async fn handle_delete_manifest(
     } else {
         OciIndexDeleteScope::NamedReference
     };
-    if let Err(e) =
-        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest, scope)
-            .await
+    if let Err(e) = delete_oci_manifest_and_artifacts(
+        &state.db,
+        repo.id,
+        &repo.image,
+        reference,
+        &digest,
+        scope,
+    )
+    .await
     {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -12071,16 +12077,6 @@ async fn handle_delete_manifest(
             &e.to_string(),
         );
     }
-
-    // Soft-delete the corresponding artifact record
-    let artifact_path = format!("v2/{}/manifests/{}", repo.image, reference);
-    let _ = sqlx::query!(
-        "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE repository_id = $1 AND path = $2",
-        repo.id,
-        artifact_path
-    )
-    .execute(&state.db)
-    .await;
 
     info!(
         "Manifest deleted: {}:{} (digest {})",
@@ -12185,19 +12181,79 @@ pub(crate) fn rest_unwind_digest<'a>(
     }
 }
 
-/// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
-/// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
-/// tag, its `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects`
-/// edges so storage GC can reclaim the blobs. Shared by the OCI
-/// `handle_delete_manifest` path and the REST `delete_artifact` path so a UI
-/// delete leaves the index consistent.
+/// Soft-deletes the `artifacts` rows a `/v2` manifest delete removes (#4450).
 ///
-/// Thin begin/commit wrapper around [`delete_oci_manifest_content_in_tx`],
-/// mirroring the `persist_tag_and_refs` / `persist_tag_and_refs_in_tx` pair.
+/// Binds: `$1` repository id, `$2` the exact `v2/<image>/manifests/<reference>`
+/// path the request named, `$3` whether the delete is content-addressed, `$4`
+/// the deleted digest's sha256 hex (NULL for a non-sha256 digest).
 ///
-/// The caller is responsible for soft-deleting the corresponding `artifacts`
-/// row and for resolving `digest`; this function only unwinds the OCI index.
-pub(crate) async fn delete_oci_manifest_content(
+/// * Every delete tombstones the row at the named path.
+/// * A content-addressed delete (`DELETE .../manifests/<digest>`) also
+///   tombstones every other manifest-shaped row in the repository whose bytes
+///   ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
+///   migrated source-layout rows. The index unwind already removed every
+///   `oci_tags` row for the digest repository-wide, so these rows are the last
+///   record claiming the manifest exists. Left live, the startup
+///   `oci_migration_reindex` took them for never-indexed migrated manifests
+///   and re-registered the deleted image on the next restart, and storage GC
+///   could never reclaim its body.
+///
+/// The path shape is the one the reindex scans
+/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
+/// so no row the reindex could pick up for this digest survives the delete.
+/// Blob and non-manifest rows are never touched. Rows already in the trash are
+/// skipped so their `updated_at` keeps the time they were really deleted.
+pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = concat!(
+    r#"
+    UPDATE artifacts a
+    SET is_deleted = true, updated_at = NOW()
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+      AND (
+            a.path = $2
+         OR ($3 AND a.checksum_sha256 = $4 AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+    r#")
+      )
+    "#
+);
+
+/// The `artifacts` path a `/v2` manifest request names.
+fn v2_manifest_artifact_path(image: &str, reference: &str) -> String {
+    format!("v2/{}/manifests/{}", image, reference)
+}
+
+/// Soft-delete the `artifacts` rows for a `/v2` manifest delete inside the
+/// caller's transaction. See [`SOFT_DELETE_MANIFEST_ARTIFACTS_SQL`] for which
+/// rows go. Returns the number of rows tombstoned.
+pub(crate) async fn soft_delete_manifest_artifacts_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(SOFT_DELETE_MANIFEST_ARTIFACTS_SQL)
+        .bind(repo_id)
+        .bind(v2_manifest_artifact_path(image, reference))
+        .bind(scope == OciIndexDeleteScope::ContentAddressed)
+        .bind(digest.strip_prefix("sha256:"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// The whole database side of `DELETE /v2/<name>/manifests/<reference>`: the
+/// OCI index unwind ([`delete_oci_manifest_content_in_tx`]) and the `artifacts`
+/// soft-delete ([`soft_delete_manifest_artifacts_in_tx`]) in ONE transaction,
+/// so a failure of either leaves neither half applied (#4450). Previously the
+/// soft-delete ran after the unwind had committed and its error was dropped.
+///
+/// Lock order matches the push path and the REST delete: the index rows
+/// (`oci_tags`, the ref edges, `oci_manifests` last within the unwind, as
+/// documented in #4441) before the `artifacts` rows.
+pub(crate) async fn delete_oci_manifest_and_artifacts(
     pool: &PgPool,
     repo_id: Uuid,
     image: &str,
@@ -12207,10 +12263,16 @@ pub(crate) async fn delete_oci_manifest_content(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    soft_delete_manifest_artifacts_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
     tx.commit().await
 }
 
-/// Transaction-participating form of [`delete_oci_manifest_content`]. Runs the
+/// Remove a Docker/OCI manifest from the OCI index: delete its `oci_tags`
+/// row(s) and, when the digest is no longer tagged by any sibling tag, its
+/// `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects` edges so
+/// storage GC can reclaim the blobs. Shared by the OCI `handle_delete_manifest`
+/// path (through [`delete_oci_manifest_and_artifacts`]) and the REST
+/// `delete_artifact` path so a UI delete leaves the index consistent. Runs the
 /// tag removal and index cleanup against a caller-owned transaction WITHOUT
 /// committing, so the caller can bind the unwind to a larger atomic unit — the
 /// REST delete pairs it with the `artifacts` soft-delete UPDATE so a failure of
