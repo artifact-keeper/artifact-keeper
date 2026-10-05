@@ -12282,13 +12282,18 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
         .bind(digest)
         .execute(&mut **tx)
         .await?;
-    }
 
-    // #1683 / #4433: an explicit `DELETE .../manifests/<digest>` deletes the
-    // manifest itself, so forget its existence record. A tag-name delete only
-    // removes a tag; the manifest stays addressable by digest and keeps its row.
-    if scope == OciIndexDeleteScope::ContentAddressed {
-        crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
+        // #1683 / #4433: a delete that names the manifest by digest deletes
+        // the manifest itself, so forget its existence record (kept while a
+        // live parent index still references it). A tag-name delete only
+        // removes a tag; the manifest stays addressable by digest.
+        if crate::services::oci_manifests::delete_removes_record(
+            scope == OciIndexDeleteScope::ContentAddressed,
+            reference,
+            digest,
+        ) {
+            crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
+        }
     }
 
     Ok(())

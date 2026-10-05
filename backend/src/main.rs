@@ -625,7 +625,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     // One-shot backfill of the first-class `oci_manifests` existence table
-    // (#1683 / #4433) for manifests committed before migration 265. Every
+    // (#1683 / #4433) for manifests committed before migration 268. Every
     // push/cache since then records its row inline. Backgrounded: nothing
     // reads the table yet, the pass is additive and idempotent (no-op once
     // every manifest has a row), and it reads each body from storage, so it

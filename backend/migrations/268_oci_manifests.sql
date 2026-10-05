@@ -15,9 +15,10 @@
 --
 -- This slice is write-only. `persist_tag_and_refs_in_tx` upserts the row in
 -- the same transaction as the `oci_tags` row (push, proxy cache, migration
--- import), the OCI DELETE-by-digest path removes it, and a background startup
--- backfill (`services::oci_manifests`) fills rows for manifests committed
--- before this migration. Nothing reads the table yet; switching GET/HEAD/
+-- import), a delete by digest removes it once no tag and no parent index edge
+-- still holds the manifest, and a background startup backfill
+-- (`services::oci_manifests`) fills rows for manifests committed before this
+-- migration. Nothing reads the table yet; switching GET/HEAD/
 -- DELETE, referrers and the storage-GC orphan predicate to it is a later
 -- slice, as are FKs from `oci_tags` / `oci_manifest_refs` /
 -- `manifest_blob_refs`.
