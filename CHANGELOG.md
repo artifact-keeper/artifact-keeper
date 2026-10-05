@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`cryptoki` bumped 0.12.0 -> 0.12.1 for RUSTSEC-2026-0286** (#3963, GHSA-r6vc-97x9-63vv): the PKCS#11 client treated the `CKA_ALLOWED_MECHANISMS` byte length as an element count, so a valid attribute read through `Session::get_attributes` could build an out-of-bounds slice (crash, or disclosure of adjacent heap words). Lockfile-only; no behaviour change for deployments without an HSM.
 
+- **`rustls` 0.23.43 → 0.23.45 for RUSTSEC-2026-0285** (#3878). TLS 1.3 handshake messages were accepted across encryption-level boundaries in `rustls` < 0.23.45 (medium, 5.3), and `rustls` is the TLS stack under every outbound connection the registry makes -- `reqwest`, `hyper-rustls`, `redis`, `metrics-exporter-prometheus`, `sqlx`'s `tls-rustls` and the backend's own dependency. Lockfile-only: `rustls-webpki` 0.103.13 → 0.103.15 and `aws-lc-rs` 1.16.2 → 1.18.1 (with `aws-lc-sys` 0.39.0 → 0.45.0 and `aws-lc-fips-sys` 0.13.16 → 0.14.2) move with it because the new `rustls` requires them; a stale `itertools 0.13.0` lock entry is dropped at the same time. No manifest changes.
+
 ## [1.9.1] - 2026-09-10
 
 ### Changed
