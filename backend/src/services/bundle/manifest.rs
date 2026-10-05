@@ -8,15 +8,18 @@
 //! importer that cannot honour a populated reserved field refuses the bundle
 //! ([`unsupported_features`]) instead of silently ignoring it.
 //!
-//! Decoding is two-step: the envelope (`format`, `schema_version`) is read
-//! from untyped JSON first, so a newer bundle gets an explicit version error
-//! rather than an opaque "unknown field". The typed decode then uses
-//! `deny_unknown_fields` throughout: within a schema version, a field this
-//! server does not understand is an error, never dropped. Encoding is
+//! Decoding is two-step: a small envelope struct (`format`,
+//! `schema_version`) is read first, so a newer bundle gets an explicit
+//! version error rather than an opaque "unknown field". The typed decode then
+//! runs straight from the bytes with `deny_unknown_fields` throughout: within
+//! a schema version a field this server does not understand is an error,
+//! never dropped, and a duplicated key at any level is an error rather than
+//! "last one wins" (no parser differential between this importer and a guard
+//! or reviewer reading the same manifest with another JSON tool). Encoding is
 //! deterministic (records sorted, fixed field order), so a failed burn can be
 //! re-exported byte-identically.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -39,6 +42,11 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Cap on problems collected by [`validate_manifest`], so a hostile manifest
 /// cannot make the report itself unbounded.
 pub const MAX_REPORTED_PROBLEMS: usize = 100;
+/// Most volumes one set may span.
+pub const MAX_VOLUME_COUNT: u32 = 10_000;
+/// Largest size, sequence number or count a manifest may carry: the job
+/// tables store them as `BIGINT`.
+pub const MAX_STORED_U64: u64 = i64::MAX as u64;
 
 /// Who produced the bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -235,7 +243,7 @@ pub struct BundleManifest {
 }
 
 /// Counts derived from a manifest that passed [`validate_manifest`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestSummary {
     pub repository_count: usize,
     pub item_count: usize,
@@ -244,13 +252,20 @@ pub struct ManifestSummary {
     pub scan_evidence_count: usize,
 }
 
-/// Read the envelope (`format`, `schema_version`) from untyped JSON and refuse
-/// anything that is not a bundle manifest this server can read.
-pub fn check_envelope(value: &serde_json::Value) -> Result<u32, BundleError> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| BundleError::WrongFormat("manifest is not a JSON object".into()))?;
-    match obj.get("format").and_then(|f| f.as_str()) {
+/// The two fields read before the typed decode. Unknown fields are ignored
+/// here (the strict decode rejects them); a duplicated `format` or
+/// `schema_version` is already an error.
+#[derive(Deserialize)]
+struct Envelope {
+    format: Option<serde_json::Value>,
+    schema_version: Option<serde_json::Value>,
+}
+
+fn check_envelope_fields(
+    format: Option<&serde_json::Value>,
+    schema_version: Option<&serde_json::Value>,
+) -> Result<u32, BundleError> {
+    match format.and_then(|f| f.as_str()) {
         Some(BUNDLE_FORMAT) => {}
         Some(other) => {
             return Err(BundleError::WrongFormat(format!(
@@ -263,12 +278,9 @@ pub fn check_envelope(value: &serde_json::Value) -> Result<u32, BundleError> {
             ))
         }
     }
-    let version = obj
-        .get("schema_version")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| {
-            BundleError::Malformed("schema_version must be a non-negative integer".into())
-        })?;
+    let version = schema_version.and_then(|v| v.as_u64()).ok_or_else(|| {
+        BundleError::Malformed("schema_version must be a non-negative integer".into())
+    })?;
     if version < u64::from(MIN_SCHEMA_VERSION) || version > u64::from(MANIFEST_SCHEMA_VERSION) {
         return Err(BundleError::UnsupportedVersion {
             found: version,
@@ -279,7 +291,17 @@ pub fn check_envelope(value: &serde_json::Value) -> Result<u32, BundleError> {
     Ok(version as u32)
 }
 
-/// Decode `manifest.json` bytes: size cap, envelope check, strict typed parse.
+/// Check the envelope of an already-parsed JSON document and refuse anything
+/// that is not a bundle manifest this server can read.
+pub fn check_envelope(value: &serde_json::Value) -> Result<u32, BundleError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| BundleError::WrongFormat("manifest is not a JSON object".into()))?;
+    check_envelope_fields(obj.get("format"), obj.get("schema_version"))
+}
+
+/// Decode `manifest.json` bytes: size cap, envelope check, strict typed parse
+/// straight from the bytes (duplicate keys rejected at every level).
 pub fn decode_manifest(bytes: &[u8], limits: &BundleLimits) -> Result<BundleManifest, BundleError> {
     if bytes.len() as u64 > limits.max_manifest_bytes {
         return Err(BundleError::LimitExceeded(format!(
@@ -287,10 +309,17 @@ pub fn decode_manifest(bytes: &[u8], limits: &BundleLimits) -> Result<BundleMani
             limits.max_manifest_bytes
         )));
     }
-    let value: serde_json::Value =
+    // serde also accepts a struct written as a JSON array; the manifest is
+    // only ever an object.
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(BundleError::WrongFormat(
+            "manifest is not a JSON object".into(),
+        ));
+    }
+    let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|e| BundleError::Malformed(e.to_string()))?;
-    check_envelope(&value)?;
-    serde_json::from_value(value).map_err(|e| BundleError::Malformed(e.to_string()))
+    check_envelope_fields(envelope.format.as_ref(), envelope.schema_version.as_ref())?;
+    serde_json::from_slice(bytes).map_err(|e| BundleError::Malformed(e.to_string()))
 }
 
 /// Encode a manifest deterministically: records sorted by their natural keys,
@@ -375,6 +404,9 @@ fn validate_sequence(m: &BundleManifest, p: &mut Problems) {
             if seq.sequence_number == 0 {
                 p.push("sequence_number must be >= 1");
             }
+            if seq.sequence_number > MAX_STORED_U64 {
+                p.push(format!("sequence_number exceeds {MAX_STORED_U64}"));
+            }
             let base_ok = match kind {
                 BundleKind::Baseline => seq.baseline_sequence_number == seq.sequence_number,
                 _ => seq.baseline_sequence_number < seq.sequence_number,
@@ -391,6 +423,7 @@ fn validate_sequence(m: &BundleManifest, p: &mut Problems) {
 
 fn validate_repositories(m: &BundleManifest, p: &mut Problems) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
+    let mut folded = BTreeSet::new();
     if m.repositories.is_empty() {
         p.push("bundle declares no repositories");
     }
@@ -401,6 +434,12 @@ fn validate_repositories(m: &BundleManifest, p: &mut Problems) -> BTreeSet<Strin
         }
         if !keys.insert(repo.key.clone()) {
             p.push(format!("repository {:?} is declared twice", repo.key));
+        } else if !folded.insert(repo.key.to_ascii_lowercase()) {
+            p.push(format!(
+                "repository {:?} differs from another key only by case; the keys would \
+                 collide on case-insensitive media",
+                repo.key
+            ));
         }
         if !is_label(&repo.format, 64) || !is_label(&repo.repo_type, 32) {
             p.push(format!(
@@ -471,6 +510,9 @@ fn validate_items(
             &item.blob_path,
             &blob_path(&item.sha256, &item.logical_path),
         );
+        if item.size_bytes > MAX_STORED_U64 {
+            p.push(format!("{what}: size_bytes exceeds {MAX_STORED_U64}"));
+        }
         if item.volume == 0 || item.volume > m.volume_set.volume_count {
             p.push(format!(
                 "{what}: volume {} is outside 1..={}",
@@ -550,8 +592,10 @@ pub fn validate_manifest(
     if !is_printable(&m.producer.product, 64) || !is_printable(&m.producer.version, 64) {
         p.push("producer.product and producer.version are required");
     }
-    if m.volume_set.volume_count == 0 {
-        p.push("volume_set.volume_count must be >= 1");
+    if m.volume_set.volume_count == 0 || m.volume_set.volume_count > MAX_VOLUME_COUNT {
+        p.push(format!(
+            "volume_set.volume_count must be between 1 and {MAX_VOLUME_COUNT}"
+        ));
     }
     if let Some(mcn) = &m.volume_set.media_control_number {
         if !is_printable(mcn, 64) {
@@ -567,8 +611,7 @@ pub fn validate_manifest(
     if !p.0.is_empty() {
         return Err(p.0);
     }
-    let distinct_blobs: BTreeMap<&str, ()> =
-        m.items.iter().map(|i| (i.blob_path.as_str(), ())).collect();
+    let distinct_blobs: BTreeSet<&str> = m.items.iter().map(|i| i.blob_path.as_str()).collect();
     Ok(ManifestSummary {
         repository_count: m.repositories.len(),
         item_count: m.items.len(),
@@ -758,6 +801,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn duplicate_keys_are_rejected_at_every_level() {
+        let good = String::from_utf8(encode_manifest(&sample_manifest()).unwrap()).unwrap();
+        // A second top-level `items` array, as a hostile producer would add.
+        let dup_items = good.replacen("\"items\": [", "\"items\": [], \"items\": [", 1);
+        let err = decode_manifest(dup_items.as_bytes(), &limits()).unwrap_err();
+        assert!(
+            matches!(err, BundleError::Malformed(ref m) if m.contains("duplicate field `items`")),
+            "{err}"
+        );
+        // A duplicated key inside one record.
+        let dup_sha = good.replacen("\"sha256\": ", "\"sha256\": \"x\", \"sha256\": ", 1);
+        let err = decode_manifest(dup_sha.as_bytes(), &limits()).unwrap_err();
+        assert!(
+            matches!(err, BundleError::Malformed(ref m) if m.contains("duplicate")),
+            "{err}"
+        );
+        // A duplicated envelope key.
+        let dup_ver = r#"{"format":"akbundle","schema_version":1,"schema_version":1}"#;
+        assert!(matches!(
+            decode_manifest(dup_ver.as_bytes(), &limits()),
+            Err(BundleError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_manifest_must_be_a_json_object() {
+        let as_array = br#" ["akbundle", 1]"#;
+        assert!(matches!(
+            decode_manifest(as_array, &limits()),
+            Err(BundleError::WrongFormat(_))
+        ));
+        assert!(matches!(
+            decode_manifest(b"", &limits()),
+            Err(BundleError::WrongFormat(_))
+        ));
+    }
+
+    #[test]
+    fn values_are_bounded_to_the_job_columns() {
+        let mut m = sample_manifest();
+        m.items[0].size_bytes = MAX_STORED_U64 + 1;
+        assert_problem(&m, "size_bytes exceeds");
+
+        let mut m = sample_manifest();
+        m.volume_set.volume_count = MAX_VOLUME_COUNT + 1;
+        assert_problem(&m, "volume_count must be between");
+
+        let mut m = sample_manifest();
+        m.kind = BundleKind::Baseline;
+        m.sequence = Some(SequenceInfo {
+            stream_id: Uuid::nil(),
+            sequence_number: u64::MAX,
+            baseline_sequence_number: u64::MAX,
+        });
+        assert_problem(&m, "sequence_number exceeds");
+    }
+
+    #[test]
+    fn repository_keys_must_not_collide_by_case() {
+        let mut m = sample_manifest();
+        let mut upper = m.repositories[0].clone();
+        upper.key = "LIBS".into();
+        upper.metadata_path = "repos/LIBS/repo.json".into();
+        upper.artifacts_path = "repos/LIBS/artifacts.json".into();
+        m.repositories.push(upper);
+        assert_problem(&m, "only by case");
+    }
+
+    #[test]
     fn unknown_fields_within_a_version_are_rejected() {
         let mut value = serde_json::to_value(sample_manifest()).unwrap();
         value["items"][0]["content_base64"] = serde_json::json!("AAAA");
@@ -820,7 +932,9 @@ pub(crate) mod tests {
         assert_problem(&m, "outside 1..=1");
 
         let mut m = sample_manifest();
-        m.items[0].size_bytes = u64::MAX;
+        m.items[0].size_bytes = MAX_STORED_U64;
+        m.items[1].size_bytes = MAX_STORED_U64;
+        m.items.push(item("libs", "c.jar", SHA_A, MAX_STORED_U64));
         assert_problem(&m, "overflows");
 
         let mut m = sample_manifest();

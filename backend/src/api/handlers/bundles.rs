@@ -15,7 +15,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -34,6 +34,11 @@ use crate::services::bundle::manifest::{
     BundleManifest, MediaProfile, BUNDLE_FORMAT, MANIFEST_SCHEMA_VERSION, MIN_SCHEMA_VERSION,
 };
 use crate::services::bundle::BundleLimits;
+
+/// Whether this build can produce bundles (PR2 of #2464 flips it).
+pub const EXPORT_AVAILABLE: bool = false;
+/// Whether this build can ingest bundles (PR3 of #2464 flips it).
+pub const IMPORT_AVAILABLE: bool = false;
 
 /// Issue tracking the unimplemented parts of this API.
 const TRACKING_ISSUE: &str = "#2464";
@@ -61,7 +66,17 @@ const ITEM_STATUSES: &[&str] = &[
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/format", get(get_bundle_format))
-        .route("/manifest/validate", post(validate_bundle_manifest))
+        // The API router disables the global body limit for uploads; this
+        // route buffers its body, so cap it at the manifest limit (+1 so an
+        // exactly-over body still reaches the codec's clear error).
+        .route(
+            "/manifest/validate",
+            post(validate_bundle_manifest).layer(DefaultBodyLimit::max(
+                usize::try_from(BundleLimits::from_env().max_manifest_bytes)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1),
+            )),
+        )
         .route("/exports", post(create_bundle_export))
         .route("/imports", post(create_bundle_import))
         .route("/jobs", get(list_bundle_jobs))
@@ -102,7 +117,12 @@ pub struct BundleFormatResponse {
 pub struct ManifestValidationReport {
     /// Decoded and internally consistent.
     pub valid: bool,
-    /// Valid and uses no feature this server cannot import yet.
+    /// Valid and uses no format feature this server's importer refuses
+    /// (sequenced sets, signatures, multi-volume sets).
+    pub supported_by_importer: bool,
+    /// `supported_by_importer` AND this build can import at all
+    /// (`import_available` in `/format`). A UI should offer an import only
+    /// when this is true.
     pub importable: bool,
     pub schema_version: Option<u32>,
     pub supported_schema_versions: [u32; 2],
@@ -247,8 +267,8 @@ pub fn format_description() -> BundleFormatResponse {
                 capacity_bytes: p.capacity_bytes(),
             })
             .collect(),
-        export_available: false,
-        import_available: false,
+        export_available: EXPORT_AVAILABLE,
+        import_available: IMPORT_AVAILABLE,
     }
 }
 
@@ -257,6 +277,7 @@ pub fn format_description() -> BundleFormatResponse {
 pub fn build_validation_report(bytes: &[u8], limits: &BundleLimits) -> ManifestValidationReport {
     let mut report = ManifestValidationReport {
         valid: false,
+        supported_by_importer: false,
         importable: false,
         schema_version: None,
         supported_schema_versions: [MIN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION],
@@ -288,7 +309,8 @@ pub fn build_validation_report(bytes: &[u8], limits: &BundleLimits) -> ManifestV
             report.total_bytes = summary.total_bytes;
             report.scan_evidence_count = summary.scan_evidence_count;
             report.unsupported_features = unsupported_features(&manifest);
-            report.importable = report.unsupported_features.is_empty();
+            report.supported_by_importer = report.unsupported_features.is_empty();
+            report.importable = report.supported_by_importer && IMPORT_AVAILABLE;
         }
         Err(problems) => report.problems = problems,
     }
@@ -610,7 +632,11 @@ mod tests {
     fn validation_report_for_a_good_manifest() {
         let bytes = encode_manifest(&sample_manifest()).unwrap();
         let r = build_validation_report(&bytes, &BundleLimits::default());
-        assert!(r.valid && r.importable, "{:?}", r.problems);
+        assert!(r.valid && r.supported_by_importer, "{:?}", r.problems);
+        assert_eq!(
+            r.importable, IMPORT_AVAILABLE,
+            "never importable while /imports is 501"
+        );
         assert_eq!(r.item_count, 2);
         assert_eq!(r.total_bytes, 30);
         assert_eq!(r.schema_version, Some(1));
@@ -623,7 +649,7 @@ mod tests {
             br#"{"format":"akbundle","schema_version":99}"#,
             &BundleLimits::default(),
         );
-        assert!(!r.valid && !r.importable);
+        assert!(!r.valid && !r.importable && !r.supported_by_importer);
         assert!(
             r.problems[0].contains("schema_version 99"),
             "{:?}",
@@ -640,7 +666,7 @@ mod tests {
         let mut m = sample_manifest();
         m.volume_set.volume_count = 3;
         let r = build_validation_report(&encode_manifest(&m).unwrap(), &BundleLimits::default());
-        assert!(r.valid && !r.importable);
+        assert!(r.valid && !r.importable && !r.supported_by_importer);
         assert!(r.unsupported_features[0].contains("multi-volume"));
     }
 
@@ -705,6 +731,9 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
+            // Small manifest cap so the body-limit check below stays cheap
+            // (nextest runs each test in its own process).
+            std::env::set_var(crate::services::bundle::MAX_MANIFEST_BYTES_ENV, "65536");
             let job = seed_job(&pool, "import").await;
             let state = tdh::build_state(pool.clone(), "/tmp/ak-bundles-test");
             let app = || {
@@ -766,6 +795,14 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(report["valid"], true);
+
+            let huge = vec![b' '; 65536 + 2];
+            let (status, _) = tdh::send(
+                app(),
+                tdh::post("/manifest/validate".into(), "application/json", huge.into()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 
             let (status, body) = tdh::send(
                 app(),

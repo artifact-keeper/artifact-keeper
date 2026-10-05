@@ -1698,7 +1698,7 @@ async fn with_debian_config(
 }
 
 /// Validate that a repository key is safe and well-formed.
-fn validate_repository_key(key: &str) -> Result<()> {
+pub(crate) fn validate_repository_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > 128 {
         return Err(AppError::Validation(
             "Repository key must be between 1 and 128 characters".to_string(),

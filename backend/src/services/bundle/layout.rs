@@ -23,6 +23,7 @@
 //! [`MigrationService::sanitize_path`]) before the layout match.
 
 use super::BundleError;
+use crate::api::handlers::repositories::validate_repository_key;
 use crate::services::migration_service::MigrationService;
 
 /// Name of the manifest entry. It must be the first entry of the tar stream.
@@ -106,14 +107,13 @@ pub fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// `true` when `key` is a repository key a bundle may carry: non-empty,
-/// bounded, and already in the canonical form
-/// [`MigrationService::sanitize_repo_key`] produces (so it is also a safe
-/// single path component).
+/// `true` when `key` is a repository key a bundle may carry: exactly the
+/// keys the product lets an operator create
+/// ([`validate_repository_key`]: 1-128 ASCII alphanumerics, `-`, `_`, `.`,
+/// no leading `.`/`-`, no `..`), each of which is also a safe single path
+/// component.
 pub fn is_valid_repo_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= MAX_REPO_KEY_BYTES
-        && MigrationService::sanitize_repo_key(key) == key
+    key.len() <= MAX_REPO_KEY_BYTES && validate_repository_key(key).is_ok()
 }
 
 /// Validate a path that names a file or directory *inside* the bundle.
@@ -482,9 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn repo_keys_must_be_canonical() {
-        assert!(is_valid_repo_key("libs-release_1.x"));
-        for bad in ["", "a b", "-lead", "trail.", "a/b", "..", "ü"] {
+    fn repo_keys_match_the_product_rule() {
+        for ok in ["libs-release_1.x", "libs-", "libs.", "Libs"] {
+            assert!(is_valid_repo_key(ok), "{ok:?} is a creatable key");
+        }
+        for bad in ["", "a b", "-lead", ".lead", "a..b", "a/b", "..", "ü"] {
             assert!(!is_valid_repo_key(bad), "{bad:?} must be refused");
         }
         assert!(!is_valid_repo_key(&"a".repeat(MAX_REPO_KEY_BYTES + 1)));

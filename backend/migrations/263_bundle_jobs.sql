@@ -68,6 +68,10 @@ CREATE TABLE bundle_items (
 );
 
 CREATE INDEX idx_bundle_items_job_status ON bundle_items (job_id, status);
+-- Serves the ON DELETE SET NULL from artifacts: without it every hard delete
+-- of an artifact would scan bundle_items (up to millions of journal rows).
+CREATE INDEX idx_bundle_items_artifact_id ON bundle_items (artifact_id)
+    WHERE artifact_id IS NOT NULL;
 
 -- Low-side scan evidence carried in a bundle (adversarial review on #2464,
 -- constraint 1). It is evidence for a human reviewer and at most a reason to
@@ -98,15 +102,22 @@ CREATE TABLE bundle_scan_evidence (
 CREATE INDEX idx_bundle_scan_evidence_sha ON bundle_scan_evidence (artifact_sha256);
 
 -- Provenance on scan_results (constraint 1, defence 2). Every existing and
--- future row written by this instance's scanners is 'local_scan';
--- find_reusable_scan only reuses 'local_scan' rows, so even a later change
--- that routes imported data into this table cannot create a dedup source.
+-- future row written by this instance's scanners is 'local_scan'. Every
+-- scan_results read that treats a completed row as "already scanned"
+-- (find_reusable_scan, find_existing_scan_for_artifact and the
+-- prepare_scan_placeholder short-circuit) only accepts 'local_scan' rows, so
+-- even a later change that routes imported data into this table cannot
+-- make it stand in for a local scan.
 --
--- Online shape on a hot table: a constant default is catalog-only (PG 11+),
--- the NOT VALID constraint is a catalog update, and VALIDATE takes only
--- SHARE UPDATE EXCLUSIVE, which does not block writes.
+-- Online shape on a hot table: a constant default is catalog-only (PG 11+)
+-- and the NOT VALID constraint is a catalog update that checks every new
+-- write. There is deliberately NO `VALIDATE CONSTRAINT` here: in the same
+-- transaction it would run its full scan while still holding the ACCESS
+-- EXCLUSIVE lock the two ALTERs took, blocking every read and write of
+-- scan_results (docs/operations/online-migrations.md, section 2). Every
+-- existing row satisfies the check by construction (it gets the constant
+-- default), so validation would prove nothing.
 ALTER TABLE scan_results
     ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'local_scan';
 ALTER TABLE scan_results ADD CONSTRAINT scan_results_origin_check
     CHECK (origin IN ('local_scan', 'imported')) NOT VALID;
-ALTER TABLE scan_results VALIDATE CONSTRAINT scan_results_origin_check;

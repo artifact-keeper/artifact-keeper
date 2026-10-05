@@ -168,28 +168,61 @@ mod tests {
         assert!(v.to_string().contains("schema_version 9"));
     }
 
-    /// Adversarial constraint 1 on #2464: nothing in the bundle subsystem may
-    /// write imported scan evidence into `scan_results`, where hash-based
-    /// dedup would turn it into an instance-wide scan exemption. Imported
-    /// evidence goes to `bundle_scan_evidence` only.
-    #[test]
-    fn bundle_code_never_writes_scan_results() {
-        let sources = [
-            include_str!("archive.rs"),
-            include_str!("layout.rs"),
-            include_str!("manifest.rs"),
-            include_str!("../../api/handlers/bundles.rs"),
-        ];
-        let table = concat!("scan_", "results");
-        for src in sources {
-            let lower = src.to_ascii_lowercase();
-            for verb in ["insert into ", "update ", "copy "] {
-                assert!(
-                    !lower.contains(&format!("{verb}{table}")),
-                    "bundle code must not {verb}{table}"
-                );
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read bundle source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
             }
         }
+    }
+
+    /// Adversarial constraint 1 on #2464: nothing in the bundle subsystem may
+    /// write imported scan evidence into `scan_results` (or the checksum-keyed
+    /// `proxy_scan_results`), where hash-based dedup would turn it into an
+    /// instance-wide scan exemption, nor go through the scan-result service
+    /// that writes them. Imported evidence goes to `bundle_scan_evidence`
+    /// only. Walks the whole module directory so files added by the export
+    /// and import workers are covered without editing this list.
+    #[test]
+    fn bundle_code_never_writes_scan_results() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_sources(&root.join("src/services/bundle"), &mut files);
+        files.push(root.join("src/api/handlers/bundles.rs"));
+        assert!(files.len() >= 5, "bundle sources not found: {files:?}");
+
+        let table = concat!("scan_", "results");
+        let write = regex::Regex::new(&format!(
+            r"(?i)\b(insert\s+into|update|copy|delete\s+from)\s+(\w+\.)?(proxy_)?{table}\b"
+        ))
+        .unwrap();
+        let service = concat!("ScanResult", "Service");
+        for path in files {
+            let src = std::fs::read_to_string(&path).expect("read source");
+            let collapsed = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !write.is_match(&collapsed),
+                "{} writes {table}: imported evidence belongs in bundle_scan_evidence",
+                path.display()
+            );
+            assert!(
+                !src.contains(service),
+                "{} uses the scan-result service; bundle code must not write scan results",
+                path.display()
+            );
+        }
+        // The pattern itself catches the shapes it is meant to.
+        for bad in [
+            "INSERT INTO {t} (",
+            "insert into public.proxy_{t}",
+            "UPDATE {t} SET",
+        ] {
+            assert!(write.is_match(&bad.replace("{t}", table)), "{bad}");
+        }
+        assert!(!write.is_match(&format!("{table}_origin_check")));
     }
 
     #[test]

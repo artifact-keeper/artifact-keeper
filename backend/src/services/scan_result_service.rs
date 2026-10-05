@@ -770,7 +770,10 @@ impl ScanResultService {
     /// carried in an imported bundle) would otherwise become a permanent,
     /// instance-wide scan exemption for every future upload of those bytes.
     /// Imported evidence lives in `bundle_scan_evidence`; this filter holds
-    /// even if a later change routes it here.
+    /// even if a later change routes it here. The per-artifact short-circuits
+    /// ([`Self::find_existing_scan_for_artifact`] and step 1 of
+    /// [`Self::prepare_scan_placeholder`]) apply the same filter, so an
+    /// imported row can never stand in for an artifact's own local scan.
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -851,6 +854,7 @@ impl ScanResultService {
               AND checksum_sha256 = $2
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -944,6 +948,7 @@ impl ScanResultService {
               AND checksum_sha256 = $2
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -3885,6 +3890,22 @@ mod tests {
             assert!(
                 imported.is_none(),
                 "an imported verdict must never satisfy hash-based scan dedup"
+            );
+            let own = svc
+                .find_existing_scan_for_artifact(aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert!(
+                own.is_none(),
+                "an imported row must not short-circuit the artifact's own scan"
+            );
+            let (placeholder, _) = svc
+                .prepare_scan_placeholder(aid, repo_id, &ck, "grype", 3650, 3650)
+                .await
+                .expect("prepare");
+            assert_ne!(
+                placeholder, scan_id,
+                "prepare must queue a local scan rather than reuse the imported row"
             );
 
             let bogus = sqlx::query("UPDATE scan_results SET origin = 'bundle' WHERE id = $1")

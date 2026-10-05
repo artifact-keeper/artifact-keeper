@@ -152,7 +152,10 @@ pub fn index_bundle<R: Read>(
         if kind == BundleEntry::Manifest {
             manifest = Some(read_manifest_entry(&mut entry, limits)?);
         } else {
-            files.insert(path, entry.header().size().unwrap_or(0));
+            // `entry.size()` is the size the stream is actually advanced by
+            // (a PAX `size` record overrides the ustar header field), so the
+            // cross-check reconciles what was read, not what a header claims.
+            files.insert(path, entry.size());
         }
     }
 
@@ -326,6 +329,53 @@ mod tests {
         let inspected = inspect_bundle(bytes.as_slice(), &limits()).unwrap();
         assert_eq!(inspected.summary.item_count, 2);
         assert_eq!(inspected.manifest_sha256.len(), 64);
+    }
+
+    #[test]
+    fn contiguous_file_entries_are_accepted_as_regular_files() {
+        let mut parts = valid_bundle_parts();
+        let (name, data) = parts.pop().unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        for (n, d) in &parts {
+            file(&mut b, n, d);
+        }
+        raw_entry(&mut b, &name, tar::EntryType::Continuous, &data, None);
+        let bytes = b.into_inner().unwrap();
+        let inspected = inspect_bundle(bytes.as_slice(), &limits()).unwrap();
+        assert_eq!(inspected.summary.item_count, 2);
+    }
+
+    #[test]
+    fn pax_size_override_is_what_gets_reconciled() {
+        // The ustar header claims the manifest's 10 bytes for blob A, but a PAX
+        // record says 5 and only 5 bytes follow. Readers advance by the PAX
+        // size, so the cross-check must see 5, not the header's 10.
+        let parts = valid_bundle_parts();
+        let mut b = tar::Builder::new(Vec::new());
+        for (n, d) in &parts {
+            if n.contains(SHA_A) {
+                b.append_pax_extensions([("size", b"5".as_slice())])
+                    .unwrap();
+                let mut h = tar::Header::new_gnu();
+                h.set_path(n).unwrap();
+                h.set_mode(0o644);
+                h.set_size(10);
+                h.set_cksum();
+                b.append(&h, &b"xxxxx"[..]).unwrap();
+            } else {
+                file(&mut b, n, d);
+            }
+        }
+        let index = index_bundle(b.into_inner().unwrap().as_slice(), &limits()).unwrap();
+        let blob = parts.iter().find(|(n, _)| n.contains(SHA_A)).unwrap();
+        assert_eq!(index.files.get(&blob.0), Some(&5));
+        let problems = cross_check(&index, &sample_manifest(), 1);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("archive entry is 5 bytes")),
+            "{problems:?}"
+        );
     }
 
     #[test]
