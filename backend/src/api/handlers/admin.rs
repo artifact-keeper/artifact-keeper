@@ -78,8 +78,10 @@ pub fn router() -> Router<SharedState> {
 /// configuration, persisted cursor, leadership and the last feed error.
 ///
 /// Read-only; the feed is configured through `NPM_UPSTREAM_FEED_ENABLED` /
-/// `NPM_UPSTREAM_FEED_URL`. `is_leader` and `last_error` describe the replica
-/// that answered; `cluster_leader_active` is cluster-wide.
+/// `NPM_UPSTREAM_FEED_URL`. `consumer_running`, `is_leader` and `last_error`
+/// describe only the replica that answered, which `replica_id` names; behind a
+/// load balancer successive calls may hit different replicas.
+/// `cluster_leader_active`, `cursor` and `last_poll_at` are cluster-wide.
 #[utoipa::path(
     get,
     path = "/npm/upstream-feed/status",
@@ -2910,6 +2912,10 @@ mod tests {
         assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
         let Json(status) = admitted.expect("admin status");
         assert!(status.enabled);
+        assert_eq!(
+            status.replica_id,
+            crate::services::cluster_work::WorkerIdentity::for_process().as_str()
+        );
         assert_eq!(status.feed_url, feed_url);
         assert_eq!(status.cursor.as_deref(), Some("777"));
         assert!(status.last_poll_at.is_some());

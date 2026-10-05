@@ -49,6 +49,7 @@ use url::Url;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
@@ -677,8 +678,20 @@ impl Drop for RunningGuard {
 
 /// Admin view of the npm upstream change-feed (#3069), served by
 /// `GET /api/v1/admin/npm/upstream-feed/status`.
+///
+/// Mixed scope: `consumer_running`, `is_leader` and `last_error` describe
+/// only the replica named by `replica_id` (the one that answered this call);
+/// `enabled`/`feed_url` are that replica's effective configuration; `cursor`,
+/// `last_poll_at` and `cluster_leader_active` are cluster-wide (read from the
+/// shared database). Behind a load balancer, repeated calls may be answered
+/// by different replicas.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct NpmUpstreamFeedStatus {
+    /// Which replica answered, as `<host>:<pid>:<boot-uuid>` (`<host>` is
+    /// `POD_NAME`, else `HOSTNAME`). The per-replica fields below
+    /// (`consumer_running`, `is_leader`, `last_error`) describe this replica
+    /// only.
+    pub replica_id: String,
     /// Effective `NPM_UPSTREAM_FEED_ENABLED`.
     pub enabled: bool,
     /// Effective `NPM_UPSTREAM_FEED_URL`, with userinfo and query string
@@ -784,6 +797,7 @@ pub async fn npm_feed_status(
         None => (None, None, false),
     };
     Ok(NpmUpstreamFeedStatus {
+        replica_id: WorkerIdentity::for_process().as_str().to_string(),
         enabled: config.npm_upstream_feed_enabled,
         feed_url,
         cursor,
@@ -2183,6 +2197,7 @@ mod tests {
             .await
             .expect("status");
         assert!(empty.enabled);
+        assert_eq!(empty.replica_id, WorkerIdentity::for_process().as_str());
         assert!(!empty.feed_url.contains("u:p@"), "{}", empty.feed_url);
         assert_eq!(empty.cursor, None);
         assert_eq!(empty.last_poll_at, None);
