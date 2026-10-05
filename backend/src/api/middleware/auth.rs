@@ -8259,6 +8259,11 @@ mod tests {
             StatusCode::NOT_FOUND,
         ),
         (Method::POST, "/alpine//upload", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/pacman//x-1-1-any.pkg.tar.zst",
+            StatusCode::NOT_FOUND,
+        ),
         (Method::POST, "/conda//upload", StatusCode::NOT_FOUND),
         (Method::POST, "/conda/t/upload", StatusCode::UNAUTHORIZED),
         (

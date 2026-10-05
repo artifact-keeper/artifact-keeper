@@ -477,6 +477,41 @@ fn check_upload_filename(filename: &str, info: &PkgInfo) -> Result<(), Response>
     Ok(())
 }
 
+/// Insert the artifact row and its `pacman` metadata in one transaction. The
+/// metadata row is what the databases are rendered from, so a package whose
+/// metadata could not be written must not be published at all (it would be
+/// invisible to pacman yet block re-upload with a 409).
+async fn insert_package_rows(
+    db: &PgPool,
+    artifact: proxy_helpers::NewArtifact<'_>,
+    metadata: &PacmanMetadata,
+) -> Result<uuid::Uuid, Response> {
+    let repository_id = artifact.repository_id;
+    let metadata = serde_json::to_value(metadata).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::internal_err_message("Failed to encode package metadata", &e),
+        )
+    })?;
+    let mut tx = db.begin().await.map_err(super::db_err)?;
+    let artifact_id = proxy_helpers::insert_artifact_row(&mut tx, artifact).await?;
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'pacman', $2)",
+    )
+    .bind(artifact_id)
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(super::db_err)?;
+    tx.commit().await.map_err(super::db_err)?;
+
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repository_id)
+        .execute(db)
+        .await;
+    Ok(artifact_id)
+}
+
 async fn store_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -526,7 +561,15 @@ async fn store_package(
     let key = storage_key(repo.id, &artifact_path);
     proxy_helpers::put_artifact_bytes(state, repo, &key, body).await?;
 
-    let artifact_id = proxy_helpers::insert_artifact(
+    let files_indexed = contents.files.is_some();
+    let metadata = PacmanMetadata {
+        filename: filename.to_string(),
+        arch: info.arch.clone(),
+        pkginfo: info.clone(),
+        files: contents.files,
+        pgpsig: None,
+    };
+    let artifact_id = insert_package_rows(
         &state.db,
         proxy_helpers::NewArtifact {
             repository_id: repo.id,
@@ -539,19 +582,10 @@ async fn store_package(
             storage_key: &key,
             uploaded_by: user_id,
         },
+        &metadata,
     )
     .await?;
-
-    let files_indexed = contents.files.is_some();
-    let metadata = PacmanMetadata {
-        filename: filename.to_string(),
-        arch: info.arch.clone(),
-        pkginfo: info.clone(),
-        files: contents.files,
-        pgpsig: None,
-    };
-    let metadata = serde_json::to_value(&metadata).unwrap_or_default();
-    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "pacman", &metadata)
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
     crate::services::scanner_service::trigger_scan_on_upload(
         &state.db,
@@ -600,7 +634,7 @@ async fn attach_signature(
         .map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
     let arch = filename_arch(filename)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid package filename"))?;
-    let (artifact_id, _, _) =
+    let (artifact_id, _, metadata) =
         find_package(&state.db, repo.id, &[package_artifact_path(arch, filename)])
             .await?
             .ok_or_else(|| {
@@ -609,17 +643,39 @@ async fn attach_signature(
                     "Upload the package before its signature",
                 )
             })?;
+    let already_signed = || {
+        error(
+            StatusCode::CONFLICT,
+            "A signature is already attached to this package; delete and re-upload \
+             the package to change it",
+        )
+    };
+    let Some(metadata) = metadata else {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "This package has no pacman index metadata; delete and re-upload it",
+        ));
+    };
+    if stored_signature(Some(metadata)).is_some() {
+        return Err(already_signed());
+    }
 
-    sqlx::query(
+    // Set-once: a writer must not be able to swap the signature on someone
+    // else's (immutable) package. The guard also closes the race between the
+    // check above and this write.
+    let updated = sqlx::query(
         "UPDATE artifact_metadata \
          SET metadata = jsonb_set(metadata, '{pgpsig}', to_jsonb($2::text)) \
-         WHERE artifact_id = $1",
+         WHERE artifact_id = $1 AND NOT (metadata ? 'pgpsig')",
     )
     .bind(artifact_id)
     .bind(fmt::signature_base64(&signature))
     .execute(&state.db)
     .await
     .map_err(super::db_err)?;
+    if updated.rows_affected() == 0 {
+        return Err(already_signed());
+    }
 
     info!(
         "pacman signature attached: {} in repo {}",
@@ -717,7 +773,21 @@ mod tests {
         let names: Vec<_> = latest.iter().map(|p| p.meta.filename.as_str()).collect();
         assert_eq!(names, vec!["alpha-new", "zeta-2"]);
         let db = render_database(&latest, false).unwrap();
-        assert!(!db.is_empty());
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&db[..]));
+        let paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "alpha-1.0-1/",
+                "alpha-1.0-1/desc",
+                "zeta-1.0-1/",
+                "zeta-1.0-1/desc"
+            ]
+        );
     }
 
     #[test]
@@ -824,22 +894,48 @@ mod db_tests {
         send(fx, tdh::get(format!("/{}/{rel}", fx.repo_key))).await
     }
 
-    async fn put(fx: &tdh::Fixture, rel: &str, body: &'static [u8]) -> StatusCode {
-        send(
-            fx,
-            tdh::put(format!("/{}/{rel}", fx.repo_key), Bytes::from_static(body)),
-        )
-        .await
-        .0
+    async fn put(fx: &tdh::Fixture, rel: &str, body: impl Into<Bytes>) -> StatusCode {
+        send(fx, tdh::put(format!("/{}/{rel}", fx.repo_key), body.into()))
+            .await
+            .0
     }
 
-    async fn delete(fx: &tdh::Fixture, rel: &str) -> StatusCode {
-        let req = Request::builder()
+    fn delete_req(fx: &tdh::Fixture, rel: &str) -> Request<axum::body::Body> {
+        Request::builder()
             .method("DELETE")
             .uri(format!("/{}/{rel}", fx.repo_key))
             .body(axum::body::Body::empty())
-            .unwrap();
-        send(fx, req).await.0
+            .unwrap()
+    }
+
+    async fn delete(fx: &tdh::Fixture, rel: &str) -> StatusCode {
+        send(fx, delete_req(fx, rel)).await.0
+    }
+
+    /// A minimal zstd package for `name`/`version`/`arch`, returned with its
+    /// canonical filename.
+    fn build_package(name: &str, version: &str, arch: &str) -> (String, Vec<u8>) {
+        let pkginfo = format!("pkgname = {name}\npkgver = {version}\narch = {arch}\n");
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in [
+            (".PKGINFO", pkginfo.as_bytes()),
+            ("usr/bin/tool", b"#!/bin/sh\n".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body).unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        (
+            format!("{name}-{version}-{arch}.pkg.tar.zst"),
+            zstd::encode_all(&tar[..], 1).unwrap(),
+        )
+    }
+
+    fn db_versions(db: &[u8]) -> Vec<String> {
+        db_members(db).into_iter().map(|(path, _)| path).collect()
     }
 
     /// `(entry path, contents)` of every regular file in a served database.
@@ -877,10 +973,13 @@ mod db_tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            put(&fx, "junk-1-1-any.pkg.tar.zst", b"junk").await,
+            put(&fx, "junk-1-1-any.pkg.tar.zst", b"junk".as_slice()).await,
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(put(&fx, "README", b"x").await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            put(&fx, "README", b"x".as_slice()).await,
+            StatusCode::BAD_REQUEST
+        );
 
         // `any` packages appear in every architecture's databases.
         for arch in ["x86_64", "aarch64"] {
@@ -921,7 +1020,7 @@ mod db_tests {
         let sig_path = format!("x86_64/{MARKER_FILE}.sig");
         assert_eq!(get(&fx, &sig_path).await.0, StatusCode::NOT_FOUND);
         assert_eq!(
-            put(&fx, &format!("{MARKER_FILE}.sig"), b"garbage").await,
+            put(&fx, &format!("{MARKER_FILE}.sig"), b"garbage".as_slice()).await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
@@ -1009,6 +1108,94 @@ mod db_tests {
             crate::services::signing_service::verify_detached(&key.public_key_pem, &db, &armored)
                 .unwrap_or_else(|e| panic!("{name}.sig does not verify: {e}"));
         }
+        fx.teardown().await;
+    }
+
+    /// Architecture-specific packages are listed and served only under their
+    /// own architecture, and the newest upload of a name wins on real rows.
+    #[tokio::test]
+    async fn arch_specific_packages_and_newest_upload_wins() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let (old_file, old_pkg) = build_package("tool", "1.0-1", "x86_64");
+        let (new_file, new_pkg) = build_package("tool", "1.0-2", "x86_64");
+        assert_eq!(put(&fx, &old_file, old_pkg).await, StatusCode::CREATED);
+        // created_at is the ordering key; keep the two uploads apart.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            put(&fx, &new_file, new_pkg.clone()).await,
+            StatusCode::CREATED
+        );
+
+        let (_, db) = get(&fx, "x86_64/r.db").await;
+        assert_eq!(db_versions(&db), vec!["tool-1.0-2/desc"]);
+        let (_, db) = get(&fx, "aarch64/r.db").await;
+        assert!(
+            db_versions(&db).is_empty(),
+            "x86_64 package leaked into aarch64"
+        );
+
+        let (status, body) = get(&fx, &format!("x86_64/{new_file}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &new_pkg[..]);
+        assert_eq!(
+            get(&fx, &format!("aarch64/{new_file}")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // The older pkgrel is still downloadable by its own filename.
+        assert_eq!(
+            get(&fx, &format!("x86_64/{old_file}")).await.0,
+            StatusCode::OK
+        );
+
+        // Deleting the newest brings the previous build back into the index.
+        assert_eq!(
+            delete(&fx, &format!("x86_64/{new_file}")).await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, db) = get(&fx, "x86_64/r.db").await;
+        assert_eq!(db_versions(&db), vec!["tool-1.0-1/desc"]);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn writes_require_credentials_and_respect_promotion_only() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let anon = |req| tdh::send(fx.router_anon(super::router()), req);
+        let (status, _) = anon(tdh::put(
+            format!("/{}/{MARKER_FILE}", fx.repo_key),
+            Bytes::from_static(MARKER_PKG),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(put(&fx, MARKER_FILE, MARKER_PKG).await, StatusCode::CREATED);
+        let (status, _) = anon(delete_req(&fx, &format!("any/{MARKER_FILE}"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A signature is set once; replacing it needs a delete + re-upload.
+        assert_eq!(
+            put(&fx, &format!("{MARKER_FILE}.sig"), MARKER_SIG).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            put(&fx, &format!("{MARKER_FILE}.sig"), MARKER_SIG).await,
+            StatusCode::CONFLICT
+        );
+
+        fx.set_promotion_only(true).await;
+        assert_eq!(
+            delete(&fx, &format!("any/{MARKER_FILE}")).await,
+            StatusCode::FORBIDDEN
+        );
+        let (_, other) = build_package("other", "1-1", "any");
+        assert_eq!(
+            put(&fx, "other-1-1-any.pkg.tar.zst", other).await,
+            StatusCode::CONFLICT
+        );
         fx.teardown().await;
     }
 

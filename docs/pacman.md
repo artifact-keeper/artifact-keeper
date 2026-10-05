@@ -15,8 +15,8 @@ All routes live under `/pacman/{repo_key}`:
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `PUT` | `/{package}` | Upload `{name}-{pkgver}-{pkgrel}-{arch}.pkg.tar.{zst,xz,gz,bz2}` (or `.pkg.tar`) |
-| `PUT` | `/{package}.sig` | Attach the package's detached signature (binary or ASCII-armored) |
+| `PUT` | `/{package}` | Upload `{name}-[{epoch}:]{pkgver}-{pkgrel}-{arch}.pkg.tar.{zst,xz,gz,bz2}` (or `.pkg.tar`) |
+| `PUT` | `/{package}.sig` | Attach the package's detached signature (binary or ASCII-armored); set once |
 | `GET` | `/{arch}/{name}.db` | Package database (`{name}.db.tar.gz` also works) |
 | `GET` | `/{arch}/{name}.files` | Database including file lists (`pacman -F`) |
 | `GET` | `/{arch}/{name}.db.sig`, `/{arch}/{name}.files.sig` | Detached database signature (only when a signing key is attached) |
@@ -28,15 +28,28 @@ All routes live under `/pacman/{repo_key}`:
 `{name}` in the database filename is not checked, so the pacman section name
 can be anything. Packages built for `arch=('any')` appear in every
 architecture's database. Uploading a package whose filename disagrees with its
-`.PKGINFO` is refused, and so is re-uploading an existing filename (409):
+`.PKGINFO` is refused (the filename includes the epoch, `foo-1:2.0-1-x86_64...`,
+when `.PKGINFO` has one), and so is re-uploading an existing filename (409):
 publish a new `pkgrel` instead. When several versions of a package are
 uploaded, the database lists the most recently uploaded one, the way
 `repo-add` replaces an existing entry.
 
-The file list for `pacman -F` is read from the package at upload. A package
-too large to list within the server's budget (8 GiB decompressed or 500,000
-entries) is still published and installable; it just has no entry in the
-`.files` database.
+Packages must be uploaded through `/pacman/{repo_key}/`: that is where
+`.PKGINFO` is read and the package is indexed. A file pushed through the
+generic artifact API is stored but never appears in the databases. Uploads
+need a token with the `write:artifacts` scope and the repository's write
+permission; deletes need `delete:artifacts` and the delete permission (direct
+deletes on a promotion-only repository are reserved to admins and service
+accounts). Deleting through the generic artifact API works as well.
+
+`.PKGINFO` must appear among the first 32 archive entries (makepkg writes the
+metadata members first) within the shared ingest decompression budget
+(`MAX_INGEST_DECOMPRESSED_BYTES`, 128 MiB by default); anything else is
+refused. The file list for `pacman -F` is then read from the rest of the
+package under a separate budget, `PACMAN_FILE_LIST_MAX_DECOMPRESSED_BYTES`
+(4 GiB decompressed by default; 500,000 entries). A package past it is still
+published and installable; it just has no entry in the `.files` database. A
+package whose archive is truncated or corrupt is refused (400).
 
 ## Publishing
 
@@ -71,8 +84,9 @@ Attach a signing key with `key_type: gpg` to the repository (`POST
 /api/v1/signing/keys`, then `POST /api/v1/signing/repositories/{id}/config`
 with `sign_metadata: true`) and every `{name}.db` and `{name}.files` gets a
 detached signature at `.sig`, made over exactly the bytes pacman downloaded.
-RSA keys are rejected for pacman repositories because pacman only verifies
-OpenPGP signatures.
+Signing keys with a `key_type` other than `gpg` (for example `rsa` or
+`ed25519`) are rejected for pacman repositories because pacman only verifies
+OpenPGP signatures; a gpg key may use an RSA algorithm (`rsa2048`, `rsa4096`).
 
 Trust the repository key once on each client:
 
@@ -88,6 +102,22 @@ With the repository key and the packager's key trusted, the default
 `PackageOptional` (for example `SigLevel = PackageOptional DatabaseRequired`).
 Without a repository signing key the database `.sig` requests answer 404,
 which `DatabaseOptional` accepts.
+
+pacman fetches `{name}.db` and `{name}.db.sig` in separate requests. Both are
+rendered from the same rows and the rendering is deterministic, but an upload,
+delete or signature attach that lands between the two requests makes the
+signature cover a different database: `pacman -Sy` then reports an invalid
+database signature once and succeeds on the next run.
+
+**Key rotation.** pacman requires every signature in a `.sig` to verify, so a
+pacman repository is always signed with its single active key (no overlap
+period with the old key). After rotating, clients must import and
+`pacman-key --lsign-key` the new key before their next `pacman -Sy`.
+
+**Quarantine.** The databases list the newest upload of each package name
+even while that upload is held by an upload quarantine or scan policy, and
+the held package's download is refused until it is released. pacman therefore
+cannot install that package (or upgrade to it) until the hold is lifted.
 
 ## Testing
 

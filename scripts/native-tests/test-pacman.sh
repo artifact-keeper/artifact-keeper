@@ -13,7 +13,9 @@
 #
 # The client steps run in an archlinux container on the host network, so the
 # registry URL must be reachable from the host (e.g. a backend started with
-# `cargo run`). Requires curl, jq and podman (or docker).
+# `cargo run`). Requires curl, jq and podman (or docker), and an amd64 host:
+# the official archlinux image is published for x86_64 only. Building the
+# package installs base-devel from the live Arch mirrors.
 #
 # Usage:
 #   ./test-pacman.sh                                   # localhost:30080
@@ -48,7 +50,17 @@ pass() { echo "  ok: $*"; }
 
 WORK_DIR="$(mktemp -d)"
 chmod 777 "$WORK_DIR"
-trap 'rm -rf "$WORK_DIR"' EXIT
+TOKEN=""
+cleanup() {
+    # The repository (and the signing key it cascades) goes on every exit,
+    # not just the successful one.
+    if [ -n "$TOKEN" ]; then
+        curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" \
+            "$REGISTRY_URL/api/v1/repositories/$REPO_KEY" || true
+    fi
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 echo "==> pacman native client test"
 echo "Registry: $REGISTRY_URL  repo: $REPO_KEY  package: $PKG_NAME $PKG_VER-1"
@@ -56,21 +68,22 @@ echo "Registry: $REGISTRY_URL  repo: $REPO_KEY  package: $PKG_NAME $PKG_VER-1"
 # ---- 1. repository + signing key ------------------------------------------
 TOKEN=$(curl -sf -X POST "$REGISTRY_URL/api/v1/auth/login" \
     -H "Content-Type: application/json" \
-    -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" | jq -r .access_token)
+    -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" | jq -r .access_token) \
+    || fail "login"
 [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || fail "login"
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
 REPO_ID=$(curl -sf -X POST "$REGISTRY_URL/api/v1/repositories" "${AUTH[@]}" \
     -H "Content-Type: application/json" \
     -d "{\"key\":\"$REPO_KEY\",\"name\":\"pacman native test\",\"format\":\"pacman\",\"repo_type\":\"local\",\"is_public\":false}" \
-    | jq -r .id)
+    | jq -r .id) || fail "create repository"
 [ -n "$REPO_ID" ] && [ "$REPO_ID" != "null" ] || fail "create repository"
 pass "created private pacman repository $REPO_KEY"
 
 KEY_ID=$(curl -sf -X POST "$REGISTRY_URL/api/v1/signing/keys" "${AUTH[@]}" \
     -H "Content-Type: application/json" \
     -d "{\"repository_id\":\"$REPO_ID\",\"name\":\"$REPO_KEY-signing\",\"key_type\":\"gpg\",\"algorithm\":\"rsa2048\",\"uid_name\":\"AK pacman test\",\"uid_email\":\"pacman-test@example.invalid\"}" \
-    | jq -r .id)
+    | jq -r .id) || fail "create signing key"
 [ -n "$KEY_ID" ] && [ "$KEY_ID" != "null" ] || fail "create signing key"
 curl -sf -X POST "$REGISTRY_URL/api/v1/signing/repositories/$REPO_ID/config" "${AUTH[@]}" \
     -H "Content-Type: application/json" \
@@ -82,7 +95,7 @@ pass "repository signing key attached"
 # ---- 2. build and sign a package ------------------------------------------
 cat > "$WORK_DIR/build.sh" <<EOF
 set -euo pipefail
-pacman -Sy --noconfirm --needed base-devel >/dev/null
+pacman -Syu --noconfirm --needed base-devel >/dev/null
 useradd -m builder
 install -d -o builder /home/builder/pkg
 cat > /home/builder/pkg/PKGBUILD <<'P'
@@ -168,7 +181,7 @@ grep -q "hello from $PKG_NAME $PKG_VER" /usr/share/$PKG_NAME/hello.txt
 echo CLIENT-OK
 EOF
 "$RUNTIME" run --rm --network host -v "$WORK_DIR:/work:Z" "$ARCH_IMAGE" bash /work/client.sh \
-    | tee "$WORK_DIR/client.log" | sed 's/^/    /'
+    | tee "$WORK_DIR/client.log" | sed 's/^/    /' || true
 grep -q CLIENT-OK "$WORK_DIR/client.log" || fail "pacman client run"
 pass "pacman -Sy, -Sw, -S and -Fy verified the signed repository"
 
@@ -178,9 +191,9 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${AUTH[@]}" \
 [ "$STATUS" = 204 ] || fail "delete: HTTP $STATUS"
 # The (now empty) database is still signed, so this run keeps SigLevel=Required.
 "$RUNTIME" run --rm --network host -v "$WORK_DIR:/work:Z" "$ARCH_IMAGE" bash /work/client.sh deleted \
-    | grep -q DELETE-OK || fail "package still visible after delete"
+    | tee "$WORK_DIR/deleted.log" | sed 's/^/    /' || true
+grep -q DELETE-OK "$WORK_DIR/deleted.log" || fail "package still visible after delete"
 pass "deleted package is gone from the database"
 
-curl -sf -X DELETE "${AUTH[@]}" "$REGISTRY_URL/api/v1/repositories/$REPO_KEY" >/dev/null || true
 echo ""
 echo "pacman native client test PASSED"

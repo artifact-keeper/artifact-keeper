@@ -243,7 +243,7 @@ fn format_to_purl_type(format: &str) -> &'static str {
         "rpm" => "rpm",
         "deb" | "debian" | "apt" => "deb",
         "apk" | "alpine" => "apk",
-        "pacman" | "alpm" => "alpm",
+        "pacman" => "alpm",
         _ => "generic",
     }
 }
@@ -21426,6 +21426,7 @@ tonic-build = "0.12"
         assert_eq!(format_to_purl_type("alpine"), "apk");
         assert_eq!(format_to_purl_type("APK"), "apk");
         assert_eq!(format_to_purl_type("Alpine"), "apk");
+        assert_eq!(format_to_purl_type("pacman"), "alpm");
     }
 
     #[test]

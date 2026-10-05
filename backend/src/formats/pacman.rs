@@ -49,12 +49,31 @@ const PKGINFO_MAX_BYTES: u64 = 1024 * 1024;
 /// sane key type plus armor without accepting arbitrary blobs.
 pub const SIGNATURE_MAX_BYTES: usize = 16 * 1024;
 
-/// Decoded-byte budget for the file-list walk. Listing the files of a package
-/// means inflating all of it (repo-add runs `bsdtar -tf` for the same reason),
-/// so the general 128 MiB ingest budget would refuse ordinary large packages.
-/// The walk streams and keeps only entry names, so the budget bounds CPU, not
-/// memory; a package past it is still published, just without a file list.
-pub const FILE_LIST_MAX_DECODED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Entries walked while looking for `.PKGINFO`. makepkg writes the package
+/// metadata members (`.BUILDINFO`, `.MTREE`, `.PKGINFO`, `.INSTALL`, ...)
+/// ahead of the payload, so a real package always reaches it within a few
+/// entries; an archive that does not is refused before any payload is walked.
+pub const PKGINFO_MAX_ENTRIES: u64 = 32;
+
+/// Default decoded-byte budget for the file-list walk that continues once
+/// `.PKGINFO` has been read. Listing a package's files means inflating all of
+/// it (repo-add runs `bsdtar -tf` for the same reason), so the general ingest
+/// budget (128 MiB) would refuse ordinary large packages. The walk streams and
+/// keeps only entry names, so this bounds CPU, not memory; a package past it
+/// is still published, just without a `%FILES%` entry. Override with
+/// [`FILE_LIST_MAX_DECOMPRESSED_BYTES_ENV`].
+pub const DEFAULT_FILE_LIST_MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Environment variable overriding [`DEFAULT_FILE_LIST_MAX_DECOMPRESSED_BYTES`].
+pub const FILE_LIST_MAX_DECOMPRESSED_BYTES_ENV: &str = "PACMAN_FILE_LIST_MAX_DECOMPRESSED_BYTES";
+
+/// Effective file-list budget, honouring [`FILE_LIST_MAX_DECOMPRESSED_BYTES_ENV`].
+pub fn file_list_max_decompressed_bytes() -> u64 {
+    crate::util::bounded_archive::positive_env_or(
+        FILE_LIST_MAX_DECOMPRESSED_BYTES_ENV,
+        DEFAULT_FILE_LIST_MAX_DECOMPRESSED_BYTES,
+    )
+}
 
 /// Entry-count cap for the file-list walk (texlive-class packages carry tens
 /// of thousands of entries).
@@ -255,7 +274,8 @@ pub fn classify_repo_file(filename: &str) -> Option<RepoFile<'_>> {
 
 /// Pick a decompressor from the stream's magic bytes. pacman packages are
 /// tarballs under whatever `PKGEXT` compression the packager chose, and the
-/// magic (not the filename) is what decides how they decode.
+/// magic (not the filename) is what decides how they decode. The multi-member
+/// decoders match libarchive, which reads concatenated gzip/xz/bzip2 members.
 fn package_decoder<'a>(data: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
     let decoder: Box<dyn Read + 'a> = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         Box::new(
@@ -263,9 +283,9 @@ fn package_decoder<'a>(data: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
                 .map_err(|e| AppError::Validation(format!("Invalid zstd stream: {e}")))?,
         )
     } else if data.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
-        Box::new(xz2::read::XzDecoder::new(data))
+        Box::new(xz2::read::XzDecoder::new_multi_decoder(data))
     } else if data.starts_with(&[0x1F, 0x8B]) {
-        Box::new(flate2::read::GzDecoder::new(data))
+        Box::new(flate2::read::MultiGzDecoder::new(data))
     } else if data.starts_with(b"BZh") {
         Box::new(bzip2::read::MultiBzDecoder::new(data))
     } else {
@@ -280,29 +300,116 @@ pub struct PackageContents {
     pub info: PkgInfo,
     /// Sorted, de-duplicated file list for the `.files` database (directories
     /// carry a trailing `/`, as `bsdtar -tf` prints them). `None` when the
-    /// walk could not finish within its budgets: the package is still indexed
-    /// in `.db`, it just has no `%FILES%` section.
+    /// walk ran out of its file-list budgets: the package is still indexed in
+    /// `.db`, it just has no `%FILES%` section.
     pub files: Option<Vec<String>>,
 }
 
-/// Read `.PKGINFO` and the file list out of a package in one streaming walk.
+const BUDGET_EXHAUSTED: &str = "pacman package decompression budget exceeded";
+
+/// A decoded-byte budget whose limit can be raised mid-stream: the walk runs
+/// under the tight ingest budget until `.PKGINFO` is parsed, then continues
+/// under the file-list budget. Records whether the budget (rather than a
+/// corrupt stream) is what stopped the walk.
+struct PhasedBudget<R> {
+    inner: R,
+    used: u64,
+    limit: std::rc::Rc<std::cell::Cell<u64>>,
+    exhausted: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: Read> Read for PhasedBudget<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.limit.get().saturating_sub(self.used);
+        if remaining == 0 {
+            // At the limit: only a clean EOF is not a breach.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => {
+                    self.exhausted.set(true);
+                    Err(std::io::Error::other(BUDGET_EXHAUSTED))
+                }
+            };
+        }
+        let cap = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.used += n as u64;
+        Ok(n)
+    }
+}
+
+/// Budgets for [`inspect_package_limited`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InspectLimits {
+    /// Decoded bytes allowed until `.PKGINFO` is parsed.
+    pub pkginfo_bytes: u64,
+    /// Entries allowed until `.PKGINFO` is found.
+    pub pkginfo_entries: u64,
+    /// Decoded bytes allowed for the whole walk once `.PKGINFO` is parsed.
+    /// `None` stops the walk at `.PKGINFO` (no file list).
+    pub file_list_bytes: Option<u64>,
+    pub file_list_entries: u64,
+    pub file_list_name_bytes: usize,
+}
+
+impl InspectLimits {
+    fn upload() -> Self {
+        Self {
+            pkginfo_bytes: crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+            pkginfo_entries: PKGINFO_MAX_ENTRIES,
+            file_list_bytes: Some(file_list_max_decompressed_bytes()),
+            file_list_entries: FILE_LIST_MAX_ENTRIES,
+            file_list_name_bytes: FILE_LIST_MAX_NAME_BYTES,
+        }
+    }
+}
+
+/// Read `.PKGINFO` and the file list out of an uploaded package in one
+/// streaming walk, in two phases: `.PKGINFO` must turn up within the shared
+/// ingest budget and [`PKGINFO_MAX_ENTRIES`], and only then does the file-list
+/// walk continue under [`file_list_max_decompressed_bytes`].
 pub fn inspect_package(data: &[u8]) -> Result<PackageContents> {
-    inspect_package_limited(data, FILE_LIST_MAX_DECODED_BYTES, FILE_LIST_MAX_ENTRIES)
+    inspect_package_limited(data, InspectLimits::upload())
+}
+
+/// Read only `.PKGINFO` (phase one of [`inspect_package`]).
+pub fn read_pkginfo(data: &[u8]) -> Result<PkgInfo> {
+    let limits = InspectLimits {
+        file_list_bytes: None,
+        ..InspectLimits::upload()
+    };
+    inspect_package_limited(data, limits).map(|c| c.info)
+}
+
+fn invalid_package(e: impl std::fmt::Display) -> AppError {
+    AppError::Validation(format!("Invalid pacman package: {e}"))
 }
 
 /// `_limited` seam for [`inspect_package`] so tests can drive tiny budgets.
 pub(crate) fn inspect_package_limited(
     data: &[u8],
-    max_decoded: u64,
-    max_entries: u64,
+    limits: InspectLimits,
 ) -> Result<PackageContents> {
-    let reader = crate::util::bounded_archive::budgeted_to(package_decoder(data)?, max_decoded);
-    let mut archive = tar::Archive::new(reader);
-    let entries = archive
-        .entries()
-        .map_err(|e| AppError::Validation(format!("Invalid pacman package: {e}")))?;
+    use std::{cell::Cell, rc::Rc};
 
-    let mut info = None;
+    let limit = Rc::new(Cell::new(limits.pkginfo_bytes));
+    let exhausted = Rc::new(Cell::new(false));
+    let reader = PhasedBudget {
+        inner: package_decoder(data)?,
+        used: 0,
+        limit: limit.clone(),
+        exhausted: exhausted.clone(),
+    };
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive.entries().map_err(invalid_package)?;
+
+    let mut info: Option<PkgInfo> = None;
     let mut files = Vec::new();
     let mut name_bytes = 0usize;
     let mut complete = true;
@@ -310,36 +417,54 @@ pub(crate) fn inspect_package_limited(
 
     for entry in entries {
         seen += 1;
-        if seen > max_entries {
+        if info.is_none() && seen > limits.pkginfo_entries {
+            return Err(invalid_package(format!(
+                ".PKGINFO not found within the first {} entries",
+                limits.pkginfo_entries
+            )));
+        }
+        if seen > limits.file_list_entries {
             complete = false;
             break;
         }
         let mut entry = match entry {
             Ok(entry) => entry,
-            // Past `.PKGINFO` a broken or over-budget tail only costs the file
-            // list; before it the upload is not a readable package at all.
-            Err(_) if info.is_some() => {
+            // Past `.PKGINFO`, running out of the file-list budget only costs
+            // the file list. Anything else (a truncated or corrupt stream) is
+            // a broken package, and so is every failure before `.PKGINFO`.
+            Err(_) if info.is_some() && exhausted.get() => {
                 complete = false;
                 break;
             }
-            Err(e) => return Err(AppError::Validation(format!("Invalid pacman package: {e}"))),
+            Err(e) if exhausted.get() => {
+                return Err(AppError::Validation(format!(
+                    "Archive expands beyond the decompression budget before .PKGINFO: {e}"
+                )))
+            }
+            Err(e) => return Err(invalid_package(e)),
         };
         let path = match entry.path() {
             Ok(p) => p.to_string_lossy().trim_start_matches("./").to_string(),
-            Err(_) => continue,
+            Err(e) => return Err(invalid_package(e)),
         };
-        if path == ".PKGINFO" {
+        if path == ".PKGINFO" && info.is_none() {
             let raw = crate::util::bounded_archive::read_capped(
                 &mut entry,
                 PKGINFO_MAX_BYTES,
                 ".PKGINFO",
             )?;
             info = Some(parse_pkginfo(&String::from_utf8_lossy(&raw))?);
+            match limits.file_list_bytes {
+                Some(budget) => limit.set(budget.max(limits.pkginfo_bytes)),
+                None => break,
+            }
             continue;
         }
         // repo-add lists files with `bsdtar --exclude='^.*'`: the package
         // metadata members (.BUILDINFO, .MTREE, .INSTALL, ...) are not files.
-        if path.is_empty() || path.starts_with('.') || path.contains(['\n', '\r']) {
+        // Names carrying control characters cannot be represented in the
+        // line-oriented `files` entry (or, for NUL, in JSONB) and are skipped.
+        if path.is_empty() || path.starts_with('.') || path.chars().any(char::is_control) {
             continue;
         }
         let mut name = path;
@@ -347,7 +472,7 @@ pub(crate) fn inspect_package_limited(
             name.push('/');
         }
         name_bytes += name.len();
-        if name_bytes > FILE_LIST_MAX_NAME_BYTES {
+        if name_bytes > limits.file_list_name_bytes {
             complete = false;
             break;
         }
@@ -361,7 +486,7 @@ pub(crate) fn inspect_package_limited(
     files.dedup();
     Ok(PackageContents {
         info,
-        files: complete.then_some(files),
+        files: (complete && limits.file_list_bytes.is_some()).then_some(files),
     })
 }
 
@@ -585,8 +710,7 @@ impl FormatHandler for PacmanHandler {
         {
             metadata["filename"] = filename.into();
             if !content.is_empty() {
-                let contents = inspect_package(content)?;
-                metadata["pkginfo"] = serde_json::to_value(&contents.info)?;
+                metadata["pkginfo"] = serde_json::to_value(read_pkginfo(content)?)?;
             }
         }
         Ok(metadata)
@@ -696,10 +820,16 @@ mod tests {
     fn decodes_every_supported_compression() {
         use std::io::Write;
         let tar = demo_package_tar();
+        // Two concatenated gzip members, as libarchive (and so pacman) reads them.
         let gz = {
-            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            e.write_all(&tar).unwrap();
-            e.finish().unwrap()
+            let (a, b) = tar.split_at(700);
+            let mut out = Vec::new();
+            for part in [a, b] {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(part).unwrap();
+                out.extend(e.finish().unwrap());
+            }
+            out
         };
         let xz = {
             let mut e = xz2::write::XzEncoder::new(Vec::new(), 1);
@@ -730,11 +860,92 @@ mod tests {
         }
     }
 
+    fn limits(pkginfo_bytes: u64, file_list_bytes: Option<u64>, entries: u64) -> InspectLimits {
+        InspectLimits {
+            pkginfo_bytes,
+            pkginfo_entries: PKGINFO_MAX_ENTRIES,
+            file_list_bytes,
+            file_list_entries: entries,
+            file_list_name_bytes: 1 << 20,
+        }
+    }
+
     #[test]
     fn file_list_over_budget_keeps_the_package_indexable() {
-        let contents = inspect_package_limited(&demo_package_tar(), u64::MAX, 3).unwrap();
+        // Entry cap.
+        let contents =
+            inspect_package_limited(&demo_package_tar(), limits(u64::MAX, Some(u64::MAX), 3))
+                .unwrap();
         assert_eq!(contents.info.pkgname, "demo");
         assert_eq!(contents.files, None);
+
+        // Byte budget running out after `.PKGINFO`.
+        let tar = tar_of(&[(".PKGINFO", PKGINFO.as_bytes()), ("usr/big", &[0u8; 8192])]);
+        let contents = inspect_package_limited(&tar, limits(2048, Some(4096), 100)).unwrap();
+        assert_eq!(contents.info.pkgname, "demo");
+        assert_eq!(contents.files, None);
+        // ...while a larger file-list budget lists it.
+        let contents = inspect_package_limited(&tar, limits(2048, Some(1 << 20), 100)).unwrap();
+        assert_eq!(contents.files.unwrap(), vec!["usr/big"]);
+    }
+
+    /// The upload walk must stay on the shared ingest budget until `.PKGINFO`
+    /// is parsed: a bomb in front of it is refused at that budget, not at the
+    /// much larger file-list one.
+    #[test]
+    fn rejects_a_bomb_before_pkginfo() {
+        let tar = tar_of(&[("usr/big", &[0u8; 4096]), (".PKGINFO", PKGINFO.as_bytes())]);
+        let err = inspect_package_limited(&tar, limits(1024, Some(u64::MAX), 100))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decompression budget"), "{err}");
+    }
+
+    #[test]
+    fn pkginfo_must_come_early() {
+        let mut entries: Vec<(String, &[u8])> = (0..PKGINFO_MAX_ENTRIES)
+            .map(|i| (format!("usr/f{i}"), b"x".as_slice()))
+            .collect();
+        entries.push((".PKGINFO".to_string(), PKGINFO.as_bytes()));
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let err = inspect_package(&tar_of(&refs)).unwrap_err().to_string();
+        assert!(err.contains("within the first"), "{err}");
+    }
+
+    /// A stream that breaks after `.PKGINFO` is a broken package, not an
+    /// over-budget one: it must be refused rather than published.
+    #[test]
+    fn truncated_package_is_refused() {
+        let tar = demo_package_tar();
+        let cut = &tar[..tar.len() - 1024 - 700];
+        assert!(inspect_package(cut).is_err());
+        let zst = zstd::encode_all(&tar[..], 1).unwrap();
+        assert!(inspect_package(&zst[..zst.len() - 8]).is_err());
+    }
+
+    #[test]
+    fn skips_names_with_control_characters() {
+        let tar = tar_of(&[
+            (".PKGINFO", PKGINFO.as_bytes()),
+            ("usr/ok", b"x"),
+            ("usr/bad\u{1}name", b"x"),
+        ]);
+        assert_eq!(
+            inspect_package(&tar).unwrap().files.unwrap(),
+            vec!["usr/ok"]
+        );
+    }
+
+    #[test]
+    fn read_pkginfo_stops_at_pkginfo() {
+        let tar = tar_of(&[(".PKGINFO", PKGINFO.as_bytes()), ("usr/big", &[0u8; 8192])]);
+        assert_eq!(read_pkginfo(&tar).unwrap().pkgname, "demo");
+        assert_eq!(read_pkginfo(MARKER_PKG).unwrap().pkgname, "ak-marker");
+        assert!(read_pkginfo(b"nope").is_err());
+        assert_eq!(
+            file_list_max_decompressed_bytes(),
+            DEFAULT_FILE_LIST_MAX_DECOMPRESSED_BYTES
+        );
     }
 
     #[test]
@@ -743,12 +954,6 @@ mod tests {
         let err = inspect_package(&tar).unwrap_err().to_string();
         assert!(err.contains(".PKGINFO not found"), "{err}");
         assert!(inspect_package(b"definitely not a package").is_err());
-    }
-
-    #[test]
-    fn rejects_a_bomb_before_pkginfo() {
-        let tar = tar_of(&[("usr/big", &[0u8; 4096]), (".PKGINFO", PKGINFO.as_bytes())]);
-        assert!(inspect_package_limited(&tar, 1024, 100).is_err());
     }
 
     #[test]

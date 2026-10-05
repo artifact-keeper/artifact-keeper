@@ -13,7 +13,7 @@ echo "=============================================="
 
 # Define test sets
 SMOKE_TESTS=(pypi npm cargo)
-ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf incus hex pub proxy-virtual pub-proxy pub-virtual health-probes tag-replication curation)
+ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf incus hex pacman pub proxy-virtual pub-proxy pub-virtual health-probes tag-replication curation)
 
 # Select tests based on profile
 case "$PROFILE" in

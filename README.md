@@ -24,7 +24,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **Full-Text Search** - OpenSearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
 - **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
-- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, pacman, and Conda handlers
+- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, Pacman, and Conda handlers
 
 ## System Architecture
 
@@ -205,7 +205,7 @@ flowchart LR
 - **Dual scanner** - Trivy for filesystem/container analysis, Grype for dependency trees
 - **Scoring** - A through F grades based on finding severity and count
 - **Policies** - Configurable rules that block or quarantine artifacts
-- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, pacman, and Conda packages
+- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, Pacman, and Conda packages
 
 > **Container-image scanning (`TRIVY_ADAPTER_URL`).** The base `docker-compose.yml`
 > wires `TRIVY_URL` for the legacy trivy *server* (filesystem / incus rootfs
