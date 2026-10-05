@@ -45,13 +45,15 @@ PTYPE=https://github.com/artifact-keeper/artifact-keeper/attestations/release-ca
 
 STUB="$WORK/bin"; mkdir -p "$STUB"
 
-# Digest probe stub: answers per image name from FAKE_DIGEST_<key>.
+# Digest probe stub: answers per image name from FAKE_DIGEST_<key>; the
+# adapter's exact version tag (anything but sha-*) from FAKE_DIGEST_adapter_tag
+# (default absent), for the "stays" anchor (#4076).
 cat > "$STUB/probe" <<'STUBPROBE'
 #!/usr/bin/env bash
 case "$2" in
   *-backend)         v="${FAKE_DIGEST_backend-}" ;;
   *-openscap)        v="${FAKE_DIGEST_openscap-}" ;;
-  *-scanner-adapter) v="${FAKE_DIGEST_adapter-}" ;;
+  *-scanner-adapter) case "${3:-}" in sha-*) v="${FAKE_DIGEST_adapter-}" ;; *) v="${FAKE_DIGEST_adapter_tag:-absent}" ;; esac ;;
   *) v="" ;;
 esac
 [ -n "$v" ] || v=indeterminate
@@ -68,7 +70,10 @@ chmod +x "$STUB/probe"
 # answers with a JSON envelope of the real shape carrying the predicate from
 # FAKE_PREDICATE (or a per-image override FAKE_PREDICATE_<key>). When
 # FAKE_PREDICATES_<key> is set to a JSON array, one statement per element is
-# returned, in that order -- a digest carrying several certifications.
+# returned, in that order -- a digest carrying several certifications. For the
+# adapter's published digest FAKE_STAYS_DIGEST the statements come from
+# FAKE_PREDICATES_adapter_stays instead, and any digest listed in
+# FAKE_GH_NONE_DIGESTS has no attestation at all (#4076).
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 [ "${1:-}" = "attestation" ] && [ "${2:-}" = "verify" ] || { echo "stub gh: unexpected '${1:-} ${2:-}'" >&2; exit 64; }
@@ -87,6 +92,9 @@ while [ $# -gt 0 ]; do
 done
 [ "${FAKE_GH_NETFAIL:-0}" = "1" ] && { echo 'failed to fetch attestations: dial tcp: i/o timeout' >&2; exit 1; }
 [ "${FAKE_GH_NONE:-0}" = "1" ] && { echo '✗ no attestations found for subject' >&2; exit 1; }
+for d in ${FAKE_GH_NONE_DIGESTS:-}; do
+  case "$subject" in *"@$d") echo '✗ no attestations found for subject' >&2; exit 1 ;; esac
+done
 actual_signer="${FAKE_GH_SIGNER:-artifact-keeper/artifact-keeper/.github/workflows/release-candidate.yml}"
 actual_ref="${FAKE_GH_SOURCE_REF:-refs/heads/main}"
 actual_identity="https://github.com/${actual_signer}@${actual_ref}"
@@ -101,6 +109,7 @@ actual_identity="https://github.com/${actual_signer}@${actual_ref}"
 case "$subject" in
   *-backend@*)         p="${FAKE_PREDICATE_backend:-$FAKE_PREDICATE}"; list="${FAKE_PREDICATES_backend:-}" ;;
   *-openscap@*)        p="${FAKE_PREDICATE_openscap:-$FAKE_PREDICATE}"; list="${FAKE_PREDICATES_openscap:-}" ;;
+  *-scanner-adapter@"${FAKE_STAYS_DIGEST:-none}") p="$FAKE_PREDICATE"; list="${FAKE_PREDICATES_adapter_stays:-}" ;;
   *-scanner-adapter@*) p="${FAKE_PREDICATE_adapter:-$FAKE_PREDICATE}"; list="${FAKE_PREDICATES_adapter:-}" ;;
   *) p="$FAKE_PREDICATE"; list="" ;;
 esac
@@ -128,6 +137,15 @@ good_predicate() { # <sha> <run> [certified_ref] [blob]  (empty = field absent)
   [ -n "$blob" ] && extra="${extra}$(printf '"certified_workflow_blob":"%s",' "$blob")"
   printf '{"commit_sha":"%s","version":"1.9.0",%s"candidate_run_id":"%s","gate_run_id":"777","digests":{"backend":"%s","openscap":"%s","scanner_adapter":"%s"}}' \
     "$1" "$extra" "$2" "$D_BACKEND" "$D_OPENSCAP" "$D_ADAPTER"
+}
+
+# A certification whose adapter decision is recorded (#4076):
+# <sha> <run> <decision> <adapter digest> [tag] [owner_rev] [scanner_adapter_version]
+decided_predicate() {
+  good_predicate "$1" "$2" | jq -c --arg d "$3" --arg a "$4" --arg t "${5-1.3.0}" \
+      --arg o "${6-$SHA_B}" --arg v "${7-1.3.0}" \
+    '.digests.scanner_adapter = $a | .scanner_adapter_version = $v
+     | .scanner_adapter_decision = {decision: $d, owner_rev: $o, tag: $t}'
 }
 
 # <label> <expected-exit> <expected-substring>; scenario from exported env.
@@ -247,6 +265,87 @@ FAKE_PREDICATE='{"commit_sha":"'"$SHA_A"'","version":"1.9.0","digests":{"backend
 
 # 11. bad input
 SHA=abc expect "malformed CERT_SHA -> INFRA (exit 2)" 2 "40-character"
+
+# ── the scanner adapter's exact version stays published (#4076) ────────────
+# A legacy certification (no recorded decision) says so in the outputs.
+: > "$WORK/out"
+expect "legacy certification -> CERTIFIED, adapter anchored at sha-<sha>" 0 "CERTIFIED"
+if grep -qx "scanner_adapter_decision=" "$WORK/out" && grep -qx "scanner_adapter_digest=${D_ADAPTER}" "$WORK/out"; then
+  pass "a legacy certification emits an empty adapter decision and the sha-tag digest"
+else
+  fail "legacy adapter outputs wrong (got: $(tr '\n' ' ' < "$WORK/out"))"
+fi
+
+# "new": anchored at sha-<sha> as before, decision passed through.
+: > "$WORK/out"
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 new "$D_ADAPTER" "sha-${SHA_A:0:7}" "")" \
+  expect "decision new -> CERTIFIED at the sha-tag digest" 0 "CERTIFIED"
+grep -qx "scanner_adapter_decision=new" "$WORK/out" && pass "decision new is emitted" || fail "decision new not emitted"
+
+# "stays": the certified adapter is the published :1.3.0 (built from SHA_B),
+# and this commit's rebuild carries no certification at all. That digest also
+# carries the owner's own certification, which must be ignored.
+D_PUB=sha256:5555555555555555555555555555555555555555555555555555555555555555
+STAYS="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB")"
+OWNER_CERT="$(good_predicate "$SHA_B" 3131)"
+export FAKE_STAYS_DIGEST="$D_PUB" FAKE_GH_NONE_DIGESTS="$D_ADAPTER"
+: > "$WORK/out"
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${OWNER_CERT},${STAYS}]" \
+  expect "decision stays -> CERTIFIED at the published exact tag" 0 "stays on :1.3.0"
+if grep -qx "scanner_adapter_digest=${D_PUB}" "$WORK/out" && grep -qx "scanner_adapter_decision=stays" "$WORK/out" \
+   && grep -qx "scanner_adapter_owner_rev=${SHA_B}" "$WORK/out"; then
+  pass "stays emits the shipped digest, the decision and the owner"
+else
+  fail "stays outputs wrong (got: $(tr '\n' ' ' < "$WORK/out"))"
+fi
+
+# The exact tag was re-pointed since certification: the new bytes carry no
+# certification for this commit, and the rebuild never had one.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_OTHER" FAKE_PREDICATES_adapter_stays="[${STAYS}]" \
+FAKE_GH_NONE_DIGESTS="$D_ADAPTER $D_OTHER" \
+  expect "stays, exact tag now serves other bytes -> BLOCKED" 1 "nor on the published exact tag"
+# The published digest carries only the OWNER's certification (the realistic
+# shape when this commit was never certified at that digest): certified, but
+# not for this commit, so nothing anchors the adapter.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${OWNER_CERT}]" \
+  expect "stays, published digest certified only for its owner -> BLOCKED" 1 "nor on the published exact tag"
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${OWNER_CERT}]" \
+  expect "...and says the digest is certified, but not for this commit" 1 "is certified, but not for ${SHA_A}"
+# ...or is gone.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag=absent \
+  expect "stays, exact tag absent -> BLOCKED" 1 "nor on the published exact tag"
+# ...or cannot be read: INFRA, never a pass.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag=indeterminate \
+  expect "stays, exact tag unreadable -> INFRA (exit 2)" 2 "could not read"
+
+# Re-pointed, and the new bytes were certified for this commit by ANOTHER
+# run's "stays": the image set is still not one run's.
+FAKE_PREDICATE="$STAYS" FAKE_DIGEST_adapter_tag="$D_PUB" \
+FAKE_PREDICATES_adapter_stays="[$(decided_predicate "$SHA_A" 5150 stays "$D_PUB")]" \
+  expect "stays digest certified by a different run -> BLOCKED" 1 "certified by ONE run or not at all"
+
+# The tag must be the adapter's own exact VERSION, nothing else.
+BADTAG="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" 1.3.1)"
+FAKE_PREDICATE="$BADTAG" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${BADTAG}]" \
+  expect "stays anchored at another version's tag -> BLOCKED" 1 "not its scanner_adapter_version"
+for t in latest 1.3 '../x'; do
+  FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" "$t" "$SHA_B" "$t")" \
+    expect "stays anchored at the non-exact tag '${t}' -> BLOCKED" 1 "not an exact X.Y.Z adapter version"
+done
+
+# owner_rev reaches a shell in the promote: a sha on "stays", empty otherwise.
+for o in "" "abc" '$(id)'; do
+  BADOWNER="$(decided_predicate "$SHA_A" 4242 stays "$D_PUB" 1.3.0 "$o")"
+  FAKE_PREDICATE="$BADOWNER" FAKE_DIGEST_adapter_tag="$D_PUB" FAKE_PREDICATES_adapter_stays="[${BADOWNER}]" \
+    expect "stays with owner_rev '${o}' -> BLOCKED" 1 "not a 40-character commit sha"
+done
+unset FAKE_STAYS_DIGEST FAKE_GH_NONE_DIGESTS
+
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 new "$D_ADAPTER" "sha-${SHA_A:0:7}" "$SHA_B")" \
+  expect "decision new with an owner_rev -> BLOCKED" 1 "only \"stays\" has an owner"
+
+FAKE_PREDICATE="$(decided_predicate "$SHA_A" 4242 maybe "$D_ADAPTER" 1.3.0 "")" \
+  expect "unknown adapter decision -> BLOCKED" 1 "unknown scanner-adapter decision 'maybe'"
 
 # ── the DERIVED release line (maintenance-branch candidates) ───────────────
 # A patch release is certified FROM MAIN, so the accepted identity is

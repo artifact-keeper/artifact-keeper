@@ -453,7 +453,14 @@ jobs:
     outputs:
       backend_digest: ${{ steps.digests.outputs.backend_digest }}
       openscap_digest: ${{ steps.digests.outputs.openscap_digest }}
-      adapter_digest: ${{ steps.digests.outputs.adapter_digest }}
+      # The adapter digest the release SHIPS (#4076): this commit's sha-<sha>
+      # rebuild when the exact version is new, the published `:VERSION`
+      # digest when it stays. See "Pin the scanner-adapter digest that ships".
+      adapter_digest: ${{ steps.adapter.outputs.adapter_digest }}
+      adapter_tag: ${{ steps.adapter.outputs.adapter_tag }}
+      adapter_image_ref: ${{ steps.adapter.outputs.adapter_image_ref }}
+      adapter_decision: ${{ steps.adapter.outputs.adapter_decision }}
+      adapter_owner_rev: ${{ steps.adapter.outputs.adapter_owner_rev }}
       adapter_version: ${{ steps.digests.outputs.adapter_version }}
       publish_run_id: ${{ steps.publish.outputs.run_id }}
     steps:
@@ -525,9 +532,11 @@ jobs:
 
       # The `sha-<sha>` tags are content-addressed anchors written by every
       # main build. Their digests are what the gate tests and what the
-      # certification names. The adoption gate release.yml applies to a
-      # promoted image (#3640) is applied here in its strict form: the
-      # published image's recorded revision must BE this commit.
+      # certification names. (The scanner adapter's certified digest is
+      # settled below, by its exact-version decision: #4076.) The adoption
+      # gate release.yml applies to a promoted image (#3640) is applied here
+      # in its strict form: the published image's recorded revision must BE
+      # this commit.
       - name: Resolve the sha-tag digests and their provenance
         id: digests
         env:
@@ -579,11 +588,41 @@ jobs:
 
       # ── parity: the scanner-adapter exact-version decision (#3773) ──────────
       # The check RELEASING.md step 6 admitted a candidate never exercised.
+      # It also writes the decision to this step's outputs (#4076):
+      # decision=new|stays, owner_rev, adapter_version.
       - name: Assert the scanner-adapter exact version can publish from this commit
+        id: adapter_decision
         env:
           GHCR_TOKEN: ${{ github.token }}
           ADAPTER_SHA: ${{ needs.resolve.outputs.sha }}
         run: scripts/ci/assert-adapter-exact-version.sh
+
+      # ── the adapter the release ships (#4076) ───────────────────────────────
+      # On "new" the release ships this commit's sha-<sha> rebuild; on "stays"
+      # it ships the published `:VERSION` digest, which is then what gets
+      # certified (checked against the owner's sha tag and Docker Hub). The
+      # logic and its rationale live in scripts/ci/pin-adapter-digest.sh,
+      # tested by test-pin-adapter-digest.sh. It also refuses "stays" when the
+      # certified commit's own assert-candidate-certified.sh predates #4076:
+      # release.yml runs that copy on the tag and would refuse the
+      # certification after the tag exists (backport first).
+      #
+      # The Release Gate cannot be pinned to this image yet: release-gate.yml
+      # (artifact-keeper-test) takes no adapter input and deploys the chart's
+      # pinned adapter (artifact-keeper-test#380). `adapter_image_ref` is the
+      # value to pass once it does.
+      - name: Pin the scanner-adapter digest that ships
+        id: adapter
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+          CERT_SHA: ${{ needs.resolve.outputs.sha }}
+          CERTIFIED_BRANCH: ${{ needs.resolve.outputs.certified_branch }}
+          DECISION: ${{ steps.adapter_decision.outputs.decision }}
+          OWNER_REV: ${{ steps.adapter_decision.outputs.owner_rev }}
+          ADAPTER_VERSION: ${{ steps.digests.outputs.adapter_version }}
+          REBUILD_DIGEST: ${{ steps.digests.outputs.adapter_digest }}
+        run: scripts/ci/pin-adapter-digest.sh
 
   # ── the gate, exactly as release.yml runs it ─────────────────────────────────
   release-gate:
@@ -648,6 +687,8 @@ jobs:
       BACKEND_DIGEST: ${{ needs.images.outputs.backend_digest }}
       OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
       ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
+      ADAPTER_DECISION: ${{ needs.images.outputs.adapter_decision }}
+      ADAPTER_OWNER_REV: ${{ needs.images.outputs.adapter_owner_rev }}
     steps:
       # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
       # This job holds a token, so nothing it EXECUTES may come from the
@@ -674,6 +715,9 @@ jobs:
       - name: Write the certification predicate
         env:
           ADAPTER_VERSION: ${{ needs.images.outputs.adapter_version }}
+          ADAPTER_DECISION: ${{ needs.images.outputs.adapter_decision }}
+          ADAPTER_OWNER_REV: ${{ needs.images.outputs.adapter_owner_rev }}
+          ADAPTER_TAG: ${{ needs.images.outputs.adapter_tag }}
           PUBLISH_RUN_ID: ${{ needs.images.outputs.publish_run_id }}
         run: |
           set -euo pipefail
@@ -685,6 +729,7 @@ jobs:
             --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --arg publish_run "$PUBLISH_RUN_ID" \
             --arg adapter_version "$ADAPTER_VERSION" \
+            --arg adapter_decision "$ADAPTER_DECISION" --arg adapter_owner "$ADAPTER_OWNER_REV" --arg adapter_tag "$ADAPTER_TAG" \
             --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
             --arg backend_image "$BACKEND_IMAGE" --arg openscap_image "$OPENSCAP_IMAGE" --arg adapter_image "$ADAPTER_IMAGE" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -711,6 +756,12 @@ jobs:
               gate_workflow: "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main",
               docker_publish_run_id: $publish_run,
               scanner_adapter_version: $adapter_version,
+              # The exact-version decision (#4076). On "stays" the adapter
+              # digest below is the published :VERSION (tag), built from
+              # owner_rev, and the verifier anchors the adapter at that tag
+              # instead of sha_tag. On "new" owner_rev is empty and tag is
+              # sha_tag.
+              scanner_adapter_decision: { decision: $adapter_decision, owner_rev: $adapter_owner, tag: $adapter_tag },
               digests: { backend: $backend, openscap: $openscap, scanner_adapter: $adapter },
               images: { backend: $backend_image, openscap: $openscap_image, scanner_adapter: $adapter_image },
               certified_at: $at
@@ -770,6 +821,8 @@ jobs:
             echo "backend_digest=${BACKEND_DIGEST}"
             echo "openscap_digest=${OPENSCAP_DIGEST}"
             echo "scanner_adapter_digest=${ADAPTER_DIGEST}"
+            echo "scanner_adapter_decision=${ADAPTER_DECISION}"
+            echo "scanner_adapter_owner_rev=${ADAPTER_OWNER_REV}"
             echo "verdict=CERTIFIED"
           } > certification/certification.txt
           cat certification/certification.txt
@@ -802,7 +855,7 @@ jobs:
             echo "|---|---|"
             echo "| backend | \`${BACKEND_DIGEST}\` |"
             echo "| openscap | \`${OPENSCAP_DIGEST}\` |"
-            echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` |"
+            echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` (${ADAPTER_DECISION}${ADAPTER_OWNER_REV:+, published from \`${ADAPTER_OWNER_REV:0:7}\`}) |"
             echo
             echo "Next: dispatch **Release Promote** on main with \`sha=${SHA}\`. It re-applies \`:${VERSION}\` to these digests, creates \`v${VERSION}\` last, and hands over to the release workflow."
           } >> "$GITHUB_STEP_SUMMARY"
