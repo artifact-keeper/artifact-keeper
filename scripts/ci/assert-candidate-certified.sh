@@ -57,6 +57,22 @@
 #   a digest that carries a valid certification from release-candidate.yml
 #   whose predicate names THIS commit and these SAME digests.
 #
+#   ONE EXCEPTION, the scanner adapter (#4076). It is versioned by
+#   docker/scanner-adapter/VERSION, and when that version was already published
+#   from an earlier commit with unchanged sources, its exact tag STAYS on the
+#   published digest: what the release ships is `:<adapter VERSION>`, not this
+#   commit's `sha-<sha>` rebuild. The candidate then certifies the published
+#   digest and records the decision in the predicate
+#   (`scanner_adapter_decision: {decision: "stays", owner_rev, tag}`). For such
+#   a certification the adapter's anchor is that tag instead of `sha-<sha>`:
+#   it must resolve NOW to the certified digest, the tag must be the
+#   predicate's own `scanner_adapter_version`, and the digest must carry the
+#   same run's certification for THIS commit. The anchors to try are read from
+#   the certifications on the FIRST image (the backend), which is always
+#   anchored at `sha-<sha>`. A predicate with no decision, or "new", is
+#   anchored at `sha-<sha>` exactly as before. The adapter's emitted digest is
+#   the anchored one -- the digest that ships.
+#
 #   Each clause is load-bearing:
 #     * "resolve now" -- the registry is read at verification time, so an
 #       image re-pushed under the same sha tag since certification is refused
@@ -75,7 +91,9 @@
 #
 # Exit codes (mirrors assert-preflight-evidence.sh):
 #   0  certified; the digests and run ids are printed as key=value lines and
-#      appended to $GITHUB_OUTPUT when set
+#      appended to $GITHUB_OUTPUT when set (with the scanner adapter:
+#      scanner_adapter_decision = new|stays|<empty for a legacy predicate>,
+#      scanner_adapter_owner_rev)
 #   1  BLOCKED -- no certification for this commit, or it no longer matches
 #   2  INFRA   -- could not measure (registry / attestations API). NOT a pass.
 #
@@ -171,9 +189,17 @@ echo
 # ---------------------------------------------------------------------------
 # 2. a certification from the candidate workflow, on each of those digests
 # ---------------------------------------------------------------------------
-for key in "${keys[@]}"; do
-  for pair in $IMAGES; do [[ "${pair%%=*}" == "$key" ]] && ref="${pair#*=}"; done
-  subject="oci://${ref}@${digest_of[$key]}"
+ADAPTER_KEY=scanner_adapter
+declare -A anchor_digest=()   # "<key>|<tag>" -> digest the registry serves now
+
+# certs_for <key> <ref> <digest> <where> <hard|soft>
+# Sets CERTS to the JSON array of predicates on <digest> that name THIS commit.
+# hard: no certification, or none for this commit, is a refusal (the rule).
+# soft: either is an empty answer, for the adapter's alternative anchors; an
+#       unreachable API is still INFRA, never an empty answer.
+certs_for() {
+  local key="$1" ref="$2" digest="$3" where="$4" mode="$5" subject out rc predicates mine other
+  subject="oci://${ref}@${digest}"
   out=""; rc=0
   out="$(gh attestation verify "$subject" \
           --repo "$REPO" \
@@ -182,11 +208,16 @@ for key in "${keys[@]}"; do
           --predicate-type "$PREDICATE_TYPE" \
           --format json 2>&1)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    printf '%s\n' "$out" | sed 's/^/      /'
     if looks_like_infra "$out"; then
+      printf '%s\n' "$out" | sed 's/^/      /'
       infra "gh attestation verify could not reach the attestations API or the registry for ${subject}."
     fi
-    blocked "${ref}@${digest_of[$key]} (sha-${SHORT}) carries no release-candidate certification signed by ${IDENTITY}. The full Release Gate has not passed on this commit's images. Dispatch the 'Release Candidate' workflow on ${SHA}, get it green, then retry."
+    if [[ "$mode" == soft ]]; then
+      echo "  ${key}: ${ref}@${digest} (${where}) carries no release-candidate certification"
+      CERTS='[]'; return 0
+    fi
+    printf '%s\n' "$out" | sed 's/^/      /'
+    blocked "${ref}@${digest} (${where}) carries no release-candidate certification signed by ${IDENTITY}. The full Release Gate has not passed on this commit's images. Dispatch the 'Release Candidate' workflow on ${SHA}, get it green, then retry."
   fi
   # Statements are found by shape rather than by position, so a change in
   # gh's JSON envelope does not silently turn every predicate into "missing".
@@ -195,11 +226,60 @@ for key in "${keys[@]}"; do
   [[ -n "$predicates" && "$(jq 'length' <<<"$predicates")" -gt 0 ]] || infra "gh attestation verify succeeded for ${subject} but its JSON carried no in-toto statement to read the predicate from."
   mine="$(jq -c --arg sha "$SHA" '[.[] | select(.commit_sha == $sha)]' <<<"$predicates")"
   if [[ "$(jq 'length' <<<"$mine")" -eq 0 ]]; then
+    if [[ "$mode" == soft ]]; then
+      echo "  ${key}: ${ref}@${digest} (${where}) is certified, but not for ${SHA}"
+      CERTS='[]'; return 0
+    fi
     other="$(jq -r 'first | .commit_sha // empty' <<<"$predicates")"
     blocked "the certification on ${key}'s digest names commit '${other:-<none>}', not ${SHA}. These bytes were certified for a different commit."
   fi
-  candidates_of["$key"]="$mine"
-  echo "  ${key}: certification verified (${IDENTITY}; $(jq 'length' <<<"$mine") statement(s) for this commit)"
+  CERTS="$mine"
+}
+
+for key in "${keys[@]}"; do
+  for pair in $IMAGES; do [[ "${pair%%=*}" == "$key" ]] && ref="${pair#*=}"; done
+  stays_tags=""
+  if [[ "$key" == "$ADAPTER_KEY" && "$key" != "${keys[0]}" ]]; then
+    # The adapter tags this commit's certifications on the first image say
+    # the adapter ships at (#4076). None: the plain sha-<sha> rule applies.
+    stays_tags="$(jq -r '[.[] | select((.scanner_adapter_decision.decision // "") == "stays")
+                          | .scanner_adapter_decision.tag // "" | tostring] | unique | .[]' \
+                    <<<"${candidates_of[${keys[0]}]}")"
+  fi
+  if [[ -z "$stays_tags" ]]; then
+    certs_for "$key" "$ref" "${digest_of[$key]}" "sha-${SHORT}" hard
+    candidates_of["$key"]="$CERTS"
+  else
+    registry="${ref%%/*}"; repository="${ref#*/}"
+    certs_for "$key" "$ref" "${digest_of[$key]}" "sha-${SHORT}" soft
+    all="$CERTS"
+    while IFS= read -r tag; do
+      # An exact X.Y.Z version only: the adapter's floating tags (`1`, `1.3`,
+      # `latest`) move, so they can never be the anchor of a certification.
+      [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || blocked "a certification for ${SHA} anchors ${key} at the tag '${tag}', which is not an exact X.Y.Z adapter version."
+      answer="$("$DIGEST_CMD" "$registry" "$repository" "$tag" 2>/dev/null)" || true
+      case "$answer" in
+        sha256:*)
+          anchor_digest["${key}|${tag}"]="$answer"
+          echo "  ${key}: ${ref}:${tag} -> ${answer} (the exact tag a certification says ships)"
+          certs_for "$key" "$ref" "$answer" ":${tag}" soft
+          all="$(jq -c -n --argjson a "$all" --argjson b "$CERTS" '$a + $b')"
+          ;;
+        absent)
+          echo "  ${key}: ${ref}:${tag} does not exist"
+          ;;
+        *)
+          infra "could not read ${ref}:${tag} from the registry (probe said '${answer:-<no answer>}')."
+          ;;
+      esac
+    done <<<"$stays_tags"
+    if [[ "$(jq 'length' <<<"$all")" -eq 0 ]]; then
+      blocked "${key} carries no release-candidate certification for ${SHA}, neither on sha-${SHORT} nor on the published exact tag(s) the certification names ($(tr '\n' ' ' <<<"$stays_tags" | sed 's/ $//')). Dispatch the 'Release Candidate' workflow on ${SHA}, get it green, then retry."
+    fi
+    candidates_of["$key"]="$all"
+  fi
+  echo "  ${key}: certification verified (${IDENTITY}; $(jq 'length' <<<"${candidates_of[$key]}") statement(s) for this commit)"
 done
 echo
 
@@ -316,11 +396,47 @@ else
   echo "  workflow:  ${derived_blob:0:12} (as blessed at certification time)"
 fi
 
+adapter_decision=""; adapter_owner=""
 for key in "${keys[@]}"; do
   p="${predicate_of[$key]}"
   named="$(jq -r --arg k "$key" '.digests[$k] // empty' <<<"$p")"
+  where="sha-${SHORT}"
+  if [[ "$key" == "$ADAPTER_KEY" ]]; then
+    adapter_decision="$(jq -r '.scanner_adapter_decision.decision // empty' <<<"$p")"
+    adapter_owner="$(jq -r '.scanner_adapter_decision.owner_rev // empty' <<<"$p")"
+    # owner_rev reaches the promote's tag message and summary: a commit sha
+    # on "stays", nothing otherwise, and never anything else.
+    case "$adapter_decision" in
+      stays) [[ "$adapter_owner" =~ ^[0-9a-f]{40}$ ]] \
+               || blocked "the certification says ${key} stays but records owner_rev '${adapter_owner}', which is not a 40-character commit sha." ;;
+      *)     [[ -z "$adapter_owner" ]] \
+               || blocked "the certification records owner_rev '${adapter_owner}' for scanner-adapter decision '${adapter_decision:-<none>}'; only \"stays\" has an owner." ;;
+    esac
+    case "$adapter_decision" in
+      ""|new) ;;
+      stays)
+        # The certified adapter is the published exact tag, not the rebuild
+        # (#4076). It is only that if the tag is the adapter's own VERSION
+        # and the registry still serves the certified digest under it.
+        tag="$(jq -r '.scanner_adapter_decision.tag // empty' <<<"$p")"
+        adapter_version="$(jq -r '.scanner_adapter_version // empty' <<<"$p")"
+        if [[ -z "$tag" || "$tag" != "$adapter_version" ]]; then
+          blocked "the certification says ${key} stays on ':${tag:-<none>}', which is not its scanner_adapter_version '${adapter_version:-<none>}'. Refusing an adapter anchored anywhere but its own exact version."
+        fi
+        if [[ "$key" == "${keys[0]}" || -z "${anchor_digest["${key}|${tag}"]:-}" ]]; then
+          blocked "the certification says ${key} stays on ':${tag}', but that tag does not resolve now. The adapter the release would ship is gone; certify again."
+        fi
+        digest_of["$key"]="${anchor_digest["${key}|${tag}"]}"
+        where=":${tag}"
+        echo "  ${key}:   stays on :${tag} (published from ${adapter_owner:0:7}); the certified adapter is that digest, not this commit's rebuild"
+        ;;
+      *)
+        blocked "the certification records an unknown scanner-adapter decision '${adapter_decision}'."
+        ;;
+    esac
+  fi
   if [[ "$named" != "${digest_of[$key]}" ]]; then
-    blocked "the certification names ${key} as '${named:-<none>}' but the registry now serves ${digest_of[$key]} for sha-${SHORT}. The bytes changed since the gate ran; certify again."
+    blocked "the certification names ${key} as '${named:-<none>}' but the registry now serves ${digest_of[$key]} for ${where}. The bytes changed since the gate ran; certify again."
   fi
 done
 
@@ -337,6 +453,10 @@ emit version "$cert_version"
 emit candidate_run_id "$cert_run"
 emit gate_run_id "$gate_run"
 for key in "${keys[@]}"; do emit "${key}_digest" "${digest_of[$key]}"; done
+if [[ " ${keys[*]} " == *" ${ADAPTER_KEY} "* ]]; then
+  emit "${ADAPTER_KEY}_decision" "$adapter_decision"
+  emit "${ADAPTER_KEY}_owner_rev" "$adapter_owner"
+fi
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
@@ -349,6 +469,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo "| candidate run | ${cert_run} |"
     echo "| gate run | ${gate_run} |"
     for key in "${keys[@]}"; do echo "| ${key} | \`${digest_of[$key]}\` |"; done
+    [[ -n "$adapter_decision" ]] && echo "| scanner-adapter decision | ${adapter_decision}${adapter_owner:+ (published from \`${adapter_owner:0:7}\`)} |"
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 exit 0
