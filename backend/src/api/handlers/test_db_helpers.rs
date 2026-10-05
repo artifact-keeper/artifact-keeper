@@ -1781,6 +1781,8 @@ pub fn make_repo_info(
 /// an `artifacts` row at `path`. Returns the inserted artifact id.
 ///
 /// Centralizes the put+insert pattern shared by every handler smoke test.
+/// The row's checksum is the placeholder `test-seed`; use
+/// [`seed_artifact_with_checksum`] when the test matches on the digest.
 #[allow(clippy::too_many_arguments)]
 pub async fn seed_artifact(
     state: &SharedState,
@@ -1793,6 +1795,38 @@ pub async fn seed_artifact(
     content_type: &str,
     content: Bytes,
     uploaded_by: Uuid,
+) -> Uuid {
+    seed_artifact_with_checksum(
+        state,
+        pool,
+        repo,
+        storage_key,
+        path,
+        name,
+        version,
+        content_type,
+        content,
+        uploaded_by,
+        "test-seed",
+    )
+    .await
+}
+
+/// [`seed_artifact`] with an explicit `checksum_sha256` for the row, for
+/// tests whose behaviour depends on the stored digest (e.g. presence checks).
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_artifact_with_checksum(
+    state: &SharedState,
+    pool: &PgPool,
+    repo: &crate::api::handlers::proxy_helpers::RepoInfo,
+    storage_key: &str,
+    path: &str,
+    name: &str,
+    version: &str,
+    content_type: &str,
+    content: Bytes,
+    uploaded_by: Uuid,
+    checksum_sha256: &str,
 ) -> Uuid {
     crate::api::handlers::proxy_helpers::put_artifact_bytes(
         state,
@@ -1810,7 +1844,7 @@ pub async fn seed_artifact(
             name,
             version,
             size_bytes: content.len() as i64,
-            checksum_sha256: "test-seed",
+            checksum_sha256,
             content_type,
             storage_key,
             uploaded_by,

@@ -7,6 +7,10 @@
 //!   already hold, so a client importing a dependency tree transfers only the
 //!   genuinely new bytes. It generalises the shape of the Git LFS batch
 //!   endpoint (`gitlfs.rs`) to any hosted repository, with a hard item cap.
+//!   It answers from the artifact catalogue only (live `artifacts` rows); it
+//!   does not probe storage, so an artifact whose stored object was lost still
+//!   reads as present. Clients that want such objects repaired keep sending
+//!   `skip_if_present` on their chunked pushes, which does check storage.
 //! * [`already_present_for_session`] answers "already present" at chunked
 //!   upload init (`POST /api/v1/uploads` with `skip_if_present: true`) when a
 //!   live artifact at the requested path already carries the declared
@@ -73,6 +77,11 @@ pub struct MissingArtifactsRequest {
 }
 
 /// Why an item is reported missing.
+///
+/// Presence is decided from the artifact catalogue only, not from storage: an
+/// item whose catalogue row matches is never listed, even if its stored
+/// object has been lost. `skip_if_present` at chunked-upload init is the
+/// storage-aware check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingReason {
@@ -235,8 +244,9 @@ async fn live_checksums(
     params(("key" = String, Path, description = "Repository key")),
     request_body = MissingArtifactsRequest,
     responses(
-        (status = 200, description = "The subset of items not present with the given checksum", body = MissingArtifactsResponse),
-        (status = 400, description = "Too many items, an invalid path or digest, or a remote/virtual repository", body = crate::api::openapi::ErrorResponse),
+        (status = 200, description = "The subset of items with no live catalogue entry at that path and checksum. Catalogue-only: storage is not probed, so an artifact whose stored object was lost still reads as present; send `skip_if_present` on chunked uploads to have such objects re-uploaded.", body = MissingArtifactsResponse),
+        (status = 400, description = "Too many items (max 1000), an invalid path or digest, or a remote/virtual repository", body = crate::api::openapi::ErrorResponse),
+        (status = 413, description = "Request body over the route limit; send smaller batches"),
         (status = 404, description = "Repository not found or not readable by the caller", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []), ())
@@ -248,7 +258,10 @@ pub async fn missing_artifacts(
     Json(req): Json<MissingArtifactsRequest>,
 ) -> Result<Json<MissingArtifactsResponse>> {
     // Visibility first: a caller who cannot read the repository must get the
-    // same 404 as for a nonexistent one, whatever the body contains.
+    // same 404 as for a nonexistent one, whatever items the body contains.
+    // (A body the `Json` extractor rejects -- malformed, wrong content type,
+    // over the size limit -- fails before this runs, independently of the
+    // repository, so that rejection reveals nothing either.)
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -296,9 +309,10 @@ pub(crate) async fn already_present_for_session(
 ) -> Option<AlreadyPresentResponse> {
     // Opening a session needs write; answering "already present" discloses
     // what is stored, which needs read. A write-only caller gets a session.
-    require_visible(repo, &Some(auth.clone()), repo_service)
-        .await
-        .ok()?;
+    if let Err(e) = require_visible(repo, &Some(auth.clone()), repo_service).await {
+        tracing::debug!(repo = %repo.key, error = %e, "skip_if_present: no read access, opening a session");
+        return None;
+    }
     let sha = normalize_sha256(declared.checksum_sha256)?;
     let (artifact_id, size, version, storage_key): (Uuid, i64, Option<String>, String) =
         sqlx::query_as(
@@ -312,6 +326,9 @@ pub(crate) async fn already_present_for_session(
         .bind(&sha)
         .fetch_optional(&state.db)
         .await
+        .inspect_err(|e| {
+            tracing::warn!(repo = %repo.key, error = %e, "skip_if_present: artifact lookup failed, opening a session");
+        })
         .ok()??;
     if !row_satisfies_request(
         size,
@@ -324,13 +341,22 @@ pub(crate) async fn already_present_for_session(
     // The row alone is not enough: the object must still be in storage, or a
     // re-upload is exactly what repairs it. `content_already_stored` answers
     // `false` on a migration-mode backend, which also falls through.
-    let storage = state.storage_for_repo(&repo.storage_location()).ok()?;
-    if !storage
-        .content_already_stored(&storage_key)
-        .await
-        .unwrap_or(false)
-    {
-        return None;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .inspect_err(|e| {
+            tracing::warn!(repo = %repo.key, error = %e, "skip_if_present: storage unavailable, opening a session");
+        })
+        .ok()?;
+    match storage.content_already_stored(&storage_key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(repo = %repo.key, %storage_key, "skip_if_present: object not stored, opening a session");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo.key, %storage_key, error = %e, "skip_if_present: storage probe failed, opening a session");
+            return None;
+        }
     }
     Some(AlreadyPresentResponse {
         already_present: true,
@@ -345,7 +371,7 @@ pub(crate) async fn already_present_for_session(
 #[openapi(paths(missing_artifacts))]
 pub struct ArtifactPresenceApiDoc;
 
-#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 // streaming-invariant: test scaffolding exempt — buffering bounded response
 // bodies in DB-backed handler tests is not an artifact path (#1608).
@@ -461,31 +487,20 @@ mod tests {
         let sha = format!("{:x}", Sha256::digest(content));
         let key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&sha);
-        let repo = fx.repo_info("local", None);
-        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+        let id = tdh::seed_artifact_with_checksum(
             &fx.state,
-            &repo,
-            &key,
-            Bytes::copy_from_slice(content),
-        )
-        .await
-        .expect("seed bytes");
-        let id = crate::api::handlers::proxy_helpers::insert_artifact(
             &fx.pool,
-            crate::api::handlers::proxy_helpers::NewArtifact {
-                repository_id: fx.repo_id,
-                path,
-                name: path.rsplit('/').next().unwrap_or(path),
-                version: "1.0",
-                size_bytes: content.len() as i64,
-                checksum_sha256: &sha,
-                content_type: "application/octet-stream",
-                storage_key: &key,
-                uploaded_by: fx.user_id,
-            },
+            &fx.repo_info("local", None),
+            &key,
+            path,
+            path.rsplit('/').next().unwrap_or(path),
+            "1.0",
+            "application/octet-stream",
+            Bytes::copy_from_slice(content),
+            fx.user_id,
+            &sha,
         )
-        .await
-        .expect("seed row");
+        .await;
         (id, sha)
     }
 
@@ -552,15 +567,13 @@ mod tests {
         let (status, body) = check(app.clone(), &fx.repo_key, serde_json::json!(over)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+        // An empty list on a readable repository is an empty answer.
+        let (status, body) = check(app.clone(), &fx.repo_key, serde_json::json!([])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({ "checked": 0, "missing": [] }));
+
         // A soft-deleted artifact is missing again.
-        sqlx::query(
-            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
-        )
-        .bind(fx.repo_id)
-        .bind("deps/lib-1.0.jar")
-        .execute(&fx.pool)
-        .await
-        .unwrap();
+        set_deleted(&fx, "deps/lib-1.0.jar", true).await;
         let (_, body) = check(
             app,
             &fx.repo_key,
@@ -598,6 +611,49 @@ mod tests {
         fx.teardown().await;
     }
 
+    async fn set_deleted(fx: &tdh::Fixture, path: &str, deleted: bool) {
+        sqlx::query("UPDATE artifacts SET is_deleted = $3 WHERE repository_id = $1 AND path = $2")
+            .bind(fx.repo_id)
+            .bind(path)
+            .bind(deleted)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+
+    /// The route's own body limit: a full batch of maximum-length paths fits,
+    /// a body over the limit is refused with 413 before any lookup.
+    #[tokio::test]
+    async fn missing_endpoint_body_limit() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let app = fx.router_with_auth(repo_router());
+
+        let long_path = format!("p/{}", "a".repeat(MAX_ARTIFACT_PATH_LEN - 2));
+        assert_eq!(long_path.len(), MAX_ARTIFACT_PATH_LEN);
+        let full =
+            vec![serde_json::json!({ "path": long_path, "sha256": SHA_A }); MAX_PRESENCE_ITEMS];
+        let (status, body) = check(app.clone(), &fx.repo_key, serde_json::json!(full)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checked"], MAX_PRESENCE_ITEMS);
+        assert_eq!(
+            body["missing"].as_array().unwrap().len(),
+            MAX_PRESENCE_ITEMS
+        );
+
+        let mut oversized = vec![b' '; PRESENCE_BODY_LIMIT + 1];
+        oversized[..12].copy_from_slice(br#"{"items":[]}"#);
+        let req = tdh::post(
+            format!("/{}/artifacts-missing", fx.repo_key),
+            "application/json",
+            Bytes::from(oversized),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn missing_endpoint_rejects_virtual_repository() {
         let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
@@ -618,10 +674,26 @@ mod tests {
         auth: AuthExtension,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        init_session_with(fx, auth, body, false).await
+    }
+
+    async fn init_session_with(
+        fx: &tdh::Fixture,
+        auth: AuthExtension,
+        body: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, serde_json::Value) {
         let app = crate::api::handlers::upload::router()
             .with_state(fx.state.clone())
             .layer(Extension::<AuthExtension>(auth));
-        let (status, body) = tdh::send(app, post_json("/".to_string(), &body)).await;
+        let mut req = post_json("/".to_string(), &body);
+        if replication {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+        let (status, body) = tdh::send(app, req).await;
         (
             status,
             serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
@@ -728,6 +800,29 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "write-only: {body}");
         drop_session(&fx, &body).await;
         tdh::cleanup_user(&fx.pool, writer_id).await;
+
+        // Replication never takes the short-circuit, even when asked to.
+        let (status, body) = init_session_with(
+            &fx,
+            auth.clone(),
+            request("ferry/blob.bin", &sha, content.len(), Some(true)),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "replication: {body}");
+        drop_session(&fx, &body).await;
+
+        // A soft-deleted row is not "present": the upload must go through.
+        set_deleted(&fx, "ferry/blob.bin", true).await;
+        let (status, body) = init_session(
+            &fx,
+            auth.clone(),
+            request("ferry/blob.bin", &sha, content.len(), Some(true)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "soft-deleted: {body}");
+        drop_session(&fx, &body).await;
+        set_deleted(&fx, "ferry/blob.bin", false).await;
 
         // The row alone is not enough: with the object gone the client must
         // upload again so the blob is repaired.
