@@ -7,10 +7,17 @@
 //! nightly mirror grew one full snapshot per night forever.
 //!
 //! With `RPM_VERSION_RETENTION_KEEP=N` set (unset or `0` keeps everything, the
-//! default), an hourly scheduler pass keeps, per repository, the `N` newest
-//! versions plus the active publication, deletes every older
-//! `repository_versions` row (its membership rows cascade) and then deletes the
-//! objects under each pruned version's storage prefix.
+//! default), an hourly scheduler pass keeps, per repository:
+//! - the `N` newest *published* versions,
+//! - every unpublished version (a draft cut) newer than the newest published
+//!   one, so a run of drafts can never push out a published `@N` that clients
+//!   may pin, and a draft about to be published is never pruned,
+//! - the active publication, wherever it sits.
+//!
+//! Every other `repository_versions` row (published versions beyond the
+//! window, and drafts older than the newest published version) is deleted
+//! (its membership rows cascade), then the objects under each pruned version's
+//! storage prefix are deleted.
 //!
 //! Safety properties:
 //! - The active publication (`repositories.active_publication_id`) is never
@@ -18,8 +25,10 @@
 //!   holds the repository row lock, so a concurrent publish either commits
 //!   first (its version is then active and kept) or finds its version gone and
 //!   cleans up after itself (see `rpm_publish_service::publish`).
-//! - The newest version is always kept (`N >= 1`), so `MAX(version_number)`
-//!   never moves backwards and a pruned `@N` number is never reissued.
+//! - The newest version is always kept (`N >= 1`): it is either the newest
+//!   published version or a draft newer than it. `MAX(version_number)`
+//!   therefore never moves backwards and a pruned `@N` number is never
+//!   reissued.
 //! - Rows are deleted before objects. Once the row is gone `@N` is
 //!   unresolvable, so deleting its objects cannot break a client mid-download
 //!   of anything still advertised.
@@ -85,24 +94,38 @@ pub fn keep_from_env() -> Option<u32> {
     )
 }
 
-/// The versions of one repository to prune: everything outside the `keep`
-/// highest version numbers, except the active publication. `keep == 0` prunes
-/// nothing (retention disabled), so the newest version always survives.
+/// One `repository_versions` row as retention sees it.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub(crate) struct VersionRow {
+    pub id: Uuid,
+    pub version_number: i64,
+    pub published: bool,
+}
+
+/// The versions of one repository to prune. Kept: the `keep` newest
+/// published versions, every unpublished version newer than the newest
+/// published one (with nothing published, every draft), and the active
+/// publication. Everything else is pruned. `keep == 0` prunes nothing
+/// (retention disabled). The newest version always survives: it is either the
+/// newest published version or a draft newer than it.
 pub(crate) fn select_prunable(
-    versions: &[(Uuid, i64)],
+    versions: &[VersionRow],
     active: Option<Uuid>,
     keep: u32,
 ) -> Vec<Uuid> {
     if keep == 0 {
         return Vec::new();
     }
-    let mut newest_first: Vec<&(Uuid, i64)> = versions.iter().collect();
-    newest_first.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
-    newest_first
-        .into_iter()
-        .skip(keep as usize)
-        .filter(|(id, _)| Some(*id) != active)
-        .map(|(id, _)| *id)
+    let mut published: Vec<&VersionRow> = versions.iter().filter(|v| v.published).collect();
+    published.sort_unstable_by_key(|v| std::cmp::Reverse(v.version_number));
+    let newest_published = published.first().map(|v| v.version_number);
+    let kept_published: BTreeSet<Uuid> =
+        published.iter().take(keep as usize).map(|v| v.id).collect();
+    versions
+        .iter()
+        .filter(|v| Some(v.id) != active && !kept_published.contains(&v.id))
+        .filter(|v| v.published || newest_published.is_some_and(|n| v.version_number < n))
+        .map(|v| v.id)
         .collect()
 }
 
@@ -150,14 +173,14 @@ pub(crate) fn is_stray_key(
 
 /// The version numbers of `versions` whose ids were not deleted.
 pub(crate) fn surviving_numbers(
-    versions: &[(Uuid, i64)],
+    versions: &[VersionRow],
     deleted: impl IntoIterator<Item = Uuid>,
 ) -> BTreeSet<i64> {
     let deleted: BTreeSet<Uuid> = deleted.into_iter().collect();
     versions
         .iter()
-        .filter(|(id, _)| !deleted.contains(id))
-        .map(|(_, n)| *n)
+        .filter(|v| !deleted.contains(&v.id))
+        .map(|v| v.version_number)
         .collect()
 }
 
@@ -216,8 +239,9 @@ async fn prune_rows(db: &PgPool, repo_id: Uuid, keep: u32) -> Result<PrunedRows,
         return Ok(PrunedRows::default());
     };
 
-    let versions: Vec<(Uuid, i64)> = sqlx::query_as(
-        "SELECT id, version_number FROM repository_versions WHERE repository_id = $1",
+    let versions: Vec<VersionRow> = sqlx::query_as(
+        "SELECT id, version_number, published_at IS NOT NULL AS published \
+         FROM repository_versions WHERE repository_id = $1",
     )
     .bind(repo_id)
     .fetch_all(&mut *tx)
@@ -226,7 +250,7 @@ async fn prune_rows(db: &PgPool, repo_id: Uuid, keep: u32) -> Result<PrunedRows,
     if prune.is_empty() {
         tx.commit().await?;
         return Ok(PrunedRows {
-            surviving: versions.iter().map(|(_, n)| *n).collect(),
+            surviving: versions.iter().map(|v| v.version_number).collect(),
             ..Default::default()
         });
     }
@@ -384,8 +408,26 @@ pub async fn run_retention_pass(
 mod tests {
     use super::*;
 
-    fn v(n: i64) -> (Uuid, i64) {
-        (Uuid::from_u128(n as u128), n)
+    /// A published version `n` (id derived from `n`).
+    fn v(n: i64) -> VersionRow {
+        VersionRow {
+            id: Uuid::from_u128(n as u128),
+            version_number: n,
+            published: true,
+        }
+    }
+
+    /// An unpublished (draft) version `n`.
+    fn d(n: i64) -> VersionRow {
+        VersionRow {
+            published: false,
+            ..v(n)
+        }
+    }
+
+    fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+        ids.sort();
+        ids
     }
 
     #[test]
@@ -404,19 +446,51 @@ mod tests {
     fn test_select_prunable_keeps_newest_n_and_active() {
         let versions = vec![v(3), v(1), v(5), v(2), v(4)];
         // keep 2 -> 5 and 4 survive; 1 is active and survives too.
-        let mut pruned = select_prunable(&versions, Some(v(1).0), 2);
-        pruned.sort();
-        assert_eq!(pruned, vec![v(2).0, v(3).0]);
+        assert_eq!(
+            sorted(select_prunable(&versions, Some(v(1).id), 2)),
+            vec![v(2).id, v(3).id]
+        );
         // Active inside the window changes nothing.
-        let mut pruned = select_prunable(&versions, Some(v(5).0), 2);
-        pruned.sort();
-        assert_eq!(pruned, vec![v(1).0, v(2).0, v(3).0]);
+        assert_eq!(
+            sorted(select_prunable(&versions, Some(v(5).id), 2)),
+            vec![v(1).id, v(2).id, v(3).id]
+        );
         // No active publication.
-        assert_eq!(select_prunable(&versions, None, 4), vec![v(1).0]);
+        assert_eq!(select_prunable(&versions, None, 4), vec![v(1).id]);
         // Fewer versions than the window, and disabled retention.
         assert!(select_prunable(&versions, None, 5).is_empty());
         assert!(select_prunable(&versions, None, 0).is_empty());
         assert!(select_prunable(&[], None, 1).is_empty());
+    }
+
+    // Drafts never consume a slot: the window counts published versions only,
+    // drafts newer than the newest published version are kept, and drafts
+    // older than it are pruned.
+    #[test]
+    fn test_select_prunable_counts_only_published_and_keeps_newer_drafts() {
+        // Published 1, 3, 5; drafts 2, 4, 6, 7.
+        let versions = vec![v(1), d(2), v(3), d(4), v(5), d(6), d(7)];
+        // keep 2 -> published 5 and 3 kept, drafts 6 and 7 kept; draft 4 is
+        // older than the newest published version, so it goes with 1 and 2.
+        assert_eq!(
+            sorted(select_prunable(&versions, None, 2)),
+            vec![v(1).id, v(2).id, v(4).id]
+        );
+        // A run of drafts never pushes out published versions.
+        let drafts_on_top = vec![v(1), v(2), d(3), d(4), d(5), d(6)];
+        assert!(select_prunable(&drafts_on_top, None, 2).is_empty());
+        assert_eq!(
+            select_prunable(&drafts_on_top, None, 1),
+            vec![v(1).id],
+            "only published 1 falls out of a 1-wide window"
+        );
+        // Nothing published yet: every draft is kept.
+        assert!(select_prunable(&[d(1), d(2), d(3)], None, 1).is_empty());
+        // The active publication survives even outside the window.
+        assert_eq!(
+            sorted(select_prunable(&versions, Some(v(1).id), 1)),
+            vec![v(2).id, v(3).id, v(4).id]
+        );
     }
 
     #[test]
@@ -564,9 +638,9 @@ mod tests {
         let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
 
         let mut ids = Vec::new();
-        for n in 1..=5 {
-            // Version 4 was created but never published.
-            ids.push(seed_version(&pool, repo, remote, &storage, n, n != 4).await);
+        for n in 1..=6 {
+            // Versions 4 and 6 were cut but never published.
+            ids.push(seed_version(&pool, repo, remote, &storage, n, n != 4 && n != 6).await);
         }
         sqlx::query("UPDATE repositories SET active_publication_id = $2 WHERE id = $1")
             .bind(repo)
@@ -586,39 +660,42 @@ mod tests {
         prune_repository(&pool, &storage, repo, 0, &mut report)
             .await
             .unwrap();
-        assert_eq!(version_numbers(&pool, repo).await, vec![1, 2, 3, 4, 5]);
+        assert_eq!(version_numbers(&pool, repo).await, vec![1, 2, 3, 4, 5, 6]);
 
         let mut report = RetentionReport::default();
         prune_repository(&pool, &storage, repo, 2, &mut report)
             .await
             .unwrap();
-        // Active (2) + newest two (4, 5) survive.
-        assert_eq!(version_numbers(&pool, repo).await, vec![2, 4, 5]);
+        // Active (2), the two newest published (3, 5) and the draft newer than
+        // them (6) survive; published 1 and the older draft 4 are pruned.
+        assert_eq!(version_numbers(&pool, repo).await, vec![2, 3, 5, 6]);
         assert_eq!(report.versions_pruned, 2);
         assert_eq!(report.delete_failures, 0);
-        // 1 and 3: six repodata blobs + one cached package each, plus the stray.
-        assert_eq!(report.objects_deleted, 2 * 7 + 1);
+        // 1: six repodata blobs + one cached package; draft 4 stored nothing;
+        // plus the stray.
+        assert_eq!(report.objects_deleted, 7 + 1);
         assert!(!object_exists(&storage, repo, 1).await);
-        assert!(!object_exists(&storage, repo, 3).await);
         assert!(!storage.exists(&stray).await.unwrap());
         assert!(object_exists(&storage, repo, 2).await);
+        assert!(object_exists(&storage, repo, 3).await);
         assert!(object_exists(&storage, repo, 5).await);
         let members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM repository_version_packages WHERE version_id = ANY($1)",
         )
-        .bind(vec![ids[0], ids[2]])
+        .bind(vec![ids[0], ids[3]])
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(members, 0, "membership rows cascade with the version");
 
-        // A second pass is idempotent; keep 1 still spares the active version.
+        // keep 1 still spares the active version and the newer draft.
         let mut report = RetentionReport::default();
         prune_repository(&pool, &storage, repo, 1, &mut report)
             .await
             .unwrap();
-        assert_eq!(version_numbers(&pool, repo).await, vec![2, 5]);
+        assert_eq!(version_numbers(&pool, repo).await, vec![2, 5, 6]);
         assert_eq!(report.versions_pruned, 1);
+        assert!(!object_exists(&storage, repo, 3).await);
 
         tdh::cleanup(&pool, repo, actor).await;
         tdh::cleanup(&pool, remote, actor).await;
@@ -755,7 +832,7 @@ mod tests {
     fn test_surviving_numbers_follow_the_actual_delete() {
         let versions = vec![v(1), v(2), v(3)];
         // A row the SQL guard spared stays in `surviving`.
-        let surviving = surviving_numbers(&versions, [v(1).0]);
+        let surviving = surviving_numbers(&versions, [v(1).id]);
         assert_eq!(surviving.into_iter().collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(surviving_numbers(&versions, []).len(), 3);
     }
