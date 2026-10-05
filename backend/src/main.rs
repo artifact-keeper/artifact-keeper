@@ -1067,6 +1067,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.smtp_service.clone(),
         state.event_bus.clone(),
         advisory_client.clone(),
+        state.proxy_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool

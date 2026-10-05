@@ -57,6 +57,15 @@ impl CreateLifecyclePolicyRequest {
     }
 }
 
+/// Repositories an update must check for an inert Remote assignment (#3734):
+/// all of them when the config changes, else only those the update adds.
+fn inert_check_scope(config_changed: bool, ids: &[Uuid], existing: &[Uuid]) -> Vec<Uuid> {
+    ids.iter()
+        .filter(|id| config_changed || !existing.contains(id))
+        .copied()
+        .collect()
+}
+
 fn validate_schedule(schedule: Option<&str>) -> Result<()> {
     if let Some(expression) = schedule {
         if cron::Schedule::from_str(&normalize_cron_expression(expression)).is_err() {
@@ -190,6 +199,7 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         let found = Self::lock_repositories(&mut tx, &ids).await?;
         Self::require_repositories(&ids, &found)?;
+        Self::reject_inert_remote_assignments(&mut tx, &req.policy_type, &req.config, &ids).await?;
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO lifecycle_policies \
              (applies_to_all, name, description, policy_type, config, priority, cron_schedule, \
@@ -249,10 +259,18 @@ impl LifecycleService {
         let applies_to_all = req.applies_to_all.unwrap_or(existing.applies_to_all);
         let ids = normalize_scope(
             applies_to_all,
-            req.repository_ids.unwrap_or(existing.repository_ids),
+            req.repository_ids
+                .unwrap_or_else(|| existing.repository_ids.clone()),
         )?;
+        let config_changed = req.config.is_some();
         let config = req.config.unwrap_or(existing.config);
         self.validate_policy_config(&existing.policy_type, &config)?;
+        // A new config is checked against every assignment; otherwise only
+        // newly added repositories are, so a policy assigned before #3734 can
+        // still be renamed or disabled.
+        let checked = inert_check_scope(config_changed, &ids, &existing.repository_ids);
+        Self::reject_inert_remote_assignments(&mut tx, &existing.policy_type, &config, &checked)
+            .await?;
         let schedule = req.cron_schedule.or(existing.cron_schedule);
         validate_schedule(schedule.as_deref())?;
         sqlx::query(
@@ -292,6 +310,15 @@ impl LifecycleService {
                 "Global policies cannot be attached to or detached from individual repositories"
                     .into(),
             ));
+        }
+        if attached && !policy.repository_ids.contains(&repository_id) {
+            Self::reject_inert_remote_assignments(
+                &mut tx,
+                &policy.policy_type,
+                &policy.config,
+                &[repository_id],
+            )
+            .await?;
         }
         let mut ids = policy.repository_ids;
         if attached {

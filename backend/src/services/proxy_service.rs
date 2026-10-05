@@ -5319,6 +5319,66 @@ impl ProxyService {
         self.cache_store.invalidate(&keys).await
     }
 
+    /// Retention eviction of one cataloged proxy-cache entry (#3734): delete
+    /// its body and `__cache_meta__.json` sidecar from the proxy-cache store.
+    ///
+    /// The lifecycle sweep's sibling of [`Self::invalidate_cache_by_key`]. It
+    /// targets the same keys ([`CacheKeys::derive`] for `(repo_key, path)`),
+    /// plus the keys the catalog row itself recorded when they differ (an
+    /// entry cached before #3454 sits in the unscoped tree), accepted only
+    /// when [`ProxyCacheScope::owns_entry_key`] places them in this
+    /// repository's cache. It differs from invalidation in one deliberate
+    /// way: a storage error is returned instead of swallowed. Storage GC
+    /// leaves `proxy-cache/*` objects alone, so a retention sweep that
+    /// dropped the catalog row after a failed delete would strand the object
+    /// where nothing ever reclaims it. The caller deletes the row only after
+    /// this returns `Ok`, and a failed entry is retried by the next run.
+    ///
+    /// Returns the number of objects actually deleted (`NotFound` is not an
+    /// error: a placeholder row may never have had a body).
+    pub async fn evict_cached_entry(
+        &self,
+        repo_key: &str,
+        path: &str,
+        recorded_keys: [&str; 2],
+    ) -> Result<usize> {
+        let mut keys: Vec<String> = Vec::with_capacity(4);
+        if let Ok(derived) = CacheKeys::derive(&self.cache_scope, repo_key, path) {
+            keys.push(derived.content);
+            keys.push(derived.metadata);
+        }
+        for recorded in recorded_keys {
+            if keys.iter().any(|k| k == recorded) {
+                continue;
+            }
+            if self.cache_scope.owns_entry_key(repo_key, recorded) {
+                keys.push(recorded.to_string());
+            } else {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    storage_key = %recorded,
+                    "lifecycle: catalog row records a key outside this repository's proxy \
+                     cache; not deleting it"
+                );
+            }
+        }
+        // Bodies before sidecars, as invalidation orders them.
+        keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
+
+        let mut deleted = 0usize;
+        for key in &keys {
+            match self.storage.delete(key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            if key.ends_with("__cache_meta__.json") {
+                invalidate_proxy_metadata_lru(key).await;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
     /// `upstream_etag`, `storage_etag`, `content_type`, `size_bytes`) for
     /// a given path on a repository, without checking expiry.
@@ -6407,26 +6467,13 @@ impl ProxyService {
         // the #2047 hazard (a repository recreated with the same key serving
         // the deleted one's upstream content) would survive as long as the
         // legacy tree does. It deletes only; it can never serve bytes.
+        // `repo_roots` also guards the collision where `repo_key` equals THIS
+        // deployment's scope segment: the legacy prefix would then be the root
+        // of the ENTIRE deployment's cache. Repository creation/rename rejects
+        // the collision too (`repositories::validate_key_not_scope_collision`);
+        // the guard is the half that still holds for older repositories.
         let mut deleted = 0usize;
-        let mut prefixes = vec![self.cache_scope.repo_root(repo_key)];
-        // The legacy unscoped sweep (`proxy-cache/<repo_key>/`) reclaims objects
-        // this deployment cached before #3454. But `proxy-cache/<repo_key>/` is
-        // ALSO the shape of a scope root: when `repo_key` equals THIS
-        // deployment's own scope segment the legacy prefix collapses to
-        // `proxy-cache/<scope>/` — the root of the ENTIRE deployment's cache —
-        // and sweeping it would delete every other repository's cached content.
-        // A repository key can legally equal the scope segment (both are drawn
-        // from `[A-Za-z0-9._-]`, so a UUID or a token like `prod-eu` is a valid
-        // key), so guard the collision explicitly and sweep only the scoped
-        // subtree in that case. Repository creation/rename rejects the collision
-        // too (`repositories::validate_key_not_scope_collision`); this guard is
-        // the half that still holds for a repository that predates that check.
-        if self.cache_scope.segment() != Some(repo_key) {
-            let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
-            if !prefixes.contains(&legacy) {
-                prefixes.push(legacy);
-            }
-        }
+        let prefixes = self.cache_scope.repo_roots(repo_key);
         let mut keys = Vec::new();
         for prefix in &prefixes {
             keys.extend(self.storage.list(Some(prefix)).await?);
