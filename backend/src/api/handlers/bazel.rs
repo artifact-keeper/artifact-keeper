@@ -23,9 +23,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -42,12 +40,6 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-
-/// The registry config served when a hosted repository has not stored its
-/// own and for every virtual repository. Bazel treats every field as
-/// optional; an empty mirror list means "fetch archives from `source.json`'s
-/// own URL".
-const DEFAULT_REGISTRY_JSON: &str = r#"{"mirrors":[]}"#;
 
 const REGISTRY_FILE: &str = "bazel_registry.json";
 
@@ -95,13 +87,17 @@ impl BazelRequest {
     }
 }
 
-/// A path segment that is safe to splice into a storage key: non-empty, not a
-/// dot segment, and free of separators and control characters.
+/// A path segment that is safe to splice into a storage key and an upstream
+/// URL: non-empty, not a dot segment, and free of separators, control
+/// characters and URL metacharacters (`%`, `?`, `#` would smuggle a query,
+/// fragment or second encoding layer upstream; no registry file needs them).
 fn is_safe_segment(seg: &str) -> bool {
     !seg.is_empty()
         && seg != "."
         && seg != ".."
-        && !seg.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+        && !seg
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '%' | '?' | '#') || c.is_control())
 }
 
 /// Bazel module names are `[a-z]([a-z0-9._-]*[a-z0-9])?`. Upper case is
@@ -321,20 +317,67 @@ async fn hosted_versions(
         .collect())
 }
 
-/// Ids of the non-Remote members of a virtual repository the caller may read.
-async fn hosted_member_ids(
+fn non_remote_ids(members: Vec<crate::models::repository::Repository>) -> Vec<Uuid> {
+    members
+        .into_iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect()
+}
+
+/// How a virtual repository's hosted members relate to one module name.
+struct HostedOwnership {
+    /// Some hosted member publishes the name, whether or not the caller may
+    /// read it. Decided over ALL members (an enforcement walk, like the
+    /// `virtual_non_remote_owns_*` guards): narrowing by caller visibility
+    /// would hand an anonymous caller the upstream copy of a name a private
+    /// hosted member owns, the dependency-confusion case #1217 closes.
+    owned: bool,
+    /// The versions the caller may see (hosted members it can read).
+    visible_versions: Vec<String>,
+}
+
+async fn hosted_ownership(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_id: Uuid,
-) -> Result<Vec<Uuid>, Response> {
-    Ok(
-        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id)
-            .await?
-            .into_iter()
-            .filter(|m| m.repo_type != RepositoryType::Remote)
-            .map(|m| m.id)
-            .collect(),
+    name: &str,
+) -> Result<HostedOwnership, Response> {
+    let all = non_remote_ids(proxy_helpers::fetch_virtual_members(&state.db, virtual_id).await?);
+    if hosted_versions(&state.db, &all, name).await?.is_empty() {
+        return Ok(HostedOwnership {
+            owned: false,
+            visible_versions: Vec::new(),
+        });
+    }
+    let readable = non_remote_ids(
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await?,
+    );
+    Ok(HostedOwnership {
+        owned: true,
+        visible_versions: hosted_versions(&state.db, &readable, name).await?,
+    })
+}
+
+/// Look up a hosted file by its EXACT stored path. A suffix match would let a
+/// file published under another module (`modules/evil/1.0/x/modules/a/1.0/
+/// source.json`) shadow the real `modules/a/1.0/source.json`.
+async fn find_hosted_exact(
+    db: &PgPool,
+    repo_id: Uuid,
+    path: &str,
+) -> Result<Option<proxy_helpers::LocalArtifactHit>, Response> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, storage_key FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.map(|(id, storage_key)| proxy_helpers::LocalArtifactHit { id, storage_key }))
 }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +386,6 @@ async fn hosted_member_ids(
 
 fn not_found(what: &str) -> Response {
     (StatusCode::NOT_FOUND, format!("{} not found", what)).into_response()
-}
-
-fn json_bytes_response(body: impl Into<Body>) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body.into())
-        .unwrap()
 }
 
 async fn get_file(
@@ -370,14 +405,13 @@ async fn get_file(
     match &request {
         BazelRequest::RegistryConfig => {
             if !is_virtual {
-                if let Some(hit) =
-                    proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, REGISTRY_FILE)
-                        .await?
-                {
+                if let Some(hit) = find_hosted_exact(&state.db, repo.id, REGISTRY_FILE).await? {
                     return serve_hosted(&state, &repo, hit, REGISTRY_FILE, &ctx).await;
                 }
             }
-            Ok(json_bytes_response(DEFAULT_REGISTRY_JSON))
+            // Bazel treats every field as optional; no mirrors means "fetch
+            // archives from the URL in `source.json`".
+            Ok(super::json_response(&serde_json::json!({ "mirrors": [] })))
         }
         BazelRequest::ModuleMetadata { name } => {
             let doc = if is_virtual {
@@ -392,15 +426,16 @@ async fn get_file(
         BazelRequest::ModuleFile { name, .. } => {
             let rel = request.path();
             if !is_virtual {
-                let hit = proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &rel)
+                let hit = find_hosted_exact(&state.db, repo.id, &rel)
                     .await?
                     .ok_or_else(|| not_found("Module file"))?;
                 return serve_hosted(&state, &repo, hit, &rel, &ctx).await;
             }
             // A module a hosted member publishes shadows the same name on
             // every Remote member (the #1217 name-shadowing guard).
-            let hosted = hosted_member_ids(&state, auth.as_ref(), repo.id).await?;
-            let owned_locally = !hosted_versions(&state.db, &hosted, name).await?.is_empty();
+            let owned_locally = hosted_ownership(&state, auth.as_ref(), repo.id, name)
+                .await?
+                .owned;
             let opts = proxy_helpers::DownloadResponseOpts {
                 upstream_path: &rel,
                 virtual_lookup: proxy_helpers::VirtualLookup::ExactPath(&rel),
@@ -466,20 +501,20 @@ async fn proxy_remote(
     Ok(response)
 }
 
-/// `metadata.json` for a virtual repository. When a hosted member publishes
-/// the module, only the hosted versions are advertised (Remote members are
-/// shadowed, matching the file route); otherwise every Remote member's
-/// document is merged in priority order.
+/// `metadata.json` for a virtual repository. When any hosted member publishes
+/// the module, Remote members are shadowed (matching the file route) and only
+/// the hosted versions the caller may read are advertised (none: 404);
+/// otherwise every Remote member's document is merged in priority order.
 async fn virtual_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     name: &str,
 ) -> Result<Option<serde_json::Value>, Response> {
-    let hosted = hosted_member_ids(state, auth, repo.id).await?;
-    let versions = hosted_versions(&state.db, &hosted, name).await?;
-    if !versions.is_empty() {
-        return Ok(Some(build_metadata(versions)));
+    let hosted = hosted_ownership(state, auth, repo.id, name).await?;
+    if hosted.owned {
+        let versions = hosted.visible_versions;
+        return Ok((!versions.is_empty()).then(|| build_metadata(versions)));
     }
     let docs = proxy_helpers::collect_virtual_metadata(
         &state.db,
@@ -487,14 +522,11 @@ async fn virtual_metadata(
         state.proxy_service.as_deref(),
         repo.id,
         &format!("modules/{}/metadata.json", name),
+        // A member whose document does not parse is logged and skipped by
+        // `collect_virtual_metadata`; the error value itself is discarded.
         |bytes, _member| async move {
-            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Invalid metadata.json from upstream",
-                )
-                    .into_response()
-            })
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|_| StatusCode::BAD_GATEWAY.into_response())
         },
     )
     .await?;
@@ -504,6 +536,11 @@ async fn virtual_metadata(
 // ---------------------------------------------------------------------------
 // PUT /bazel/{repo_key}/modules/{name}/{version}/{file...} — Publish a file
 // ---------------------------------------------------------------------------
+
+/// Storage key for a published file, unique per content.
+fn storage_key_for(artifact_path: &str, sha256: &str) -> String {
+    format!("bazel/{}/{}", sha256, artifact_path)
+}
 
 /// Validate an uploaded file's body for the registry file it is published as.
 #[allow(clippy::result_large_err)]
@@ -546,19 +583,34 @@ async fn put_file(
     let artifact_path = format!("modules/{}/{}/{}", name, version, file);
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
-    proxy_helpers::ensure_unique_artifact_path(
+    let checksum = format!("{:x}", Sha256::digest(&body));
+    // A deleted version stays immutable: re-publishing the same path is only
+    // allowed with identical bytes (Bazel lockfiles pin these hashes).
+    super::cleanup_soft_deleted_artifact_checked(
         &state.db,
+        &RepositoryFormat::Bazel,
         repo.id,
         &artifact_path,
-        "Module file already exists",
+        &checksum,
     )
-    .await?;
+    .await
+    .map_err(|e| e.into_response())?;
+    let ensure_unique = || {
+        proxy_helpers::ensure_unique_artifact_path(
+            &state.db,
+            repo.id,
+            &artifact_path,
+            "Module file already exists",
+        )
+    };
+    ensure_unique().await?;
 
-    let storage_key = format!("bazel/{}", artifact_path);
+    // Content-addressed key: a concurrent PUT of different bytes to the same
+    // path cannot overwrite the blob the winning row points at.
+    let storage_key = storage_key_for(&artifact_path, &checksum);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
-    let checksum = format!("{:x}", Sha256::digest(&body));
-    let artifact_id = proxy_helpers::insert_artifact(
+    let inserted = proxy_helpers::insert_artifact(
         &state.db,
         proxy_helpers::NewArtifact {
             repository_id: repo.id,
@@ -572,7 +624,17 @@ async fn put_file(
             uploaded_by: user_id,
         },
     )
-    .await?;
+    .await;
+    let artifact_id = match inserted {
+        Ok(id) => id,
+        // Lost a race with a concurrent PUT of the same path: the
+        // UNIQUE(repository_id, path) violation surfaces as a 409 like the
+        // pre-check, not a 500.
+        Err(resp) => {
+            ensure_unique().await?;
+            return Err(resp);
+        }
+    };
 
     let metadata = serde_json::json!({ "name": name, "version": version, "filename": file });
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "bazel", &metadata)
@@ -652,6 +714,10 @@ mod tests {
             "modules/rules cc/1.0/MODULE.bazel",
             "modules/rules_cc/.hidden/MODULE.bazel",
             "modules/rules_cc/1.0 /MODULE.bazel",
+            "modules/rules_cc/1.0/MODULE.bazel%3Fx",
+            "modules/rules_cc/1.0/MODULE.bazel?x=1",
+            "modules/rules_cc/1.0/a#frag",
+            "modules/rules_cc/1%2e0/MODULE.bazel",
             "other/bazel_registry.json",
             "v2/_catalog",
         ] {
@@ -780,15 +846,19 @@ mod tests {
     // DB-backed router tests
     // -----------------------------------------------------------------------
 
-    async fn put_as_owner(f: &tdh::Fixture, path: &str, body: &'static [u8]) -> StatusCode {
-        let app = f.router_with_auth(super::router());
-        let uri = format!("/{}/{}", f.repo_key, path);
+    /// PUT as the fixture user, an ordinary member of the fixture repository.
+    async fn put_as_member(f: &tdh::Fixture, path: &str, body: &'static [u8]) -> StatusCode {
+        put_with(f.router_with_auth(super::router()), &f.repo_key, path, body).await
+    }
+
+    async fn put_with(app: Router, key: &str, path: &str, body: &'static [u8]) -> StatusCode {
+        let uri = format!("/{}/{}", key, path);
         tdh::send(app, tdh::put(uri, Bytes::from_static(body)))
             .await
             .0
     }
 
-    async fn get_anon(app: Router, uri: String) -> (StatusCode, Bytes) {
+    async fn fetch(app: Router, uri: String) -> (StatusCode, Bytes) {
         tdh::send(app, tdh::get(uri)).await
     }
 
@@ -827,53 +897,103 @@ mod tests {
             ("modules/mylib/1.2.0/patches/fix.patch", &b"--- a"[..]),
         ] {
             assert_eq!(
-                put_as_owner(&f, path, body).await,
+                put_as_member(&f, path, body).await,
                 StatusCode::CREATED,
                 "{path}"
             );
         }
         // Published versions are immutable.
         assert_eq!(
-            put_as_owner(&f, "modules/mylib/1.2.0/MODULE.bazel", b"other").await,
+            put_as_member(&f, "modules/mylib/1.2.0/MODULE.bazel", b"other").await,
             StatusCode::CONFLICT
         );
         // metadata.json is generated, never uploaded.
         assert_eq!(
-            put_as_owner(&f, "modules/mylib/metadata.json", b"{}").await,
+            put_as_member(&f, "modules/mylib/metadata.json", b"{}").await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            put_as_owner(&f, "modules/mylib/1.3.0/source.json", b"nope").await,
+            put_as_member(&f, "modules/mylib/1.3.0/source.json", b"nope").await,
             StatusCode::BAD_REQUEST
         );
 
         let app = f.router_anon(super::router());
         let key = &f.repo_key;
         let (status, body) =
-            get_anon(app.clone(), format!("/{key}/modules/mylib/metadata.json")).await;
+            fetch(app.clone(), format!("/{key}/modules/mylib/metadata.json")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             json(&body)["versions"],
             serde_json::json!(["1.2.0", "1.10.0"])
         );
 
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{key}/modules/mylib/1.2.0/MODULE.bazel"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"module(name='mylib')");
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{key}/modules/mylib/1.2.0/patches/fix.patch"),
         )
         .await;
         assert_eq!((status, &body[..]), (StatusCode::OK, &b"--- a"[..]));
 
-        let (status, body) = get_anon(app.clone(), format!("/{key}/bazel_registry.json")).await;
+        let (status, body) = fetch(app.clone(), format!("/{key}/bazel_registry.json")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body), serde_json::json!({"mirrors": []}));
+
+        // A file published under another module whose tail spells this
+        // module's path must not shadow it (exact-path lookup), and a module
+        // file named bazel_registry.json must not become the registry config.
+        for (path, body) in [
+            (
+                "modules/evil/1.0/x/modules/mylib/1.2.0/MODULE.bazel",
+                &b"evil"[..],
+            ),
+            (
+                "modules/evil/1.0/x/modules/mylib/1.2.0/source.json",
+                &br#"{"url":"evil"}"#[..],
+            ),
+            (
+                "modules/x/1.0/bazel_registry.json",
+                &br#"{"mirrors":["https://evil/"]}"#[..],
+            ),
+        ] {
+            assert_eq!(put_as_member(&f, path, body).await, StatusCode::CREATED);
+        }
+        for (path, want) in [
+            (
+                "modules/mylib/1.2.0/MODULE.bazel",
+                &b"module(name='mylib')"[..],
+            ),
+            ("modules/mylib/1.2.0/source.json", &br#"{"url":"u"}"#[..]),
+        ] {
+            let (status, body) = fetch(app.clone(), format!("/{key}/{path}")).await;
+            assert_eq!((status, &body[..]), (StatusCode::OK, want), "{path}");
+        }
+        let (_, body) = fetch(app.clone(), format!("/{key}/bazel_registry.json")).await;
+        assert_eq!(json(&body), serde_json::json!({"mirrors": []}));
+
+        // A deleted version stays immutable: only identical bytes republish.
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind("modules/mylib/1.2.0/source.json")
+        .execute(&f.pool)
+        .await
+        .expect("soft-delete");
+        assert_eq!(
+            put_as_member(&f, "modules/mylib/1.2.0/source.json", br#"{"url":"swap"}"#).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            put_as_member(&f, "modules/mylib/1.2.0/source.json", br#"{"url":"u"}"#).await,
+            StatusCode::CREATED
+        );
 
         for missing in [
             "modules/other/metadata.json",
@@ -881,9 +1001,53 @@ mod tests {
             "modules/mylib/1.2.0/../../x",
             "not/a/registry/path",
         ] {
-            let (status, _) = get_anon(app.clone(), format!("/{key}/{missing}")).await;
+            let (status, _) = fetch(app.clone(), format!("/{key}/{missing}")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
         }
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn hosted_serves_stored_registry_config() {
+        let Some(f) = tdh::Fixture::setup("local", "bazel").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let config: &[u8] = br#"{"mirrors":["https://mirror.example/"]}"#;
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "bazel/bazel_registry.json",
+            REGISTRY_FILE,
+            REGISTRY_FILE,
+            "",
+            "application/json",
+            Bytes::from_static(config),
+            f.user_id,
+        )
+        .await;
+        let (status, body) = fetch(
+            f.router_anon(super::router()),
+            format!("/{}/{}", f.repo_key, REGISTRY_FILE),
+        )
+        .await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, config));
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn remote_without_upstream_or_proxy_is_404() {
+        // The fixture state carries no proxy service.
+        let Some(f) = tdh::Fixture::setup("remote", "bazel").await else {
+            return;
+        };
+        let (status, _) = fetch(
+            f.router_anon(super::router()),
+            format!("/{}/modules/a/1.0/MODULE.bazel", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         f.teardown().await;
     }
 
@@ -898,13 +1062,38 @@ mod tests {
             Bytes::from_static(b"m"),
         );
         assert_eq!(tdh::send(app, req).await.0, StatusCode::UNAUTHORIZED);
+
+        // A token without write:artifacts cannot publish.
+        let mut read_only = tdh::make_auth(f.user_id, &f.username);
+        read_only.is_api_token = true;
+        read_only.scopes = Some(vec!["read:artifacts".to_string()]);
+        let app = tdh::router_with_auth(super::router(), f.state.clone(), read_only);
+        assert_eq!(
+            put_with(app, &f.repo_key, "modules/a/1.0/MODULE.bazel", b"m").await,
+            StatusCode::FORBIDDEN
+        );
+
+        f.set_promotion_only(true).await;
+        assert_eq!(
+            put_as_member(&f, "modules/a/1.0/MODULE.bazel", b"m").await,
+            StatusCode::CONFLICT
+        );
+        f.teardown().await;
+
+        let Some(f) = tdh::Fixture::setup("virtual", "bazel").await else {
+            return;
+        };
+        assert_eq!(
+            put_as_member(&f, "modules/a/1.0/MODULE.bazel", b"m").await,
+            StatusCode::BAD_REQUEST
+        );
         f.teardown().await;
 
         let Some(f) = tdh::Fixture::setup("remote", "bazel").await else {
             return;
         };
         assert_eq!(
-            put_as_owner(&f, "modules/a/1.0/MODULE.bazel", b"m").await,
+            put_as_member(&f, "modules/a/1.0/MODULE.bazel", b"m").await,
             StatusCode::METHOD_NOT_ALLOWED
         );
         f.teardown().await;
@@ -937,17 +1126,17 @@ mod tests {
         let app = tdh::router_anon(super::router(), state);
         let key = &f.repo_key;
 
-        let (status, body) = get_anon(app.clone(), format!("/{key}/bazel_registry.json")).await;
+        let (status, body) = fetch(app.clone(), format!("/{key}/bazel_registry.json")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["mirrors"][0], "https://m/");
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{key}/modules/rules_cc/metadata.json"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["versions"], serde_json::json!(["0.1.1"]));
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{key}/modules/rules_cc/0.1.1/MODULE.bazel"),
         )
@@ -964,8 +1153,7 @@ mod tests {
             tdh::written_proxy_ttl_secs(cache.path(), key, "modules/rules_cc/metadata.json").await;
         assert_eq!(module_ttl, immutable);
         assert!(metadata_ttl < immutable, "metadata.json must stay mutable");
-        let (status, _) =
-            get_anon(app.clone(), format!("/{key}/modules/absent/metadata.json")).await;
+        let (status, _) = fetch(app.clone(), format!("/{key}/modules/absent/metadata.json")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         f.teardown().await;
     }
@@ -974,12 +1162,13 @@ mod tests {
     async fn virtual_merges_members_and_hosted_shadows_remote() {
         use wiremock::MockServer;
 
-        // The fixture repo is the hosted member; the caller owns it.
+        // The fixture repo is the (private) hosted member; the fixture user is
+        // an ordinary member of it, an anonymous caller cannot read it.
         let Some(f) = tdh::Fixture::setup("local", "bazel").await else {
             return;
         };
         assert_eq!(
-            put_as_owner(&f, "modules/internal/1.0.0/MODULE.bazel", b"internal").await,
+            put_as_member(&f, "modules/internal/1.0.0/MODULE.bazel", b"internal").await,
             StatusCode::CREATED
         );
 
@@ -1004,15 +1193,22 @@ mod tests {
         tdh::publish_repo(&f.pool, virtual_id).await;
         // The remote member outranks the hosted one, so only the shadowing
         // guard keeps the impostor out.
-        let (remote_id, _rkey, rdir) =
+        let (remote_id, _, rdir) =
             tdh::attach_remote_member(&f.pool, virtual_id, "bazel", &server.uri(), 0).await;
         tdh::link_virtual_member(&f.pool, virtual_id, f.repo_id, 1).await;
+        // A lower-priority member whose metadata.json is not JSON is skipped
+        // by the merge rather than failing it.
+        let junk = MockServer::start().await;
+        mount_upstream(&junk, &[("/modules/rules_cc/metadata.json", "not json")]).await;
+        let (junk_id, _jkey, jdir) =
+            tdh::attach_remote_member(&f.pool, virtual_id, "bazel", &junk.uri(), 2).await;
 
         let cache = tempfile::tempdir().expect("tempdir");
         let proxy =
             tdh::build_proxy_service_with_fs(f.pool.clone(), cache.path().to_str().unwrap());
         let state =
             tdh::build_state_with_proxy(f.pool.clone(), cache.path().to_str().unwrap(), proxy);
+        let anon = tdh::router_anon(super::router(), state.clone());
         let app = tdh::router_with_auth(
             super::router(),
             state,
@@ -1021,13 +1217,13 @@ mod tests {
         let vk = &virtual_key;
 
         let (status, body) =
-            get_anon(app.clone(), format!("/{vk}/modules/rules_cc/metadata.json")).await;
+            fetch(app.clone(), format!("/{vk}/modules/rules_cc/metadata.json")).await;
         assert_eq!(status, StatusCode::OK, "{:?}", body);
         assert_eq!(
             json(&body)["versions"],
             serde_json::json!(["0.1.1", "0.2.0"])
         );
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{vk}/modules/rules_cc/0.1.1/MODULE.bazel"),
         )
@@ -1036,25 +1232,58 @@ mod tests {
             (status, &body[..]),
             (StatusCode::OK, &b"upstream rules_cc"[..])
         );
+        // A versioned file fetched through a Remote member is cached with the
+        // member's real format, i.e. as immutable.
+        let rkey = sqlx::query_scalar::<_, String>("SELECT key FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("remote key");
+        assert_eq!(
+            tdh::written_proxy_ttl_secs(cache.path(), &rkey, "modules/rules_cc/0.1.1/MODULE.bazel")
+                .await,
+            crate::services::cache_classifier::Mutability::Immutable.write_ttl_secs()
+        );
 
         let (status, body) =
-            get_anon(app.clone(), format!("/{vk}/modules/internal/metadata.json")).await;
+            fetch(app.clone(), format!("/{vk}/modules/internal/metadata.json")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["versions"], serde_json::json!(["1.0.0"]));
-        let (status, body) = get_anon(
+        let (status, body) = fetch(
             app.clone(),
             format!("/{vk}/modules/internal/1.0.0/MODULE.bazel"),
         )
         .await;
         assert_eq!((status, &body[..]), (StatusCode::OK, &b"internal"[..]));
 
-        let (status, body) = get_anon(app.clone(), format!("/{vk}/bazel_registry.json")).await;
+        let (status, body) = fetch(app.clone(), format!("/{vk}/bazel_registry.json")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body), serde_json::json!({"mirrors": []}));
-        let (status, _) =
-            get_anon(app.clone(), format!("/{vk}/modules/absent/metadata.json")).await;
+        let (status, _) = fetch(app.clone(), format!("/{vk}/modules/absent/metadata.json")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // An anonymous caller cannot read the private hosted member, but the
+        // member still owns `internal`: the upstream impostor must not be
+        // served in its place (dependency confusion, #1217).
+        for path in [
+            "modules/internal/metadata.json",
+            "modules/internal/1.0.0/MODULE.bazel",
+        ] {
+            let (status, body) = fetch(anon.clone(), format!("/{vk}/{path}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body:?}");
+        }
+        let (status, body) = fetch(
+            anon.clone(),
+            format!("/{vk}/modules/rules_cc/metadata.json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json(&body)["versions"],
+            serde_json::json!(["0.1.1", "0.2.0"])
+        );
+
+        tdh::cleanup_member_repo(&f.pool, junk_id, &jdir).await;
         tdh::cleanup_member_repo(&f.pool, remote_id, &rdir).await;
         tdh::cleanup_member_repo(&f.pool, virtual_id, &vdir).await;
         f.teardown().await;
