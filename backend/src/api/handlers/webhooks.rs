@@ -325,8 +325,13 @@ pub struct CreateWebhookRequest {
     /// Which signature tokens deliveries carry in
     /// `X-ArtifactKeeper-Signature`: `hmac` (default; `v1=` HMAC tokens
     /// only), `asymmetric` (a `v2=<kid>:<sig>` Ed25519 token only, verified
-    /// against `GET /api/v1/webhooks/jwks`), or `both`. `asymmetric` and
-    /// `both` require `AK_WEBHOOK_SECRET_KEY` (HTTP 422 otherwise).
+    /// against `GET /api/v1/webhooks/jwks`), or `both`. The `v2=` signature
+    /// covers `"<t>.<webhook_id>.<body>"` and deliveries carry
+    /// `X-ArtifactKeeper-Webhook-Id`; receivers must check it is this
+    /// webhook's `id`. `asymmetric` and `both` require
+    /// `AK_WEBHOOK_SECRET_KEY` (HTTP 422 otherwise). An `asymmetric` webhook
+    /// still gets an HMAC secret (stored, returned once, unused by its
+    /// deliveries) so that a later switch to `both`/`hmac` needs no rotation.
     #[serde(default)]
     pub signing_mode: SigningMode,
 }
@@ -587,7 +592,7 @@ pub async fn list_webhooks(
                 headers: redact_header_values(w.get("headers")),
                 payload_template: PayloadTemplate::from_str_lossy(&tpl),
                 event_schema_version: w.get("event_schema_version"),
-                signing_mode: SigningMode::from_str_lossy(w.get("signing_mode")),
+                signing_mode: SigningMode::from_stored(w.get("signing_mode")),
                 secret_digest: w.get("secret_digest"),
                 secret_rotation_active: prev_expires
                     .map(|e| e > chrono::Utc::now())
@@ -615,7 +620,7 @@ pub async fn list_webhooks(
     request_body = CreateWebhookRequest,
     responses(
         (status = 200, description = "Webhook created. Body includes the raw secret exactly once (omitted when created unsigned).", body = WebhookSecretCreatedResponse),
-        (status = 422, description = "Validation error, including: a secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest (create the webhook without a secret, or have an administrator configure the signing key)"),
+        (status = 422, description = "Validation error, including: a secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest (create the webhook without a secret, or have an administrator configure the signing key); or signing_mode asymmetric/both was requested but AK_WEBHOOK_SECRET_KEY is not configured, or cannot decrypt the stored instance signing key (it was changed after the key was created)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -721,7 +726,7 @@ pub async fn create_webhook(
         headers: webhook.get("headers"),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
         event_schema_version: webhook.get("event_schema_version"),
-        signing_mode: SigningMode::from_str_lossy(webhook.get("signing_mode")),
+        signing_mode: SigningMode::from_stored(webhook.get("signing_mode")),
         secret_digest: webhook.get("secret_digest"),
         secret_rotation_active: prev_expires
             .map(|e| e > chrono::Utc::now())
@@ -822,14 +827,25 @@ fn prepare_secret_for_storage(
 /// it is a 422 like the HMAC-secret case in `prepare_secret_for_storage`.
 fn signing_key_error_to_app(e: SigningKeyError) -> AppError {
     match e {
-        SigningKeyError::Crypto(e) => AppError::Validation(format!(
+        SigningKeyError::EncryptionKeyUnavailable(e) => AppError::Validation(format!(
             "asymmetric webhook signing is not available on this deployment ({}); \
              use signing_mode \"hmac\" or ask an administrator to configure \
              AK_WEBHOOK_SECRET_KEY",
             e
         )),
-        SigningKeyError::Malformed => {
-            AppError::Internal("stored webhook signing key is malformed".to_string())
+        SigningKeyError::Undecryptable(_) => AppError::Validation(
+            "asymmetric webhook signing is unavailable: the stored instance \
+             signing key cannot be decrypted with the current \
+             AK_WEBHOOK_SECRET_KEY (was it changed after the key was created?). \
+             An administrator can retire the old key with \
+             `UPDATE webhook_signing_keys SET retired_at = NOW() WHERE retired_at IS NULL;` \
+             and a new key is created on next use (receivers re-fetch \
+             GET /api/v1/webhooks/jwks). Until then use signing_mode \"hmac\"."
+                .to_string(),
+        ),
+        SigningKeyError::Malformed | SigningKeyError::VanishedAfterInsert => {
+            tracing::error!("webhook signing key: {}", e);
+            AppError::Internal(e.to_string())
         }
         SigningKeyError::Database(e) => AppError::Database(e.to_string()),
     }
@@ -839,7 +855,11 @@ fn signing_key_error_to_app(e: SigningKeyError) -> AppError {
 ///
 /// Unauthenticated by design: it carries only public keys, and receivers
 /// (which hold no Artifact Keeper credentials) must be able to fetch it.
-/// Each key's `kid` matches the `<kid>` in `v2=<kid>:<sig>`. The instance
+/// Each key's `kid` matches the `<kid>` in `v2=<kid>:<sig>`. A `v2=` token
+/// signs `"<t>.<webhook_id>.<raw body>"`; receivers must check that the
+/// delivery's `X-ArtifactKeeper-Webhook-Id` is their own webhook's id and
+/// verify over that id, which stops a delivery captured at one receiver
+/// being replayed to another (one instance key signs for every webhook). The instance
 /// key is created on first fetch when `AK_WEBHOOK_SECRET_KEY` is set; when
 /// it is not, the key set is empty.
 #[utoipa::path(
@@ -926,7 +946,7 @@ pub async fn get_webhook(
         headers: redact_header_values(webhook.get("headers")),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
         event_schema_version: webhook.get("event_schema_version"),
-        signing_mode: SigningMode::from_str_lossy(webhook.get("signing_mode")),
+        signing_mode: SigningMode::from_stored(webhook.get("signing_mode")),
         secret_digest: webhook.get("secret_digest"),
         secret_rotation_active: prev_expires
             .map(|e| e > chrono::Utc::now())
@@ -1119,6 +1139,7 @@ pub async fn test_webhook(
     let client = crate::services::http_client::webhook_client();
     let header_inputs = DeliveryHeaderInputs {
         delivery_id: test_delivery_id,
+        webhook_id: id,
         event: "test",
         event_version: &event_version,
         retry_attempt: None,
@@ -1345,6 +1366,7 @@ pub async fn redeliver(
     let client = crate::services::http_client::webhook_client();
     let header_inputs = DeliveryHeaderInputs {
         delivery_id,
+        webhook_id,
         event: &delivery.event,
         event_version: &event_version,
         retry_attempt: None,
@@ -1725,6 +1747,9 @@ struct RetryDeliveryRow {
 /// can share one well-tested header set.
 struct DeliveryHeaderInputs<'a> {
     pub delivery_id: Uuid,
+    /// Destination webhook. Bound into every `v2=` signature and sent as
+    /// `X-ArtifactKeeper-Webhook-Id` when one is present (#921).
+    pub webhook_id: Uuid,
     pub event: &'a str,
     pub event_version: &'a str,
     /// `Some(n)` on the retry path (1-indexed), `None` on the test/redeliver paths.
@@ -1785,11 +1810,22 @@ fn build_delivery_request_headers(inputs: &DeliveryHeaderInputs<'_>) -> Vec<(Str
         }
     }
 
+    // The v2 signature covers the destination webhook id; tell the receiver
+    // which id it was signed for. Only sent with a v2 token, so `hmac`
+    // webhooks keep their exact pre-#921 header set.
+    if !inputs.v2_keys.is_empty() {
+        out.push((
+            "X-ArtifactKeeper-Webhook-Id".into(),
+            inputs.webhook_id.to_string(),
+        ));
+    }
+
     // Signature headers (if configured). The legacy header is HMAC-only,
     // so an asymmetric-only webhook sends just the v2 header.
     if !inputs.secrets.is_empty() || !inputs.v2_keys.is_empty() {
         let sig_header = crate::services::webhook_signing::render_signature_header(
             inputs.unix_secs,
+            inputs.webhook_id,
             inputs.body_bytes,
             inputs.secrets,
             inputs.v2_keys,
@@ -1882,7 +1918,7 @@ async fn load_active_secrets(
         None => return Ok(Default::default()),
     };
 
-    let mode = SigningMode::from_str_lossy(row.get("signing_mode"));
+    let mode = SigningMode::from_stored(row.get("signing_mode"));
     let cur: Option<Vec<u8>> = row.get("secret_encrypted");
     let prev: Option<Vec<u8>> = row.get("secret_previous_encrypted");
     let exp: Option<chrono::DateTime<chrono::Utc>> = row.get("secret_previous_expires_at");
@@ -2103,8 +2139,6 @@ async fn dead_letter_claimed_delivery(db: &sqlx::PgPool, delivery: &Claimed<Retr
 /// POST and updates the delivery record by claim token. Uses `sqlx::query()`
 /// (not the macro) because the new columns are not in the offline SQLx cache.
 pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(), String> {
-    use sqlx::Row;
-
     let rows = claim_due_webhook_deliveries(
         db,
         50,
@@ -2112,6 +2146,18 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         WEBHOOK_RETRY_CLAIM_TTL_SECS,
     )
     .await?;
+
+    deliver_claimed_webhook_batch(db, &rows).await
+}
+
+/// Send each claimed delivery and record the outcome. Split from
+/// [`process_webhook_retries`] so a test can drive the real send path for
+/// exactly the rows it claimed, without draining other due deliveries.
+async fn deliver_claimed_webhook_batch(
+    db: &sqlx::PgPool,
+    rows: &[Claimed<RetryDeliveryRow>],
+) -> std::result::Result<(), String> {
+    use sqlx::Row;
 
     if rows.is_empty() {
         return Ok(());
@@ -2126,7 +2172,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    for delivery in &rows {
+    for delivery in rows {
         // Look up the webhook URL and headers. Signing-secret material is
         // loaded separately via `load_active_secrets` so the retry path can
         // use the AES-GCM-decrypted secrets directly for HMAC. The legacy
@@ -2192,6 +2238,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
         let header_inputs = DeliveryHeaderInputs {
             delivery_id: delivery.id,
+            webhook_id: delivery.webhook_id,
             event: &delivery.event,
             event_version: &event_version,
             retry_attempt: Some(delivery.attempts + 1),
@@ -3332,9 +3379,12 @@ mod tests {
 
     // ---------------- DeliveryHeaderInputs / build_delivery_request_headers ----------------
 
+    const SAMPLE_WEBHOOK_ID: Uuid = Uuid::from_u128(0xA);
+
     fn sample_inputs<'a>(secrets: &'a [&'a str], body: &'a [u8]) -> DeliveryHeaderInputs<'a> {
         DeliveryHeaderInputs {
             delivery_id: Uuid::nil(),
+            webhook_id: SAMPLE_WEBHOOK_ID,
             event: "artifact.uploaded",
             event_version: "2026-04-01",
             retry_attempt: None,
@@ -3577,6 +3627,11 @@ mod tests {
             .unwrap()
             .1;
         assert!(!sig_header.contains("v2="));
+        assert!(header(
+            &build_delivery_request_headers(&with_mode),
+            "X-ArtifactKeeper-Webhook-Id"
+        )
+        .is_none());
     }
 
     #[test]
@@ -3610,12 +3665,20 @@ mod tests {
         let jwk = v2_test_key().to_jwk();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].0, jwk.kid);
-        assert!(jwk.verify_v2(ts, body, &tokens[0].1));
+        // The signed destination is announced and is this webhook.
+        let announced: Uuid = header(&h, "X-ArtifactKeeper-Webhook-Id")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(announced, SAMPLE_WEBHOOK_ID);
+        assert!(jwk.verify_v2(ts, announced, body, &tokens[0].1));
+        // Replayed to another webhook's receiver, it does not verify.
+        assert!(!jwk.verify_v2(ts, Uuid::from_u128(0xB), body, &tokens[0].1));
     }
 
     #[test]
     fn signing_key_error_maps_to_actionable_status() {
-        let missing = signing_key_error_to_app(SigningKeyError::Crypto(
+        let missing = signing_key_error_to_app(SigningKeyError::EncryptionKeyUnavailable(
             crate::services::webhook_secret_crypto::WebhookSecretError::KeyMissing,
         ));
         match missing {
@@ -3625,19 +3688,27 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+        match signing_key_error_to_app(SigningKeyError::Undecryptable(
+            crate::services::webhook_secret_crypto::WebhookSecretError::NotUtf8,
+        )) {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("cannot be decrypted"));
+                assert!(msg.contains("UPDATE webhook_signing_keys SET retired_at"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
         assert!(matches!(
             signing_key_error_to_app(SigningKeyError::Malformed),
             AppError::Internal(_)
         ));
+        match signing_key_error_to_app(SigningKeyError::VanishedAfterInsert) {
+            AppError::Internal(msg) => assert!(msg.contains("vanished")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
         assert!(matches!(
             signing_key_error_to_app(SigningKeyError::Database(sqlx::Error::RowNotFound)),
             AppError::Database(_)
         ));
-    }
-
-    #[test]
-    fn jwks_cache_control_is_short_and_public() {
-        assert_eq!(JWKS_CACHE_CONTROL, "public, max-age=300");
     }
 
     // ---------------- validate_event_version ----------------
@@ -3678,6 +3749,35 @@ mod tests {
         // SAFETY: SECRET_ENV_LOCK serializes env access for tests in this module.
         unsafe {
             std::env::set_var(crate::services::webhook_secret_crypto::ENV_KEY, key);
+        }
+    }
+
+    /// Set the all-zero test `AK_WEBHOOK_SECRET_KEY` and report whether the
+    /// instance webhook signing key is usable with it. The key is a
+    /// persistent singleton row no test cleans up; on a developer database
+    /// that has run a real server (random `AK_WEBHOOK_SECRET_KEY`) the active
+    /// row cannot be decrypted with the test key, and the asymmetric DB
+    /// tests skip with this message instead of failing. CI's fresh database
+    /// always takes the usable path.
+    ///
+    /// `SECRET_ENV_LOCK` is deliberately not taken: it is a std Mutex and
+    /// would be held across `.await`; every writer sets the same value and
+    /// nextest runs each test in its own process.
+    async fn instance_key_usable_with_test_key(pool: &sqlx::PgPool) -> bool {
+        set_test_secret_key();
+        match crate::services::webhook_signing_keys::ensure_instance_key(pool).await {
+            Ok(_) => true,
+            Err(SigningKeyError::Undecryptable(e)) => {
+                eprintln!(
+                    "SKIP: an active webhook_signing_keys row exists that the test \
+                     AK_WEBHOOK_SECRET_KEY cannot decrypt ({e}); this database ran a \
+                     server with a different key. Retire it with `UPDATE \
+                     webhook_signing_keys SET retired_at = NOW() WHERE retired_at IS NULL` \
+                     to run this test."
+                );
+                false
+            }
+            Err(e) => panic!("instance webhook signing key: {e}"),
         }
     }
 
@@ -5701,6 +5801,7 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
+            // SECRET_ENV_LOCK not taken: see `instance_key_usable_with_test_key`.
             super::set_test_secret_key();
             let id = insert_webhook(&pool, None, None).await;
             let ct = super::encrypt_test_secret("whsec_current");
@@ -5750,7 +5851,9 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
-            super::set_test_secret_key();
+            if !super::instance_key_usable_with_test_key(&pool).await {
+                return;
+            }
             let admin = create_user(&pool, true).await;
             let state = tdh::build_state(pool.clone(), "/tmp");
 
@@ -5806,9 +5909,14 @@ mod tests {
             let refs = signing.secret_refs();
             let body = br#"{"event":"artifact.created"}"#;
             let mut inputs = super::sample_inputs(&refs, body);
+            inputs.webhook_id = id;
             inputs.v2_keys = &signing.v2_keys;
             let h = build_delivery_request_headers(&inputs);
             assert!(super::header(&h, "X-Webhook-Signature").is_none());
+            assert_eq!(
+                super::header(&h, "X-ArtifactKeeper-Webhook-Id"),
+                Some(id.to_string().as_str())
+            );
             let sig = super::header(&h, "X-ArtifactKeeper-Signature").unwrap();
             let (ts, tokens) = crate::services::webhook_signing::parse_v2_tokens(sig).unwrap();
             for (kid, token) in tokens {
@@ -5818,7 +5926,11 @@ mod tests {
                     .iter()
                     .find(|j| j.kid == kid)
                     .expect("v2 kid must be published in the JWKS");
-                assert!(jwk.verify_v2(ts, body, &token));
+                assert!(jwk.verify_v2(ts, id, body, &token));
+                assert!(
+                    !jwk.verify_v2(ts, Uuid::new_v4(), body, &token),
+                    "a v2 signature must not verify for another webhook"
+                );
             }
         }
     }
@@ -5935,6 +6047,95 @@ mod tests {
                 }
 
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        /// The production delivery path, on the wire: an asymmetric webhook's
+        /// queued delivery is sent by the retry worker to a mock receiver,
+        /// which gets a `v2=` token bound to its webhook id (announced in
+        /// `X-ArtifactKeeper-Webhook-Id`) that verifies against `load_jwks`,
+        /// and no HMAC material. Only the fixture row is claimed and sent, so
+        /// other tests' due deliveries are left alone.
+        #[tokio::test]
+        async fn retry_worker_sends_webhook_bound_v2_verifiable_against_jwks() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            if !instance_key_usable_with_test_key(&pool).await {
+                return;
+            }
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let webhook_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO webhooks (id, name, url, events, is_enabled, signing_mode) \
+                 VALUES ($1, $2, $3, ARRAY['artifact.created'], true, 'asymmetric')",
+            )
+            .bind(webhook_id)
+            .bind(format!("wh-v2-{}", &webhook_id.to_string()[..8]))
+            .bind(format!("{}/hook", server.uri()))
+            .execute(&pool)
+            .await
+            .expect("insert asymmetric webhook");
+            let delivery_id = insert_due_delivery(&pool, webhook_id).await;
+            let claimed = claim_fixture_delivery(&pool, delivery_id, "test-v2-worker", 60.0).await;
+
+            deliver_claimed_webhook_batch(&pool, std::slice::from_ref(&claimed))
+                .await
+                .expect("deliver claimed batch");
+
+            let received = server.received_requests().await.expect("recording on");
+            let success: bool =
+                sqlx::query_scalar("SELECT success FROM webhook_deliveries WHERE id = $1")
+                    .bind(delivery_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("delivery row");
+            let jwks = crate::services::webhook_signing_keys::load_jwks(&pool)
+                .await
+                .expect("load jwks");
+            cleanup_claim_test(&pool, webhook_id).await;
+
+            assert!(
+                success,
+                "a 200 from the receiver marks the delivery successful"
+            );
+            assert_eq!(received.len(), 1);
+            let req = &received[0];
+            let hdr = |name: &str| {
+                req.headers
+                    .get(name)
+                    .map(|v| v.to_str().expect("ascii header").to_string())
+            };
+            assert_eq!(
+                hdr("x-artifactkeeper-webhook-id"),
+                Some(webhook_id.to_string())
+            );
+            assert!(
+                hdr("x-webhook-signature").is_none(),
+                "asymmetric sends no HMAC"
+            );
+            let sig = hdr("x-artifactkeeper-signature").expect("signature header");
+            assert!(!sig.contains("v1="), "asymmetric sends no v1 token: {sig}");
+            let (ts, tokens) =
+                crate::services::webhook_signing::parse_v2_tokens(&sig).expect("v2 token");
+            assert_eq!(tokens.len(), 1);
+            for (kid, token) in tokens {
+                let jwk = jwks
+                    .keys
+                    .iter()
+                    .find(|j| j.kid == kid)
+                    .expect("v2 kid must be published in the JWKS");
+                assert!(jwk.verify_v2(ts, webhook_id, &req.body, &token));
+                assert!(!jwk.verify_v2(ts, Uuid::new_v4(), &req.body, &token));
             }
         }
 

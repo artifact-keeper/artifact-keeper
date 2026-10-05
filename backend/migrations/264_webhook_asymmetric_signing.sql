@@ -3,8 +3,8 @@
 -- 1. `webhooks.signing_mode` selects which tokens a webhook's deliveries
 --    carry in `X-ArtifactKeeper-Signature`: `hmac` (the existing `v1=`
 --    tokens only, and the default, so every existing webhook keeps its exact
---    wire format), `asymmetric` (a `v2=<kid>:<sig>` Ed25519 token only), or
---    `both`.
+--    wire format), `asymmetric` (a `v2=<kid>:<sig>` Ed25519 token over
+--    `<t>.<webhook_id>.<body>` only), or `both`.
 -- 2. `webhook_signing_keys` holds the instance-wide Ed25519 key. The private
 --    half is AES-256-GCM encrypted with AK_WEBHOOK_SECRET_KEY, exactly like
 --    `webhooks.secret_encrypted`; the public half is plain so the JWKS
@@ -14,11 +14,16 @@
 --    published JWKS until it passes.
 --
 -- Online shape: `webhooks` is configuration-sized (not in migration_safety's
--- HOT_TABLES). ADD COLUMN with a constant default is catalogue-only (PG 11+);
--- the CHECK is added NOT VALID (catalogue-only) and validated separately
--- under SHARE UPDATE EXCLUSIVE. The lock timeout makes a rolling upgrade
--- fail fast, leaving nothing applied, instead of queueing behind an old
--- replica's open transaction on `webhooks`; it is re-run on the next start.
+-- HOT_TABLES). ADD COLUMN with a constant default is catalogue-only (PG 11+)
+-- and the CHECK is added NOT VALID, also catalogue-only. It is deliberately
+-- not VALIDATEd here: sqlx runs this file in one transaction, so a VALIDATE
+-- would scan under the ACCESS EXCLUSIVE lock ADD COLUMN already holds, and
+-- it would prove nothing -- every existing row gets the constant 'hmac',
+-- which satisfies the CHECK, and NOT VALID still enforces it on every new
+-- write (docs/operations/online-migrations.md). The lock timeout makes a
+-- rolling upgrade fail fast, leaving nothing applied, instead of queueing
+-- behind an old replica's open transaction on `webhooks`; it is re-run on
+-- the next start.
 
 SET LOCAL lock_timeout = '5s';
 
@@ -29,7 +34,6 @@ ALTER TABLE webhooks DROP CONSTRAINT IF EXISTS webhooks_signing_mode_check;
 ALTER TABLE webhooks ADD CONSTRAINT webhooks_signing_mode_check
     CHECK (signing_mode IN ('hmac', 'asymmetric', 'both'))
     NOT VALID;
-ALTER TABLE webhooks VALIDATE CONSTRAINT webhooks_signing_mode_check;
 
 CREATE TABLE IF NOT EXISTS webhook_signing_keys (
     kid                   TEXT        PRIMARY KEY,

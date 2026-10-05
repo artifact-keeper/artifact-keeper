@@ -15,14 +15,17 @@
 //! comparison succeeds.
 //!
 //! Webhooks whose `signing_mode` is `asymmetric` or `both` also carry
-//! `v2=<kid>:<base64url Ed25519 signature>` over the same message, verified
-//! against `GET /api/v1/webhooks/jwks` (see
-//! [`crate::services::webhook_signing_keys`]). Receivers that only know
-//! `v1=` ignore the `v2=` token.
+//! `v2=<kid>:<base64url Ed25519 signature>` over
+//! `"<unix_seconds>.<webhook_id>.<raw_body>"` plus an
+//! `X-ArtifactKeeper-Webhook-Id` header, verified against
+//! `GET /api/v1/webhooks/jwks` (see [`crate::services::webhook_signing_keys`],
+//! which also explains why the webhook id is signed). Receivers that only
+//! know `v1=` ignore the `v2=` token.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::services::webhook_signing_keys::InstanceSigningKey;
 
@@ -88,14 +91,16 @@ impl SigningMode {
         }
     }
 
-    /// Parse a stored value. Unknown values fall back to `hmac`, the mode
-    /// every row had before the column existed (the column's CHECK keeps
-    /// unknown values out; this is belt and braces for a read path).
-    pub fn from_str_lossy(s: &str) -> Self {
+    /// Parse a stored value. The column's CHECK keeps unknown values out
+    /// today, but a later release may add a mode that an older replica reads
+    /// during a rolling upgrade. Such a value fails closed to `asymmetric`:
+    /// the webhook asked for something stronger than HMAC, so it must never
+    /// silently fall back to HMAC-only signing.
+    pub fn from_stored(s: &str) -> Self {
         match s {
-            "asymmetric" => SigningMode::Asymmetric,
+            "hmac" => SigningMode::Hmac,
             "both" => SigningMode::Both,
-            _ => SigningMode::Hmac,
+            _ => SigningMode::Asymmetric,
         }
     }
 
@@ -112,12 +117,14 @@ impl SigningMode {
 
 /// Render the `X-ArtifactKeeper-Signature` value for any signing mode:
 /// `t=<ts>`, then one `v1=<hex>` per HMAC secret (current first), then one
-/// `v2=<kid>:<base64url sig>` per Ed25519 key. With no keys this returns
+/// `v2=<kid>:<base64url sig>` per Ed25519 key, each signing
+/// `"<t>.<webhook_id>.<body>"`. With no keys this returns
 /// exactly [`render_header`]'s output, which is what keeps `hmac` mode
 /// byte-identical. Returns an empty string when there is nothing to sign
 /// with; callers omit the header then.
 pub fn render_signature_header(
     unix_secs: i64,
+    webhook_id: Uuid,
     body: &[u8],
     secrets: &[&str],
     v2_keys: &[InstanceSigningKey],
@@ -133,7 +140,7 @@ pub fn render_signature_header(
         header.push_str(&format!(
             ",v2={}:{}",
             key.kid(),
-            key.sign_v2(unix_secs, body)
+            key.sign_v2(unix_secs, webhook_id, body)
         ));
     }
     header
@@ -284,6 +291,8 @@ mod tests {
 
     // ---------------- v2 (Ed25519) tokens, #921 ----------------
 
+    const WH: Uuid = Uuid::from_u128(0xA);
+
     fn test_key() -> InstanceSigningKey {
         InstanceSigningKey::from_seed(&[9u8; 32])
     }
@@ -292,7 +301,7 @@ mod tests {
     fn signature_header_without_keys_is_render_header() {
         for secrets in [&[][..], &["whsec_a"][..], &["whsec_new", "whsec_old"][..]] {
             assert_eq!(
-                render_signature_header(1_700_000_000, b"hi", secrets, &[]),
+                render_signature_header(1_700_000_000, WH, b"hi", secrets, &[]),
                 render_header(1_700_000_000, b"hi", secrets)
             );
         }
@@ -303,12 +312,13 @@ mod tests {
         let key = test_key();
         let h = render_signature_header(
             1_700_000_000,
+            WH,
             b"hi",
             &["whsec_a"],
             std::slice::from_ref(&key),
         );
         let v1 = compute_v1_signature("whsec_a", 1_700_000_000, b"hi");
-        let v2 = key.sign_v2(1_700_000_000, b"hi");
+        let v2 = key.sign_v2(1_700_000_000, WH, b"hi");
         assert_eq!(h, format!("t=1700000000,v1={},v2={}:{}", v1, key.kid(), v2));
         // An HMAC-only receiver still parses the header and sees one v1.
         let (ts, v1s) = parse_header(&h).unwrap();
@@ -319,7 +329,7 @@ mod tests {
     #[test]
     fn signature_header_asymmetric_only_has_no_v1() {
         let key = test_key();
-        let h = render_signature_header(1_700_000_000, b"hi", &[], std::slice::from_ref(&key));
+        let h = render_signature_header(1_700_000_000, WH, b"hi", &[], std::slice::from_ref(&key));
         assert!(h.starts_with("t=1700000000,v2="));
         assert!(!h.contains("v1="));
         assert!(parse_header(&h).is_none());
@@ -335,6 +345,7 @@ mod tests {
         let body = br#"{"event":"artifact.uploaded"}"#;
         let h = render_signature_header(
             1_700_000_000,
+            WH,
             body,
             &["whsec_a"],
             std::slice::from_ref(&key),
@@ -345,8 +356,9 @@ mod tests {
         let (ts, tokens) = parse_v2_tokens(&h).unwrap();
         for (kid, sig) in tokens {
             let jwk = jwks.keys.iter().find(|j| j.kid == kid).unwrap();
-            assert!(jwk.verify_v2(ts, body, &sig));
-            assert!(!jwk.verify_v2(ts, b"tampered", &sig));
+            assert!(jwk.verify_v2(ts, WH, body, &sig));
+            assert!(!jwk.verify_v2(ts, WH, b"tampered", &sig));
+            assert!(!jwk.verify_v2(ts, Uuid::from_u128(0xB), body, &sig));
         }
     }
 
@@ -369,13 +381,15 @@ mod tests {
             SigningMode::Asymmetric,
             SigningMode::Both,
         ] {
-            assert_eq!(SigningMode::from_str_lossy(m.as_str()), m);
+            assert_eq!(SigningMode::from_stored(m.as_str()), m);
             let json = serde_json::to_string(&m).unwrap();
             assert_eq!(json, format!("\"{}\"", m.as_str()));
             assert_eq!(serde_json::from_str::<SigningMode>(&json).unwrap(), m);
         }
         assert_eq!(SigningMode::default(), SigningMode::Hmac);
-        assert_eq!(SigningMode::from_str_lossy("garbage"), SigningMode::Hmac);
+        // Fail closed: an unknown stored mode never degrades to HMAC-only.
+        assert_eq!(SigningMode::from_stored("rsa"), SigningMode::Asymmetric);
+        assert_eq!(SigningMode::from_stored(""), SigningMode::Asymmetric);
         assert!(serde_json::from_str::<SigningMode>("\"rsa\"").is_err());
     }
 

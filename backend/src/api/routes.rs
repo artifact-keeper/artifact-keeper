@@ -1752,9 +1752,16 @@ mod tests {
             c.guest_access_env_pinned = true;
         });
         let app = super::create_router(state);
-        let (status, body) =
-            tdh::send(app.clone(), tdh::get("/api/v1/webhooks/jwks".to_string())).await;
+        let (status, body, headers) =
+            tdh::send_with_headers(app.clone(), tdh::get("/api/v1/webhooks/jwks".to_string()))
+                .await;
         assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=300")
+        );
         let doc: serde_json::Value = serde_json::from_slice(&body).expect("JWKS is JSON");
         assert!(
             doc["keys"].is_array(),

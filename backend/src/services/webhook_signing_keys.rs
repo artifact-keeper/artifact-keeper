@@ -2,9 +2,19 @@
 //!
 //! Webhooks whose `signing_mode` is `asymmetric` or `both` carry a
 //! `v2=<kid>:<sig>` token in `X-ArtifactKeeper-Signature`, where `sig` is an
-//! Ed25519 signature over the same `"<t>.<body>"` message the HMAC `v1=`
-//! token covers. Receivers verify it against the public key published at
-//! `GET /api/v1/webhooks/jwks`, so no shared secret has to be distributed.
+//! Ed25519 signature over `"<t>.<webhook_id>.<body>"`, and the delivery also
+//! carries `X-ArtifactKeeper-Webhook-Id: <webhook_id>`. Receivers verify it
+//! against the public key published at `GET /api/v1/webhooks/jwks`, so no
+//! shared secret has to be distributed.
+//!
+//! **Why the webhook id is signed.** One key signs for every webhook on the
+//! instance. Over `"<t>.<body>"` alone (the `v1=` message), a delivery
+//! captured at receiver A would verify as genuine at receiver B within the
+//! replay window; `v1=` never allowed that because each webhook has its own
+//! secret. Binding the destination webhook id restores the property, provided
+//! receivers check it: a receiver MUST reject a delivery whose
+//! `X-ArtifactKeeper-Webhook-Id` is not its own webhook's id (returned when
+//! the webhook is created), and verify the signature over that id.
 //!
 //! One key signs for the whole instance. Its private half is stored in
 //! `webhook_signing_keys.private_key_encrypted`, encrypted with the same
@@ -22,6 +32,13 @@
 //! overlap window) is a follow-up; the schema already carries `retired_at`
 //! for it, and the JWKS lists every key whose `retired_at` is unset or in
 //! the future.
+//!
+//! **Recovery until rotation ships.** If `AK_WEBHOOK_SECRET_KEY` changes, the
+//! active key can no longer be decrypted: asymmetric deliveries go out
+//! without `v2=` (logged) and asymmetric creates return 422 saying so. An
+//! administrator retires the undecryptable key with
+//! `UPDATE webhook_signing_keys SET retired_at = NOW() WHERE retired_at IS NULL;`
+//! a new key is created on next use, and receivers pick it up from the JWKS.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -30,6 +47,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use utoipa::ToSchema;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::services::webhook_secret_crypto::{self, WebhookSecretError};
 
@@ -39,17 +58,40 @@ pub const JWK_ALG: &str = "EdDSA";
 /// Errors raised while loading or creating the instance signing key.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningKeyError {
-    /// `AK_WEBHOOK_SECRET_KEY` is missing or malformed, or the stored
-    /// private key could not be decrypted with it.
-    #[error("webhook signing key encryption: {0}")]
-    Crypto(#[from] WebhookSecretError),
+    /// `AK_WEBHOOK_SECRET_KEY` is unset or malformed, so no key can be
+    /// encrypted or decrypted.
+    #[error("webhook signing key unavailable: {0}")]
+    EncryptionKeyUnavailable(WebhookSecretError),
+
+    /// `AK_WEBHOOK_SECRET_KEY` is set but cannot decrypt the stored active
+    /// key (typically: it was changed after the key was created).
+    #[error("stored webhook signing key cannot be decrypted with the current AK_WEBHOOK_SECRET_KEY: {0}")]
+    Undecryptable(WebhookSecretError),
 
     /// The stored private key decrypted but is not a 32-byte Ed25519 seed.
     #[error("stored webhook signing key is malformed")]
     Malformed,
 
+    /// The insert succeeded or lost the race, yet no active key could be
+    /// read back (e.g. it was retired concurrently).
+    #[error("active webhook signing key vanished after insert")]
+    VanishedAfterInsert,
+
     #[error("webhook signing key query failed: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+/// Sort a crypto failure into "no usable AES key configured" versus "the
+/// configured key does not open the stored ciphertext".
+fn classify_crypto_error(e: WebhookSecretError) -> SigningKeyError {
+    match e {
+        WebhookSecretError::KeyMissing
+        | WebhookSecretError::KeyNotBase64(_)
+        | WebhookSecretError::KeyWrongLength(_) => SigningKeyError::EncryptionKeyUnavailable(e),
+        WebhookSecretError::Crypto(_) | WebhookSecretError::NotUtf8 => {
+            SigningKeyError::Undecryptable(e)
+        }
+    }
 }
 
 /// The instance Ed25519 signing key together with its `kid`.
@@ -78,8 +120,8 @@ impl InstanceSigningKey {
 
     /// Generate a fresh key from the OS CSPRNG.
     pub fn generate() -> Self {
-        let mut seed = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(seed.as_mut());
         Self::from_seed(&seed)
     }
 
@@ -93,10 +135,13 @@ impl InstanceSigningKey {
         self.signing_key.verifying_key().to_bytes()
     }
 
-    /// Sign `"<unix_secs>.<body>"` and return the signature base64url
-    /// encoded without padding. `body` must be the exact bytes POSTed.
-    pub fn sign_v2(&self, unix_secs: i64, body: &[u8]) -> String {
-        let sig = self.signing_key.sign(&signed_message(unix_secs, body));
+    /// Sign `"<unix_secs>.<webhook_id>.<body>"` and return the signature
+    /// base64url encoded without padding. `body` must be the exact bytes
+    /// POSTed and `webhook_id` the destination webhook.
+    pub fn sign_v2(&self, unix_secs: i64, webhook_id: Uuid, body: &[u8]) -> String {
+        let sig = self
+            .signing_key
+            .sign(&signed_message(unix_secs, webhook_id, body));
         B64URL.encode(sig.to_bytes())
     }
 
@@ -106,12 +151,16 @@ impl InstanceSigningKey {
     }
 }
 
-/// The message both `v1=` and `v2=` tokens sign: `"<unix_secs>.<body>"`.
-fn signed_message(unix_secs: i64, body: &[u8]) -> Vec<u8> {
-    let ts = unix_secs.to_string();
-    let mut msg = Vec::with_capacity(ts.len() + 1 + body.len());
-    msg.extend_from_slice(ts.as_bytes());
-    msg.push(b'.');
+/// The message a `v2=` token signs: `"<unix_secs>.<webhook_id>.<body>"`,
+/// with the webhook id in its lowercase hyphenated form (exactly the
+/// `X-ArtifactKeeper-Webhook-Id` header value). Unlike `v1=` (whose
+/// per-webhook secret already binds the destination), the instance-wide key
+/// needs the id in the message so a delivery cannot be replayed to another
+/// webhook's receiver.
+fn signed_message(unix_secs: i64, webhook_id: Uuid, body: &[u8]) -> Vec<u8> {
+    let prefix = format!("{}.{}.", unix_secs, webhook_id.as_hyphenated());
+    let mut msg = Vec::with_capacity(prefix.len() + body.len());
+    msg.extend_from_slice(prefix.as_bytes());
     msg.extend_from_slice(body);
     msg
 }
@@ -159,10 +208,17 @@ impl Jwk {
     }
 
     /// Verify a `v2=` signature (base64url, no padding) over
-    /// `"<unix_secs>.<body>"` against this key. This is exactly what a
-    /// receiver does after picking the JWK whose `kid` matches the token.
-    /// Returns `false` on any decode, length, or signature failure.
-    pub fn verify_v2(&self, unix_secs: i64, body: &[u8], sig_b64url: &str) -> bool {
+    /// `"<unix_secs>.<webhook_id>.<body>"` against this key. This is what a
+    /// receiver does after checking `webhook_id` is its own webhook and
+    /// picking the JWK whose `kid` matches the token. Returns `false` on any
+    /// decode, length, or signature failure.
+    pub fn verify_v2(
+        &self,
+        unix_secs: i64,
+        webhook_id: Uuid,
+        body: &[u8],
+        sig_b64url: &str,
+    ) -> bool {
         let Ok(x) = B64URL.decode(&self.x) else {
             return false;
         };
@@ -178,7 +234,8 @@ impl Jwk {
         let Ok(sig) = Signature::from_slice(&sig) else {
             return false;
         };
-        key.verify(&signed_message(unix_secs, body), &sig).is_ok()
+        key.verify(&signed_message(unix_secs, webhook_id, body), &sig)
+            .is_ok()
     }
 }
 
@@ -215,6 +272,15 @@ async fn load_active_encrypted(db: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Err
     .await
 }
 
+/// Decrypt a stored private key into a signing key; the plaintext seed is
+/// zeroized when dropped.
+fn decrypt_stored_key(ciphertext: &[u8]) -> Result<InstanceSigningKey, SigningKeyError> {
+    let seed = Zeroizing::new(
+        webhook_secret_crypto::decrypt_bytes(ciphertext).map_err(classify_crypto_error)?,
+    );
+    key_from_decrypted_seed(&seed)
+}
+
 /// Return the active instance signing key, creating it on first use.
 ///
 /// Creation needs `AK_WEBHOOK_SECRET_KEY` (to encrypt the private key at
@@ -222,11 +288,12 @@ async fn load_active_encrypted(db: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Err
 /// loser's insert is a no-op and it re-reads the winner's row.
 pub async fn ensure_instance_key(db: &PgPool) -> Result<InstanceSigningKey, SigningKeyError> {
     if let Some(ct) = load_active_encrypted(db).await? {
-        return key_from_decrypted_seed(&webhook_secret_crypto::decrypt_bytes(&ct)?);
+        return decrypt_stored_key(&ct);
     }
 
     let fresh = InstanceSigningKey::generate();
-    let encrypted = webhook_secret_crypto::encrypt_bytes(fresh.signing_key.as_bytes())?;
+    let encrypted = webhook_secret_crypto::encrypt_bytes(fresh.signing_key.as_bytes())
+        .map_err(classify_crypto_error)?;
     sqlx::query(
         "INSERT INTO webhook_signing_keys (kid, public_key, private_key_encrypted) \
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
@@ -239,20 +306,45 @@ pub async fn ensure_instance_key(db: &PgPool) -> Result<InstanceSigningKey, Sign
 
     let ct = load_active_encrypted(db)
         .await?
-        .ok_or(SigningKeyError::Malformed)?;
-    key_from_decrypted_seed(&webhook_secret_crypto::decrypt_bytes(&ct)?)
+        .ok_or(SigningKeyError::VanishedAfterInsert)?;
+    decrypt_stored_key(&ct)
 }
 
-/// Load the public JWKS: every key not yet retired, newest first. Creates
-/// the instance key first when none exists so a receiver that fetches the
-/// JWKS before the first asymmetric delivery still gets the key; when that
-/// is impossible (no `AK_WEBHOOK_SECRET_KEY`) the document is empty rather
-/// than an error, because asymmetric signing is simply not available yet.
+/// Set once the JWKS path has warned that no key can be created, so an
+/// anonymous caller cannot flood the log at warn level.
+static JWKS_UNAVAILABLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this call should emit the warn-level "unavailable" log (first
+/// time per process); later occurrences log at debug.
+fn first_unavailable_warning() -> bool {
+    !JWKS_UNAVAILABLE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Load the public JWKS: every key not yet retired, newest first.
+///
+/// Public keys are read in the clear; the private key is never touched when
+/// an active key exists. Only when none exists is the instance key created,
+/// so a receiver that fetches the JWKS before the first asymmetric delivery
+/// still gets it. When that is impossible (no `AK_WEBHOOK_SECRET_KEY`) the
+/// document is empty rather than an error: asymmetric signing is simply not
+/// available yet.
 pub async fn load_jwks(db: &PgPool) -> Result<JwksDocument, sqlx::Error> {
-    if let Err(e) = ensure_instance_key(db).await {
-        match e {
-            SigningKeyError::Database(e) => return Err(e),
-            other => tracing::warn!("webhook JWKS: instance signing key unavailable: {}", other),
+    let has_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM webhook_signing_keys WHERE retired_at IS NULL)",
+    )
+    .fetch_one(db)
+    .await?;
+    if !has_active {
+        match ensure_instance_key(db).await {
+            Ok(_) => {}
+            Err(SigningKeyError::Database(e)) => return Err(e),
+            Err(other) if first_unavailable_warning() => {
+                tracing::warn!("webhook JWKS: instance signing key unavailable: {}", other)
+            }
+            Err(other) => {
+                tracing::debug!("webhook JWKS: instance signing key unavailable: {}", other)
+            }
         }
     }
     let public_keys: Vec<Vec<u8>> = sqlx::query_scalar(
@@ -305,30 +397,48 @@ mod tests {
         assert!(v.get("use_").is_none());
     }
 
+    fn wh(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
     #[test]
     fn v2_signature_verifies_against_published_jwk() {
         let k = rfc_key();
         let body = br#"{"event":"artifact.uploaded"}"#;
-        let sig = k.sign_v2(1_700_000_000, body);
+        let sig = k.sign_v2(1_700_000_000, wh(1), body);
         let jwks = jwks_from_public_keys(&[k.public_key_bytes().to_vec()]);
         let jwk = jwks.keys.iter().find(|j| j.kid == k.kid()).unwrap();
-        assert!(jwk.verify_v2(1_700_000_000, body, &sig));
+        assert!(jwk.verify_v2(1_700_000_000, wh(1), body, &sig));
     }
 
     #[test]
     fn v2_signature_rejects_tampering() {
         let k = rfc_key();
         let jwk = k.to_jwk();
-        let sig = k.sign_v2(1_700_000_000, b"hello");
-        assert!(!jwk.verify_v2(1_700_000_001, b"hello", &sig));
-        assert!(!jwk.verify_v2(1_700_000_000, b"hellO", &sig));
+        let sig = k.sign_v2(1_700_000_000, wh(1), b"hello");
+        assert!(!jwk.verify_v2(1_700_000_001, wh(1), b"hello", &sig));
+        assert!(!jwk.verify_v2(1_700_000_000, wh(1), b"hellO", &sig));
         let other = InstanceSigningKey::generate().to_jwk();
-        assert!(!other.verify_v2(1_700_000_000, b"hello", &sig));
+        assert!(!other.verify_v2(1_700_000_000, wh(1), b"hello", &sig));
+    }
+
+    /// Review finding on #4414: a delivery signed for webhook A must not
+    /// verify as a delivery for webhook B, even though one instance key signs
+    /// both.
+    #[test]
+    fn v2_signature_is_bound_to_the_destination_webhook() {
+        let k = rfc_key();
+        let jwk = k.to_jwk();
+        let body = br#"{"event":"artifact.uploaded"}"#;
+        let for_a = k.sign_v2(1_700_000_000, wh(0xA), body);
+        assert!(jwk.verify_v2(1_700_000_000, wh(0xA), body, &for_a));
+        assert!(!jwk.verify_v2(1_700_000_000, wh(0xB), body, &for_a));
+        assert_ne!(for_a, k.sign_v2(1_700_000_000, wh(0xB), body));
     }
 
     #[test]
     fn v2_signature_is_unpadded_base64url_of_64_bytes() {
-        let sig = rfc_key().sign_v2(1, b"x");
+        let sig = rfc_key().sign_v2(1, wh(1), b"x");
         assert!(!sig.contains('='));
         assert!(!sig.contains('+') && !sig.contains('/'));
         assert_eq!(B64URL.decode(&sig).unwrap().len(), 64);
@@ -338,13 +448,13 @@ mod tests {
     fn verify_v2_rejects_malformed_inputs() {
         let k = rfc_key();
         let jwk = k.to_jwk();
-        assert!(!jwk.verify_v2(1, b"x", "not base64!"));
-        assert!(!jwk.verify_v2(1, b"x", &B64URL.encode([0u8; 10])));
+        assert!(!jwk.verify_v2(1, wh(1), b"x", "not base64!"));
+        assert!(!jwk.verify_v2(1, wh(1), b"x", &B64URL.encode([0u8; 10])));
         let mut bad = jwk.clone();
         bad.x = B64URL.encode([1u8; 5]);
-        assert!(!bad.verify_v2(1, b"x", &k.sign_v2(1, b"x")));
+        assert!(!bad.verify_v2(1, wh(1), b"x", &k.sign_v2(1, wh(1), b"x")));
         bad.x = "%%%".to_string();
-        assert!(!bad.verify_v2(1, b"x", &k.sign_v2(1, b"x")));
+        assert!(!bad.verify_v2(1, wh(1), b"x", &k.sign_v2(1, wh(1), b"x")));
     }
 
     #[test]
@@ -383,6 +493,41 @@ mod tests {
 
     #[test]
     fn signed_message_layout() {
-        assert_eq!(signed_message(42, b"body"), b"42.body".to_vec());
+        assert_eq!(
+            signed_message(42, wh(0xAB), b"body"),
+            b"42.00000000-0000-0000-0000-0000000000ab.body".to_vec()
+        );
+    }
+
+    #[test]
+    fn crypto_errors_are_classified() {
+        use crate::services::encryption::EncryptionError;
+        for e in [
+            WebhookSecretError::KeyMissing,
+            WebhookSecretError::KeyNotBase64("x".into()),
+            WebhookSecretError::KeyWrongLength(3),
+        ] {
+            assert!(matches!(
+                classify_crypto_error(e),
+                SigningKeyError::EncryptionKeyUnavailable(_)
+            ));
+        }
+        assert!(matches!(
+            classify_crypto_error(WebhookSecretError::NotUtf8),
+            SigningKeyError::Undecryptable(_)
+        ));
+        let decrypt_failed = WebhookSecretError::Crypto(EncryptionError::DecryptionFailed);
+        assert!(matches!(
+            classify_crypto_error(decrypt_failed),
+            SigningKeyError::Undecryptable(_)
+        ));
+    }
+
+    #[test]
+    fn unavailable_warning_fires_once_per_process() {
+        // Other tests in this process may already have consumed the first
+        // warning; either way the second call must be debug-only.
+        let _ = first_unavailable_warning();
+        assert!(!first_unavailable_warning());
     }
 }
