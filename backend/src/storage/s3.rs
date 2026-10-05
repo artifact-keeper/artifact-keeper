@@ -1982,7 +1982,7 @@ impl super::StorageBackend for S3Backend {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1999,7 +1999,7 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2029,7 +2029,7 @@ impl super::StorageBackend for S3Backend {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2071,7 +2071,7 @@ impl super::StorageBackend for S3Backend {
         Ok(false)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2098,7 +2098,7 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         S3Backend::copy(self, source, dest).await
     }
@@ -2117,7 +2117,7 @@ impl super::StorageBackend for S3Backend {
     /// Returns `Ok(None)` when the object is missing rather than an error,
     /// so the freshness probe can treat "ETag unavailable" as "do not
     /// fast-path" without losing the distinction from a real I/O failure.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2135,7 +2135,7 @@ impl super::StorageBackend for S3Backend {
         self.redirect_downloads
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -2195,7 +2195,7 @@ impl super::StorageBackend for S3Backend {
         self.list_with_modified(Some(prefix)).await.map(Some)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         let path: ObjectPath = ".health-probe".into();
         match self.store.head(&path).await {
@@ -2207,7 +2207,7 @@ impl super::StorageBackend for S3Backend {
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2258,7 +2258,7 @@ impl super::StorageBackend for S3Backend {
         Ok(Box::pin(stream))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -2307,7 +2307,7 @@ impl super::StorageBackend for S3Backend {
     /// `AbortMultipartUpload` on drop, so the upload does not linger until the
     /// bucket's `AbortIncompleteMultipartUpload` lifecycle rule reclaims it. A
     /// successfully completed upload defuses the guard and is never aborted.
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
