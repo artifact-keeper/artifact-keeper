@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **WASM plugin runtime updated to wasmtime 36.0.17** (#4361, #4332; RUSTSEC-2026-0314, RUSTSEC-2026-0316, RUSTSEC-2026-0321, RUSTSEC-2026-0322, RUSTSEC-2026-0323). A WASM plugin guest could allocate past its host-call fuel limit through dynamic record lifting, panic the host through a filesystem datetime overflow in WASI, get around its fuel limit through WASI preview 0 `poll_oneoff`, make the host allocate excessive memory when it had no stdio, or read uninitialized host memory through `fd_readdir`. All five are fixed upstream by 36.0.17 (this line was on 36.0.14); no configuration change is needed.
 
+- **`cryptoki` bumped 0.12.0 -> 0.12.1 for RUSTSEC-2026-0286** (#3963, GHSA-r6vc-97x9-63vv): the PKCS#11 client treated the `CKA_ALLOWED_MECHANISMS` byte length as an element count, so a valid attribute read through `Session::get_attributes` could build an out-of-bounds slice (crash, or disclosure of adjacent heap words). Lockfile-only; no behaviour change for deployments without an HSM.
+
 ## [1.9.1] - 2026-09-10
 
 ### Changed
