@@ -1,8 +1,10 @@
 //! OpenTelemetry `CLIENT` spans for outbound upstream-registry requests (#3954).
 //!
-//! Every request the proxy service sends to an upstream registry (artifact and
+//! Every upstream request made by `services::proxy_service` (artifact and
 //! metadata fetches, conditional revalidations, the OCI bearer-token exchange
-//! and its retry) goes through [`send_upstream`]. It wraps the send in an
+//! and its retry) goes through [`send_upstream`]. Upstream calls made outside
+//! the proxy service (`services::upstream_metadata`, `services::upstream_feed`,
+//! the npm and goproxy handlers) do not yet, and are follow-ups on #3954. It wraps the send in an
 //! `otel.kind = "client"` span carrying the stable HTTP client semantic
 //! conventions (`http.request.method`, `url.full`, `server.address`,
 //! `server.port`, `http.response.status_code`, `error.type`) and injects the
@@ -16,14 +18,23 @@
 //!
 //! Injection is a no-op unless OpenTelemetry export is configured:
 //! `crate::telemetry::init_tracing` installs the W3C propagator only on that
-//! path, and without it `get_text_map_propagator` is the no-op propagator. The
-//! injected trace id is this service's own span context, which only adopts an
-//! inbound `traceparent` from a trusted proxy (see
-//! `api::middleware::tracing::trust_inbound_trace_context`), so an untrusted
-//! caller cannot choose the trace id sent upstream.
+//! path, and without it `get_text_map_propagator` is the no-op propagator.
+//!
+//! What is injected is this service's own span context, and it inherits
+//! whatever inbound trace context the `http_request` span adopted (see
+//! `api::middleware::tracing::trust_inbound_trace_context`). With
+//! `RATE_LIMIT_TRUSTED_PROXY_CIDRS` configured, only a listed proxy's
+//! `traceparent` is adopted. With the list EMPTY (the default) any client's
+//! `traceparent` is adopted, so on an OTLP-enabled deployment a client can
+//! choose the trace id, and its `tracestate` entries, that are forwarded to
+//! third-party upstreams. Both are validated by the propagator and by
+//! `HeaderValue`, so this is not a header-injection vector, but operators who
+//! do not want caller-chosen trace context relayed upstream should set the
+//! trusted-proxy list. Making upstream injection itself opt-in is a possible
+//! follow-up on #3954.
 
 use opentelemetry::propagation::Injector;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::{Method, StatusCode, Url};
 use tracing::{field::Empty, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -38,12 +49,13 @@ pub(crate) async fn send_upstream(
 ) -> reqwest::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut request = built?;
+    let had_auth = request.headers().contains_key(AUTHORIZATION);
     let span = upstream_client_span(request.method(), request.url());
     inject_trace_context(&span, request.headers_mut());
 
     let result = client.execute(request).instrument(span.clone()).await;
     match &result {
-        Ok(response) => record_response_status(&span, response.status()),
+        Ok(response) => record_response_status(&span, response.status(), had_auth),
         Err(err) => record_transport_error(&span, err),
     }
     result
@@ -54,7 +66,7 @@ pub(crate) async fn send_upstream(
 /// semantic conventions. `url.full` is redacted (no userinfo, query or
 /// fragment), as the semantic conventions require for credentials and as every
 /// other upstream diagnostic in this crate does.
-pub(crate) fn upstream_client_span(method: &Method, url: &Url) -> Span {
+fn upstream_client_span(method: &Method, url: &Url) -> Span {
     tracing::info_span!(
         "upstream_request",
         otel.name = %method,
@@ -71,7 +83,7 @@ pub(crate) fn upstream_client_span(method: &Method, url: &Url) -> Span {
 
 /// Write `span`'s W3C trace context into `headers` through the globally
 /// installed propagator.
-pub(crate) fn inject_trace_context(span: &Span, headers: &mut HeaderMap) {
+fn inject_trace_context(span: &Span, headers: &mut HeaderMap) {
     let cx = span.context();
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&cx, &mut HeaderInjector(headers));
@@ -81,17 +93,23 @@ pub(crate) fn inject_trace_context(span: &Span, headers: &mut HeaderMap) {
 /// Whether an upstream response status marks the client span as failed.
 ///
 /// The HTTP semantic conventions say a `CLIENT` span SHOULD be an error for
-/// any 4xx or 5xx. `401` is the one exception taken here: an OCI registry
-/// answers every first, unauthenticated request with a `401` bearer
-/// challenge, which the proxy then satisfies with a token exchange and a
-/// retry (each in its own span). Marking that expected step as an error would
-/// put an error span in nearly every container-image trace.
-pub(crate) fn status_is_error(status: StatusCode) -> bool {
-    (status.is_client_error() || status.is_server_error()) && status != StatusCode::UNAUTHORIZED
+/// any 4xx or 5xx. The one exception is a `401` to a request sent WITHOUT an
+/// `Authorization` header: an OCI registry answers every first anonymous
+/// request with a `401` bearer challenge, which the proxy then satisfies with
+/// a token exchange and a retry (each in its own span). Marking that expected
+/// step as an error would put an error span in nearly every container-image
+/// trace. A `401` to a request that carried credentials (configured Basic
+/// auth, a bearer token, a token-endpoint request with Basic auth) means those
+/// credentials were rejected, and is an error.
+fn status_is_error(status: StatusCode, had_auth: bool) -> bool {
+    if status == StatusCode::UNAUTHORIZED {
+        return had_auth;
+    }
+    status.is_client_error() || status.is_server_error()
 }
 
 /// Low-cardinality `error.type` for a request that produced no response.
-pub(crate) fn transport_error_type(err: &reqwest::Error) -> &'static str {
+fn transport_error_type(err: &reqwest::Error) -> &'static str {
     if err.is_timeout() {
         "timeout"
     } else if err.is_connect() {
@@ -109,9 +127,9 @@ pub(crate) fn transport_error_type(err: &reqwest::Error) -> &'static str {
     }
 }
 
-fn record_response_status(span: &Span, status: StatusCode) {
+fn record_response_status(span: &Span, status: StatusCode, had_auth: bool) {
     span.record("http.response.status_code", status.as_u16());
-    if status_is_error(status) {
+    if status_is_error(status, had_auth) {
         span.record("error.type", status.as_str());
         span.record("otel.status_code", "error");
     }
@@ -212,15 +230,60 @@ mod tests {
         }
     }
 
+    /// OTel spans as the SDK hands them to an exporter, so tests can assert
+    /// the exported `Status` rather than only the tracing fields that
+    /// `tracing-opentelemetry` maps onto it.
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanProcessor for Exported {
+        fn on_start(&self, _: &mut opentelemetry_sdk::trace::Span, _: &opentelemetry::Context) {}
+        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+            self.0.lock().unwrap().push(span);
+        }
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(
+            &self,
+            _: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    impl Exported {
+        /// The exported status of the single `upstream_request` span.
+        fn upstream_status(&self) -> opentelemetry::trace::Status {
+            let spans = self.0.lock().unwrap();
+            let client: Vec<_> = spans
+                .iter()
+                .filter(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
+                .collect();
+            assert_eq!(client.len(), 1, "exactly one CLIENT span expected");
+            client[0].status.clone()
+        }
+    }
+
     /// A subscriber with a real `tracing-opentelemetry` layer (so spans have
-    /// an OTel context to inject) plus the field capture.
-    fn subscriber(fields: &Fields) -> impl tracing::Subscriber + Send + Sync {
+    /// an OTel context to inject and are exported to `exported`) plus the
+    /// field capture.
+    fn subscriber_exporting(
+        fields: &Fields,
+        exported: &Exported,
+    ) -> impl tracing::Subscriber + Send + Sync {
         use opentelemetry::trace::TracerProvider as _;
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_span_processor(exported.clone())
+            .build();
         let tracer = provider.tracer("test");
         tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .with(fields.clone())
+    }
+
+    fn subscriber(fields: &Fields) -> impl tracing::Subscriber + Send + Sync {
+        subscriber_exporting(fields, &Exported::default())
     }
 
     #[test]
@@ -281,13 +344,60 @@ mod tests {
 
     #[test]
     fn status_classification_follows_client_semconv_except_bearer_challenge() {
-        for ok in [200u16, 204, 206, 301, 304] {
-            assert!(!status_is_error(StatusCode::from_u16(ok).unwrap()), "{ok}");
+        for had_auth in [false, true] {
+            for ok in [200u16, 204, 206, 301, 304] {
+                let status = StatusCode::from_u16(ok).unwrap();
+                assert!(!status_is_error(status, had_auth), "{ok}");
+            }
+            for err in [400u16, 403, 404, 410, 429, 500, 502, 503] {
+                let status = StatusCode::from_u16(err).unwrap();
+                assert!(status_is_error(status, had_auth), "{err}");
+            }
         }
-        for err in [400u16, 403, 404, 410, 429, 500, 502, 503] {
-            assert!(status_is_error(StatusCode::from_u16(err).unwrap()), "{err}");
+        // An anonymous request's 401 is the OCI bearer challenge; an
+        // authenticated request's 401 is rejected credentials.
+        assert!(!status_is_error(StatusCode::UNAUTHORIZED, false));
+        assert!(status_is_error(StatusCode::UNAUTHORIZED, true));
+    }
+
+    /// Send one GET to a mock answering 401 and return the exported status.
+    async fn exported_status_of_401(authenticate: bool) -> opentelemetry::trace::Status {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("www-authenticate", "Bearer realm=\"x\""),
+            )
+            .mount(&server)
+            .await;
+
+        let exported = Exported::default();
+        let _guard =
+            tracing::subscriber::set_default(subscriber_exporting(&Fields::default(), &exported));
+        let mut request = reqwest::Client::new().get(server.uri());
+        if authenticate {
+            request = request.bearer_auth("rejected-token");
         }
-        assert!(!status_is_error(StatusCode::UNAUTHORIZED));
+        send_upstream(request).await.expect("the mock answers");
+        exported.upstream_status()
+    }
+
+    #[tokio::test]
+    async fn anonymous_bearer_challenge_is_not_exported_as_an_error() {
+        assert_eq!(
+            exported_status_of_401(false).await,
+            opentelemetry::trace::Status::Unset
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_are_exported_as_an_error() {
+        assert!(matches!(
+            exported_status_of_401(true).await,
+            opentelemetry::trace::Status::Error { .. }
+        ));
     }
 
     #[tokio::test]

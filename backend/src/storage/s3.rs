@@ -1194,8 +1194,13 @@ fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) ->
 /// The original error string is appended as `caused by:` so the full
 /// message is still searchable in the logs.
 pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
-    let raw = err.to_string();
-    let l = raw.to_lowercase();
+    let full = err.to_string();
+    let l = full.to_lowercase();
+    // The raw text is kept for searchability, minus any request URL (#3954):
+    // object_store embeds the endpoint, bucket and key URL in generic and
+    // retry errors, and this message now reaches INFO logs and exported span
+    // status through the storage spans' `err` recording.
+    let raw = redact_urls_in_text(&full);
 
     let category = if l.contains("certificate")
         || l.contains("tls")
@@ -1258,6 +1263,21 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     };
 
     format!("{}. caused by: {}", category, raw)
+}
+
+/// Replace every `http(s)://...` URL in `text` with `<url>` (#3954).
+pub(crate) fn redact_urls_in_text(text: &str) -> std::borrow::Cow<'_, str> {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).expect("static regex")
+    });
+    URL.replace_all(text, "<url>")
+}
+
+/// `AppError::Storage` for a failed object-store call: `context`, then the
+/// [`classify_s3_error`] diagnostic, so no request URL (endpoint, bucket)
+/// reaches the error text that storage spans record (#3954).
+fn s3_storage_error(context: impl std::fmt::Display, err: &object_store::Error) -> AppError {
+    AppError::Storage(format!("{context}: {}", classify_s3_error(err)))
 }
 
 /// Generate the full S3 key with optional prefix.
@@ -1856,7 +1876,7 @@ impl S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read fallback '{}': {}", fallback_key, e))
+                    s3_storage_error(format!("Failed to read fallback '{}'", fallback_key), &e)
                 })?;
                 tracing::info!(
                     key = %key,
@@ -1867,10 +1887,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1910,10 +1933,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object range '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object range '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1933,10 +1959,13 @@ impl S3Backend {
             .signed_url(http::Method::DELETE, path, Duration::from_secs(300))
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned DELETE URL for '{}': {}",
-                    display_key, e
-                ))
+                s3_storage_error(
+                    format!(
+                        "Failed to generate presigned DELETE URL for '{}'",
+                        display_key
+                    ),
+                    &e,
+                )
             })?;
 
         let response = reqwest::Client::new()
@@ -1944,9 +1973,11 @@ impl S3Backend {
             .send()
             .await
             .map_err(|e| {
+                // `without_url`: the URL is presigned, so it carries a signature.
                 AppError::Storage(format!(
                     "Failed to send DELETE request for '{}': {}",
-                    display_key, e
+                    display_key,
+                    e.without_url()
                 ))
             })?;
 
@@ -1992,7 +2023,7 @@ impl super::StorageBackend for S3Backend {
             .await
             .map_err(|e| {
                 tracing::error!(key = %key, error = %e, "S3 put_object failed");
-                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+                s3_storage_error(format!("Failed to put object '{}'", key), &e)
             })?;
 
         tracing::debug!(key = %key, "S3 put object successful");
@@ -2008,7 +2039,7 @@ impl super::StorageBackend for S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read object '{}': {}", key, e))
+                    s3_storage_error(format!("Failed to read object '{}'", key), &e)
                 })?;
                 tracing::debug!(key = %key, size = bytes.len(), "S3 get object successful");
                 Ok(bytes)
@@ -2022,10 +2053,10 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to get object '{}'", key),
+                &e,
+            )),
         }
     }
 
@@ -2038,10 +2069,10 @@ impl super::StorageBackend for S3Backend {
             Ok(_) => return Ok(true),
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to check existence of '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to check existence of '{}'", key),
+                    &e,
+                ));
             }
         }
 
@@ -2059,10 +2090,13 @@ impl super::StorageBackend for S3Backend {
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
-                        return Err(AppError::Storage(format!(
-                            "Failed to check fallback existence of '{}' for '{}': {}",
-                            fallback_key, key, e
-                        )));
+                        return Err(s3_storage_error(
+                            format!(
+                                "Failed to check fallback existence of '{}' for '{}'",
+                                fallback_key, key
+                            ),
+                            &e,
+                        ));
                     }
                 }
             }
@@ -2086,10 +2120,10 @@ impl super::StorageBackend for S3Backend {
             match self.store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
-                    return Err(AppError::Storage(format!(
-                        "Failed to delete object '{}': {}",
-                        key, e
-                    )))
+                    return Err(s3_storage_error(
+                        format!("Failed to delete object '{}'", key),
+                        &e,
+                    ))
                 }
             }
         }
@@ -2124,10 +2158,10 @@ impl super::StorageBackend for S3Backend {
         match self.store.head(&path).await {
             Ok(meta) => Ok(meta.e_tag),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "head_etag failed for '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("head_etag failed for '{}'", key),
+                &e,
+            )),
         }
     }
 
@@ -2172,10 +2206,10 @@ impl super::StorageBackend for S3Backend {
             .signed_url(http::Method::GET, &path, clamped_expiry)
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned URL for '{}': {}",
-                    key, e
-                ))
+                s3_storage_error(
+                    format!("Failed to generate presigned URL for '{}'", key),
+                    &e,
+                )
             })?;
 
         tracing::debug!(
@@ -2244,10 +2278,10 @@ impl super::StorageBackend for S3Backend {
                 )));
             }
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to get object '{}': {}",
-                    key_owned, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to get object '{}'", key_owned),
+                    &e,
+                ));
             }
         };
 
@@ -2291,10 +2325,13 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object range '{}' (offset={}, length={}): {}",
-                key, offset, length, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get object range '{}' (offset={}, length={})",
+                    key, offset, length
+                ),
+                &e,
+            )),
         }
     }
 
@@ -2340,10 +2377,10 @@ impl super::StorageBackend for S3Backend {
                     total += data.len() as u64;
                     if upload_id.is_none() {
                         let id = self.store.create_multipart(&path).await.map_err(|e| {
-                            AppError::Storage(format!(
-                                "Failed to start multipart upload for '{}': {}",
-                                key, e
-                            ))
+                            s3_storage_error(
+                                format!("Failed to start multipart upload for '{}'", key),
+                                &e,
+                            )
                         })?;
                         abort_guard.arm(id.clone());
                         upload_id = Some(id);
@@ -2462,10 +2499,10 @@ impl super::StorageBackend for S3Backend {
                 .await
             {
                 abort_guard.abort_now().await;
-                return Err(AppError::Storage(format!(
-                    "Failed to complete multipart upload for '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to complete multipart upload for '{}'", key),
+                    &e,
+                ));
             }
             // Upload completed: defuse the guard so drop never aborts it.
             abort_guard.disarm();
@@ -2734,7 +2771,9 @@ impl S3Backend {
             if !copy_rejected_for_missing_length(&message) {
                 return Err(AppError::Storage(format!(
                     "Failed to copy '{}' to '{}': {}",
-                    source, dest, message
+                    source,
+                    dest,
+                    redact_urls_in_text(&message)
                 )));
             }
             tracing::warn!(
@@ -2849,10 +2888,9 @@ impl S3Backend {
             // bulk ceiling, not reqwest's unbounded default.
             send = send.timeout(timeout);
         }
-        let response = send
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("{} failed to send: {}", what, e)))?;
+        let response = send.send().await.map_err(|e| {
+            AppError::Storage(format!("{} failed to send: {}", what, e.without_url()))
+        })?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -6273,6 +6311,27 @@ mod tests {
         let msg = classify_s3_error(&e);
         assert!(msg.contains("signature rejected"), "got: {msg}");
         assert!(msg.contains("clock"), "must mention clock skew: {msg}");
+    }
+
+    #[test]
+    fn test_classify_redacts_request_urls_from_the_raw_text() {
+        // #3954: the message reaches INFO logs and exported span status.
+        let e = generic_err(
+            "Error performing GET https://minio.internal:9000/my-bucket/a/b?x=1 in 1s - boom",
+        );
+        let msg = classify_s3_error(&e);
+        assert!(!msg.contains("minio.internal"), "got: {msg}");
+        assert!(!msg.contains("my-bucket"), "got: {msg}");
+        assert!(
+            msg.contains("Error performing GET <url> in 1s - boom"),
+            "got: {msg}"
+        );
+        let err = s3_storage_error(format!("Failed to get object '{}'", "k"), &e);
+        assert!(
+            err.to_string()
+                .contains("Failed to get object 'k': S3 request failed. caused by:"),
+            "got: {err}"
+        );
     }
 
     #[test]

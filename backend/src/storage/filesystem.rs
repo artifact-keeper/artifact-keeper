@@ -19,20 +19,20 @@ use crate::error::{AppError, Result};
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
 #[cfg(unix)]
-async fn sync_parent_directory(path: &Path) -> Result<()> {
+/// Errors name the storage `key`, not the absolute directory: the message is
+/// recorded on the storage span and logged at INFO (#3954).
+async fn sync_parent_directory(path: &Path, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent).await.map_err(|e| {
             AppError::Storage(format!(
-                "Failed to open parent directory {} for sync: {}",
-                parent.display(),
-                e
+                "Failed to open parent directory of '{}' for sync: {}",
+                key, e
             ))
         })?;
         dir.sync_all().await.map_err(|e| {
             AppError::Storage(format!(
-                "Failed to sync parent directory {}: {}",
-                parent.display(),
-                e
+                "Failed to sync parent directory of '{}': {}",
+                key, e
             ))
         })?;
     }
@@ -40,15 +40,15 @@ async fn sync_parent_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn sync_parent_directory(_path: &Path) -> Result<()> {
+async fn sync_parent_directory(_path: &Path, _key: &str) -> Result<()> {
     Ok(())
 }
 
-fn temp_path_for_dest(dest: &Path, id: Uuid) -> Result<PathBuf> {
+fn temp_path_for_dest(dest: &Path, key: &str, id: Uuid) -> Result<PathBuf> {
     let parent = dest.parent().ok_or_else(|| {
         AppError::Storage(format!(
-            "Destination path {} has no parent directory",
-            dest.display()
+            "Destination path for '{}' has no parent directory",
+            key
         ))
     })?;
     Ok(parent.join(format!(".tmp.{id}")))
@@ -323,7 +323,7 @@ impl StorageBackend for FilesystemStorage {
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp_path = temp_path_for_dest(&dest_path, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest_path, dest, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(&source_path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy failed").await;
@@ -360,7 +360,7 @@ impl StorageBackend for FilesystemStorage {
                 dest, e
             )));
         }
-        sync_parent_directory(&dest_path).await?;
+        sync_parent_directory(&dest_path, dest).await?;
         Ok(())
     }
 
@@ -378,7 +378,7 @@ impl StorageBackend for FilesystemStorage {
         // two concurrent writers of the same key raced on truncate/write so a
         // reader could observe torn bytes. Staging makes the visible `dest`
         // flip atomically from absent/old bytes to complete bytes.
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file copy failed").await;
@@ -416,7 +416,7 @@ impl StorageBackend for FilesystemStorage {
                 key, e
             )));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
         Ok(())
     }
 
@@ -499,7 +499,7 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
         let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
@@ -538,7 +538,7 @@ impl StorageBackend for FilesystemStorage {
             remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
             return Err(AppError::Storage(format!("Rename error: {}", e)));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -709,9 +709,19 @@ mod tests {
     }
 
     #[test]
+    fn test_temp_path_error_names_the_key_not_the_path() {
+        // #3954: the message is recorded on the storage span at INFO.
+        let err = temp_path_for_dest(Path::new("/"), "my-key", Uuid::nil())
+            .expect_err("the root has no parent");
+        let msg = err.to_string();
+        assert!(msg.contains("'my-key'"), "got: {msg}");
+        assert!(!msg.contains("path /"), "got: {msg}");
+    }
+
+    #[test]
     fn test_temp_path_for_dest_uses_short_sibling_name() {
         let dest = PathBuf::from(format!("/data/aa/{}", "a".repeat(240)));
-        let temp = temp_path_for_dest(&dest, Uuid::nil()).expect("temp path");
+        let temp = temp_path_for_dest(&dest, "k", Uuid::nil()).expect("temp path");
 
         assert_eq!(temp.parent(), dest.parent());
         let file_name = temp
