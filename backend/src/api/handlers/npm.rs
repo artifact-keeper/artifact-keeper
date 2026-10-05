@@ -1957,7 +1957,7 @@ async fn npm_audit_upstream_json(
         Err(err) => {
             debug!(
                 target: "npm_audit",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "failed to reach npm audit upstream; serving empty advisories"
             );
@@ -1977,7 +1977,7 @@ async fn npm_audit_upstream_json(
             if !status.is_success() {
                 debug!(
                     target: "npm_audit",
-                    upstream = %url,
+                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                     status = %status,
                     "npm audit upstream returned non-success; serving empty advisories"
                 );
@@ -1988,7 +1988,7 @@ async fn npm_audit_upstream_json(
         Err(err) => {
             debug!(
                 target: "npm_audit",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "failed to read npm audit upstream body; serving empty advisories"
             );
@@ -2054,7 +2054,7 @@ async fn npm_meta_upstream_bytes(
         Err(err) => {
             debug!(
                 target: "npm_meta",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "npm meta GET upstream unreachable"
             );
@@ -2076,7 +2076,7 @@ async fn npm_meta_upstream_bytes(
         Err(err) => {
             debug!(
                 target: "npm_meta",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "npm meta GET failed to read upstream body"
             );

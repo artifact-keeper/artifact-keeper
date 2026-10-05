@@ -685,14 +685,7 @@ pub(crate) fn redact_url_for_diagnostics(url: &str) -> String {
         (None, Some(f)) => f,
         (None, None) => url.len(),
     };
-    strip_userinfo_fallback(&url[..end])
-}
-
-/// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
-/// not parse. Delegates to [`strip_url_userinfo`], which works at the string
-/// level and therefore needs no successful parse.
-fn strip_userinfo_fallback(url: &str) -> String {
-    strip_url_userinfo(url).0
+    strip_url_userinfo(&url[..end]).0
 }
 
 /// Remove the `userinfo@` segment (`user:password@`, or a bare `token@`) from
@@ -706,17 +699,62 @@ fn strip_userinfo_fallback(url: &str) -> String {
 /// through, paired with the returned flag so a client can still tell that
 /// credentials are configured.
 ///
-/// The authority is the text after an optional `scheme://` (or a leading
-/// `//`) up to the first `/`, `?` or `#`. Its userinfo is everything up to the
-/// LAST `@`, matching how URL parsers split `user:p@ss@host`. Working on the
-/// raw string means an unparseable value is redacted too.
+/// The scheme is only recognised at the start of the string, followed by any
+/// run of `/` or `\` (WHATWG parsers accept `https:user:pass@host`,
+/// `https:/user:pass@host` and `https:\\user:pass@host` as credentialed
+/// URLs). The authority then runs to the first `/`, `?` or `#` (and `\` for
+/// the special schemes, as the URL parser does), and its userinfo is
+/// everything up to the LAST `@`. As a final guard, if `reqwest::Url` still
+/// sees a username or password in the result, the parsed URL with its
+/// userinfo cleared is returned instead, so the output never carries
+/// credentials the fetch path would send.
 pub(crate) fn strip_url_userinfo(url: &str) -> (String, bool) {
-    let (prefix, rest) = match url.find("://") {
-        Some(pos) => url.split_at(pos + 3),
-        None if url.starts_with("//") => url.split_at(2),
-        None => ("", url),
+    let (stripped, had) = strip_url_userinfo_textual(url);
+    match reqwest::Url::parse(&stripped) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_password(None);
+            let _ = parsed.set_username("");
+            (parsed.to_string(), true)
+        }
+        _ => (stripped, had),
+    }
+}
+
+/// The string-level half of [`strip_url_userinfo`].
+fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
+    let scheme_len = url.find(':').filter(|&i| {
+        let scheme = &url[..i];
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    let (prefix_len, special) = match scheme_len {
+        Some(i) => {
+            let slashes = url[i + 1..]
+                .bytes()
+                .take_while(|b| *b == b'/' || *b == b'\\')
+                .count();
+            let special = matches!(
+                url[..i].to_ascii_lowercase().as_str(),
+                "http" | "https" | "ws" | "wss" | "ftp"
+            );
+            // A non-special scheme only counts with a `//` authority marker;
+            // otherwise `user:pass@host/x` (no scheme at all) would keep its
+            // username as a "scheme".
+            if special || url[i + 1..].starts_with("//") {
+                (i + 1 + slashes, special)
+            } else {
+                (0, false)
+            }
+        }
+        None if url.starts_with("//") => (2, false),
+        None => (0, false),
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (prefix, rest) = url.split_at(prefix_len);
+    let authority_end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
     match authority.rfind('@') {
         Some(at) => (format!("{prefix}{}{tail}", &authority[at + 1..]), at > 0),
@@ -3489,10 +3527,13 @@ impl UpstreamClient {
         let response = send_upstream(request).await.map_err(|e| {
             AppError::Storage(format!("Failed to check upstream for changes: {}", e))
         })?;
+        // The URL may embed upstream `user:password@` credentials (#4452);
+        // every log line below renders the redacted form.
+        let shown = redact_url_for_diagnostics(url);
 
         match response.status() {
             StatusCode::NOT_MODIFIED => {
-                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
+                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", shown);
                 Ok(false)
             }
             StatusCode::OK => {
@@ -3501,11 +3542,11 @@ impl UpstreamClient {
 
                 match new_etag {
                     Some(etag) if etag == cached_etag => {
-                        tracing::debug!("Upstream ETag unchanged for {}", url);
+                        tracing::debug!("Upstream ETag unchanged for {}", shown);
                         Ok(false)
                     }
                     _ => {
-                        tracing::debug!("Upstream has newer content for {}", url);
+                        tracing::debug!("Upstream has newer content for {}", shown);
                         Ok(true)
                     }
                 }
@@ -3517,7 +3558,7 @@ impl UpstreamClient {
                 // handle the full 401 flow on the next access.
                 tracing::debug!(
                     "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -3554,7 +3595,7 @@ impl UpstreamClient {
                     "Upstream returned {} for ETag check on {}; no content information, \
                      treating as a revalidation failure",
                     status,
-                    url
+                    shown
                 );
                 match validate_upstream_status(status, url) {
                     Err(err) => Err(err),
@@ -3567,7 +3608,7 @@ impl UpstreamClient {
                 tracing::warn!(
                     "Unexpected status {} checking upstream {}, assuming changed",
                     status,
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -4476,7 +4517,7 @@ impl ProxyService {
                         {
                             tracing::warn!(
                                 "Upstream fetch failed for {}; serving stale cached copy: {}",
-                                full_url,
+                                redact_url_for_diagnostics(&full_url),
                                 upstream_err
                             );
                             Ok((stale_content, stale_content_type, stale_content_encoding))
@@ -5666,7 +5707,7 @@ impl ProxyService {
                     if let Ok(content) = self.storage.get(&cache_key).await {
                         tracing::warn!(
                             "Upstream fetch failed for {}; serving stale: {}",
-                            full_url,
+                            redact_url_for_diagnostics(&full_url),
                             upstream_err
                         );
                         let ct = meta.content_type.clone();
@@ -5791,7 +5832,8 @@ impl ProxyService {
 
                 Err(AppError::Storage(format!(
                     "Upstream returned error status {}: {}",
-                    status, url
+                    status,
+                    redact_url_for_diagnostics(url)
                 )))
             }
             _ => {
@@ -13753,6 +13795,24 @@ mod tests {
             ("https://token@host:8443", "https://host:8443", true),
             ("https://u:p@ss@host/a", "https://host/a", true),
             ("//user:pass@host/path", "//host/path", true),
+            ("user:pass@host/path", "host/path", true),
+            ("https://u:p@[::1]:8443/x", "https://[::1]:8443/x", true),
+            ("https://user%40corp:p%40ss@host/", "https://host/", true),
+            ("https://:pw@host/", "https://host/", true),
+            // WHATWG accepts these slash-less / backslash forms as
+            // credentialed special-scheme URLs; a `://` later in the query
+            // must not be mistaken for the scheme separator.
+            (
+                "https:user:pass@host/x?q=http://z",
+                "https:host/x?q=http://z",
+                true,
+            ),
+            ("https:/user:pass@host", "https:/host", true),
+            ("https:\\\\user:pass@host", "https:\\\\host", true),
+            // `\` ends a special-scheme authority, as in the URL parser: the
+            // host is `host`, and `\x@y/z` is path.
+            ("https://u:p@host\\x@y/z", "https://host\\x@y/z", true),
+            ("https://host\\@evil/", "https://host\\@evil/", false),
             // Credential-free URLs come back exactly as stored (no parser
             // normalization such as an added trailing slash).
             (

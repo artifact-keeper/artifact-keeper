@@ -30319,20 +30319,27 @@ mod content_encoding_forwarding_tests {
         assert_eq!(&body[..], &coded[..]);
     }
 
-    /// #4050: the artifact detail response exposes the immutable origin
-    /// record — for a proxied artifact, the fetch-through repository AND the
-    /// upstream that supplied the bytes.
-    #[tokio::test]
-    async fn test_get_artifact_metadata_exposes_origin_4050() {
+    /// Seed one proxied artifact into a fresh Remote whose stored
+    /// `upstream_url` is `stored_upstream`, then read it back through BOTH
+    /// artifact detail routes (`GET /repositories/{key}/artifacts/{path}` and
+    /// `GET /artifacts/{id}`). Returns the two JSON bodies and the repo key.
+    async fn origin_detail_bodies(
+        stored_upstream: &str,
+    ) -> Option<(serde_json::Value, serde_json::Value, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
-            return;
-        };
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
-        tdh::seed_artifact(
+        // The origin fill trigger copies the repositories row's upstream_url.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(stored_upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+        let artifact_id = tdh::seed_artifact(
             &fx.state,
             &fx.pool,
-            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            &fx.repo_info("remote", Some(stored_upstream)),
             "org/origin/1.0/origin-1.0.bin",
             "org/origin/1.0/origin-1.0.bin",
             "origin",
@@ -30354,22 +30361,112 @@ mod content_encoding_forwarding_tests {
             Default::default(),
         )
         .await;
+        let by_id = crate::api::handlers::artifacts::get_artifact(
+            axum::extract::State(fx.state.clone()),
+            Extension(None),
+            axum::extract::Path(artifact_id),
+        )
+        .await;
+        let repo_key = fx.repo_key.clone();
         fx.teardown().await;
 
         let resp = result.unwrap_or_else(|e| panic!("metadata serve failed: {e:?}"));
         let (status, body, _headers) = tdh::collect_response(resp).await;
         assert_eq!(status, StatusCode::OK);
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_path: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_id = serde_json::to_value(
+            by_id
+                .unwrap_or_else(|e| panic!("get_artifact failed: {e:?}"))
+                .0,
+        )
+        .expect("artifact json");
+        Some((by_path, by_id, repo_key))
+    }
+
+    /// #4050: the artifact detail response exposes the immutable origin
+    /// record — for a proxied artifact, the fetch-through repository AND the
+    /// upstream that supplied the bytes.
+    #[tokio::test]
+    async fn test_get_artifact_metadata_exposes_origin_4050() {
+        let Some((json, by_id, repo_key)) =
+            origin_detail_bodies("https://upstream.example.test").await
+        else {
+            return;
+        };
         assert_eq!(
             json["origin"]["v"], 1,
             "origin must be on the detail response: {json}"
         );
         assert_eq!(json["origin"]["kind"], "proxy");
-        assert_eq!(json["origin"]["repository_key"], fx.repo_key);
+        assert_eq!(json["origin"]["repository_key"], repo_key);
         assert_eq!(
             json["origin"]["upstream_url"], "https://upstream.example.test",
             "the detail response must name the upstream that supplied the bytes: {json}"
         );
+        assert_eq!(by_id["origin"], json["origin"], "{by_id}");
+    }
+
+    /// #4452: a Remote whose upstream_url embeds credentials stamps them into
+    /// the stored origin; neither artifact detail route may return them.
+    #[tokio::test]
+    async fn test_artifact_detail_origin_redacts_upstream_userinfo_4452() {
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@upstream.example.test", "alice:s3cret");
+        let Some((by_path, by_id, _)) = origin_detail_bodies(&stored).await else {
+            return;
+        };
+        for json in [&by_path, &by_id] {
+            let text = json.to_string();
+            assert!(
+                !text.contains("s3cret") && !text.contains("alice"),
+                "leaked: {text}"
+            );
+            assert_eq!(
+                json["origin"]["upstream_url"],
+                "https://upstream.example.test"
+            );
+        }
+    }
+
+    /// #4452: the `test-upstream` probe reaches an upstream that requires the
+    /// URL's embedded Basic credentials, and its 200 body reports the URL
+    /// without them plus `upstream_url_has_credentials`.
+    #[tokio::test]
+    async fn test_test_upstream_redacts_upstream_userinfo_4452() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/base"))
+            .and(wiremock::matchers::basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let plain = format!("{}/base", server.uri());
+        let stored = plain.replacen("://", "://alice:s3cret@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&stored)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let result = super::test_upstream(
+            axum::extract::State(fx.state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            axum::extract::Path(fx.repo_key.clone()),
+        )
+        .await;
+        fx.teardown().await;
+
+        let json = result
+            .unwrap_or_else(|e| panic!("test-upstream must reach the authed mock: {e:?}"))
+            .0;
+        assert_eq!(json["upstream_status"], 200, "{json}");
+        assert_eq!(json["upstream_url"], plain.as_str(), "{json}");
+        assert_eq!(json["upstream_url_has_credentials"], true, "{json}");
+        assert!(!json.to_string().contains("s3cret"), "leaked: {json}");
     }
 }
 
