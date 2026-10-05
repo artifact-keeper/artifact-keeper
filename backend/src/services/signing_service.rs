@@ -15,7 +15,7 @@ use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-use pgp::types::{KeyVersion, PublicKeyTrait, SecretKeyTrait};
+use pgp::types::{KeyVersion, PublicKeyTrait, PublicParams, SecretKeyTrait};
 use pgp::ArmorOptions;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
@@ -108,6 +108,75 @@ fn algorithm_to_bits_u32(algorithm: &str) -> std::result::Result<u32, String> {
     algorithm_to_bits(algorithm).and_then(|bits| {
         u32::try_from(bits).map_err(|_| format!("Unsupported RSA key size: {}", bits))
     })
+}
+
+const MIN_ATTESTATION_RSA_BITS: usize = 2048;
+
+fn mpi_bit_len(n: &pgp::types::Mpi) -> usize {
+    let bytes = n.as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    bytes.len() * 8 - bytes[0].leading_zeros() as usize
+}
+
+pub(crate) fn attestation_hash_is_allowed(alg: HashAlgorithm) -> bool {
+    matches!(
+        alg,
+        HashAlgorithm::SHA2_256
+            | HashAlgorithm::SHA2_384
+            | HashAlgorithm::SHA2_512
+            | HashAlgorithm::SHA3_256
+            | HashAlgorithm::SHA3_512
+    )
+}
+
+fn reject_weak_attestation_signature(signature: &StandaloneSignature) -> Result<()> {
+    if signature.signature.config.typ != SignatureType::Binary {
+        return Err(AppError::Validation(
+            "Trust attestation requires a binary OpenPGP signature".to_string(),
+        ));
+    }
+    let hash = signature.signature.config.hash_alg;
+    if !attestation_hash_is_allowed(hash) {
+        return Err(AppError::Validation(format!(
+            "Trust attestation rejects hash algorithm {hash:?} (SHA-1 and MD5 are not allowed)"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_untrusted_issuer_key(issuer: &SignedPublicKey) -> Result<()> {
+    if !issuer.details.revocation_signatures.is_empty() {
+        return Err(AppError::Validation(
+            "Issuer OpenPGP key is revoked".to_string(),
+        ));
+    }
+    if let Some(exp) = issuer.expires_at() {
+        if exp <= Utc::now() {
+            return Err(AppError::Validation(
+                "Issuer OpenPGP key has expired".to_string(),
+            ));
+        }
+    }
+    match issuer.public_params() {
+        PublicParams::RSA { n, .. } => {
+            let bits = mpi_bit_len(n);
+            if bits < MIN_ATTESTATION_RSA_BITS {
+                return Err(AppError::Validation(format!(
+                    "Issuer RSA key is {bits} bits; minimum is {MIN_ATTESTATION_RSA_BITS}"
+                )));
+            }
+        }
+        PublicParams::Ed25519 { .. } | PublicParams::EdDSALegacy { .. } => {}
+        PublicParams::ECDSA(_) => {}
+        other => {
+            return Err(AppError::Validation(format!(
+                "Issuer public-key algorithm {other:?} is not accepted for trust attestations"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn pgp_user_id(uid_name: Option<&str>, uid_email: Option<&str>, fallback_name: &str) -> String {
@@ -838,9 +907,11 @@ created_at:{created_at}\n",
                 e
             ))
         })?;
+        reject_untrusted_issuer_key(&issuer_public)?;
 
         let (signature, _) = StandaloneSignature::from_string(&req.signature_armored)
             .map_err(|e| AppError::Validation(format!("Invalid detached signature: {}", e)))?;
+        reject_weak_attestation_signature(&signature)?;
         // Verify against the provided primary key. Subkeys are not a trust
         // path; a signature that only verifies as a subkey is rejected here.
         signature
@@ -3854,6 +3925,7 @@ mod tests {
             .expect("create signing key");
 
         let issuer = generate_test_openpgp_signing_key(TEST_PASSPHRASE).await;
+        let other = generate_test_openpgp_signing_key(TEST_PASSPHRASE).await;
         let issuer_svc = SigningService {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
@@ -3863,6 +3935,25 @@ mod tests {
             .get_trust_attestation_challenge(key.id)
             .await
             .expect("challenge");
+        let good_sig = issuer_svc
+            .sign_openpgp_detached_with_key(&issuer, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+        let err = service
+            .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+                signing_key_id: key.id,
+                issuer_name: None,
+                issuer_public_key_armored: other.public_key_pem,
+                signature_armored: good_sig.clone(),
+                created_by: None,
+            })
+            .await
+            .expect_err("signature from one key must not verify against another public key");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+
         let bad_sig = issuer_svc
             .sign_openpgp_detached_with_key(&issuer, b"not-the-challenge")
             .await
@@ -3883,10 +3974,6 @@ mod tests {
         );
 
         service.revoke_key(key.id, None).await.expect("revoke");
-        let good_sig = issuer_svc
-            .sign_openpgp_detached_with_key(&issuer, challenge.payload.as_bytes())
-            .await
-            .expect("issuer signature");
         let err = service
             .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
                 signing_key_id: key.id,
@@ -3901,5 +3988,13 @@ mod tests {
             matches!(err, AppError::Validation(_)),
             "expected Validation, got {err:?}"
         );
+    }
+
+    #[test]
+    fn attestation_hash_rejects_sha1_and_md5() {
+        assert!(!attestation_hash_is_allowed(HashAlgorithm::MD5));
+        assert!(!attestation_hash_is_allowed(HashAlgorithm::SHA1));
+        assert!(attestation_hash_is_allowed(HashAlgorithm::SHA2_256));
+        assert!(attestation_hash_is_allowed(HashAlgorithm::SHA2_512));
     }
 }
