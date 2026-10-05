@@ -647,6 +647,24 @@ async fn put_file(
     )
     .await;
 
+    // A version becomes resolvable (listed in metadata.json) when its
+    // MODULE.bazel is published, so that file registers the catalog row and
+    // fires the one artifact.uploaded webhook event for the version (#3659).
+    if file == "MODULE.bazel" {
+        crate::services::package_service::register_published_package(
+            &state.db,
+            &state.event_bus,
+            repo.id,
+            "bazel",
+            &name,
+            &version,
+            body.len() as i64,
+            &checksum,
+            None,
+        )
+        .await;
+    }
+
     info!(
         "Bazel publish: {} {} {} to repo {}",
         name, version, file, repo_key
