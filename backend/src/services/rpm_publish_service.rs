@@ -306,6 +306,15 @@ pub async fn publish(
     repo_id: Uuid,
     version_number: i64,
 ) -> Result<PublishSummary, AppError> {
+    // Serialise publishes of this version (#4421). Without it, two concurrent
+    // calls both pass the `published_at` check below and write the same
+    // repodata keys, so repomd.xml and repomd.xml.asc can come from different
+    // writers. The loser fails fast with 409 instead of overwriting the
+    // winner's blobs. Held (as an open transaction) until this publish has
+    // marked the version; the immutability check runs under it, so a publish
+    // that starts after the winner finished sees `published_at` set.
+    let publish_lock = acquire_publish_lock(db, repo_id, version_number).await?;
+
     // Resolve the version and guard immutability. Scope to repo_id so a version
     // number is only ever resolvable within its own repository.
     let row: Option<(Uuid, Option<DateTime<Utc>>)> = sqlx::query_as(
@@ -494,6 +503,7 @@ pub async fn publish(
         &storage_prefix,
     )
     .await?;
+    publish_lock.rollback().await?;
 
     Ok(PublishSummary {
         version_number,
@@ -503,8 +513,47 @@ pub async fn publish(
     })
 }
 
+/// Take the per-version publish lock: a transaction-scoped advisory lock on
+/// `(repo_id, version_number)`, released when the returned transaction ends
+/// (also when it is dropped on an error path). A second concurrent publish of
+/// the same version gets 409 rather than waiting and then rewriting the
+/// winner's immutable repodata (#4421).
+async fn acquire_publish_lock(
+    db: &PgPool,
+    repo_id: Uuid,
+    version_number: i64,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError> {
+    let mut tx = db.begin().await?;
+    let acquired: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(publish_lock_key(repo_id, version_number))
+            .fetch_one(&mut *tx)
+            .await?;
+    if !acquired {
+        return Err(publish_in_progress(version_number));
+    }
+    Ok(tx)
+}
+
+/// Advisory-lock key text for publishing `version_number` of `repo_id`.
+fn publish_lock_key(repo_id: Uuid, version_number: i64) -> String {
+    format!("rpm-publish:{repo_id}:{version_number}")
+}
+
+/// 409 for a publish that lost the race to a concurrent one (#4421).
+fn publish_in_progress(version_number: i64) -> AppError {
+    AppError::Conflict(format!(
+        "Version {version_number} is already being published by another request"
+    ))
+}
+
 /// Mark `version_id` published under `storage_prefix` and make it the
 /// repository's active publication.
+///
+/// The UPDATE only matches an unpublished version (`published_at IS NULL`,
+/// #4421), so a version is marked published exactly once. When the version
+/// exists but is already published, this returns 409 WITHOUT touching
+/// storage: the blobs under the prefix are the winner's.
 ///
 /// The repository row is locked FIRST, in the same order the version retention
 /// pass takes its locks (#2359), so the two cannot deadlock. If retention
@@ -532,7 +581,7 @@ async fn mark_published(
         r#"UPDATE repository_versions
            SET published_at = now(), repomd_storage_key = $2,
                storage_prefix = $3, signature_storage_key = $4
-           WHERE id = $1"#,
+           WHERE id = $1 AND published_at IS NULL"#,
     )
     .bind(version_id)
     .bind(&repomd_key)
@@ -542,7 +591,17 @@ async fn mark_published(
     .await?
     .rows_affected();
     if marked == 0 {
+        let still_exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM repository_versions WHERE id = $1")
+                .bind(version_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         drop(tx);
+        if still_exists.is_some() {
+            return Err(AppError::Conflict(format!(
+                "Version {version_number} is already published and its @N metadata is immutable"
+            )));
+        }
         for name in PUBLICATION_REPODATA_FILES {
             let _ = storage.delete(&format!("{storage_prefix}/{name}")).await;
         }
@@ -1290,6 +1349,99 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(active, None);
+        tdh::cleanup(&pool, repo, actor).await;
+    }
+
+    // #4421: two publishers of one version. The second to mark it gets 409
+    // and must leave the first publisher's repodata alone; it must not move
+    // `published_at` or reuse the prune-cleanup path.
+    #[tokio::test]
+    async fn test_mark_published_twice_conflicts_without_cleanup_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        let version_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repository_versions (repository_id, version_number) \
+             VALUES ($1, 3) RETURNING id",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let prefix = publication_prefix(repo, 3);
+        for name in PUBLICATION_REPODATA_FILES {
+            put_blob(&storage, &format!("{prefix}/{name}"), b"winner".to_vec())
+                .await
+                .unwrap();
+        }
+        let db = &pool;
+        let published_at = || async move {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT published_at FROM repository_versions WHERE id = $1",
+            )
+            .bind(version_id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+        };
+
+        mark_published(&pool, &storage, repo, version_id, 3, &prefix)
+            .await
+            .expect("first publisher marks the version");
+        let first = published_at().await.expect("published");
+        let err = mark_published(&pool, &storage, repo, version_id, 3, &prefix)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Conflict(m) if m.contains("already published")),
+            "{err:?}"
+        );
+        assert_eq!(
+            published_at().await,
+            Some(first),
+            "published_at is not moved"
+        );
+        for name in PUBLICATION_REPODATA_FILES {
+            let blob = storage.get(&format!("{prefix}/{name}")).await.unwrap();
+            assert_eq!(&blob[..], b"winner", "{name} must survive the loser");
+        }
+        tdh::cleanup(&pool, repo, actor).await;
+    }
+
+    // #4421: while one publish of a version holds the publish lock, a second
+    // concurrent publish of the same version is refused with 409 before it
+    // writes anything; a different version is not blocked.
+    #[tokio::test]
+    async fn test_concurrent_publish_of_one_version_conflicts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        let signing = SigningService::new(pool.clone(), "test-encryption-key-4421");
+
+        let first = acquire_publish_lock(&pool, repo, 5)
+            .await
+            .expect("first publisher takes the lock");
+        let second = publish(&pool, &storage, &signing, repo, 5).await;
+        assert!(
+            matches!(&second, Err(AppError::Conflict(m)) if m.contains("being published")),
+            "{second:?}"
+        );
+        // Version 6 has its own lock (and does not exist, hence 404).
+        let other = publish(&pool, &storage, &signing, repo, 6).await;
+        assert!(matches!(other, Err(AppError::NotFound(_))), "{other:?}");
+        first.rollback().await.unwrap();
+        // Released: the next publish gets past the lock.
+        let after = publish(&pool, &storage, &signing, repo, 5).await;
+        assert!(matches!(after, Err(AppError::NotFound(_))), "{after:?}");
+        assert_eq!(publish_lock_key(repo, 5), format!("rpm-publish:{repo}:5"));
         tdh::cleanup(&pool, repo, actor).await;
     }
 
