@@ -14,7 +14,11 @@
 	reverse_proxy /v2 backend:8080
 	reverse_proxy /v2/* backend:8080
 	# Native package format handlers — route directly to backend
-	# so requests avoid the Next.js middleware proxy hop
+	# so requests avoid the Next.js middleware proxy hop. Keep this list in
+	# step with `format_routes` in backend/src/api/routes.rs: a prefix that is
+	# missing here falls through to the web UI and gets its HTML 404 (#4482,
+	# #1772). scripts/ci/check-caddy-format-routes.sh enforces it.
+	reverse_proxy /general/* backend:8080
 	reverse_proxy /maven/* backend:8080
 	reverse_proxy /npm/* backend:8080
 	reverse_proxy /pypi/* backend:8080
@@ -26,6 +30,7 @@
 	reverse_proxy /debian/* backend:8080
 	reverse_proxy /rpm/* backend:8080
 	reverse_proxy /alpine/* backend:8080
+	reverse_proxy /pacman/* backend:8080
 	reverse_proxy /composer/* backend:8080
 	reverse_proxy /conan/* backend:8080
 	reverse_proxy /conda/* backend:8080
@@ -40,11 +45,13 @@
 	reverse_proxy /puppet/* backend:8080
 	reverse_proxy /ansible/* backend:8080
 	reverse_proxy /cran/* backend:8080
+	reverse_proxy /bazel/* backend:8080
 	reverse_proxy /huggingface/* backend:8080
 	reverse_proxy /jetbrains/* backend:8080
 	reverse_proxy /vscode/* backend:8080
 	reverse_proxy /proto/* backend:8080
 	reverse_proxy /incus/* backend:8080
+	reverse_proxy /lxc/* backend:8080
 	reverse_proxy /ext/* backend:8080
 }
 
