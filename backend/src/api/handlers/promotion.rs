@@ -12,11 +12,12 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::handlers::repositories::require_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::quality::{QualityGateEvaluation, QualityGateViolation};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryType, RepositoryVisibility};
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::quality_check_service::QualityCheckService;
@@ -117,7 +118,11 @@ pub struct PromotionHistoryEntry {
     pub id: Uuid,
     pub artifact_id: Uuid,
     pub artifact_path: String,
+    /// Key of the repository the artifact was promoted (or rejected) from.
+    /// Empty when that repository was deleted or the caller cannot read it.
     pub source_repo_key: String,
+    /// Key of the repository the artifact was promoted into. Empty when that
+    /// repository was deleted or the caller cannot read it.
     pub target_repo_key: String,
     pub status: String,
     pub rejection_reason: Option<String>,
@@ -1721,18 +1726,25 @@ pub async fn reject_artifact(
         ("status" = Option<String>, Query, description = "Filter by status (promoted, rejected, pending_approval)"),
     ),
     responses(
-        (status = 200, description = "Promotion history for repository", body = PromotionHistoryResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 200, description = "Promotion history for repository. The key of a counterpart repository the caller cannot read is returned as an empty string.", body = PromotionHistoryResponse),
+        (status = 404, description = "Repository not found, or not readable by the caller", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn promotion_history(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_key): Path<String>,
     Query(query): Query<PromotionHistoryQuery>,
 ) -> Result<Json<PromotionHistoryResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&repo_key).await?;
+    // #4418: the history names artifact paths, the counterpart repository,
+    // rejection reasons, actors and policy results, so it is a READ of the
+    // repository and takes the same existence-hiding gate as the sibling read
+    // endpoints: a caller who cannot read the repository gets the same 404 as
+    // for a repository that does not exist.
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
 
     let (page, per_page, offset) = compute_promotion_pagination(query.page, query.per_page);
 
@@ -1741,8 +1753,12 @@ pub async fn promotion_history(
         id: Uuid,
         artifact_id: Uuid,
         artifact_path: Option<String>,
+        source_repo_id: Option<Uuid>,
         source_repo_key: Option<String>,
+        source_visibility: Option<RepositoryVisibility>,
+        target_repo_id: Option<Uuid>,
         target_repo_key: Option<String>,
+        target_visibility: Option<RepositoryVisibility>,
         status: String,
         rejection_reason: Option<String>,
         promoted_by: Option<Uuid>,
@@ -1760,8 +1776,12 @@ pub async fn promotion_history(
             ph.id,
             ph.artifact_id,
             a.path as artifact_path,
+            sr.id as source_repo_id,
             sr.key as source_repo_key,
+            sr.visibility as source_visibility,
+            tr.id as target_repo_id,
             tr.key as target_repo_key,
+            tr.visibility as target_visibility,
             ph.status,
             ph.rejection_reason,
             ph.promoted_by,
@@ -1801,14 +1821,34 @@ pub async fn promotion_history(
 
     let total_pages = compute_total_pages(total, per_page);
 
+    // The other side of each row (the release target of a staging repo's
+    // history, or the staging source of a release repo's) may be a repository
+    // the caller cannot read; its key is blanked exactly as the per-artifact
+    // `last_promotion` state redacts it (#4384, #4418). The requested
+    // repository passed `require_visible` above.
+    let mut readable = super::last_promotion::readable_repo_ids(
+        &state.db,
+        rows.iter().flat_map(|r| {
+            [
+                r.source_repo_id.zip(r.source_visibility),
+                r.target_repo_id.zip(r.target_visibility),
+            ]
+            .into_iter()
+            .flatten()
+        }),
+        Some(&auth),
+    )
+    .await;
+    readable.insert(repo.id);
+
     let items = rows
         .into_iter()
         .map(|row| PromotionHistoryEntry {
             id: row.id,
             artifact_id: row.artifact_id,
             artifact_path: row.artifact_path.unwrap_or_default(),
-            source_repo_key: row.source_repo_key.unwrap_or_default(),
-            target_repo_key: row.target_repo_key.unwrap_or_default(),
+            source_repo_key: readable_repo_key(row.source_repo_id, row.source_repo_key, &readable),
+            target_repo_key: readable_repo_key(row.target_repo_id, row.target_repo_key, &readable),
             status: row.status,
             rejection_reason: row.rejection_reason,
             promoted_by: row.promoted_by,
@@ -1828,6 +1868,21 @@ pub async fn promotion_history(
             total_pages,
         },
     }))
+}
+
+/// A promotion-history repository key as the caller may see it: the key when
+/// the repository is in `readable`, otherwise empty (the same value the
+/// response already carries for a repository that has since been deleted), so
+/// the history never names a repository its viewer could not open (#4418).
+fn readable_repo_key(
+    repo_id: Option<Uuid>,
+    key: Option<String>,
+    readable: &std::collections::HashSet<Uuid>,
+) -> String {
+    match repo_id {
+        Some(id) if readable.contains(&id) => key.unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5270,6 +5325,200 @@ mod tests {
             cleanup(&pool, &[src, tgt], user).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #4418: promotion-history read gate and counterpart-key redaction.
+    // -----------------------------------------------------------------------
+    mod history_authz_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use sqlx::PgPool;
+
+        /// Two private repositories with one recorded promotion from the
+        /// first (staging side) into the second (release side).
+        struct HistoryFixture {
+            pool: PgPool,
+            state: SharedState,
+            user: Uuid,
+            username: String,
+            staging: (Uuid, String),
+            release: (Uuid, String),
+        }
+
+        impl HistoryFixture {
+            async fn setup() -> Option<Self> {
+                let pool = tdh::try_pool().await?;
+                let (user, username) = tdh::create_user(&pool).await;
+                let (s_id, s_key, s_dir) = tdh::create_repo(&pool, "local", "generic").await;
+                let (r_id, r_key, _r_dir) = tdh::create_repo(&pool, "local", "generic").await;
+                let artifact: Uuid = sqlx::query_scalar(
+                    "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, 'app/1.0/app.bin', 'app', 1, repeat('0', 64), \
+                             'application/octet-stream', 'ph-4418') RETURNING id",
+                )
+                .bind(s_id)
+                .fetch_one(&pool)
+                .await
+                .expect("seed artifact");
+                sqlx::query(
+                    "INSERT INTO promotion_history \
+                     (artifact_id, source_repo_id, target_repo_id, status) \
+                     VALUES ($1, $2, $3, 'promoted')",
+                )
+                .bind(artifact)
+                .bind(s_id)
+                .bind(r_id)
+                .execute(&pool)
+                .await
+                .expect("seed promotion history");
+                let state = tdh::build_state(pool.clone(), s_dir.to_str().unwrap());
+                Some(Self {
+                    pool,
+                    state,
+                    user,
+                    username,
+                    staging: (s_id, s_key),
+                    release: (r_id, r_key),
+                })
+            }
+
+            async fn history(
+                &self,
+                key: &str,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                let app = tdh::router_with_auth_ext(router(), self.state.clone(), auth);
+                let uri = format!("/repositories/{key}/promotion-history");
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                (status, json)
+            }
+
+            fn member(&self) -> AuthExtension {
+                tdh::make_auth(self.user, &self.username)
+            }
+
+            async fn teardown(self) {
+                tdh::cleanup(&self.pool, self.staging.0, self.user).await;
+                tdh::cleanup(&self.pool, self.release.0, self.user).await;
+            }
+        }
+
+        fn keys(json: &serde_json::Value) -> (String, String) {
+            let item = &json["items"][0];
+            (
+                item["source_repo_key"].as_str().unwrap_or("?").to_string(),
+                item["target_repo_key"].as_str().unwrap_or("?").to_string(),
+            )
+        }
+
+        /// A caller with no grant on a private repository gets the same 404 a
+        /// missing repository gets, not the history.
+        #[tokio::test]
+        async fn non_member_gets_404_on_private_repo() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert!(json.get("items").is_none(), "{json}");
+            let (missing, _) = f.history("ph-4418-no-such-repo", f.member()).await;
+            assert_eq!(missing, StatusCode::NOT_FOUND);
+            f.teardown().await;
+        }
+
+        /// A repository-scoped token outside its scope is refused like a
+        /// non-member, even when the user holds a grant.
+        #[tokio::test]
+        async fn out_of_scope_token_gets_404() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let scoped = AuthExtension {
+                is_api_token: true,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                    f.release.0,
+                ]),
+                ..f.member()
+            };
+            let (status, _) = f.history(&f.staging.1, scoped).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            f.teardown().await;
+        }
+
+        /// A member of the staging repository reads its history, but the
+        /// release repository it cannot read is not named.
+        #[tokio::test]
+        async fn member_reads_history_with_unreadable_target_redacted() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 1, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), String::new()));
+
+            // Readable on both sides: both keys are shown.
+            tdh::grant_repo_access(&f.pool, f.release.0, f.user).await;
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        /// Visibility, not only grants: an `internal` repository is readable
+        /// by any authenticated principal and a `public` one by everyone,
+        /// while the private counterpart stays redacted. Admins see all.
+        #[tokio::test]
+        async fn visibility_and_admin_paths() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            for visibility in ["internal", "public"] {
+                sqlx::query(
+                    "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+                )
+                .bind(f.release.0)
+                .bind(visibility)
+                .execute(&f.pool)
+                .await
+                .expect("set visibility");
+                let (status, json) = f.history(&f.release.1, f.member()).await;
+                assert_eq!(status, StatusCode::OK, "{visibility}: {json}");
+                assert_eq!(
+                    keys(&json),
+                    (String::new(), f.release.1.clone()),
+                    "{visibility}: the private staging source stays redacted"
+                );
+            }
+            let admin = AuthExtension {
+                is_admin: true,
+                ..f.member()
+            };
+            let (status, json) = f.history(&f.staging.1, admin).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        #[test]
+        fn readable_repo_key_blanks_unreadable_and_deleted() {
+            let open = Uuid::new_v4();
+            let readable: std::collections::HashSet<Uuid> = [open].into_iter().collect();
+            let key = || Some("k".to_string());
+            assert_eq!(readable_repo_key(Some(open), key(), &readable), "k");
+            assert_eq!(
+                readable_repo_key(Some(Uuid::new_v4()), key(), &readable),
+                ""
+            );
+            assert_eq!(readable_repo_key(None, None, &readable), "");
+            assert_eq!(readable_repo_key(Some(open), None, &readable), "");
         }
     }
 }
