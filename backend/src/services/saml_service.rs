@@ -662,8 +662,10 @@ impl SamlService {
             sp_entity_id = self.config.sp_entity_id,
         );
 
-        // Base64 encode and URL encode the request
-        let encoded_request = base64_encode(authn_request.as_bytes());
+        // HTTP-Redirect binding (SAML 2.0 Bindings §3.4.4.1): DEFLATE, then
+        // base64, then URL-encode. IdPs that enforce the DEFLATE step, such as
+        // Entra ID (AADSTS750055), reject the bare XML (#4475).
+        let encoded_request = base64_encode(&deflate_raw(authn_request.as_bytes())?);
         let url_encoded_request = urlencoding::encode(&encoded_request);
         let url_encoded_relay_state = urlencoding::encode(&relay_state);
 
@@ -1282,6 +1284,19 @@ impl SamlService {
     pub fn acs_url(&self) -> &str {
         &self.config.acs_url
     }
+}
+
+/// Raw DEFLATE (RFC 1951, no zlib or gzip header), the encoding the SAML
+/// HTTP-Redirect binding requires for `SAMLRequest`.
+fn deflate_raw(input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let to_error =
+        |e: std::io::Error| AppError::Internal(format!("Failed to DEFLATE SAML message: {e}"));
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(input).map_err(to_error)?;
+    encoder.finish().map_err(to_error)
 }
 
 /// Base64 encode bytes
@@ -2701,6 +2716,54 @@ mod tests {
 
         // Should contain RelayState parameter
         assert!(request.redirect_url.contains("RelayState="));
+    }
+
+    #[tokio::test]
+    async fn test_create_authn_request_is_deflate_encoded() {
+        // #4475: the HTTP-Redirect binding requires SAMLRequest to be raw
+        // DEFLATE before base64; Entra ID rejects bare XML (AADSTS750055).
+        use std::io::Read;
+
+        let service = make_test_saml_service();
+        let request = service.create_authn_request().unwrap();
+        let url = url::Url::parse(&request.redirect_url).unwrap();
+        let saml_request = url
+            .query_pairs()
+            .find(|(key, _)| key == "SAMLRequest")
+            .map(|(_, value)| value.into_owned())
+            .expect("SAMLRequest parameter");
+
+        let compressed = base64_decode(&saml_request).unwrap();
+        assert!(
+            !compressed.starts_with(b"<"),
+            "SAMLRequest must not be bare XML"
+        );
+        let mut xml = String::new();
+        flate2::read::DeflateDecoder::new(compressed.as_slice())
+            .read_to_string(&mut xml)
+            .expect("SAMLRequest must inflate as raw DEFLATE");
+
+        assert!(xml.contains("<samlp:AuthnRequest"));
+        assert!(xml.contains(&format!(r#"ID="{}""#, request.request_id)));
+        assert!(xml.contains(&format!(
+            r#"AssertionConsumerServiceURL="{}""#,
+            service.acs_url()
+        )));
+    }
+
+    #[test]
+    fn test_deflate_raw_round_trips() {
+        use std::io::Read;
+
+        let input = b"<samlp:AuthnRequest ID=\"_id1\"/>".repeat(20);
+        let compressed = deflate_raw(&input).unwrap();
+        assert!(compressed.len() < input.len());
+
+        let mut inflated = Vec::new();
+        flate2::read::DeflateDecoder::new(compressed.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert_eq!(inflated, input);
     }
 
     // =======================================================================
