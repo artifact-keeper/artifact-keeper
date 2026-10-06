@@ -884,9 +884,10 @@ fn assign_role_deprecation_headers() -> [(HeaderName, HeaderValue); 2] {
 /// Assign role to user (**deprecated**, #3522).
 ///
 /// **Deprecated: use `POST /api/v1/permissions` instead.** The endpoint keeps
-/// working and keeps writing `user_roles`, but every response now carries a
-/// `Deprecation` header and a `Link: </api/v1/permissions>;
-/// rel="successor-version"` header, and the operation is flagged
+/// working and keeps writing `user_roles`, but every successful (200)
+/// response now carries a `Deprecation` header and a `Link:
+/// </api/v1/permissions>; rel="successor-version"` header (error responses,
+/// such as 401/403/422, do not), and the operation is flagged
 /// `deprecated` in the OpenAPI spec so generated SDKs warn on use. #3522
 /// chose this (option 1) over scoping the endpoint to a repository or making
 /// `user_roles` a live global grant.

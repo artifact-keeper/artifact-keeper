@@ -35,7 +35,7 @@ env:
 
 jobs:
   sync-spec:
-    name: Export & Sync OpenAPI Spec
+    name: Export & Lint OpenAPI Spec
     # Pinned rather than `ubuntu-latest`: the memory budget below is sized for
     # this image's 16 GB, and a silent image move should not re-size it.
     runs-on: ubuntu-24.04
@@ -44,6 +44,10 @@ jobs:
     # one-shard test harness. 15 was the budget for the old build, which the
     # runner killed at ~10 min anyway (#4078).
     timeout-minutes: 45
+    # No secrets in this job (#4078): it builds the backend and runs the
+    # third-party lint tools. The deploy key is confined to `push-spec`.
+    permissions:
+      contents: read
     # The export test lives in the `router` test shard (backend/src/api/
     # openapi.rs's test module is gated `#[cfg(ak_test_shard = "router")]`,
     # scripts/ci/test-shards.py). Building ONLY that shard is what makes this
@@ -120,11 +124,16 @@ jobs:
       # lint is refused there -- found only after the release, by hand
       # (#4078). Run the same three commands here, against the API repo's own
       # rule files (.spectral.yaml, redocly.yaml read from its `main`), so a
-      # bad spec fails THIS run before anything is pushed, dry run included.
-      # Keep the commands in step with that workflow: Spectral at
+      # bad spec fails THIS job and `push-spec` never starts, dry run
+      # included. Keep the commands in step with that workflow: Spectral at
       # `--fail-severity error`, Redocly lint advisory (it is
-      # `continue-on-error` there), and the bundle must succeed. The tools are
-      # unpinned there too; pinning them here would let the two drift apart.
+      # `continue-on-error` there), and the bundle must succeed.
+      #
+      # This job holds no secret: the npm tools are third-party code, and the
+      # deploy key lives only in `push-spec`, on a different runner. The
+      # tools are still pinned to exact versions and installed with
+      # `--ignore-scripts` into a prefix that is not on PATH. Bump the pins
+      # when the API repo's (unpinned) lint starts disagreeing with them.
       - name: Check out the API repo's lint rules
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -137,28 +146,36 @@ jobs:
             redocly.yaml
           sparse-checkout-cone-mode: false
 
-      - uses: actions/setup-node@v7
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '20'
 
       - name: Lint the spec as artifact-keeper-api's required check does
         working-directory: .api-lint
+        env:
+          SPECTRAL_CLI_VERSION: "6.17.0"
+          REDOCLY_CLI_VERSION: "2.59.0"
         run: |
-          npm install -g @stoplight/spectral-cli @redocly/cli
+          tools="$RUNNER_TEMP/openapi-lint-tools"
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$tools" \
+            "@stoplight/spectral-cli@${SPECTRAL_CLI_VERSION}" "@redocly/cli@${REDOCLY_CLI_VERSION}"
+          spectral="$tools/node_modules/.bin/spectral"
+          redocly="$tools/node_modules/.bin/redocly"
           cp ../openapi.yaml openapi.yaml
 
           # Spectral lint (blocking in the API repo)
-          spectral lint openapi.yaml --fail-severity error
+          "$spectral" lint openapi.yaml --fail-severity error
 
           # Redocly lint (continue-on-error in the API repo): report, never fail
-          if ! redocly lint openapi.yaml; then
+          if ! "$redocly" lint openapi.yaml; then
             echo "::warning title=Redocly lint::redocly lint reported problems. They are advisory in artifact-keeper-api's Lint & Validate OpenAPI check too, so this does not block the sync."
           fi
 
           # Verify bundleable (blocking in the API repo)
-          redocly bundle openapi.yaml -o "$RUNNER_TEMP/bundled.yaml"
+          "$redocly" bundle openapi.yaml -o "$RUNNER_TEMP/bundled.yaml"
 
-          echo "- **API repo lint:** passed (spectral, redocly bundle)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **API repo lint:** passed (spectral ${SPECTRAL_CLI_VERSION}, redocly ${REDOCLY_CLI_VERSION} bundle)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload spec artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -167,6 +184,33 @@ jobs:
           path: |
             openapi.json
             openapi.yaml
+
+  # The only job that sees API_REPO_DEPLOY_KEY. It runs no third-party code
+  # beyond downloading the spec `sync-spec` exported and linted, and it starts
+  # only when that job is green, so a spec the API repo's required lint would
+  # refuse is never pushed. It runs on dry runs too (so the hand-off is
+  # exercised); only the push step itself is skipped there.
+  push-spec:
+    name: Push Spec to API Repo
+    needs: sync-spec
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download the linted spec
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: openapi-spec
+
+      - name: Check the spec arrived
+        run: |
+          for f in openapi.json openapi.yaml; do
+            if [ ! -s "$f" ]; then
+              echo "::error title=Spec artifact incomplete::$f is missing or empty in the openapi-spec artifact."
+              exit 1
+            fi
+          done
 
       # `inputs.dry_run != true` rather than `!inputs.dry_run`: this step is the
       # whole point of the run, and the negation form skips it for ANY truthy
