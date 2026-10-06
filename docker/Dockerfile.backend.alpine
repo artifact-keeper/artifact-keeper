@@ -212,9 +212,11 @@ FROM alpine:${ALPINE_VERSION} AS runtime
 # APK security errata, then install the runtime deps (no libssl needed -
 # OpenSSL is vendored/static). `apk upgrade --no-cache` rebuilds against
 # current errata on every image build; the targeted `add` keeps the install
-# set explicit.
+# set explicit. squashfs-tools provides `unsquashfs`, which the Incus scanner
+# runs to extract SquashFS rootfs images (#4469).
 RUN apk upgrade --no-cache && \
-    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs xz curl
+    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs xz curl \
+        squashfs-tools
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 
