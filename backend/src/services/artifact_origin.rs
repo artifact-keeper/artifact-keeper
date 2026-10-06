@@ -97,12 +97,10 @@ impl ArtifactOrigin {
         serde_json::from_value(value.clone()).ok()
     }
 
-    /// [`Self::from_json`] for an API response (#4452). The stored document
-    /// is derived from the repository's `upstream_url`, so an upstream URL
-    /// with embedded `user:password@` credentials is recorded verbatim; strip
-    /// the userinfo before it is returned. Policy evaluation keeps reading
-    /// the stored value through `from_json`, so allowlist matching is
-    /// unchanged.
+    /// [`Self::from_json`] for an API response (#4452). Origins are recorded
+    /// without userinfo since migration 271 (#4463), which also scrubbed the
+    /// existing rows; this strip stays as defence in depth for any document
+    /// written by a path that bypassed the normalizer.
     pub fn for_response(value: &serde_json::Value) -> Option<Self> {
         let mut origin = Self::from_json(value)?;
         if let Some(url) = origin.upstream_url.as_deref() {
@@ -113,36 +111,42 @@ impl ArtifactOrigin {
 }
 
 /// Normalize an upstream URL for origin comparison — the Rust mirror of
-/// the SQL `ak_normalize_upstream_url` the fill trigger and backfill use:
-/// lowercase the scheme://authority (case-insensitive per RFC 3986),
-/// strip trailing slashes, leave the path case-intact. The migration
-/// worker normalizes source base URLs through here so a URL recorded in
-/// Rust compares equal to one recorded by the trigger.
+/// the SQL `ak_normalize_upstream_url` the fill trigger and backfills use
+/// (migration 271): trim ASCII whitespace, drop any `userinfo@` from the
+/// authority (#4463: a Remote configured as `https://user:pass@host/...`
+/// must not leave its credentials in every proxied artifact's origin), then
+/// lowercase the scheme://authority (case-insensitive per RFC 3986, ASCII
+/// only), strip trailing slashes, and leave the path case-intact. The
+/// migration worker normalizes source base URLs through here so a URL
+/// recorded in Rust compares equal to one recorded by the trigger; a
+/// DB-backed test pins the two implementations to each other.
 pub fn normalize_upstream_url(url: &str) -> String {
-    let trimmed = url.trim();
-    let after_scheme = trimmed
-        .find("://")
-        .filter(|&i| {
-            trimmed[..i]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
-                && !trimmed[..i].is_empty()
-        })
-        .map(|i| i + 3);
-    let prefix_len = after_scheme.and_then(|start| {
-        trimmed[start..]
-            .find('/')
-            .map(|rel| start + rel)
-            .or(Some(trimmed.len()))
-    });
-    match prefix_len {
-        Some(end) => {
-            let prefix = trimmed[..end].to_ascii_lowercase();
-            let rest = &trimmed[end..];
-            format!("{prefix}{rest}").trim_end_matches('/').to_string()
-        }
-        None => trimmed.trim_end_matches('/').to_string(),
+    let trimmed = url.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (stripped, _) = crate::services::proxy_service::strip_url_userinfo_textual(trimmed);
+    lowercase_scheme_authority(&stripped)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Lowercase `scheme://authority` (the authority running to the first `/`)
+/// when `url` starts with a scheme followed by `://`; anything else is
+/// returned unchanged. The SQL side matches
+/// `^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*`.
+fn lowercase_scheme_authority(url: &str) -> String {
+    let Some(sep) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = &url[..sep];
+    let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    if !scheme_ok {
+        return url.to_string();
     }
+    let start = sep + 3;
+    let end = url[start..].find('/').map_or(url.len(), |rel| start + rel);
+    format!("{}{}", url[..end].to_ascii_lowercase(), &url[end..])
 }
 
 /// Read the `origin` document recorded on an existing artifact so a copy
@@ -521,8 +525,184 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // #4153: migration 270 re-stamps migrated rows
+    // #4463: userinfo never reaches a recorded origin
     // ------------------------------------------------------------------
+
+    /// Credentialed spellings from #4462's `strip_url_userinfo` table plus
+    /// the normalizer's own cases, with the expected normal form. Built at
+    /// runtime so secret scanners do not flag a fixture.
+    fn normalizer_cases() -> Vec<(String, String)> {
+        let cred = "alice:s3cret";
+        [
+            (
+                "https://{c}@registry.example.com/simple?x=1#f",
+                "https://registry.example.com/simple?x=1#f",
+            ),
+            ("https://token@Host:8443", "https://host:8443"),
+            ("https://u:p@ss@host/a", "https://host/a"),
+            ("//{c}@host/path", "//host/path"),
+            ("{c}@host/path", "host/path"),
+            ("https://{c}@[::1]:8443/x/", "https://[::1]:8443/x"),
+            ("https://user%40corp:p%40ss@host/", "https://host"),
+            ("https://:pw@host/", "https://host"),
+            ("https:{c}@host/x?q=http://z", "https:host/x?q=http://z"),
+            ("https:/{c}@host", "https:/host"),
+            ("https:\\\\{c}@host", "https:\\\\host"),
+            ("https://{c}@HOST\\x@y/z", "https://host\\x@y/z"),
+            ("https://host\\@evil/", "https://host\\@evil"),
+            ("https://host/a@b?c=d@e", "https://host/a@b?c=d@e"),
+            ("https://host?q=a@b", "https://host?q=a@b"),
+            ("https://@host/", "https://host"),
+            (
+                "  HTTPS://{c}@Repo1.Example.ORG/Maven2/  ",
+                "https://repo1.example.org/Maven2",
+            ),
+            (
+                "ftp://{c}@Files.Example.TEST/pub",
+                "ftp://files.example.test/pub",
+            ),
+            ("git+ssh://{c}@Example.TEST/r", "git+ssh://example.test/r"),
+            ("https://registry.npmjs.org", "https://registry.npmjs.org"),
+            ("not a url", "not a url"),
+            ("", ""),
+        ]
+        .into_iter()
+        .map(|(raw, want)| (raw.replace("{c}", cred), want.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn test_normalize_strips_userinfo_4463() {
+        for (raw, want) in normalizer_cases() {
+            let got = normalize_upstream_url(&raw);
+            assert_eq!(got, want, "{raw}");
+            assert!(
+                !got.contains("s3cret"),
+                "credential survived: {raw} -> {got}"
+            );
+            assert_eq!(normalize_upstream_url(&got), got, "not idempotent: {raw}");
+        }
+    }
+
+    #[test]
+    fn test_migration_origin_never_records_source_userinfo_4463() {
+        let src = format!("https://{}@Arti.Example.TEST/artifactory/", "alice:s3cret");
+        let origin = ArtifactOrigin::migration("dest", Some(&src));
+        assert_eq!(
+            origin.upstream_url.as_deref(),
+            Some("https://arti.example.test/artifactory")
+        );
+    }
+
+    /// Deterministic pseudo-random URLs assembled from the pieces the two
+    /// normalizers branch on (scheme spellings, separators, userinfo,
+    /// IPv6/port hosts, `@` after the authority, whitespace, case).
+    fn generated_urls(n: usize) -> Vec<String> {
+        const SCHEMES: [&str; 8] = ["https", "HTTP", "ftp", "git+ssh", "s3", "", "1x", "ws"];
+        const SEPS: [&str; 6] = ["://", ":", ":/", ":\\\\", "//", ":///"];
+        const USERS: [&str; 7] = ["", "u@", "u:p@", "a%40b:p%40w@", ":pw@", "@", "x:y@z@"];
+        const HOSTS: [&str; 6] = [
+            "Host.Example.TEST",
+            "[::1]:8443",
+            "h:80",
+            "HOST\\x@y",
+            "",
+            "Ü.example",
+        ];
+        const TAILS: [&str; 8] = [
+            "",
+            "/",
+            "/A/b/",
+            "?q=a@b",
+            "#f@g",
+            "/p@q/",
+            "///",
+            "/x?y=http://z",
+        ];
+        const PADS: [&str; 3] = ["", " ", "\t"];
+        let mut state: u64 = 0x4463_4153;
+        let mut next = |m: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % m
+        };
+        (0..n)
+            .map(|_| {
+                let pad = PADS[next(PADS.len())];
+                format!(
+                    "{pad}{}{}{}{}{}{pad}",
+                    SCHEMES[next(SCHEMES.len())],
+                    SEPS[next(SEPS.len())],
+                    USERS[next(USERS.len())],
+                    HOSTS[next(HOSTS.len())],
+                    TAILS[next(TAILS.len())],
+                )
+            })
+            .collect()
+    }
+
+    /// #4463: the Rust normalizer and the SQL one the fill trigger runs
+    /// (migration 271) must agree on every input, or a policy written
+    /// against a Rust-normalized URL silently stops matching stored
+    /// origins. Same for the userinfo strip on its own.
+    #[tokio::test]
+    async fn test_rust_and_sql_normalizers_agree_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut inputs: Vec<String> = normalizer_cases().into_iter().map(|(raw, _)| raw).collect();
+        inputs.extend(generated_urls(2000));
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT u, ak_normalize_upstream_url(u), ak_strip_url_userinfo(u) \
+               FROM unnest($1::text[]) WITH ORDINALITY AS t(u, n) ORDER BY n",
+        )
+        .bind(&inputs)
+        .fetch_all(&pool)
+        .await
+        .expect("evaluate the SQL normalizer");
+        assert_eq!(rows.len(), inputs.len());
+        for (raw, sql_norm, sql_strip) in rows {
+            assert_eq!(sql_norm, normalize_upstream_url(&raw), "normalize: {raw:?}");
+            assert_eq!(
+                sql_strip,
+                crate::services::proxy_service::strip_url_userinfo_textual(&raw).0,
+                "strip: {raw:?}"
+            );
+        }
+    }
+
+    /// #4463: a Remote configured with `user:password@` in its URL stamps
+    /// origins without the credentials, so a credential-free allowlist
+    /// entry matches what is stored.
+    #[tokio::test]
+    async fn test_credentialed_remote_records_origin_without_userinfo_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let upstream = format!("HTTPS://{}@Upstream.Example.TEST/base/", "alice:s3cret");
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(&upstream)
+            .execute(&fx.pool)
+            .await
+            .expect("set credentialed upstream");
+
+        let (_id, origin) = insert_and_read_origin(&fx.pool, fx.repo_id, "e/1/e.bin").await;
+        let doc = origin.expect("origin recorded");
+        assert_eq!(
+            doc["upstream_url"], "https://upstream.example.test/base",
+            "{doc}"
+        );
+        assert!(
+            !doc.to_string().contains("s3cret"),
+            "credential at rest: {doc}"
+        );
+        fx.teardown().await;
+    }
 
     async fn rerun_migration(pool: &sqlx::PgPool, sql: &'static str) {
         let mut conn = pool.acquire().await.expect("acquire migration connection");
@@ -534,6 +714,8 @@ mod tests {
 
     const MIGRATION_270: &str =
         include_str!("../../migrations/270_artifacts_origin_migration_restamp.sql");
+    const MIGRATION_271: &str =
+        include_str!("../../migrations/271_origin_upstream_strip_userinfo.sql");
 
     /// Insert an artifact row with an explicit origin document (the fill
     /// trigger keeps an explicit value), created `age_hours` ago.
@@ -724,6 +906,84 @@ mod tests {
             .execute(pool)
             .await
             .expect("delete connection");
+        fx.teardown().await;
+    }
+
+    /// #4463: migration 271 strips userinfo from origins recorded before it
+    /// (and from the proxy cache catalogue), touching only the
+    /// `upstream_url` facet, and a second run is a no-op.
+    #[tokio::test]
+    async fn test_migration_271_strips_recorded_userinfo_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let pool = &fx.pool;
+        let credentialed = format!("https://{}@upstream.example.test/base", "alice:s3cret");
+        let doc = serde_json::json!({
+            "v": 1, "kind": "proxy", "repository_key": fx.repo_key, "upstream_url": credentialed,
+        });
+        let id = insert_with_origin(
+            pool,
+            fx.repo_id,
+            "f/1/f.bin",
+            &format!("{:064x}", 7),
+            doc,
+            0,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, upstream_url) VALUES ($1, 'f/1/f.bin', 'k', 'm', 1, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{credentialed}/f/1/f.bin"))
+        .execute(pool)
+        .await
+        .expect("insert proxy cache row");
+
+        for _ in 0..2 {
+            rerun_migration(pool, MIGRATION_271).await;
+            assert_eq!(
+                kind_of(pool, id).await,
+                serde_json::json!({
+                    "v": 1, "kind": "proxy", "repository_key": fx.repo_key,
+                    "upstream_url": "https://upstream.example.test/base",
+                })
+            );
+            let cached: String = sqlx::query_scalar(
+                "SELECT upstream_url FROM proxy_cache_artifacts WHERE repository_id = $1",
+            )
+            .bind(fx.repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read cache row");
+            assert_eq!(cached, "https://upstream.example.test/base/f/1/f.bin");
+        }
+
+        // The upstream-only GUC window does not admit a kind change.
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL ak.origin_rewrite = 'on'")
+            .execute(&mut *tx)
+            .await
+            .expect("set guc");
+        let hostile = sqlx::query(
+            "UPDATE artifacts SET origin = origin || '{\"kind\":\"hosted\"}' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
+        assert!(
+            hostile.is_err(),
+            "proxy -> hosted is not a sanctioned rewrite"
+        );
+        drop(tx);
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(pool)
+            .await
+            .expect("delete cache rows");
         fx.teardown().await;
     }
 }

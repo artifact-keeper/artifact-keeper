@@ -3756,6 +3756,76 @@ mod tests {
         ));
     }
 
+    /// #4463: before migration 271 the stored origin of an artifact proxied
+    /// through a credentialed Remote kept `user:password@`, so a
+    /// credential-free `allowed_upstreams` entry never admitted it and a
+    /// `denied_upstreams` entry never denied it. Both now match.
+    #[tokio::test]
+    async fn test_origin_upstream_lists_match_credentialed_remote_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let upstream = format!("https://{}@Upstream.Example.TEST/base/", "alice:s3cret");
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(&upstream)
+            .execute(&fx.pool)
+            .await
+            .expect("set credentialed upstream");
+        let artifact: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, 'o/1/o.bin', 'o', 1, $2, \
+             'application/octet-stream', 'o/1/o.bin') RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{:064x}", 4463))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert proxied artifact");
+        let svc = PolicyService::new(fx.pool.clone());
+
+        for (allow, deny) in [(true, false), (false, true)] {
+            let listed = vec!["https://upstream.example.test/base".to_string()];
+            svc.create_policy(
+                &format!("4463-{allow}-{}", fx.repo_id),
+                Some(fx.repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    origin: OriginPolicyPredicates {
+                        allowed_upstreams: if allow { listed.clone() } else { vec![] },
+                        denied_upstreams: if deny { listed } else { vec![] },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create origin policy");
+            let result = svc
+                .evaluate_artifact(artifact, fx.repo_id)
+                .await
+                .expect("evaluate");
+            let fired: Vec<_> = result
+                .violations
+                .iter()
+                .filter(|v| v.contains("[origin.upstream]"))
+                .collect();
+            assert_eq!(
+                fired.len(),
+                usize::from(deny),
+                "allow={allow} deny={deny}: {result:?}"
+            );
+            delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        }
+        fx.teardown().await;
+    }
+
     /// DB-backed: an origin policy is expressible through the service API and
     /// enforced by `evaluate_artifact` against the origin the ingest trigger
     /// stamped — denied upstream blocks, matching allowlist passes, and a

@@ -721,8 +721,10 @@ pub(crate) fn strip_url_userinfo(url: &str) -> (String, bool) {
     }
 }
 
-/// The string-level half of [`strip_url_userinfo`].
-fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
+/// The string-level half of [`strip_url_userinfo`]. Also the userinfo step
+/// of [`crate::services::artifact_origin::normalize_upstream_url`], whose SQL
+/// twin is `ak_strip_url_userinfo` (migration 271): keep the two in lockstep.
+pub(crate) fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
     let scheme_len = url.find(':').filter(|&i| {
         let scheme = &url[..i];
         scheme.starts_with(|c: char| c.is_ascii_alphabetic())
