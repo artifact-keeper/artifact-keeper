@@ -143,10 +143,11 @@ pub struct CompleteResponse {
     responses(
         (status = 200, description = "`skip_if_present` was set and the artifact is already stored; no session was opened", body = super::artifact_presence::AlreadyPresentResponse),
         (status = 201, description = "Upload session created", body = CreateSessionResponse),
-        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Invalid request, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -533,8 +534,9 @@ async fn get_session_status(
     ),
     responses(
         (status = 200, description = "Upload finalized, artifact created", body = CompleteResponse),
-        (status = 400, description = "Incomplete chunks or invalid state", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
+        (status = 405, description = "The session's repository is remote (proxy); direct uploads are not accepted and the session is failed", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Conflict, for one of two reasons that the status code alone does not distinguish; read the response body to tell them apart. \
             (1) Checksum mismatch: the assembled file's SHA-256 differs from the checksum declared when the session was created. \
             The body is `{\"error\": \"checksum mismatch: expected <sha256>, got <sha256>\"}`; the session is failed, so re-upload in a new session. \
@@ -5324,9 +5326,17 @@ mod tests {
     /// repositories are covered by `create_session_returns_201_for_existing_repo`.
     #[tokio::test]
     async fn create_session_rejects_remote_and_virtual_repositories() {
-        for (repo_type, want) in [
-            ("remote", StatusCode::METHOD_NOT_ALLOWED),
-            ("virtual", StatusCode::BAD_REQUEST),
+        for (repo_type, want, text) in [
+            (
+                "remote",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Cannot publish to a remote (proxy) repository",
+            ),
+            (
+                "virtual",
+                StatusCode::BAD_REQUEST,
+                "Cannot publish to a virtual repository",
+            ),
         ] {
             let Some(f) = tdh::Fixture::setup(repo_type, "debian").await else {
                 return;
@@ -5352,6 +5362,11 @@ mod tests {
                 status,
                 want,
                 "{repo_type}: body {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                String::from_utf8_lossy(&body).contains(text),
+                "{repo_type}: the refusal must be the hosted-only gate's, got {}",
                 String::from_utf8_lossy(&body)
             );
             assert_eq!(sessions, 0, "{repo_type}: no session may be opened");
@@ -5383,6 +5398,7 @@ mod tests {
                 .fetch_one(&f.pool)
                 .await
                 .expect("count artifacts");
+        let staged_exists = staged.exists().await;
         cleanup_staged_session(&f, session_id, &staged).await;
         f.teardown().await;
 
@@ -5392,8 +5408,18 @@ mod tests {
             "body: {}",
             String::from_utf8_lossy(&body)
         );
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("Cannot publish to a remote (proxy) repository"),
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
         assert_eq!(session_status, "failed");
         assert_eq!(error.as_deref(), Some(NOT_HOSTED_SESSION_ERROR));
+        assert!(
+            !staged_exists,
+            "the failed session's staged chunk must be reclaimed"
+        );
         assert_eq!(
             artifacts, 0,
             "a refused completion must not write an artifact"

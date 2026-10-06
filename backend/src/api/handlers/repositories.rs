@@ -8731,8 +8731,11 @@ pub async fn list_artifact_versions(
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
         (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
+        (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -19161,8 +19164,20 @@ mod tests {
                     x\r\n\
                     --XB--\r\n";
         for (repo_type, want) in [
-            ("remote", Some(StatusCode::METHOD_NOT_ALLOWED)),
-            ("virtual", Some(StatusCode::BAD_REQUEST)),
+            (
+                "remote",
+                Some((
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Cannot publish to a remote (proxy) repository",
+                )),
+            ),
+            (
+                "virtual",
+                Some((
+                    StatusCode::BAD_REQUEST,
+                    "Cannot publish to a virtual repository",
+                )),
+            ),
             ("local", None),
         ] {
             let (repo_id, key, dir) = tdh::create_repo(&pool, repo_type, "generic").await;
@@ -19199,8 +19214,21 @@ mod tests {
                     .unwrap_or(-1);
             tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
             let _ = std::fs::remove_dir_all(&dir);
-            let statuses = [put, multipart, with_path].map(|r| r.err().map(|e| e.status()));
-            assert_eq!(statuses, [want; 3], "{repo_type}");
+            let mut refusals = Vec::new();
+            for result in [put, multipart, with_path] {
+                refusals.push(match result {
+                    Ok(_) => None,
+                    Err(resp) => {
+                        let status = resp.status();
+                        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                            .await
+                            .expect("refusal body");
+                        Some((status, String::from_utf8_lossy(&body).into_owned()))
+                    }
+                });
+            }
+            let want_owned = want.map(|(status, text)| (status, text.to_string()));
+            assert_eq!(refusals, vec![want_owned; 3], "{repo_type}");
             let expected_rows = if want.is_some() { 0 } else { 3 };
             assert_eq!(stored, expected_rows, "{repo_type}");
         }

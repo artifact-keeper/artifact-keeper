@@ -3784,29 +3784,43 @@ mod tests {
         assert_eq!(all.len(), WebhookEvent::ALL.len());
         assert!(validate_webhook_events(&all).is_ok());
         assert!(validate_webhook_events(&["age_gate_reopened".to_string()]).is_ok());
-        // Every accepted name is one the producer maps an EventBus event to,
-        // so a subscription to it can actually fire.
-        for name in &all {
+    }
+
+    /// #4419: the subscribable set is EXACTLY the set the producer can
+    /// deliver, in both directions: every accepted name is emitted by some
+    /// bus event (no dead subscriptions), and every emitted name is
+    /// accepted (no event a new `BUS_TO_WEBHOOK_EVENT` entry makes
+    /// impossible to subscribe to).
+    #[test]
+    fn webhook_event_set_matches_the_producer_table() {
+        use crate::services::webhook_producer::{map_event_type, BUS_TO_WEBHOOK_EVENT};
+        use std::collections::BTreeSet;
+        let accepted: BTreeSet<String> = WebhookEvent::accepted_names().into_iter().collect();
+        let emitted: BTreeSet<String> = BUS_TO_WEBHOOK_EVENT
+            .iter()
+            .map(|(bus, webhook)| {
+                assert_eq!(map_event_type(bus), Some(*webhook), "{bus}");
+                webhook.to_string()
+            })
+            .collect();
+        assert_eq!(accepted, emitted);
+    }
+
+    /// The `CreateWebhookRequest.events` schema doc is static text (utoipa
+    /// reads literal doc comments), so pin it to `WebhookEvent::ALL`: it
+    /// must name every accepted event.
+    #[test]
+    fn create_webhook_events_schema_doc_lists_every_accepted_name() {
+        let spec = serde_json::to_value(WebhooksApiDoc::openapi()).unwrap();
+        let doc = spec["components"]["schemas"]["CreateWebhookRequest"]["properties"]["events"]
+            ["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        for name in WebhookEvent::accepted_names() {
             assert!(
-                [
-                    "artifact.uploaded",
-                    "artifact.deleted",
-                    "repository.created",
-                    "repository.deleted",
-                    "user.created",
-                    "user.deleted",
-                    "build.started",
-                    "build.completed",
-                    "build.failed",
-                    "age_gate.queued",
-                    "age_gate.approved",
-                    "age_gate.rejected",
-                    "age_gate.reopened"
-                ]
-                .iter()
-                .any(|bus| crate::services::webhook_producer::map_event_type(bus)
-                    == Some(name.as_str())),
-                "{name} is accepted but never emitted"
+                doc.contains(&format!("`{name}`")),
+                "{name} missing from: {doc}"
             );
         }
     }

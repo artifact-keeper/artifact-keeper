@@ -25,44 +25,56 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::event_bus::{DomainEvent, EventBus};
 
-/// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
-/// to the underscore-form string used in the `webhooks.events` text array
-/// (e.g. "artifact_uploaded", "repository_deleted").
+/// Every EventBus event type that produces a webhook delivery, paired with
+/// the underscore-form string used in the `webhooks.events` text array
+/// (e.g. `"artifact.uploaded"` -> `"artifact_uploaded"`).
 ///
 /// The webhook system uses snake_case underscore identifiers to match
 /// `WebhookEvent::Display` in `crate::api::handlers::webhooks`. The EventBus
-/// uses dotted, lower-case identifiers. This function bridges the two.
+/// uses dotted, lower-case identifiers. This table bridges the two and is
+/// the single source of truth for which webhook events can fire: webhook
+/// create validates subscriptions against `WebhookEvent::ALL`, and a test
+/// there pins that set to exactly the right-hand column here (#4419).
+pub const BUS_TO_WEBHOOK_EVENT: &[(&str, &str)] = &[
+    // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
+    // the artifact_uploaded webhook. Same alias as email_dispatcher.
+    //
+    // #3411 settled which of the two is the event: `artifact.uploaded` is
+    // what `ArtifactService::finalize_upload` publishes, and
+    // `artifact.created` stays an accepted ALIAS on this side only — it is
+    // emitted by nothing, deliberately, because both names collapse onto
+    // one subscription and emitting both would double-deliver.
+    ("artifact.created", "artifact_uploaded"),
+    ("artifact.uploaded", "artifact_uploaded"),
+    ("artifact.deleted", "artifact_deleted"),
+    ("repository.created", "repository_created"),
+    ("repository.deleted", "repository_deleted"),
+    ("user.created", "user_created"),
+    ("user.deleted", "user_deleted"),
+    ("build.started", "build_started"),
+    ("build.completed", "build_completed"),
+    ("build.failed", "build_failed"),
+    ("age_gate.queued", "age_gate_queued"),
+    ("age_gate.approved", "age_gate_approved"),
+    ("age_gate.rejected", "age_gate_rejected"),
+    // A decided review voided back to pending (#2968): without this entry
+    // subscribers that saw the approval/rejection never learn it was
+    // reopened — the gap #2264's review-identity work rides along with.
+    ("age_gate.reopened", "age_gate_reopened"),
+];
+
+/// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
+/// to the underscore-form string used in the `webhooks.events` text array
+/// (e.g. "artifact_uploaded", "repository_deleted"), per
+/// [`BUS_TO_WEBHOOK_EVENT`].
 ///
 /// Returns `None` for events that do not have a corresponding `WebhookEvent`
 /// variant. Such events are silently skipped (no rows are enqueued).
 pub fn map_event_type(event_type: &str) -> Option<&'static str> {
-    match event_type {
-        // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
-        // the artifact_uploaded webhook. Same alias as email_dispatcher.
-        //
-        // #3411 settled which of the two is the event: `artifact.uploaded` is
-        // what `ArtifactService::finalize_upload` publishes, and
-        // `artifact.created` stays an accepted ALIAS on this side only — it is
-        // emitted by nothing, deliberately, because both names collapse onto
-        // one subscription and emitting both would double-deliver.
-        "artifact.created" | "artifact.uploaded" => Some("artifact_uploaded"),
-        "artifact.deleted" => Some("artifact_deleted"),
-        "repository.created" => Some("repository_created"),
-        "repository.deleted" => Some("repository_deleted"),
-        "user.created" => Some("user_created"),
-        "user.deleted" => Some("user_deleted"),
-        "build.started" => Some("build_started"),
-        "build.completed" => Some("build_completed"),
-        "build.failed" => Some("build_failed"),
-        "age_gate.queued" => Some("age_gate_queued"),
-        "age_gate.approved" => Some("age_gate_approved"),
-        "age_gate.rejected" => Some("age_gate_rejected"),
-        // A decided review voided back to pending (#2968): without this arm
-        // subscribers that saw the approval/rejection never learn it was
-        // reopened — the gap #2264's review-identity work rides along with.
-        "age_gate.reopened" => Some("age_gate_reopened"),
-        _ => None,
-    }
+    BUS_TO_WEBHOOK_EVENT
+        .iter()
+        .find(|(bus, _)| *bus == event_type)
+        .map(|(_, webhook)| *webhook)
 }
 
 /// Build the v1 JSON payload that gets stored in `webhook_deliveries.payload`.
