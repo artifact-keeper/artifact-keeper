@@ -199,7 +199,7 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         let found = Self::lock_repositories(&mut tx, &ids).await?;
         Self::require_repositories(&ids, &found)?;
-        validate_version_pattern_in_postgres(&mut tx, &req.config).await?;
+        validate_regexes_in_postgres(&mut tx, &req.policy_type, &req.config).await?;
         Self::reject_inert_remote_assignments(&mut tx, &req.policy_type, &req.config, &ids).await?;
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO lifecycle_policies \
@@ -272,7 +272,7 @@ impl LifecycleService {
         // newly added repositories are, so a policy assigned before #3734 can
         // still be renamed or disabled.
         if config_changed {
-            validate_version_pattern_in_postgres(&mut tx, &config).await?;
+            validate_regexes_in_postgres(&mut tx, &existing.policy_type, &config).await?;
         }
         let checked = inert_check_scope(config_changed, &ids, &existing.repository_ids);
         Self::reject_inert_remote_assignments(&mut tx, &existing.policy_type, &config, &checked)

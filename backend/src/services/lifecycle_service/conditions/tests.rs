@@ -148,7 +148,6 @@ async fn match_version_pattern_validation_2024() {
             .unwrap_or_else(|e| panic!("{policy_type} must accept match.version_pattern: {e}"));
     }
     for (bad, needle) in [
-        (json!("("), "Invalid regex in match.version_pattern"),
         (
             json!(""),
             "match.version_pattern must be a non-empty string",
@@ -589,11 +588,11 @@ async fn version_pattern_rejects_rust_only_word_boundaries_2024() {
         )
         .expect("escaped backslash");
     assert!(matches!(
-        postgres_regex_error(Some("2201B"), "bad"),
+        postgres_regex_error("match.version_pattern", Some("2201B"), "bad"),
         AppError::Validation(m) if m.contains("PostgreSQL regular expression: bad")
     ));
     assert!(matches!(
-        postgres_regex_error(Some("57014"), "cancelled"),
+        postgres_regex_error("match.version_pattern", Some("57014"), "cancelled"),
         AppError::Database(_)
     ));
 }

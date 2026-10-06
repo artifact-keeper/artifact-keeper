@@ -708,6 +708,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
+    // were compiled by PostgreSQL at create/update time can carry a pattern
+    // that fails every run or (`\b`) protects nothing; name them once per
+    // boot without changing them.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::lifecycle_service::warn_invalid_lifecycle_regexes(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #1331: name every signing key that is bound to Debian/RPM metadata
     // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
     // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each

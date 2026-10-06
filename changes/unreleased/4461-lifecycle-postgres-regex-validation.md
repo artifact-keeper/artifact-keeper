@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4461, #4459]
+---
+- **Every lifecycle policy regex is now validated by PostgreSQL, the engine that runs it, and `\b` / `\B` are refused** (#4461). `exclude.version_patterns` and the `pattern` of `tag_pattern_keep` / `tag_pattern_delete` were only checked with the Rust `regex` crate, but PostgreSQL executes them and the two dialects differ. A protective exclusion such as `\bstable\b` validated, then matched nothing in PostgreSQL (where `\b` means backspace), so the versions it was written to protect were deleted; `\z`, `\pL`, `(?P<name>...)` or a mid-pattern `(?i)` validated and then failed every run. Creating or updating a policy now compiles each of these patterns with PostgreSQL and returns 400 `VALIDATION_ERROR` for one it rejects, and refuses `\b` / `\B` with a hint to use `\y` / `\Y`, as #4459 already did for `match.version_pattern`. Stored policies are not changed: the backend logs one WARN per offending policy at startup, and a preview lists the problems in `errors` (and stops with zero matches when a pattern cannot compile). The patterns are documented as PostgreSQL regular expressions, unanchored unless they use `^` / `$`.
