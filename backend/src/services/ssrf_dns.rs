@@ -30,8 +30,8 @@ enum ResolverMode {
     Webhook,
     /// SSO/OIDC discovery-token-JWKS-userinfo fetch against a configured
     /// IdP: private/CGNAT/ULA permitted only when `SSO_ALLOW_PRIVATE_IPS`
-    /// (or `AK_SSRF_ALLOW_PRIVATE_CIDRS`) opts the address in; otherwise
-    /// identical to [`ResolverMode::Upstream`].
+    /// or `AK_SSRF_ALLOW_PRIVATE_CIDRS` opts the address in (the two are
+    /// additive, #4474); otherwise identical to [`ResolverMode::Upstream`].
     SsoDiscovery,
 }
 
@@ -220,8 +220,9 @@ pub fn ssrf_guard_resolver_webhook() -> Arc<dyn Resolve> {
 
 /// `Arc<dyn Resolve>` for SSO/OIDC-fetch clients: private/CGNAT/ULA
 /// targets pass only when the operator has opted in via
-/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
-/// metadata/loopback/link-local hard-blocks always apply (issue #2380).
+/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS` (either
+/// suffices, #4474); the metadata/loopback/link-local hard-blocks always
+/// apply (issue #2380).
 pub fn ssrf_guard_resolver_sso() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::SsoDiscovery))
 }
@@ -511,9 +512,9 @@ mod tests {
         });
     }
 
-    /// #4428: the webhook resolver mode honours `WEBHOOK_ALLOW_PRIVATE_IPS`
-    /// even when the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` list is configured
-    /// and does not cover the address; upstream and SSO keep the list
+    /// #4428 / #4474: the webhook and SSO resolver modes honour their
+    /// toggles even when the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` list is
+    /// configured and does not cover the address; upstream keeps the list
     /// authoritative under the same environment.
     #[test]
     fn webhook_mode_toggle_is_additive_to_shared_cidr_list() {
@@ -527,18 +528,18 @@ mod tests {
             || {
                 let outside: SocketAddr = "10.0.0.5:0".parse().unwrap();
                 let inside: SocketAddr = "10.244.0.5:0".parse().unwrap();
-                assert_eq!(
-                    filter_allowed(ResolverMode::Webhook, [outside, inside]),
-                    vec![outside, inside],
-                    "webhook mode must keep a private address outside the CIDR list"
-                );
-                for mode in [ResolverMode::Upstream, ResolverMode::SsoDiscovery] {
+                for mode in [ResolverMode::Webhook, ResolverMode::SsoDiscovery] {
                     assert_eq!(
                         filter_allowed(mode, [outside, inside]),
-                        vec![inside],
-                        "{mode:?} must keep the CIDR list authoritative"
+                        vec![outside, inside],
+                        "{mode:?} must keep a private address outside the CIDR list"
                     );
                 }
+                assert_eq!(
+                    filter_allowed(ResolverMode::Upstream, [outside, inside]),
+                    vec![inside],
+                    "upstream mode must keep the CIDR list authoritative"
+                );
             },
         );
     }
