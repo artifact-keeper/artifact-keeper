@@ -66,6 +66,17 @@ generate_password() {
     fi
 }
 
+generate_webhook_key() {
+    # 32 random bytes, base64 encoded: the only shape AK_WEBHOOK_SECRET_KEY
+    # accepts (#4313). Without it the compose file's placeholder used to stop
+    # the backend from starting.
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32
+    else
+        head -c 32 /dev/urandom | base64 | tr -d '\n'
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -127,6 +138,7 @@ done
 info "Generating secure credentials..."
 
 JWT_SECRET="$(generate_password)$(generate_password)"
+AK_WEBHOOK_SECRET_KEY="$(generate_webhook_key)"
 DB_PASSWORD="$(generate_password)"
 
 if [ -z "$AK_ADMIN_PASSWORD" ]; then
@@ -189,6 +201,7 @@ ADMIN_PASSWORD=${AK_ADMIN_PASSWORD}
 
 # Security keys (auto-generated, keep these secret)
 JWT_SECRET=${JWT_SECRET}
+AK_WEBHOOK_SECRET_KEY=${AK_WEBHOOK_SECRET_KEY}
 
 # Search backend (OpenSearch runs in single-node mode with the security
 # plugin disabled for local self-host deployments. The service is bound to

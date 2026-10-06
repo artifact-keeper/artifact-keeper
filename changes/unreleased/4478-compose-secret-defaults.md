@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4478, #4313, #1350]
+---
+- **The stock `docker-compose.yml` and `.env.example` no longer ship secret values the backend refuses at startup** (#4478, #4313, #1350). Compose defaulted `JWT_SECRET` to `change-me-in-production-please` and `AK_WEBHOOK_SECRET_KEY` to an intentionally invalid placeholder, and `.env.example` carried `JWT_SECRET=change-this-in-production-use-at-least-32-bytes`. The backend rejects all three, so `docker compose up -d` gave a backend that restarted forever while the web UI looked healthy, and operators had to find and fix two variables over two restart cycles. `JWT_SECRET` now has no default: unset, the backend exits once with its existing error naming the variable and `openssl rand -base64 48`. `AK_WEBHOOK_SECRET_KEY` is passed through only when it is defined, so an unset key starts the backend with a warning (webhook create and rotate-secret return HTTP 500 until it is set) instead of stopping it. `.env.example` leaves `JWT_SECRET=` empty and documents both `openssl rand` commands, and `scripts/install.sh` now generates `AK_WEBHOOK_SECRET_KEY` alongside `JWT_SECRET`.

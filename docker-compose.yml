@@ -189,7 +189,9 @@ services:
   # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   #
   # Key environment variables to review for your deployment:
-  #   JWT_SECRET        - MUST be changed for production (use a random 32+ char string)
+  #   JWT_SECRET        - REQUIRED, no default. Generate with: openssl rand -base64 48
+  #   AK_WEBHOOK_SECRET_KEY - webhook signing-secret key, generate with:
+  #                       openssl rand -base64 32 (webhooks are disabled until set)
   #   ADMIN_PASSWORD    - if unset, a random password is generated on first boot
   #   STORAGE_PATH      - where artifacts are stored on disk (or configure S3 below)
   #   CORS_ORIGINS      - set to your actual domain(s) in production
@@ -222,7 +224,13 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
+      # REQUIRED. There is deliberately no default (#4478): the backend
+      # refuses every placeholder, so a shipped default could only ever make
+      # it restart forever. Unset, the backend exits once with an error that
+      # names the variable and the command to generate it. Put the output of
+      #   openssl rand -base64 48
+      # in a .env file next to this compose file (see .env.example).
+      JWT_SECRET: ${JWT_SECRET:-}
       # ADMIN_PASSWORD: set this to skip first-boot setup lock.
       # If unset, a random password is generated and written to
       # /data/storage/admin.password on each boot until it is changed.
@@ -294,12 +302,14 @@ services:
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
       # Generate with: openssl rand -base64 32, then set the variable in
-      # your shell or a .env file before docker compose up. The placeholder
-      # below is intentionally invalid base64 so the backend fails fast at
-      # boot (ensure_configured) with a clear error rather than running
-      # with a known-weak key. Without a key set, webhook create and
-      # rotate-secret endpoints return HTTP 500.
-      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-REPLACE_ME_WITH_OUTPUT_OF_openssl_rand_base64_32}
+      # your shell or a .env file before docker compose up. No value here on
+      # purpose (#4478, #4313, #1350): when the variable is not set at all
+      # the backend starts and only warns, and webhook create and
+      # rotate-secret return HTTP 500 until a key is set. A value that is
+      # set but malformed (including an empty string or the old
+      # REPLACE_ME placeholder) still makes the backend refuse to start, so
+      # this passes the variable through only when you define it.
+      AK_WEBHOOK_SECRET_KEY:
       # Toggle the webhooks v2 EventBus producer. Default off. Flip to true
       # once you have rotated migrated webhook secrets via /rotate-secret
       # and verified delivery against your receivers.
