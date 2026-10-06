@@ -211,6 +211,51 @@ counter, so an interrupted run resumes where it stopped instead of starting over
 the one not to copy: it backfills every live artifact row in one statement and
 then builds a GIN index over the result, in a single transaction.
 
+#### Bound every wait (#4153)
+
+A backfill's row locks, and a `CREATE TRIGGER … ON <hot table>` (`SHARE ROW
+EXCLUSIVE`, which queues behind any open transaction and blocks every write
+behind it while it waits), must not sit on the migration session's 5-minute
+`lock_timeout`. From migration 270 on, a gate
+(`hot_table_backfills_and_triggers_set_timeouts`) requires any migration that
+backfills or adds a trigger to a hot table to set both `lock_timeout` and
+`statement_timeout`. In a batching `DO` block `SET LOCAL` ends at each
+`COMMIT`, so set them per batch, and retry a batch that hits
+`lock_not_available` rather than failing the deploy:
+
+```sql
+LOOP
+    attempt := 0;
+    LOOP
+        BEGIN
+            SET LOCAL lock_timeout = '5s';
+            SET LOCAL statement_timeout = '5min';
+            -- one batch
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            attempt := attempt + 1;
+            IF attempt >= 5 THEN RAISE; END IF;
+            PERFORM pg_sleep(attempt);
+        END;
+    END LOOP;
+    COMMIT;   -- outside the EXCEPTION block: a subtransaction cannot COMMIT
+    ...
+END LOOP;
+```
+
+#### Rewriting `artifacts.origin`
+
+`artifacts.origin` is immutable by trigger (`ak_artifacts_origin_immutable`).
+Never `ALTER TABLE artifacts DISABLE TRIGGER` to rewrite it: the ALTER takes a
+table lock, and in a `-- no-transaction` file the disabled state commits and is
+visible to every session until re-enabled. Since migration 270 the trigger
+function honours a transaction-local GUC instead, and only for two shapes: a
+`hosted` -> `migration` re-stamp with the same `repository_key`, and a change
+of the `upstream_url` facet alone. Set it per batch with
+`SET LOCAL ak.origin_rewrite = 'on'`; it ends with the batch's `COMMIT`. A new
+kind of rewrite needs its own clause in the trigger function, reviewed like any
+other change to the immutability guarantee.
+
 ### 5. Column type change
 
 There is no online `ALTER COLUMN … TYPE`. Add a new column, backfill it in

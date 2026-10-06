@@ -519,4 +519,211 @@ mod tests {
         .expect("count malformed origins");
         assert_eq!(malformed, 0, "every recorded origin must be well-formed");
     }
+
+    // ------------------------------------------------------------------
+    // #4153: migration 270 re-stamps migrated rows
+    // ------------------------------------------------------------------
+
+    async fn rerun_migration(pool: &sqlx::PgPool, sql: &'static str) {
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        sqlx::raw_sql(sql)
+            .execute(&mut *conn)
+            .await
+            .expect("re-running the migration must succeed");
+    }
+
+    const MIGRATION_270: &str =
+        include_str!("../../migrations/270_artifacts_origin_migration_restamp.sql");
+
+    /// Insert an artifact row with an explicit origin document (the fill
+    /// trigger keeps an explicit value), created `age_hours` ago.
+    async fn insert_with_origin(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        path: &str,
+        checksum: &str,
+        origin: serde_json::Value,
+        age_hours: i32,
+    ) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, origin, created_at) \
+             VALUES ($1, $2, $2, 1, $3, 'application/octet-stream', $2, $4, \
+                     now() - make_interval(hours => $5)) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(checksum)
+        .bind(origin)
+        .bind(age_hours)
+        .fetch_one(pool)
+        .await
+        .expect("insert artifact with explicit origin")
+    }
+
+    async fn kind_of(pool: &sqlx::PgPool, id: uuid::Uuid) -> serde_json::Value {
+        sqlx::query_scalar("SELECT origin FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read origin")
+    }
+
+    /// #4153: migration 270 re-stamps rows the migration worker imported
+    /// before it stamped its own origin (recorded `hosted` by the 228
+    /// backfill) and leaves everything it cannot attribute unambiguously.
+    /// Re-running it is a no-op, and afterwards the immutability trigger
+    /// still rejects every rewrite outside the sanctioned GUC window.
+    #[tokio::test]
+    async fn test_migration_270_restamps_migrated_rows_and_keeps_immutability_4153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let pool = &fx.pool;
+        let src_key = format!("src-{}", fx.repo_id.simple());
+        let conn_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc) \
+             VALUES ($1, 'HTTPS://Arti.Example.TEST/artifactory/', 'api_token', '\\x00') \
+             RETURNING id",
+        )
+        .bind(format!("4153-{}", fx.repo_id))
+        .fetch_one(pool)
+        .await
+        .expect("insert source connection");
+        let job = |config: serde_json::Value| {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO migration_jobs (source_connection_id, status, config) \
+                 VALUES ($1, 'completed', $2) RETURNING id",
+            )
+            .bind(conn_id)
+            .bind(config)
+            .fetch_one(pool)
+        };
+        let mut mappings = serde_json::Map::new();
+        mappings.insert(src_key.clone(), fx.repo_key.clone().into());
+        let mapped = job(serde_json::json!({"repo_mappings": mappings.clone()}))
+            .await
+            .expect("mapped job");
+        let dry = job(serde_json::json!({"dry_run": true, "repo_mappings": mappings}))
+            .await
+            .expect("dry-run job");
+
+        let hosted = ArtifactOrigin::hosted(&fx.repo_key).to_json();
+        let sum = |n: u32| format!("{n:064x}");
+        let composed = insert_with_origin(
+            pool,
+            fx.repo_id,
+            "lib/1.0/lib-1.0.tgz",
+            &sum(1),
+            hosted.clone(),
+            24,
+        )
+        .await;
+        let verbatim = insert_with_origin(
+            pool,
+            fx.repo_id,
+            "com/ex/a/1/a-1.jar",
+            &sum(2),
+            hosted.clone(),
+            24,
+        )
+        .await;
+        let dup_a =
+            insert_with_origin(pool, fx.repo_id, "x/1/dup.bin", &sum(3), hosted.clone(), 24).await;
+        let dup_b =
+            insert_with_origin(pool, fx.repo_id, "x/2/dup.bin", &sum(3), hosted.clone(), 24).await;
+        let later =
+            insert_with_origin(pool, fx.repo_id, "late.bin", &sum(4), hosted.clone(), 0).await;
+        let wrong_sum =
+            insert_with_origin(pool, fx.repo_id, "w.bin", &sum(5), hosted.clone(), 24).await;
+        let dry_row =
+            insert_with_origin(pool, fx.repo_id, "dry.bin", &sum(6), hosted.clone(), 24).await;
+
+        for (job_id, rel, checksum) in [
+            (mapped, "lib/-/lib-1.0.tgz", sum(1)),
+            (mapped, "com/ex/a/1/a-1.jar", sum(2)),
+            (mapped, "x/dup.bin", sum(3)),
+            (mapped, "late.bin", sum(4)),
+            (mapped, "w.bin", sum(9)),
+            (dry, "dry.bin", sum(6)),
+        ] {
+            sqlx::query(
+                "INSERT INTO migration_items (job_id, item_type, source_path, target_path, \
+                 status, checksum_target, completed_at) \
+                 VALUES ($1, 'artifact', $2, $3, 'completed', $4, now() - interval '1 hour')",
+            )
+            .bind(job_id)
+            .bind(format!("{src_key}/{rel}"))
+            .bind(format!("{}/{rel}", fx.repo_key))
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("insert migration item");
+        }
+
+        rerun_migration(pool, MIGRATION_270).await;
+
+        let want = serde_json::json!({
+            "v": 1,
+            "kind": "migration",
+            "repository_key": fx.repo_key,
+            "upstream_url": "https://arti.example.test/artifactory",
+        });
+        assert_eq!(kind_of(pool, composed).await, want, "composed-path row");
+        assert_eq!(kind_of(pool, verbatim).await, want, "verbatim-path row");
+        for (id, why) in [
+            (dup_a, "ambiguous: two rows share the file name"),
+            (dup_b, "ambiguous: two rows share the file name"),
+            (later, "created after the item completed"),
+            (wrong_sum, "checksum differs"),
+            (dry_row, "dry-run job"),
+        ] {
+            assert_eq!(kind_of(pool, id).await, hosted, "{why}");
+        }
+
+        // Idempotent: a second run changes nothing.
+        rerun_migration(pool, MIGRATION_270).await;
+        assert_eq!(kind_of(pool, composed).await, want);
+        assert_eq!(kind_of(pool, dup_a).await, hosted);
+
+        // The trigger is still enforced outside the GUC window...
+        let rewrite = sqlx::query("UPDATE artifacts SET origin = $2 WHERE id = $1")
+            .bind(dup_a)
+            .bind(want.clone())
+            .execute(pool)
+            .await;
+        assert!(
+            rewrite.is_err(),
+            "hosted -> migration without the GUC must be rejected"
+        );
+        // ...and inside it, only the sanctioned shapes pass.
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL ak.origin_rewrite = 'on'")
+            .execute(&mut *tx)
+            .await
+            .expect("set guc");
+        let hostile = sqlx::query("UPDATE artifacts SET origin = $2 WHERE id = $1")
+            .bind(composed)
+            .bind(serde_json::json!({"v":1,"kind":"hosted","repository_key":"attacker"}))
+            .execute(&mut *tx)
+            .await;
+        assert!(
+            hostile.is_err(),
+            "migration -> hosted is not a sanctioned rewrite"
+        );
+        drop(tx);
+
+        sqlx::query("DELETE FROM migration_jobs WHERE source_connection_id = $1")
+            .bind(conn_id)
+            .execute(pool)
+            .await
+            .expect("delete jobs");
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(pool)
+            .await
+            .expect("delete connection");
+        fx.teardown().await;
+    }
 }

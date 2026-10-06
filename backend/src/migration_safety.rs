@@ -945,6 +945,74 @@ fn tables_created(masked: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
+/// First migration the timeout rule ([`timeout_findings`]) applies to
+/// (#4153). Everything before it is history: 222-269 had already run on
+/// development and staging databases when the rule was added, and editing an
+/// applied migration breaks its sqlx checksum. Migration 270 is the follow-up
+/// that carries the timeouts those files lacked.
+const TIMEOUT_RULE_FROM: u32 = 270;
+
+/// Why a migration must bound its lock waits and statement time (#4153), or
+/// `None` when it need not.
+///
+/// Two shapes qualify when they touch a [`HOT_TABLES`] entry outside a
+/// routine body:
+///
+/// * a backfill: any `UPDATE <hot>` or `DELETE FROM <hot>`, batched or not.
+///   Row locks queue behind a long transaction like any other lock, and a
+///   batch that cannot get its rows must give up and retry rather than stall
+///   the deploy for the session's 5-minute `lock_timeout` (main.rs);
+/// * `CREATE TRIGGER … ON <hot>`: it takes `SHARE ROW EXCLUSIVE`, which queues
+///   behind any open transaction on the table and blocks every write behind
+///   it while it waits.
+///
+/// Such a migration must contain both `SET [LOCAL] lock_timeout` and
+/// `SET [LOCAL] statement_timeout`. Inside a batching `DO` block, `SET LOCAL`
+/// lasts until the batch's `COMMIT`, so it is repeated per batch.
+fn timeout_findings(masked: &str, hot: &std::collections::BTreeSet<&str>) -> Option<String> {
+    let routines = routine_bodies(masked);
+    let outside = |at: usize| !routines.iter().any(|(s, e)| at >= *s && at < *e);
+    let mut reasons = Vec::new();
+    for (opener, what) in [
+        ("UPDATE", "backfill"),
+        ("DELETE FROM", "backfill"),
+        ("CREATE TRIGGER", "trigger"),
+    ] {
+        let mut from = 0usize;
+        while let Some((s, e)) = find_phrase(masked, opener, from) {
+            from = e;
+            let table = if what == "trigger" {
+                find_phrase(masked, "ON", e).and_then(|(_, on)| identifier_after(masked, on))
+            } else {
+                identifier_after(masked, e)
+            };
+            if let Some(t) = table.filter(|t| hot.contains(t.as_str()) && outside(s)) {
+                reasons.push(format!("{what} on `{t}`"));
+            }
+        }
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let sets = |guc: &str| {
+        find_phrase(masked, &format!("SET LOCAL {guc}"), 0).is_some()
+            || find_phrase(masked, &format!("SET {guc}"), 0).is_some()
+    };
+    let missing: Vec<&str> = ["lock_timeout", "statement_timeout"]
+        .into_iter()
+        .filter(|guc| !sets(guc))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    reasons.dedup();
+    Some(format!(
+        "{} without SET {}",
+        reasons.join(", "),
+        missing.join(" / ")
+    ))
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -1179,6 +1247,75 @@ mod tests {
              before the build. See docs/operations/online-migrations.md.",
             bad.join(", ")
         );
+    }
+
+    /// #4153: a migration from [`TIMEOUT_RULE_FROM`] on that backfills a hot
+    /// table or creates a trigger on one must bound its lock waits and its
+    /// statement time.
+    #[test]
+    fn hot_table_backfills_and_triggers_set_timeouts() {
+        let hot: std::collections::BTreeSet<&str> = HOT_TABLES.iter().map(|(t, _)| *t).collect();
+        let mut bad = Vec::new();
+        for (name, body) in migration_files() {
+            let version: u32 = name
+                .split('_')
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{name}: no numeric version prefix"));
+            if version < TIMEOUT_RULE_FROM {
+                continue;
+            }
+            if let Some(why) = timeout_findings(&mask_sql(&body), &hot) {
+                bad.push(format!("{name}: {why}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "migration(s) backfill or add a trigger on a hot table without bounding \
+             their waits (#4153): {}\n\
+             Add `SET LOCAL lock_timeout = '5s'` and `SET LOCAL statement_timeout = ...` \
+             to every transaction that runs the statement (inside a batching DO block, \
+             once per batch, since COMMIT ends SET LOCAL), and retry a batch that hits \
+             lock_not_available instead of waiting. See \
+             docs/operations/online-migrations.md.",
+            bad.join("; ")
+        );
+    }
+
+    #[test]
+    fn timeout_findings_flags_only_unbounded_hot_table_work() {
+        let hot: std::collections::BTreeSet<&str> = ["artifacts"].into_iter().collect();
+        let check = |sql: &str| timeout_findings(&mask_sql(sql), &hot);
+
+        // Backfill and trigger shapes without timeouts are flagged.
+        let backfill = "DO $$ BEGIN LOOP UPDATE artifacts SET x = 1 WHERE id IN \
+                        (SELECT id FROM artifacts LIMIT 10); COMMIT; END LOOP; END $$;";
+        assert_eq!(
+            check(backfill).as_deref(),
+            Some("backfill on `artifacts` without SET lock_timeout / statement_timeout")
+        );
+        let trigger = "CREATE TRIGGER t BEFORE UPDATE ON artifacts \
+                       FOR EACH ROW EXECUTE FUNCTION f();";
+        assert!(check(trigger).unwrap().contains("trigger on `artifacts`"));
+        let half = format!("SET LOCAL lock_timeout = '5s'; {trigger}");
+        assert_eq!(
+            check(&half).as_deref(),
+            Some("trigger on `artifacts` without SET statement_timeout")
+        );
+
+        // Bounded, a cold table, a routine body, or a comment: not flagged.
+        let bounded =
+            format!("SET LOCAL lock_timeout = '5s'; SET statement_timeout = '1min'; {backfill}");
+        assert_eq!(check(&bounded), None);
+        assert_eq!(check("UPDATE system_settings SET v = 1;"), None);
+        assert_eq!(
+            check(
+                "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+                 UPDATE artifacts SET x = 1; RETURN NEW; END $f$;"
+            ),
+            None
+        );
+        assert_eq!(check("-- UPDATE artifacts SET x = 1\nSELECT 1;"), None);
     }
 
     /// Every hot table named in [`HOT_TABLES`] must actually exist in the
