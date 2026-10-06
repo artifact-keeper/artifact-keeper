@@ -1557,6 +1557,13 @@ jobs:
       - name: Check duplicate-migration gate catches what it must
         run: bash scripts/ci/test-check-duplicate-migrations.sh
 
+      # Stock compose exposure (#4480): Postgres (fixed login), OpenSearch
+      # (no security plugin), Trivy and OpenSCAP were published on 0.0.0.0.
+      # Only Caddy may publish beyond loopback in the default stack. Pure
+      # YAML inspection, ~1s.
+      - name: Check the stock compose publishes only the proxy beyond loopback
+        run: bash scripts/ci/check-compose-published-ports.sh
+
       # A release prep that renames `## [Unreleased]` to `## [X.Y.Z]` without
       # opening a fresh empty one strands every entry that lands after it:
       # PR branches cut before the rename anchor into the renamed, ALREADY
