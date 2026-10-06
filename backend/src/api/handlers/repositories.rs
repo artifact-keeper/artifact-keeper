@@ -44,8 +44,9 @@ use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
-    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
-    RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
+    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
+    MemberVisibility, RepoVisibility, RepositoryService,
+    UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
@@ -1329,7 +1330,17 @@ pub struct RepositoryResponse {
     /// (`NOT NULL DEFAULT 'filesystem'`), so like `curation_enabled` this
     /// needs no separate lookup and is always concrete.
     pub storage_backend: String,
+    /// Bytes stored in this repository itself. Always 0 for a virtual
+    /// repository, which stores nothing of its own, so summing this field
+    /// over repositories (for example per project) counts each byte once
+    /// (#4423).
     pub storage_used_bytes: i64,
+    /// Virtual repositories only: the combined bytes of the member
+    /// repositories the caller can see, each member counted once (#2785,
+    /// #3081). These bytes are already in the members' own
+    /// `storage_used_bytes`; do not add them to a total. `null` for every
+    /// other repository type (#4423).
+    pub member_storage_used_bytes: Option<i64>,
     pub quota_bytes: Option<i64>,
     /// Project this repository is assigned to (#2472), if any.
     pub project_id: Option<Uuid>,
@@ -1478,6 +1489,17 @@ fn upstream_url_for_response(stored: Option<&str>) -> (Option<String>, bool) {
     }
 }
 
+/// [`repo_to_response`] with both display storage figures (#4423): the
+/// repository's own bytes, and for a virtual repository its members' bytes.
+fn repo_to_display_response(
+    repo: crate::models::repository::Repository,
+    usage: DisplayStorageUsage,
+) -> RepositoryResponse {
+    let mut response = repo_to_response(repo, usage.own_bytes);
+    response.member_storage_used_bytes = usage.member_bytes;
+    response
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
@@ -1505,6 +1527,7 @@ fn repo_to_response(
         versioning_enabled: repo.versioning_enabled,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
+        member_storage_used_bytes: None,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
         // db-less: single-repo handlers overwrite this via `with_row_presence_fields`
@@ -3178,35 +3201,34 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    // #2785: the batched per-repo figure above keys off `repository_id`, which
-    // is (near) empty for a virtual repo — it owns no artifact rows, only
-    // member links. Overwrite each virtual repo's figure with the union of its
-    // resolvable members so the listing total matches the child repos.
+    // #2785: a virtual repo owns no artifact rows, only member links, so its
+    // own figure is 0 (#4423: it must not repeat its members' bytes, or any
+    // sum over the listing counts them twice). The union of its resolvable
+    // members is reported separately as `member_storage_used_bytes`.
     //
     // #3078: resolve every virtual on the page in ONE query (the old shape
     // called `get_virtual_storage_usage` once per virtual — an N+1 that
-    // re-scanned every reachable member's artifact rows per call). Seeding 0
-    // first preserves the old always-overwrite semantics: a virtual with no
-    // resolvable members has no row in the batch result and must render 0.
-    let mut storage_map = storage_map;
+    // re-scanned every reachable member's artifact rows per call). A virtual
+    // with no resolvable members has no row in the batch result and renders
+    // a member figure of 0.
     let virtual_ids: Vec<Uuid> = repos
         .iter()
         .filter(|r| r.repo_type == RepositoryType::Virtual)
         .map(|r| r.id)
         .collect();
-    if !virtual_ids.is_empty() {
-        for id in &virtual_ids {
-            storage_map.insert(*id, 0);
+    // #3081: aggregate only over the members THIS caller may see — a member
+    // the caller cannot read must not disclose its byte size through the
+    // virtual's total. An empty `virtual_ids` returns without a query.
+    let member_map = service
+        .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
+        .await?;
+    let display_usage = |id: Uuid| {
+        if virtual_ids.contains(&id) {
+            DisplayStorageUsage::virtual_repo(member_map.get(&id).copied().unwrap_or(0))
+        } else {
+            DisplayStorageUsage::own(storage_map.get(&id).copied().unwrap_or(0))
         }
-        // #3081: aggregate only over the members THIS caller may see — a
-        // member the caller cannot read must not disclose its byte size
-        // through the virtual's total.
-        storage_map.extend(
-            service
-                .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
-                .await?,
-        );
-    }
+    };
 
     // Batch fetch which repos have a trusted GPG key configured (#2568) and
     // any plugin `format_key` (#3070) so the listing reports both without an
@@ -3232,9 +3254,9 @@ pub async fn list_repositories(
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
-            let storage = storage_map.get(&r.id).copied().unwrap_or(0);
+            let storage = display_usage(r.id);
             let (has_gpg, format_key) = row_fields.get(&r.id).cloned().unwrap_or_default();
-            let mut resp = repo_to_response(r, storage);
+            let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
             resp.format_key = custom_format_key(&resp.format, format_key);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
@@ -3846,7 +3868,7 @@ pub async fn get_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let mut response = repo_to_response(repo, storage_used);
+    let mut response = repo_to_display_response(repo, storage_used);
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
@@ -4812,7 +4834,7 @@ pub async fn update_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let response = repo_to_response(repo, storage_used);
+    let response = repo_to_display_response(repo, storage_used);
     let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
@@ -15010,6 +15032,7 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 1024,
+            member_storage_used_bytes: None,
             quota_bytes: Some(1048576),
             upstream_url: None,
             upstream_url_has_credentials: false,
@@ -16422,6 +16445,7 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             upstream_url_has_credentials: false,
@@ -27391,6 +27415,7 @@ mod tests {
             versioning_enabled: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: None,
             upstream_url_has_credentials: false,
@@ -28939,14 +28964,17 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
-        let listed: std::collections::HashMap<String, i64> = json["items"]
+        let listed: std::collections::HashMap<String, (i64, Option<i64>)> = json["items"]
             .as_array()
             .expect("items array")
             .iter()
             .map(|item| {
                 (
                     item["key"].as_str().expect("key").to_string(),
-                    item["storage_used_bytes"].as_i64().expect("storage figure"),
+                    (
+                        item["storage_used_bytes"].as_i64().expect("storage figure"),
+                        item["member_storage_used_bytes"].as_i64(),
+                    ),
                 )
             })
             .collect();
@@ -28962,7 +28990,8 @@ mod apt_validation_tests {
             (hollow, "hollow", 0),
         ];
         for (id, tag, expected) in matrix {
-            let oracle = if tag == "virt" || tag == "hollow" {
+            let is_virtual = tag == "virt" || tag == "hollow";
+            let oracle = if is_virtual {
                 service
                     .get_virtual_storage_usage(id, &MemberVisibility::Unfiltered)
                     .await
@@ -28977,9 +29006,16 @@ mod apt_validation_tests {
                 oracle, expected,
                 "live-SUM oracle drifted from the seeded expectation for {tag}"
             );
+            // #4423: a virtual's own figure is 0; its members' union is the
+            // separate `member_storage_used_bytes`.
+            let figures = if is_virtual {
+                (0, Some(expected))
+            } else {
+                (expected, None)
+            };
             assert_eq!(
                 listed.get(&format!("{prefix}-{tag}")).copied(),
-                Some(expected),
+                Some(figures),
                 "ledger-backed listing figure must equal the live-SUM oracle for {tag}"
             );
         }
@@ -29499,9 +29535,16 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
-        detail["storage_used_bytes"]
+        virtual_member_figure_4423(&detail)
+    }
+
+    /// A virtual repository's member total from a response item, after
+    /// checking its own `storage_used_bytes` is 0 (#4423).
+    fn virtual_member_figure_4423(item: &serde_json::Value) -> i64 {
+        assert_eq!(item["storage_used_bytes"].as_i64(), Some(0), "{item}");
+        item["member_storage_used_bytes"]
             .as_i64()
-            .expect("detail storage figure")
+            .expect("virtual member storage figure")
     }
 
     /// Read `storage_used_bytes` for `key` from `GET /?q={prefix}` — the
@@ -29530,7 +29573,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(key))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("virtual repo present in listing")
     }
 
@@ -29936,8 +29979,8 @@ mod apt_validation_tests {
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
         assert_eq!(
-            detail["storage_used_bytes"].as_i64(),
-            Some(3_000),
+            virtual_member_figure_4423(&detail),
+            3_000,
             "anonymous total must count the public member only, not the private one"
         );
 
@@ -29951,7 +29994,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(virt_key.as_str()))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("public virtual present in anonymous listing");
         assert_eq!(
             listed, 3_000,
@@ -30117,9 +30160,7 @@ mod apt_validation_tests {
                     String::from_utf8_lossy(&body)
                 );
                 let resp: serde_json::Value = serde_json::from_slice(&body).expect("patch json");
-                resp["storage_used_bytes"]
-                    .as_i64()
-                    .expect("patch storage figure")
+                virtual_member_figure_4423(&resp)
             }
         };
 

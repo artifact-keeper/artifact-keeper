@@ -1030,6 +1030,35 @@ where
     Ok(false)
 }
 
+/// The storage figures a repository response displays (#4423).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayStorageUsage {
+    /// Bytes stored in the repository itself; 0 for a virtual repository.
+    /// Summing this over repositories never counts a byte twice.
+    pub own_bytes: i64,
+    /// For a virtual repository only: the union of the bytes of the members
+    /// the caller can see (#2785, #3081). `None` for every other type.
+    pub member_bytes: Option<i64>,
+}
+
+impl DisplayStorageUsage {
+    /// A non-virtual repository's own figure.
+    pub fn own(own_bytes: i64) -> Self {
+        Self {
+            own_bytes,
+            member_bytes: None,
+        }
+    }
+
+    /// A virtual repository: no own bytes, `member_bytes` through its members.
+    pub fn virtual_repo(member_bytes: i64) -> Self {
+        Self {
+            own_bytes: 0,
+            member_bytes: Some(member_bytes),
+        }
+    }
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -2281,30 +2310,33 @@ impl RepositoryService {
         Ok(usage)
     }
 
-    /// Storage figure to DISPLAY for `repo` (issue #2785).
+    /// Storage figures to DISPLAY for `repo` (issues #2785, #4423).
     ///
     /// A virtual repository owns no `artifacts` / `proxy_cache_artifacts` /
     /// `oci_blobs` rows of its own — its content is whatever resolves through
-    /// its members. A plain `get_storage_usage(virtual_id)` therefore reports
-    /// the virtual's *own* rows (effectively zero) even though browsing the
-    /// virtual surfaces real member data, so the detail view showed a total
-    /// that did not match the combined total of its child repos. For a virtual
-    /// repo we instead sum over the union of its resolvable member contents;
-    /// every other repo type keeps the existing per-repo figure unchanged.
+    /// its members. Its OWN figure is therefore 0, so a client (or the project
+    /// rollup) that sums `storage_used_bytes` over repositories counts every
+    /// byte once, in the member that stores it (#4423). The union of its
+    /// resolvable member contents (#2785) is reported separately as
+    /// [`DisplayStorageUsage::member_bytes`]. Every other repo type reports
+    /// its own per-repo figure and no member figure.
     ///
     /// `visibility` is the CALLER's member visibility (issue #3081): the
-    /// virtual total is aggregated only over the members that caller is
-    /// allowed to see. It is unused for non-virtual repositories, whose own
+    /// virtual's member total is aggregated only over the members that caller
+    /// is allowed to see. It is unused for non-virtual repositories, whose own
     /// figure is already gated by the handler's `require_visible` check.
     pub async fn get_display_storage_usage(
         &self,
         repo: &Repository,
         visibility: &MemberVisibility,
-    ) -> Result<i64> {
+    ) -> Result<DisplayStorageUsage> {
         if repo.repo_type == RepositoryType::Virtual {
-            self.get_virtual_storage_usage(repo.id, visibility).await
+            let members = self.get_virtual_storage_usage(repo.id, visibility).await?;
+            Ok(DisplayStorageUsage::virtual_repo(members))
         } else {
-            self.get_storage_usage(repo.id).await
+            Ok(DisplayStorageUsage::own(
+                self.get_storage_usage(repo.id).await?,
+            ))
         }
     }
 
@@ -2919,6 +2951,9 @@ impl RepositoryService {
     /// (`idx_repositories_project_id`) joined to their ledger rows: the sum
     /// of the maintained counters, plus the ids of member repositories that
     /// have no ledger row yet (callers account for those from live sums).
+    /// Virtual repositories are skipped: they store nothing of their own,
+    /// their members (in this project or not) already carry the bytes, and
+    /// counting them here would double count (#4423).
     async fn project_ledger_rows<'e, E>(executor: E, project_id: Uuid) -> Result<(i64, Vec<Uuid>)>
     where
         E: sqlx::PgExecutor<'e>,
@@ -2932,6 +2967,7 @@ impl RepositoryService {
               FROM repositories r
               LEFT JOIN repository_usage_ledger l ON l.repository_id = r.id
              WHERE r.project_id = $1
+               AND r.repo_type <> 'virtual'
             "#,
             project_id
         )
@@ -6594,8 +6630,9 @@ mod tests {
                     .get_display_storage_usage(&virt, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display"),
-                combined,
-                "display helper unions members for a virtual repo"
+                DisplayStorageUsage::virtual_repo(combined),
+                "display helper reports no own bytes and the member union for a virtual \
+                 repo (#4423)"
             );
             // A non-virtual repo keeps its own per-repo figure via the helper.
             assert_eq!(
@@ -6603,7 +6640,7 @@ mod tests {
                     .get_display_storage_usage(&m1, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display m1"),
-                m1_usage
+                DisplayStorageUsage::own(m1_usage)
             );
 
             cleanup_repo(&pool, virt.id).await;
@@ -8132,6 +8169,68 @@ mod tests {
                 .check_quota_locked(&mut tx, repo, path, size)
                 .await
                 .expect("admission")
+        }
+
+        /// #4423: a virtual repository in the same project as its hosted
+        /// member must not count the member's bytes a second time. Its own
+        /// display figure is 0 (the member union is reported separately), the
+        /// project rollup skips it, and project admission never seeds a ledger
+        /// row for it.
+        #[tokio::test]
+        async fn test_virtual_repo_not_double_counted_in_project_4423() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(10_000), 1).await;
+            let hosted = repos[0];
+            let virt = service
+                .create(make_virtual_req(
+                    &format!("{}v", uuid::Uuid::new_v4().simple()),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create virtual");
+            sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                .bind(project)
+                .bind(virt.id)
+                .execute(&pool)
+                .await
+                .expect("assign virtual to project");
+            service
+                .add_virtual_member(virt.id, hosted, Some(1))
+                .await
+                .expect("add member");
+            assert!(admit_and_insert(&service, &pool, hosted, "dc/a", 600).await);
+
+            let mut displayed = 0;
+            for id in [hosted, virt.id] {
+                let repo = service.get_by_id(id).await.expect("repo");
+                let usage = service
+                    .get_display_storage_usage(&repo, &MemberVisibility::Unfiltered)
+                    .await
+                    .expect("display usage");
+                displayed += usage.own_bytes;
+                if id == virt.id {
+                    assert_eq!(usage, DisplayStorageUsage::virtual_repo(600));
+                }
+            }
+            assert_eq!(displayed, 600, "summing own figures counts each byte once");
+            assert_eq!(
+                service
+                    .get_project_ledger_usage(project)
+                    .await
+                    .expect("project usage"),
+                600
+            );
+            assert_eq!(
+                ledger_hosted(&pool, virt.id).await,
+                None,
+                "project admission must not seed a ledger row for a virtual repo"
+            );
+
+            cleanup_repo(&pool, virt.id).await;
+            cleanup_project_with_repos(&pool, project, &repos).await;
         }
 
         /// Quota evasion by splitting across repositories: two repositories
