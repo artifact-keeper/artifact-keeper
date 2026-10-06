@@ -614,6 +614,26 @@ mod tests {
         }
     }
 
+    /// #3522: `POST /api/v1/users/{id}/roles` is deprecated in favour of
+    /// `POST /api/v1/permissions`, and the spec must say so (generated SDKs
+    /// key their deprecation warnings off this flag). The sibling `GET` on
+    /// the same path is not deprecated.
+    #[test]
+    fn test_3522_openapi_assign_user_role_is_deprecated() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let item = &spec["paths"]["/api/v1/users/{id}/roles"];
+        assert!(item.is_object(), "path missing from the spec");
+        assert_eq!(item["post"]["deprecated"], serde_json::Value::Bool(true));
+        assert!(item["get"]["deprecated"].is_null());
+        let headers = &item["post"]["responses"]["200"]["headers"];
+        assert!(
+            headers["Deprecation"].is_object(),
+            "Deprecation header documented"
+        );
+        assert!(headers["Link"].is_object(), "Link header documented");
+        assert!(spec["paths"]["/api/v1/permissions"]["post"].is_object());
+    }
+
     /// #3812: `visibility` is the authoritative field; the legacy boolean and
     /// its alias stay accepted and returned but are flagged deprecated in the
     /// spec so generated SDKs surface it.
