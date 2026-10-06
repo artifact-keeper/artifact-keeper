@@ -21,8 +21,11 @@
 #     -> artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
 #
 # Pin a specific release by setting ARTIFACT_KEEPER_VERSION in a .env file
-# alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). Omit the
-# "v" prefix. If unset, "latest" is used.
+# alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). It pins the
+# backend and openscap images, which are released together with the same tag.
+# The web UI is released on its own cadence (#2708), so pin it separately with
+# ARTIFACT_KEEPER_WEB_VERSION (e.g. ARTIFACT_KEEPER_WEB_VERSION=1.10.1). Omit
+# the "v" prefix. If either is unset, "latest" is used for those images.
 # =============================================================================
 
 services:
@@ -408,7 +411,9 @@ services:
   # Runs SCAP compliance checks against container images. Optional: remove
   # this service and unset OPENSCAP_URL on the backend if not needed.
   openscap:
-    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest  # or artifactkeeper/openscap:latest
+    # Same release tag as the backend: both are published by every backend
+    # release (#4481).
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:${ARTIFACT_KEEPER_VERSION:-latest}  # or artifactkeeper/openscap:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-openscap
     ports:
       - "8091:8091"
@@ -495,7 +500,9 @@ services:
   # internal Docker network. No ports are exposed directly; Caddy handles
   # external access and routes requests to the appropriate service.
   web:
-    image: ghcr.io/artifact-keeper/artifact-keeper-web:latest  # or artifactkeeper/web:latest
+    # Web releases are decoupled from backend releases (#2708), so the web
+    # image has its own pin (#4481).
+    image: ghcr.io/artifact-keeper/artifact-keeper-web:${ARTIFACT_KEEPER_WEB_VERSION:-latest}  # or artifactkeeper/web:${ARTIFACT_KEEPER_WEB_VERSION:-latest}
     container_name: artifact-keeper-web
     depends_on:
       backend:

@@ -1604,6 +1604,12 @@ jobs:
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
 
+      # Stock compose version pins (#4481): openscap and web were hardcoded to
+      # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
+      # floating. Pure YAML inspection, ~1s.
+      - name: Check every first-party compose image follows a version pin
+        run: bash scripts/ci/check-compose-version-pins.sh
+
       # The other half of the CHANGELOG bookkeeping (#3797). A branch cut
       # before a release cut anchors its bullet to `## [Unreleased]`; the cut
       # renames that heading and opens a fresh one, so when the branch merges
