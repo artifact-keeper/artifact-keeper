@@ -295,6 +295,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 - **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Mirror GitHub release assets using the github, mise or aqua format with finite caching
 - **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
+- **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
 
 ## Project Structure
 
