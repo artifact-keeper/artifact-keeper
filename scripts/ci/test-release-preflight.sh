@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/release-preflight.sh checks 1, 3 and 4
+# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5 and 6
 # (issues #3308, #3309, #3338 and #3339).
 #
 # WHY THIS EXISTS
@@ -893,6 +893,36 @@ else
   fail "no previous stable tag: expected exit 2 with INFRA, got $rc"
   sed 's/^/        /' "$WORK/out.txt" >&2
 fi
+
+echo
+echo "release-preflight check 6 (curated notes finished, #4468)"
+
+# Check 6 reads .github/release-notes/<Cargo.toml version>.md. The base
+# fixture (version 9.9.9, green publish, checks 4 and 5 skipped) is READY, so
+# these exit codes are a statement about check 6 alone. Delete the `bad` in
+# check 6 and case 6a goes green; widen its pattern and 6b goes red.
+mkdir -p "$REPO_DIR/.github/release-notes"
+
+# 6a. THE REGRESSION: a TODO hidden in an HTML comment still blocks.
+printf '# Artifact Keeper 9.9.9\n\nText.\n<!-- TODO(W5): add #1234 -->\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "notes with a hidden TODO -> NOT READY" 1 "unfinished markers"
+
+# 6b. Finished notes pass, including prose that merely contains the letters
+#     ("todolist", "drafted") -- matching is
+#     whole-word and uppercase.
+printf '# Artifact Keeper 9.9.9\n\nThe plan was drafted early; see the todolist.\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "finished notes -> READY" 0 "has no TODO or DRAFT markers"
+
+# 6c. A DRAFT banner blocks too.
+printf '<!-- DRAFT for the 9.9.9 cut -->\n# Artifact Keeper 9.9.9\n' \
+  > "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "notes marked DRAFT -> NOT READY" 1 "unfinished markers"
+
+# 6d. No notes file for the version is reported, not blocked.
+rm -f "$REPO_DIR/.github/release-notes/9.9.9.md"
+expect "no notes file yet -> READY (noted)" 0 "does not exist yet"
 
 echo
 if [ "$fails" -eq 0 ]; then

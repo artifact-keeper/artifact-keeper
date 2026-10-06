@@ -153,6 +153,22 @@ names the same commit.
    When a commit is refused, each gate names the rule it failed and, for a
    near miss, the path that put it outside the set.
 
+   Check 6 refuses curated notes that are not finished: if
+   `.github/release-notes/<version>.md` exists for the version `Cargo.toml`
+   names, any uppercase `TODO` or `DRAFT` word in it is blocking. Notes may be
+   drafted on `main` before the cut (1.11.0's were, #4468) and their open
+   items are usually HTML comments, which GitHub does not render, so a
+   forgotten draft would otherwise publish with the gaps invisible. Resolve or
+   delete every marker in the prep PR.
+
+   **Cut checklist, beyond the preflight.** Before dispatching the candidate,
+   also confirm the secrets the post-release jobs need (step 8): the
+   `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
+   announcement failed with 404), and `AWS_AMI_BUILDER_ROLE_ARN` names a role
+   whose OIDC trust admits this repository. Neither is visible to the
+   preflight, and a missing one turns a published release's announcement or
+   AMI job red.
+
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
    all of them in one PR (or one PR per repo):
@@ -1008,7 +1024,10 @@ section**:
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
 commit it in the same PR as the CHANGELOG assembly (step 3). `release.yml`'s
-"Resolve release notes" step uses that file as the Release `body_path`.
+"Resolve release notes" step uses that file as the Release `body_path`. A
+long release may land a draft earlier, with its open items marked `TODO`;
+preflight check 6 refuses the cut until no `TODO` or `DRAFT` marker is left
+in the notes for the version being released.
 
 For a stable `vX.Y.Z` the file is **required**: with no curated file the
 release-preflight job refuses the tag, and the "Resolve release notes" step
