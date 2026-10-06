@@ -2007,8 +2007,13 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    runs-on: ak-ci-runners
-    timeout-minutes: 45
+    # GitHub-hosted, not ak-ci-runners (narrowed backport of main's #3991):
+    # on this pool the in-Dockerfile `cargo chef cook` went silent for ~43
+    # min on three different pods and the job was cancelled at its ceiling.
+    # docker-publish.yml builds the same Dockerfile on `ubuntu-24.04`. 90:
+    # a cold cook layer (any Cargo.toml/Cargo.lock change) needs the room.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
@@ -2062,7 +2067,8 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    runs-on: ak-ci-runners
+    # GitHub-hosted, as on main (#3991).
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
