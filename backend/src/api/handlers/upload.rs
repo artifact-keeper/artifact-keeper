@@ -251,6 +251,14 @@ async fn create_session(
         .await
         .map_err(IntoResponse::into_response)?;
 
+    // Hosted-only gate (#4420), the same rule and response every native
+    // publish route applies: a remote repository is a cache of its upstream
+    // and a virtual one only aggregates its members, so a direct write to
+    // either would plant an artifact that shadows the upstream (or a member)
+    // without ever having been fetched from it. Checked after the
+    // authorization gates and before any session row exists.
+    proxy_helpers::reject_write_if_not_hosted(repo_record.repo_type.as_str())?;
+
     let is_replication = super::is_replication_request(&headers);
     if req.skip_if_present && !is_replication {
         let declared = super::artifact_presence::DeclaredUpload {
@@ -633,6 +641,15 @@ async fn complete_session_commit(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
+    // #4420: a session opened before the hosted-only gate existed (or against
+    // a repository whose type has changed since) must not commit into a remote
+    // or virtual repository either. Terminal: the session can never become
+    // completable, so it is failed rather than released and its staged chunks
+    // are reclaimed by `complete`.
+    if let Err(rejection) = proxy_helpers::reject_write_if_not_hosted(repo.repo_type.as_str()) {
+        UploadService::fail_committing(&state.db, &session, NOT_HOSTED_SESSION_ERROR).await;
+        return Err(rejection);
+    }
     let storage = match state.storage_for_repo(&repo.storage_location()) {
         Ok(storage) => storage,
         Err(e) => {
@@ -1299,6 +1316,11 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
         None
     }
 }
+
+/// `upload_sessions.error_message` for a completion refused because the
+/// repository is not hosted (#4420).
+const NOT_HOSTED_SESSION_ERROR: &str =
+    "repository does not accept direct uploads (remote or virtual repository)";
 
 /// Extract a simple artifact name from its path (last path component without extension).
 /// Read the leading bytes of an uploaded `.rpm` that hold its lead,
@@ -5294,6 +5316,88 @@ mod tests {
             .await;
         delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
+    }
+
+    /// #4420: opening a chunked-upload session against a remote repository
+    /// answers 405 and against a virtual one 400, exactly as the native
+    /// publish routes do, and leaves no session row behind. Hosted
+    /// repositories are covered by `create_session_returns_201_for_existing_repo`.
+    #[tokio::test]
+    async fn create_session_rejects_remote_and_virtual_repositories() {
+        for (repo_type, want) in [
+            ("remote", StatusCode::METHOD_NOT_ALLOWED),
+            ("virtual", StatusCode::BAD_REQUEST),
+        ] {
+            let Some(f) = tdh::Fixture::setup(repo_type, "debian").await else {
+                return;
+            };
+            let app =
+                upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+            let req = create_session_req(&serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": "pool/main/h/hello/hello_1.0_amd64.deb",
+                "total_size": 16_i64,
+                "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            }));
+            let (status, body) = tdh::send(app, req).await;
+            let sessions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM upload_sessions WHERE repository_id = $1")
+                    .bind(f.repo_id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap_or(-1);
+            cleanup_created_session(&f.pool, &body).await;
+            f.teardown().await;
+            assert_eq!(
+                status,
+                want,
+                "{repo_type}: body {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(sessions, 0, "{repo_type}: no session may be opened");
+        }
+    }
+
+    /// #4420: a session already staged against a remote repository (opened
+    /// before the create-time gate existed) cannot be committed either. The
+    /// completion answers 405, fails the session terminally (it can never
+    /// become completable) and writes no artifact row.
+    #[tokio::test]
+    async fn complete_rejects_a_session_staged_in_a_remote_repository() {
+        let Some(f) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"remote-shadow";
+        let (session_id, staged) = stage_completable_session(&f, payload).await;
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        let (session_status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session");
+        let artifacts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count artifacts");
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(session_status, "failed");
+        assert_eq!(error.as_deref(), Some(NOT_HOSTED_SESSION_ERROR));
+        assert_eq!(
+            artifacts, 0,
+            "a refused completion must not write an artifact"
+        );
     }
 
     #[tokio::test]

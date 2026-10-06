@@ -8976,6 +8976,11 @@ async fn authorize_generic_upload(
         .await
         .map_err(|e| e.into_response())?;
 
+    // Hosted-only gate (#4420): the generic PUT and both multipart entry
+    // points refuse remote and virtual repositories with the same response the
+    // native publish routes give, before any byte is staged.
+    proxy_helpers::reject_write_if_not_hosted(repo.repo_type.as_str())?;
+
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
     // the promotion service writes through its own path and is unaffected. This
@@ -19136,6 +19141,70 @@ mod tests {
         tdh::cleanup(&pool, local.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4420: the generic PUT and both multipart upload entry points refuse a
+    /// remote repository with 405 and a virtual one with 400 (the native
+    /// publish-route responses), even for an admin, and store nothing; a
+    /// hosted repository still accepts the same request.
+    #[tokio::test]
+    async fn generic_uploads_reject_remote_and_virtual_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(user_id, &username);
+        let form = "--XB\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\
+                    \r\n\
+                    x\r\n\
+                    --XB--\r\n";
+        for (repo_type, want) in [
+            ("remote", Some(StatusCode::METHOD_NOT_ALLOWED)),
+            ("virtual", Some(StatusCode::BAD_REQUEST)),
+            ("local", None),
+        ] {
+            let (repo_id, key, dir) = tdh::create_repo(&pool, repo_type, "generic").await;
+            let state = tdh::build_state(pool.clone(), &dir.to_string_lossy());
+            let put = upload_artifact(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/put.bin".to_string())),
+                HeaderMap::new(),
+                Body::from(Bytes::from_static(b"BYTES")),
+            )
+            .await;
+            let multipart = upload_artifact_multipart(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path(key.clone()),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let with_path = upload_artifact_multipart_with_path(
+                State(state),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/mp.bin".to_string())),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let stored: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or(-1);
+            tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            let statuses = [put, multipart, with_path].map(|r| r.err().map(|e| e.status()));
+            assert_eq!(statuses, [want; 3], "{repo_type}");
+            let expected_rows = if want.is_some() { 0 } else { 3 };
+            assert_eq!(stored, expected_rows, "{repo_type}");
+        }
+        tdh::cleanup(&pool, Uuid::nil(), user_id).await;
     }
 
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
