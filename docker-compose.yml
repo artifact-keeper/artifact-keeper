@@ -14,11 +14,11 @@
 #
 # Container images are available from two registries:
 #   ghcr.io (default):  ghcr.io/artifact-keeper/artifact-keeper-{backend,web,openscap}
-#   Docker Hub:         artifactkeeper/{backend,web,openscap}
+#   Docker Hub:         docker.io/artifactkeeper/{backend,web,openscap}
 #
 # To use Docker Hub instead, replace image references below. For example:
 #   ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
-#     -> artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+#     -> docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
 #
 # Pin a specific release by setting ARTIFACT_KEEPER_VERSION in a .env file
 # alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). Omit the
@@ -33,7 +33,7 @@ services:
   # In production, replace this with certs issued by your internal CA or use a
   # managed database service that handles TLS for you.
   pg-certs:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-pg-certs
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -75,7 +75,7 @@ services:
   # with proper backups, replication, and connection pooling.
   # Default credentials below are for local evaluation only.
   postgres:
-    image: postgres:18-alpine
+    image: docker.io/library/postgres:18-alpine
     container_name: artifact-keeper-db
     depends_on:
       pg-certs:
@@ -119,7 +119,7 @@ services:
   # shell-free) while providing sh + curl + jq. Mirrors the pg-certs init
   # container's `apk add` pattern above.
   dtrack-init:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-dtrack-init
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -165,7 +165,7 @@ services:
   # (issue #1563). This one-shot root init container chowns the volume to
   # 1001:0 before the backend starts. Mirrors the pg-certs init pattern above.
   scan-workspace-init:
-    image: alpine:3.24
+    image: docker.io/library/alpine:3.24
     container_name: artifact-keeper-scan-ws-init
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
@@ -186,7 +186,7 @@ services:
   # ---------------------------------------------------------------------------
   # The core Artifact Keeper service. Handles all API requests, package format
   # protocols, storage, and integrations with scanners.
-  # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+  # Docker Hub alternative: docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   #
   # Key environment variables to review for your deployment:
   #   JWT_SECRET        - MUST be changed for production (use a random 32+ char string)
@@ -338,7 +338,7 @@ services:
   # ---------------------------------------------------------------------------
   # Powers artifact and package search in the UI and API.
   opensearch:
-    image: opensearchproject/opensearch:2.19.6
+    image: docker.io/opensearchproject/opensearch:2.19.6
     container_name: artifact-keeper-opensearch
     environment:
       discovery.type: single-node
@@ -435,7 +435,7 @@ services:
   #   docker compose --profile dtrack --profile dtrack-ui up
   # https://dependencytrack.org/
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.14.3
+    image: docker.io/dependencytrack/apiserver:4.14.3
     container_name: artifact-keeper-dtrack-api
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -475,7 +475,7 @@ services:
   # apiserver). Run with:
   #   docker compose --profile dtrack --profile dtrack-ui up
   dependency-track-frontend:
-    image: dependencytrack/frontend:4.14.3
+    image: docker.io/dependencytrack/frontend:4.14.3
     container_name: artifact-keeper-dtrack-frontend
     profiles:
       - dtrack-ui  # Requires the `dtrack` profile too; see comment above.
@@ -513,7 +513,7 @@ services:
   # cert. In production, you may replace Caddy with your own reverse proxy
   # (nginx, Traefik, a cloud load balancer, etc.).
   caddy:
-    image: caddy:2-alpine
+    image: docker.io/library/caddy:2-alpine
     container_name: artifact-keeper-caddy
     depends_on:
       backend:
