@@ -517,9 +517,12 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
 ///   silently relax the other.
 /// - `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8,192.168.7.0/24` — more
 ///   precise: only the listed CIDRs are exempted, and this allowlist
-///   applies to **both** contexts. Same metadata / loopback hard-blocks
-///   apply. Wins over the blanket toggle if both are set (allowlist is
-///   strictly more restrictive).
+///   applies to **every** context. Same metadata / loopback hard-blocks
+///   apply. For the upstream and SSO contexts it wins over the blanket
+///   toggle if both are set (allowlist is strictly more restrictive). For
+///   the webhook context the two are additive: `WEBHOOK_ALLOW_PRIVATE_IPS`
+///   still admits every private address when a CIDR list is also set
+///   (#4428), see [`private_ip_allowed_by`].
 ///   `UPSTREAM_PRIVATE_IP_ALLOWLIST` is accepted as a backward-compatible
 ///   alias; if both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` takes
 ///   precedence.
@@ -638,17 +641,8 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
 /// allowlist for the given context. Returns false (i.e. block) by
 /// default. Order:
 ///
-/// 1. If `AK_SSRF_ALLOW_PRIVATE_CIDRS` (or its backward-compatible
-///    alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`) is set, only IPs inside
-///    one of those CIDRs are exempted. The blanket toggle is ignored.
-///    If both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` wins so the
-///    canonical name is the operator's source of truth. The allowlist
-///    applies to both contexts.
-/// 2. Otherwise, the per-context blanket toggle is consulted:
-///    `UPSTREAM_ALLOW_PRIVATE_IPS=true` for the upstream/remote-proxy
-///    path, `WEBHOOK_ALLOW_PRIVATE_IPS=true` for the webhook path.
-///    Issue #1435 split these so relaxing one does not silently relax
-///    the other.
+/// The environment is read here and the decision itself is
+/// [`private_ip_allowed_by`], which documents the precedence.
 ///
 /// Metadata IPs and loopback are checked separately and are never
 /// reachable through this path (see `is_hard_blocked_ipv4`).
@@ -663,10 +657,45 @@ fn private_ip_allowed(ip: std::net::IpAddr, ctx: OutboundUrlContext) -> bool {
     if matches!(ctx, OutboundUrlContext::TrustedInternal) {
         return true;
     }
-    if let Some(list) = private_cidr_allowlist_value() {
-        return cidr_list_contains(&list, ip);
+    private_ip_allowed_by(
+        ip,
+        ctx,
+        private_cidr_allowlist_value().as_deref(),
+        allow_private_ips_enabled(ctx),
+    )
+}
+
+/// Pure precedence rule behind [`private_ip_allowed`], given the shared
+/// CIDR allowlist (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, or its backward-compatible
+/// alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`; the canonical name wins when both
+/// are set) and whether the context's blanket toggle is on:
+///
+/// * **Webhook** (#4428): the two knobs are ADDITIVE. An address is allowed
+///   when `WEBHOOK_ALLOW_PRIVATE_IPS` is on, or when it lies in the shared
+///   CIDR list. The CIDR list exists to narrow the attacker-influenceable
+///   upstream surface; before #4428 configuring it for that purpose silently
+///   switched off an explicit `WEBHOOK_ALLOW_PRIVATE_IPS=true`, so a private
+///   webhook receiver outside the listed CIDRs was refused. Webhook targets
+///   are created by admins only (#2321 G4), so the explicit webhook toggle
+///   is honoured as written.
+/// * **Upstream and SSO**: unchanged. A configured CIDR list is
+///   authoritative and the blanket toggle is ignored (the list is strictly
+///   more restrictive); with no list the per-context toggle decides
+///   (`UPSTREAM_ALLOW_PRIVATE_IPS` / `SSO_ALLOW_PRIVATE_IPS`, split per
+///   surface in #1435 / #1891 so relaxing one does not relax another).
+fn private_ip_allowed_by(
+    ip: std::net::IpAddr,
+    ctx: OutboundUrlContext,
+    cidr_list: Option<&str>,
+    toggle_enabled: bool,
+) -> bool {
+    if matches!(ctx, OutboundUrlContext::Webhook) {
+        return toggle_enabled || cidr_list.is_some_and(|list| cidr_list_contains(list, ip));
     }
-    allow_private_ips_enabled(ctx)
+    match cidr_list {
+        Some(list) => cidr_list_contains(list, ip),
+        None => toggle_enabled,
+    }
 }
 
 /// Read the configured private-CIDR allowlist, preferring the canonical
@@ -1889,6 +1918,81 @@ mod tests {
         // Outside the allowlist: both contexts still block.
         assert!(validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL").is_err());
         assert!(validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL").is_err());
+    }
+
+    /// #4428: the precedence rule itself, without the environment. For the
+    /// webhook context the blanket toggle and the shared CIDR list are
+    /// additive; for upstream and SSO a configured list stays authoritative.
+    #[test]
+    fn test_private_ip_allowed_by_precedence_per_context() {
+        let inside: std::net::IpAddr = "10.244.0.5".parse().unwrap();
+        let outside: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let list = Some("10.244.0.0/16");
+        let wh = OutboundUrlContext::Webhook;
+        // Webhook: toggle on admits everything private, list or no list.
+        assert!(private_ip_allowed_by(outside, wh, list, true));
+        assert!(private_ip_allowed_by(inside, wh, list, true));
+        assert!(private_ip_allowed_by(outside, wh, None, true));
+        // Webhook: toggle off falls back to the list, then to blocked.
+        assert!(private_ip_allowed_by(inside, wh, list, false));
+        assert!(!private_ip_allowed_by(outside, wh, list, false));
+        assert!(!private_ip_allowed_by(outside, wh, None, false));
+        // Upstream and SSO: the list wins over the toggle.
+        for ctx in [
+            OutboundUrlContext::Upstream,
+            OutboundUrlContext::SsoDiscovery,
+        ] {
+            assert!(!private_ip_allowed_by(outside, ctx, list, true), "{ctx:?}");
+            assert!(private_ip_allowed_by(inside, ctx, list, true), "{ctx:?}");
+            assert!(private_ip_allowed_by(inside, ctx, list, false), "{ctx:?}");
+            assert!(private_ip_allowed_by(outside, ctx, None, true), "{ctx:?}");
+            assert!(!private_ip_allowed_by(outside, ctx, None, false), "{ctx:?}");
+        }
+    }
+
+    /// #4428 end to end through the environment: with
+    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` set, `WEBHOOK_ALLOW_PRIVATE_IPS=true`
+    /// must still admit a private webhook receiver OUTSIDE the listed CIDRs,
+    /// in whichever order the two were configured, while the upstream
+    /// validator keeps treating the list as authoritative.
+    #[test]
+    fn test_webhook_toggle_is_additive_to_named_cidr_allowlist() {
+        let orders: [[(&str, &str); 2]; 2] = [
+            [
+                ("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16"),
+                ("WEBHOOK_ALLOW_PRIVATE_IPS", "true"),
+            ],
+            [
+                ("WEBHOOK_ALLOW_PRIVATE_IPS", "true"),
+                ("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16"),
+            ],
+        ];
+        for order in orders {
+            let _g = AllowlistGuard::new();
+            for (k, v) in order {
+                std::env::set_var(k, v);
+            }
+            assert!(
+                validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL").is_ok(),
+                "webhook toggle must admit a receiver outside the CIDR list ({order:?})"
+            );
+            assert!(
+                validate_outbound_webhook_url("http://10.244.0.5/hook", "Webhook URL").is_ok(),
+                "a receiver inside the CIDR list stays allowed ({order:?})"
+            );
+            assert!(
+                !is_blocked_resolved_ip_webhook("10.0.0.1".parse().unwrap()),
+                "the connect-time webhook check must agree with validation ({order:?})"
+            );
+            assert!(
+                validate_outbound_webhook_url("http://169.254.169.254/x", "Webhook URL").is_err(),
+                "metadata stays hard-blocked ({order:?})"
+            );
+            assert!(
+                validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL").is_err(),
+                "upstream keeps the CIDR list authoritative ({order:?})"
+            );
+        }
     }
 
     #[test]

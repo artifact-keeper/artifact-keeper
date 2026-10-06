@@ -434,10 +434,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(
                 target: "security",
                 "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
-                 now target ALL RFC1918 / unique-local addresses. Cloud \
-                 metadata IPs and loopback remain blocked. Prefer \
+                 now target ALL RFC1918 / unique-local addresses, whether or \
+                 not AK_SSRF_ALLOW_PRIVATE_CIDRS is also set. Cloud \
+                 metadata IPs and loopback remain blocked. Unset it and use \
                  AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
-                 narrower SSRF surface (issue #1435)."
+                 narrower SSRF surface (issues #1435, #4428)."
             );
         }
     }
