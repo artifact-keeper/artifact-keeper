@@ -19,20 +19,20 @@ use crate::error::{AppError, Result};
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
 #[cfg(unix)]
-async fn sync_parent_directory(path: &Path) -> Result<()> {
+/// Errors name the storage `key`, not the absolute directory: the message is
+/// recorded on the storage span and logged at INFO (#3954).
+async fn sync_parent_directory(path: &Path, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent).await.map_err(|e| {
             AppError::Storage(format!(
-                "Failed to open parent directory {} for sync: {}",
-                parent.display(),
-                e
+                "Failed to open parent directory of '{}' for sync: {}",
+                key, e
             ))
         })?;
         dir.sync_all().await.map_err(|e| {
             AppError::Storage(format!(
-                "Failed to sync parent directory {}: {}",
-                parent.display(),
-                e
+                "Failed to sync parent directory of '{}': {}",
+                key, e
             ))
         })?;
     }
@@ -40,15 +40,15 @@ async fn sync_parent_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn sync_parent_directory(_path: &Path) -> Result<()> {
+async fn sync_parent_directory(_path: &Path, _key: &str) -> Result<()> {
     Ok(())
 }
 
-fn temp_path_for_dest(dest: &Path, id: Uuid) -> Result<PathBuf> {
+fn temp_path_for_dest(dest: &Path, key: &str, id: Uuid) -> Result<PathBuf> {
     let parent = dest.parent().ok_or_else(|| {
         AppError::Storage(format!(
-            "Destination path {} has no parent directory",
-            dest.display()
+            "Destination path for '{}' has no parent directory",
+            key
         ))
     })?;
     Ok(parent.join(format!(".tmp.{id}")))
@@ -228,7 +228,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Some(keys))
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let path = self.key_to_path(key);
 
@@ -273,7 +273,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
         let content = fs::read(&path).await.map_err(|e| {
@@ -294,13 +294,13 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(content))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let path = self.key_to_path(key);
         Ok(path.exists())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
         fs::remove_file(&path).await.map_err(|e| {
@@ -316,14 +316,14 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let source_path = self.key_to_path(source);
         let dest_path = self.key_to_path(dest);
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp_path = temp_path_for_dest(&dest_path, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest_path, dest, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(&source_path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy failed").await;
@@ -360,11 +360,11 @@ impl StorageBackend for FilesystemStorage {
                 dest, e
             )));
         }
-        sync_parent_directory(&dest_path).await?;
+        sync_parent_directory(&dest_path, dest).await?;
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
@@ -378,7 +378,7 @@ impl StorageBackend for FilesystemStorage {
         // two concurrent writers of the same key raced on truncate/write so a
         // reader could observe torn bytes. Staging makes the visible `dest`
         // flip atomically from absent/old bytes to complete bytes.
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
 
         if let Err(e) = fs::copy(path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file copy failed").await;
@@ -416,13 +416,13 @@ impl StorageBackend for FilesystemStorage {
                 key, e
             )));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
         Ok(())
     }
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
         let file = fs::File::open(&path).await.map_err(|e| {
@@ -447,7 +447,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Box::pin(mapped))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -486,7 +486,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(out))
     }
 
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -499,7 +499,7 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+        let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
         let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
@@ -538,7 +538,7 @@ impl StorageBackend for FilesystemStorage {
             remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
             return Err(AppError::Storage(format!("Rename error: {}", e)));
         }
-        sync_parent_directory(&dest).await?;
+        sync_parent_directory(&dest, key).await?;
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -551,6 +551,64 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3954: storage spans record a failed operation (`err` on the
+    /// `#[tracing::instrument]`), which `tracing-opentelemetry` turns into an
+    /// error span status. The event is INFO, not ERROR, so a routine NotFound
+    /// (a proxy-cache miss) does not become an error log line, and is not
+    /// below INFO, so the status still lands under a `RUST_LOG=info` filter.
+    #[tokio::test]
+    async fn test_failed_operation_records_err_on_the_storage_span() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct ErrEvents(Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        struct HasError(bool);
+        impl tracing::field::Visit for HasError {
+            fn record_debug(&mut self, f: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                self.0 |= f.name() == "error";
+            }
+        }
+        impl<S> tracing_subscriber::Layer<S> for ErrEvents
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut has_error = HasError(false);
+                event.record(&mut has_error);
+                if let (true, Some(span)) = (has_error.0, ctx.event_span(event)) {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((span.name().to_string(), *event.metadata().level()));
+                }
+            }
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+        let events = ErrEvents::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+
+        let err = StorageBackend::get(&storage, "no-such-key").await;
+        assert!(matches!(err, Err(AppError::NotFound(_))));
+        assert!(StorageBackend::exists(&storage, "no-such-key")
+            .await
+            .is_ok());
+
+        let recorded = events.0.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("get".to_string(), tracing::Level::INFO)],
+            "exactly the failed get must record its error on its own span"
+        );
+    }
 
     /// #3517: `put_file` must stage and rename, never copy in place.
     ///
@@ -651,9 +709,19 @@ mod tests {
     }
 
     #[test]
+    fn test_temp_path_error_names_the_key_not_the_path() {
+        // #3954: the message is recorded on the storage span at INFO.
+        let err = temp_path_for_dest(Path::new("/"), "my-key", Uuid::nil())
+            .expect_err("the root has no parent");
+        let msg = err.to_string();
+        assert!(msg.contains("'my-key'"), "got: {msg}");
+        assert!(!msg.contains("path /"), "got: {msg}");
+    }
+
+    #[test]
     fn test_temp_path_for_dest_uses_short_sibling_name() {
         let dest = PathBuf::from(format!("/data/aa/{}", "a".repeat(240)));
-        let temp = temp_path_for_dest(&dest, Uuid::nil()).expect("temp path");
+        let temp = temp_path_for_dest(&dest, "k", Uuid::nil()).expect("temp path");
 
         assert_eq!(temp.parent(), dest.parent());
         let file_name = temp

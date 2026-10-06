@@ -202,7 +202,66 @@ impl ProxyCacheScope {
     pub fn key_overhead_bytes(&self) -> usize {
         self.root.len()
     }
+
+    /// Every key root that can hold objects this deployment cached for
+    /// `repo_key`: the scoped root, plus the pre-#3454 unscoped root.
+    ///
+    /// The unscoped root `proxy-cache/<repo_key>/` is also the shape of a
+    /// scope root: when `repo_key` equals this deployment's own scope segment
+    /// it collapses to `proxy-cache/<scope>/`, the root of the ENTIRE
+    /// deployment's cache, so it is left out in that case. A repository key
+    /// can legally equal the segment (both are drawn from `[A-Za-z0-9._-]`);
+    /// repository creation rejects the collision, this guard covers
+    /// repositories that predate that check.
+    ///
+    /// It cannot cover the same collision with ANOTHER deployment's segment
+    /// on a shared bucket: that ambiguity is inherent to the legacy layout.
+    /// Callers that delete through these roots either list the repository's
+    /// own tree on repository delete, or (lifecycle, #3734) only touch the two
+    /// leaf objects a catalogue row names.
+    pub fn repo_roots(&self, repo_key: &str) -> Vec<String> {
+        let mut roots = vec![self.repo_root(repo_key)];
+        if self.segment() != Some(repo_key) {
+            let legacy = Self::unscoped().repo_root(repo_key);
+            if !roots.contains(&legacy) {
+                roots.push(legacy);
+            }
+        }
+        roots
+    }
+
+    /// Whether `key` is a cache-entry object (`.../__content__` body or
+    /// `.../__cache_meta__.json` sidecar) under one of [`Self::repo_roots`]
+    /// for `repo_key`.
+    ///
+    /// The lifecycle sweep (#3734) deletes the keys a `proxy_cache_artifacts`
+    /// row records. A row is database state, not a derivation, so this is the
+    /// guard that keeps a corrupt or foreign row from steering a retention
+    /// delete at another repository's cache, at hosted content, or out of the
+    /// namespace with a `..` segment.
+    pub fn owns_entry_key(&self, repo_key: &str, key: &str) -> bool {
+        let Some(rest) = self
+            .repo_roots(repo_key)
+            .iter()
+            .find_map(|root| key.strip_prefix(root.as_str()).map(str::to_string))
+        else {
+            return false;
+        };
+        let Some(logical) = ENTRY_KEY_SUFFIXES
+            .iter()
+            .find_map(|suffix| rest.strip_suffix(suffix))
+        else {
+            return false;
+        };
+        !logical.is_empty()
+            && logical
+                .split('/')
+                .all(|segment| !matches!(segment, "" | "." | ".."))
+    }
 }
+
+/// Leaf names of the two objects one proxy-cache entry occupies.
+const ENTRY_KEY_SUFFIXES: [&str; 2] = ["/__content__", "/__cache_meta__.json"];
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -225,6 +284,61 @@ mod tests {
         assert!(crate::storage::key_is_bucket_root_anchored(
             &ProxyCacheScope::from_deployment_id(DEPLOY_A).repo_root("some-repo")
         ));
+    }
+
+    #[test]
+    fn repo_roots_include_legacy_tree_unless_key_is_the_scope_3734() {
+        let scoped = ProxyCacheScope::from_explicit_segment("prod").unwrap();
+        assert_eq!(
+            scoped.repo_roots("pypi-remote"),
+            vec![
+                "proxy-cache/prod/pypi-remote/".to_string(),
+                "proxy-cache/pypi-remote/".to_string()
+            ]
+        );
+        // The legacy root of a key equal to the segment is the whole
+        // deployment's cache root: never offered.
+        assert_eq!(
+            scoped.repo_roots("prod"),
+            vec!["proxy-cache/prod/prod/".to_string()]
+        );
+        assert_eq!(
+            ProxyCacheScope::unscoped().repo_roots("r"),
+            vec!["proxy-cache/r/".to_string()]
+        );
+    }
+
+    #[test]
+    fn owns_entry_key_accepts_only_this_repositorys_entry_objects_3734() {
+        let scope = ProxyCacheScope::from_explicit_segment("prod").unwrap();
+        for key in [
+            "proxy-cache/prod/r/simple/six/six.whl/__content__",
+            "proxy-cache/prod/r/simple/six/six.whl/__cache_meta__.json",
+            "proxy-cache/r/simple/six/six.whl/__content__",
+        ] {
+            assert!(scope.owns_entry_key("r", key), "{key} must be owned");
+        }
+        for key in [
+            // another repository, scoped and legacy
+            "proxy-cache/prod/other/simple/six/__content__",
+            "proxy-cache/other/simple/six/__content__",
+            // another deployment's scope
+            "proxy-cache/staging/r/simple/six/__content__",
+            // hosted content and arbitrary objects
+            "repos/r/six.whl",
+            "proxy-cache/prod/r/simple/six/six.whl",
+            "proxy-cache/prod/r/__content__",
+            // traversal and empty segments
+            "proxy-cache/prod/r/../other/x/__content__",
+            "proxy-cache/prod/r/./x/__content__",
+            "proxy-cache/prod/r//x/__content__",
+        ] {
+            assert!(!scope.owns_entry_key("r", key), "{key} must be refused");
+        }
+        // A key equal to the scope segment never reaches through the legacy
+        // root into a sibling repository of the same deployment.
+        assert!(!scope.owns_entry_key("prod", "proxy-cache/prod/other/x/__content__"));
+        assert!(scope.owns_entry_key("prod", "proxy-cache/prod/prod/x/__content__"));
     }
 
     #[test]

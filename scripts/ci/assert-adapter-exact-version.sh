@@ -33,6 +33,16 @@
 #
 # Exit codes: 0 ok, 1 BLOCKED, 2 INFRA.
 #
+# Machine-readable result (#4076). On exit 0 the decision is printed as
+# key=value lines, and appended to $GITHUB_OUTPUT when that is set, so the
+# candidate and the promote read it instead of matching prose:
+#   decision=new|stays   new: the promote creates the exact tag from this
+#                        commit's sha-<sha> image; stays: the exact tag keeps
+#                        its published digest, which is what the release ships
+#   owner_rev=<40-hex>   the commit the published exact tag was built from
+#                        (empty for "new")
+#   adapter_version=<v>  the VERSION the decision is about
+#
 # Env:
 #   ADAPTER_SHA          (required) commit being certified (40-hex, must be
 #                        present in the current git repository)
@@ -54,6 +64,19 @@ HUB_IMAGE="${ADAPTER_HUB_IMAGE:-artifactkeeper/scanner-adapter}"
 SOURCES="${ADAPTER_SOURCES:-docker/scanner-adapter docker/Dockerfile.scanner-adapter}"
 STATE_CMD="${ADAPTER_TAG_STATE_CMD:-${ROOT}/.github/scripts/registry-tag-state.sh}"
 REV_CMD="${ADAPTER_TAG_REVISION_CMD:-${ROOT}/.github/scripts/registry-tag-revision.sh}"
+
+# key=value on stdout, and into $GITHUB_OUTPUT for a workflow step.
+emit() {
+  echo "$1=$2"
+  [[ -n "${GITHUB_OUTPUT:-}" ]] && echo "$1=$2" >> "$GITHUB_OUTPUT"
+  return 0
+}
+decided() { # <new|stays> <owner rev or empty>
+  emit decision "$1"
+  emit owner_rev "$2"
+  emit adapter_version "$VERSION"
+  exit 0
+}
 
 blocked() { echo "::error title=Scanner adapter exact tag cannot publish::$1"; echo "BLOCKED: $1"; exit 1; }
 infra()   { echo "::error title=Scanner adapter registry state unmeasurable::$1"; echo "INFRA: $1"; exit 2; }
@@ -83,7 +106,7 @@ echo "  docker.io/${HUB_IMAGE}:${VERSION} -> ${hub_state:-<no answer>}"
 case "${ghcr_state}|${hub_state}" in
   absent\|absent)
     echo "ok: scanner-adapter ${VERSION} is new on both registries; the promote creates the exact tag from this commit's sha-${SHA:0:7} image."
-    exit 0
+    decided new ''
     ;;
   present\|present)
     ;;
@@ -121,4 +144,4 @@ if ! git diff --quiet "$rev" "$SHA" -- "${srcarr[@]}"; then
 fi
 
 echo "ok: scanner-adapter ${VERSION} is published from ${rev:0:7} and its sources are unchanged at ${SHA:0:7}; the exact tag stays on its published digest."
-exit 0
+decided stays "$rev"

@@ -147,6 +147,10 @@ const HOT_TABLES: &[(&str, &str)] = &[
     ),
     ("oci_tags", "one row per tag across every OCI repository"),
     (
+        "oci_manifests",
+        "one row per OCI manifest per repository (#1683), at least as large as oci_tags",
+    ),
+    (
         "manifest_blob_refs",
         "one row per blob referenced by a manifest — the widest OCI fan-out",
     ),

@@ -28,6 +28,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::upstream_tracing::send_upstream;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -288,7 +289,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     tracing::debug!("Proxying sumdb request to {}", url);
 
     let client = crate::services::http_client::default_client();
-    let upstream_resp = client.get(&url).send().await.map_err(|e| {
+    let upstream_resp = send_upstream(client.get(&url)).await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
         (StatusCode::BAD_GATEWAY, "Failed to reach checksum database").into_response()
     })?;

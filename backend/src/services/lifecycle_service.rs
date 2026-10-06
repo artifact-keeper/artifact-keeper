@@ -16,6 +16,9 @@
 //!   `tag_pattern_keep` for backward compatibility. See issue #1905.
 //! - tag_pattern_delete: delete artifacts matching a regex pattern
 //! - size_quota_bytes: enforce per-repo storage quotas
+//! - composite: delete artifacts that meet every one of several conditions
+//!   (`conditions[]`, ANDed), with the same `match`, `exclude` and `min_keep`
+//!   keys; see the `conditions` submodule (#2024).
 //!
 //! Every policy type additionally accepts an optional `config.exclude` block
 //! naming artifacts the sweep must never delete (#2024):
@@ -32,9 +35,12 @@
 //! It is still per-policy, not a global keep-list: a second policy without the
 //! same `exclude` block can still delete the artifact.
 //!
-//! Every policy type also accepts an optional `config.match` scope; today its
-//! only selector is `path_prefix`, which limits the policy to artifacts whose
-//! repository-relative path starts with the given string. `max_age_days`
+//! Every policy type also accepts an optional `config.match` scope:
+//! `path_prefix` limits the policy to artifacts whose repository-relative path
+//! starts with the given string, and `version_pattern` to artifacts whose
+//! version (the tag, for OCI formats) matches a regex. The pattern is a
+//! PostgreSQL regex (validated by PostgreSQL at create/update time) and is
+//! unanchored unless it uses `^` / `$`. `max_age_days`
 //! additionally accepts `min_keep`: the newest N artifacts of each package
 //! (grouped and ordered exactly as `max_versions` groups them) survive even
 //! when they are past the age window (#2024):
@@ -46,6 +52,11 @@
 //! Unknown keys in `config` are rejected at create/update time rather than
 //! ignored, so a misspelt exclusion fails loudly instead of deleting what it
 //! was written to protect.
+//!
+//! In a Remote repository, `max_age_days` and `no_downloads_days` also evict
+//! proxy-cached content catalogued in `proxy_cache_artifacts` (#3734); see
+//! the `proxy_cache` submodule. Those entries are reported under
+//! `PolicyExecutionResult::proxy_cache`, separately from artifacts.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -118,24 +129,48 @@ macro_rules! path_prefix_predicate {
     };
 }
 
-/// Every per-policy row filter that is independent of the policy type: the
-/// exclusion list ([`exclusion_predicate!`]) and the `match` scope
-/// ([`path_prefix_predicate!`]).
+/// SQL fragment implementing a policy's `config.match.version_pattern` scope.
 ///
-/// This is the one fragment every candidate query and every soft-delete
-/// appends, always bound through [`bind_policy_filters!`] in the same order
-/// (`versions`, `version_patterns`, `path_prefix`), so the dry-run preview and
-/// the live run cannot disagree about which artifacts are in scope (#2024).
-macro_rules! policy_filter_predicate {
-    ($alias:literal, $versions_param:literal, $patterns_param:literal, $prefix_param:literal) => {
+/// `$pattern_param` is a nullable `TEXT` bind of
+/// [`PolicyFilters::version_pattern`]. NULL (no selector) makes the conjunct
+/// true for every row. The version is coalesced to `''` exactly as in
+/// [`exclusion_predicate!`], so a version-less artifact is in scope only when
+/// the pattern matches the empty string, never through a NULL comparison.
+macro_rules! version_pattern_predicate {
+    ($alias:literal, $pattern_param:literal) => {
         concat!(
-            exclusion_predicate!($alias, $versions_param, $patterns_param),
-            path_prefix_predicate!($alias, $prefix_param)
+            "    AND (",
+            $pattern_param,
+            "::TEXT IS NULL OR COALESCE(",
+            $alias,
+            "version, '') ~ ",
+            $pattern_param,
+            "::TEXT)\n"
         )
     };
 }
 
-/// Bind a [`PolicyFilters`] to the three consecutive parameters a
+/// Every per-policy row filter that is independent of the policy type: the
+/// exclusion list ([`exclusion_predicate!`]) and the `match` scope
+/// ([`path_prefix_predicate!`], [`version_pattern_predicate!`]).
+///
+/// This is the one fragment every candidate query and every soft-delete
+/// appends, always bound through [`bind_policy_filters!`] in the same order
+/// (`versions`, `version_patterns`, `path_prefix`, `version_pattern`), so the
+/// dry-run preview and the live run cannot disagree about which artifacts are
+/// in scope (#2024). The four parameters are always consecutive and start at
+/// the `$versions_param` position.
+macro_rules! policy_filter_predicate {
+    ($alias:literal, $versions_param:literal, $patterns_param:literal, $prefix_param:literal, $version_pattern_param:literal) => {
+        concat!(
+            exclusion_predicate!($alias, $versions_param, $patterns_param),
+            path_prefix_predicate!($alias, $prefix_param),
+            version_pattern_predicate!($alias, $version_pattern_param)
+        )
+    };
+}
+
+/// Bind a [`PolicyFilters`] to the four consecutive parameters a
 /// [`policy_filter_predicate!`] expansion expects. Works for both
 /// `sqlx::query` and `sqlx::query_as` builders.
 macro_rules! bind_policy_filters {
@@ -144,6 +179,7 @@ macro_rules! bind_policy_filters {
             .bind(&$filters.exclusions.versions)
             .bind(&$filters.exclusions.version_patterns)
             .bind(&$filters.path_prefix)
+            .bind(&$filters.version_pattern)
     };
 }
 
@@ -248,15 +284,23 @@ macro_rules! max_versions_ranked_cte {
             " AS rn\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
             oci_tag_join!(),
             "WHERE a.repository_id = $1\n    AND a.is_deleted = false\n",
-            policy_filter_predicate!("a.", "$3", "$4", "$5"),
+            policy_filter_predicate!("a.", "$3", "$4", "$5", "$6"),
             ")\n"
         )
     };
 }
 
-/// Build a max-age query with a shared effective timestamp expression.
+/// Build a retention query: live artifacts of the repository that satisfy a
+/// deletion condition and the policy's shared filters.
 ///
-/// An OCI manifest artifact ages from the matching logical reference row in
+/// The deletion condition is the trailing token list (`max_age_expired!(..)`
+/// for `max_age_days`, the AND of every configured condition for a
+/// `composite` policy). Each statement of a count/soft-delete pair expands the
+/// same condition through this macro, which is what keeps a preview and the
+/// live run on one definition.
+///
+/// A max-age condition ([`max_age_expired!`]) ages an artifact as follows. An
+/// OCI manifest artifact ages from the matching logical reference row in
 /// `oci_tags`, keyed by `(repository, image, reference)`, rather than from the
 /// path-keyed artifact row's first-seen `created_at`. This applies to both
 /// human-readable tags and digest-shaped references. When no matching tag row
@@ -302,75 +346,75 @@ macro_rules! max_versions_ranked_cte {
 /// artifact row is soft-deleted despite its fresh tag mapping. The `oci_tags`
 /// row still protects the current manifest bytes, but the reference disappears
 /// from artifact-backed listings. Verified both ways against a live database.
-macro_rules! max_age_from_where {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt) => {
+macro_rules! retention_from_where {
+    ($repository_predicate:literal, $filter_params:tt, $($condition:tt)+) => {
         concat!(
             "\nFROM artifacts a\n",
             oci_tag_join!(),
             "WHERE\n    ",
             $repository_predicate,
             "a.is_deleted = false\n    AND ",
-            max_age_expired!($days_parameter),
+            $($condition)+,
             "\n",
-            max_age_filters!($filter_params)
+            filters_at!($filter_params)
         )
     };
 }
 
-/// Expand a `[versions, patterns, prefix]` parameter triple into
-/// [`policy_filter_predicate!`] on alias `a.`.
-macro_rules! max_age_filters {
-    ([$versions:literal, $patterns:literal, $prefix:literal]) => {
-        policy_filter_predicate!("a.", $versions, $patterns, $prefix)
+/// Expand a `[versions, patterns, prefix, version_pattern]` parameter list
+/// into [`policy_filter_predicate!`] on alias `a.`.
+macro_rules! filters_at {
+    ([$versions:literal, $patterns:literal, $prefix:literal, $version_pattern:literal]) => {
+        policy_filter_predicate!("a.", $versions, $patterns, $prefix, $version_pattern)
     };
 }
 
-/// Count/size query for a max-age policy.
-macro_rules! max_age_select_sql {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt) => {
+/// Count/size query over [`retention_from_where!`].
+macro_rules! retention_select_sql {
+    ($repository_predicate:literal, $filter_params:tt, $($condition:tt)+) => {
         concat!(
             "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes",
-            max_age_from_where!($repository_predicate, $days_parameter, $filter_params)
+            retention_from_where!($repository_predicate, $filter_params, $($condition)+)
         )
     };
 }
 
-/// Soft-delete query for a max-age policy.
+/// Soft-delete query over [`retention_from_where!`].
 ///
 /// `UPDATE` cannot carry a `LEFT JOIN`, so the shared `FROM`/`WHERE` is reused
 /// verbatim inside an `IN` subselect. Both statements therefore still derive
 /// from one definition -- the property that makes dry-run counts and the real
 /// run agree, and the reason the previous two hand-maintained copies were
 /// collapsed into a macro in the first place.
-macro_rules! max_age_update_sql {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt) => {
+macro_rules! retention_update_sql {
+    ($repository_predicate:literal, $filter_params:tt, $($condition:tt)+) => {
         concat!(
             "UPDATE artifacts AS a SET is_deleted = true, updated_at = NOW()\nWHERE a.id IN (\n    SELECT a.id",
-            max_age_from_where!($repository_predicate, $days_parameter, $filter_params),
+            retention_from_where!($repository_predicate, $filter_params, $($condition)+),
             ")\n"
         )
     };
 }
 
-/// Ranked candidate set for a max-age policy with `min_keep` (#2024).
+/// Ranked candidate set for a policy with `min_keep` (#2024).
 ///
 /// Ranks every live, in-scope, non-excluded artifact in its retention group
 /// with [`retention_rank!`] -- the exact grouping and recency `max_versions`
-/// uses -- and flags whether it is past the age window with the same
-/// [`max_age_expired!`] test the plain max-age query uses. The age test is a
-/// column rather than a `WHERE` conjunct on purpose: the newest N of a group
-/// must be counted whether or not they have expired, otherwise "keep the 5
-/// newest" would mean "keep the 5 newest *expired*" and a group whose recent
-/// pushes are all young would lose every old version.
+/// uses -- and flags whether it satisfies the deletion condition (the
+/// trailing tokens, e.g. [`max_age_expired!`]) as the `expired` column. The
+/// condition is a column rather than a `WHERE` conjunct on purpose: the newest
+/// N of a group must be counted whether or not they meet it, otherwise "keep
+/// the 5 newest" would mean "keep the 5 newest *expired*" and a group whose
+/// recent pushes are all young would lose every old version.
 ///
 /// Excluded and out-of-scope artifacts are filtered before ranking, exactly as
 /// in `max_versions`: a pinned `latest` must not occupy one of the slots
 /// `min_keep` reserves for real versions.
-macro_rules! max_age_min_keep_cte {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt) => {
+macro_rules! retention_ranked_cte {
+    ($repository_predicate:literal, $filter_params:tt, $($condition:tt)+) => {
         concat!(
             "\nWITH ranked AS (\n    SELECT a.id,\n           a.size_bytes,\n           ",
-            max_age_expired!($days_parameter),
+            $($condition)+,
             " AS expired,\n           ",
             retention_rank!(),
             " AS rn\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
@@ -378,17 +422,17 @@ macro_rules! max_age_min_keep_cte {
             "WHERE\n    ",
             $repository_predicate,
             "a.is_deleted = false\n",
-            max_age_filters!($filter_params),
+            filters_at!($filter_params),
             ")\n"
         )
     };
 }
 
-/// Count/size query for a max-age policy with `min_keep`.
-macro_rules! max_age_min_keep_select_sql {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt, $keep_parameter:literal) => {
+/// Count/size query for a policy with `min_keep`.
+macro_rules! retention_ranked_select_sql {
+    ($repository_predicate:literal, $filter_params:tt, $keep_parameter:literal, $($condition:tt)+) => {
         concat!(
-            max_age_min_keep_cte!($repository_predicate, $days_parameter, $filter_params),
+            retention_ranked_cte!($repository_predicate, $filter_params, $($condition)+),
             "SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes\nFROM ranked\nWHERE expired AND rn > ",
             $keep_parameter,
             "::BIGINT\n"
@@ -396,12 +440,12 @@ macro_rules! max_age_min_keep_select_sql {
     };
 }
 
-/// Soft-delete query for a max-age policy with `min_keep`; same CTE and the
-/// same `expired AND rn > N` test as the count above.
-macro_rules! max_age_min_keep_update_sql {
-    ($repository_predicate:literal, $days_parameter:literal, $filter_params:tt, $keep_parameter:literal) => {
+/// Soft-delete query for a policy with `min_keep`; same CTE and the same
+/// `expired AND rn > N` test as the count above.
+macro_rules! retention_ranked_update_sql {
+    ($repository_predicate:literal, $filter_params:tt, $keep_parameter:literal, $($condition:tt)+) => {
         concat!(
-            max_age_min_keep_cte!($repository_predicate, $days_parameter, $filter_params),
+            retention_ranked_cte!($repository_predicate, $filter_params, $($condition)+),
             "UPDATE artifacts SET is_deleted = true, updated_at = NOW()\nWHERE id IN (SELECT id FROM ranked WHERE expired AND rn > ",
             $keep_parameter,
             "::BIGINT)\n"
@@ -409,28 +453,37 @@ macro_rules! max_age_min_keep_update_sql {
     };
 }
 
-const MAX_AGE_SCOPED_SELECT_SQL: &str =
-    max_age_select_sql!("a.repository_id = $1\n    AND ", "$2", ["$3", "$4", "$5"]);
-const MAX_AGE_GLOBAL_SELECT_SQL: &str = max_age_select_sql!("", "$1", ["$2", "$3", "$4"]);
-const MAX_AGE_SCOPED_UPDATE_SQL: &str =
-    max_age_update_sql!("a.repository_id = $1\n    AND ", "$2", ["$3", "$4", "$5"]);
-const MAX_AGE_GLOBAL_UPDATE_SQL: &str = max_age_update_sql!("", "$1", ["$2", "$3", "$4"]);
-const MAX_AGE_MIN_KEEP_SCOPED_SELECT_SQL: &str = max_age_min_keep_select_sql!(
+// Max-age binds: [$1 repository], days, the four filter parameters, [min_keep].
+const MAX_AGE_SCOPED_SELECT_SQL: &str = retention_select_sql!(
     "a.repository_id = $1\n    AND ",
-    "$2",
-    ["$3", "$4", "$5"],
-    "$6"
+    ["$3", "$4", "$5", "$6"],
+    max_age_expired!("$2")
+);
+const MAX_AGE_GLOBAL_SELECT_SQL: &str =
+    retention_select_sql!("", ["$2", "$3", "$4", "$5"], max_age_expired!("$1"));
+const MAX_AGE_SCOPED_UPDATE_SQL: &str = retention_update_sql!(
+    "a.repository_id = $1\n    AND ",
+    ["$3", "$4", "$5", "$6"],
+    max_age_expired!("$2")
+);
+const MAX_AGE_GLOBAL_UPDATE_SQL: &str =
+    retention_update_sql!("", ["$2", "$3", "$4", "$5"], max_age_expired!("$1"));
+const MAX_AGE_MIN_KEEP_SCOPED_SELECT_SQL: &str = retention_ranked_select_sql!(
+    "a.repository_id = $1\n    AND ",
+    ["$3", "$4", "$5", "$6"],
+    "$7",
+    max_age_expired!("$2")
 );
 const MAX_AGE_MIN_KEEP_GLOBAL_SELECT_SQL: &str =
-    max_age_min_keep_select_sql!("", "$1", ["$2", "$3", "$4"], "$5");
-const MAX_AGE_MIN_KEEP_SCOPED_UPDATE_SQL: &str = max_age_min_keep_update_sql!(
+    retention_ranked_select_sql!("", ["$2", "$3", "$4", "$5"], "$6", max_age_expired!("$1"));
+const MAX_AGE_MIN_KEEP_SCOPED_UPDATE_SQL: &str = retention_ranked_update_sql!(
     "a.repository_id = $1\n    AND ",
-    "$2",
-    ["$3", "$4", "$5"],
-    "$6"
+    ["$3", "$4", "$5", "$6"],
+    "$7",
+    max_age_expired!("$2")
 );
 const MAX_AGE_MIN_KEEP_GLOBAL_UPDATE_SQL: &str =
-    max_age_min_keep_update_sql!("", "$1", ["$2", "$3", "$4"], "$5");
+    retention_ranked_update_sql!("", ["$2", "$3", "$4", "$5"], "$6", max_age_expired!("$1"));
 
 /// Pick the `(count, soft-delete)` statement pair for a max-age run.
 ///
@@ -452,6 +505,25 @@ pub(crate) fn max_age_sql(scoped: bool, min_keep: bool) -> (&'static str, &'stat
         ),
     }
 }
+/// A no-downloads condition: the artifact has no `download_statistics` row
+/// inside the window and was itself created before it. Shared by the
+/// `no_downloads_days` policy and the `no_downloads_days` condition of a
+/// `composite` policy, so the two cannot drift apart.
+macro_rules! no_downloads_idle {
+    ($alias:literal, $days_parameter:literal) => {
+        concat!(
+            "NOT EXISTS (\n        SELECT 1 FROM download_statistics ds\n        WHERE ds.artifact_id = ",
+            $alias,
+            "id\n          AND ds.downloaded_at > NOW() - make_interval(days => ",
+            $days_parameter,
+            "::INT)\n    )\n    AND ",
+            $alias,
+            "created_at < NOW() - make_interval(days => ",
+            $days_parameter,
+            "::INT)"
+        )
+    };
+}
 
 /// Shared `WHERE` body for a `no_downloads_days` policy.
 ///
@@ -466,22 +538,21 @@ pub(crate) fn max_age_sql(scoped: bool, min_keep: bool) -> (&'static str, &'stat
 /// exclusion list that reached only one of the two copies would report an
 /// artifact as protected and then delete it.
 macro_rules! no_downloads_where {
-    ($alias:literal, $versions_parameter:literal, $patterns_parameter:literal, $prefix_parameter:literal) => {
+    ($alias:literal, $versions_parameter:literal, $patterns_parameter:literal, $prefix_parameter:literal, $version_pattern_parameter:literal) => {
         concat!(
             "WHERE ",
             $alias,
             "is_deleted = false\n    AND ($1::UUID IS NULL OR ",
             $alias,
-            "repository_id = $1)\n    AND NOT EXISTS (\n        SELECT 1 FROM download_statistics ds\n        WHERE ds.artifact_id = ",
-            $alias,
-            "id\n          AND ds.downloaded_at > NOW() - make_interval(days => $2::INT)\n    )\n    AND ",
-            $alias,
-            "created_at < NOW() - make_interval(days => $2::INT)\n",
+            "repository_id = $1)\n    AND ",
+            no_downloads_idle!($alias, "$2"),
+            "\n",
             policy_filter_predicate!(
                 $alias,
                 $versions_parameter,
                 $patterns_parameter,
-                $prefix_parameter
+                $prefix_parameter,
+                $version_pattern_parameter
             )
         )
     };
@@ -490,14 +561,14 @@ macro_rules! no_downloads_where {
 /// Count/size query for a `no_downloads_days` policy.
 const NO_DOWNLOADS_SELECT_SQL: &str = concat!(
     "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes\nFROM artifacts a\n",
-    no_downloads_where!("a.", "$3", "$4", "$5")
+    no_downloads_where!("a.", "$3", "$4", "$5", "$6")
 );
 
 /// Soft-delete query for a `no_downloads_days` policy. Derives from the same
 /// `no_downloads_where!` definition as the count above.
 const NO_DOWNLOADS_UPDATE_SQL: &str = concat!(
     "UPDATE artifacts SET is_deleted = true, updated_at = NOW()\n",
-    no_downloads_where!("artifacts.", "$3", "$4", "$5")
+    no_downloads_where!("artifacts.", "$3", "$4", "$5", "$6")
 );
 
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
@@ -703,6 +774,9 @@ pub(crate) enum PolicyType {
     TagPatternKeep,
     TagPatternDelete,
     SizeQuotaBytes,
+    /// `conditions[]`: the AND of several deletion conditions (#2024). See
+    /// the `conditions` submodule.
+    Composite,
 }
 
 impl PolicyType {
@@ -717,6 +791,7 @@ impl PolicyType {
             "tag_pattern_keep" => Ok(Self::TagPatternKeep),
             "tag_pattern_delete" => Ok(Self::TagPatternDelete),
             "size_quota_bytes" => Ok(Self::SizeQuotaBytes),
+            "composite" => Ok(Self::Composite),
             other => Err(AppError::Internal(format!(
                 "Unsupported policy type: {other}",
             ))),
@@ -733,6 +808,7 @@ impl PolicyType {
             Self::TagPatternKeep => "tag_pattern_keep",
             Self::TagPatternDelete => "tag_pattern_delete",
             Self::SizeQuotaBytes => "size_quota_bytes",
+            Self::Composite => "composite",
         }
     }
 }
@@ -785,6 +861,36 @@ pub(crate) fn parse_pattern_field(
     Ok(pattern.to_string())
 }
 
+/// Largest day window a policy accepts (100 years). A window is bound into
+/// `make_interval(days => $N::INT)`; anything near `i32::MAX` days makes
+/// PostgreSQL raise `timestamp out of range` on every run, and an unchecked
+/// `as i32` cast of a larger value wraps to a small window that deletes far
+/// more than written. Create/update refuses anything above this.
+pub(crate) const MAX_WINDOW_DAYS: i64 = 36_500;
+
+/// Check a day window at create/update time: `1..=MAX_WINDOW_DAYS`.
+pub(crate) fn check_window_days(days: i64, label: &str) -> Result<i32> {
+    if (1..=MAX_WINDOW_DAYS).contains(&days) {
+        Ok(days as i32)
+    } else {
+        Err(AppError::Validation(format!(
+            "{label} must be a positive integer number of days, at most {MAX_WINDOW_DAYS}"
+        )))
+    }
+}
+
+/// The day window of a `max_age_days` / `no_downloads_days` config as bound
+/// at execution time, shared by both executors and the proxy-cache arm. It
+/// saturates rather than wraps, so a row stored before [`MAX_WINDOW_DAYS`]
+/// was enforced can never turn into a short window.
+pub(crate) fn parse_window_days(
+    config: &serde_json::Value,
+    policy_type: PolicyType,
+) -> Result<i32> {
+    let days = parse_i64_field(config, policy_type.as_wire_str(), "days")?;
+    Ok(i32::try_from(days).unwrap_or(i32::MAX))
+}
+
 /// Top-level `config` key carrying a policy's exclusion ("keep") list.
 pub(crate) const EXCLUDE_CONFIG_KEY: &str = "exclude";
 
@@ -815,7 +921,6 @@ pub(crate) struct PolicyExclusions {
 
 impl PolicyExclusions {
     /// True when no exclusion is configured, i.e. the SQL predicate is inert.
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.versions.is_empty() && self.version_patterns.is_empty()
     }
@@ -896,12 +1001,12 @@ pub(crate) fn parse_exclusions(config: &serde_json::Value) -> Result<PolicyExclu
 pub(crate) const MATCH_CONFIG_KEY: &str = "match";
 
 /// The only keys accepted inside `config.match`. Further selectors from #2024
-/// (format, tag regex) are deliberately rejected until they are implemented,
+/// (format, repository) are deliberately rejected until they are implemented,
 /// so a config written for them fails instead of silently matching more.
-const MATCH_ALLOWED_KEYS: [&str; 1] = ["path_prefix"];
+const MATCH_ALLOWED_KEYS: [&str; 2] = ["path_prefix", "version_pattern"];
 
-/// `max_age_days` key: keep the newest N artifacts of each retention group
-/// even when they are past the age window (#2024).
+/// `max_age_days` / `composite` key: keep the newest N artifacts of each
+/// retention group even when they meet the deletion condition (#2024).
 pub(crate) const MIN_KEEP_CONFIG_KEY: &str = "min_keep";
 
 /// Every type-independent row filter a policy carries: its exclusion list and
@@ -916,17 +1021,44 @@ pub(crate) struct PolicyFilters {
     /// `config.match.path_prefix`: only artifacts whose repository-relative
     /// `path` starts with this string are candidates. `None` matches all.
     pub(crate) path_prefix: Option<String>,
+    /// `config.match.version_pattern`: only artifacts whose `version` (the
+    /// tag, for OCI formats) matches this regex are candidates. `None`
+    /// matches all. It is a PostgreSQL (ARE) regex, validated by PostgreSQL
+    /// at create/update time, and unanchored: `sha-` also matches
+    /// `release-sha-1`, so anchor with `^` / `$`. Unlike `exclude.version_patterns` this narrows the policy
+    /// rather than protecting from it, and it applies before `min_keep` /
+    /// `max_versions` ranking, so "keep the 5 newest" counts in-scope
+    /// versions only.
+    pub(crate) version_pattern: Option<String>,
 }
 
-/// Parse and validate `config.match`. Same strictness as `config.exclude`: an
-/// unknown key or a malformed value is a validation error, because a scope
-/// that silently matches everything turns a narrow cleanup into a broad one.
-pub(crate) fn parse_match_path_prefix(config: &serde_json::Value) -> Result<Option<String>> {
+/// Read one optional non-empty string selector out of `config.match`.
+fn parse_match_string(
+    matcher: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>> {
+    match matcher.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(AppError::Validation(format!(
+            "match.{key} must be a non-empty string"
+        ))),
+    }
+}
+
+/// Parse and validate `config.match` into `(path_prefix, version_pattern)`.
+/// Same strictness as `config.exclude`: an unknown key or a malformed value
+/// is a validation error, because a scope that silently matches everything
+/// turns a narrow cleanup into a broad one.
+pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>, Option<String>)> {
     let Some(matcher) = config.get(MATCH_CONFIG_KEY) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let map = matcher.as_object().ok_or_else(|| {
-        AppError::Validation("config 'match' must be an object with 'path_prefix'".to_string())
+        AppError::Validation(
+            "config 'match' must be an object with 'path_prefix' and/or 'version_pattern'"
+                .to_string(),
+        )
     })?;
     if let Some(key) = map
         .keys()
@@ -937,24 +1069,84 @@ pub(crate) fn parse_match_path_prefix(config: &serde_json::Value) -> Result<Opti
             MATCH_ALLOWED_KEYS.join(", ")
         )));
     }
-    match map.get("path_prefix") {
-        None => Ok(None),
-        Some(serde_json::Value::String(prefix)) if !prefix.is_empty() => Ok(Some(prefix.clone())),
-        Some(_) => Err(AppError::Validation(
-            "match.path_prefix must be a non-empty string".to_string(),
-        )),
+    let path_prefix = parse_match_string(map, "path_prefix")?;
+    let version_pattern = parse_match_string(map, "version_pattern")?;
+    if let Some(pattern) = &version_pattern {
+        regex::Regex::new(pattern).map_err(|e| {
+            AppError::Validation(format!("Invalid regex in match.version_pattern: {e}"))
+        })?;
+        reject_backspace_escape(pattern)?;
     }
+    Ok((path_prefix, version_pattern))
+}
+
+/// `\b` and `\B` validate as word-boundary escapes in the Rust `regex` crate
+/// but mean "backspace" and "backslash" in a PostgreSQL regex, so a scope
+/// written with them would silently match nothing. PostgreSQL spells word
+/// boundaries `\y` / `\Y`.
+fn reject_backspace_escape(pattern: &str) -> Result<()> {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.next(), Some('b' | 'B')) {
+            return Err(AppError::Validation(
+                "match.version_pattern: \\b and \\B are not word boundaries in a PostgreSQL \
+                 regex; use \\y / \\Y"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// SQLSTATE `invalid_regular_expression`.
+const INVALID_REGULAR_EXPRESSION: &str = "2201B";
+
+/// Map a failed PostgreSQL regex compile to a validation error; anything else
+/// stays a database error.
+fn postgres_regex_error(code: Option<&str>, message: &str) -> AppError {
+    if code == Some(INVALID_REGULAR_EXPRESSION) {
+        AppError::Validation(format!(
+            "match.version_pattern is not a valid PostgreSQL regular expression: {message}"
+        ))
+    } else {
+        AppError::Database(message.to_string())
+    }
+}
+
+/// Compile `match.version_pattern` with the engine that runs it. The pattern
+/// is executed by PostgreSQL (`version ~ $N`), whose regex dialect differs
+/// from the Rust `regex` crate `parse_match` checks with: `\z`, `\pL`,
+/// `(?P<name>...)` or a mid-pattern `(?i)` pass the Rust check and then fail
+/// every run. Called at create/update time, inside the write transaction.
+pub(crate) async fn validate_version_pattern_in_postgres(
+    conn: &mut sqlx::PgConnection,
+    config: &serde_json::Value,
+) -> Result<()> {
+    let (_, Some(pattern)) = parse_match(config)? else {
+        return Ok(());
+    };
+    sqlx::query("SELECT '' ~ $1")
+        .bind(&pattern)
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| match e.as_database_error() {
+            Some(db) => postgres_regex_error(db.code().as_deref(), db.message()),
+            None => AppError::Database(e.to_string()),
+        })
 }
 
 /// Parse a policy's [`PolicyFilters`] from its `config`.
 pub(crate) fn parse_policy_filters(config: &serde_json::Value) -> Result<PolicyFilters> {
+    let (path_prefix, version_pattern) = parse_match(config)?;
     Ok(PolicyFilters {
         exclusions: parse_exclusions(config)?,
-        path_prefix: parse_match_path_prefix(config)?,
+        path_prefix,
+        version_pattern,
     })
 }
 
-/// Parse the optional `min_keep` of a `max_age_days` config. Absent is
+/// Parse the optional `min_keep` of a `max_age_days` or `composite` config. Absent is
 /// `None`; present must be a positive integer. A zero would be a no-op that
 /// still switches the policy onto the ranked query, and a negative or
 /// non-integer value is a typo that must not run as "keep nothing".
@@ -962,7 +1154,7 @@ pub(crate) fn parse_min_keep(config: &serde_json::Value) -> Result<Option<i64>> 
     match config.get(MIN_KEEP_CONFIG_KEY) {
         None => Ok(None),
         Some(value) => value.as_i64().filter(|n| *n > 0).map(Some).ok_or_else(|| {
-            AppError::Validation("max_age_days 'min_keep' must be a positive integer".to_string())
+            AppError::Validation("'min_keep' must be a positive integer".to_string())
         }),
     }
 }
@@ -974,7 +1166,8 @@ pub(crate) fn parse_min_keep(config: &serde_json::Value) -> Result<Option<i64>> 
 /// (`{"max_versions": 5}` alongside `{"keep": 5}`) that `parse_i64_field`
 /// still accepts, so no shape that executed yesterday stops validating today.
 /// `exclude` and `match` apply to every type; `min_keep` only to
-/// `max_age_days` (`max_versions` already is a keep-N policy).
+/// `max_age_days` and `composite` (`max_versions` already is a keep-N
+/// policy).
 pub(crate) fn allowed_config_keys(policy_type: &str) -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = match policy_type {
         "max_age_days" => vec!["days", "max_age_days", MIN_KEEP_CONFIG_KEY],
@@ -982,6 +1175,7 @@ pub(crate) fn allowed_config_keys(policy_type: &str) -> Vec<&'static str> {
         "no_downloads_days" => vec!["days", "no_downloads_days"],
         "tag_pattern_keep" | "tag_pattern_delete" => vec!["pattern"],
         "size_quota_bytes" => vec!["quota_bytes", "size_quota_bytes"],
+        "composite" => vec![conditions::CONDITIONS_CONFIG_KEY, MIN_KEEP_CONFIG_KEY],
         _ => vec![],
     };
     if !keys.is_empty() {
@@ -1099,6 +1293,9 @@ pub struct PolicyExecutionResult {
     /// Bytes actually reclaimed by this run. Always zero for a dry run.
     pub bytes_freed: i64,
     pub errors: Vec<String>,
+    /// Proxy-cache entries of Remote repositories in scope (#3734), counted
+    /// separately from the `artifacts_*` / `bytes_*` fields above.
+    pub proxy_cache: ProxyCacheExecutionResult,
 }
 
 /// Aggregate count and bytes for policy matching queries.
@@ -1121,13 +1318,33 @@ struct UsageTotal {
     pub total: i64,
 }
 
+/// Bind values of a [`retention_from_where!`] statement pair, in `$N` order.
+struct RetentionBinds<'a> {
+    /// `$1` of a per-repository statement; `None` for the legacy global one.
+    repository_id: Option<Uuid>,
+    /// One nullable `INT` day window per condition the statement tests.
+    windows: &'a [Option<i32>],
+    filters: &'a PolicyFilters,
+    /// The trailing `rn > N` bind of a ranked (`min_keep`) statement.
+    min_keep: Option<i64>,
+}
+
 pub struct LifecycleService {
     db: PgPool,
+    /// Owner of the proxy-cache store, for evicting Remote repositories'
+    /// cached objects (#3734). See [`LifecycleService::with_proxy_service`].
+    proxy_service: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
+    /// Candidates per page of a live proxy-cache sweep.
+    proxy_cache_page_size: i64,
 }
 
 impl LifecycleService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            proxy_service: None,
+            proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
+        }
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
@@ -1164,6 +1381,18 @@ impl LifecycleService {
     /// A crash between tx2 and bookkeeping leaves `last_run_at` stale, so
     /// the policy runs again on the next tick — same idempotent cascade.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
+        self.execute_policy_until(id, dry_run, &CancellationToken::new())
+            .await
+    }
+
+    /// [`Self::execute_policy`] that stops a long proxy-cache sweep between
+    /// pages once `abort` fires (the scheduler's lease-loss token, #3502).
+    async fn execute_policy_until(
+        &self,
+        id: Uuid,
+        dry_run: bool,
+        abort: &CancellationToken,
+    ) -> Result<PolicyExecutionResult> {
         let mut policy = self.get_policy(id).await?;
 
         if !policy.enabled && !dry_run {
@@ -1192,13 +1421,17 @@ impl LifecycleService {
             result.artifacts_removed += current.artifacts_removed;
             result.bytes_matched += current.bytes_matched;
             result.bytes_freed += current.bytes_freed;
+            let cache = self
+                .run_proxy_cache_arm(&policy, repository_id, dry_run, abort, &mut result.errors)
+                .await?;
+            result.proxy_cache.absorb(cache);
         }
         if !dry_run {
             sqlx::query(
                 "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
             )
             .bind(id)
-            .bind(result.artifacts_removed)
+            .bind(result.artifacts_removed + result.proxy_cache.entries_removed)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1270,6 +1503,7 @@ impl LifecycleService {
                 Self::execute_tag_pattern_delete(conn, policy, dry_run).await
             }
             PolicyType::SizeQuotaBytes => Self::execute_size_quota(conn, policy, dry_run).await,
+            PolicyType::Composite => Self::execute_composite(conn, policy, dry_run).await,
         }
     }
 
@@ -1317,8 +1551,9 @@ impl LifecycleService {
         &self,
         policy: LifecyclePolicy,
         results: &mut Vec<PolicyExecutionResult>,
+        abort: &CancellationToken,
     ) {
-        match self.execute_policy(policy.id, false).await {
+        match self.execute_policy_until(policy.id, false, abort).await {
             Ok(result) => results.push(result),
             Err(e) => {
                 tracing::error!(
@@ -1335,6 +1570,7 @@ impl LifecycleService {
                     bytes_matched: 0,
                     bytes_freed: 0,
                     errors: vec![e.to_string()],
+                    proxy_cache: ProxyCacheExecutionResult::default(),
                 });
             }
         }
@@ -1345,8 +1581,9 @@ impl LifecycleService {
         let policies = self.load_enabled_policies().await?;
 
         let mut results = Vec::new();
+        let never = CancellationToken::new();
         for policy in policies {
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, &never).await;
         }
 
         Ok(results)
@@ -1407,7 +1644,7 @@ impl LifecycleService {
                 continue;
             }
 
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, abort).await;
         }
 
         Ok(results)
@@ -1480,6 +1717,7 @@ impl LifecycleService {
             bytes_matched,
             bytes_freed: if dry_run { 0 } else { bytes_matched },
             errors: vec![],
+            proxy_cache: ProxyCacheExecutionResult::default(),
         }
     }
 
@@ -1488,38 +1726,64 @@ impl LifecycleService {
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
-        let days = parse_i64_field(&policy.config, PolicyType::MaxAgeDays.as_wire_str(), "days")?;
+        let days = parse_window_days(&policy.config, PolicyType::MaxAgeDays)?;
         let filters = parse_policy_filters(&policy.config)?;
         let min_keep = parse_min_keep(&policy.config)?;
-        let (select_sql, update_sql) =
-            max_age_sql(policy.repository_id.is_some(), min_keep.is_some());
+        let binds = RetentionBinds {
+            repository_id: policy.repository_id,
+            windows: &[Some(days)],
+            filters: &filters,
+            min_keep,
+        };
+        Self::count_then_soft_delete(
+            conn,
+            policy,
+            dry_run,
+            max_age_sql(policy.repository_id.is_some(), min_keep.is_some()),
+            &binds,
+        )
+        .await
+    }
 
-        // Both statements bind identically: [repository], days, the three
-        // filter parameters, [min_keep]. The optional binds are positional
-        // and line up with the `$N` layout of the constant `max_age_sql`
-        // returned for exactly this (scoped, min_keep) combination.
-        macro_rules! bind_max_age {
+    /// Shared body of the [`retention_from_where!`] family's executors: count
+    /// what the statement pair selects, then (live runs only, and only when
+    /// something matched) soft-delete with the twin statement under the
+    /// identical binds.
+    async fn count_then_soft_delete(
+        conn: &mut sqlx::PgConnection,
+        policy: &LifecyclePolicy,
+        dry_run: bool,
+        (select_sql, update_sql): (&'static str, &'static str),
+        binds: &RetentionBinds<'_>,
+    ) -> Result<PolicyExecutionResult> {
+        // [repository], each condition window, the four filter parameters,
+        // [min_keep]: positional, and lined up with the `$N` layout of the
+        // statement pair the caller picked for exactly this shape.
+        macro_rules! bind_retention {
             ($query:expr) => {{
                 let mut query = $query;
-                if let Some(repository_id) = policy.repository_id {
+                if let Some(repository_id) = binds.repository_id {
                     query = query.bind(repository_id);
                 }
-                query = bind_policy_filters!(query.bind(days as i32), filters);
-                if let Some(keep) = min_keep {
+                for window in binds.windows {
+                    query = query.bind(*window);
+                }
+                query = bind_policy_filters!(query, binds.filters);
+                if let Some(keep) = binds.min_keep {
                     query = query.bind(keep);
                 }
                 query
             }};
         }
 
-        let matched = bind_max_age!(sqlx::query_as::<_, CountBytes>(select_sql))
+        let matched = bind_retention!(sqlx::query_as::<_, CountBytes>(select_sql))
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
-            removed = bind_max_age!(sqlx::query(update_sql))
+            removed = bind_retention!(sqlx::query(update_sql))
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
@@ -1604,17 +1868,13 @@ impl LifecycleService {
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
-        let days = parse_i64_field(
-            &policy.config,
-            PolicyType::NoDownloadsDays.as_wire_str(),
-            "days",
-        )?;
+        let days = parse_window_days(&policy.config, PolicyType::NoDownloadsDays)?;
 
         let repo_filter = policy.repository_id;
         let filters = parse_policy_filters(&policy.config)?;
 
         let matched = sqlx::query_as::<_, CountBytes>(NO_DOWNLOADS_SELECT_SQL);
-        let matched = bind_policy_filters!(matched.bind(repo_filter).bind(days as i32), filters)
+        let matched = bind_policy_filters!(matched.bind(repo_filter).bind(days), filters)
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1622,7 +1882,7 @@ impl LifecycleService {
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
             let update = sqlx::query(NO_DOWNLOADS_UPDATE_SQL);
-            let result = bind_policy_filters!(update.bind(repo_filter).bind(days as i32), filters)
+            let result = bind_policy_filters!(update.bind(repo_filter).bind(days), filters)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1680,8 +1940,8 @@ impl LifecycleService {
         // One fragment per alias, both expanded from `policy_filter_predicate!`,
         // so the preview and the soft-delete cannot disagree about which
         // artifacts the exclusion list protects or the `match` scope selects.
-        let select_exclusion = policy_filter_predicate!("a.", "$3", "$4", "$5");
-        let update_exclusion = policy_filter_predicate!("artifacts.", "$3", "$4", "$5");
+        let select_exclusion = policy_filter_predicate!("a.", "$3", "$4", "$5", "$6");
+        let update_exclusion = policy_filter_predicate!("artifacts.", "$3", "$4", "$5", "$6");
 
         let select_sql = format!(
             r#"
@@ -1781,7 +2041,7 @@ impl LifecycleService {
             ) ds ON true
             WHERE a.repository_id = $1 AND a.is_deleted = false
             "#,
-            policy_filter_predicate!("a.", "$2", "$3", "$4"),
+            policy_filter_predicate!("a.", "$2", "$3", "$4", "$5"),
             "ORDER BY ds.last_downloaded_at ASC NULLS FIRST, a.created_at ASC\n"
         ));
         let candidates = bind_policy_filters!(candidates.bind(repo_id), filters)
@@ -1836,10 +2096,10 @@ impl LifecycleService {
         // misspelt `exclude` (`excludes`, `exclude_tags`, ...) previously
         // validated cleanly and then swept away exactly the releases it was
         // written to protect. The same applies to a config written against a
-        // schema this build does not implement yet -- `conditions` and
-        // friends, or a `match` selector other than `path_prefix`, must 422
-        // rather than fall through to the single-condition semantics and
-        // delete on the wrong rule.
+        // schema this build does not implement yet -- `conditions` on a
+        // single-condition type (only `composite` reads it), or a `match`
+        // selector this build does not know, must 422 rather than be ignored
+        // and delete on the wrong rule.
         //
         // Stored policies are unaffected: validation runs on create/update
         // only, never on execute, so no policy already in the table changes
@@ -1864,7 +2124,7 @@ impl LifecycleService {
         // bad `exclude`/`match` block is a 422 at create/update time rather
         // than a surprise at sweep time.
         parse_policy_filters(config)?;
-        if policy_type == "max_age_days" {
+        if matches!(policy_type, "max_age_days" | "composite") {
             parse_min_keep(config)?;
         }
 
@@ -1879,11 +2139,12 @@ impl LifecycleService {
 
         match policy_type {
             "max_age_days" => {
-                read_positive_i64("days").ok_or_else(|| {
+                let days = read_positive_i64("days").ok_or_else(|| {
                     AppError::Validation(
                         "max_age_days requires 'days' (positive integer) in config".to_string(),
                     )
                 })?;
+                check_window_days(days, "max_age_days 'days'")?;
             }
             "max_versions" => {
                 read_positive_i64("keep").ok_or_else(|| {
@@ -1893,12 +2154,13 @@ impl LifecycleService {
                 })?;
             }
             "no_downloads_days" => {
-                read_positive_i64("days").ok_or_else(|| {
+                let days = read_positive_i64("days").ok_or_else(|| {
                     AppError::Validation(
                         "no_downloads_days requires 'days' (positive integer) in config"
                             .to_string(),
                     )
                 })?;
+                check_window_days(days, "no_downloads_days 'days'")?;
             }
             "tag_pattern_keep" | "tag_pattern_delete" => {
                 let pattern = config
@@ -1913,6 +2175,9 @@ impl LifecycleService {
                 // Validate regex
                 regex::Regex::new(pattern)
                     .map_err(|e| AppError::Validation(format!("Invalid regex pattern: {}", e)))?;
+            }
+            "composite" => {
+                conditions::parse_conditions(config)?;
             }
             "size_quota_bytes" => {
                 read_positive_i64("quota_bytes").ok_or_else(|| {
@@ -1933,6 +2198,13 @@ impl LifecycleService {
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod policy_scope_tests;
+
+// After the SQL macros for the same reason: its predicate reuses
+// `path_prefix_predicate!`.
+mod proxy_cache;
+// After the SQL macros: it expands the `retention_*` family.
+mod conditions;
+pub use proxy_cache::ProxyCacheExecutionResult;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -3633,6 +3905,7 @@ mod tests {
             bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -3654,6 +3927,7 @@ mod tests {
             bytes_matched: 1024,
             bytes_freed: 1024,
             errors: vec!["Error A".to_string(), "Error B".to_string()],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"errors\":[\"Error A\",\"Error B\"]"));
@@ -3672,6 +3946,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         for t in &valid_types {
             assert!(valid_types.contains(t));
@@ -3740,6 +4015,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         // These are the types handled in execute_policy match arms
         // (this list must be kept in sync manually — if a type is added to
@@ -3751,6 +4027,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         for t in &create_types {
             assert!(
@@ -3945,6 +4222,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         for pt in types {
             let policy = make_policy(Uuid::new_v4(), &format!("{} policy", pt), pt);
@@ -4196,6 +4474,7 @@ mod tests {
             bytes_matched: i64::MAX,
             bytes_freed: i64::MAX,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains(&i64::MAX.to_string()));
@@ -4212,6 +4491,7 @@ mod tests {
             bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4806,6 +5086,7 @@ mod tests {
             ("tag_pattern_keep", PolicyType::TagPatternKeep),
             ("tag_pattern_delete", PolicyType::TagPatternDelete),
             ("size_quota_bytes", PolicyType::SizeQuotaBytes),
+            ("composite", PolicyType::Composite),
         ];
         for (wire, expected) in cases {
             let got = PolicyType::parse(wire).expect("valid wire string");
@@ -4862,6 +5143,7 @@ mod tests {
             PolicyType::TagPatternKeep,
             PolicyType::TagPatternDelete,
             PolicyType::SizeQuotaBytes,
+            PolicyType::Composite,
         ];
         for v in variants {
             let s = v.as_wire_str();
@@ -4887,6 +5169,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         for s in whitelist {
             PolicyType::parse(s)
@@ -5253,6 +5536,7 @@ mod tests {
             "tag_pattern_keep",
             "tag_pattern_delete",
             "size_quota_bytes",
+            "composite",
         ];
         let dispatch_variants = [
             PolicyType::MaxAgeDays,
@@ -5261,6 +5545,7 @@ mod tests {
             PolicyType::TagPatternKeep,
             PolicyType::TagPatternDelete,
             PolicyType::SizeQuotaBytes,
+            PolicyType::Composite,
         ];
         assert_eq!(create_policy_whitelist.len(), dispatch_variants.len());
         for v in dispatch_variants {

@@ -261,6 +261,10 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
 
 /// Spawn all background scheduler tasks.
 /// Returns join handles for graceful shutdown (not currently used, fire-and-forget).
+///
+/// `proxy_service` lets scheduled lifecycle runs evict Remote repositories'
+/// proxy-cached objects (#3734); `None` when this instance has no proxy cache.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_all(
     db: PgPool,
     config: Config,
@@ -269,6 +273,7 @@ pub fn spawn_all(
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
     advisory_client: Arc<crate::services::scanner_service::AdvisoryClient>,
+    proxy_service: Option<Arc<crate::services::proxy_service::ProxyService>>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -440,7 +445,7 @@ pub fn spawn_all(
         let check_secs = config.lifecycle_check_interval_secs;
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(60)).await;
-            let service = LifecycleService::new(db.clone());
+            let service = LifecycleService::new(db.clone()).with_proxy_service(proxy_service);
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
@@ -2187,7 +2192,12 @@ pub(crate) async fn run_curation_sync_cycle(
                                 curation_sync::parse_deb_packages_index(&content, "main")
                             }
                             _ => {
-                                tracing::warn!("DEB Packages fetch failed for {}", upstream_url);
+                                tracing::warn!(
+                                    "DEB Packages fetch failed for {}",
+                                    crate::services::proxy_service::redact_url_for_diagnostics(
+                                        upstream_url
+                                    )
+                                );
                                 continue;
                             }
                         }

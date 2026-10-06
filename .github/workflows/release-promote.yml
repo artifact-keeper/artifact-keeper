@@ -179,6 +179,10 @@ jobs:
           # public. Cheaper to refuse it here.
           need .github/workflows/sync-openapi-spec.yml '^[[:space:]]*workflow_dispatch:' 'dispatchable sync-openapi-spec.yml'
           need scripts/ci/resolve-certified-ref.sh  '.'                               'scripts/ci/resolve-certified-ref.sh'
+          # The adapter is versioned on its own; read from the commit's object,
+          # not the worktree. Steps 5 and 6 both use it.
+          ADAPTER_VERSION="$(git show "${SHA}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')"
+          [[ -n "$ADAPTER_VERSION" ]] || { echo "::error title=No scanner-adapter version::docker/scanner-adapter/VERSION is empty or missing at ${SHA}."; exit 1; }
           echo "Promoting ${VERSION} at ${SHA} on ${CERTIFIED_REF} ($(git log -1 --format='%s' "$SHA"))"
           {
             echo "sha=${SHA}"
@@ -186,6 +190,7 @@ jobs:
             echo "tag=v${VERSION}"
             echo "certified_ref=${CERTIFIED_REF}"
             echo "certified_branch=${BRANCH}"
+            echo "adapter_version=${ADAPTER_VERSION}"
           } >> "$GITHUB_OUTPUT"
 
       # ── 1. nothing permanent exists yet (or it already names this commit) ──
@@ -236,6 +241,26 @@ jobs:
           CERT_SHA: ${{ steps.resolve.outputs.sha }}
           CERT_EXPECT_VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/ci/assert-candidate-certified.sh
+
+      # A "stays" certification names the published adapter digest, which only
+      # a verifier from #4076 on can read. release.yml runs the TAGGED commit's
+      # copy of assert-candidate-certified.sh, so on a commit whose copy is
+      # older it would refuse the release after step 6 made the tag permanent.
+      # The candidate already refuses to certify that shape; this re-asks it
+      # before anything is named, for a certification minted some other way.
+      - name: Assert the tagged commit's verifier can read this certification
+        if: steps.cert.outputs.scanner_adapter_decision == 'stays'
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          BRANCH: ${{ steps.resolve.outputs.certified_branch }}
+        run: |
+          set -euo pipefail
+          verifier="$(git show "${SHA}:scripts/ci/assert-candidate-certified.sh" 2>/dev/null || true)"
+          if ! grep -q 'scanner_adapter_decision' <<<"$verifier"; then
+            echo "::error title=Tagged commit cannot verify this certification::the scanner adapter stays on its published digest, but scripts/ci/assert-candidate-certified.sh at ${SHA} predates #4076, and release.yml on the tag would refuse the certification after the tag exists. Nothing was tagged. Backport #4076 to ${BRANCH} first, then certify and promote the backport commit."
+            exit 1
+          fi
+          echo "  ${SHA:0:7}'s verifier reads scanner_adapter_decision; release.yml on the tag can verify this certification."
 
       # ── 3. the preflight evidence release.yml will demand ───────────────────
       - name: Assert a green Release Preflight audited this commit
@@ -291,6 +316,10 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.resolve.outputs.version }}
           SHA: ${{ steps.resolve.outputs.sha }}
+          ADAPTER_VERSION: ${{ steps.resolve.outputs.adapter_version }}
+          ADAPTER_DIGEST: ${{ steps.cert.outputs.scanner_adapter_digest }}
+          ADAPTER_DECISION: ${{ steps.cert.outputs.scanner_adapter_decision }}
+          ADAPTER_OWNER_REV: ${{ steps.cert.outputs.scanner_adapter_owner_rev }}
         run: |
           set -euo pipefail
           bad=0
@@ -304,7 +333,6 @@ jobs:
               bad=1
             fi
           }
-          ADAPTER_VERSION="$(git show "${SHA}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')"
           check "$BACKEND_IMAGE"  "$VERSION" "${{ steps.cert.outputs.backend_digest }}"
           check "$OPENSCAP_IMAGE" "$VERSION" "${{ steps.cert.outputs.openscap_digest }}"
           # The scanner adapter is versioned on its own (docker/scanner-adapter/VERSION)
@@ -319,13 +347,25 @@ jobs:
           # assert what it actually promises: on "stays", :VERSION still resolves to the
           # image built from the owning commit; on "new", it resolves to the certified
           # digest the PROMOTE run just applied.
+          #
+          # Since #4076 the candidate records that decision in the certification and
+          # certifies the digest that ships, so for such a certification there is
+          # nothing to re-derive: the verifier already anchored the adapter at
+          # :VERSION on "stays", and on "new" the PROMOTE run just applied it. Either
+          # way :VERSION must name the certified digest. Only a certification minted
+          # before #4076 (no decision recorded) takes the re-derivation below.
+          if [[ -n "$ADAPTER_DECISION" ]]; then
+            echo "  scanner-adapter ${ADAPTER_VERSION}: certified decision '${ADAPTER_DECISION}'${ADAPTER_OWNER_REV:+ (published from ${ADAPTER_OWNER_REV:0:7})}; asserting :${ADAPTER_VERSION} == ${ADAPTER_DIGEST}"
+            check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "$ADAPTER_DIGEST"
+            exit "$bad"
+          fi
           decision="$(ADAPTER_SHA="$SHA" scripts/ci/assert-adapter-exact-version.sh 2>&1)" || {
             printf '%s\n' "$decision" | sed 's/^/  /'
             echo "::error title=Scanner adapter exact-version decision failed::the promote cannot tell what :${ADAPTER_VERSION} must name; see the decision output above. Nothing was tagged."
             exit 1
           }
           printf '%s\n' "$decision" | sed 's/^/  /'
-          if grep -q 'stays on its published digest' <<<"$decision"; then
+          if grep -qx 'decision=stays' <<<"$decision"; then
             rev="$(.github/scripts/registry-tag-revision.sh ghcr.io "${ADAPTER_IMAGE#ghcr.io/}" "$ADAPTER_VERSION" 2>/dev/null || true)"
             [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error title=Scanner adapter owner unknown::ghcr.io/${ADAPTER_IMAGE#ghcr.io/}:${ADAPTER_VERSION} is published but its source revision could not be read (got '${rev:-<none>}'). Nothing was tagged."; exit 1; }
             expected_adapter="$(.github/scripts/registry-tag-digest.sh ghcr.io "${ADAPTER_IMAGE#ghcr.io/}" "sha-${rev:0:7}" 2>/dev/null || true)"
@@ -333,7 +373,7 @@ jobs:
             echo "  scanner-adapter ${ADAPTER_VERSION} stays on its published digest (built from ${rev:0:7}); asserting :${ADAPTER_VERSION} == ${ADAPTER_IMAGE}:sha-${rev:0:7}"
             check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "$expected_adapter"
           else
-            check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "${{ steps.cert.outputs.scanner_adapter_digest }}"
+            check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "$ADAPTER_DIGEST"
           fi
           exit "$bad"
 
@@ -349,12 +389,23 @@ jobs:
           GATE_RUN: ${{ steps.cert.outputs.gate_run_id }}
           BACKEND_DIGEST: ${{ steps.cert.outputs.backend_digest }}
           OPENSCAP_DIGEST: ${{ steps.cert.outputs.openscap_digest }}
+          ADAPTER_VERSION: ${{ steps.resolve.outputs.adapter_version }}
           ADAPTER_DIGEST: ${{ steps.cert.outputs.scanner_adapter_digest }}
+          ADAPTER_DECISION: ${{ steps.cert.outputs.scanner_adapter_decision }}
+          ADAPTER_OWNER_REV: ${{ steps.cert.outputs.scanner_adapter_owner_rev }}
         run: |
           set -euo pipefail
-          MESSAGE="$(printf 'Release %s\n\nCertified-Candidate: %s/%s/actions/runs/%s\nCertified-Gate-Run: %s\nCertified-Backend-Digest: %s\nCertified-Openscap-Digest: %s\nCertified-Scanner-Adapter-Digest: %s\nCreated-By: release-promote.yml run %s\n' \
+          # The adapter digest is the one the certification names, which since
+          # #4076 is the digest that ships (the published :VERSION when the
+          # adapter version stays). The decision line says which.
+          case "$ADAPTER_DECISION" in
+            stays) ADAPTER_LINE="${ADAPTER_VERSION} stays (published from ${ADAPTER_OWNER_REV})" ;;
+            new)   ADAPTER_LINE="${ADAPTER_VERSION} new (built from ${SHA})" ;;
+            *)     ADAPTER_LINE="${ADAPTER_VERSION} (certification predates the recorded decision)" ;;
+          esac
+          MESSAGE="$(printf 'Release %s\n\nCertified-Candidate: %s/%s/actions/runs/%s\nCertified-Gate-Run: %s\nCertified-Backend-Digest: %s\nCertified-Openscap-Digest: %s\nCertified-Scanner-Adapter-Digest: %s\nScanner-Adapter-Version: %s\nCreated-By: release-promote.yml run %s\n' \
             "$VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN" "$GATE_RUN" \
-            "$BACKEND_DIGEST" "$OPENSCAP_DIGEST" "$ADAPTER_DIGEST" "$GITHUB_RUN_ID")"
+            "$BACKEND_DIGEST" "$OPENSCAP_DIGEST" "$ADAPTER_DIGEST" "$ADAPTER_LINE" "$GITHUB_RUN_ID")"
           err="$(mktemp)"
           if ! tag_obj="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/git/tags" \
                 -f "tag=${TAG}" -f "message=${MESSAGE}" -f "object=${SHA}" -f type=commit \
@@ -434,6 +485,9 @@ jobs:
           FOLLOW_REF: ${{ steps.resolve.outputs.tag }}
           FOLLOW_SINCE: ${{ steps.release.outputs.start }}
           FOLLOW_WAIT: 'false'
+          ADAPTER_DIGEST: ${{ steps.cert.outputs.scanner_adapter_digest }}
+          ADAPTER_DECISION: ${{ steps.cert.outputs.scanner_adapter_decision }}
+          ADAPTER_OWNER_REV: ${{ steps.cert.outputs.scanner_adapter_owner_rev }}
           VERSION: ${{ steps.resolve.outputs.version }}
           TAG: ${{ steps.resolve.outputs.tag }}
           SHA: ${{ steps.resolve.outputs.sha }}
@@ -455,7 +509,7 @@ jobs:
             echo "| tag | \`${TAG}\` (annotated, created last) |"
             echo "| backend | \`${{ steps.cert.outputs.backend_digest }}\` |"
             echo "| openscap | \`${{ steps.cert.outputs.openscap_digest }}\` |"
-            echo "| scanner-adapter | \`${{ steps.cert.outputs.scanner_adapter_digest }}\` |"
+            echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` (${ADAPTER_DECISION:-decision not recorded}${ADAPTER_OWNER_REV:+, published from \`${ADAPTER_OWNER_REV}\`}) |"
             echo "| release run | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id} |"
             echo
             echo "release.yml now verifies the certification, builds and signs the binaries, publishes the GitHub Release and promotes the floating tags."

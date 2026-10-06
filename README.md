@@ -294,6 +294,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 - **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Mirror GitHub release assets using the github, mise or aqua format with finite caching
+- **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
 
 ## Project Structure
 

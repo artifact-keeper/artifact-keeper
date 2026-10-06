@@ -511,6 +511,15 @@ struct OriginFacts {
     upstream_url: Option<String>,
 }
 
+/// Render an origin upstream URL into a violation message (#4452). The
+/// stored origin of an artifact proxied through a Remote whose URL embeds
+/// `user:password@` carries those credentials, and violation messages reach
+/// promotion / approval responses and persisted `policy_result` records, so
+/// the message drops the userinfo. Matching keeps using the stored value.
+fn origin_upstream_for_message(upstream: &str) -> String {
+    crate::services::proxy_service::strip_url_userinfo(upstream).0
+}
+
 /// Evaluate one policy's origin predicates against one artifact's origin
 /// facts (#4050). Cross-format: these fire for every artifact, whatever
 /// its format, because where the bytes came from is format-independent.
@@ -534,8 +543,9 @@ fn evaluate_origin_predicates(
         match &upstream {
             Some(u) if preds.allowed_upstreams.iter().any(|a| a == u) => {}
             Some(u) => violations.push(format!(
-                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' \
-                 is not in the policy's allowed upstreams"
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{}' \
+                 is not in the policy's allowed upstreams",
+                origin_upstream_for_message(u)
             )),
             None => violations.push(format!(
                 "Policy '{policy_name}' [origin.upstream]: upstream of origin is unknown \
@@ -546,7 +556,8 @@ fn evaluate_origin_predicates(
     if let Some(u) = &upstream {
         if preds.denied_upstreams.iter().any(|d| d == u) {
             violations.push(format!(
-                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' is denied"
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{}' is denied",
+                origin_upstream_for_message(u)
             ));
         }
     }
@@ -3570,6 +3581,31 @@ mod tests {
     fn origin_preds_4050(preds: OriginPolicyPredicates) -> OriginPolicyPredicates {
         assert!(!preds.is_inert(), "test predicate set must not be inert");
         preds
+    }
+
+    #[test]
+    fn test_origin_upstream_violation_messages_never_carry_userinfo_4452() {
+        // #4452: a proxied artifact's stored origin mirrors a Remote's
+        // credentialed upstream_url. The violation text reaches promotion and
+        // approval responses, so it must drop the userinfo; matching still
+        // uses the stored value (the denylist entry below only matches it).
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@repo1.maven.org/maven2", "alice:s3cret");
+        let facts = OriginFacts {
+            upstream_url: Some(stored.clone()),
+            ..origin_facts_4050()
+        };
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            allowed_upstreams: vec!["https://repo1.maven.org/maven2".to_string()],
+            denied_upstreams: vec![stored],
+            ..Default::default()
+        });
+        let violations = evaluate_origin_predicates("p", &preds, &facts);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        for v in &violations {
+            assert!(!v.contains("s3cret") && !v.contains("alice"), "leaked: {v}");
+            assert!(v.contains("'https://repo1.maven.org/maven2'"), "{v}");
+        }
     }
 
     #[test]

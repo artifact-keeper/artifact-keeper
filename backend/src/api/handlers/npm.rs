@@ -47,6 +47,7 @@ use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
 use crate::services::upstream_metadata::UpstreamMetadataCache;
+use crate::services::upstream_tracing::send_upstream;
 use chrono::Utc;
 
 // ---------------------------------------------------------------------------
@@ -1952,12 +1953,12 @@ async fn npm_audit_upstream_json(
         .header(CONTENT_TYPE, "application/json")
         .body(body);
 
-    let resp = match req.send().await {
+    let resp = match send_upstream(req).await {
         Ok(r) => r,
         Err(err) => {
             debug!(
                 target: "npm_audit",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "failed to reach npm audit upstream; serving empty advisories"
             );
@@ -1977,7 +1978,7 @@ async fn npm_audit_upstream_json(
             if !status.is_success() {
                 debug!(
                     target: "npm_audit",
-                    upstream = %url,
+                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                     status = %status,
                     "npm audit upstream returned non-success; serving empty advisories"
                 );
@@ -1988,7 +1989,7 @@ async fn npm_audit_upstream_json(
         Err(err) => {
             debug!(
                 target: "npm_audit",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "failed to read npm audit upstream body; serving empty advisories"
             );
@@ -2049,12 +2050,12 @@ async fn npm_meta_upstream_bytes(
     };
     let client = crate::services::http_client::default_client();
 
-    let resp = match client.get(&url).send().await {
+    let resp = match send_upstream(client.get(&url)).await {
         Ok(r) => r,
         Err(err) => {
             debug!(
                 target: "npm_meta",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "npm meta GET upstream unreachable"
             );
@@ -2076,7 +2077,7 @@ async fn npm_meta_upstream_bytes(
         Err(err) => {
             debug!(
                 target: "npm_meta",
-                upstream = %url,
+                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
                 error = %err,
                 "npm meta GET failed to read upstream body"
             );
@@ -5228,6 +5229,7 @@ impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
         &self,
         state: &SharedState,
         req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
         _digest: &str,
     ) -> Result<(), Response> {
         correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
@@ -12370,9 +12372,13 @@ mod tests {
         });
         let client_request = serde_json::json!({"express": ["4.17.0"]});
 
+        // The audit passthrough goes through `send_upstream` (#4455): without
+        // `traceparent` the mock does not match and the test fails.
+        let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/security/advisories/bulk"))
             .and(body_json(client_request.clone()))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")
@@ -13687,8 +13693,11 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
+        // The `/-/` meta passthrough goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("GET"))
             .and(path("/-/ping"))
+            .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")

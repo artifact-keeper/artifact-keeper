@@ -287,7 +287,33 @@ names the same commit.
 
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
-   predicate names the commit, the version, the run and every digest. A
+   predicate names the commit, the version, the run and every digest.
+   The scanner-adapter is certified at the digest the release ships
+   (#4076): this commit's `sha-<sha>` rebuild when its
+   `docker/scanner-adapter/VERSION` is new, but the already-published
+   `:<adapter VERSION>` digest when that version stays (published from an
+   earlier commit with unchanged sources). The predicate records which
+   (`scanner_adapter_decision`: `new`/`stays`, the owning revision, the
+   tag), the verifier anchors the adapter at that tag, and the promote's tag
+   message and summary print the certified adapter digest and decision.
+
+   Until artifact-keeper-test#380 lands (tracked here as #4439), the
+   adapter's attestation is **provenance of what ships, not proof that the
+   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
+   pinned adapter, for "new" and "stays" alike. The candidate exposes the
+   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+
+   **Maintenance lines need the #4076 verifier before their next cut.**
+   `release.yml` runs the *tagged* commit's copy of
+   `scripts/ci/assert-candidate-certified.sh`, and a copy older than #4076
+   cannot read a "stays" certification: it would refuse the release after
+   the tag already exists. So the candidate (and, again, the promote, before
+   anything is named) refuses to certify "stays" on a commit whose verifier
+   predates #4076, with an error naming the line. To cut a patch on a
+   `release/X.Y.x` whose adapter version is already published, first backport
+   #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
+   self-test, and main's current `release-candidate.yml`, which the line
+   needs byte-identical anyway), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
@@ -318,7 +344,9 @@ names the same commit.
    ```
 
    In order: it verifies the certification for the commit and that the
-   registry still serves the certified digests for `sha-<sha>`; re-checks the
+   registry still serves the certified digests for `sha-<sha>` (the scanner
+   adapter at its exact `:<adapter VERSION>` tag when its version stays, and
+   then that the commit's own verifier can read that certification); re-checks the
    preflight evidence; applies `:X.Y.Z` to the certified digests through
    Docker Publish's PROMOTE mode (`promote_version=X.Y.Z
    promote_source_sha=<sha>` — no rebuild, the digest-aware guard still runs,

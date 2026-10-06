@@ -293,7 +293,7 @@ pub async fn get_artifact(
         // than failing the request.
         origin: artifact
             .origin
-            .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v)),
+            .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::for_response(&v)),
         last_promotion,
     }))
 }

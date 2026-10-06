@@ -769,6 +769,23 @@ mod tests {
         assert_eq!(coords.extension, "pom");
     }
 
+    /// #4102 audit: the nuspec reader failed on the XML declaration; a POM
+    /// with a declaration, a byte-order mark and CRLF line endings parses.
+    #[test]
+    fn test_parse_pom_with_declaration_bom_and_crlf() {
+        let body = "<project><groupId>com.acme</groupId><artifactId>widget</artifactId>\r\n\
+                    <version>1.0</version></project>";
+        let declared = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n{body}");
+        for (what, xml) in [
+            ("declaration + CRLF", declared.clone()),
+            ("BOM + declaration + CRLF", format!("\u{feff}{declared}")),
+        ] {
+            let pom =
+                MavenHandler::parse_pom(xml.as_bytes()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(pom.artifact_id.as_deref(), Some("widget"), "{what}");
+        }
+    }
+
     #[test]
     fn test_parse_pom_with_properties_and_dependencies() {
         // Regression: a POM declaring <properties> previously failed to parse

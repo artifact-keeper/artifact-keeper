@@ -998,6 +998,16 @@ pub struct CreateRepositoryRequest {
     /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
     /// `false` for the default union semantics.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591). Each entry is an exact
+    /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
+    /// and canonicalized. By default the credentials only follow a realm on
+    /// the upstream's own origin (GHSA-78h6-3wp8-2542); list the token
+    /// service here when the registry serves it from another host, e.g.
+    /// `https://auth.docker.io` for a credentialed `https://registry-1.docker.io`
+    /// remote, or `https://gitlab.example.com` for a GitLab registry on
+    /// `https://registry.example.com`. Only valid for Remote repositories.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote (proxy) distribution/component/architecture filter
     /// (#2460, epic #2458). Only valid for Debian *Remote* repositories.
     /// Passthrough-only: allowed paths are proxied byte-for-byte; denied
@@ -1212,6 +1222,11 @@ pub struct UpdateRepositoryRequest {
     /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
     /// Virtual repositories; omit to leave it unchanged.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Replace the trusted cross-origin OCI Bearer token realms for this
+    /// Remote repository (#3591); same rules as on create. Omit to leave the
+    /// list unchanged; send `[]` to clear it and restore the strict
+    /// same-origin default.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Update the Debian remote proxy filter (#2460). Three-way semantics:
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
@@ -1325,7 +1340,17 @@ pub struct RepositoryResponse {
     /// update) and the listing; `repo_to_response` alone defaults it to `false`
     /// (it is db-less and cannot read the column).
     pub has_trusted_gpg_key: bool,
+    /// The Remote repository's upstream URL with any embedded userinfo
+    /// (`user:password@` or `token@`) removed (#4452). Credentials embedded in
+    /// the URL at create time are still stored and still sent upstream as
+    /// HTTP Basic auth, but are never returned; `upstream_url_has_credentials`
+    /// says whether any are configured.
     pub upstream_url: Option<String>,
+    /// Whether the stored `upstream_url` carries embedded userinfo
+    /// credentials that were stripped from `upstream_url` above (#4452).
+    /// Independent of `upstream_auth_configured`, which covers the dedicated
+    /// (encrypted) upstream credential fields.
+    pub upstream_url_has_credentials: bool,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
     /// Whether the Package Age / quarantine policy is enabled for this
@@ -1371,6 +1396,11 @@ pub struct RepositoryResponse {
     /// repositories; omitted for every other repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591), canonical origins. Omitted
+    /// when none are configured (the strict same-origin default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote proxy filter (#2460), read back from `repository_config`.
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1437,11 +1467,24 @@ async fn with_repodata_depth(
     Ok(response)
 }
 
+/// Render a stored `upstream_url` for an API response (#4452): the URL with
+/// its userinfo stripped, plus whether any userinfo was present. Every
+/// response that carries a repository's upstream URL goes through here so the
+/// embedded password can never be echoed.
+fn upstream_url_for_response(stored: Option<&str>) -> (Option<String>, bool) {
+    match stored.map(crate::services::proxy_service::strip_url_userinfo) {
+        Some((url, has_credentials)) => (Some(url), has_credentials),
+        None => (None, false),
+    }
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
     storage_used_bytes: i64,
 ) -> RepositoryResponse {
+    let (upstream_url, upstream_url_has_credentials) =
+        upstream_url_for_response(repo.upstream_url.as_deref());
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
@@ -1467,7 +1510,8 @@ fn repo_to_response(
         // db-less: single-repo handlers overwrite this via `with_row_presence_fields`
         // and the listing sets it from a batch presence query (#2568).
         has_trusted_gpg_key: false,
-        upstream_url: repo.upstream_url,
+        upstream_url,
+        upstream_url_has_credentials,
         upstream_auth_type: None,
         upstream_auth_configured: false,
         // Populated by the handlers that have a DB handle (see
@@ -1484,6 +1528,7 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         npm_virtual_isolate_hosted_names: None,
+        oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
@@ -2440,6 +2485,41 @@ fn npm_virtual_isolate_to_store(
     }
 }
 
+/// Validate a supplied `oci_trusted_bearer_realms` list (#3591) and return
+/// the canonical list to persist. `Ok(None)` for an absent field and for an
+/// empty list on a repository the setting does not apply to (an untouched
+/// settings form configures nothing, the #3299 rule). A non-empty list on a
+/// non-Remote repository is a 400: no other type fetches from an upstream.
+fn oci_trusted_realms_to_store(
+    repo_type: &RepositoryType,
+    requested: Option<&[String]>,
+) -> Result<Option<Vec<String>>> {
+    match requested {
+        None => Ok(None),
+        Some(list) if *repo_type == RepositoryType::Remote => {
+            crate::services::oci_trusted_realms::normalize_trusted_realms(list).map(Some)
+        }
+        Some([]) => Ok(None),
+        Some(_) => Err(AppError::Validation(
+            "oci_trusted_bearer_realms is only valid for remote repositories".to_string(),
+        )),
+    }
+}
+
+/// Echo the trusted OCI bearer realms (#3591) on Remote repositories.
+async fn with_oci_trusted_realms(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if *repo_type == RepositoryType::Remote {
+        let list = crate::services::oci_trusted_realms::load_trusted_realms(db, repo_id).await?;
+        response.oci_trusted_bearer_realms = (!list.is_empty()).then_some(list);
+    }
+    Ok(response)
+}
+
 /// Persist a validated isolate-mode toggle (#3767). No cache invalidation is
 /// needed: the toggle is part of every npm virtual packument cache key, so the
 /// next read on every replica (and the shared Redis tier) misses and
@@ -3318,6 +3398,10 @@ pub async fn create_repository(
         &format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
+    // the same reason; persisted once `repo.id` exists.
+    let oci_trusted_realms =
+        oci_trusted_realms_to_store(&repo_type, payload.oci_trusted_bearer_realms.as_deref())?;
 
     // Debian remote proxy filter (#2460): validate up-front — before the
     // repository row is created — so a rejected config (wrong repo type or an
@@ -3523,6 +3607,10 @@ pub async fn create_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
+    }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
     // create), so here we only write the trimmed values to `repository_config`.
@@ -3710,6 +3798,7 @@ pub async fn create_repository(
         response,
     )
     .await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type_out, response).await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
@@ -3776,6 +3865,7 @@ pub async fn get_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -4370,6 +4460,13 @@ pub async fn update_repository(
         &existing.format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated before the
+    // update for the same reason. Writing them is gated by the repository
+    // `admin` check above, like every other credential-routing setting.
+    let oci_trusted_realms = oci_trusted_realms_to_store(
+        &existing.repo_type,
+        payload.oci_trusted_bearer_realms.as_deref(),
+    )?;
 
     let repo = service
         .update_with_repodata_depth(
@@ -4442,6 +4539,10 @@ pub async fn update_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -4734,6 +4835,7 @@ pub async fn update_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -8388,7 +8490,7 @@ pub async fn get_artifact_metadata(
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
                 .flatten()
-                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v));
+                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::for_response(&v));
         let last_promotion = fetch_last_promotions(&state.db, &[artifact.id], auth.as_ref())
             .await
             .remove(&artifact.id);
@@ -11347,10 +11449,13 @@ pub async fn test_upstream(
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
     if response.status().is_success() || status == 404 {
+        let (upstream_url, upstream_url_has_credentials) =
+            upstream_url_for_response(Some(upstream_url));
         Ok(Json(serde_json::json!({
             "status": "ok",
             "upstream_status": status,
             "upstream_url": upstream_url,
+            "upstream_url_has_credentials": upstream_url_has_credentials,
         })))
     } else {
         Err(AppError::BadGateway(format!(
@@ -14513,6 +14618,37 @@ mod tests {
     }
 
     #[test]
+    fn test_repository_response_never_echoes_upstream_url_password() {
+        // #4452: a Remote created with `https://user:pass@host/...` must not
+        // hand the password back on create / get / list / update, which all
+        // render through `repo_to_response`.
+        let mut repo = sample_repo();
+        repo.repo_type = RepositoryType::Remote;
+        repo.upstream_url =
+            Some("https://alice:s3cret-4452@registry.example.com/anything/base".to_string());
+        let json = serde_json::to_value(repo_to_response(repo, 0)).unwrap();
+        let text = json.to_string();
+        assert!(!text.contains("s3cret-4452"), "password leaked: {text}");
+        assert!(!text.contains("alice"), "username leaked: {text}");
+        assert_eq!(
+            json["upstream_url"],
+            "https://registry.example.com/anything/base"
+        );
+        assert_eq!(json["upstream_url_has_credentials"], true);
+
+        // A credential-free URL is echoed verbatim with the flag false, and a
+        // repository without an upstream keeps `null`.
+        let mut plain = sample_repo();
+        plain.upstream_url = Some("https://registry.npmjs.org".to_string());
+        let json = serde_json::to_value(repo_to_response(plain, 0)).unwrap();
+        assert_eq!(json["upstream_url"], "https://registry.npmjs.org");
+        assert_eq!(json["upstream_url_has_credentials"], false);
+        let json = serde_json::to_value(repo_to_response(sample_repo(), 0)).unwrap();
+        assert!(json["upstream_url"].is_null());
+        assert_eq!(json["upstream_url_has_credentials"], false);
+    }
+
+    #[test]
     fn test_create_request_deserializes_custom_user_agent() {
         let json = r#"{"key":"npm-proxy","name":"NPM Proxy","format":"npm","repo_type":"remote","custom_user_agent":"MyClient/2.0"}"#;
         let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
@@ -14868,6 +15004,7 @@ mod tests {
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -14882,6 +15019,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -16278,6 +16416,7 @@ mod tests {
             storage_used_bytes: 0,
             quota_bytes: None,
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: Some(true),
@@ -16292,6 +16431,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -26293,6 +26433,181 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // oci_trusted_bearer_realms (#3591): validation + create/update/get plumbing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oci_trusted_realms_to_store_gates_on_remote() {
+        let list = vec!["https://Auth.Docker.io/".to_string()];
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&list)).unwrap(),
+            Some(vec!["https://auth.docker.io".to_string()])
+        );
+        // `[]` on a remote is an explicit clear.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[])).unwrap(),
+            Some(vec![])
+        );
+        // An untouched form (`[]`) on a non-remote is a no-op; a real list is a 400.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Local, Some(&[])).unwrap(),
+            None
+        );
+        let err = oci_trusted_realms_to_store(&RepositoryType::Virtual, Some(&list)).unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        // Invalid entries are rejected on a remote.
+        for bad in [
+            "http://auth.docker.io",
+            "https://*.docker.io",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[bad.to_string()]))
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oci_trusted_realms_create_update_get_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::load_trusted_realms;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("realm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+
+        // A non-remote create carrying a list is rejected before any row is written.
+        let local_key = format!("realm-local-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &local_key,
+                "local",
+                "docker",
+                serde_json::json!({ "oci_trusted_bearer_realms": ["https://auth.docker.io"] }),
+            ),
+        )
+        .await
+        .expect_err("non-remote must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&local_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            written, 0,
+            "a rejected create must not write the repository row"
+        );
+
+        let repo_key = format!("realm-remote-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &repo_key,
+                "Docker Hub",
+                "docker",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://registry-1.docker.io",
+                    "oci_trusted_bearer_realms": ["https://AUTH.docker.io/", "https://auth.docker.io"]
+                }),
+            ),
+        )
+        .await
+        .expect("remote create with trusted realms must succeed");
+        let docker = vec!["https://auth.docker.io".to_string()];
+        assert_eq!(created.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            docker
+        );
+
+        let Json(fetched) = get_repository(State(state.clone()), auth(), Path(repo_key.clone()))
+            .await
+            .expect("GET must succeed");
+        assert_eq!(fetched.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+
+        // Replace.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({
+                "oci_trusted_bearer_realms": ["https://gitlab.example.com:8443"]
+            })),
+        )
+        .await
+        .expect("update must succeed");
+        let gitlab = vec!["https://gitlab.example.com:8443".to_string()];
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // An invalid entry is rejected and leaves the stored list unchanged.
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(
+                serde_json::json!({ "oci_trusted_bearer_realms": ["http://gitlab.example.com"] }),
+            ),
+        )
+        .await
+        .expect_err("http realm must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("https")));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            gitlab
+        );
+
+        // Omitting the field leaves it unchanged.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "description": "x" })),
+        )
+        .await
+        .expect("unrelated update must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // `[]` clears and the response omits the field.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "oci_trusted_bearer_realms": [] })),
+        )
+        .await
+        .expect("clear must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms, None);
+        assert!(load_trusted_realms(&pool, created.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
     // custom_user_agent: handler plumbing (create / update / get round-trips)
     // -----------------------------------------------------------------------
 
@@ -26981,6 +27296,7 @@ mod tests {
             storage_used_bytes: 0,
             quota_bytes: None,
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -26995,6 +27311,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -30002,20 +30319,27 @@ mod content_encoding_forwarding_tests {
         assert_eq!(&body[..], &coded[..]);
     }
 
-    /// #4050: the artifact detail response exposes the immutable origin
-    /// record — for a proxied artifact, the fetch-through repository AND the
-    /// upstream that supplied the bytes.
-    #[tokio::test]
-    async fn test_get_artifact_metadata_exposes_origin_4050() {
+    /// Seed one proxied artifact into a fresh Remote whose stored
+    /// `upstream_url` is `stored_upstream`, then read it back through BOTH
+    /// artifact detail routes (`GET /repositories/{key}/artifacts/{path}` and
+    /// `GET /artifacts/{id}`). Returns the two JSON bodies and the repo key.
+    async fn origin_detail_bodies(
+        stored_upstream: &str,
+    ) -> Option<(serde_json::Value, serde_json::Value, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
-            return;
-        };
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
-        tdh::seed_artifact(
+        // The origin fill trigger copies the repositories row's upstream_url.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(stored_upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+        let artifact_id = tdh::seed_artifact(
             &fx.state,
             &fx.pool,
-            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            &fx.repo_info("remote", Some(stored_upstream)),
             "org/origin/1.0/origin-1.0.bin",
             "org/origin/1.0/origin-1.0.bin",
             "origin",
@@ -30037,22 +30361,112 @@ mod content_encoding_forwarding_tests {
             Default::default(),
         )
         .await;
+        let by_id = crate::api::handlers::artifacts::get_artifact(
+            axum::extract::State(fx.state.clone()),
+            Extension(None),
+            axum::extract::Path(artifact_id),
+        )
+        .await;
+        let repo_key = fx.repo_key.clone();
         fx.teardown().await;
 
         let resp = result.unwrap_or_else(|e| panic!("metadata serve failed: {e:?}"));
         let (status, body, _headers) = tdh::collect_response(resp).await;
         assert_eq!(status, StatusCode::OK);
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_path: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_id = serde_json::to_value(
+            by_id
+                .unwrap_or_else(|e| panic!("get_artifact failed: {e:?}"))
+                .0,
+        )
+        .expect("artifact json");
+        Some((by_path, by_id, repo_key))
+    }
+
+    /// #4050: the artifact detail response exposes the immutable origin
+    /// record — for a proxied artifact, the fetch-through repository AND the
+    /// upstream that supplied the bytes.
+    #[tokio::test]
+    async fn test_get_artifact_metadata_exposes_origin_4050() {
+        let Some((json, by_id, repo_key)) =
+            origin_detail_bodies("https://upstream.example.test").await
+        else {
+            return;
+        };
         assert_eq!(
             json["origin"]["v"], 1,
             "origin must be on the detail response: {json}"
         );
         assert_eq!(json["origin"]["kind"], "proxy");
-        assert_eq!(json["origin"]["repository_key"], fx.repo_key);
+        assert_eq!(json["origin"]["repository_key"], repo_key);
         assert_eq!(
             json["origin"]["upstream_url"], "https://upstream.example.test",
             "the detail response must name the upstream that supplied the bytes: {json}"
         );
+        assert_eq!(by_id["origin"], json["origin"], "{by_id}");
+    }
+
+    /// #4452: a Remote whose upstream_url embeds credentials stamps them into
+    /// the stored origin; neither artifact detail route may return them.
+    #[tokio::test]
+    async fn test_artifact_detail_origin_redacts_upstream_userinfo_4452() {
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@upstream.example.test", "alice:s3cret");
+        let Some((by_path, by_id, _)) = origin_detail_bodies(&stored).await else {
+            return;
+        };
+        for json in [&by_path, &by_id] {
+            let text = json.to_string();
+            assert!(
+                !text.contains("s3cret") && !text.contains("alice"),
+                "leaked: {text}"
+            );
+            assert_eq!(
+                json["origin"]["upstream_url"],
+                "https://upstream.example.test"
+            );
+        }
+    }
+
+    /// #4452: the `test-upstream` probe reaches an upstream that requires the
+    /// URL's embedded Basic credentials, and its 200 body reports the URL
+    /// without them plus `upstream_url_has_credentials`.
+    #[tokio::test]
+    async fn test_test_upstream_redacts_upstream_userinfo_4452() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/base"))
+            .and(wiremock::matchers::basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let plain = format!("{}/base", server.uri());
+        let stored = plain.replacen("://", "://alice:s3cret@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&stored)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let result = super::test_upstream(
+            axum::extract::State(fx.state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            axum::extract::Path(fx.repo_key.clone()),
+        )
+        .await;
+        fx.teardown().await;
+
+        let json = result
+            .unwrap_or_else(|e| panic!("test-upstream must reach the authed mock: {e:?}"))
+            .0;
+        assert_eq!(json["upstream_status"], 200, "{json}");
+        assert_eq!(json["upstream_url"], plain.as_str(), "{json}");
+        assert_eq!(json["upstream_url_has_credentials"], true, "{json}");
+        assert!(!json.to_string().contains("s3cret"), "leaked: {json}");
     }
 }
 

@@ -2435,6 +2435,83 @@ pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     .expect("enable scan-on-proxy");
 }
 
+/// A Maven-built jar declaring `<group>:<artifact>:<version>` in its own
+/// `META-INF/maven/<group>/<artifact>/pom.properties` (#4100 scan-on-proxy
+/// tests). A per-call nonce entry keeps every fixture's digest unique, since
+/// proxy scan verdicts are global and keyed on the content digest.
+pub fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file(
+        format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+        opts,
+    )
+    .expect("pom.properties entry");
+    write!(
+        zip,
+        "groupId={group}\nartifactId={artifact}\nversion={version}\n"
+    )
+    .expect("pom.properties body");
+    zip.start_file("nonce.txt", opts).expect("nonce entry");
+    zip.write_all(Uuid::new_v4().to_string().as_bytes())
+        .expect("nonce body");
+    zip.finish().expect("finish jar").into_inner()
+}
+
+/// Seed a `vulnerable` (one critical) or `clean` proxy scan verdict for
+/// `bytes`, returning its digest for [`drop_proxy_verdicts`].
+pub async fn seed_proxy_verdict(
+    pool: &PgPool,
+    bytes: &[u8],
+    repo_id: Uuid,
+    vulnerable: bool,
+) -> String {
+    let digest = crate::api::handlers::proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes));
+    let (verdict, n, severity) = if vulnerable {
+        ("vulnerable", 1, Some("critical"))
+    } else {
+        ("clean", 0, None)
+    };
+    crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+        .record_verdict(
+            &digest,
+            "grype",
+            verdict,
+            n,
+            n,
+            0,
+            0,
+            0,
+            severity,
+            Some("grype-0.99.0-test"),
+            Some(repo_id),
+        )
+        .await
+        .expect("seed proxy scan verdict");
+    digest
+}
+
+/// Remove the verdicts [`seed_proxy_verdict`] wrote.
+pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
+    sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+        .bind(digests)
+        .execute(pool)
+        .await
+        .expect("cleanup proxy_scan_results");
+}
+
+/// Proxy downloads recorded for `path` on `repo_id` (#3446 / #4100
+/// exactly-once assertions).
+pub async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+    crate::services::proxy_catalog::download_counts_by_paths(pool, repo_id, &[path.to_string()])
+        .await
+        .expect("download counts")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Attach a new public Remote repository of `format`, proxying `upstream`, to
 /// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
 pub async fn attach_remote_member(
@@ -3104,4 +3181,48 @@ pub async fn collect_response(
 /// query.
 pub fn admin_auth_ext() -> Option<AuthExtension> {
     Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
+}
+
+/// Collects `tracing` output written while a subscriber built with it as the
+/// writer is the thread default (`tracing::subscriber::set_default`). Clone
+/// it into the subscriber and read the text back with [`LogCapture::text`].
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Install a thread-default subscriber at `level` writing into this
+    /// capture; logs are captured until the returned guard drops.
+    pub fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(level)
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    /// Everything captured so far, lossily decoded.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
 }
