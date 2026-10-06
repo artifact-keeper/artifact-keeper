@@ -115,6 +115,51 @@ jobs:
           echo "- Paths: $(python3 -c "import json; print(len(json.load(open('openapi.json'))['paths']))")" >> $GITHUB_STEP_SUMMARY
           echo "- Schemas: $(python3 -c "import json; print(len(json.load(open('openapi.json')).get('components',{}).get('schemas',{})))")" >> $GITHUB_STEP_SUMMARY
 
+      # artifact-keeper-api's `main` requires its "Lint & Validate OpenAPI"
+      # check (its .github/workflows/validate.yml), so a spec that fails that
+      # lint is refused there -- found only after the release, by hand
+      # (#4078). Run the same three commands here, against the API repo's own
+      # rule files (.spectral.yaml, redocly.yaml read from its `main`), so a
+      # bad spec fails THIS run before anything is pushed, dry run included.
+      # Keep the commands in step with that workflow: Spectral at
+      # `--fail-severity error`, Redocly lint advisory (it is
+      # `continue-on-error` there), and the bundle must succeed. The tools are
+      # unpinned there too; pinning them here would let the two drift apart.
+      - name: Check out the API repo's lint rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: artifact-keeper/artifact-keeper-api
+          ref: main
+          path: .api-lint
+          persist-credentials: false
+          sparse-checkout: |
+            .spectral.yaml
+            redocly.yaml
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Lint the spec as artifact-keeper-api's required check does
+        working-directory: .api-lint
+        run: |
+          npm install -g @stoplight/spectral-cli @redocly/cli
+          cp ../openapi.yaml openapi.yaml
+
+          # Spectral lint (blocking in the API repo)
+          spectral lint openapi.yaml --fail-severity error
+
+          # Redocly lint (continue-on-error in the API repo): report, never fail
+          if ! redocly lint openapi.yaml; then
+            echo "::warning title=Redocly lint::redocly lint reported problems. They are advisory in artifact-keeper-api's Lint & Validate OpenAPI check too, so this does not block the sync."
+          fi
+
+          # Verify bundleable (blocking in the API repo)
+          redocly bundle openapi.yaml -o "$RUNNER_TEMP/bundled.yaml"
+
+          echo "- **API repo lint:** passed (spectral, redocly bundle)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload spec artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
