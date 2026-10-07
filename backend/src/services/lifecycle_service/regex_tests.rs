@@ -335,9 +335,10 @@ async fn slow_regex_compile_is_bounded_by_the_timeout_4461() {
 }
 
 /// A live run refuses a stored policy whose PROTECTIVE pattern (an
-/// exclusion, or the keep pattern of tag_pattern_keep) fails open; a
-/// selecting pattern (`match.version_pattern`, tag_pattern_delete) with the
-/// same `\b` matches nothing and still runs. Nothing stored is changed.
+/// exclusion, or the keep pattern of tag_pattern_keep) fails open, and one
+/// whose `match.version_pattern` uses `\b` (#4459, #4502); a
+/// `tag_pattern_delete` pattern with the same `\b` still runs. Nothing stored
+/// is changed.
 #[tokio::test]
 async fn live_run_refuses_fail_open_stored_patterns_4461() {
     let Some(pool) = crate::testing::try_pool_with(2).await else {
@@ -355,6 +356,10 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
         ),
         ("tag_pattern_keep", json!({"pattern": r"\bstable\b"})),
         ("tag_pattern_keep", json!({"pattern": r"(?P<n>x)"})),
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
+        ),
     ];
     for (policy_type, config) in refused {
         let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
@@ -365,13 +370,7 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
         assert_eq!(service.get_policy(id).await.unwrap().config, config);
         service.delete_policy(id).await.expect("cleanup");
     }
-    let report_only = [
-        (
-            "max_age_days",
-            json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
-        ),
-        ("tag_pattern_delete", json!({"pattern": r"\btmp"})),
-    ];
+    let report_only = [("tag_pattern_delete", json!({"pattern": r"\btmp"}))];
     for (policy_type, config) in report_only {
         let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
         service
@@ -380,4 +379,96 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
             .unwrap_or_else(|e| panic!("{config}: a selecting pattern still runs: {e}"));
         service.delete_policy(id).await.expect("cleanup");
     }
+}
+
+/// #4502: a stored `match.version_pattern` with `\b`, on a policy that has a
+/// repository with a matching-looking artifact. The preview reports it in
+/// `errors` and matches nothing (it used to be a 400 from `parse_match`), and
+/// a live run refuses it up front and deletes nothing.
+#[tokio::test]
+async fn stored_match_word_boundary_is_previewed_and_refused_4502() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    let repository_id = super::tests::insert_max_age_test_repository(&mut conn).await;
+    let storage_key = format!("generic/{}", Uuid::new_v4());
+    let artifact = super::tests::insert_max_age_test_artifact(
+        &mut conn,
+        repository_id,
+        "builds/foo-1",
+        "foo-1",
+        &storage_key,
+        30,
+    )
+    .await;
+    let config = json!({"days": 1, "match": {"version_pattern": r"\bfoo"}});
+    let id = insert_unvalidated(&pool, "max_age_days", config.clone()).await;
+    sqlx::query(
+        "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
+    )
+    .bind(id)
+    .bind(repository_id)
+    .execute(&mut *conn)
+    .await
+    .expect("assign repository");
+
+    let service = LifecycleService::new(pool.clone());
+    let preview = service
+        .execute_policy(id, true)
+        .await
+        .expect("the preview reports the pattern instead of failing");
+    assert_eq!(preview.errors.len(), 1, "{preview:?}");
+    assert!(
+        preview.errors[0].contains("match.version_pattern") && preview.errors[0].contains(r"\y"),
+        "{preview:?}"
+    );
+    assert_eq!(preview.artifacts_matched, 0);
+    match service.execute_policy(id, false).await {
+        Err(AppError::Validation(m)) => assert!(
+            m.contains("Refusing to run") && m.contains("match.version_pattern"),
+            "{m}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!super::tests::is_deleted(&mut conn, artifact).await);
+    assert_eq!(service.get_policy(id).await.unwrap().config, config);
+
+    service.delete_policy(id).await.expect("cleanup");
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .execute(&mut *conn)
+        .await;
+}
+
+/// Which stored-regex problems refuse a live run, and with what message.
+#[test]
+fn live_run_refusal_covers_protective_and_match_patterns_4502() {
+    let problem = |field: &str, issue| StoredRegexProblem {
+        field: field.to_string(),
+        message: format!("{field}: bad"),
+        issue,
+    };
+    let exclusion = problem(
+        "exclude.version_patterns[0]",
+        StoredRegexIssue::WordBoundary,
+    );
+    let matcher = problem("match.version_pattern", StoredRegexIssue::WordBoundary);
+    let delete = problem("pattern", StoredRegexIssue::WordBoundary);
+
+    let refusal = |policy_type: &str, problems: &[StoredRegexProblem]| {
+        live_run_refusal("p", policy_type, problems).map(|e| e.to_string())
+    };
+    let m = refusal("max_age_days", &[exclusion]).expect("exclusion");
+    assert!(m.contains("would protect nothing"), "{m}");
+    assert!(matcher.blocks_run());
+    let m = refusal("max_age_days", &[matcher]).expect("match pattern");
+    assert!(
+        m.contains("match.version_pattern") && m.contains("cannot run this pattern"),
+        "{m}"
+    );
+    assert!(refusal("tag_pattern_keep", std::slice::from_ref(&delete)).is_some());
+    assert!(!delete.blocks_run());
+    assert!(refusal("tag_pattern_delete", &[delete]).is_none());
+    assert!(refusal("max_age_days", &[]).is_none());
 }

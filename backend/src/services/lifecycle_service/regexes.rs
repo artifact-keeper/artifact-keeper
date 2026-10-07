@@ -226,9 +226,23 @@ pub(crate) struct StoredRegexProblem {
 }
 
 impl StoredRegexProblem {
-    /// The policy cannot run at all, so a preview stops here.
+    /// The policy cannot run as stored, so a preview stops here: the pattern
+    /// does not compile, or it is a `match.version_pattern` with `\b`/`\B`,
+    /// which a run refuses (#4459, #4502). A selector that "matches nothing"
+    /// is not safe in general: inside a negative lookahead such as
+    /// `^(?!.*\bstable)` it makes the scope match EVERY version.
     pub(crate) fn blocks_run(&self) -> bool {
-        self.issue == StoredRegexIssue::DoesNotCompile
+        self.issue == StoredRegexIssue::DoesNotCompile || self.is_match_word_boundary()
+    }
+
+    /// `match.version_pattern` with `\b`/`\B` (#4459).
+    fn is_match_word_boundary(&self) -> bool {
+        self.issue == StoredRegexIssue::WordBoundary && self.field == "match.version_pattern"
+    }
+
+    /// A live run of a policy of `policy_type` must refuse this problem.
+    pub(crate) fn refuses_live_run(&self, policy_type: &str) -> bool {
+        self.fails_open(policy_type) || self.is_match_word_boundary()
     }
 
     /// The pattern PROTECTS artifacts in a policy of `policy_type` (an
@@ -321,4 +335,23 @@ pub async fn warn_invalid_lifecycle_regexes(db: &PgPool) {
         }
         Err(e) => tracing::warn!("lifecycle regex startup check failed: {e}"),
     }
+}
+
+/// The error a live run of `policy_name` (a `policy_type` policy) returns for
+/// its stored-regex `problems`, or `None` when it may run (#4461, #4502).
+pub(crate) fn live_run_refusal(
+    policy_name: &str,
+    policy_type: &str,
+    problems: &[StoredRegexProblem],
+) -> Option<AppError> {
+    let problem = problems.iter().find(|p| p.refuses_live_run(policy_type))?;
+    let why = if problem.fails_open(policy_type) {
+        "This pattern protects artifacts and would protect nothing as written"
+    } else {
+        "PostgreSQL cannot run this pattern as written"
+    };
+    Some(AppError::Validation(format!(
+        "Refusing to run lifecycle policy '{policy_name}': {}. {why}; fix the policy",
+        problem.message
+    )))
 }
