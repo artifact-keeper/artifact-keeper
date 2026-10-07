@@ -4690,6 +4690,148 @@ mod streaming_pipeline_regression_tests {
         f.teardown().await;
     }
 
+    /// The fixture repository as the finalize task sees it.
+    fn fixture_repo_info(f: &tdh::Fixture) -> RepoInfo {
+        RepoInfo {
+            id: f.repo_id,
+            key: f.repo_key.clone(),
+            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            format: "generic".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
+    /// #4422 review: an Incus image over the repository quota is refused
+    /// synchronously (507, before any 202) when the preflight already fails.
+    /// When the space is used up only after the 202, the background finalize
+    /// refuses it: the session flips to `failed` with the quota message, the
+    /// staged bytes are removed and no row is written. The locked admission
+    /// in `upsert_artifact` refuses the row the same way.
+    #[tokio::test]
+    async fn quota_refusal_sync_and_in_finalize_4422() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 10 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let image = vec![7u8; 64];
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/images/ubuntu/2/incus.tar.xz", f.repo_key))
+            .body(Body::from(image.clone()))
+            .expect("build PUT");
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The late path: a finalizing session whose image no longer fits.
+        let session_id = Uuid::new_v4();
+        let artifact_path = build_artifact_path("ubuntu", "1", "incus.tar.xz");
+        let staged = std::env::temp_dir().join(format!("ak-incus-quota-{session_id}"));
+        std::fs::write(&staged, &image).expect("stage image");
+        let finalize_token = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status, finalize_token, \
+              finalize_claimed_until) \
+             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 64, $5, 'finalizing', $6, \
+                     NOW() + make_interval(secs => $7))",
+        )
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(&artifact_path)
+        .bind(&*staged.to_string_lossy())
+        .bind(finalize_token)
+        .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
+        .execute(&f.pool)
+        .await
+        .expect("insert finalizing session");
+        let metadata = serde_json::json!({ "file_type": "unknown" });
+        finalize_upload(
+            f.state.clone(),
+            fixture_repo_info(&f),
+            FinalizeParams {
+                session_id,
+                repo_id: f.repo_id,
+                artifact_path: artifact_path.clone(),
+                product: "ubuntu".to_string(),
+                version: "1".to_string(),
+                size_bytes: image.len() as i64,
+                checksum: "0".repeat(64),
+                storage_key: build_storage_key(&f.repo_id, &artifact_path),
+                user_id: f.user_id,
+                metadata: metadata.clone(),
+                sealed_path: staged.clone(),
+                committed_offset: image.len() as i64,
+                final_path: None,
+                finalize_token,
+            },
+        )
+        .await;
+        let (status, err): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, finalize_error FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(status, "failed");
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("Repository storage quota exceeded")),
+            "{err:?}"
+        );
+        assert!(!staged.exists(), "the staged image must be removed");
+
+        // The authoritative admission in the row upsert refuses it too.
+        let refused = upsert_artifact(UpsertArtifactParams {
+            db: &f.pool,
+            event_bus: &f.state.event_bus,
+            repo_id: f.repo_id,
+            artifact_path: &artifact_path,
+            product: "ubuntu",
+            version: "1",
+            size_bytes: image.len() as i64,
+            checksum: &"0".repeat(64),
+            storage_key: &build_storage_key(&f.repo_id, &artifact_path),
+            user_id: f.user_id,
+            metadata: &metadata,
+        })
+        .await
+        .expect_err("the locked admission refuses the row");
+        assert!(
+            refused.contains("Repository storage quota exceeded"),
+            "{refused}"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
+        f.teardown().await;
+    }
+
     /// A finalize whose backend push fails must flip the session to `failed`
     /// with an error string, so the client that already received `202` can
     /// observe the failure via `GET /uploads/{id}` instead of it being lost.
@@ -4725,21 +4867,7 @@ mod streaming_pipeline_regression_tests {
         .await
         .expect("insert finalizing session");
 
-        let repo = RepoInfo {
-            id: f.repo_id,
-            key: f.repo_key.clone(),
-            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
-            storage_backend: "filesystem".to_string(),
-            repo_type: "local".to_string(),
-            format: "generic".to_string(),
-            upstream_url: None,
-            promotion_only: false,
-            age_gate_enabled: false,
-            age_gate_min_age_days: 7,
-            age_gate_mode: "upstream_publish_time".to_string(),
-            curation_enabled: false,
-            curation_default_action: "allow".to_string(),
-        };
+        let repo = fixture_repo_info(&f);
 
         finalize_upload(
             f.state.clone(),

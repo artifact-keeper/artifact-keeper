@@ -310,6 +310,16 @@ mod tests {
         begin_admitted_publish(&pool, repo_id, "a.bin", 90)
             .await
             .expect("overwrite charged its delta only");
+        // Overwriting it with 150 bytes is a +90 delta: 60 + 90 exceeds 100.
+        let err = begin_admitted_publish(&pool, repo_id, "a.bin", 150)
+            .await
+            .expect_err("an overwrite whose increase exceeds the quota");
+        assert_eq!(err.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            preflight_publish_quota(&pool, repo_id, PublishAt::Path("a.bin"), 150)
+                .await
+                .is_err()
+        );
 
         tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
     }

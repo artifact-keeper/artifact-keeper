@@ -2860,6 +2860,61 @@ mod catalog_registration_tests {
         assert_eq!(row.version, digest);
         assert_eq!(row.versions, vec![digest]);
     }
+
+    /// #4422 review: a `buf push` past the repository quota answers the
+    /// Connect `resource_exhausted` error with status 507 and writes no row.
+    #[tokio::test]
+    async fn module_upload_refused_by_quota_answers_connect_507_4422() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "quota" },
+                "files": [{
+                    "path": "acme/quota/v1/q.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let resp: serde_json::Value = serde_json::from_slice(&resp).expect("connect error json");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{resp}"
+        );
+        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
+        assert_eq!(resp["message"], "Repository storage quota exceeded");
+        assert_eq!(rows, 0);
+    }
 }
 
 /// #3919 review (B1): a protobuf commit row records the COMMIT digest (over

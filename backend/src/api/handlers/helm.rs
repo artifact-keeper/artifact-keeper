@@ -2472,6 +2472,57 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         f.teardown().await;
     }
 
+    /// #4422 review: chart and `.prov` are admitted row by row in ONE
+    /// transaction, the prov against usage that already includes the chart.
+    /// When each fits alone but not together, the push is refused with 507
+    /// and neither row lands; at exactly their sum both are admitted.
+    #[tokio::test]
+    async fn test_helm_chart_and_prov_admitted_together_against_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let together = (tgz.len() + REAL_PROV.len()) as i64;
+        let set_quota = |quota: i64| {
+            sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                .bind(f.repo_id)
+                .bind(quota)
+                .execute(&f.pool)
+        };
+        let parts: &[(&str, &str, &[u8])] = &[
+            ("chart", "provchart-0.1.0.tgz", &tgz),
+            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+        ];
+        let rows = || {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+        };
+
+        set_quota(together - 1).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 0, "neither row may land");
+
+        set_quota(together).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 2);
+
+        f.teardown().await;
+    }
+
     /// The core of #2635: a `.prov` uploaded next to its chart must be
     /// PERSISTED and served back byte-for-byte at the URL helm derives.
     #[tokio::test]

@@ -27118,6 +27118,108 @@ mod cross_repo_session_regression_tests {
         .await;
     }
 
+    /// #4422 review: the chunked `docker push` path (POST, PATCH, PUT
+    /// `?digest=`) is refused with `507 DENIED` when the blob exceeds the
+    /// quota. The refusal rolls back (no `oci_blobs` row) and resets the
+    /// session, so the same PUT succeeds once the quota allows it.
+    #[tokio::test]
+    async fn chunked_blob_push_refused_by_quota_then_retryable_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "chunkq").await;
+        let set_quota = |quota: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                    .bind(repo_id)
+                    .bind(quota)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        set_quota(5).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let send = |req: Request<Body>| tdh::send(router(None).with_state(state.clone()), req);
+
+        let (status, _) = send(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+                .header("Authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let session_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let chunk = b"chunked-over-quota".to_vec();
+        let (status, _) = send(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}",
+                    repo_key, session_id
+                ))
+                .header("Authorization", &auth)
+                .body(Body::from(chunk.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let digest = format!("sha256:{}", sha256_hex(&chunk));
+        let complete = || {
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}?digest={}",
+                    repo_key, session_id, digest
+                ))
+                .header("Authorization", &auth)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let (status, body) = send(complete()).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert!(body.contains("DENIED"), "{body}");
+        let blobs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blobs, 0, "a refused completion records no blob");
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 1, "the session survives the refusal");
+
+        set_quota(1_000).await;
+        let (status, body) = send(complete()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the reset session completes once the quota allows it: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
     /// PUT complete with a digest that does not match the streamed bytes must
     /// reject with 400 DIGEST_INVALID and write no blob row. Our streaming
     /// design keeps the session `open` (retryable) on mismatch instead of
