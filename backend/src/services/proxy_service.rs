@@ -193,6 +193,22 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     true
 }
 
+/// Drop this process's memoised sidecar lookup for `metadata_key` before a
+/// streaming re-enter (#4013).
+///
+/// The metadata LRU memoises a MISS (`None`) for [`PROXY_METADATA_LRU_TTL`].
+/// The cache check that preceded the election stored exactly that miss, and
+/// the leader that has since filled the entry may live on another replica,
+/// whose publish invalidated only its own process's LRU. Without this the
+/// re-enter re-reads the stale miss for up to 30 s and elects a second
+/// upstream fetch of an object that is already in the shared cache.
+async fn forget_cached_sidecar_miss(metadata_key: &str) {
+    let lru = proxy_metadata_lru().await;
+    if matches!(lru.get(metadata_key).await, Some(None)) {
+        lru.invalidate(metadata_key).await;
+    }
+}
+
 /// Completion signal of the streaming publish registered for `metadata_key`
 /// (#4013): flips to `true` when its writer task ends (commit, reject or
 /// error). Read right after [`CachePersister::tee_stream`] registered it, so
@@ -5241,7 +5257,13 @@ impl ProxyService {
             })
             .await?;
 
-        Ok(handle.map(StreamingFetchResult::from))
+        match handle {
+            Some(handle) => Ok(Some(StreamingFetchResult::from(handle))),
+            None => {
+                forget_cached_sidecar_miss(&metadata_key).await;
+                Ok(None)
+            }
+        }
     }
 
     /// Streaming cache-hit fast path, factored out so both the coordinated
@@ -22062,6 +22084,55 @@ mod tests {
             lru.get(&key).await.is_none(),
             "invalidate must drop the entry"
         );
+    }
+
+    /// #4013: a re-enter drops a memoised MISS (another replica may have just
+    /// filled the shared cache) but keeps a memoised hit.
+    #[tokio::test]
+    async fn test_forget_cached_sidecar_miss_drops_only_a_memoised_miss() {
+        let miss = format!(
+            "proxy-cache/{}/_test_/reenter-miss/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let hit = format!(
+            "proxy-cache/{}/_test_/reenter-hit/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(miss.clone(), None).await;
+        lru.insert(hit.clone(), Some(sample_cache_metadata("kept")))
+            .await;
+        forget_cached_sidecar_miss(&miss).await;
+        forget_cached_sidecar_miss(&hit).await;
+        assert!(
+            lru.get(&miss).await.is_none(),
+            "the stale miss must be re-read from storage on re-enter"
+        );
+        assert!(
+            matches!(lru.get(&hit).await, Some(Some(_))),
+            "a memoised hit is still valid and is kept"
+        );
+        lru.invalidate(&hit).await;
+    }
+
+    /// #4013: the streaming leader's publish signal is the writer's #3335
+    /// registration: absent before, `false` while writing, `true` after.
+    #[tokio::test]
+    async fn test_tee_publish_done_tracks_the_writer_registration() {
+        let key = format!(
+            "proxy-cache/{}/_test_/publish-done/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        assert!(tee_publish_done(&key).is_none());
+        let guard = TeePublishGuard::register(&key);
+        let mut done = tee_publish_done(&key).expect("registered");
+        assert!(!*done.borrow());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), done.wait_for(|d| *d))
+            .await
+            .expect("flips on writer exit")
+            .expect("value observed");
+        assert!(tee_publish_done(&key).is_none(), "deregistered on exit");
     }
 
     #[tokio::test]
