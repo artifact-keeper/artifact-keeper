@@ -102,9 +102,9 @@ fn dt_transport_err(operation: &str, err: reqwest::Error) -> AppError {
 pub(crate) const DT_PERMISSIONS_HINT: &str =
     "Dependency-Track rejected the request (auth/permission failure). \
      The API key's team must have ALL of: BOM_UPLOAD, PROJECT_CREATION_UPLOAD, \
-     PORTFOLIO_MANAGEMENT, VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default \
-     'Automation' team has none of these; grant them via the DT UI \
-     (Administration -> Teams -> permissions) or \
+     PORTFOLIO_MANAGEMENT, VIEW_PORTFOLIO, VIEW_POLICY_VIOLATION, \
+     VIEW_VULNERABILITY. The default 'Automation' team has none of these; \
+     grant them via the DT UI (Administration -> Teams -> permissions) or \
      POST /api/v1/permission/{permission}/team/{uuid}.";
 
 /// True if the status indicates an authentication or authorization failure

@@ -58,6 +58,7 @@ REQUIRED_PERMISSIONS=(
   VIEW_PORTFOLIO
   VIEW_VULNERABILITY
   PORTFOLIO_MANAGEMENT
+  VIEW_POLICY_VIOLATION
 )
 
 cat > "$WORK_DIR/mock_dtrack.py" <<PYEOF
@@ -327,8 +328,8 @@ grep -q 'already provisioned' "$WORK_DIR/init2.out" || \
 # 304 as success. We assert each required POST path appears twice: once
 # from Phase 1 and once from Phase 2.
 PERM_COUNT_AFTER_WARM=$(wc -l < "$PERM_LOG" | tr -d ' ')
-[ "$PERM_COUNT_AFTER_WARM" -eq 10 ] || \
-  fail "Phase 2: warm restart did not re-apply permission grants (POST count=${PERM_COUNT_AFTER_WARM}, expected 10)"
+[ "$PERM_COUNT_AFTER_WARM" -eq 12 ] || \
+  fail "Phase 2: warm restart did not re-apply permission grants (POST count=${PERM_COUNT_AFTER_WARM}, expected 12)"
 for PERM in "${REQUIRED_PERMISSIONS[@]}"; do
   COUNT=$(grep -xc "/api/v1/permission/$PERM/team/11111111-2222-3333-4444-555555555555" "$PERM_LOG" || true)
   [ "$COUNT" -eq 2 ] || \
