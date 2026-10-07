@@ -14,7 +14,8 @@
 //!   commits a manifest (push, proxy cache, migration import) records it, and a
 //!   rolled-back push leaves no row behind.
 //! * [`delete_in_tx`] — called from the manifest-delete unwind once the digest
-//!   is no longer tagged, for a delete that names the manifest by digest.
+//!   is no longer tagged, for a delete that names the manifest by digest or a
+//!   last-tag delete that leaves it unaddressable ([`delete_removes_record`]).
 //! * [`run_backfill`] — a one-shot, idempotent, best-effort startup pass that
 //!   records manifests committed before migration 268.
 //!
@@ -93,19 +94,70 @@ pub(crate) async fn upsert_in_tx(
 }
 
 /// Whether a manifest delete that has just removed the digest's last tag also
-/// deletes the manifest itself (and so its `oci_manifests` row). True for a
-/// content-addressed delete, and for a named delete whose reference IS the
-/// digest (the REST delete of a by-digest artifact): both name the manifest,
-/// not a tag. A tag-name delete leaves the manifest addressable by digest.
+/// deletes the manifest itself (and so its `oci_manifests` row).
+///
+/// * A content-addressed delete, and a named delete whose reference IS the
+///   digest (the REST delete of a by-digest artifact), name the manifest, not
+///   a tag: always.
+/// * A tag-name delete that removed the LAST tag (#4449): only when no live
+///   manifest-shaped `artifacts` row for the digest survives the delete
+///   (`live_manifest_row_remains`). Until the #1683 reader slice serves
+///   manifests from this table, a manifest is addressable by digest only
+///   through such a row (or a live parent index edge, which [`delete_in_tx`]
+///   checks), so once the last of them goes the manifest 404s by digest and
+///   its record must go with it. When a row does remain (the image was also
+///   pushed by digest, or a migrated row the reindex will index), the record
+///   stays.
 pub(crate) fn delete_removes_record(
     content_addressed: bool,
     reference: &str,
     digest: &str,
+    live_manifest_row_remains: bool,
 ) -> bool {
-    content_addressed || reference == digest
+    content_addressed || reference == digest || !live_manifest_row_remains
 }
 
-/// Forget a manifest that was deleted by digest. Runs inside the caller's
+/// Live manifest-shaped `artifacts` rows of the digest other than the one the
+/// delete removes (`$1` repository id, `$2` sha256 hex, `$3` the deleted
+/// row's path). Same path shape as the reindex candidate scan.
+const LIVE_MANIFEST_ROW_REMAINS_SQL: &str = concat!(
+    r#"
+    SELECT EXISTS (
+        SELECT 1 FROM artifacts a
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.checksum_sha256 = $2
+          AND a.path <> $3
+          AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+    r#"
+    )
+    "#
+);
+
+/// Whether a live manifest-shaped `artifacts` row for `digest` survives a
+/// delete of the row at `deleted_path` (#4449). Read-only, inside the caller's
+/// transaction, so it takes no row lock and leaves the #4441 lock order
+/// (index rows, then `oci_manifests`, then `artifacts`) unchanged. A
+/// non-`sha256:` digest can never match `checksum_sha256`: `false`.
+pub(crate) async fn live_manifest_row_remains_in_tx(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    digest: &str,
+    deleted_path: &str,
+) -> Result<bool, sqlx::Error> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Ok(false);
+    };
+    sqlx::query_scalar(LIVE_MANIFEST_ROW_REMAINS_SQL)
+        .bind(repo_id)
+        .bind(hex)
+        .bind(deleted_path)
+        .fetch_one(conn)
+        .await
+}
+
+/// Forget a deleted manifest (see [`delete_removes_record`]). Runs inside the caller's
 /// transaction, after its tag rows and stale index edges are gone.
 ///
 /// A manifest that is still the child of a live index (`oci_manifest_refs`
@@ -591,14 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_record_only_when_the_manifest_is_named() {
-        let d = "sha256:abc";
-        assert!(delete_removes_record(true, d, d));
-        assert!(delete_removes_record(false, d, d));
-        assert!(!delete_removes_record(false, "latest", d));
-    }
-
-    #[test]
     fn verify_body_accepts_matching_digest() {
         let body = image_body("v");
         assert!(verify_body(&compute_sha256(&body), &body).is_ok());
@@ -811,30 +855,178 @@ mod tests {
         );
     }
 
-    /// A tag-name delete leaves the manifest itself in place (it remains
-    /// addressable by digest); a named delete whose reference is the digest
-    /// (REST delete of a by-digest artifact) removes the row.
+    /// What a push leaves behind besides the index rows: the `artifacts` row
+    /// at `v2/app/manifests/<reference>`.
+    async fn push_image(pool: &PgPool, repo_id: Uuid, reference: &str, digest: &str, body: &[u8]) {
+        persist_image(pool, repo_id, reference, digest, body).await;
+        crate::api::handlers::oci_v2::upsert_manifest_artifact(
+            pool,
+            repo_id,
+            "app",
+            reference,
+            digest,
+            IMAGE,
+            &manifest_storage_key(digest),
+            body.len() as i64,
+            None,
+            None,
+        )
+        .await
+        .expect("upsert manifest artifact");
+    }
+
+    #[test]
+    fn delete_removes_record_when_the_manifest_is_named_or_left_unaddressable() {
+        let d = "sha256:abc";
+        assert!(delete_removes_record(true, d, d, true));
+        assert!(delete_removes_record(false, d, d, true));
+        // #4449: the last tag of a tag-only image goes with its record.
+        assert!(delete_removes_record(false, "latest", d, false));
+        // A by-digest row still serves it: the record stays.
+        assert!(!delete_removes_record(false, "latest", d, true));
+    }
+
+    #[test]
+    fn live_row_check_excludes_the_deleted_row_and_uses_the_reindex_shape() {
+        assert!(LIVE_MANIFEST_ROW_REMAINS_SQL.contains("a.path <> $3"));
+        assert!(LIVE_MANIFEST_ROW_REMAINS_SQL.contains("a.is_deleted = false"));
+        assert!(LIVE_MANIFEST_ROW_REMAINS_SQL
+            .contains(crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!()));
+    }
+
+    /// #4449: deleting the LAST tag of an image pushed only by tag leaves the
+    /// manifest unpullable by digest (no tag, no edge, no live `artifacts`
+    /// row), so its `oci_manifests` row goes too. An image also pushed by
+    /// digest keeps a live by-digest row, stays pullable and keeps its record.
+    /// A named delete whose reference is the digest (REST delete of a
+    /// by-digest artifact) removes the record.
     #[tokio::test]
-    async fn named_delete_keeps_row_unless_reference_is_the_digest() {
+    async fn last_tag_delete_removes_row_only_when_nothing_addresses_the_manifest() {
         let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
-        let body = image_body("named");
-        let digest = compute_sha256(&body);
-        persist_image(&fx.pool, fx.repo_id, "v1", &digest, &body).await;
-        delete(&fx.pool, fx.repo_id, "v1", &digest, false).await;
-        let after_tag_delete = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        // Tag only: the last tag delete forgets the manifest.
+        let tag_only = image_body("tag-only");
+        let tag_only_digest = compute_sha256(&tag_only);
+        push_image(&fx.pool, fx.repo_id, "v1", &tag_only_digest, &tag_only).await;
+        delete(&fx.pool, fx.repo_id, "v1", &tag_only_digest, false).await;
+        let tag_only_row = manifest_row(&fx.pool, fx.repo_id, &tag_only_digest).await;
 
-        persist_image(&fx.pool, fx.repo_id, &digest, &digest, &body).await;
-        delete(&fx.pool, fx.repo_id, &digest, &digest, false).await;
-        let after_digest_delete = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        // Two tags: the first tag delete is not the last one.
+        let two = image_body("two-tags");
+        let two_digest = compute_sha256(&two);
+        push_image(&fx.pool, fx.repo_id, "a", &two_digest, &two).await;
+        push_image(&fx.pool, fx.repo_id, "b", &two_digest, &two).await;
+        delete(&fx.pool, fx.repo_id, "a", &two_digest, false).await;
+        let two_after_first = manifest_row(&fx.pool, fx.repo_id, &two_digest).await;
+        delete(&fx.pool, fx.repo_id, "b", &two_digest, false).await;
+        let two_after_last = manifest_row(&fx.pool, fx.repo_id, &two_digest).await;
+
+        // Tag + digest: the digest row is a tag in `oci_tags` too, so the tag
+        // delete is not the last; then the REST-style named delete of the
+        // digest removes the record.
+        let both = image_body("tag-and-digest");
+        let both_digest = compute_sha256(&both);
+        push_image(&fx.pool, fx.repo_id, "v1", &both_digest, &both).await;
+        push_image(&fx.pool, fx.repo_id, &both_digest, &both_digest, &both).await;
+        delete(&fx.pool, fx.repo_id, "v1", &both_digest, false).await;
+        let both_after_tag = manifest_row(&fx.pool, fx.repo_id, &both_digest).await;
+        delete(&fx.pool, fx.repo_id, &both_digest, &both_digest, false).await;
+        let both_after_digest = manifest_row(&fx.pool, fx.repo_id, &both_digest).await;
+
+        // Last tag gone, but a live migrated row (not yet indexed) holds the
+        // digest: the record stays for the reindex to pick up.
+        let migrated = image_body("migrated");
+        let migrated_digest = compute_sha256(&migrated);
+        push_image(&fx.pool, fx.repo_id, "v1", &migrated_digest, &migrated).await;
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, 'app/v1/manifest.json', 'app', 1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(migrated_digest.trim_start_matches("sha256:"))
+        .bind(IMAGE)
+        .bind(manifest_storage_key(&migrated_digest))
+        .execute(&fx.pool)
+        .await
+        .expect("seed migrated row");
+        delete(&fx.pool, fx.repo_id, "v1", &migrated_digest, false).await;
+        let migrated_row = manifest_row(&fx.pool, fx.repo_id, &migrated_digest).await;
         fx.teardown().await;
 
-        assert!(
-            after_tag_delete.is_some(),
-            "a tag delete must not forget the manifest"
+        assert_eq!(
+            tag_only_row, None,
+            "#4449: tag-only image, last tag deleted"
         );
-        assert_eq!(after_digest_delete, None);
+        assert!(
+            two_after_first.is_some(),
+            "a sibling tag keeps the manifest"
+        );
+        assert_eq!(two_after_last, None, "the last of two tags");
+        assert!(
+            both_after_tag.is_some(),
+            "a tag delete must not forget a manifest still pullable by digest"
+        );
+        assert_eq!(both_after_digest, None);
+        assert!(
+            migrated_row.is_some(),
+            "a live manifest row for the digest keeps the record"
+        );
+    }
+
+    /// #4449 with an index: deleting the index's last tag forgets the index.
+    /// Deleting the last tag of a child still referenced by ANOTHER tagged
+    /// index keeps the child's record (the live parent edge, which also keeps
+    /// it pullable), and the other index keeps its own.
+    #[tokio::test]
+    async fn last_tag_delete_of_index_keeps_shared_child_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let child = image_body("shared-child-4449");
+        let child_digest = compute_sha256(&child);
+        let doomed = index_body(&[&child_digest]);
+        let doomed_digest = compute_sha256(&doomed);
+        let keeper = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{INDEX}","manifests":[{{"mediaType":"{IMAGE}","digest":"{child_digest}","size":10}}],"annotations":{{"k":"keeper"}}}}"#
+        )
+        .into_bytes();
+        let keeper_digest = compute_sha256(&keeper);
+        // The child was pushed by its own tag `c1` (index rows + artifacts
+        // row), and both indexes reference it.
+        push_image(&fx.pool, fx.repo_id, "c1", &child_digest, &child).await;
+        for (tag, digest, body) in [
+            ("v1", &doomed_digest, &doomed),
+            ("v2", &keeper_digest, &keeper),
+        ] {
+            persist_tag_and_refs(
+                &fx.pool,
+                fx.repo_id,
+                "app",
+                tag,
+                digest,
+                INDEX,
+                &ManifestClass::Index,
+                body,
+            )
+            .await
+            .expect("persist index");
+        }
+
+        delete(&fx.pool, fx.repo_id, "v1", &doomed_digest, false).await;
+        // The child's own last tag: nothing but the keeper's edge addresses it.
+        delete(&fx.pool, fx.repo_id, "c1", &child_digest, false).await;
+        let doomed_row = manifest_row(&fx.pool, fx.repo_id, &doomed_digest).await;
+        let keeper_row = manifest_row(&fx.pool, fx.repo_id, &keeper_digest).await;
+        let child_row = manifest_row(&fx.pool, fx.repo_id, &child_digest).await;
+        fx.teardown().await;
+
+        assert_eq!(doomed_row, None, "the untagged index is gone");
+        assert!(keeper_row.is_some());
+        assert!(
+            child_row.is_some(),
+            "the shared child of a live index stays"
+        );
     }
 
     /// Deleting a child manifest by digest while its parent index is still

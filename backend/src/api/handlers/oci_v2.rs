@@ -12395,12 +12395,28 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
 
         // #1683 / #4433: a delete that names the manifest by digest deletes
         // the manifest itself, so forget its existence record (kept while a
-        // live parent index still references it). A tag-name delete only
-        // removes a tag; the manifest stays addressable by digest.
+        // live parent index still references it). A tag-name delete that
+        // removed the last tag forgets it too unless a live manifest-shaped
+        // `artifacts` row for the digest survives this delete: without one
+        // the manifest 404s by digest (#4449). A plain read, so the #4441
+        // lock order (index rows, `oci_manifests`, then `artifacts`) holds.
+        let content_addressed = scope == OciIndexDeleteScope::ContentAddressed;
+        let live_manifest_row_remains = if content_addressed || reference == digest {
+            false
+        } else {
+            crate::services::oci_manifests::live_manifest_row_remains_in_tx(
+                tx,
+                repo_id,
+                digest,
+                &v2_manifest_artifact_path(image, reference),
+            )
+            .await?
+        };
         if crate::services::oci_manifests::delete_removes_record(
-            scope == OciIndexDeleteScope::ContentAddressed,
+            content_addressed,
             reference,
             digest,
+            live_manifest_row_remains,
         ) {
             crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
         }
