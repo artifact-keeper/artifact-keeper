@@ -84,6 +84,13 @@ FETCH_TOLERANCE=0          # allow upstream counter up to 1+tolerance
                            # (default: 0, or REPLICAS-1 for an object > 16 MiB)
 ```
 
+Operator note (#4013): with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`, a
+replica that loses the lock waits up to `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS`
+(default 65) for the leader before fetching itself. Keep that below the
+ingress / load balancer read timeout (this harness's nginx LB allows 300 s;
+nginx-ingress defaults to 60 s), or clients are cut off and retry into a fresh
+wait.
+
 To widen or narrow the race window, set `LATENCY_MS` / `ARTIFACT_SIZE_BYTES` on
 the `mock-upstream` service before `up` (or via the workflow inputs).
 

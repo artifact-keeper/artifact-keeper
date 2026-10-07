@@ -1103,7 +1103,11 @@ pub struct Config {
     /// filling at the deadline the waiter fetches once for its replica, so a
     /// cold object costs 1 upstream fetch, or at most one per replica when the
     /// fill outlives this. Each waiting replica holds one database connection
-    /// per cold key while it waits. Default: 65.
+    /// per cold key while it waits (the server drops a waiter whose client went
+    /// away within about a second, PG 14+). Keep it BELOW the ingress / load
+    /// balancer read timeout (nginx-ingress: 60 s): a client cut off first
+    /// retries into a fresh wait, so the per-replica fallback never fires.
+    /// Default: 65.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
     // -- OCI virtual-resolution negative cache (#1424) --

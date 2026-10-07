@@ -123,6 +123,11 @@ pub trait ClusterLock: Send + Sync {
 /// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
 pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
 
+/// How often the server checks that a blocked waiter's client is still
+/// connected (`client_connection_check_interval`, PG 14+), so a cancelled wait
+/// frees its backend within about this long instead of after `lock_timeout`.
+const CLIENT_CONNECTION_CHECK_INTERVAL: &str = "1s";
+
 /// Postgres `lock_timeout` value for a blocking advisory wait of `timeout`.
 ///
 /// `lock_timeout = 0` means "wait forever" in Postgres, so a zero (or sub-ms)
@@ -200,6 +205,16 @@ impl ClusterLock for PgAdvisoryLock {
             .bind(lock_timeout_setting(timeout))
             .execute(&mut conn)
             .await?;
+        // A backend asleep in a lock wait does not notice that its client went
+        // away: without this a cancelled wait (client gone, ingress timeout)
+        // keeps a server connection and its place in the lock queue until the
+        // lock is granted or `lock_timeout` fires. PG 14+ polls the socket at
+        // this interval and ends the wait. Best-effort: older servers reject
+        // the setting and simply keep the pre-14 behaviour.
+        let _ = sqlx::query("SELECT set_config('client_connection_check_interval', $1, false)")
+            .bind(CLIENT_CONNECTION_CHECK_INTERVAL)
+            .execute(&mut conn)
+            .await;
         match sqlx::query("SELECT pg_advisory_lock($1, $2)")
             .bind(class)
             .bind(obj)
@@ -609,5 +624,64 @@ mod tests {
             .expect("query ok")
             .expect("free after the waiter released");
         free.release().await;
+    }
+    /// #4013 review: a cancelled blocking wait must not leave a server backend
+    /// queued on the lock until `lock_timeout`. With
+    /// `client_connection_check_interval` the server notices the closed
+    /// client and drops the waiter within about a second. PG 14+ only.
+    #[tokio::test]
+    async fn pg_cancelled_blocking_wait_frees_its_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        if version < 140_000 {
+            return;
+        }
+        let lock = PgAdvisoryLock::new(pool.clone());
+        let key = format!("proxy-cache:pgcancel-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+        let waiting = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+                 AND classid::bigint = $1 AND objid::bigint = $2 AND NOT granted",
+            )
+            .bind(i64::from(PROXY_HYDRATION_LOCK_CLASS))
+            .bind(i64::from(obj as u32))
+            .fetch_one(&pool)
+            .await
+            .expect("pg_locks")
+        };
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the wait was still blocked when cancelled"
+        );
+        let mut freed = false;
+        for _ in 0..50 {
+            if waiting().await == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            freed,
+            "the server must drop a cancelled waiter well before lock_timeout (60 s)"
+        );
+        held.release().await;
     }
 }
