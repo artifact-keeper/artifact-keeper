@@ -10635,6 +10635,80 @@ async fn oci_blob_quota_refusal(
     )
 }
 
+/// The pieces of a live manifest PUT that [`commit_pushed_manifest`] writes.
+struct PushedManifest<'a> {
+    repo_id: Uuid,
+    image: &'a str,
+    reference: &'a str,
+    digest: &'a str,
+    content_type: &'a str,
+    class: &'a ManifestClass,
+    body: &'a [u8],
+    manifest_key: &'a str,
+    artifact_path: &'a str,
+    total_size: i64,
+    uploaded_by: Uuid,
+}
+
+/// Commit a pushed manifest's tag, references, storage-quota admission and
+/// `artifacts` row on ONE transaction (#4422), returning the artifact id or
+/// the OCI error the push answers. Nothing commits unless everything does.
+async fn commit_pushed_manifest(
+    state: &SharedState,
+    m: PushedManifest<'_>,
+) -> Result<Uuid, Response> {
+    let internal = |e: &dyn std::fmt::Display| {
+        tracing::error!("manifest push for {} failed: {e}", m.artifact_path);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to record the manifest",
+        )
+    };
+    let mut tx = state.db.begin().await.map_err(|e| internal(&e))?;
+    persist_tag_and_refs_in_tx(
+        &mut tx,
+        m.repo_id,
+        m.image,
+        m.reference,
+        m.digest,
+        m.content_type,
+        m.class,
+        m.body,
+    )
+    .await
+    .map_err(|e| internal(&e))?;
+    if let Some(refusal) = oci_quota_refusal(
+        super::publish_quota::locked_quota_denial(
+            &mut tx,
+            &state.db,
+            m.repo_id,
+            m.artifact_path,
+            m.total_size,
+        )
+        .await,
+    ) {
+        return Err(refusal);
+    }
+    let artifact_id = upsert_manifest_artifact(
+        &mut *tx,
+        m.repo_id,
+        m.image,
+        m.reference,
+        m.digest,
+        m.content_type,
+        m.manifest_key,
+        m.total_size,
+        Some(m.uploaded_by),
+        // A live push takes the trigger-derived hosted origin (#4050).
+        None,
+    )
+    .await
+    .map_err(|e| internal(&e))?;
+    tx.commit().await.map_err(|e| internal(&e))?;
+    Ok(artifact_id)
+}
+
 /// Upsert the `artifacts` row that makes a Docker/OCI manifest visible to the
 /// subsystems that enumerate the `artifacts` table (UI/download, GC, quota,
 /// scanning).
@@ -10855,77 +10929,36 @@ async fn handle_put_manifest(
     // rows that pre-date this code, but is no longer needed to repair a push
     // that returned 201.
     //
-    // #4422: the manifest's `artifacts` row is admitted against the storage
-    // quotas BEFORE the tag goes live, in the transaction that upserts the row
-    // below, so a refused push never leaves a pullable tag behind.
+    // #4422: the tag, its references, the quota admission and the manifest's
+    // `artifacts` row all commit on ONE transaction (one pooled connection).
+    // Holding a quota-locked transaction open while a second connection
+    // committed the tag starved the pool under concurrent pushes, and formed
+    // a lock cycle with the blob-GC sweep that Postgres could not see
+    // (connection A: ledger row; B: `oci_blobs` rows; GC: `oci_blobs` then
+    // ledger). On one connection the referenced `oci_blobs` rows are locked
+    // first (inside `persist_tag_and_refs_in_tx`), then the ledger, which is
+    // the sweep's own order; and a refused or failed push commits nothing,
+    // so it never leaves a pullable tag behind.
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
-    let mut manifest_tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-    if let Some(refusal) = oci_quota_refusal(
-        super::publish_quota::locked_quota_denial(
-            &mut manifest_tx,
-            &state.db,
-            repo_id,
-            &artifact_path,
-            total_size,
-        )
-        .await,
-    ) {
-        return refusal;
-    }
-    if let Err(e) = persist_tag_and_refs(
-        &state.db,
-        repo_id,
-        &image,
-        reference,
-        &digest,
-        &content_type,
-        &class,
-        &body,
-    )
-    .await
-    {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
-
-    // Also create an artifact record so it appears in the UI (and so GC /
-    // quota / scanning, which enumerate the `artifacts` table, see this
-    // manifest). Shared with the migration import path via
-    // `upsert_manifest_artifact` so a pushed and a migrated manifest are
-    // recorded identically.
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
-
-    let upserted = upsert_manifest_artifact(
-        &mut *manifest_tx,
-        repo_id,
-        &image,
-        reference,
-        &digest,
-        &content_type,
-        &manifest_key,
-        total_size,
-        Some(claims.sub),
-        // A live push takes the trigger-derived hosted origin (#4050).
-        None,
+    let committed = commit_pushed_manifest(
+        state,
+        PushedManifest {
+            repo_id,
+            image: &image,
+            reference,
+            digest: &digest,
+            content_type: &content_type,
+            class: &class,
+            body: &body,
+            manifest_key: &manifest_key,
+            artifact_path: &artifact_path,
+            total_size,
+            uploaded_by: claims.sub,
+        },
     )
     .await;
-    let upserted = match upserted {
-        Ok(artifact_id) => manifest_tx.commit().await.map(|()| artifact_id),
-        Err(e) => Err(e),
-    };
-    match upserted {
+    match committed {
         Ok(artifact_id) => {
             crate::services::quarantine_service::apply_upload_hold_hosted(
                 &state.db,
@@ -10941,13 +10974,7 @@ async fn handle_put_manifest(
             )
             .await;
         }
-        Err(e) => {
-            tracing::error!(
-                "Failed to upsert artifact record for {}: {}",
-                artifact_path,
-                e
-            );
-        }
+        Err(refusal) => return refusal,
     }
 
     // Surface the pushed image in the packages catalog. The web UI's
@@ -27509,6 +27536,116 @@ mod cross_repo_session_regression_tests {
         }
 
         cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
+    }
+
+    /// An OCI image manifest whose config descriptor is `digest` (declared
+    /// `config_size`) and whose layers declare `layer_sizes`.
+    fn image_manifest(digest: &str, config_size: i64, layer_sizes: &[i64]) -> String {
+        let layers: Vec<serde_json::Value> = layer_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{:064x}", i + 1),
+                    "size": size
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest,
+                "size": config_size
+            },
+            "layers": layers
+        })
+        .to_string()
+    }
+
+    fn put_manifest_request(repo_key: &str, tag: &str, auth: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/myimage/manifests/{}", repo_key, tag))
+            .header("Authorization", auth)
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// #4422 review: a manifest PUT commits its tag, references, quota
+    /// admission and `artifacts` row on ONE pooled connection. On a pool of
+    /// exactly one connection, concurrent pushes into a quota-capped
+    /// repository all succeed; holding the quota transaction while a second
+    /// connection committed the tag starved the pool and timed out.
+    #[tokio::test]
+    async fn concurrent_manifest_pushes_hold_one_connection_each_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(single) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "onepool").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = tdh::build_state(single, storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let config = b"one-pool-config-blob".to_vec();
+        let digest = push_blob(&state, &repo_key, &auth, &config).await;
+
+        let pushes = (0..3).map(|i| {
+            let app = router(None).with_state(state.clone());
+            let req = put_manifest_request(
+                &repo_key,
+                &format!("v{i}"),
+                &auth,
+                image_manifest(&digest, config.len() as i64, &[]),
+            );
+            async move { tdh::send(app, req).await }
+        });
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            futures::future::join_all(pushes),
+        )
+        .await
+        .expect("concurrent manifest pushes must not hang");
+        for (status, body) in results {
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let tags: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tags, 3);
+
+        for table in [
+            "oci_manifest_refs",
+            "manifest_blob_refs",
+            "oci_tags",
+            "artifacts",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE repository_id = $1");
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(repo_id)
+                .execute(&pool)
+                .await;
+        }
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 
     /// #1776: create a non-local OCI repo (remote/virtual) marked public, with a
