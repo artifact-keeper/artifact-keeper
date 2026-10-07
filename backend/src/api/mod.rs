@@ -567,11 +567,15 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
-/// Redact sensitive query-string parameters from a URI path for safe logging.
+/// Redact credentials from a request path and query string for safe logging.
 ///
-/// Parameters named `token`, `key`, `api_key`, `password`, or `secret`
-/// (case-insensitive) have their values replaced with `[REDACTED]`.
+/// Query parameters named `token`, `key`, `api_key`, `password`, or `secret`
+/// (case-insensitive) have their values replaced with `[REDACTED]` (#544).
+///
+/// The path is passed through [`redact_token_path_segment`], which hides the
+/// bearer token the two conda token-channel layouts carry in the path itself.
 pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
+    let path = redact_token_path_segment(path);
     match query {
         Some(q) => {
             let redacted: String = q
@@ -594,8 +598,50 @@ pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
                 .join("&");
             format!("{}?{}", path, redacted)
         }
-        None => path.to_string(),
+        None => path.into_owned(),
     }
+}
+
+/// Replace the token segment of a conda token-channel path with `[REDACTED]`.
+///
+/// Two layouts put a bearer token in the path rather than a header:
+///
+/// - `/conda/t/<TOKEN>/<repo_key>/...` (conda's `.condarc` token channel)
+/// - `/t/<TOKEN>/conda/<repo_key>/...` (rattler / pixi `--conda-token`)
+///
+/// Only a path that STARTS with one of those prefixes is touched; a `/t/`
+/// deeper in the path (a repository or package path that happens to contain
+/// one) is left alone. Leading slashes are skipped the same way
+/// `extract_conda_url_token` skips them, so `//conda/t/<TOKEN>/...` is
+/// redacted too. Under `/conda/t/` the segment is only treated as a token when
+/// more path follows it, so `/conda/t/channeldata.json` (a repository whose
+/// key is literally `t`) stays readable, matching what the auth middleware
+/// accepts as a credential. Everything around the token is kept verbatim.
+pub fn redact_token_path_segment(path: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let trimmed = path.trim_start_matches('/');
+    let lead = &path[..path.len() - trimmed.len()];
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("t/") {
+        ("t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("conda/t/") {
+        // A token channel needs a path after the token; without one the
+        // segment is a route under a repository named `t`.
+        if !rest.contains('/') {
+            return Cow::Borrowed(path);
+        }
+        ("conda/t/", rest)
+    } else {
+        return Cow::Borrowed(path);
+    };
+    let (token, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if token.is_empty() {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(format!("{lead}{prefix}[REDACTED]{tail}"))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -914,6 +960,70 @@ mod tests {
             result,
             "/endpoint?token=[REDACTED]&password=[REDACTED]&secret=[REDACTED]&key=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn test_redact_conda_token_channel_path() {
+        let result =
+            redact_sensitive_params("/conda/t/ak_secret123/my-repo/noarch/repodata.json", None);
+        assert_eq!(result, "/conda/t/[REDACTED]/my-repo/noarch/repodata.json");
+    }
+
+    #[test]
+    fn test_redact_rattler_token_path() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/linux-64/pkg-1.0-0.conda",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/linux-64/pkg-1.0-0.conda"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_with_sensitive_query() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/noarch/repodata.json",
+            Some("token=abc&x=1"),
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/noarch/repodata.json?token=[REDACTED]&x=1"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_extra_leading_slashes() {
+        let result = redact_sensitive_params("//conda/t/ak_secret123/my-repo/", None);
+        assert_eq!(result, "//conda/t/[REDACTED]/my-repo/");
+    }
+
+    #[test]
+    fn test_redact_token_path_nested_t_untouched() {
+        for path in [
+            "/conda/my-repo/t/noarch/repodata.json",
+            "/npm/some-repo/t/x",
+            "/api/v1/repositories/t/artifacts",
+            "/maven/repo/org/t/1.0/t-1.0.jar",
+        ] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_repo_named_t_untouched() {
+        // `/conda/t/<doc>` with nothing after is the plain route for a
+        // repository whose key is `t`, not a token channel.
+        for path in ["/conda/t/channeldata.json", "/conda/t/upload", "/conda/t"] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_empty_token_untouched() {
+        assert_eq!(redact_sensitive_params("/t//conda/x", None), "/t//conda/x");
+        assert_eq!(redact_sensitive_params("/t/", None), "/t/");
     }
 
     // -----------------------------------------------------------------------

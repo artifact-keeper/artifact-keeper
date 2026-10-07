@@ -1354,11 +1354,9 @@ mod make_http_request_span_tests {
         warn_if_trace_context_untrusted(&crate::config::Config::test_config());
     }
 
-    /// The span must still redact its URI (#544). Guards against a future edit
-    /// to this builder reintroducing the raw `request.uri()`: captures the
-    /// `uri` field actually recorded on the `http_request` span.
-    #[test]
-    fn the_uri_is_redacted_before_it_reaches_the_span() {
+    /// Build the `http_request` span for `request` and return the `uri` field
+    /// actually recorded on it.
+    fn captured_span_uri(request: &Request<()>) -> String {
         use std::sync::{Arc, Mutex};
 
         struct UriVisitor<'a>(&'a mut Option<String>);
@@ -1387,7 +1385,7 @@ mod make_http_request_span_tests {
         let captured = Arc::new(Mutex::new(None));
         let subscriber = tracing_subscriber::registry().with(CaptureUri(captured.clone()));
         tracing::subscriber::with_default(subscriber, || {
-            let _span = make_http_request_span(&request_with(&[]), &[]);
+            let _span = make_http_request_span(request, &[]);
         });
 
         let uri = captured
@@ -1395,6 +1393,15 @@ mod make_http_request_span_tests {
             .unwrap()
             .clone()
             .expect("make_http_request_span must record a uri field");
+        uri
+    }
+
+    /// The span must still redact its URI (#544). Guards against a future edit
+    /// to this builder reintroducing the raw `request.uri()`: captures the
+    /// `uri` field actually recorded on the `http_request` span.
+    #[test]
+    fn the_uri_is_redacted_before_it_reaches_the_span() {
+        let uri = captured_span_uri(&request_with(&[]));
         assert!(
             uri.starts_with("/npm/some-repo/pkg"),
             "unexpected uri: {uri}"
@@ -1403,5 +1410,33 @@ mod make_http_request_span_tests {
             !uri.contains("secret"),
             "the span's uri must be redacted, got {uri}"
         );
+    }
+
+    /// The conda token layouts carry the bearer token in the PATH (#4555), so
+    /// query redaction alone leaked it into the span. Covers rattler's
+    /// `/t/<TOKEN>/conda/...` and conda's `/conda/t/<TOKEN>/...`.
+    #[test]
+    fn a_conda_path_token_is_redacted_before_it_reaches_the_span() {
+        for (raw, want) in [
+            (
+                "/t/ak_pathsecret/conda/my-repo/noarch/repodata.json",
+                "/t/[REDACTED]/conda/my-repo/noarch/repodata.json",
+            ),
+            (
+                "/conda/t/ak_pathsecret/my-repo/noarch/repodata.json",
+                "/conda/t/[REDACTED]/my-repo/noarch/repodata.json",
+            ),
+        ] {
+            let request = Request::builder()
+                .uri(raw)
+                .body(())
+                .expect("request builds");
+            let uri = captured_span_uri(&request);
+            assert!(
+                !uri.contains("ak_pathsecret"),
+                "the span's uri must not carry the path token, got {uri}"
+            );
+            assert_eq!(uri, want);
+        }
     }
 }
