@@ -974,6 +974,18 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(provider_type.contains("kubernetes"), "{provider_type}");
+        // The published contract matches `normalize_provider_type`: an
+        // unknown type is refused, not treated as free text.
+        assert!(
+            provider_type.contains("refused with 400"),
+            "{provider_type}"
+        );
+        assert!(!provider_type.contains("Free text"), "{provider_type}");
+        let echoed = spec["components"]["schemas"]["CiOidcProviderResponse"]["properties"]
+            ["provider_type"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!echoed.contains("echoed as written"), "{echoed}");
     }
 
     /// 2.4 — setting or changing a key source or static JWKS emits a

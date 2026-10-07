@@ -222,11 +222,12 @@ pub struct CiOidcIdentityMapping {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateCiOidcProviderRequest {
     pub name: String,
-    /// `gitlab`, `github`, `kubernetes` or `generic` (the default). Free text,
-    /// but only those exact values change behaviour: `kubernetes` mints a
+    /// One of `gitlab`, `github`, `kubernetes` or `generic` (the default),
+    /// matched case-insensitively and stored lowercase; any other value, a
+    /// typo such as `k8s` included, is refused with 400. `kubernetes` mints a
     /// read-only access token with no refresh token and logs the workload of
-    /// each exchange. Any other value, a typo such as `k8s` included, behaves
-    /// as `generic`.
+    /// each exchange. On update, a provider created before the type was
+    /// checked may send its stored value back unchanged.
     pub provider_type: Option<String>,
     pub issuer_url: String,
     pub audience: Option<String>,
@@ -303,8 +304,9 @@ impl From<ProviderResponseRow> for CiOidcProviderResponse {
 pub struct CiOidcProviderResponse {
     pub id: Uuid,
     pub name: String,
-    /// The stored type, echoed as written: only `gitlab`, `github` and
-    /// `kubernetes` change behaviour, anything else acts as `generic`.
+    /// The stored type: `gitlab`, `github`, `kubernetes` or `generic`. A
+    /// provider created before the type was checked may still hold another
+    /// value, which acts as `generic`.
     pub provider_type: String,
     pub issuer_url: String,
     pub audience: String,
@@ -347,6 +349,20 @@ fn normalize_provider_type(raw: &str) -> Result<String> {
             "Unknown provider_type '{raw}': expected one of {}",
             PROVIDER_TYPES.join(", ")
         )))
+    }
+}
+
+/// The `provider_type` an update stores: the stored one when the request
+/// omits it or sends the stored value back unchanged, else the normalised
+/// request. Echoing the stored value is accepted even when it is not one of
+/// [`PROVIDER_TYPES`], because a provider created while the type was free text
+/// may hold such a value and a client (the web UI included) re-sends the whole
+/// provider on every edit; only a create or a change of type is checked.
+fn resolve_updated_provider_type(requested: Option<&str>, stored: &str) -> Result<String> {
+    match requested {
+        None => Ok(stored.to_string()),
+        Some(raw) if raw == stored => Ok(stored.to_string()),
+        Some(raw) => normalize_provider_type(raw),
     }
 }
 
@@ -833,10 +849,8 @@ impl CiOidcService {
         req: UpdateCiOidcProviderRequest,
     ) -> Result<ProviderUpdate> {
         let existing = self.get(id).await?;
-        let provider_type = match req.provider_type.as_deref() {
-            Some(raw) => normalize_provider_type(raw)?,
-            None => existing.provider_type.clone(),
-        };
+        let provider_type =
+            resolve_updated_provider_type(req.provider_type.as_deref(), &existing.provider_type)?;
         let previous_provider_type =
             (provider_type != existing.provider_type).then(|| existing.provider_type.clone());
         let (key_source, static_jwks) = resolve_key_material(
@@ -2720,6 +2734,96 @@ mod tests {
             .await
             .expect_err("deleted provider should not exist");
         assert!(err.to_string().contains("provider not found"));
+    }
+
+    #[test]
+    fn an_update_may_echo_the_stored_provider_type() {
+        use super::resolve_updated_provider_type as resolve;
+        assert_eq!(resolve(None, "circleci").unwrap(), "circleci");
+        assert_eq!(resolve(Some("circleci"), "circleci").unwrap(), "circleci");
+        assert_eq!(
+            resolve(Some("Kubernetes"), "circleci").unwrap(),
+            "kubernetes"
+        );
+        assert_eq!(resolve(Some("GitLab"), "gitlab").unwrap(), "gitlab");
+        for bad in ["jenkins", "CircleCI", "k8s"] {
+            assert!(
+                matches!(
+                    resolve(Some(bad), "circleci"),
+                    Err(crate::error::AppError::Validation(_))
+                ),
+                "{bad:?} changes the type to an unknown one"
+            );
+        }
+    }
+
+    /// A provider stored while `provider_type` was free text keeps working
+    /// with a client that re-sends the whole provider on edit (the web UI
+    /// does), while a create or a change to an unknown type is still 400.
+    #[tokio::test]
+    async fn a_legacy_provider_type_round_trips_on_update() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let request = |provider_type: &str, name: &str| super::UpdateCiOidcProviderRequest {
+            name: Some(name.to_string()),
+            provider_type: Some(provider_type.to_string()),
+            issuer_url: None,
+            audience: None,
+            is_enabled: None,
+            key_source: None,
+            static_jwks: None,
+        };
+
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO ci_oidc_providers (name, provider_type, issuer_url, audience) \
+             VALUES ($1, 'circleci', 'https://oidc.circleci.example.com', 'artifact-keeper') \
+             RETURNING id",
+        )
+        .bind(format!("legacy-{}", uuid::Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("seed a legacy provider");
+
+        let renamed = format!("legacy-renamed-{}", uuid::Uuid::new_v4());
+        let updated = svc
+            .update(id, request("circleci", &renamed))
+            .await
+            .expect("echoing the stored type is accepted");
+        assert_eq!(updated.provider.provider_type, "circleci");
+        assert_eq!(updated.provider.name, renamed);
+        assert_eq!(updated.previous_provider_type, None);
+
+        let err = svc
+            .update(id, request("jenkins", &renamed))
+            .await
+            .err()
+            .expect("an unknown new type is refused");
+        assert!(matches!(err, crate::error::AppError::Validation(_)));
+
+        let err = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("legacy-create-{}", uuid::Uuid::new_v4()),
+                provider_type: Some("circleci".to_string()),
+                issuer_url: "https://oidc.circleci.example.com".to_string(),
+                audience: None,
+                is_enabled: None,
+                key_source: None,
+                static_jwks: None,
+            })
+            .await
+            .expect_err("a create with an unknown type is refused");
+        assert!(matches!(err, crate::error::AppError::Validation(_)));
+
+        let moved = svc
+            .update(id, request("Generic", &renamed))
+            .await
+            .expect("a legacy provider can move to a known type");
+        assert_eq!(moved.provider.provider_type, "generic");
+        assert_eq!(moved.previous_provider_type.as_deref(), Some("circleci"));
+
+        svc.delete(id).await.expect("cleanup");
     }
 
     #[tokio::test]

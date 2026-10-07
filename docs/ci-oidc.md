@@ -259,7 +259,10 @@ host can read it. A leaked token that could push would let an attacker replace
 images for every consumer of the registry, which is why this ceiling is fixed
 by type and cannot be widened. `provider_type` is matched case-insensitively
 and stored lowercase; a value that is not `gitlab`, `github`, `kubernetes` or
-`generic`, a typo such as `k8s` included, is refused with 400. Changing a
+`generic`, a typo such as `k8s` included, is refused with 400. A provider
+created before the type was checked may hold another value; an update that
+sends that stored value back unchanged is accepted, so editing such a provider
+in the web UI keeps working, and it still acts as `generic`. Changing a
 provider's type, for example `kubernetes` to `generic`, is written to the
 `security` log with the acting admin, because it widens every credential the
 provider mints from then on.
