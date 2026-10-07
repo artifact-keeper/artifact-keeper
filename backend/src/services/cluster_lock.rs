@@ -13,6 +13,8 @@
 //! without leaking a lock back into the pool. An in-memory implementation backs
 //! the unit tests so the coordinator is exercisable without a live database.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 
@@ -84,6 +86,99 @@ pub trait ClusterLock: Send + Sync {
     /// * `Err(_)` — lock infrastructure failure; the caller degrades to
     ///   per-process coordination (no worse than the pre-#1609 behavior).
     async fn try_acquire(&self, class: i32, obj: i32) -> Result<Option<ClusterLease>>;
+
+    /// Acquire `(class, obj)`, BLOCKING for at most `timeout` while another
+    /// replica holds it (#4013).
+    ///
+    /// * `Ok(Some(_))` — acquired. For a waiter this is the wake-up signal: the
+    ///   previous holder released, which the streaming leader does only after
+    ///   its cache publish, so the object is now readable from the cache.
+    /// * `Ok(None)` — `timeout` elapsed with the lock still held elsewhere.
+    /// * `Err(_)` — lock infrastructure failure.
+    ///
+    /// The provided body polls [`Self::try_acquire`] every
+    /// [`BLOCKING_ACQUIRE_POLL`]; it backs the in-memory test locks. The
+    /// Postgres implementation overrides it with a server-side wait that wakes
+    /// at the holder's release.
+    async fn acquire_blocking(
+        &self,
+        class: i32,
+        obj: i32,
+        timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(lease) = self.try_acquire(class, obj).await? {
+                return Ok(Some(lease));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(BLOCKING_ACQUIRE_POLL.min(deadline - now)).await;
+        }
+    }
+}
+
+/// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
+pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
+
+/// Server-side TCP keepalives for a session that holds or waits on an advisory
+/// lock (#4013): idle seconds, probe interval seconds, probe count.
+///
+/// When a replica's node disappears (force-deleted pod, node loss) its
+/// sockets close silently: no FIN, no RST. Postgres then keeps the dead
+/// session, and the advisory lock it holds, until the kernel's default
+/// keepalive gives up (about two hours on Linux). With these the server
+/// declares the peer dead after about `idle + interval * count` = 30 s and
+/// ends the session, which releases the lock and wakes the waiters on the
+/// other replicas. Only the dedicated lock sessions get them, never the pool.
+const LOCK_SESSION_KEEPALIVES: (&str, &str, &str) = ("15", "5", "3");
+
+/// Arm [`LOCK_SESSION_KEEPALIVES`] on a dedicated lock session. Best-effort:
+/// a Unix-socket session ignores them and a failure only keeps the server's
+/// defaults, so errors are not surfaced.
+async fn arm_dead_peer_keepalives(conn: &mut sqlx::PgConnection) {
+    let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
+    let _ = sqlx::query(
+        "SELECT set_config('tcp_keepalives_idle', $1, false), \
+                set_config('tcp_keepalives_interval', $2, false), \
+                set_config('tcp_keepalives_count', $3, false)",
+    )
+    .bind(idle)
+    .bind(interval)
+    .bind(count)
+    .execute(conn)
+    .await;
+}
+
+/// How often the server checks that a blocked waiter's client is still
+/// connected (`client_connection_check_interval`, PG 14+), so a cancelled wait
+/// frees its backend within about this long instead of after `lock_timeout`.
+const CLIENT_CONNECTION_CHECK_INTERVAL: &str = "1s";
+
+/// Postgres `lock_timeout` value for a blocking advisory wait of `timeout`.
+///
+/// `lock_timeout = 0` means "wait forever" in Postgres, so a zero (or sub-ms)
+/// timeout is rounded UP to 1 ms rather than silently becoming unbounded.
+fn lock_timeout_setting(timeout: Duration) -> String {
+    let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
+    format!("{ms}ms")
+}
+
+/// `true` when `err` ended a lock wait because time ran out: `lock_timeout`
+/// (SQLSTATE 55P03 `lock_not_available`), or a role/database
+/// `statement_timeout` shorter than it (57014 `query_canceled`). Either way the
+/// holder is still working and the waiter should fetch on its own; neither is
+/// a lock-infrastructure failure.
+fn is_wait_expired(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| is_wait_expiry_code(&code))
+}
+
+fn is_wait_expiry_code(code: &str) -> bool {
+    matches!(code, "55P03" | "57014")
 }
 
 /// Real PostgreSQL advisory-lock implementation (#1609).
@@ -120,12 +215,62 @@ impl ClusterLock for PgAdvisoryLock {
         // connection we own outright. On the happy path `release` unlocks and
         // drops it; on panic/cancel/pod-kill the guard drops, the detached
         // connection CLOSES, and Postgres releases the session lock (crash-safe).
-        let detached = conn.detach();
+        let mut detached = conn.detach();
+        arm_dead_peer_keepalives(&mut detached).await;
         Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
             conn: Some(detached),
             class,
             obj,
         })))
+    }
+
+    async fn acquire_blocking(
+        &self,
+        class: i32,
+        obj: i32,
+        timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        // DETACH before the blocking statement, not after it: if this future
+        // is cancelled mid-wait (client gone) a pooled connection would go back
+        // to the pool while Postgres may still grant it the session lock, which
+        // would then poison the key for every replica. A detached connection
+        // simply closes on drop, and the server drops the wait (or the lock)
+        // with it. It also means the session-level `lock_timeout` below never
+        // leaks into a pooled connection.
+        let mut conn = self.pool.acquire().await?.detach();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(lock_timeout_setting(timeout))
+            .execute(&mut conn)
+            .await?;
+        // A backend asleep in a lock wait does not notice that its client went
+        // away: without this a cancelled wait (client gone, ingress timeout)
+        // keeps a server connection and its place in the lock queue until the
+        // lock is granted or `lock_timeout` fires. PG 14+ polls the socket at
+        // this interval and ends the wait. Best-effort: older servers reject
+        // the setting and simply keep the pre-14 behaviour.
+        let _ = sqlx::query("SELECT set_config('client_connection_check_interval', $1, false)")
+            .bind(CLIENT_CONNECTION_CHECK_INTERVAL)
+            .execute(&mut conn)
+            .await;
+        // A waiter that is granted the lock holds it until it releases; if its
+        // node died meanwhile, only keepalives free it.
+        arm_dead_peer_keepalives(&mut conn).await;
+        match sqlx::query("SELECT pg_advisory_lock($1, $2)")
+            .bind(class)
+            .bind(obj)
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
+                conn: Some(conn),
+                class,
+                obj,
+            }))),
+            // The holder is still working after `timeout`: not an error, the
+            // caller falls back to fetching on its own. `conn` closes here.
+            Err(e) if is_wait_expired(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -192,9 +337,36 @@ pub struct ErroringClusterLock;
 #[async_trait]
 impl ClusterLock for ErroringClusterLock {
     async fn try_acquire(&self, _class: i32, _obj: i32) -> Result<Option<ClusterLease>> {
-        Err(crate::error::AppError::Database(
-            "simulated cluster-lock backend failure".to_string(),
-        ))
+        Err(simulated_lock_failure())
+    }
+}
+
+#[cfg(test)]
+fn simulated_lock_failure() -> crate::error::AppError {
+    crate::error::AppError::Database("simulated cluster-lock backend failure".to_string())
+}
+
+/// A [`ClusterLock`] whose `try_acquire` always LOSES (another replica holds the
+/// key) but whose blocking wait fails, for exercising the coordinator's
+/// "lock lost, then the wait itself errors" path in unit tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct LosingThenErroringClusterLock;
+
+#[cfg(test)]
+#[async_trait]
+impl ClusterLock for LosingThenErroringClusterLock {
+    async fn try_acquire(&self, _class: i32, _obj: i32) -> Result<Option<ClusterLease>> {
+        Ok(None)
+    }
+
+    async fn acquire_blocking(
+        &self,
+        _class: i32,
+        _obj: i32,
+        _timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        Err(simulated_lock_failure())
     }
 }
 
@@ -353,5 +525,378 @@ mod tests {
             freed,
             "dropping the guard must release the advisory lock (connection close)"
         );
+    }
+
+    #[test]
+    fn lock_timeout_setting_never_becomes_unbounded() {
+        // `lock_timeout = 0` is "wait forever" in Postgres: a zero timeout
+        // must round UP, never down.
+        assert_eq!(lock_timeout_setting(Duration::ZERO), "1ms");
+        assert_eq!(lock_timeout_setting(Duration::from_micros(300)), "1ms");
+        assert_eq!(lock_timeout_setting(Duration::from_secs(65)), "65000ms");
+        assert_eq!(
+            lock_timeout_setting(Duration::from_secs(u64::MAX / 4)),
+            format!("{}ms", i32::MAX)
+        );
+    }
+
+    #[test]
+    fn non_database_errors_are_not_lock_timeouts() {
+        assert!(!is_wait_expired(&sqlx::Error::RowNotFound));
+        assert!(!is_wait_expired(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[test]
+    fn statement_timeout_counts_as_an_expired_wait() {
+        assert!(is_wait_expiry_code("55P03"), "lock_timeout");
+        assert!(is_wait_expiry_code("57014"), "statement_timeout");
+        assert!(!is_wait_expiry_code("40P01"), "deadlock is a real error");
+        assert!(
+            !is_wait_expiry_code("08006"),
+            "connection failure is a real error"
+        );
+    }
+
+    #[tokio::test]
+    async fn provided_blocking_acquire_waits_for_release_then_wins() {
+        let lock = InMemoryClusterLock::default();
+        let obj = lease_object_id("blocking");
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("no error")
+            .expect("acquired");
+        let waiter = {
+            let lock = lock.clone();
+            tokio::spawn(async move {
+                lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "waiter blocks while the key is held");
+        held.release().await;
+        let won = waiter.await.expect("join").expect("no error");
+        assert!(won.is_some(), "waiter acquires once the holder releases");
+    }
+
+    #[tokio::test]
+    async fn provided_blocking_acquire_times_out_while_held() {
+        let lock = InMemoryClusterLock::default();
+        let obj = lease_object_id("blocking-timeout");
+        let _held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("no error")
+            .expect("acquired");
+        let got = lock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_millis(20))
+            .await
+            .expect("no error");
+        assert!(
+            got.is_none(),
+            "timeout while held is Ok(None), not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_acquire_surfaces_backend_errors() {
+        let err = ErroringClusterLock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, 1, Duration::from_millis(5))
+            .await;
+        assert!(err.is_err());
+        let err = LosingThenErroringClusterLock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, 1, Duration::from_millis(5))
+            .await;
+        assert!(err.is_err());
+    }
+
+    /// Tier-2 (#4013): the REAL blocking advisory wait wakes when the holder
+    /// releases, times out with `Ok(None)` (SQLSTATE 55P03 under
+    /// `lock_timeout`) while it is held, and a cancelled wait never leaves a
+    /// lock behind. Two separate pools stand in for two replicas.
+    #[tokio::test]
+    async fn pg_blocking_acquire_wakes_on_release_and_times_out() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b = PgAdvisoryLock::new(pool_b);
+        let key = format!("proxy-cache:pgblock-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+
+        let held = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+
+        // Timeout while held: Ok(None), not an error.
+        let started = std::time::Instant::now();
+        let timed_out = replica_b
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_millis(150))
+            .await
+            .expect("lock_timeout maps to Ok(None)");
+        assert!(timed_out.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(140));
+
+        // A cancelled wait must not leave a lock behind once the holder goes.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            replica_b.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "wait was still blocked when cancelled");
+
+        // Wake on release.
+        let waiter = tokio::spawn(async move {
+            replica_b
+                .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "waiter blocks while held");
+        held.release().await;
+        let woke = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter woke promptly after release")
+            .expect("join")
+            .expect("query ok")
+            .expect("acquired after release");
+        woke.release().await;
+
+        // Nothing leaked: the key is free again.
+        let free = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("free after the waiter released");
+        free.release().await;
+    }
+    /// #4013 review: a cancelled blocking wait must not leave a server backend
+    /// queued on the lock until `lock_timeout`. With
+    /// `client_connection_check_interval` the server notices the closed
+    /// client and drops the waiter within about a second. PG 14+ only.
+    #[tokio::test]
+    async fn pg_cancelled_blocking_wait_frees_its_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+        if version < 140_000 {
+            return;
+        }
+        let lock = PgAdvisoryLock::new(pool.clone());
+        let key = format!("proxy-cache:pgcancel-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+        let waiting = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+                 AND classid::bigint = $1 AND objid::bigint = $2 AND NOT granted",
+            )
+            .bind(i64::from(PROXY_HYDRATION_LOCK_CLASS))
+            .bind(i64::from(obj as u32))
+            .fetch_one(&pool)
+            .await
+            .expect("pg_locks")
+        };
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the wait was still blocked when cancelled"
+        );
+        let mut freed = false;
+        for _ in 0..50 {
+            if waiting().await == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            freed,
+            "the server must drop a cancelled waiter well before lock_timeout (60 s)"
+        );
+        held.release().await;
+    }
+    /// #4013 review: a session `statement_timeout` shorter than the wait
+    /// cancels `pg_advisory_lock` with 57014. That is an expired wait
+    /// (`Ok(None)`, fetch on our own), not a lock-infrastructure error.
+    #[tokio::test]
+    async fn pg_statement_timeout_ends_the_wait_like_lock_timeout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::str::FromStr;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let url = std::env::var("DATABASE_URL").expect("try_pool implies DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("url")
+            .options([("statement_timeout", "150")]);
+        let short = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("pool with a short statement_timeout");
+        let holder = PgAdvisoryLock::new(pool);
+        let waiter = PgAdvisoryLock::new(short);
+        let key = format!("proxy-cache:pgstmt-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let held = holder
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+        let started = std::time::Instant::now();
+        let got = waiter
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30))
+            .await
+            .expect("57014 maps to Ok(None), not Err");
+        assert!(got.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ended by statement_timeout, not lock_timeout"
+        );
+        held.release().await;
+    }
+    /// #4013 (hardware verification): the leader's lock-holding session and a
+    /// waiter's session both carry server-side keepalives, so a replica whose
+    /// node vanished is reaped in about 30 s instead of the kernel default.
+    #[tokio::test]
+    async fn pg_lock_sessions_carry_dead_peer_keepalives() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let lock = PgAdvisoryLock::new(pool);
+        let key = format!("proxy-cache:pgkeepalive-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let mut leases = vec![lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("leader")];
+        let other = lease_object_id(&format!("{key}-waiter"));
+        leases.push(
+            lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, other, Duration::from_secs(5))
+                .await
+                .expect("query ok")
+                .expect("free key is granted at once"),
+        );
+        for lease in &mut leases {
+            let ClusterLease::Postgres(lease) = lease else {
+                panic!("postgres lease");
+            };
+            let conn = lease.conn.as_mut().expect("held connection");
+            let tcp: bool = sqlx::query_scalar("SELECT inet_client_addr() IS NOT NULL")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("transport");
+            if !tcp {
+                continue; // keepalives do not apply to a Unix socket
+            }
+            let settings: (String, String, String) = sqlx::query_as(
+                "SELECT current_setting('tcp_keepalives_idle'), \
+                        current_setting('tcp_keepalives_interval'), \
+                        current_setting('tcp_keepalives_count')",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .expect("settings");
+            let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
+            assert_eq!(
+                settings,
+                (idle.to_string(), interval.to_string(), count.to_string())
+            );
+        }
+        for lease in leases {
+            lease.release().await;
+        }
+    }
+
+    /// #4013 (hardware verification): when the leader's session dies (here
+    /// `pg_terminate_backend`, what the keepalive reaper does to a vanished
+    /// node), its lock is released and a waiter on another replica wakes at
+    /// once, then wins the re-election, well inside 2 s.
+    #[tokio::test]
+    async fn pg_waiter_reelects_promptly_when_the_leader_session_dies() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let admin = pool_a.clone();
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b = PgAdvisoryLock::new(pool_b);
+        let key = format!("proxy-cache:pgdeadleader-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let leader = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("leader");
+        let waiter = tokio::spawn(async move {
+            let woke = replica_b
+                .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(60))
+                .await;
+            (replica_b, woke)
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter blocks behind the live leader"
+        );
+
+        let started = std::time::Instant::now();
+        let terminated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid::bigint = $1 \
+               AND objid::bigint = $2 AND granted) t",
+        )
+        .bind(i64::from(PROXY_HYDRATION_LOCK_CLASS))
+        .bind(i64::from(obj as u32))
+        .fetch_one(&admin)
+        .await
+        .expect("terminate the leader session");
+        assert_eq!(terminated, 1, "exactly the leader's session held the lock");
+
+        let (replica_b, woke) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiter wakes as soon as the leader session is gone")
+            .expect("join");
+        let woke = woke.expect("query ok").expect("granted, not timed out");
+        // The woken waiter releases and re-elects (ReElect -> re-enter); the
+        // re-election finds the lock free and wins it.
+        woke.release().await;
+        let reelected = replica_b
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("re-elected leader");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "re-election within 2 s of the leader's death, not the 60 s wait"
+        );
+        reelected.release().await;
+        drop(leader); // its connection is already dead
     }
 }

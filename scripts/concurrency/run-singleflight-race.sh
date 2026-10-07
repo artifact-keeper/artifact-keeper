@@ -17,7 +17,10 @@
 #   4. Fires N concurrent GETs (default 200) for the SINGLE uncached artifact
 #      through the LB (round-robined across replicas).
 #   5. Asserts:
-#        A1 upstream fetch counter == 1 (modulo FETCH_TOLERANCE)
+#        A1 upstream fetch counter == 1 (modulo FETCH_TOLERANCE; for a LARGE
+#           object, > the 16 MiB in-process fan-out window, the default
+#           tolerance is REPLICAS-1, i.e. <= one fetch per replica: the floor
+#           when a remote leader outlives the lock wait timeout, #4013)
 #        A2 every response is HTTP 200 with sha256 == the published digest
 #        A3 exactly one cached blob in the object store
 #
@@ -31,7 +34,9 @@
 #   REPO_KEY            maven-race-proxy
 #   ARTIFACT_PATH       race/big-artifact.bin    path under the proxy repo
 #   RESULTS_DIR         /tmp/concurrency-results
-#   FETCH_TOLERANCE     0                        allow counter up to 1+tolerance
+#   REPLICAS            3                        backend replicas behind the LB
+#   FETCH_TOLERANCE     (auto)                   allow counter up to 1+tolerance;
+#                                                default 0, or REPLICAS-1 for LARGE
 #   MINIO_ALIAS_CMD     (auto)                   how to count blobs in MinIO
 set -uo pipefail
 
@@ -51,6 +56,7 @@ _ak_test_env="$(dirname "$0")/../lib/test-env.sh"
 [ -r "$_ak_test_env" ] && . "$_ak_test_env"
 ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 CONCURRENCY="${CONCURRENCY:-200}"
+REPLICAS="${REPLICAS:-3}"
 REPO_KEY="${REPO_KEY:-maven-race-proxy}"
 ARTIFACT_PATH="${ARTIFACT_PATH:-race/big-artifact.bin}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/concurrency-results}"
@@ -105,6 +111,11 @@ if [ -z "$EXPECTED_SHA" ]; then
 fi
 echo "  Published sha256: $EXPECTED_SHA"
 echo "  Published size:   $EXPECTED_SIZE bytes"
+# A1 allowance: explicit FETCH_TOLERANCE wins; otherwise strict for a small
+# object and <= REPLICAS fetches for a LARGE one (#4013).
+FETCH_TOLERANCE="${FETCH_TOLERANCE:-$(default_fetch_tolerance "${EXPECTED_SIZE:-0}" "$REPLICAS")}"
+export FETCH_TOLERANCE
+echo "  A1 tolerance:     $FETCH_TOLERANCE (replicas: $REPLICAS)"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -273,6 +284,8 @@ FAILED=0
 echo "--- A1: exactly one upstream fetch ---"
 A1=$(assert_fetch_counter_one "$POST_COUNT"); A1_RC=$?
 if [ "$A1_RC" -eq 0 ]; then echo -e "  ${GREEN}$A1${NC}"; else echo -e "  ${RED}$A1${NC}"; FAILED=$((FAILED+1)); fi
+A1_WARN=$(fetch_count_warning "$POST_COUNT" "$((END_TIME - START_TIME))" "${PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS:-65}")
+if [ -n "$A1_WARN" ]; then echo -e "  ${YELLOW}$A1_WARN${NC}"; fi
 
 echo "--- A2: every response 200 + correct sha256 ---"
 A2=$(assert_all_responses_ok "$RESULTS_DIR/results.csv" "$EXPECTED_SHA"); A2_RC=$?
@@ -306,6 +319,7 @@ cat > "$RESULTS_DIR/summary.json" <<EOF
     "artifact_path": "$ARTIFACT_PATH",
     "expected_sha256": "$EXPECTED_SHA",
     "expected_size": ${EXPECTED_SIZE:-0},
+    "replicas": $REPLICAS,
     "fetch_tolerance": ${FETCH_TOLERANCE:-0}
   },
   "results": {
@@ -324,7 +338,7 @@ echo "=============================================="
 echo "Summary"
 echo "=============================================="
 echo "  Concurrency:            $CONCURRENCY"
-echo "  Upstream fetch count:   $POST_COUNT  (expected 1)"
+echo "  Upstream fetch count:   $POST_COUNT  (target 1, allowed <= $((1 + FETCH_TOLERANCE)))"
 echo "  Cached blob count:      $BLOB_COUNT  (expected 1)"
 echo "  Responses 200:          $OK_COUNT / $CONCURRENCY"
 echo "  Responses non-200:      $BAD_COUNT"

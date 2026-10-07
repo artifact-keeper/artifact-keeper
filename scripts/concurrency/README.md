@@ -51,7 +51,7 @@ Configurable via env: `ARTIFACT_SIZE_BYTES` (default 256 MiB), `LATENCY_MS`
 
 | ID | Assertion | The bug it catches |
 | --- | --- | --- |
-| **A1** | mock-upstream fetch counter `== 1` (strict; `FETCH_TOLERANCE` allows a documented passthrough margin) | Cross-process stampede: each replica fetches independently → counter ≫ 1. |
+| **A1** | mock-upstream fetch counter `== 1` (strict for a small object; for a LARGE object, bigger than the 16 MiB in-process fan-out window, the default `FETCH_TOLERANCE` is `REPLICAS-1`, i.e. `<= replicas`: the floor when a remote leader outlives `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS`, #4013) | Cross-process stampede: each request fetches independently → counter ≫ replicas. |
 | **A2** | **every** response is HTTP 200 **and** its SHA-256 == the published digest | Torn / truncated bodies — the #1606 failure. |
 | **A3** | exactly **one** cached blob (`__content__`) under `proxy-cache/<repo>/` in the object store | Duplicate / half-written cache entries from racing writers. |
 
@@ -79,8 +79,21 @@ Tunables (env vars consumed by the driver):
 CONCURRENCY=200            # number of concurrent GETs
 LB_URL=http://localhost:18080
 MOCK_UPSTREAM_URL=http://localhost:19999
-FETCH_TOLERANCE=0          # allow upstream counter up to 1+tolerance
+REPLICAS=3                 # backend replicas behind the LB (sets the LARGE default)
+FETCH_TOLERANCE=           # unset = automatic: 0, or REPLICAS-1 for an object
+                           # > 16 MiB; set a number to override (0 = strict)
 ```
+
+Operator note (#4013): with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`, a
+replica that loses the lock waits up to `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS`
+(default 65) for the leader before fetching itself. Keep that below the
+ingress / load balancer read timeout (this harness's nginx LB allows 300 s;
+nginx-ingress defaults to 60 s), or clients are cut off and retry into a fresh
+wait. If the leader replica's node is lost mid-fill (force-deleted pod, node
+failure), its sockets close silently; server-side TCP keepalives on the lock
+session (15 s idle + 3 probes x 5 s) let Postgres reap it in about 30 s, which
+releases the lock, and the waiting replicas re-elect at once. Expect about 30 s
+of extra latency for the requests waiting on that object, not the full wait.
 
 To widen or narrow the race window, set `LATENCY_MS` / `ARTIFACT_SIZE_BYTES` on
 the `mock-upstream` service before `up` (or via the workflow inputs).

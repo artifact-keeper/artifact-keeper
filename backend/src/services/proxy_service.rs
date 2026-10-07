@@ -193,6 +193,32 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     true
 }
 
+/// Drop this process's memoised sidecar lookup for `metadata_key` before a
+/// streaming re-enter (#4013).
+///
+/// The metadata LRU memoises a MISS (`None`) for [`PROXY_METADATA_LRU_TTL`].
+/// The cache check that preceded the election stored exactly that miss, and
+/// the leader that has since filled the entry may live on another replica,
+/// whose publish invalidated only its own process's LRU. Without this the
+/// re-enter re-reads the stale miss for up to 30 s and elects a second
+/// upstream fetch of an object that is already in the shared cache.
+async fn forget_cached_sidecar_miss(metadata_key: &str) {
+    let lru = proxy_metadata_lru().await;
+    if matches!(lru.get(metadata_key).await, Some(None)) {
+        lru.invalidate(metadata_key).await;
+    }
+}
+
+/// Completion signal of the streaming publish registered for `metadata_key`
+/// (#4013): flips to `true` when its writer task ends (commit, reject or
+/// error). Read right after [`CachePersister::tee_stream`] registered it, so
+/// it is this leader's own publish. `None` when nothing is registered.
+fn tee_publish_done(metadata_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lock_tee_publish_registry()
+        .get(metadata_key)
+        .map(|entry| entry.done_rx.clone())
+}
+
 /// Response from an upstream registry fetch.
 pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
@@ -5133,6 +5159,12 @@ impl ProxyService {
         // A Deferred digest survives the re-enters as a cheap
         // [`DeferredCommitDigest`] clone — every clone shares the ONE
         // underlying resolution, so a re-enter never re-fetches the sidecar.
+        //
+        // Under the cross-replica coordinator (#4013) a re-enter is not a
+        // timed poll: a losing leader blocks on the cluster lock until the
+        // remote leader has PUBLISHED, so each re-enter corresponds to a
+        // finished remote fill and normally lands on the warm cache. The
+        // budget is therefore never drained by waiting on a large object.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
@@ -5225,7 +5257,13 @@ impl ProxyService {
             })
             .await?;
 
-        Ok(handle.map(StreamingFetchResult::from))
+        match handle {
+            Some(handle) => Ok(Some(StreamingFetchResult::from(handle))),
+            None => {
+                forget_cached_sidecar_miss(&metadata_key).await;
+                Ok(None)
+            }
+        }
     }
 
     /// Streaming cache-hit fast path, factored out so both the coordinated
@@ -5587,10 +5625,14 @@ impl ProxyService {
                 return Ok(StreamHandle {
                     body: upstream.body,
                     headers,
+                    cache_published: None,
                 });
             }
         }
 
+        // #4013: the cross-replica coordinator releases its lock on the tee
+        // writer's completion, so capture that signal before the key moves.
+        let publish_key = metadata_key.clone();
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
@@ -5647,7 +5689,11 @@ impl ProxyService {
             ));
         }
 
-        Ok(StreamHandle { body, headers })
+        Ok(StreamHandle {
+            body,
+            headers,
+            cache_published: tee_publish_done(&publish_key),
+        })
     }
 
     /// Apply the buffered path's upstream-error correctness to the streaming
@@ -5749,7 +5795,11 @@ impl ProxyService {
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
             };
-            return Ok(StreamHandle { body, headers });
+            return Ok(StreamHandle {
+                body,
+                headers,
+                cache_published: None,
+            });
         }
 
         Err(upstream_err)
@@ -16720,6 +16770,152 @@ mod tests {
     }
 
     /// Drain a streaming proxy body into a single `Vec<u8>`.
+    /// #4013 review: the streaming leader's handle carries the tee writer's
+    /// publish signal, which flips only once the cache entry is committed.
+    /// (The cross-replica lock is released on it; without it the lock would
+    /// be released at the client's EOF, before the sidecar exists.)
+    #[tokio::test]
+    async fn test_streaming_leader_handle_carries_the_cache_publish_signal() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"publish-signal-body".to_vec();
+        let artifact = "org/acme/sig/1.0/sig-1.0.jar";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{artifact}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("ak-4013-sig-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for(
+            &format!("sig-{}", Uuid::new_v4()),
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        );
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+        let handle = proxy
+            .open_streaming_leader(&repo, artifact, artifact, cache_key, metadata_key, None)
+            .await
+            .expect("leader opens");
+        let mut published = handle
+            .cache_published
+            .clone()
+            .expect("a tee'd leader body must carry its publish signal");
+        assert!(
+            !*published.borrow(),
+            "nothing is published before the body is read"
+        );
+        assert_eq!(drain_stream(handle.body).await, body);
+        tokio::time::timeout(Duration::from_secs(10), published.wait_for(|done| *done))
+            .await
+            .expect("publish finishes")
+            .expect("signal observed");
+        assert!(
+            proxy.is_cache_fresh(&repo.key, artifact).await,
+            "when the signal flips, the entry is committed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4013 review: a streaming re-enter must forget the miss its own cache
+    /// check memoised. Another replica may have filled the shared cache in
+    /// the meantime, and its publish only invalidated ITS process's LRU.
+    #[tokio::test]
+    async fn test_streaming_reenter_forgets_the_memoised_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_hydration::coordinate_stream_fanout;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("ak-4013-reenter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        // No upstream is ever contacted: the attempt below falls back.
+        let repo = remote_repo_for(
+            &format!("reenter-{}", Uuid::new_v4()),
+            "http://upstream.invalid",
+            tmp.to_str().unwrap(),
+        );
+        let artifact = "org/acme/re/1.0/re-1.0.jar";
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+
+        // An in-process leader for the same object that has already started
+        // emitting, so the attempt is a late arrival: it waits for the
+        // leader and then asks the caller to re-enter (`Ok(None)`).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        let leader_body: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|i| (i, rx))
+            }));
+        let leader = coordinate_stream_fanout(&format!("proxy-stream:{cache_key}"), || async {
+            Ok(StreamHandle {
+                body: leader_body,
+                headers: Default::default(),
+                cache_published: None,
+            })
+        })
+        .await
+        .expect("ok")
+        .expect("leader");
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::spawn(async move {
+            let mut body = leader.body;
+            let _ = body.next().await;
+            let _ = first_tx.send(());
+            while body.next().await.is_some() {}
+        });
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("send");
+        first_rx.await.expect("leader started emitting");
+
+        let attempt = {
+            let proxy = Arc::clone(&proxy);
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                proxy
+                    .try_fetch_artifact_streaming_once(&repo, artifact, artifact, None)
+                    .await
+                    .map(|r| r.is_none())
+            })
+        };
+        let lru = proxy_metadata_lru().await;
+        let mut memoised = false;
+        for _ in 0..100 {
+            if matches!(lru.get(&metadata_key).await, Some(None)) {
+                memoised = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(memoised, "the attempt's cache check memoised the miss");
+        drop(tx);
+        let reentered = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("attempt finishes with the leader")
+            .expect("join")
+            .expect("no error");
+        drain.await.expect("drain");
+        assert!(reentered, "a late arrival asks the caller to re-enter");
+        assert!(
+            lru.get(&metadata_key).await.is_none(),
+            "the re-enter must re-read the sidecar, not the memoised miss"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
@@ -22034,6 +22230,55 @@ mod tests {
             lru.get(&key).await.is_none(),
             "invalidate must drop the entry"
         );
+    }
+
+    /// #4013: a re-enter drops a memoised MISS (another replica may have just
+    /// filled the shared cache) but keeps a memoised hit.
+    #[tokio::test]
+    async fn test_forget_cached_sidecar_miss_drops_only_a_memoised_miss() {
+        let miss = format!(
+            "proxy-cache/{}/_test_/reenter-miss/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let hit = format!(
+            "proxy-cache/{}/_test_/reenter-hit/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(miss.clone(), None).await;
+        lru.insert(hit.clone(), Some(sample_cache_metadata("kept")))
+            .await;
+        forget_cached_sidecar_miss(&miss).await;
+        forget_cached_sidecar_miss(&hit).await;
+        assert!(
+            lru.get(&miss).await.is_none(),
+            "the stale miss must be re-read from storage on re-enter"
+        );
+        assert!(
+            matches!(lru.get(&hit).await, Some(Some(_))),
+            "a memoised hit is still valid and is kept"
+        );
+        lru.invalidate(&hit).await;
+    }
+
+    /// #4013: the streaming leader's publish signal is the writer's #3335
+    /// registration: absent before, `false` while writing, `true` after.
+    #[tokio::test]
+    async fn test_tee_publish_done_tracks_the_writer_registration() {
+        let key = format!(
+            "proxy-cache/{}/_test_/publish-done/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        assert!(tee_publish_done(&key).is_none());
+        let guard = TeePublishGuard::register(&key);
+        let mut done = tee_publish_done(&key).expect("registered");
+        assert!(!*done.borrow());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), done.wait_for(|d| *d))
+            .await
+            .expect("flips on writer exit")
+            .expect("value observed");
+        assert!(tee_publish_done(&key).is_none(), "deregistered on exit");
     }
 
     #[tokio::test]

@@ -31,6 +31,23 @@ assert_fetch_counter_one 0 >/dev/null 2>&1; rc=$?; check_rc "count==0 fails (nev
 FETCH_TOLERANCE=2 assert_fetch_counter_one 3 >/dev/null 2>&1; rc=$?; check_rc "count==3 passes with tolerance=2" 0 "$rc"
 FETCH_TOLERANCE=2 assert_fetch_counter_one 4 >/dev/null 2>&1; rc=$?; check_rc "count==4 fails with tolerance=2" 1 "$rc"
 
+echo "== default_fetch_tolerance (#4013) =="
+expect_eq "LARGE object, 3 replicas -> tolerance 2 (<= replicas)" "2" "$(default_fetch_tolerance 268435456 3)"
+expect_eq "small object stays strict" "0" "$(default_fetch_tolerance 4096 3)"
+expect_eq "exactly the fan-out window is not LARGE" "0" "$(default_fetch_tolerance 16777216 3)"
+expect_eq "single replica stays strict" "0" "$(default_fetch_tolerance 268435456 1)"
+
+echo "== fetch_count_warning (#4013) =="
+expect_eq "one fetch: no warning" "" "$(fetch_count_warning 1 40 65)"
+case "$(fetch_count_warning 3 40 65)" in
+    "WARN 3 upstream fetches although"*) ok "3 fetches in a short storm warn as a regression" ;;
+    *) bad "3 fetches in a short storm must warn as a regression" ;;
+esac
+case "$(fetch_count_warning 3 90 65)" in
+    "WARN 3 upstream fetches: within tolerance"*) ok "3 fetches after the wait timeout warn as the floor" ;;
+    *) bad "3 fetches after the wait timeout must warn as the floor" ;;
+esac
+
 echo "== assert_single_cached_blob =="
 assert_single_cached_blob 1 >/dev/null 2>&1; rc=$?; check_rc "blob count 1 passes" 0 "$rc"
 assert_single_cached_blob 3 >/dev/null 2>&1; rc=$?; check_rc "blob count 3 fails" 1 "$rc"
