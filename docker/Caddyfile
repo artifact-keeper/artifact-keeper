@@ -34,6 +34,8 @@
 	reverse_proxy /composer/* backend:8080
 	reverse_proxy /conan/* backend:8080
 	reverse_proxy /conda/* backend:8080
+	# rattler's token-in-URL layout for conda: /t/<token>/conda/<repo>/... (#4555)
+	reverse_proxy /t/* backend:8080
 	reverse_proxy /swift/* backend:8080
 	reverse_proxy /terraform/* backend:8080
 	reverse_proxy /cocoapods/* backend:8080
