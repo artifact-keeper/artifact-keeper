@@ -24,9 +24,15 @@ The compressed input and the extracted tree are bounded by
   Alpine's `squashfs-tools` package and supports all five codecs (gzip, xz,
   zstd, LZO, LZ4).
 
-## Known limitation: non-root extraction
+## Non-root extraction
 
-The backend runs as a non-root user. Run that way, `unsquashfs` exits
-non-zero on an image whose files carry `security.*` extended attributes or
-that contains device nodes, which is most real rootfs images, and the scan
-fails. Tracked in #4470.
+The backend runs as a non-root user, which cannot create device nodes or
+write `security.*` extended attributes. The scanner needs neither:
+
+- `unsquashfs` runs with `-no-xattrs`, so SELinux labels and file
+  capabilities are not extracted.
+- A device node that cannot be created is skipped. `unsquashfs` and `tar`
+  then exit non-zero (status 2); the scanner logs a warning that names the
+  skipped entries and scans the rest of the tree (#4470).
+- Any other extraction error still fails the scan, as does a SquashFS
+  extraction that leaves the root filesystem empty.
