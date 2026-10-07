@@ -73,6 +73,17 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
     oci_error_detail(status, code, message, None)
 }
 
+/// The retryable 503 an OCI pull answers when the scan-on-proxy config
+/// cannot be read (#4365 item 5), in the registry's `{"errors": [...]}`
+/// envelope rather than the generic JSON error the other formats use.
+fn oci_scan_config_unreadable() -> Response {
+    oci_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNAVAILABLE",
+        "scan-on-proxy configuration is temporarily unreadable",
+    )
+}
+
 /// [`oci_error`] with the spec's OPTIONAL `detail` member populated.
 ///
 /// distribution-spec `spec.md` "Error Codes": *"The `detail` field is
@@ -9956,8 +9967,9 @@ async fn maybe_gate_remote_manifest_scan(
         return Ok(None);
     }
     // #4365 item 5: an unreadable config is a retryable 503, not "off".
-    let Some((action, severity_gate)) =
-        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+    let Some((action, severity_gate)) = proxy_helpers::remote_scan_policy(&state.db, repo.id)
+        .await
+        .map_err(|_| oci_scan_config_unreadable())?
     else {
         return Ok(None);
     };
@@ -10299,7 +10311,7 @@ async fn handle_get_manifest(
                 .await
                 {
                     Ok(policy) => policy,
-                    Err(resp) => return resp,
+                    Err(_) => return oci_scan_config_unreadable(),
                 };
                 if let Some((action, severity_gate)) =
                     policy.filter(|_| oci_manifest_requires_proxy_scan(&data))
@@ -40885,5 +40897,23 @@ mod cleanup_journal_repository_scope_tests {
         }
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
+    }
+}
+
+/// #4365 item 5: an unreadable scan config is an OCI-shaped 503.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_config_unreadable_4365_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unreadable_scan_config_is_an_oci_503_envelope() {
+        let (status, body, _) =
+            crate::api::handlers::test_db_helpers::collect_response(oci_scan_config_unreadable())
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+        assert!(json["errors"][0]["message"].is_string());
     }
 }

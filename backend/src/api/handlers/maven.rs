@@ -11103,3 +11103,108 @@ mod serve_key_4365_tests {
         }
     }
 }
+
+/// #4365 item 5 at the route: an unreadable scan-on-proxy config is a 503 on
+/// the direct Remote route and on the Virtual walk, before any upstream
+/// request (it used to stream the Remote pull unscanned).
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unreadable_config_route_4365_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const JAR: &str = "com/acme/widget/1.0/widget-1.0.jar";
+
+    async fn upstream() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"jar".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn hits(server: &wiremock::MockServer) -> usize {
+        server.received_requests().await.expect("recording").len()
+    }
+
+    #[tokio::test]
+    async fn unreadable_config_is_503_on_remote_and_virtual_routes() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let Some((faulty, schema)) = tdh::pool_with_unreadable_scan_configs().await else {
+            fx.teardown().await;
+            return;
+        };
+        let server = upstream().await;
+        sqlx::query("UPDATE repositories SET upstream_url = $2, is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(server.uri())
+            .execute(&fx.pool)
+            .await
+            .expect("point at upstream");
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let dir = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state_with_proxy(
+            faulty.clone(),
+            &dir,
+            tdh::build_proxy_service_with_fs(faulty.clone(), &dir),
+        );
+        let (remote_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{JAR}", fx.repo_key)),
+        )
+        .await;
+        let remote_hits = hits(&server).await;
+
+        // A Virtual over the same (scanning) Remote member.
+        let Some(vfx) = tdh::Fixture::setup("virtual", "maven").await else {
+            tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+            fx.teardown().await;
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await
+            .expect("public virtual");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(vfx.repo_id)
+        .bind(fx.repo_id)
+        .execute(&vfx.pool)
+        .await
+        .expect("attach member");
+        let (virtual_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/{JAR}", vfx.repo_key)),
+        )
+        .await;
+        let virtual_hits = hits(&server).await;
+
+        tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+        faulty.close().await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await;
+        vfx.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(
+            remote_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct Remote"
+        );
+        assert_eq!(
+            virtual_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Virtual walk"
+        );
+        assert_eq!(remote_hits, 0, "refused before any upstream request");
+        assert_eq!(virtual_hits, 0, "refused before any upstream request");
+    }
+}
