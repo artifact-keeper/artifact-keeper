@@ -34,19 +34,6 @@ fn parse_status_filter(raw: &str) -> Option<Vec<String>> {
     (!parsed.is_empty()).then_some(parsed)
 }
 
-/// Clamp review-list pagination inputs and compute SQL offset.
-fn normalize_review_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
-    let page = page.unwrap_or(1).max(1);
-    let per_page = per_page.unwrap_or(20).clamp(1, 100);
-    let offset = i64::from(page - 1) * i64::from(per_page);
-    (page, per_page, offset)
-}
-
-/// Compute total pages for a paginated review list.
-fn compute_review_total_pages(total: i64, per_page: u32) -> u32 {
-    ((total as f64) / (per_page as f64)).ceil() as u32
-}
-
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/reviews", get(list_reviews))
@@ -224,7 +211,7 @@ pub async fn list_reviews(
     // too, for parity with approve/reject and the codebase's double-guard posture.
     auth.require_admin()?;
     let svc = age_gate_service(&state)?;
-    let (page, per_page, offset) = normalize_review_pagination(query.page, query.per_page);
+    let (page, per_page, offset) = Pagination::clamp_offset(query.page, query.per_page);
 
     // `status` accepts a comma-separated list (e.g. "approved,rejected") so the UI
     // can fetch multiple states in one page while keeping pagination totals honest.
@@ -239,15 +226,9 @@ pub async fn list_reviews(
         )
         .await?;
 
-    let total_pages = compute_review_total_pages(total, per_page);
     Ok(Json(AgeGateReviewListResponse {
         items: items.into_iter().map(review_to_response).collect(),
-        pagination: Pagination {
-            page,
-            per_page,
-            total,
-            total_pages,
-        },
+        pagination: Pagination::for_page(page, per_page, total),
     }))
 }
 
@@ -566,19 +547,6 @@ mod tests {
     fn parse_status_filter_empty_is_none() {
         assert_eq!(parse_status_filter(""), None);
         assert_eq!(parse_status_filter("  , ,"), None);
-    }
-
-    #[test]
-    fn normalize_review_pagination_defaults_and_clamps() {
-        assert_eq!(normalize_review_pagination(None, None), (1, 20, 0));
-        assert_eq!(normalize_review_pagination(Some(0), Some(200)), (1, 100, 0));
-        assert_eq!(normalize_review_pagination(Some(3), Some(25)), (3, 25, 50));
-    }
-
-    #[test]
-    fn compute_review_total_pages_ceil_and_zero() {
-        assert_eq!(compute_review_total_pages(45, 20), 3);
-        assert_eq!(compute_review_total_pages(0, 20), 0);
     }
 
     #[test]
