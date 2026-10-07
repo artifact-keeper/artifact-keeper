@@ -7,12 +7,22 @@
 --
 -- Batched by primary key (keyset, 5000 rows, docs/operations/online-
 -- migrations.md "Backfill"): each batch commits on its own, bounds its row
--- locks with lock_timeout and retries a batch that cannot get them. On a
--- million rows: 200 short transactions, no table lock. Re-runnable: a filled
--- row is skipped, so an interrupted run resumes by re-walking the keys.
+-- locks with lock_timeout and retries a batch that cannot get them or that
+-- deadlocks with a cascade DELETE from a pod still on the previous release.
+-- No table lock.
+--
+-- Time bound: the whole DO block is ONE statement, so the migration session's
+-- 30-minute statement_timeout (main.rs) is its only ceiling. Measured at
+-- about 8 us per row plus the 50 ms pause between batches that changed rows
+-- (500k rows: 9 s), so it fits well inside 30 minutes up to tens of millions
+-- of rows. The table is small in practice before this upgrade: eviction used
+-- to delete a cache entry's rows with it, so it holds history for the live
+-- cache only. Re-runnable: a keyed row is skipped and a batch that changed
+-- nothing does not pause, so an interrupted run re-walks the keys quickly.
 DO $$
 DECLARE
     last_id uuid := '00000000-0000-0000-0000-000000000000';
+    touched bigint;
     attempt integer;
 BEGIN
     LOOP
@@ -36,10 +46,11 @@ BEGIN
                        AND c.id = d.proxy_cache_id
                     RETURNING d.id
                 )
-                SELECT (SELECT b.id FROM batch b ORDER BY b.id DESC LIMIT 1)
-                  INTO last_id;
+                SELECT (SELECT b.id FROM batch b ORDER BY b.id DESC LIMIT 1),
+                       (SELECT COUNT(*) FROM filled)
+                  INTO last_id, touched;
                 EXIT;
-            EXCEPTION WHEN lock_not_available THEN
+            EXCEPTION WHEN lock_not_available OR deadlock_detected THEN
                 attempt := attempt + 1;
                 IF attempt >= 5 THEN
                     RAISE;
@@ -49,6 +60,8 @@ BEGIN
         END LOOP;
         EXIT WHEN last_id IS NULL;
         COMMIT;
-        PERFORM pg_sleep(0.05);
+        IF touched > 0 THEN
+            PERFORM pg_sleep(0.05);
+        END IF;
     END LOOP;
 END $$;
