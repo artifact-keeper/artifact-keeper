@@ -129,6 +129,7 @@ pub mod upstream_feed;
 pub mod upstream_filter;
 pub mod upstream_metadata;
 pub mod upstream_tracing;
+pub mod version_order;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
