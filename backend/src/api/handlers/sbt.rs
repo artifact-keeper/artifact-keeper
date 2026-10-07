@@ -1504,3 +1504,49 @@ mod scan_on_proxy_tests {
         fx.teardown().await;
     }
 }
+
+/// #4365 item 1: sbt `(cache_key, scannable)` decisions, through the Maven
+/// helper both JVM routes share, for the Ivy and the Maven layouts.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn sbt_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar/",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            (
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                false,
+            ),
+        ] {
+            let got = maven::jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            let target = sbt_scan_target(path);
+            assert_eq!(target.is_some(), scannable, "{path}");
+            if let Some(target) = target {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
+    }
+}

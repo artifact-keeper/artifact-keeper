@@ -22122,6 +22122,68 @@ mod proxy_download_recording_tests {
         }
     }
 
+    /// #4365 item 1 exhaustiveness: every handler that enforces scan-on-proxy
+    /// derives its proxy-cache key (and, where it classifies by file name, its
+    /// scan decision) through the shared `proxy_service::proxy_serve_key`
+    /// helper, and pins that with a `serve_key_4365_tests` table. A new
+    /// enforced format fails here until it does both, so it cannot classify
+    /// one spelling and cache another.
+    #[test]
+    fn every_enforced_format_derives_its_key_through_the_shared_helper() {
+        // Calls that reach `proxy_service::proxy_serve_key`: the helper, its
+        // route-decided wrapper, and the per-format helpers built on them.
+        const SERVE_KEY_CALLS: &[&str] = &[
+            "proxy_serve_key(",
+            "route_package_serve_key(",
+            "jvm_proxy_serve_key(",
+        ];
+        // OCI decides by CONTENT (the manifest's media type and its config
+        // descriptor), not by a request file name, and its cache keys are
+        // content digests; there is no name-based classification to unify.
+        const DECIDES_BY_CONTENT: &[&str] = &["oci"];
+
+        fn handler_file(key: &str) -> String {
+            match key {
+                "go" => "goproxy.rs".to_string(),
+                "oci" => "oci_v2.rs".to_string(),
+                "pub" => "pub_registry.rs".to_string(),
+                other => format!("{other}.rs"),
+            }
+        }
+
+        for key in crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS {
+            if DECIDES_BY_CONTENT.contains(key) {
+                continue;
+            }
+            let file = handler_file(key);
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(f, _)| *f == file)
+                .unwrap_or_else(|| panic!("{file} missing from SERVE_SOURCES"));
+            let spans = test_spans(src);
+            let routes_through_helper = SERVE_KEY_CALLS.iter().any(|call| {
+                src.match_indices(call).any(|(at, _)| {
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    !spans.iter().any(|(a, b)| *a <= at && at < *b)
+                        && !prefix.trim_start().starts_with("//")
+                        && !prefix.trim_start().starts_with("fn ")
+                        && !prefix.contains("fn ")
+                })
+            });
+            assert!(
+                routes_through_helper,
+                "#4365: `{key}` enforces scan-on-proxy but {file} never calls the shared \
+                 (cache_key, scannable) helper outside tests"
+            );
+            assert!(
+                src.contains("mod serve_key_4365_tests"),
+                "#4365: `{key}` enforces scan-on-proxy but {file} has no \
+                 `serve_key_4365_tests` table pinning its (cache_key, scannable) decisions"
+            );
+        }
+    }
+
     /// Count the formats still carrying a DEFERRAL marker (as opposed to a
     /// policy exemption like a HEAD or an OCI blob). This is the remaining
     /// #3446 surface, asserted so it can only ever shrink: a new format that
