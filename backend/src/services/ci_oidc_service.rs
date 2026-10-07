@@ -133,6 +133,23 @@ pub const KEY_SOURCE_STATIC: &str = "static";
 /// has leaked the key, so storing it would only make things worse.
 const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
+/// Most keys a static JWKS may hold. A cluster publishes one or two (two
+/// during a rotation overlap); the set is echoed in every provider response
+/// and scanned on every exchange, so a bound keeps a paste mistake small.
+pub const MAX_STATIC_JWKS_KEYS: usize = 16;
+
+/// Largest static JWKS accepted, serialized. A 4096-bit RSA JWK is under
+/// 1 KiB, so this leaves room for certificate chains (`x5c`) on every key.
+pub const MAX_STATIC_JWKS_BYTES: usize = 64 * 1024;
+
+/// Throttles the WARN for a token whose `kid` is not in a static JWKS to one
+/// per provider per minute; repeats within the window log at DEBUG. The
+/// exchange endpoint is unauthenticated and a forged token only needs the
+/// provider's issuer, so without this anyone could flood the `security` log.
+/// Keyed by provider id, of which there are few, so the map stays small.
+static UNKNOWN_KID_WARNINGS: std::sync::LazyLock<crate::api::middleware::rate_limit::RateLimiter> =
+    std::sync::LazyLock::new(|| crate::api::middleware::rate_limit::RateLimiter::new(1, 60));
+
 /// `iss` / `aud` read out of an assertion that has NOT been verified yet,
 /// used only to choose which configured provider to verify it against (#3548).
 struct UnverifiedAssertionHints {
@@ -471,11 +488,23 @@ fn resolve_key_material(
 /// (which would make strict `kid` selection ambiguous).
 fn validate_static_jwks(jwks: &serde_json::Value) -> Result<()> {
     let invalid = |why: String| AppError::Validation(format!("Invalid static_jwks: {why}"));
+    let size = serde_json::to_vec(jwks).map_or(usize::MAX, |bytes| bytes.len());
+    if size > MAX_STATIC_JWKS_BYTES {
+        return Err(invalid(format!(
+            "{size} bytes exceeds the limit of {MAX_STATIC_JWKS_BYTES}"
+        )));
+    }
     let keys = jwks
         .get("keys")
         .and_then(serde_json::Value::as_array)
         .filter(|keys| !keys.is_empty())
         .ok_or_else(|| invalid("expected a JSON object with a non-empty \"keys\" array".into()))?;
+    if keys.len() > MAX_STATIC_JWKS_KEYS {
+        return Err(invalid(format!(
+            "{} keys exceeds the limit of {MAX_STATIC_JWKS_KEYS}",
+            keys.len()
+        )));
+    }
 
     let mut seen = std::collections::HashSet::new();
     for (i, key) in keys.iter().enumerate() {
@@ -1667,7 +1696,7 @@ impl CiOidcService {
                 .as_ref()
                 .and_then(|jwks| jwks["keys"].as_array())
                 .ok_or_else(|| AppError::Internal("Static CI OIDC provider has no JWKS".into()))?;
-            Self::select_static_jwk_key(provider, keys, header.kid.as_deref())?
+            Self::select_static_jwk_key(provider, keys, header.kid.as_deref()).await?
         } else {
             let discovery = self.fetch_discovery(&provider.issuer_url).await?;
             let jwks_uri = discovery["jwks_uri"]
@@ -2021,7 +2050,10 @@ impl CiOidcService {
     /// key, which is what turns a missed cluster key rotation into a
     /// diagnosable error instead of a generic "signature invalid". A token
     /// without a `kid` is accepted only when the set holds exactly one key.
-    fn select_static_jwk_key(
+    ///
+    /// The refusal's WARN is throttled per provider by
+    /// [`UNKNOWN_KID_WARNINGS`]; repeats within the window log at DEBUG.
+    async fn select_static_jwk_key(
         provider: &CiOidcProvider,
         keys: &[serde_json::Value],
         kid: Option<&str>,
@@ -2032,19 +2064,34 @@ impl CiOidcService {
             None => None,
         };
         let Some(key) = key else {
-            tracing::warn!(
-                target: "security",
-                provider_id = %provider.id,
-                provider_name = %provider.name,
-                kid = kid.unwrap_or("(none)"),
-                static_kids = %keys
-                    .iter()
-                    .map(|k| k["kid"].as_str().unwrap_or("-"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                "CI OIDC: token key id is not in the provider's static JWKS; refusing. \
-                 If the cluster rotated its signing key, add the new key to the provider"
-            );
+            if UNKNOWN_KID_WARNINGS
+                .check_rate_limit(&provider.id.to_string())
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    target: "security",
+                    provider_id = %provider.id,
+                    kid = kid.unwrap_or("(none)"),
+                    "CI OIDC: token key id is not in the provider's static JWKS; refusing \
+                     (repeat within a minute, WARN suppressed)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "security",
+                    provider_id = %provider.id,
+                    provider_name = %provider.name,
+                    kid = kid.unwrap_or("(none)"),
+                    static_kids = %keys
+                        .iter()
+                        .map(|k| k["kid"].as_str().unwrap_or("-"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "CI OIDC: token key id is not in the provider's static JWKS; refusing. \
+                     If the cluster rotated its signing key, add the new key to the provider. \
+                     Further refusals for this provider within a minute log at DEBUG"
+                );
+            }
             return Err(AppError::Authentication(match kid {
                 Some(kid) => format!("CI JWT key id '{kid}' is not in this provider's static JWKS"),
                 None => "CI JWT has no key id and this provider's static JWKS holds several \
@@ -4485,6 +4532,106 @@ mod tests {
         );
     }
 
+    /// The unauthenticated exchange cannot flood the `security` log: a
+    /// second unknown-kid refusal for the same provider within the window
+    /// is still refused, but logs at DEBUG instead of WARN.
+    #[tokio::test]
+    async fn unknown_kid_warning_is_throttled_per_provider() {
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let other = static_provider(&[&k1]);
+        let jwt = sign(&k1, Some("forged"), &k8s_token_claims(ONPREM_ISSUER));
+
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+        {
+            let _guard = capture.install(tracing::Level::DEBUG);
+            for provider in [&provider, &provider, &provider, &other] {
+                let err = test_service()
+                    .validate_ci_jwt(provider, &jwt)
+                    .await
+                    .expect_err("an unknown kid is always refused");
+                assert_eq!(
+                    axum::response::IntoResponse::into_response(err).status(),
+                    axum::http::StatusCode::UNAUTHORIZED
+                );
+            }
+        }
+        let logs = capture.text();
+        let lines = |level: &str, id: Uuid| {
+            let prefix = format!("{level} security: CI OIDC: token key id");
+            logs.lines()
+                .filter(|l| l.contains(&prefix) && l.contains(&format!("provider_id={id}")))
+                .count()
+        };
+        assert_eq!(lines("WARN", provider.id), 1, "{logs}");
+        assert_eq!(lines("DEBUG", provider.id), 2, "{logs}");
+        assert_eq!(
+            lines("WARN", other.id),
+            1,
+            "another provider has its own window"
+        );
+    }
+
+    /// The algorithm checks are shared with discovery but pinned here for
+    /// the static path too: `alg: none`, an HMAC token keyed with the public
+    /// key (the classic confusion attack) and an algorithm whose family does
+    /// not match the stored key are each refused with 401, all under a `kid`
+    /// the set holds.
+    #[tokio::test]
+    async fn static_provider_refuses_none_hmac_and_mismatched_algorithms() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let claims = k8s_token_claims(ONPREM_ISSUER);
+        let segment = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let body = segment(claims.clone());
+
+        let none = format!(
+            "{}.{body}.",
+            segment(json!({"alg": "none", "typ": "JWT", "kid": "k1"}))
+        );
+
+        let mut hs_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        hs_header.kid = Some("k1".into());
+        let public_n = k1.jwk["n"].as_str().unwrap().as_bytes().to_vec();
+        let hmac = jsonwebtoken::encode(
+            &hs_header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&public_n),
+        )
+        .unwrap();
+
+        // An RSA key in the set, an EC algorithm in the header.
+        let rs = sign(&k1, Some("k1"), &claims);
+        let signature = rs.rsplit('.').next().unwrap();
+        let mismatched = format!(
+            "{}.{body}.{signature}",
+            segment(json!({"alg": "ES256", "typ": "JWT", "kid": "k1"}))
+        );
+
+        for (case, jwt) in [
+            ("alg none", none),
+            ("HS256", hmac),
+            ("ES256 on RSA", mismatched),
+        ] {
+            let err = test_service()
+                .validate_ci_jwt(&provider, &jwt)
+                .await
+                .expect_err(case);
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{case}"
+            );
+        }
+        // Control: the same claims, properly signed, verify.
+        test_service()
+            .validate_ci_jwt(&provider, &rs)
+            .await
+            .expect("control token verifies");
+    }
+
     /// Rotation overlap: both keys of the set verify their own tokens.
     #[tokio::test]
     async fn static_provider_accepts_either_key_during_rotation() {
@@ -4547,6 +4694,25 @@ mod tests {
             axum::response::IntoResponse::into_response(err).status(),
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn static_jwks_size_and_key_count_are_capped() {
+        let keys = |n: usize| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| super::test_public_jwk(&format!("k{i}")))
+                .collect()
+        };
+        super::validate_static_jwks(&json!({ "keys": keys(super::MAX_STATIC_JWKS_KEYS) }))
+            .expect("exactly the maximum number of keys is accepted");
+        assert_refused(
+            json!({ "keys": keys(super::MAX_STATIC_JWKS_KEYS + 1) }),
+            "exceeds the limit of 16",
+        );
+
+        let mut padded = super::test_public_jwk("k1");
+        padded["x5c"] = json!(["A".repeat(super::MAX_STATIC_JWKS_BYTES)]);
+        assert_refused(json!({ "keys": [padded] }), "bytes exceeds the limit");
     }
 
     #[test]

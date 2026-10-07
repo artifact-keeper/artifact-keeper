@@ -311,10 +311,13 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
 - The JWKS must hold at least one public RSA or EC key. Keys must have unique
   `kid`s. A key with private members (`d`, `p`, `q`, `dp`, `dq`, `qi`, `k`)
   is refused with `400`: a trust anchor needs only the public key, and a pasted
-  private key is already leaked.
+  private key is already leaked. A set of more than 16 keys, or larger than
+  64 KiB, is refused with `400`.
 - A token's `kid` must name a key in the set. A token whose `kid` is not there
   is refused with `401`, and the `security` log names the provider and the
-  missing `kid`. There is no fall-back to another key. A token without a `kid`
+  missing `kid`. That warning is written at most once a minute per provider;
+  further refusals in the same minute are logged at `DEBUG`, so forged tokens
+  cannot flood the log. There is no fall-back to another key. A token without a `kid`
   is accepted only when the set holds exactly one key.
 - `iss`, `aud` and expiry are checked exactly as for `discovery`.
 - `PUT /api/v1/admin/ci-oidc/{id}` with `static_jwks` replaces the whole set.
