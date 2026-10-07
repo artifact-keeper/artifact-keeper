@@ -1468,10 +1468,10 @@ mod db_tests {
         fx.teardown().await;
     }
 
-    /// Migration 272 moves a file list written by the pre-#4424 handler out
+    /// Migration 276 moves a file list written by the pre-#4424 handler out
     /// of `artifact_metadata`, and running it again changes nothing.
     #[tokio::test]
-    async fn migration_272_moves_legacy_file_lists() {
+    async fn migration_276_moves_legacy_file_lists() {
         let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
             return;
         };
@@ -1502,7 +1502,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let migration = include_str!("../../../migrations/272_pacman_file_lists.sql");
+        let migration = include_str!("../../../migrations/276_pacman_file_lists.sql");
         for _ in 0..2 {
             sqlx::raw_sql(migration).execute(&fx.pool).await.unwrap();
         }
