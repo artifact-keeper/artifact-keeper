@@ -1895,6 +1895,10 @@ pub(crate) async fn run_curation_sync_cycle(
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
+    // Repo-level ingest failures that must surface as a failed sync (#4427)
+    // without aborting the rest of the sweep.
+    let mut failures: Vec<String> = Vec::new();
+
     for (
         staging_id,
         format,
@@ -2107,17 +2111,14 @@ pub(crate) async fn run_curation_sync_cycle(
                             continue;
                         }
 
-                        let xml = if primary_path.ends_with(".gz") {
-                            // Bound the upstream-index decompression (#2556): a
-                            // malicious/compromised upstream mirror cannot inflate
-                            // primary.xml.gz unbounded during sync. #2561: the
-                            // permit-scoped decode also caps CONCURRENT decodes.
-                            crate::util::bounded_archive::with_ingest_extraction(|| {
-                                decompress_upstream_index_gz(&bytes)
-                            })??
-                        } else {
-                            String::from_utf8_lossy(&bytes).to_string()
-                        };
+                        // Decode gz/zst/xz/bz2/plain by magic bytes (#4427),
+                        // bounded by the ingest decompression budget (#2556) so a
+                        // malicious/compromised upstream mirror cannot inflate the
+                        // primary unbounded. #2561: the permit-scoped decode also
+                        // caps CONCURRENT decodes.
+                        let xml = crate::util::bounded_archive::with_ingest_extraction(|| {
+                            curation_sync::decode_rpm_primary(&primary_path, &bytes)
+                        })??;
 
                         // Defense-in-depth: when the signed repomd also declares
                         // an <open-checksum> over the decompressed primary.xml,
@@ -2143,7 +2144,20 @@ pub(crate) async fn run_curation_sync_cycle(
                             }
                         }
 
-                        curation_sync::parse_rpm_primary_xml(&xml)
+                        // A primary that declares packages but yields none must
+                        // fail the sync, not report success with 0 (#4427).
+                        match curation_sync::parse_rpm_primary_xml_checked(&xml) {
+                            Ok(entries) => entries,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "RPM curation sync for staging repo {}: {}",
+                                    staging_id,
+                                    e
+                                );
+                                failures.push(format!("staging repo {staging_id}: {e}"));
+                                continue;
+                            }
+                        }
                     }
                     Ok(resp) => {
                         tracing::warn!("RPM primary.xml fetch failed: {}", resp.status());
@@ -2279,7 +2293,11 @@ pub(crate) async fn run_curation_sync_cycle(
                 .await;
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("curation sync failed: {}", failures.join("; ")).into())
+    }
 }
 
 /// Max distribution-file size the off-hot-path verifier will fetch to bind an

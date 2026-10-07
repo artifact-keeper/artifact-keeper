@@ -869,6 +869,128 @@ pub fn primary_gz_pinned_by_repomd(
 }
 
 // ---------------------------------------------------------------------------
+// RPM primary.xml decode + ingest guard (#4427)
+//
+// Modern createrepo_c defaults to zstd (`primary.xml.zst`), and EL/Fedora
+// mirrors also publish xz/bzip2 primaries. The sync used to gunzip only
+// `.gz` and lossily stringify everything else, so a zstd primary parsed as 0
+// packages and the sync still reported success, silently emptying the mirror.
+// ---------------------------------------------------------------------------
+
+/// Compression of an RPM repodata file, chosen from its magic bytes (the
+/// authoritative signal) with the repomd `href` extension as a cross-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepodataCompression {
+    Plain,
+    Gzip,
+    Zstd,
+    Xz,
+    Bzip2,
+}
+
+impl RepodataCompression {
+    fn from_magic(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            Some(Self::Gzip)
+        } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            Some(Self::Zstd)
+        } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            Some(Self::Xz)
+        } else if bytes.starts_with(b"BZh") {
+            Some(Self::Bzip2)
+        } else {
+            None
+        }
+    }
+
+    fn from_href(href: &str) -> Self {
+        let lower = href.to_ascii_lowercase();
+        if lower.ends_with(".gz") {
+            Self::Gzip
+        } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+            Self::Zstd
+        } else if lower.ends_with(".xz") {
+            Self::Xz
+        } else if lower.ends_with(".bz2") {
+            Self::Bzip2
+        } else {
+            Self::Plain
+        }
+    }
+
+    /// Detect the compression of a fetched repodata file. Magic bytes win; a
+    /// compressed `href` whose bytes carry no known magic is an error (the
+    /// payload cannot be decoded), never a silent plain-text fallback.
+    pub fn detect(href: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        match (Self::from_magic(bytes), Self::from_href(href)) {
+            (Some(c), _) => Ok(c),
+            (None, Self::Plain) => Ok(Self::Plain),
+            (None, declared) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "repodata file {href} is named {declared:?} but has no {declared:?} header"
+                ),
+            )),
+        }
+    }
+}
+
+/// Decode an upstream RPM `primary.xml[.gz|.zst|.xz|.bz2]` into its XML text,
+/// bounded by the shared ingest decompression budget (#2556), so no codec can
+/// be used to inflate the index unbounded.
+pub fn decode_rpm_primary(href: &str, bytes: &[u8]) -> std::io::Result<String> {
+    decode_rpm_primary_limited(
+        href,
+        bytes,
+        crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+    )
+}
+
+/// `_limited` seam for [`decode_rpm_primary`]: tests drive a tiny budget.
+pub fn decode_rpm_primary_limited(
+    href: &str,
+    bytes: &[u8],
+    budget: u64,
+) -> std::io::Result<String> {
+    use std::io::Read;
+    let decoder: Box<dyn Read + '_> = match RepodataCompression::detect(href, bytes)? {
+        RepodataCompression::Plain => Box::new(bytes),
+        RepodataCompression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
+        RepodataCompression::Zstd => Box::new(zstd::stream::read::Decoder::new(bytes)?),
+        RepodataCompression::Xz => Box::new(xz2::read::XzDecoder::new_multi_decoder(bytes)),
+        RepodataCompression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)),
+    };
+    let mut xml = String::new();
+    crate::util::bounded_archive::budgeted_to(decoder, budget).read_to_string(&mut xml)?;
+    Ok(xml)
+}
+
+/// Parse a decoded primary.xml and refuse a result that silently ingests
+/// nothing (#4427). Zero entries is only accepted from a recognizable, truly
+/// empty primary (a `<metadata>` root with no `<package>` element and no
+/// non-zero `packages=` count). Anything else that yields zero entries
+/// (undecoded binary, a non-primary document, or packages that all failed the
+/// fail-closed parser) is an error so the sync reports failure.
+pub fn parse_rpm_primary_xml_checked(xml: &str) -> Result<Vec<CurationPackageEntry>, String> {
+    let entries = parse_rpm_primary_xml(xml);
+    if !entries.is_empty() {
+        return Ok(entries);
+    }
+    if !xml.contains("<metadata") {
+        return Err("upstream primary.xml is not an RPM primary metadata document".to_string());
+    }
+    let declared: u64 = tag_attr(xml, "<metadata", "packages")
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    if declared > 0 || xml.contains("<package ") || xml.contains("<package>") {
+        return Err(format!(
+            "upstream primary.xml declares packages (packages=\"{declared}\") but none could be parsed"
+        ));
+    }
+    Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
 // pypi / npm on-demand ingestion adapters (#2955 Stage 2)
 //
 // Unlike rpm/debian, pypi and npm have no enumerable global upstream index, so
@@ -1627,5 +1749,164 @@ mod ondemand_ingestion_tests {
             len <= MAX_META_LIST_ENTRIES,
             "maintainers capped, got {len}"
         );
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod primary_decode_tests {
+    use super::*;
+    use std::io::Write;
+
+    const PRIMARY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="2">
+<package type="rpm">
+  <name>nginx</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="1.24.0" rel="1.el9"/>
+  <checksum type="sha256" pkgid="YES">abc123def456</checksum>
+  <location href="Packages/nginx-1.24.0-1.el9.x86_64.rpm"/>
+</package>
+<package type="rpm">
+  <name>curl</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="8.5.0" rel="1.el9"/>
+  <checksum type="sha256" pkgid="YES">def789ghi012</checksum>
+  <location href="Packages/curl-8.5.0-1.el9.x86_64.rpm"/>
+</package>
+</metadata>"#;
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn zst(data: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(data, 3).unwrap()
+    }
+
+    fn xz(data: &[u8]) -> Vec<u8> {
+        let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn bz2(data: &[u8]) -> Vec<u8> {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn names(entries: &[CurationPackageEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.package_name.as_str()).collect()
+    }
+
+    /// #4427 regression: a zstd primary (createrepo_c's default) must decode
+    /// and ingest the same packages as the gzip primary built from the same
+    /// XML. Before the fix the sync stringified the zstd bytes and parsed 0.
+    #[test]
+    fn zstd_primary_ingests_same_packages_as_gzip_4427() {
+        let from_gz = decode_rpm_primary("repodata/abc-primary.xml.gz", &gz(PRIMARY.as_bytes()))
+            .expect("gzip primary decodes");
+        let from_zst = decode_rpm_primary("repodata/abc-primary.xml.zst", &zst(PRIMARY.as_bytes()))
+            .expect("zstd primary decodes");
+        assert_eq!(from_gz, PRIMARY);
+        assert_eq!(from_zst, PRIMARY);
+        let entries = parse_rpm_primary_xml_checked(&from_zst).expect("zstd primary parses");
+        assert_eq!(names(&entries), vec!["nginx", "curl"]);
+    }
+
+    #[test]
+    fn xz_bzip2_and_plain_primaries_decode() {
+        for (href, bytes) in [
+            ("repodata/p-primary.xml.xz", xz(PRIMARY.as_bytes())),
+            ("repodata/p-primary.xml.bz2", bz2(PRIMARY.as_bytes())),
+            ("repodata/p-primary.xml", PRIMARY.as_bytes().to_vec()),
+        ] {
+            let xml = decode_rpm_primary(href, &bytes).unwrap_or_else(|e| panic!("{href}: {e}"));
+            assert_eq!(xml, PRIMARY, "{href}");
+        }
+    }
+
+    /// Magic bytes are authoritative: a mirror serving zstd bytes at a `.gz`
+    /// href (or an extensionless one) still decodes.
+    #[test]
+    fn compression_is_detected_from_magic_not_extension() {
+        let bytes = zst(PRIMARY.as_bytes());
+        assert_eq!(
+            RepodataCompression::detect("repodata/primary.xml.gz", &bytes).unwrap(),
+            RepodataCompression::Zstd
+        );
+        assert_eq!(
+            decode_rpm_primary("repodata/primary.xml", &bytes).unwrap(),
+            PRIMARY
+        );
+    }
+
+    /// A compressed href whose bytes are not that codec is an error, never a
+    /// lossy plain-text fallback that parses as 0 packages.
+    #[test]
+    fn compressed_href_without_codec_header_is_rejected() {
+        for href in ["p.xml.gz", "p.xml.zst", "p.xml.xz", "p.xml.bz2"] {
+            assert!(
+                decode_rpm_primary(href, b"not compressed at all").is_err(),
+                "{href}"
+            );
+        }
+    }
+
+    /// The decompression budget applies to every codec, matching the gzip cap.
+    #[test]
+    fn decode_refuses_output_past_the_budget() {
+        let bomb = vec![b' '; 1024 * 1024];
+        for (href, bytes) in [
+            ("p.xml.gz", gz(&bomb)),
+            ("p.xml.zst", zst(&bomb)),
+            ("p.xml.xz", xz(&bomb)),
+            ("p.xml.bz2", bz2(&bomb)),
+            ("p.xml", bomb.clone()),
+        ] {
+            let err = decode_rpm_primary_limited(href, &bytes, 4096)
+                .expect_err("output past budget must be refused");
+            assert!(
+                crate::util::bounded_archive::is_decompression_budget_breach(&err),
+                "{href}: {err}"
+            );
+            assert!(decode_rpm_primary_limited(href, &bytes, 2 * 1024 * 1024).is_ok());
+        }
+    }
+
+    /// #4427: a primary that declares packages but parses to none fails the
+    /// sync instead of reporting success with 0 ingested.
+    #[test]
+    fn checked_parse_fails_when_declared_packages_parse_to_zero() {
+        // Undecoded binary (the pre-fix zstd symptom).
+        let lossy = String::from_utf8_lossy(&zst(PRIMARY.as_bytes())).to_string();
+        assert!(parse_rpm_primary_xml_checked(&lossy).is_err());
+
+        // Declared count with no parseable packages.
+        let declared =
+            r#"<metadata xmlns="http://linux.duke.edu/metadata/common" packages="3"></metadata>"#;
+        assert!(parse_rpm_primary_xml_checked(declared)
+            .unwrap_err()
+            .contains("packages=\"3\""));
+
+        // A <package> element that the fail-closed parser drops.
+        let incomplete = r#"<metadata packages="0"><package type="rpm"><arch>noarch</arch></package></metadata>"#;
+        assert!(parse_rpm_primary_xml_checked(incomplete).is_err());
+    }
+
+    #[test]
+    fn checked_parse_accepts_a_genuinely_empty_primary() {
+        for xml in [
+            r#"<?xml version="1.0"?><metadata xmlns="http://linux.duke.edu/metadata/common" packages="0"></metadata>"#,
+            r#"<metadata xmlns="http://linux.duke.edu/metadata/common"/>"#,
+        ] {
+            assert!(
+                parse_rpm_primary_xml_checked(xml).unwrap().is_empty(),
+                "{xml}"
+            );
+        }
     }
 }
