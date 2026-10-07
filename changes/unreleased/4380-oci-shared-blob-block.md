@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4380]
+---
+- **A layer shared with an image blocked by scan policy no longer blocks every other image that uses it** (#4380). On a Docker/OCI remote repository with scan-on-proxy, one image with a blocking verdict made `GET /v2/<name>/blobs/<digest>` answer `403 blob belongs to an image blocked by scan policy` for any layer it shared with other images, under every image name in the repository, so clean images that shared a base or empty layer with it could not be pulled. A blob carries no image identity, so the blob check now refuses a blob only when no image in the repository that references it would be served by the manifest gate; the blocked image itself is still refused at its manifest, and its config and its own layers stay refused by digest. An image without a verdict yet counts as served under `fail_open` (the manifest gate serves it pending) and not under `fail_closed`. The security dashboard's `policy_violations_blocked`, previously always `0`, now counts proxied content currently refused by scan policy plus hosted artifacts in the `rejected` quarantine state.
