@@ -774,6 +774,18 @@ impl ScanResultService {
     /// ([`Self::find_existing_scan_for_artifact`] and step 1 of
     /// [`Self::prepare_scan_placeholder`]) apply the same filter, so an
     /// imported row can never stand in for an artifact's own local scan.
+    ///
+    /// #4425: only an ORIGINAL scan is a dedup source (`source_scan_id IS
+    /// NULL`). A reused row (`is_reused = true`) is a copy of some other
+    /// row's verdict; handing it out as a source would chain copies of
+    /// copies, and because `convert_to_reused` stamps `completed_at = NOW()`
+    /// on the copy, each hop would also restart the TTL window so a verdict
+    /// could outlive its real scan indefinitely. Requiring the original keeps
+    /// every reused row exactly one hop from a scan that actually ran, and
+    /// bounds reuse by that scan's age. This query does not know which
+    /// artifact is asking, so an artifact whose own row is a reused copy now
+    /// gets the original (another artifact's) row back; the scanner checks
+    /// the artifact's own row before copying (see `scan_artifact_inner`).
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -796,6 +808,7 @@ impl ScanResultService {
               AND status = 'completed'
               AND scan_completeness <> 'not_cataloged'
               AND origin = 'local_scan'
+              AND source_scan_id IS NULL
               AND pin_identity IS NOT DISTINCT FROM $5
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
@@ -3913,6 +3926,77 @@ mod tests {
                 .execute(&pool)
                 .await;
             assert!(bogus.is_err(), "origin is constrained to known values");
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4425: a reused row (`source_scan_id` set) is never a dedup
+        /// source. `convert_to_reused` stamps `completed_at = NOW()` on the
+        /// copy, so before the fix the copy was the NEWEST matching row and
+        /// `ORDER BY completed_at DESC` handed it out: copies chained onto
+        /// copies, and the chain kept a verdict alive past its original
+        /// scan's TTL. The artifact's own short-circuit still sees its copy.
+        #[tokio::test]
+        async fn find_reusable_scan_never_returns_a_reused_row() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (orig_aid, ck) = insert_test_artifact(&pool, repo_id, "orig").await;
+            let original = seed_completed_scan_with_pin(&svc, orig_aid, repo_id, &ck, None).await;
+            // The original ran ten days ago.
+            sqlx::query(
+                "UPDATE scan_results SET completed_at = NOW() - INTERVAL '10 days' WHERE id = $1",
+            )
+            .bind(original)
+            .execute(&pool)
+            .await
+            .expect("age original");
+
+            // A second artifact with the same bytes inherits it via the
+            // prepare-then-convert path, which stamps completed_at = NOW().
+            let (copy_aid, _) = insert_test_artifact(&pool, repo_id, "copy").await;
+            let placeholder = svc
+                .create_scan_result_with_checksum(copy_aid, repo_id, "grype", Some(&ck))
+                .await
+                .expect("placeholder");
+            let reused = svc
+                .convert_to_reused(placeholder.id, original, copy_aid, None)
+                .await
+                .expect("convert_to_reused");
+            assert!(reused.is_reused);
+            assert_eq!(reused.source_scan_id, Some(original));
+
+            let hit = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok")
+                .expect("the original is reusable");
+            assert_eq!(
+                hit.id, original,
+                "the newer reused copy must never be handed out as a dedup source"
+            );
+            assert_eq!(hit.source_scan_id, None);
+
+            // Inside the copy's window but outside the original's: the copy
+            // must not extend the verdict's life.
+            let stale = svc
+                .find_reusable_scan(&ck, "grype", 5, 5, None)
+                .await
+                .expect("query ok");
+            assert!(
+                stale.is_none(),
+                "a reused copy must not keep an expired original's verdict reusable"
+            );
+
+            // The per-artifact short-circuit (#1373) is unchanged: the copy is
+            // that artifact's own completed scan.
+            let own = svc
+                .find_existing_scan_for_artifact(copy_aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert_eq!(own.map(|r| r.id), Some(reused.id));
 
             cleanup_repo(&pool, repo_id).await;
         }

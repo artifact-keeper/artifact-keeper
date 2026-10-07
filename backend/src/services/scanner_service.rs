@@ -1065,6 +1065,26 @@ pub(crate) fn is_within_dedup_ttl(
 // scan_type) advisory lock, so there is no longer a database-free branch to
 // unit-test in isolation.
 
+/// Whether `scan_artifact_inner` must look up the artifact's OWN completed
+/// row before acting on a cross-artifact dedup match (#4425).
+///
+/// `find_reusable_scan` returns only original scans (`source_scan_id IS
+/// NULL`), so when this artifact's own completed row is a reused copy the
+/// match points at another artifact. With a prepared placeholder
+/// (`Reuse`) that is harmless: the prepare step already short-circuited to
+/// the artifact's own completed row and `convert_to_reused` no-ops on it.
+/// With `InsertFresh` there is no such guard and the reuse path would
+/// INSERT a second completed row for the same artifact and scan type, so
+/// the caller checks for an existing own row first.
+pub(crate) fn needs_own_scan_lookup(
+    source_artifact_id: Uuid,
+    current_artifact_id: Uuid,
+    prepared_action: &PreparedScanAction,
+) -> bool {
+    !should_skip_reuse_for_same_artifact(source_artifact_id, current_artifact_id)
+        && matches!(prepared_action, PreparedScanAction::InsertFresh)
+}
+
 /// Outcome of the same-artifact branch inside `scan_artifact_inner` when
 /// `find_reusable_scan` returns a row whose `artifact_id` matches the
 /// artifact currently being scanned.
@@ -8286,7 +8306,29 @@ impl ScannerService {
                     .ok()
                     .flatten()
             };
-            if let Some(source_scan) = reusable {
+            if let Some(mut source_scan) = reusable {
+                // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
+                // an artifact whose own row is a reused copy is handed the
+                // original (another artifact's) row. Without this check the
+                // InsertFresh path (auto-scan, repository scan) would copy it
+                // into a SECOND completed row for this artifact. Prefer the
+                // artifact's own completed row so the #1373 branch below
+                // treats it as already scanned.
+                if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
+                    if let Ok(Some(own)) = self
+                        .scan_result_service
+                        .find_existing_scan_for_artifact(
+                            artifact_id,
+                            checksum,
+                            scanner.scan_type(),
+                            DEDUP_TTL_DAYS,
+                            ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        )
+                        .await
+                    {
+                        source_scan = own;
+                    }
+                }
                 // #1373: when the matched source scan is for THIS artifact,
                 // a completed scan for these exact bytes already exists. We
                 // must not run a fresh scan or copy results into a new row;
@@ -22610,6 +22652,35 @@ tonic-build = "0.12"
     }
 
     #[test]
+    fn test_needs_own_scan_lookup_only_for_foreign_match_without_placeholder() {
+        // #4425: only a match on ANOTHER artifact under InsertFresh can turn
+        // into a duplicate completed row, so only that case looks up the
+        // artifact's own row first.
+        let current = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+    }
+
+    #[test]
     fn test_decide_same_artifact_action_insert_fresh_is_noop() {
         // Auto-scan-on-upload path: no placeholder was committed, so we
         // simply skip. The existing completed row already represents
@@ -26568,6 +26639,100 @@ tonic-build = "0.12"
             .bind(repo_id)
             .execute(pool)
             .await;
+    }
+
+    /// #4425 end to end: `find_reusable_scan` now returns only original
+    /// scans, so for an artifact whose own completed row is a reused copy it
+    /// hands back the ORIGINAL artifact's row. A rescan without a prepared
+    /// placeholder (auto-scan, repository scan) must still see that the
+    /// artifact is already scanned, not copy the original into a second
+    /// completed row (the release-gate assertion "Per-artifact scan list
+    /// contains exactly one completed scan", #1373). A third byte-identical
+    /// artifact copies from the original, never from the copy.
+    #[tokio::test]
+    async fn test_rescan_of_a_reused_artifact_keeps_one_completed_row() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let ck = fresh_checksum();
+        let bytes = Bytes::from_static(b"reused-bytes-4425");
+
+        // The original: a real scan.
+        let orig = insert_artifact_with(&fx, "orig", None, "orig", &ck, bytes.clone()).await;
+        service
+            .scan_artifact_with_options(orig, true, false)
+            .await
+            .expect("scan original");
+        let original: Uuid = sqlx::query_scalar(
+            "SELECT id FROM scan_results WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(orig)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("original row");
+
+        // A byte-identical artifact gets a reused copy through the
+        // prepare-then-convert path, which stamps the copy completed NOW().
+        let copy = insert_artifact_with(&fx, "copy", None, "copy", &ck, bytes.clone()).await;
+        let srs = ScanResultService::new(fx.pool.clone());
+        let placeholder = srs
+            .create_scan_result_with_checksum(copy, fx.repo_id, "grype", Some(&ck))
+            .await
+            .expect("placeholder");
+        srs.convert_to_reused(placeholder.id, original, copy, None)
+            .await
+            .expect("convert");
+
+        // Rescan the copy with no prepared placeholder.
+        service
+            .scan_artifact_with_options(copy, true, false)
+            .await
+            .expect("rescan copy");
+        let copy_rows: Vec<(Uuid, bool, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, is_reused, source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(copy)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("copy rows");
+        assert_eq!(
+            copy_rows,
+            vec![(placeholder.id, true, Some(original))],
+            "a rescan of an already-reused artifact must leave exactly its one completed row"
+        );
+
+        // A third artifact copies from the original, not from the copy.
+        let third = insert_artifact_with(&fx, "third", None, "third", &ck, bytes).await;
+        service
+            .scan_artifact_with_options(third, true, false)
+            .await
+            .expect("scan third");
+        let third_source: Option<Uuid> = sqlx::query_scalar(
+            "SELECT source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(third)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("third row");
+        assert_eq!(
+            third_source,
+            Some(original),
+            "a reused row must never be the source of another reuse"
+        );
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().len(),
+            1,
+            "only the original ran a real scan"
+        );
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 
     /// 64-hex checksum (unique per call so two parallel tests don't share a
