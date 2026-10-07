@@ -73,6 +73,26 @@ pub struct PromotionResponse {
     pub promotion_id: Option<Uuid>,
     pub policy_violations: Vec<PolicyViolation>,
     pub message: Option<String>,
+    /// Every gate rule the promotion was evaluated against, passed or not,
+    /// with the reason: `[{"rule","passed","reason"}]`. Empty when the policy
+    /// check was skipped or never reached.
+    pub gate_results: Vec<GateResult>,
+}
+
+pub use crate::services::promotion_policy_service::GateResult;
+
+/// Failing per-pair promotion rules as failed [`GateResult`]s.
+fn rule_failures_to_gate_results(
+    failing: &[crate::services::promotion_rule_service::RuleEvaluationResult],
+) -> Vec<GateResult> {
+    failing
+        .iter()
+        .map(|e| GateResult {
+            rule: e.rule_name.clone(),
+            passed: false,
+            reason: e.violations.join("; "),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -707,6 +727,7 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
         promotion_id: None,
         policy_violations: vec![],
         message: Some(message),
+        gate_results: vec![],
     }
 }
 
@@ -1032,6 +1053,7 @@ pub async fn promote_artifact(
         super::approval::check_approval_required(&state.db, source_repo.id).await?;
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
+    let mut gate_results: Vec<GateResult> = vec![];
     // #4203: an admin's skip_policy_check override is recorded in the audit
     // trail as exactly that — not as a policy that ran and passed.
     let mut policy_result_json = if req.skip_policy_check {
@@ -1064,6 +1086,7 @@ pub async fn promote_artifact(
             .collect();
 
         policy_result_json = build_policy_result_json(&eval_result);
+        gate_results = eval_result.gate_results.clone();
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
@@ -1073,6 +1096,7 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
+                gate_results,
             }));
         }
     }
@@ -1097,6 +1121,10 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations: rule_violations_to_policy_violations(&failing),
                 message: Some("Promotion blocked by promotion rule violations".to_string()),
+                gate_results: gate_results
+                    .into_iter()
+                    .chain(rule_failures_to_gate_results(&failing))
+                    .collect(),
             }));
         }
     }
@@ -1230,12 +1258,14 @@ pub async fn promote_artifact(
     // gate configured to `warn` visible to the caller at all. Before this was
     // wired the vector was pushed to and then dropped, so every successful
     // promotion reported an empty list no matter what the gate found.
-    Ok(Json(build_success_response(
+    let mut response = build_success_response(
         build_promotion_source_display(&repo_key, &artifact.path),
         build_promotion_target_display(&target_key, &artifact.path),
         promotion_id,
         policy_violations,
-    )))
+    );
+    response.gate_results = gate_results;
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1457,6 +1487,7 @@ pub async fn promote_artifacts_bulk(
                         "Promotion blocked by promotion rule violations".to_string(),
                     );
                     resp.policy_violations = rule_violations_to_policy_violations(&failing);
+                    resp.gate_results = rule_failures_to_gate_results(&failing);
                     results.push(resp);
                     continue;
                 }
@@ -1611,6 +1642,7 @@ pub async fn promote_artifacts_bulk(
             promotion_id: Some(promotion_id),
             policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
+            gate_results: vec![],
         });
     }
 
@@ -2139,6 +2171,7 @@ pub fn validate_release_target_link(
         BulkPromoteRequest,
         PromotionResponse,
         PolicyViolation,
+        GateResult,
         BulkPromotionResponse,
         RejectArtifactRequest,
         RejectionResponse,
@@ -2197,6 +2230,7 @@ fn build_success_response(
         promotion_id: Some(promotion_id),
         policy_violations,
         message: Some("Artifact promoted successfully".to_string()),
+        gate_results: vec![],
     }
 }
 
@@ -3234,6 +3268,7 @@ mod tests {
                 .collect(),
             cve_summary: None,
             license_summary: None,
+            gate_results: vec![],
         }
     }
 
@@ -3505,8 +3540,21 @@ mod tests {
             promotion_id: Some(Uuid::nil()),
             policy_violations: vec![],
             message: Some("OK".to_string()),
+            gate_results: vec![GateResult {
+                rule: "require-signature".to_string(),
+                passed: true,
+                reason: "verified CEP-27 attestation".to_string(),
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["gate_results"],
+            serde_json::json!([{
+                "rule": "require-signature",
+                "passed": true,
+                "reason": "verified CEP-27 attestation"
+            }])
+        );
         assert_eq!(json["promoted"], true);
         assert_eq!(json["source"], "staging/lib.jar");
         assert_eq!(json["target"], "release/lib.jar");

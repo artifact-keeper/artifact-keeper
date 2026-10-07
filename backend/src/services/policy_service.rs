@@ -175,6 +175,32 @@ enum CondaAttestationFact {
     Verified,
 }
 
+/// Map a recorded attestation state to the predicate fact. `unverified` and
+/// `failed` (and anything unknown) are both "present but unverified": the
+/// vocabulary distinguishes absence from a record that exists but did not (or
+/// did not yet) pass verification.
+fn attestation_fact(state: Option<&str>) -> CondaAttestationFact {
+    match state {
+        None => CondaAttestationFact::Absent,
+        Some("verified") => CondaAttestationFact::Verified,
+        Some(_) => CondaAttestationFact::PresentUnverified,
+    }
+}
+
+/// Combine the curation record and the upload-time record: absent only when
+/// both are absent, verified only when every record present is verified.
+fn fold_attestation_facts(
+    a: CondaAttestationFact,
+    b: CondaAttestationFact,
+) -> CondaAttestationFact {
+    use CondaAttestationFact::*;
+    match (a, b) {
+        (Absent, x) | (x, Absent) => x,
+        (Verified, Verified) => Verified,
+        _ => PresentUnverified,
+    }
+}
+
 /// The conda facts one artifact carries, assembled once per
 /// `evaluate_artifact` call and only when an applicable policy actually
 /// configures conda predicates (so policy-free repos pay zero extra queries).
@@ -1002,14 +1028,20 @@ impl PolicyService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let attestation = match attestation_state.as_deref() {
-            None => CondaAttestationFact::Absent,
-            Some("verified") => CondaAttestationFact::Verified,
-            // 'unverified' and 'failed' are both "present but unverified":
-            // the predicate vocabulary distinguishes absence from a record
-            // that exists but did not (or did not yet) pass verification.
-            Some(_) => CondaAttestationFact::PresentUnverified,
-        };
+        // A hosted package has no curation record: its attestation was
+        // verified when it was uploaded to the conda attestation endpoint, and
+        // the verdict lives on the artifact itself
+        // (`artifact_metadata.attestation_verification`, cep27). Both sources
+        // count, folded to the weaker one, so neither can launder the other.
+        let uploaded_state = metadata
+            .get(crate::services::curation::attestation_verify::cep27::VERIFICATION_METADATA_KEY)
+            .and_then(|record| record.get("state"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let attestation = fold_attestation_facts(
+            attestation_fact(attestation_state.as_deref()),
+            attestation_fact(uploaded_state.as_deref()),
+        );
 
         Ok(CondaFacts {
             is_conda,
@@ -3318,6 +3350,88 @@ mod tests {
             scriptless_result.allowed,
             "no scripts -> neither script predicate may fire, got: {:?}",
             scriptless_result.violations
+        );
+    }
+
+    #[test]
+    fn attestation_facts_fold_to_the_weaker_record() {
+        use CondaAttestationFact::*;
+        assert_eq!(attestation_fact(None), Absent);
+        assert_eq!(attestation_fact(Some("verified")), Verified);
+        assert_eq!(attestation_fact(Some("failed")), PresentUnverified);
+        assert_eq!(fold_attestation_facts(Absent, Absent), Absent);
+        assert_eq!(fold_attestation_facts(Absent, Verified), Verified);
+        assert_eq!(fold_attestation_facts(Verified, Absent), Verified);
+        assert_eq!(fold_attestation_facts(Verified, Verified), Verified);
+        assert_eq!(
+            fold_attestation_facts(Verified, PresentUnverified),
+            PresentUnverified
+        );
+        assert_eq!(
+            fold_attestation_facts(PresentUnverified, Absent),
+            PresentUnverified
+        );
+    }
+
+    /// F7: a HOSTED conda package has no curation record; the attestation
+    /// verified on upload (`artifact_metadata.attestation_verification`)
+    /// must satisfy `min_attestation_state = verified`, and a failed one
+    /// must not.
+    #[tokio::test]
+    async fn test_conda_uploaded_attestation_satisfies_min_attestation_state_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+        svc.create_policy(
+            &format!("f7-attestation-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    min_attestation_state: Some("verified".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create attestation policy");
+
+        let with_record = |state: &str| {
+            let mut m = conda_metadata_4058("my-channel", "MIT", "MIT");
+            m["attestation_verification"] = serde_json::json!({
+                "format": "conda",
+                "state": state,
+                "method": "sigstore-key",
+            });
+            m
+        };
+        let verified =
+            seed_conda_artifact_4058(&fx, "hosted-ok", "1.0.0", with_record("verified")).await;
+        let failed =
+            seed_conda_artifact_4058(&fx, "hosted-bad", "1.0.0", with_record("failed")).await;
+
+        let verified_result = svc.evaluate_artifact(verified, fx.repo_id).await;
+        let failed_result = svc.evaluate_artifact(failed, fx.repo_id).await;
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let verified_result = verified_result.expect("evaluate verified");
+        assert!(
+            verified_result.allowed,
+            "a verified upload attestation must satisfy the policy: {verified_result:?}"
+        );
+        let failed_result = failed_result.expect("evaluate failed");
+        assert!(
+            !failed_result.allowed,
+            "a failed upload attestation must not satisfy the policy: {failed_result:?}"
         );
     }
 

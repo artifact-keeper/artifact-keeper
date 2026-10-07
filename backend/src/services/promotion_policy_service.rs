@@ -27,6 +27,97 @@ pub struct PolicyEvaluationResult {
     pub violations: Vec<PolicyViolation>,
     pub cve_summary: Option<CveSummary>,
     pub license_summary: Option<LicenseSummary>,
+    /// One entry per rule the evaluation applied, passed or not, so a caller
+    /// can show WHY a promotion was allowed as well as why it was refused.
+    #[serde(default)]
+    pub gate_results: Vec<GateResult>,
+}
+
+/// The outcome of one promotion gate rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct GateResult {
+    /// Stable rule token (`require-signature`, `cve-severity-threshold`, ...).
+    pub rule: String,
+    pub passed: bool,
+    /// Why it passed, or the violation message(s) when it did not.
+    pub reason: String,
+}
+
+/// Assemble [`GateResult`]s from the rules an evaluation applied (with the
+/// reason each passes for) and the violations it found. A rule fails when any
+/// violation carries its token; a violation whose rule was not in `applied`
+/// (a predicate, a default policy) is reported as a failed rule of its own.
+pub fn build_gate_results(
+    applied: &[(String, String)],
+    violations: &[PolicyViolation],
+) -> Vec<GateResult> {
+    let failures = |rule: &str| -> Vec<&str> {
+        violations
+            .iter()
+            .filter(|v| v.rule == rule)
+            .map(|v| v.message.as_str())
+            .collect()
+    };
+    let mut out: Vec<GateResult> = Vec::new();
+    for (rule, pass_reason) in applied {
+        if out.iter().any(|g| &g.rule == rule) {
+            continue;
+        }
+        let failed = failures(rule);
+        out.push(GateResult {
+            rule: rule.clone(),
+            passed: failed.is_empty(),
+            reason: if failed.is_empty() {
+                pass_reason.clone()
+            } else {
+                failed.join("; ")
+            },
+        });
+    }
+    for v in violations {
+        if !out.iter().any(|g| g.rule == v.rule) {
+            out.push(GateResult {
+                rule: v.rule.clone(),
+                passed: false,
+                reason: failures(&v.rule).join("; "),
+            });
+        }
+    }
+    out
+}
+
+/// When the artifact carries a VERIFIED CEP-27 publish attestation
+/// (`artifact_metadata.attestation_verification`, written by the conda
+/// attestation endpoint), a human-readable reason naming how it verified.
+/// Such an attestation is a signature over these exact bytes by a trusted
+/// publisher identity or key, so it satisfies `require_signature`.
+pub(crate) async fn verified_attestation_reason(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Option<String>> {
+    let record: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata -> 'attestation_verification' FROM artifact_metadata \
+         WHERE artifact_id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await?
+    .flatten();
+    Ok(record.as_ref().and_then(attestation_pass_reason))
+}
+
+/// The pure half of [`verified_attestation_reason`].
+pub(crate) fn attestation_pass_reason(record: &serde_json::Value) -> Option<String> {
+    if record.get("state").and_then(|v| v.as_str()) != Some("verified") {
+        return None;
+    }
+    let field = |k: &str| record.get(k).and_then(|v| v.as_str()).unwrap_or("unknown");
+    Some(format!(
+        "verified CEP-27 attestation ({}, identity {}, issuer {})",
+        field("method"),
+        field("identity"),
+        field("issuer")
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +517,8 @@ impl PromotionPolicyService {
     ) -> Result<PolicyEvaluationResult> {
         let mut violations = Vec::new();
         let mut action = PolicyAction::Allow;
+        // (rule, why it passes) for every rule this evaluation applies.
+        let mut applied: Vec<(String, String)> = Vec::new();
 
         let cve_summary = self.get_cve_summary(artifact_id).await?;
         let license_summary = self.get_license_summary(artifact_id).await?;
@@ -441,13 +534,42 @@ impl PromotionPolicyService {
             );
         }
 
+        if let Some(ref summary) = cve_summary {
+            let rule = if scan_policy.is_some() {
+                "cve-severity-threshold"
+            } else {
+                "default-cve-policy"
+            };
+            applied.push((
+                rule.to_string(),
+                format!(
+                    "{} open finding(s), none above the policy threshold",
+                    summary.total_count
+                ),
+            ));
+        }
+
         if let (Some(ref summary), Some(ref policy)) = (&license_summary, &license_policy) {
             evaluate_licenses_against_policy(summary, policy, &mut violations, &mut action);
+            applied.push((
+                "license-compliance".to_string(),
+                format!(
+                    "license(s) {} allowed by policy '{}'",
+                    summary.licenses_found.join(", "),
+                    policy.name
+                ),
+            ));
         }
 
         if let Some(ref policy) = scan_policy {
             self.evaluate_block_unscanned(artifact_id, policy, &mut violations, &mut action)
                 .await?;
+            if policy.block_unscanned {
+                applied.push((
+                    "block-unscanned".to_string(),
+                    "a security scan has completed".to_string(),
+                ));
+            }
 
             self.evaluate_age_and_signature(
                 artifact_id,
@@ -455,6 +577,7 @@ impl PromotionPolicyService {
                 policy,
                 &mut violations,
                 &mut action,
+                &mut applied,
             )
             .await?;
         }
@@ -480,6 +603,7 @@ impl PromotionPolicyService {
             .await?;
 
         let passed = violations.is_empty();
+        let gate_results = build_gate_results(&applied, &violations);
 
         Ok(PolicyEvaluationResult {
             passed,
@@ -487,6 +611,7 @@ impl PromotionPolicyService {
             violations,
             cve_summary,
             license_summary,
+            gate_results,
         })
     }
 
@@ -529,7 +654,20 @@ impl PromotionPolicyService {
         policy: &ScanPolicyConfig,
         violations: &mut Vec<PolicyViolation>,
         action: &mut PolicyAction,
+        applied: &mut Vec<(String, String)>,
     ) -> Result<()> {
+        if let Some(hours) = policy.min_staging_hours {
+            applied.push((
+                "min-staging-time".to_string(),
+                format!("staged for at least {hours} hour(s)"),
+            ));
+        }
+        if let Some(days) = policy.max_artifact_age_days {
+            applied.push((
+                "max-artifact-age".to_string(),
+                format!("younger than {days} day(s)"),
+            ));
+        }
         let has_age_constraints =
             policy.min_staging_hours.is_some() || policy.max_artifact_age_days.is_some();
 
@@ -545,9 +683,17 @@ impl PromotionPolicyService {
         }
 
         if policy.require_signature {
-            let has_signature = self
-                .check_artifact_signature(artifact_id, repository_id)
-                .await?;
+            let attestation = verified_attestation_reason(&self.db, artifact_id).await?;
+            applied.push((
+                "require-signature".to_string(),
+                attestation
+                    .clone()
+                    .unwrap_or_else(|| "signed by the repository's active signing key".to_string()),
+            ));
+            let has_signature = attestation.is_some()
+                || self
+                    .check_artifact_signature(artifact_id, repository_id)
+                    .await?;
             let sig_violations = evaluate_signature_requirement(has_signature);
             for v in sig_violations {
                 *action = PolicyAction::Block;
@@ -1434,6 +1580,7 @@ mod tests {
             violations: vec![],
             cve_summary: None,
             license_summary: None,
+            gate_results: vec![],
         };
 
         assert!(result.passed);
@@ -1462,6 +1609,7 @@ mod tests {
                 open_cves: vec!["CVE-2024-0001".to_string()],
             }),
             license_summary: None,
+            gate_results: vec![],
         };
 
         assert!(!result.passed);
@@ -1515,6 +1663,7 @@ mod tests {
             violations: vec![],
             cve_summary: None,
             license_summary: None,
+            gate_results: vec![],
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -2765,5 +2914,137 @@ mod tests {
             result.violations
         );
         assert_eq!(result.action, PolicyAction::Allow);
+    }
+
+    // -----------------------------------------------------------------------
+    // F7: a verified CEP-27 attestation satisfies `require_signature`, and
+    // every applied rule is reported in `gate_results`.
+    // -----------------------------------------------------------------------
+
+    fn violation(rule: &str, message: &str) -> PolicyViolation {
+        PolicyViolation {
+            rule: rule.to_string(),
+            severity: "high".to_string(),
+            message: message.to_string(),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn gate_results_report_passes_failures_and_unlisted_violations() {
+        let applied = vec![
+            ("require-signature".to_string(), "signed".to_string()),
+            ("block-unscanned".to_string(), "scanned".to_string()),
+        ];
+        let violations = vec![
+            violation("block-unscanned", "no scan"),
+            violation("policy-predicate", "[conda.license] GPL"),
+            violation("policy-predicate", "[conda.channel] evil"),
+        ];
+        let results = build_gate_results(&applied, &violations);
+        assert_eq!(
+            results,
+            vec![
+                GateResult {
+                    rule: "require-signature".into(),
+                    passed: true,
+                    reason: "signed".into()
+                },
+                GateResult {
+                    rule: "block-unscanned".into(),
+                    passed: false,
+                    reason: "no scan".into()
+                },
+                GateResult {
+                    rule: "policy-predicate".into(),
+                    passed: false,
+                    reason: "[conda.license] GPL; [conda.channel] evil".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn attestation_pass_reason_only_for_verified_records() {
+        assert_eq!(
+            attestation_pass_reason(&serde_json::json!({"state": "failed"})),
+            None
+        );
+        let reason = attestation_pass_reason(&serde_json::json!({
+            "state": "verified",
+            "method": "sigstore-key",
+            "identity": "acme-ci",
+            "issuer": "key:8ef972c8a32ae989",
+        }))
+        .unwrap();
+        assert!(
+            reason.contains("sigstore-key") && reason.contains("acme-ci"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_attestation_satisfies_require_signature() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_conda_repo_4147(&pool).await;
+        sqlx::query(
+            "INSERT INTO scan_policies \
+                (name, repository_id, max_severity, block_unscanned, block_on_fail, \
+                 is_enabled, require_signature) \
+             VALUES ($1, $2, 'critical', false, false, true, true)",
+        )
+        .bind(format!("f7-signature-{repo}"))
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("seed require_signature policy");
+
+        let attested = seed_conda_artifact_4147(&pool, repo, Some("ch")).await;
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata || $2::jsonb WHERE artifact_id = $1",
+        )
+        .bind(attested)
+        .bind(serde_json::json!({"attestation_verification": {
+            "state": "verified", "method": "sigstore-key",
+            "identity": "acme-ci", "issuer": "key:8ef972c8a32ae989"
+        }}))
+        .execute(&pool)
+        .await
+        .expect("record verified attestation");
+        let unattested = seed_conda_artifact_4147(&pool, repo, Some("ch")).await;
+
+        let ok = svc
+            .evaluate_artifact(attested, repo)
+            .await
+            .expect("attested");
+        let refused = svc
+            .evaluate_artifact(unattested, repo)
+            .await
+            .expect("unattested");
+        delete_repo_policies_4147(&pool, repo).await;
+
+        assert!(
+            ok.passed,
+            "a verified attestation must satisfy require_signature: {ok:?}"
+        );
+        let sig = ok
+            .gate_results
+            .iter()
+            .find(|g| g.rule == "require-signature")
+            .expect("require-signature reported");
+        assert!(sig.passed && sig.reason.contains("sigstore-key"), "{sig:?}");
+
+        assert!(!refused.passed);
+        assert_eq!(refused.action, PolicyAction::Block);
+        let sig = refused
+            .gate_results
+            .iter()
+            .find(|g| g.rule == "require-signature")
+            .expect("require-signature reported");
+        assert!(!sig.passed, "{sig:?}");
     }
 }

@@ -632,6 +632,18 @@ impl PromotionRuleService {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> Result<bool> {
+        // A verified CEP-27 publish attestation is a signature over these
+        // exact bytes by a trusted publisher identity or key, so it satisfies
+        // `require_signature` the same way the promotion policy gate does.
+        if crate::services::promotion_policy_service::verified_attestation_reason(
+            &self.db,
+            artifact_id,
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(true);
+        }
         // #2535: require the signing key to still be active so a signature from
         // a revoked or rotated-away key does not satisfy the gate.
         let signed: bool = sqlx::query_scalar::<_, bool>(
