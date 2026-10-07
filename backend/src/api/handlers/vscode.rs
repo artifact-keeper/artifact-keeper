@@ -338,6 +338,28 @@ enum GalleryAssetKind {
     Other,
 }
 
+/// The canonical `(cache_key, scannable)` decision for a gallery asset
+/// (#4365 item 1): cached under `gallery/{publisher}/{name}/{version}/{platform}/{leaf}`
+/// (each segment percent-encoded), scannable exactly when it is the package.
+/// The decision is the asset type's, not the file name's, so it is passed in
+/// as `kind` from [`classify_gallery_asset_type`].
+fn gallery_asset_serve_key(
+    (publisher, name, version, target_platform): (&str, &str, &str, &str),
+    leaf: &str,
+    kind: GalleryAssetKind,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(
+        &format!(
+            "gallery/{}/{}/{}/{}/{leaf}",
+            urlencoding::encode(publisher),
+            urlencoding::encode(name),
+            urlencoding::encode(version),
+            urlencoding::encode(target_platform),
+        ),
+        |_| kind == GalleryAssetKind::Package,
+    )
+}
+
 /// Classify a requested gallery asset type and return the spelling it is
 /// fetched and cached under (#4365 item 4).
 ///
@@ -2618,13 +2640,12 @@ async fn gallery_vspackage(
         urlencoding::encode(&version),
         urlencoding::encode(target_platform.as_ref()),
     );
-    let cache_path = format!(
-        "gallery/{}/{}/{}/{}/vspackage",
-        urlencoding::encode(&publisher),
-        urlencoding::encode(&name),
-        urlencoding::encode(&version),
-        urlencoding::encode(target_platform.as_ref()),
-    );
+    let cache_path = gallery_asset_serve_key(
+        (&publisher, &name, &version, target_platform.as_ref()),
+        "vspackage",
+        GalleryAssetKind::Package,
+    )
+    .cache_key;
     let upstream_asset_url = format!(
         "{}/{}",
         upstream_url.trim_end_matches('/'),
@@ -2691,14 +2712,12 @@ async fn gallery_asset(
         asset_type,
         target_platform.as_ref(),
     )?;
-    let cache_path = format!(
-        "gallery/{}/{}/{}/{}/asset-{:x}",
-        urlencoding::encode(&publisher),
-        urlencoding::encode(&name),
-        urlencoding::encode(&version),
-        urlencoding::encode(target_platform.as_ref()),
-        Sha256::digest(asset_type.as_bytes()),
-    );
+    let cache_path = gallery_asset_serve_key(
+        (&publisher, &name, &version, target_platform.as_ref()),
+        &format!("asset-{:x}", Sha256::digest(asset_type.as_bytes())),
+        kind,
+    )
+    .cache_key;
     let coordinate = GalleryAssetCoordinate {
         repo_key: &repo_key,
         publisher: &publisher,
@@ -10076,5 +10095,51 @@ mod vsix_manifest_publish_tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("vsce package"), "got: {body}");
         assert!(body.contains("x-publisher"), "got: {body}");
+    }
+}
+
+/// #4365 item 1: VS Code gallery `(cache_key, scannable)` decisions. The key
+/// is the one the gallery routes already used; scannable is exactly the
+/// package.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn gallery_serve_key_table() {
+        let coord = ("Red Hat", "vscode-yaml", "1.0.0", "linux-x64");
+        let package = gallery_asset_serve_key(coord, "vspackage", GalleryAssetKind::Package);
+        assert_eq!(
+            package.cache_key,
+            "gallery/Red%20Hat/vscode-yaml/1.0.0/linux-x64/vspackage"
+        );
+        assert!(package.scannable);
+        for (requested, scannable) in [
+            ("Microsoft.VisualStudio.Services.VSIXPackage", true),
+            ("microsoft.visualstudio.services.vsixpackage", true),
+            ("Microsoft.VisualStudio.Services.Icons.Default", false),
+            ("MICROSOFT.VISUALSTUDIO.CODE.MANIFEST", false),
+            ("Microsoft.VisualStudio.Code.WebResources", false),
+        ] {
+            let (canonical, kind) = classify_gallery_asset_type(requested);
+            let leaf = format!("asset-{:x}", Sha256::digest(canonical.as_bytes()));
+            let got = gallery_asset_serve_key(coord, &leaf, kind);
+            assert_eq!(
+                got.cache_key,
+                format!("gallery/Red%20Hat/vscode-yaml/1.0.0/linux-x64/{leaf}"),
+                "{requested}"
+            );
+            assert_eq!(got.scannable, scannable, "{requested}");
+        }
+        // Every capitalisation of the package shares one cache entry.
+        let leaf = |t: &str| {
+            let (canonical, _) = classify_gallery_asset_type(t);
+            format!("asset-{:x}", Sha256::digest(canonical.as_bytes()))
+        };
+        assert_eq!(
+            leaf("microsoft.visualstudio.services.vsixpackage"),
+            leaf(GALLERY_VSIX_ASSET_TYPE)
+        );
     }
 }

@@ -2368,6 +2368,18 @@ fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) 
     format!("simple/{}/{}", project.as_str(), filename)
 }
 
+/// The canonical `(cache_key, scannable)` decision for a proxied PyPI
+/// distribution (#4365 item 1): every file on the download route is a
+/// package, cached under [`build_pypi_proxy_cache_path`].
+fn pypi_file_serve_key(
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&build_pypi_proxy_cache_path(
+        project, filename,
+    ))
+}
+
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
 /// index (#1944). The JSON and HTML representations of one index must
 /// withhold the same young versions, or a JSON-negotiating client (modern
@@ -3713,7 +3725,7 @@ async fn resolve_pypi_remote_fetch_target(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let cache_path = format!("simple/{}/{}", normalized, filename);
+    let cache_path = pypi_file_serve_key(project, filename).cache_key;
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
@@ -22617,5 +22629,24 @@ mod legacy_json_xmlrpc_route_tests {
                 .starts_with(&format!("{ROUTE_BASE}/pypi/{key}/")),
             "{doc}"
         );
+    }
+}
+
+/// #4365 item 1: PyPI decides by route (every distribution is a package);
+/// the cache key is the stable `simple/{project}/{filename}` path.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pypi_file_serve_key_table() {
+        let project = NormalizedProjectName::parse("requests").expect("valid name");
+        for file in ["requests-2.31.0.tar.gz", "requests-2.31.0-py3-none-any.whl"] {
+            let got = pypi_file_serve_key(&project, file);
+            assert_eq!(got.cache_key, format!("simple/requests/{file}"));
+            assert_eq!(got.cache_key, build_pypi_proxy_cache_path(&project, file));
+            assert!(got.scannable);
+        }
     }
 }

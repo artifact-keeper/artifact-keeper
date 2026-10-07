@@ -2001,7 +2001,7 @@ async fn download(
                     // Use the canonical local cache path regardless of which
                     // upstream URL was resolved so that subsequent requests hit
                     // the proxy cache even after a config.json TTL change.
-                    let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    let cache_path = crate_serve_key(&name_lower, &version).cache_key;
 
                     // Stream the crate rather than buffering it (#895 / #2192,
                     // the cargo instance of that class). This used to be a
@@ -2129,7 +2129,7 @@ async fn download(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
-                let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                let upstream_path = crate_serve_key(&name_lower, &version).cache_key;
 
                 // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s;
                 // narrowed to name + EXACT VERSION by #3953). If a non-Remote
@@ -2374,6 +2374,19 @@ fn virtual_crate_response(
         .clone()
         .unwrap_or_else(|| "application/x-tar".to_string());
     streamed_crate_response(filename, content_type, result)
+}
+
+/// The canonical `(cache_key, scannable)` decision for a proxied `.crate`
+/// (#4365 item 1): every download is a package, cached under the canonical
+/// `api/v1/crates/{name}/{version}/download` path whichever upstream URL
+/// serves it.
+fn crate_serve_key(
+    name_lower: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "api/v1/crates/{name_lower}/{version}/download"
+    ))
 }
 
 type CrateScanPolicy = (
@@ -9559,6 +9572,30 @@ mod age_gate_tests {
             assert_eq!(scan_header(&headers), None);
             assert_eq!(&served[..], &body[..]);
             rig.teardown().await;
+        }
+    }
+}
+
+/// #4365 item 1: Cargo decides by route (every download is a crate); the
+/// cache key is the canonical download path whichever `dl` URL served it.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn crate_serve_key_table() {
+        for (name, version, key) in [
+            ("serde", "1.0.0", "api/v1/crates/serde/1.0.0/download"),
+            (
+                "tokio-util",
+                "0.7.10-alpha.1",
+                "api/v1/crates/tokio-util/0.7.10-alpha.1/download",
+            ),
+        ] {
+            let got = crate_serve_key(name, version);
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
         }
     }
 }

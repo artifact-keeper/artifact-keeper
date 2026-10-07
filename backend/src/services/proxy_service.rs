@@ -1424,6 +1424,69 @@ pub(crate) fn normalize_cache_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
+/// One proxied request's canonical decision (#4365 item 1): the proxy-cache
+/// key it is fetched, cached and counted under, and whether the scan-on-proxy
+/// gate must see it. Both come from the same [`normalize_cache_path`] value,
+/// so two spellings of one request (a trailing `/`, a doubled leading `/`)
+/// can never be cached as one entry and classified as two things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyServeKey {
+    /// The [`normalize_cache_path`] form of the request's cache path.
+    pub(crate) cache_key: String,
+    /// Whether the scan gate must see this file when the repository scans
+    /// on proxy.
+    pub(crate) scannable: bool,
+}
+
+/// The one helper every scan-on-proxy format derives its cache key and scan
+/// decision from (#4365 item 1).
+///
+/// `is_package_file` decides on the cache key's final segment (the file
+/// name), never on the raw request. Two rules sit above it, both failing
+/// towards the gate: an empty file name is not a package (nothing to scan,
+/// and nothing is served as one), and a key [`has_ambiguous_path_chars`]
+/// is always scannable, because a `?`, `#`, `;` or stray `%` can make an
+/// upstream read a different file than the name says. Formats that decide by
+/// route rather than by name (every file on the route is a package) use
+/// [`route_package_serve_key`].
+pub(crate) fn proxy_serve_key(
+    path: &str,
+    is_package_file: impl FnOnce(&str) -> bool,
+) -> ProxyServeKey {
+    let cache_key = normalize_cache_path(path);
+    let file_name = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let scannable = !file_name.is_empty()
+        && (has_ambiguous_path_chars(cache_key) || is_package_file(file_name));
+    ProxyServeKey {
+        cache_key: cache_key.to_string(),
+        scannable,
+    }
+}
+
+/// [`proxy_serve_key`] for a route whose every file is a package (an npm
+/// tarball, a PyPI distribution, a `.crate`, a `.vsix`): the decision is the
+/// route's, and only the cache key is normalized.
+pub(crate) fn route_package_serve_key(path: &str) -> ProxyServeKey {
+    proxy_serve_key(path, |_| true)
+}
+
+/// Whether `path` holds a character an upstream may read as something other
+/// than a path byte (#4365 items 1 and 3): `?` (query), `#` (fragment), `;`
+/// (path parameter), an ASCII control character (dropped by URL parsing), or
+/// a `%` that does not start a valid `%XX` escape (decoded again, or
+/// rejected, by the upstream). A valid escape such as npm's `%2F` is allowed.
+pub(crate) fn has_ambiguous_path_chars(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' | b'#' | b';' => true,
+        b'%' => !matches!(
+            (bytes.get(i + 1), bytes.get(i + 2)),
+            (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit()
+        ),
+        _ => b.is_ascii_control(),
+    })
+}
+
 impl CacheKeys {
     /// Derive both the content and metadata storage keys for a proxy-cache
     /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
@@ -22627,5 +22690,69 @@ mod upstream_filter_cache_tests {
             expired_streaming.err()
         );
         assert_eq!(hits, 0, "a refused path must never reach the upstream");
+    }
+}
+
+/// #4365 item 1: the shared `(cache_key, scannable)` helper.
+#[cfg(test)]
+mod proxy_serve_key_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_the_normalized_path_and_the_decision_is_on_its_file_name() {
+        let is_jar = |f: &str| f.ends_with(".jar");
+        for (path, key, scannable) in [
+            ("a/b/c.jar", "a/b/c.jar", true),
+            ("/a/b/c.jar/", "a/b/c.jar", true),
+            ("//a/b/c.jar//", "a/b/c.jar", true),
+            ("a/b/c.pom", "a/b/c.pom", false),
+            ("a/b/c.pom/", "a/b/c.pom", false),
+            // Nothing to serve as a package.
+            ("", "", false),
+            ("/", "", false),
+            // Ambiguous keys always reach the gate, whatever the name says.
+            ("a/b/c.jar?.pom", "a/b/c.jar?.pom", true),
+            ("a/b/c.jar#.pom", "a/b/c.jar#.pom", true),
+            ("a/b/c.jar;.pom", "a/b/c.jar;.pom", true),
+            ("a/b/c.jar%.pom", "a/b/c.jar%.pom", true),
+            ("a/b/c\t.pom", "a/b/c\t.pom", true),
+            // A valid escape is not ambiguous.
+            ("a/b%20c/d.pom", "a/b%20c/d.pom", false),
+        ] {
+            assert_eq!(
+                proxy_serve_key(path, is_jar),
+                ProxyServeKey {
+                    cache_key: key.to_string(),
+                    scannable
+                },
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            route_package_serve_key("/pkg/-/pkg-1.0.0.tgz"),
+            ProxyServeKey {
+                cache_key: "pkg/-/pkg-1.0.0.tgz".to_string(),
+                scannable: true
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_path_chars() {
+        for ambiguous in [
+            "a?b", "a#b", "a;b", "a%", "a%2", "a%zz", "a%2g", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(has_ambiguous_path_chars(ambiguous), "{ambiguous:?}");
+        }
+        for plain in [
+            "@scope%2Fname",
+            "@scope%2fname/-/name-1.0.0.tgz",
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            "a/b%20c%2Bd/e",
+            "pkg+1.0~rc1.tar.gz",
+            "sha256:abc",
+        ] {
+            assert!(!has_ambiguous_path_chars(plain), "{plain:?}");
+        }
     }
 }

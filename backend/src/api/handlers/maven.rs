@@ -1226,15 +1226,23 @@ pub(crate) fn reject_ambiguous_proxy_path(path: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// The canonical `(cache_key, scannable)` decision for a Maven or sbt proxy
+/// path (#4365 item 1): everything is scanned except the known non-package
+/// files of [`is_unscanned_jvm_companion`], decided on the cache key's file
+/// name.
+pub(crate) fn jvm_proxy_serve_key(path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(path, |file| !is_unscanned_jvm_companion(file))
+}
+
 /// A proxied request the scan-on-proxy gate must see (#4100).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JvmScanTarget<'p> {
+pub(crate) struct JvmScanTarget {
     /// The request path normalized EXACTLY as the proxy cache keys it
     /// ([`normalize_cache_path`](crate::services::proxy_service::normalize_cache_path)),
     /// which is also the path the gate fetches and caches under. Classifying
     /// any other spelling would let an alias of a refused archive (a trailing
     /// `/`) stream the same cached bytes unscanned.
-    pub path: &'p str,
+    pub path: String,
     /// The coordinate the path names, when it parses. `None` is still
     /// scanned, with no identity pin.
     pub coordinate: Option<JvmArchiveCoordinate>,
@@ -1249,14 +1257,15 @@ pub(crate) struct JvmScanTarget<'p> {
 /// anything else is scanned with no pin. A classifier (`-tests`,
 /// `-linux-x86_64`, ...) names the same coordinate, since Maven's archiver
 /// writes the project's `pom.properties` into every classified jar it builds.
-pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget<'_>> {
-    let path = crate::services::proxy_service::normalize_cache_path(path);
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    if filename.is_empty() || is_unscanned_jvm_companion(filename) {
+pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget> {
+    let key = jvm_proxy_serve_key(path);
+    if !key.scannable {
         return None;
     }
+    let path = key.cache_key;
+    let filename = path.rsplit('/').next().unwrap_or(&path);
     let coordinate = is_jvm_archive_name(filename)
-        .then(|| MavenHandler::parse_coordinates(path).ok())
+        .then(|| MavenHandler::parse_coordinates(&path).ok())
         .flatten()
         .map(|coords| JvmArchiveCoordinate {
             group_id: coords.group_id,
@@ -2941,7 +2950,7 @@ async fn serve_artifact(
                             return serve_scanned_maven_archive(
                                 state,
                                 &remote,
-                                target.path,
+                                &target.path,
                                 target.coordinate.as_ref(),
                                 policy,
                                 ctx,
@@ -3148,7 +3157,7 @@ async fn serve_artifact(
                         serve_scanned_maven_archive(
                             state,
                             &remote,
-                            target.path,
+                            &target.path,
                             target.coordinate.as_ref(),
                             policy,
                             ctx,
@@ -10993,5 +11002,104 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
         tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: Maven/sbt `(cache_key, scannable)` decisions, per layout. For
+/// every well-formed path the key is exactly the path the cache already used,
+/// so no warm entry is orphaned.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn jvm_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.war",
+                "com/acme/widget/1.0/widget-1.0.war",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.aar",
+                "com/acme/widget/1.0/widget-1.0.aar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.JAR/",
+                "com/acme/widget/1.0/widget-1.0.JAR",
+                true,
+            ),
+            (
+                "/com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom/",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.module",
+                "com/acme/widget/1.0/widget-1.0.module",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                false,
+            ),
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "com/acme/widget/maven-metadata.xml",
+                false,
+            ),
+            // sbt / Ivy layout.
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            // An ambiguous spelling never classifies as a companion file.
+            (
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                true,
+            ),
+        ] {
+            let got = jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            // The scan target agrees with the key on every path.
+            assert_eq!(maven_scan_target(path).is_some(), scannable, "{path}");
+            if let Some(target) = maven_scan_target(path) {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
     }
 }

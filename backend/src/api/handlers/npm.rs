@@ -5132,13 +5132,16 @@ async fn serve_scanned_npm_tarball(
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 1: every file on the tarball route is a package; the cache
+    // key is the canonical form of the tarball path.
+    let key = crate::services::proxy_service::route_package_serve_key(fetch_path);
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
         fetch_base: upstream_url,
         format: RepositoryFormat::Npm,
         source_path,
-        cache_path: fetch_path,
+        cache_path: &key.cache_key,
         filename,
         action,
         severity_gate,
@@ -17940,5 +17943,35 @@ mod virtual_packument_member_authz_tests {
         tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
         tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: npm decides by route (every tarball is a package); the
+/// cache key is the tarball path the fetch already used.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn npm_tarball_serve_key_table() {
+        for (name, file, key) in [
+            (
+                "lodash",
+                "lodash-4.17.21.tgz",
+                "lodash/-/lodash-4.17.21.tgz",
+            ),
+            (
+                "@types/node",
+                "node-20.0.0.tgz",
+                "@types/node/-/node-20.0.0.tgz",
+            ),
+        ] {
+            let got = crate::services::proxy_service::route_package_serve_key(
+                &build_tarball_upstream_path(name, file),
+            );
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
+        }
     }
 }
