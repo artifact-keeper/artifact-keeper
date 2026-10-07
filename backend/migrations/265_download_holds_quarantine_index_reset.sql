@@ -1,13 +1,14 @@
--- Clear any leftover INVALID concurrent index before the `-- no-transaction`
--- build in the next file. `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would skip
+-- Clear any leftover INVALID concurrent indexes before the `-- no-transaction`
+-- builds in 266 and 272. `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would skip
 -- an INVALID leftover and leave it unused-but-maintained forever.
 --
--- Proxy-cache holds (#3912) live on `proxy_cache_artifacts`, which is not a
--- hot table in the PF-008 gate, so that listing index is built here in the
--- same transaction.
+-- Both listing indexes sit on PF-008 hot tables (`artifacts` and
+-- `proxy_cache_artifacts`, see src/migration_safety.rs HOT_TABLES), so each is
+-- built CONCURRENTLY in a file of its own: 266 for `artifacts`, 272 for
+-- `proxy_cache_artifacts`. A plain CREATE INDEX here would hold SHARE on the
+-- table for the whole build and stall every upload or proxied fetch.
+SET LOCAL lock_timeout = '5s';
+
 DROP INDEX IF EXISTS idx_artifacts_download_holds_quarantine;
 
-CREATE INDEX IF NOT EXISTS idx_proxy_cache_download_holds
-    ON proxy_cache_artifacts (quarantine_until, cached_at DESC)
-    WHERE quarantine_released_at IS NULL
-      AND quarantine_until IS NOT NULL;
+DROP INDEX IF EXISTS idx_proxy_cache_download_holds;
