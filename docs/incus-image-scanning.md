@@ -31,8 +31,12 @@ write `security.*` extended attributes. The scanner needs neither:
 
 - `unsquashfs` runs with `-no-xattrs`, so SELinux labels and file
   capabilities are not extracted.
-- A device node that cannot be created is skipped. `unsquashfs` and `tar`
-  then exit non-zero (status 2); the scanner logs a warning that names the
-  skipped entries and scans the rest of the tree (#4470).
-- Any other extraction error still fails the scan, as does a SquashFS
-  extraction that leaves the root filesystem empty.
+- `unsquashfs` exits 2 on the errors a non-root extraction produces: device
+  nodes it cannot create, and timestamp, mode and symlink errors. These are
+  tolerated: the scanner logs a warning that names the skipped entries and
+  scans the rest of the tree (#4470). Write, decompression and metadata errors
+  still fail, as does any error that reports a full disk or quota.
+- GNU `tar` (the UBI image) gets the same treatment, for `Cannot mknod` on a
+  device node only; every other `tar` error fails. The Alpine image extracts
+  with busybox `tar`, where any error fails the scan.
+- An extraction that leaves no regular file in the tree fails the scan.

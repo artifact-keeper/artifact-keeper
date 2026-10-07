@@ -751,9 +751,11 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
-      # and build scripts in the dependency tree need it.
+      # and build scripts in the dependency tree need it. services-1 also
+      # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
+      # tests run as the non-root runner user instead of skipping (#4470).
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
@@ -841,6 +843,9 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           AK_TESTS_REQUIRE_DB: "1"
+          # The squashfs tests fail instead of skipping where the tools are
+          # installed (see the protoc step).
+          AK_TESTS_REQUIRE_SQUASHFS: ${{ matrix.shard == 'services-1' && '1' || '' }}
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           source <(cargo llvm-cov show-env --sh)
