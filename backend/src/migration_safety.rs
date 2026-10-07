@@ -75,7 +75,13 @@
 //!   ```
 //!
 //!   So `-- no-transaction` buys exactly one statement, and the `DROP INDEX IF
-//!   EXISTS` that clears a leftover invalid index belongs in its own file.
+//!   EXISTS` reset migration belongs in its own file. That reset runs once
+//!   (sqlx records it), so it only clears an index left INVALID by an attempt
+//!   made outside the migrator. A build that fails part-way inside the
+//!   migrator is repaired at startup instead: `CONCURRENT_INDEX_MIGRATIONS`
+//!   in `migration_repair` names the build migration and its index, and an
+//!   INVALID index of a not-yet-recorded build is dropped before it re-runs
+//!   (#4519).
 //!
 //! See `docs/operations/online-migrations.md` for the preflight/postflight
 //! runbook a new online migration is expected to follow.
@@ -1238,9 +1244,13 @@ mod tests {
              FIRST LINE is exactly `-- no-transaction`. Add that header as the very first \
              line, and read docs/operations/online-migrations.md first: a no-transaction \
              migration that fails part-way is NOT rolled back and NOT recorded, so it must \
-             be written to be safely re-runnable (drop a leftover INVALID index before \
-             rebuilding -- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` will happily skip an \
-             invalid one and leave it invalid forever).",
+             be written to be safely re-runnable. For `CREATE INDEX CONCURRENTLY`, register \
+             the migration (version, index name) in `CONCURRENT_INDEX_MIGRATIONS` \
+             (migration_repair.rs): a failed build leaves an INVALID index, which \
+             `CREATE INDEX CONCURRENTLY IF NOT EXISTS` skips on the re-run and records as \
+             done, and the startup repair drops it first. A `DROP INDEX IF EXISTS` \
+             migration before the build runs only once, so it covers out-of-band attempts \
+             only.",
             broken.join(", ")
         );
     }
@@ -1273,9 +1283,12 @@ mod tests {
              sqlx sends the whole file as one simple query, and PostgreSQL runs a \
              multi-statement simple query inside an implicit transaction block — which \
              is exactly what the header was supposed to avoid. Split the file so each \
-             `-- no-transaction` migration carries a single statement; a `DROP INDEX IF \
-             EXISTS` that clears a leftover invalid index goes in its own migration \
-             before the build. See docs/operations/online-migrations.md.",
+             `-- no-transaction` migration carries a single statement. A `DROP INDEX IF \
+             EXISTS` reset goes in its own transactional migration before the build (it \
+             runs once, so it only covers out-of-band attempts); a failed in-migrator \
+             build is repaired at startup when the build migration is registered in \
+             `CONCURRENT_INDEX_MIGRATIONS` (migration_repair.rs). See \
+             docs/operations/online-migrations.md.",
             bad.join(", ")
         );
     }

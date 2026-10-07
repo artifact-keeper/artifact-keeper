@@ -94,16 +94,15 @@ but not the hold.
 
 ### 1. Index build
 
-Two files. `220_artifacts_example_index_reset.sql`, an ordinary transactional
-migration:
+Two files and one registration. `220_artifacts_example_index_reset.sql`, an
+ordinary transactional migration:
 
 ```sql
--- Clear any index left INVALID by an earlier interrupted concurrent build.
---
--- The next migration is `-- no-transaction`: if it fails part-way it is NOT
--- rolled back and NOT recorded, so it re-runs on the next boot — and
--- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` will happily skip a leftover
--- INVALID index and leave it invalid forever. Drop first, unconditionally.
+-- Clear an index left INVALID by a concurrent build attempted outside the
+-- migrator before this release (by hand, from this runbook, and cancelled).
+-- This runs once: sqlx records it on the first boot and never runs it again,
+-- so it does NOT clean up after a failed attempt of the next migration --
+-- the startup repair does (see below).
 DROP INDEX IF EXISTS idx_artifacts_example;
 ```
 
@@ -117,8 +116,36 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_artifacts_example
     WHERE is_deleted = false;
 ```
 
-One index per pair. `CONCURRENTLY` cannot share a file with anything else, and a
-file that builds two indexes has two ways to fail half-way.
+and register the build migration, by version and index name, in
+`CONCURRENT_INDEX_MIGRATIONS` (`backend/src/migration_repair.rs`):
+
+```rust
+(221, "idx_artifacts_example"),
+```
+
+The registration is what makes a failed build recoverable. sqlx records a
+migration only after its SQL succeeds. If the concurrent build fails part-way
+(a lock timeout behind a long transaction, a killed pod, a
+`pg_cancel_backend`), it leaves an INVALID index and is not recorded, so it
+re-runs on the next boot. On its own, that re-run is worse than the failure:
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` finds the INVALID leftover, skips it,
+and the migration is recorded as a success with an index the planner never
+uses. A later "drop the old index" migration then removes the only valid one.
+The reset migration cannot help, because it was recorded on the first boot and
+does not run again.
+
+So the backend repairs it before migrating. On every start, before
+`MIGRATOR.run` and under the migrator's advisory lock,
+`migration_repair::repair_invalid_concurrent_indexes` walks
+`CONCURRENT_INDEX_MIGRATIONS`. For each registered build migration that is not
+yet recorded in `_sqlx_migrations`, it drops the named index if
+`pg_index.indisvalid` is false, and the build re-runs from scratch. A recorded
+migration and a valid index are never touched. Keep the reset migration as
+well: it covers an attempt made outside the migrator, which the repair does not
+know about.
+
+One index per migration. `CONCURRENTLY` cannot share a file with anything else,
+and a file that builds two indexes has two ways to fail half-way.
 
 ### 2. Check or foreign-key constraint
 
@@ -150,8 +177,10 @@ enforces every new write.
 
 ### 3. Unique constraint
 
-Same two-file shape as (1) — a transactional
-`DROP INDEX IF EXISTS packages_repository_id_name_key;` first, then:
+Same shape as (1): a transactional
+`DROP INDEX IF EXISTS packages_repository_id_name_key;` first, then the build,
+registered in `CONCURRENT_INDEX_MIGRATIONS` as
+`(<its version>, "packages_repository_id_name_key")`:
 
 ```sql
 -- no-transaction
@@ -289,6 +318,10 @@ update and none of this is needed
 - [ ] A `-- no-transaction` file contains exactly one statement.
 - [ ] A `-- no-transaction` file is re-runnable from any point: it will re-run
       in full if it fails, because nothing was recorded.
+- [ ] A `-- no-transaction` `CREATE INDEX CONCURRENTLY` migration is
+      registered in `CONCURRENT_INDEX_MIGRATIONS`
+      (`backend/src/migration_repair.rs`), so a failed build's INVALID index
+      is dropped before it re-runs.
 - [ ] The file's header comment says what the statement costs on a table with a
       million rows.
 
@@ -328,9 +361,11 @@ SELECT a.pid, a.state, l.mode, l.granted, now() - a.xact_start AS age, a.query
  ORDER BY a.xact_start;
 ```
 
-`SELECT pg_cancel_backend(<pid>)` stops a concurrent build safely; it leaves an
-invalid index, which the preceding `DROP INDEX IF EXISTS` migration clears on the
-next attempt.
+`SELECT pg_cancel_backend(<pid>)` stops a concurrent build safely. It leaves an
+invalid index, and the build migration is not recorded. On the next start the
+startup repair drops that index (for a migration registered in
+`CONCURRENT_INDEX_MIGRATIONS`) and the build runs again from scratch. The
+reset migration before it does not help here: it has already been recorded.
 
 ## Afterwards
 
@@ -342,7 +377,11 @@ SELECT c.relname
 ```
 
 An invalid index is not used by the planner but *is* maintained on every write,
-so it costs and gives nothing. Drop it and re-run the migration.
+so it costs and gives nothing. If its build migration is not recorded yet, the
+next start repairs it (see "Index build"). If the migration is recorded -- an
+`IF NOT EXISTS` build that skipped the leftover -- drop the index with
+`DROP INDEX CONCURRENTLY` and rebuild it by hand with the migration's
+`CREATE INDEX CONCURRENTLY` statement.
 
 Confirm the plan the index was built for actually changed:
 `EXPLAIN (ANALYZE, BUFFERS)` the query named in the migration header, and
