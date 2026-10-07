@@ -371,6 +371,7 @@ pub mod promotion_rules;
 pub mod protobuf;
 pub mod proxy_helpers;
 pub mod pub_registry;
+pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;

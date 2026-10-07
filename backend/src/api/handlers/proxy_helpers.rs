@@ -6715,6 +6715,9 @@ pub async fn put_artifact_bytes(
     storage_key: &str,
     body: Bytes,
 ) -> Result<(), Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -6869,6 +6872,9 @@ pub async fn put_artifact_stream(
     storage_key: &str,
     staged: StagedUpload,
 ) -> Result<crate::storage::PutStreamResult, Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, staged.size_bytes).await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -7329,21 +7335,29 @@ pub struct NewArtifact<'a> {
     pub uploaded_by: Uuid,
 }
 
-/// Insert a row into `artifacts` and return the new id.
+/// Insert a hosted publish's row into `artifacts` and return the new id.
 ///
 /// Replaces the duplicated nine-column INSERT macro that every multipart
-/// upload handler otherwise repeats verbatim. Errors map to a 500
-/// "Database error" response.
+/// upload handler otherwise repeats verbatim. The INSERT runs in the
+/// transaction that decides the repository / project storage-quota admission
+/// for the row (#4422), so a publish that would exceed a quota answers the
+/// generic route's `507` and leaves no row. Other database errors map to a
+/// 500 "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
     let repository_id = art.repository_id;
 
-    let mut conn = db
-        .acquire()
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        db,
+        repository_id,
+        art.path,
+        art.size_bytes,
+    )
+    .await?;
+    let id = insert_artifact_row(&mut tx, art).await?;
+    tx.commit()
         .await
         .map_err(|e| internal_error("Database", e))?;
-    let id = insert_artifact_row(&mut conn, art).await?;
-    drop(conn);
 
     // Apply the upload-time quarantine hold at the shared chokepoint used by the
     // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
