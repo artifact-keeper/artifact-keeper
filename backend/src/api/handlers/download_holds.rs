@@ -331,6 +331,281 @@ mod tests {
         assert!(summary.quarantine_active >= 1);
     }
 
+    /// Seed a hosted `artifacts` row with the given quarantine state.
+    async fn seed_hosted(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        label: &str,
+        status: &str,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        deleted: bool,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted,
+                quarantine_status, quarantine_until, quarantine_reason
+            )
+            VALUES ($1, $2, $3, $4, 4, $5,
+                    'application/octet-stream', $6, $7,
+                    $8, $9, 'seeded')
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("{label}.bin"))
+        .bind(format!("holds/{label}/{id}.bin"))
+        .bind(format!("{:064x}", id.as_u128()))
+        .bind(format!("holds/{id}"))
+        .bind(deleted)
+        .bind(status)
+        .bind(until)
+        .execute(pool)
+        .await
+        .expect("insert hosted hold");
+        id
+    }
+
+    /// Seed a proxy-cache catalog row; returns its `path`.
+    async fn seed_proxy(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        label: &str,
+        until: chrono::DateTime<chrono::Utc>,
+        released: bool,
+    ) -> String {
+        let path = format!("simple/{label}/{label}-1.0.whl");
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_cache_artifacts (
+                repository_id, path, storage_key, metadata_key, size_bytes,
+                quarantine_until, quarantine_released_at
+            )
+            VALUES ($1, $2, $3, $4, 8, $5, CASE WHEN $6 THEN NOW() END)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(format!("proxy-cache/{repo_id}/{path}/__content__"))
+        .bind(format!("proxy-cache/{repo_id}/{path}/__cache_meta__.json"))
+        .bind(until)
+        .bind(released)
+        .execute(pool)
+        .await
+        .expect("insert proxy-cache hold");
+        path
+    }
+
+    async fn list_as_admin(
+        state: &SharedState,
+        repository_key: &str,
+        kind: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> QuarantineHoldListResponse {
+        let Json(body) = list_quarantine(
+            State(state.clone()),
+            Extension(admin()),
+            Query(HoldListQuery {
+                repository_key: Some(repository_key.to_string()),
+                kind: kind.map(str::to_string),
+                page: Some(page),
+                per_page: Some(per_page),
+            }),
+        )
+        .await
+        .expect("admin list");
+        body
+    }
+
+    /// The `path` of every listed item, in response order.
+    fn paths(body: &QuarantineHoldListResponse) -> Vec<String> {
+        body.items.iter().map(|i| i.path.clone()).collect()
+    }
+
+    /// Every `kind` filter, the repository filter, the soft-delete and
+    /// released-proxy exclusions, totals and OFFSET paging across BOTH union
+    /// arms, and the documented sort order, against one seeded data set.
+    #[tokio::test]
+    async fn list_quarantine_filters_sorts_and_pages_both_sources() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (other_repo_id, other_key, other_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        let now = chrono::Utc::now();
+        let hours = chrono::Duration::hours;
+        let pool = &fx.pool;
+        let repo = fx.repo_id;
+
+        // Repository A: three active holds (two timed, one permanent), two
+        // expired, one rejected, and two rows that must never be listed.
+        let _ = seed_hosted(pool, repo, "h-permanent", "quarantined", None, false).await;
+        let _ = seed_hosted(
+            pool,
+            repo,
+            "h-active-3h",
+            "quarantined",
+            Some(now + hours(3)),
+            false,
+        )
+        .await;
+        let _ = seed_hosted(
+            pool,
+            repo,
+            "h-expired",
+            "quarantined",
+            Some(now - hours(2)),
+            false,
+        )
+        .await;
+        let _ = seed_hosted(pool, repo, "h-rejected", "rejected", None, false).await;
+        let _ = seed_hosted(pool, repo, "h-deleted", "quarantined", None, true).await;
+        let p_active = seed_proxy(pool, repo, "p-active-1h", now + hours(1), false).await;
+        let p_expired = seed_proxy(pool, repo, "p-expired", now - hours(1), false).await;
+        let _ = seed_proxy(pool, repo, "p-released", now + hours(1), true).await;
+        // Repository B: one active hold of each source that A must not see.
+        let _ = seed_hosted(pool, other_repo_id, "b-hosted", "quarantined", None, false).await;
+        let b_proxy = seed_proxy(pool, other_repo_id, "b-proxy", now + hours(1), false).await;
+
+        let path_of = |label: &str| {
+            let suffix = format!("/{label}/");
+            move |p: &String| p.contains(&suffix)
+        };
+        let label_order = |body: &QuarantineHoldListResponse| -> Vec<String> {
+            paths(body)
+                .into_iter()
+                .map(|p| p.split('/').nth(1).unwrap_or_default().to_string())
+                .collect()
+        };
+
+        let active = list_as_admin(&fx.state, &fx.repo_key, Some("active"), 1, 20).await;
+        let expired = list_as_admin(&fx.state, &fx.repo_key, Some("expired"), 1, 20).await;
+        let rejected = list_as_admin(&fx.state, &fx.repo_key, Some("rejected"), 1, 20).await;
+        let default = list_as_admin(&fx.state, &fx.repo_key, None, 1, 20).await;
+        let all = list_as_admin(
+            &fx.state,
+            &fx.repo_key,
+            Some("rejected,expired,active"),
+            1,
+            20,
+        )
+        .await;
+        let mut paged = Vec::new();
+        let mut page_meta = Vec::new();
+        for page in 1..=4 {
+            let body = list_as_admin(&fx.state, &fx.repo_key, Some("active"), page, 1).await;
+            page_meta.push((body.pagination.total, body.pagination.total_pages));
+            paged.extend(label_order(&body));
+        }
+        let other = list_as_admin(&fx.state, &other_key, None, 1, 20).await;
+
+        tdh::cleanup_member_repo(&fx.pool, other_repo_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+        fx.teardown().await;
+
+        // Active: quarantined rows, soonest-lapsing first, permanent last.
+        assert_eq!(
+            label_order(&active),
+            vec!["p-active-1h", "h-active-3h", "h-permanent"]
+        );
+        assert_eq!(active.pagination.total, 3);
+        assert_eq!(active.pagination.total_pages, 1);
+        assert!(active
+            .items
+            .iter()
+            .all(|i| i.kind == "active" && i.is_blocked));
+        assert_eq!(active.items[0].source, "proxy-cache");
+        assert_eq!(active.items[0].path, p_active);
+        assert_eq!(active.items[1].source, "hosted");
+
+        // Expired: both sources, oldest lapse first, never blocking.
+        assert_eq!(label_order(&expired), vec!["h-expired", "p-expired"]);
+        assert_eq!(expired.pagination.total, 2);
+        assert!(expired
+            .items
+            .iter()
+            .all(|i| i.kind == "expired" && !i.is_blocked));
+        assert!(expired.items.iter().any(|i| path_of("p-expired")(&i.path)));
+        assert_eq!(expired.items[1].path, p_expired);
+
+        // Rejected: hosted only, no remaining time.
+        assert_eq!(label_order(&rejected), vec!["h-rejected"]);
+        assert_eq!(rejected.pagination.total, 1);
+        assert_eq!(rejected.items[0].kind, "rejected");
+        assert!(rejected.items[0].is_blocked);
+        assert!(rejected.items[0].remaining_seconds.is_none());
+
+        // Default = active + rejected; quarantined sorts ahead of rejected.
+        assert_eq!(
+            label_order(&default),
+            vec!["p-active-1h", "h-active-3h", "h-permanent", "h-rejected"]
+        );
+        assert_eq!(default.pagination.total, 4);
+
+        // Every kind: the soft-deleted hosted row and the released proxy row
+        // never appear, and repository B's rows stay out of A's queue.
+        assert_eq!(all.pagination.total, 6);
+        assert_eq!(
+            label_order(&all),
+            vec![
+                "h-expired",
+                "p-expired",
+                "p-active-1h",
+                "h-active-3h",
+                "h-permanent",
+                "h-rejected"
+            ]
+        );
+        for hidden in ["h-deleted", "p-released", "b-hosted", "b-proxy"] {
+            assert!(
+                !paths(&all).iter().any(path_of(hidden)),
+                "{hidden} must not be listed for repository A"
+            );
+        }
+
+        // OFFSET paging walks the union in the same order with no repeats.
+        assert_eq!(paged, vec!["p-active-1h", "h-active-3h", "h-permanent"]);
+        assert!(page_meta.iter().all(|m| *m == (3, 3)));
+
+        // Repository B sees only its own two rows.
+        assert_eq!(other.pagination.total, 2);
+        assert_eq!(other.items[0].path, b_proxy);
+        assert_eq!(label_order(&other), vec!["b-proxy", "b-hosted"]);
+    }
+
+    /// The summary's active count includes BOTH hosted and proxy-cache holds,
+    /// and the rejected count picks up a rejected hosted row. Other tests share
+    /// the database, so the seeded rows set a floor rather than exact values.
+    #[tokio::test]
+    async fn summary_counts_hosted_and_proxy_holds() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let pool = &fx.pool;
+        for i in 0..3 {
+            let _ = seed_proxy(
+                pool,
+                fx.repo_id,
+                &format!("sum-p{i}"),
+                now + chrono::Duration::hours(1),
+                false,
+            )
+            .await;
+        }
+        let _ = seed_hosted(pool, fx.repo_id, "sum-h", "quarantined", None, false).await;
+        let _ = seed_hosted(pool, fx.repo_id, "sum-r", "rejected", None, false).await;
+        let Json(summary) = holds_summary(State(fx.state.clone()), Extension(admin()))
+            .await
+            .expect("admin summary");
+        fx.teardown().await;
+        assert!(summary.quarantine_active >= 4, "{summary:?}");
+        assert!(summary.quarantine_rejected >= 1, "{summary:?}");
+    }
+
     #[tokio::test]
     async fn list_quarantine_rejects_unknown_kind() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {

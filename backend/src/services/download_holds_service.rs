@@ -142,8 +142,13 @@ pub struct DownloadHoldsService {
 
 /// Hosted artifacts + proxy-cache catalog rows that currently match `kind`.
 /// `$1` repository key, `$2` want_active, `$3` want_expired, `$4` want_rejected.
+///
+/// `hold_id` is the row's own primary key in either table. It is not part of
+/// the response; it only makes the listing order total, so OFFSET paging
+/// neither repeats nor drops rows that tie on every other sort key.
 const QUARANTINE_FROM_SQL: &str = r#"
 SELECT
+    a.id AS hold_id,
     'hosted'::text AS source,
     a.id AS artifact_id,
     a.name,
@@ -168,6 +173,7 @@ WHERE a.is_deleted = false
   )
 UNION ALL
 SELECT
+    pca.id AS hold_id,
     'proxy-cache'::text AS source,
     NULL::uuid AS artifact_id,
     COALESCE(NULLIF(regexp_replace(pca.path, '.*/', ''), ''), pca.path) AS name,
@@ -261,16 +267,20 @@ impl DownloadHoldsService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // PostgreSQL only accepts bare output-column names in an ORDER BY
+        // attached directly to a UNION, so the union is wrapped in a derived
+        // table and ordered there. `hold_id` last makes the order total.
         let rows = sqlx::query_as::<_, QuarantineHoldRow>(sqlx::AssertSqlSafe(format!(
-            "{QUARANTINE_FROM_SQL}
+            "SELECT holds.* FROM ({QUARANTINE_FROM_SQL}) holds
              ORDER BY
-                CASE quarantine_status
+                CASE holds.quarantine_status
                     WHEN 'quarantined' THEN 0
                     WHEN 'rejected' THEN 1
                     ELSE 2
                 END,
-                quarantine_until ASC NULLS LAST,
-                created_at DESC
+                holds.quarantine_until ASC NULLS LAST,
+                holds.created_at DESC,
+                holds.hold_id
              OFFSET $5 LIMIT $6"
         )))
         .bind(repository_key)
