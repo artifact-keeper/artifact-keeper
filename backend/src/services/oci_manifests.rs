@@ -157,8 +157,24 @@ pub(crate) async fn live_manifest_row_remains_in_tx(
         .await
 }
 
-/// Forget a deleted manifest (see [`delete_removes_record`]). Runs inside the caller's
-/// transaction, after its tag rows and stale index edges are gone.
+/// Lock a manifest's row (if any) for the rest of the caller's transaction,
+/// before a delete decides whether to remove it (#4449). Takes the row in the
+/// #4441 order: after the delete's `oci_tags` rows, before any `artifacts` row.
+pub(crate) async fn lock_in_tx(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    digest: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM oci_manifests WHERE repository_id = $1 AND digest = $2 FOR UPDATE")
+        .bind(repo_id)
+        .bind(digest)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Forget a deleted manifest (see [`delete_removes_record`]). Runs inside the
+/// caller's transaction, after its tag rows and stale index edges are gone.
 ///
 /// A manifest that is still the child of a live index (`oci_manifest_refs`
 /// edge kept because the parent is still tagged, #1642) still exists by the

@@ -12400,6 +12400,16 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
     // digest, the manifest is still live: skip the ref/blob-ref cleanup so its
     // index edges and blob pins stay intact. The cleanup only runs once the
     // last tag for the digest in the repository is gone.
+    //
+    // #4449: lock the manifest's `oci_manifests` row BEFORE reading whether
+    // anything still references the digest. A concurrent push of the same
+    // digest upserts that row after its `oci_tags` row (the #4441 order:
+    // index rows, `oci_manifests`, `artifacts`), so either the push holds it
+    // and the reads below run after its commit and see its tag, or this
+    // delete holds it and the push re-creates the row after this commit.
+    // Without the lock a push committing between the reads and the delete
+    // left a tagged manifest with no record.
+    crate::services::oci_manifests::lock_in_tx(tx, repo_id, digest).await?;
     let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
