@@ -290,3 +290,114 @@ async fn rescan_does_not_inflate_dashboard_finding_counts() {
 
     cleanup(&pool, repo_id).await;
 }
+
+/// #4380: a proxied image refused by scan policy must show on the dashboard.
+/// `policy_violations_blocked` was hard-wired to 0, so an operator whose
+/// proxy repository was blocking pulls saw `0 blocked`. Seeds a Remote OCI
+/// repository with the reporter's settings (scan-on-proxy, fail-open,
+/// threshold `critical`) holding one image with a critical verdict and one
+/// with a below-threshold verdict: exactly one more item is blocked. Then
+/// flips the repository to `record_only`, which blocks nothing, and the count
+/// drops back. Measured as deltas so other rows in the shared database do not
+/// matter.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn proxied_image_blocked_by_policy_counts_on_dashboard() {
+    let pool = connect_db().await;
+    let svc = ScanResultService::new(pool.clone());
+
+    let repo_id = Uuid::new_v4();
+    let key = format!("scan-agg-proxy-{}", repo_id.as_simple());
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url)
+         VALUES ($1, $2, $2, $3, 'remote', 'docker', 'https://registry-1.docker.io')",
+    )
+    .bind(repo_id)
+    .bind(&key)
+    .bind(format!("/tmp/test-artifacts/{repo_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert remote repo");
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+             block_on_policy_violation, severity_threshold, proxy_scan_action)
+         VALUES ($1, true, false, true, true, 'critical', 'fail_open')",
+    )
+    .bind(repo_id)
+    .execute(&pool)
+    .await
+    .expect("insert scan config");
+
+    let before = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard before")
+        .policy_violations_blocked;
+
+    let blocked = format!("{:0>64}", Uuid::new_v4().as_simple());
+    let below = format!("{:0>64}", Uuid::new_v4().as_simple());
+    for (digest, max_severity) in [(&blocked, "critical"), (&below, "high")] {
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $2, $3, 'layer')",
+        )
+        .bind(format!("sha256:{digest}"))
+        .bind(format!("sha256:{}", "e".repeat(64)))
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert blob ref");
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict,
+                 findings_count, critical_count, max_severity, scanner_version, repository_id)
+             VALUES ($1, 'grype', 'vulnerable', 1, 0, $2, 'grype-test', $3)",
+        )
+        .bind(digest)
+        .bind(max_severity)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert verdict");
+    }
+
+    let after = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard after")
+        .policy_violations_blocked;
+
+    sqlx::query(
+        "UPDATE scan_configs SET proxy_scan_action = 'record_only' WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&pool)
+    .await
+    .expect("record only");
+    let record_only = svc
+        .get_dashboard_summary()
+        .await
+        .expect("dashboard record-only")
+        .policy_violations_blocked;
+
+    for digest in [&blocked, &below] {
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(&pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, repo_id).await;
+
+    assert_eq!(
+        after - before,
+        1,
+        "the critical image is blocked; the below-threshold one is served"
+    );
+    assert_eq!(
+        record_only, before,
+        "a record-only repository blocks nothing"
+    );
+}

@@ -5675,6 +5675,11 @@ async fn enforce_blob_scan_reblock(
     // vulnerable verdict turns out to be stale by the manifest gate's own
     // freshness rule -- see `stale_blob_verdicts_still_withhold`.
     let mut ref_owners: Vec<(&str, Uuid)> = Vec::new();
+    // #4380: the repositories whose refs were consulted, and the severity
+    // gate applied to them, kept for the "is this blob still needed by an
+    // image the manifest gate serves?" release below.
+    let mut gated_scope: Vec<Uuid> = Vec::new();
+    let mut scope_gate = crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny;
     let status = if repo.repo_type == RepositoryType::Virtual {
         // UNFILTERED-ENFORCEMENT (#3323): this walk computes a DENY-set (the
         // scan-verdict blocklist), not a response body. Narrowing it by caller
@@ -5719,10 +5724,17 @@ async fn enforce_blob_scan_reblock(
         // stricter member.
         ref_owners.push((repo.repo_type.as_str(), repo.id));
         let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
-        blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest, severity_gate).await
+        scope_gate = severity_gate;
+        let status =
+            blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest, severity_gate)
+                .await;
+        gated_scope = gated_ids;
+        status
     } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
         ref_owners.push((repo.repo_type.as_str(), repo.id));
         let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        scope_gate = severity_gate;
+        gated_scope.push(repo.id);
         blob_vulnerable_verdict_status(state, repo.id, lookup_digest, severity_gate).await
     } else {
         Ok(BlobVerdictStatus::NoVerdict)
@@ -5753,11 +5765,49 @@ async fn enforce_blob_scan_reblock(
         }
         Err(e) => Err(e),
     };
+    // #4380: a blob carries no image identity, so "this blob belongs to a
+    // blocked image" is not the same as "this pull is of a blocked image".
+    // Images share layers (a 16-byte empty layer appears in many unrelated
+    // images), and refusing the blob whenever ANY referencing image is blocked
+    // made one vulnerable image unpull every clean image that shares a layer
+    // with it. The image-level decision is the manifest gate's; the blob seam
+    // only stops a client from reassembling a blocked image by digest, so it
+    // withholds a blob only when NO image in scope that references it would be
+    // served by that gate. A blob the gate would hand out as part of a served
+    // image anyway reveals nothing the client could not already pull.
+    let blocklist = match blocklist {
+        Ok(true) => {
+            match blob_needed_by_servable_image(
+                state,
+                &scan_cfg,
+                repo,
+                &ref_owners,
+                &gated_scope,
+                lookup_digest,
+                scope_gate,
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        repo = %repo.key, digest = %lookup_digest,
+                        "serving blob shared with a blocked image: another image in this \
+                         repository that references it is served by the manifest gate (#4380)"
+                    );
+                    Ok(false)
+                }
+                Ok(false) => Ok(true),
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
     match blocklist {
         Ok(true) => {
             tracing::warn!(
                 repo = %repo.key, digest = %lookup_digest,
-                "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
+                "blocking blob pull: every image in scope that references this blob is \
+                 blocked by scan policy"
             );
             return Err(oci_error(
                 StatusCode::FORBIDDEN,
@@ -9292,11 +9342,16 @@ pub(crate) fn oci_manifest_is_docker_schema1(body: &[u8]) -> bool {
 ///   Note the verdict store itself is content-addressed and therefore global
 ///   by design (#2954): the *same* manifest digest proxied into two
 ///   repositories is the same image, so it is correctly blocked in both.
-/// * **ANY, not ALL.** Within a repository, a layer shared between a
-///   vulnerable image and a clean one is blocked. That over-blocks the clean
-///   image's pull, which is the fail-closed direction and is the right trade —
-///   the alternative ("serve if *some* referencing image scanned clean") would
-///   let a crafted clean sibling manifest unlock a known-vulnerable layer.
+/// * **ANY, then a release.** This status is `Blocking` when ANY referencing
+///   manifest carries a reusable blocking verdict. Until #4380 that was also
+///   the decision, which over-blocked: a layer shared between a vulnerable
+///   image and a clean one (a 16-byte empty layer is shared by many unrelated
+///   images) refused the clean image's pull too, repository-wide. The caller
+///   now releases the block when [`blob_needed_by_servable_image`] finds an
+///   image in the same scope that the manifest gate would serve. That does not
+///   let a "crafted clean sibling" unlock anything new: a sibling the gate
+///   serves already hands those exact bytes to anyone who pulls it, and the
+///   blocked image itself stays unpullable at its manifest.
 ///
 /// #3259: the join no longer answers a bare `EXISTS`. It returns the verdict
 /// PROVENANCE (`scanned_at` + `scanner_version`) of every referencing
@@ -9652,6 +9707,219 @@ async fn blob_severity_gate(
         return ProxySeverityGate::RecordOnly;
     }
     gate.unwrap_or(ProxySeverityGate::BlockOnAny)
+}
+
+/// One manifest in scope that references a blob, with whatever verdict its
+/// digest carries (#4380). Unlike [`BlobVerdictRef`] this is every
+/// referencing manifest, clean and unscanned ones included, so the blob seam
+/// can ask whether the blob is still needed by an image the manifest gate
+/// serves.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct BlobReferrer {
+    pub repository_id: Uuid,
+    pub verdict: Option<String>,
+    pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub scanner_version: Option<String>,
+    pub max_severity: Option<String>,
+}
+
+/// How the manifest gate treats an image owned by one repository whose refs
+/// are in scope for a blob decision (#4380).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferrerPosture {
+    /// Hosted (`Local`/`Staging`): no proxy manifest gate runs, and the blob
+    /// re-block is that content's only scan enforcement (see
+    /// [`blob_reblock_applies`]). Only a fresh, provably current `clean`
+    /// verdict shows such an image may be served.
+    Hosted,
+    /// Proxy-served under this effective `proxy_scan_action`.
+    Proxy(crate::services::proxy_scan_service::ProxyScanAction),
+    /// The owner's scan config could not be read: proves nothing.
+    Unknown,
+}
+
+/// The stricter of two proxy scan actions, for a Virtual repo over a member:
+/// fail-closed if either side is, record-only only when both are (the same
+/// direction as `proxy_helpers::stricter_scan_policy`).
+pub(crate) fn stricter_proxy_scan_action(
+    a: crate::services::proxy_scan_service::ProxyScanAction,
+    b: crate::services::proxy_scan_service::ProxyScanAction,
+) -> crate::services::proxy_scan_service::ProxyScanAction {
+    use crate::services::proxy_scan_service::ProxyScanAction;
+    if a.is_fail_closed() || b.is_fail_closed() {
+        ProxyScanAction::FailClosed
+    } else if a.is_record_only() && b.is_record_only() {
+        ProxyScanAction::RecordOnly
+    } else {
+        ProxyScanAction::FailOpen
+    }
+}
+
+/// Would the manifest gate serve the image whose referrer row this is?
+/// (#4380.)
+///
+/// Pure, and deliberately built from the gate's own decision function
+/// ([`proxy_scan_service::decide_serve`]) plus the same severity rule the
+/// gate applies to a cached `vulnerable` verdict, so the blob seam cannot
+/// drift from the manifest seam:
+///
+/// * a fresh `clean` verdict serves (`ServeCached`);
+/// * a fresh `vulnerable` verdict serves only below the severity threshold
+///   (or under record-only), exactly as `gate_proxy_scan_serve` decides;
+/// * no reusable verdict serves under fail-open / record-only (the gate serves
+///   it `X-AK-Scan: pending` and scans asynchronously) and does NOT under
+///   fail-closed (the gate would scan inline first, and the blob seam cannot
+///   know that scan's outcome, so it proves nothing);
+/// * a hosted image counts only with a fresh, provably current `clean`
+///   verdict, and an owner whose config could not be read never counts.
+pub(crate) fn manifest_gate_serves_referrer(
+    referrer: &BlobReferrer,
+    posture: ReferrerPosture,
+    current_version: Option<&str>,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use crate::services::proxy_scan_service::{
+        decide_serve, verdict_is_reusable, ProxyScanAction, ProxyScanRow, ServeDecision,
+        VERDICT_CLEAN,
+    };
+    let ttl = crate::services::scanner_service::DEDUP_TTL_DAYS as i64;
+    let row = match (&referrer.verdict, referrer.scanned_at) {
+        (Some(verdict), Some(scanned_at)) => Some(ProxyScanRow {
+            checksum_sha256: String::new(),
+            scan_type: proxy_helpers::PROXY_SCAN_TYPE.to_string(),
+            verdict: verdict.clone(),
+            findings_count: 0,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: referrer.max_severity.clone(),
+            scanner_version: referrer.scanner_version.clone(),
+            scanned_at,
+        }),
+        _ => None,
+    };
+    match posture {
+        ReferrerPosture::Unknown => false,
+        ReferrerPosture::Hosted => row.is_some_and(|r| {
+            r.verdict == VERDICT_CLEAN
+                && verdict_is_reusable(
+                    &r.verdict,
+                    r.scanned_at,
+                    r.scanner_version.as_deref(),
+                    current_version,
+                    ProxyScanAction::FailClosed,
+                    ttl,
+                    now,
+                )
+        }),
+        ReferrerPosture::Proxy(action) => {
+            match decide_serve(row.as_ref(), current_version, action, ttl, now) {
+                ServeDecision::ServeCached | ServeDecision::ServePendingScanAsync => true,
+                ServeDecision::BlockCached => !severity_gate.blocks(
+                    referrer
+                        .max_severity
+                        .as_deref()
+                        .and_then(crate::models::security::Severity::from_str_loose),
+                ),
+                ServeDecision::ScanInline => false,
+            }
+        }
+    }
+}
+
+/// Is this blob, which a blocking verdict would otherwise withhold, still
+/// needed by an image the manifest gate serves? (#4380.)
+///
+/// Answers over the same reference set the block was computed from
+/// (`gated_scope`: this repository, or a virtual's gated members). `Ok(false)`
+/// keeps the block. A config read fault on an owner makes that owner's images
+/// count as not served (fail closed); a query fault is returned so the caller
+/// withholds with its usual `423`.
+async fn blob_needed_by_servable_image(
+    state: &SharedState,
+    scan_cfg: &crate::services::scan_config_service::ScanConfigService,
+    repo: &OciRepoInfo,
+    ref_owners: &[(&str, Uuid)],
+    gated_scope: &[Uuid],
+    blob_digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> Result<bool, sqlx::Error> {
+    if gated_scope.is_empty() {
+        return Ok(false);
+    }
+    let referrers = sqlx::query_as::<_, BlobReferrer>(
+        r#"
+        SELECT DISTINCT mbr.repository_id, mbr.manifest_digest,
+               psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
+        FROM manifest_blob_refs mbr
+        LEFT JOIN proxy_scan_results psr
+          ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
+         AND psr.scan_type = $3
+        WHERE mbr.repository_id = ANY($1)
+          AND mbr.blob_digest = $2
+        "#,
+    )
+    .bind(gated_scope)
+    .bind(blob_digest)
+    .bind(proxy_helpers::PROXY_SCAN_TYPE)
+    .fetch_all(&state.db)
+    .await?;
+    if referrers.is_empty() {
+        return Ok(false);
+    }
+
+    // #3025 OR-of-both-sides: through a virtual, the virtual's own action is
+    // combined with each member's, stricter wins.
+    let virtual_action = if repo.repo_type == RepositoryType::Virtual {
+        match scan_cfg.proxy_scan_action(repo.id).await {
+            Ok(a) => Some(a),
+            Err(_) => return Ok(false),
+        }
+    } else {
+        None
+    };
+    let mut postures: std::collections::HashMap<Uuid, ReferrerPosture> =
+        std::collections::HashMap::new();
+    for (repo_type, owner_id) in ref_owners {
+        if !gated_scope.contains(owner_id) || postures.contains_key(owner_id) {
+            continue;
+        }
+        let posture =
+            if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
+                ReferrerPosture::Hosted
+            } else {
+                match scan_cfg.proxy_scan_action(*owner_id).await {
+                    Ok(a) => ReferrerPosture::Proxy(match virtual_action {
+                        Some(v) => stricter_proxy_scan_action(v, a),
+                        None => a,
+                    }),
+                    Err(_) => ReferrerPosture::Unknown,
+                }
+            };
+        postures.insert(*owner_id, posture);
+    }
+
+    let current_version = match state.scanner_service.as_deref() {
+        Some(scanner) if referrers.iter().any(|r| r.verdict.is_some()) => {
+            scanner.cve_scanner_version().await
+        }
+        _ => None,
+    };
+    let now = chrono::Utc::now();
+    Ok(referrers.iter().any(|r| {
+        manifest_gate_serves_referrer(
+            r,
+            postures
+                .get(&r.repository_id)
+                .copied()
+                .unwrap_or(ReferrerPosture::Unknown),
+            current_version.as_deref(),
+            severity_gate,
+            now,
+        )
+    }))
 }
 
 /// True when the authenticated claims are a scanner-scoped pull token
@@ -31988,6 +32256,433 @@ mod proxy_scan_block_tests {
             BlobVerdictStatus::NoVerdict,
             "an unscanned blob must not be blocked"
         );
+    }
+
+    // ── #4380: a blob shared with a blocked image ─────────────────────────
+
+    /// A runnable image manifest with one config and several layers, so two
+    /// images can share a layer the way real images share base and empty
+    /// layers.
+    fn image_manifest_layers(config_bytes: &[u8], layers: &[&[u8]]) -> (Bytes, String) {
+        let config_digest = compute_sha256(config_bytes);
+        let layer_descs: Vec<serde_json::Value> = layers
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": compute_sha256(l),
+                    "size": l.len(),
+                })
+            })
+            .collect();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_bytes.len(),
+            },
+            "layers": layer_descs,
+        });
+        (
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+            config_digest,
+        )
+    }
+
+    /// The scan settings from the #4380 report: scan-on-proxy with the
+    /// severity threshold enforced at `critical`, under `action`.
+    async fn enable_proxy_scan_critical(pool: &sqlx::PgPool, repo_id: Uuid, action: &str) {
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold, \
+                 proxy_scan_action) \
+             VALUES ($1, true, false, true, true, 'critical', $2) \
+             ON CONFLICT (repository_id) DO UPDATE SET proxy_scan_action = EXCLUDED.proxy_scan_action",
+        )
+        .bind(repo_id)
+        .bind(action)
+        .execute(pool)
+        .await
+        .expect("enable scan-on-proxy (critical threshold)");
+    }
+
+    /// Stage one image the way the manifest gate leaves it: its blob edges in
+    /// `manifest_blob_refs`, its config + layer bytes in local storage, and
+    /// (when `verdict` is set) a verdict row for its manifest digest. Returns
+    /// the manifest digest (`sha256:` form).
+    async fn stage_image_4380(
+        fx: &tdh::Fixture,
+        manifest: &Bytes,
+        blobs: &[&[u8]],
+        verdict: Option<(&str, Option<&str>)>,
+    ) -> String {
+        let digest = compute_sha256(manifest);
+        record_manifest_blob_refs(&fx.pool, fx.repo_id, &digest, manifest)
+            .await
+            .expect("record blob refs");
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for bytes in blobs {
+            let d = compute_sha256(bytes);
+            let key = blob_storage_key(&d);
+            storage
+                .put(&key, Bytes::from(bytes.to_vec()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(fx.repo_id)
+            .bind(&d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        if let Some((v, max_severity)) = verdict {
+            let critical = i32::from(max_severity == Some("critical"));
+            ProxyScanService::new(fx.pool.clone())
+                .record_verdict(
+                    digest.strip_prefix("sha256:").unwrap(),
+                    "grype",
+                    v,
+                    critical,
+                    critical,
+                    0,
+                    0,
+                    0,
+                    max_severity,
+                    Some("grype-1.0.0-test"),
+                    Some(fx.repo_id),
+                )
+                .await
+                .expect("seed verdict");
+        }
+        digest
+    }
+
+    /// Anonymous blob request through the real router under `image`.
+    async fn blob_status_4380(
+        state: &SharedState,
+        repo_key: &str,
+        image: &str,
+        method: &str,
+        digest: &str,
+    ) -> StatusCode {
+        let app = tdh::router_anon(router(None), state.clone());
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("/{repo_key}/{image}/blobs/{digest}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot").status()
+    }
+
+    /// #4380, the reported shape: images A (critical findings) and D (clean)
+    /// in one proxy repository share a layer. Before the fix the shared layer
+    /// answered `403 "blob belongs to an image blocked by scan policy"` for
+    /// every image, so the clean image D could not be pulled. Now:
+    ///
+    /// * D pulls: its manifest is 200 and every one of its blobs, the shared
+    ///   layer included, is 200 (GET and HEAD);
+    /// * A stays blocked where an image is pulled: its manifest GET is 403;
+    /// * a blob ONLY A references (its config, its own layer) stays 403, so A
+    ///   cannot be reassembled by digest.
+    #[tokio::test]
+    async fn test_shared_blob_serves_for_clean_image_while_blocked_image_stays_refused() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let shared = unique_fixture_bytes("4380-shared-empty-layer");
+        let a_cfg = unique_fixture_bytes("4380-a-cfg");
+        let a_layer = unique_fixture_bytes("4380-a-layer");
+        let d_cfg = unique_fixture_bytes("4380-d-cfg");
+        let d_layer = unique_fixture_bytes("4380-d-layer");
+        let (a_manifest, a_config) = image_manifest_layers(&a_cfg, &[&a_layer, &shared]);
+        let (d_manifest, d_config) = image_manifest_layers(&d_cfg, &[&d_layer, &shared]);
+        let shared_digest = compute_sha256(&shared);
+        let a_layer_digest = compute_sha256(&a_layer);
+        let d_layer_digest = compute_sha256(&d_layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "a", &a_manifest, IMAGE_MANIFEST_MT, None).await;
+        mount_upstream_manifest(&upstream, "app", "d", &d_manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan_critical(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let a_digest = stage_image_4380(
+            &fx,
+            &a_manifest,
+            &[&a_cfg, &a_layer, &shared],
+            Some(("vulnerable", Some("critical"))),
+        )
+        .await;
+        let d_digest = stage_image_4380(
+            &fx,
+            &d_manifest,
+            &[&d_cfg, &d_layer, &shared],
+            Some(("clean", None)),
+        )
+        .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let key = fx.repo_key.clone();
+
+        let d_manifest_status = pull_manifest(&state, &key, "d").await.status();
+        let a_manifest_status = pull_manifest(&state, &key, "a").await.status();
+        let shared_get = blob_status_4380(&state, &key, "app", "GET", &shared_digest).await;
+        let shared_head = blob_status_4380(&state, &key, "app", "HEAD", &shared_digest).await;
+        let d_cfg_get = blob_status_4380(&state, &key, "app", "GET", &d_config).await;
+        let d_layer_get = blob_status_4380(&state, &key, "app", "GET", &d_layer_digest).await;
+        let a_cfg_get = blob_status_4380(&state, &key, "app", "GET", &a_config).await;
+        let a_layer_get = blob_status_4380(&state, &key, "app", "GET", &a_layer_digest).await;
+        let a_layer_head = blob_status_4380(&state, &key, "app", "HEAD", &a_layer_digest).await;
+
+        for d in [&a_digest, &d_digest] {
+            cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            shared_get,
+            StatusCode::OK,
+            "#4380: a layer the clean image D needs must serve even though the \
+             blocked image A shares it"
+        );
+        assert_eq!(shared_head, StatusCode::OK, "#4380: HEAD agrees with GET");
+        assert_eq!(
+            d_manifest_status,
+            StatusCode::OK,
+            "clean image D's manifest serves"
+        );
+        assert_eq!(d_cfg_get, StatusCode::OK, "D's config blob serves");
+        assert_eq!(d_layer_get, StatusCode::OK, "D's own layer serves");
+        assert_eq!(
+            a_manifest_status,
+            StatusCode::FORBIDDEN,
+            "the blocked image A is still refused at its manifest"
+        );
+        assert_eq!(
+            a_cfg_get,
+            StatusCode::FORBIDDEN,
+            "A's config blob (needed by no clean image) stays refused"
+        );
+        assert_eq!(
+            a_layer_get,
+            StatusCode::FORBIDDEN,
+            "A's own layer (needed by no clean image) stays refused"
+        );
+        assert_eq!(a_layer_head, StatusCode::FORBIDDEN, "HEAD agrees with GET");
+    }
+
+    /// #4380: the release applies only while some image that needs the blob is
+    /// served. When EVERY image in the repository that references a shared
+    /// layer is blocked, the layer stays refused. Positive control in the same
+    /// fixture: an unrelated clean image's layer serves.
+    #[tokio::test]
+    async fn test_shared_blob_refused_when_every_referencing_image_is_blocked() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        enable_proxy_scan_critical(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let shared = unique_fixture_bytes("4380-all-blocked-shared");
+        let a_cfg = unique_fixture_bytes("4380-all-blocked-a-cfg");
+        let b_cfg = unique_fixture_bytes("4380-all-blocked-b-cfg");
+        let c_cfg = unique_fixture_bytes("4380-all-blocked-c-cfg");
+        let c_layer = unique_fixture_bytes("4380-all-blocked-c-layer");
+        let (a_manifest, _) = image_manifest_layers(&a_cfg, &[&shared]);
+        let (b_manifest, _) = image_manifest_layers(&b_cfg, &[&shared]);
+        let (c_manifest, _) = image_manifest_layers(&c_cfg, &[&c_layer]);
+        let mut digests = Vec::new();
+        for (m, blobs, v) in [
+            (&a_manifest, vec![&a_cfg[..], &shared[..]], "vulnerable"),
+            (&b_manifest, vec![&b_cfg[..], &shared[..]], "vulnerable"),
+            (&c_manifest, vec![&c_cfg[..], &c_layer[..]], "clean"),
+        ] {
+            let sev = (v == "vulnerable").then_some("critical");
+            digests.push(stage_image_4380(&fx, m, &blobs, Some((v, sev))).await);
+        }
+
+        let shared_get = blob_status_4380(
+            &fx.state,
+            &fx.repo_key,
+            "app",
+            "GET",
+            &compute_sha256(&shared),
+        )
+        .await;
+        let control = blob_status_4380(
+            &fx.state,
+            &fx.repo_key,
+            "app",
+            "GET",
+            &compute_sha256(&c_layer),
+        )
+        .await;
+
+        for d in &digests {
+            cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            shared_get,
+            StatusCode::FORBIDDEN,
+            "a layer only blocked images reference must stay refused"
+        );
+        assert_eq!(
+            control,
+            StatusCode::OK,
+            "positive control: an unrelated clean image's layer serves"
+        );
+    }
+
+    /// #4380: an image that references the shared layer but has no verdict yet
+    /// counts as served exactly when the manifest gate would serve it, which
+    /// is `proxy_scan_action`'s call: fail-open serves it pending (so its
+    /// layer serves), fail-closed scans first (so the blob seam proves
+    /// nothing and the layer stays refused). Same fixture, action flipped.
+    #[tokio::test]
+    async fn test_shared_blob_with_unscanned_sibling_follows_proxy_scan_action() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        enable_proxy_scan_critical(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let shared = unique_fixture_bytes("4380-unscanned-shared");
+        let a_cfg = unique_fixture_bytes("4380-unscanned-a-cfg");
+        let n_cfg = unique_fixture_bytes("4380-unscanned-n-cfg");
+        let (a_manifest, _) = image_manifest_layers(&a_cfg, &[&shared]);
+        let (n_manifest, _) = image_manifest_layers(&n_cfg, &[&shared]);
+        let a_digest = stage_image_4380(
+            &fx,
+            &a_manifest,
+            &[&a_cfg, &shared],
+            Some(("vulnerable", Some("critical"))),
+        )
+        .await;
+        stage_image_4380(&fx, &n_manifest, &[&n_cfg, &shared], None).await;
+        let shared_digest = compute_sha256(&shared);
+
+        let fail_open =
+            blob_status_4380(&fx.state, &fx.repo_key, "app", "GET", &shared_digest).await;
+        enable_proxy_scan_critical(&fx.pool, fx.repo_id, "fail_closed").await;
+        let fail_closed =
+            blob_status_4380(&fx.state, &fx.repo_key, "app", "GET", &shared_digest).await;
+
+        cleanup_proxy_scan_row(&fx.pool, a_digest.strip_prefix("sha256:").unwrap()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            fail_open,
+            StatusCode::OK,
+            "fail_open: the unscanned sibling is served pending, so its layer serves"
+        );
+        assert_eq!(
+            fail_closed,
+            StatusCode::FORBIDDEN,
+            "fail_closed: an unscanned sibling proves nothing; the layer stays refused"
+        );
+    }
+
+    fn referrer_4380(
+        verdict: Option<&str>,
+        max_severity: Option<&str>,
+        age_days: i64,
+    ) -> BlobReferrer {
+        BlobReferrer {
+            repository_id: Uuid::nil(),
+            verdict: verdict.map(str::to_string),
+            scanned_at: verdict.map(|_| chrono::Utc::now() - chrono::Duration::days(age_days)),
+            scanner_version: verdict.map(|_| "grype-1.0.0-test".to_string()),
+            max_severity: max_severity.map(str::to_string),
+        }
+    }
+
+    /// #4380: the per-referrer decision mirrors the manifest gate for every
+    /// verdict shape and posture.
+    #[test]
+    fn manifest_gate_serves_referrer_matrix() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+        let now = chrono::Utc::now();
+        let cur = Some("grype-1.0.0-test");
+        let critical = ProxySeverityGate::Threshold(Severity::Critical);
+        let open = ReferrerPosture::Proxy(ProxyScanAction::FailOpen);
+        let closed = ReferrerPosture::Proxy(ProxyScanAction::FailClosed);
+        let record = ReferrerPosture::Proxy(ProxyScanAction::RecordOnly);
+        let stale = crate::services::scanner_service::DEDUP_TTL_DAYS as i64 + 1;
+
+        let clean = referrer_4380(Some("clean"), None, 0);
+        let crit = referrer_4380(Some("vulnerable"), Some("critical"), 0);
+        let high = referrer_4380(Some("vulnerable"), Some("high"), 0);
+        let stale_crit = referrer_4380(Some("vulnerable"), Some("critical"), stale);
+        let unscanned = referrer_4380(None, None, 0);
+
+        let serves = |r: &BlobReferrer, p, g| manifest_gate_serves_referrer(r, p, cur, g, now);
+
+        // Fresh clean: served everywhere it can be proven.
+        assert!(serves(&clean, open, critical));
+        assert!(serves(&clean, closed, critical));
+        assert!(serves(&clean, ReferrerPosture::Hosted, critical));
+        // A blocking verdict is never a served image...
+        assert!(!serves(&crit, open, critical));
+        assert!(!serves(&crit, closed, critical));
+        assert!(!serves(&crit, ReferrerPosture::Hosted, critical));
+        // ...unless it is below the threshold, or the repo is record-only.
+        assert!(serves(&high, open, critical));
+        assert!(!serves(&high, open, ProxySeverityGate::BlockOnAny));
+        assert!(serves(&crit, record, ProxySeverityGate::RecordOnly));
+        // Stale or missing verdict: the gate serves pending under fail-open
+        // and scans first under fail-closed.
+        assert!(serves(&stale_crit, open, critical));
+        assert!(!serves(&stale_crit, closed, critical));
+        assert!(serves(&unscanned, open, critical));
+        assert!(!serves(&unscanned, closed, critical));
+        // Hosted: only a fresh clean verdict counts; unknown proves nothing.
+        assert!(!serves(&unscanned, ReferrerPosture::Hosted, critical));
+        assert!(!serves(&clean, ReferrerPosture::Unknown, critical));
+    }
+
+    /// #4380: through a virtual, the stricter action of the virtual and the
+    /// member applies.
+    #[test]
+    fn stricter_proxy_scan_action_direction() {
+        use crate::services::proxy_scan_service::ProxyScanAction::*;
+        assert_eq!(stricter_proxy_scan_action(FailOpen, FailClosed), FailClosed);
+        assert_eq!(
+            stricter_proxy_scan_action(FailClosed, RecordOnly),
+            FailClosed
+        );
+        assert_eq!(stricter_proxy_scan_action(RecordOnly, FailOpen), FailOpen);
+        assert_eq!(
+            stricter_proxy_scan_action(RecordOnly, RecordOnly),
+            RecordOnly
+        );
+        assert_eq!(stricter_proxy_scan_action(FailOpen, FailOpen), FailOpen);
     }
 
     // ── #3259: the blob re-block must expire on the manifest gate's clock ───

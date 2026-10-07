@@ -243,6 +243,38 @@ pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackag
     out
 }
 
+/// One proxied `vulnerable` verdict paired with the scan settings of a
+/// repository that serves it (#4380).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct ProxyBlockCandidate {
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub proxy_scan_action: String,
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+}
+
+/// Count the distinct digests that at least one repository's proxy scan gate
+/// refuses (#4380). Uses the gate's own severity rule
+/// ([`proxy_severity_gate_for_row`](crate::services::scan_config_service::proxy_severity_gate_for_row)),
+/// so record-only repositories and verdicts below an opted-in threshold are
+/// not counted as blocked.
+pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
+    let blocked: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            crate::services::scan_config_service::proxy_severity_gate_for_row(
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                &r.proxy_scan_action,
+            )
+            .blocks(r.max_severity.as_deref().and_then(Severity::from_str_loose))
+        })
+        .map(|r| r.checksum_sha256.as_str())
+        .collect();
+    blocked.len() as i64
+}
+
 /// Build a DashboardSummary from raw count values.
 pub(crate) fn build_dashboard_summary(
     repos_with_scanning: i64,
@@ -2497,7 +2529,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(build_dashboard_summary(
+        let mut out = build_dashboard_summary(
             summary.repos_with_scanning,
             summary.total_scans,
             summary.total_findings,
@@ -2505,7 +2537,70 @@ impl ScanResultService {
             summary.high_findings,
             summary.repos_grade_a,
             summary.repos_grade_f,
-        ))
+        );
+        out.policy_violations_blocked = self.count_policy_violations_blocked().await?;
+        Ok(out)
+    }
+
+    /// What the dashboard's `policy_violations_blocked` counts (#4380).
+    ///
+    /// The field was hard-wired to 0, so a scan policy that blocked content
+    /// left no trace on the dashboard. It now counts the items a scan policy
+    /// is currently refusing:
+    ///
+    /// * **hosted** artifacts whose quarantine workflow ended `rejected`, and
+    /// * **proxied** content (any format; for OCI, the image manifest) with a
+    ///   `vulnerable` verdict that the owning repository's proxy scan gate
+    ///   enforces: scan-on-proxy enabled, not `record_only`, and the verdict
+    ///   at or above the repository's severity threshold when one is opted
+    ///   into. Proxied bytes have no `artifacts` row (#1278), so they are found
+    ///   through the repository's proxy cache catalog and its OCI manifest
+    ///   edges, each distinct digest counted once.
+    ///
+    /// A verdict older than the scan TTL is not counted: the gate re-scans it
+    /// on the next pull rather than trusting it.
+    pub async fn count_policy_violations_blocked(&self) -> Result<i64> {
+        let hosted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE quarantine_status = 'rejected' AND NOT is_deleted",
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT psr.checksum_sha256, psr.max_severity,
+                   sc.proxy_scan_action, sc.block_on_policy_violation,
+                   sc.severity_threshold
+            FROM scan_configs sc
+            JOIN repositories r ON r.id = sc.repository_id
+            JOIN LATERAL (
+                SELECT pca.checksum_sha256 AS digest
+                  FROM proxy_cache_artifacts pca
+                 WHERE pca.repository_id = sc.repository_id
+                   AND pca.checksum_sha256 IS NOT NULL
+                UNION
+                SELECT REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM manifest_blob_refs mbr
+                 WHERE mbr.repository_id = sc.repository_id
+            ) cached ON true
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = cached.digest
+             AND psr.scan_type = $1
+             AND psr.verdict = 'vulnerable'
+             AND psr.scanned_at > NOW() - make_interval(days => $2)
+            WHERE sc.scan_on_proxy
+              AND r.repo_type IN ('remote', 'virtual')
+            "#,
+        )
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(hosted + count_blocked_proxy_digests(&rows))
     }
 }
 
@@ -2676,6 +2771,44 @@ mod tests {
         assert_eq!(summary.repos_grade_a, 3);
         assert_eq!(summary.repos_grade_f, 1);
         assert_eq!(summary.policy_violations_blocked, 0);
+    }
+
+    fn block_candidate(
+        digest: &str,
+        max_severity: Option<&str>,
+        action: &str,
+        block_on_policy_violation: bool,
+        threshold: &str,
+    ) -> ProxyBlockCandidate {
+        ProxyBlockCandidate {
+            checksum_sha256: digest.to_string(),
+            max_severity: max_severity.map(str::to_string),
+            proxy_scan_action: action.to_string(),
+            block_on_policy_violation,
+            severity_threshold: threshold.to_string(),
+        }
+    }
+
+    /// #4380: the dashboard counts a proxied verdict as blocked exactly when
+    /// the proxy scan gate would refuse it, once per digest.
+    #[test]
+    fn test_count_blocked_proxy_digests_follows_the_gate() {
+        let rows = vec![
+            // Critical at a critical threshold: blocked.
+            block_candidate("a", Some("critical"), "fail_open", true, "critical"),
+            // The same digest cached by a second enforcing repo: still one.
+            block_candidate("a", Some("critical"), "fail_closed", false, "high"),
+            // High below a critical threshold: served, not blocked.
+            block_candidate("b", Some("high"), "fail_open", true, "critical"),
+            // No threshold opted in: any finding blocks.
+            block_candidate("c", Some("low"), "fail_open", false, "critical"),
+            // Record-only never blocks.
+            block_candidate("d", Some("critical"), "record_only", true, "critical"),
+            // Unknown severity fails closed: blocked.
+            block_candidate("e", None, "fail_open", true, "critical"),
+        ];
+        assert_eq!(count_blocked_proxy_digests(&rows), 3);
+        assert_eq!(count_blocked_proxy_digests(&[]), 0);
     }
 
     #[test]
