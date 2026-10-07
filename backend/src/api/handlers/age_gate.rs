@@ -461,6 +461,7 @@ pub async fn update_repo_age_gate(
                     scan_config: None,
                     previous_scan_config: None,
                     scan_config_changed: None,
+                    upstream_change: None,
                 }),
         )
         .await;

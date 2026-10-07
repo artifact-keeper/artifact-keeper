@@ -4471,6 +4471,11 @@ enum UpstreamFetchOutcome {
     /// of those say anything about whether the object exists, so a walk that
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
+    /// The upstream (its OCI token service) refused the Remote's credentials
+    /// (#4453). As indeterminate as [`Self::Indeterminate`], but the direct
+    /// Remote manifest GET/HEAD reports it as a gateway error instead of
+    /// `MANIFEST_UNKNOWN`.
+    UpstreamAuthFailed,
 }
 
 impl UpstreamFetchOutcome {
@@ -4484,7 +4489,26 @@ impl UpstreamFetchOutcome {
 
     /// `true` when this outcome leaves the object's existence unresolved.
     fn is_indeterminate(&self) -> bool {
-        matches!(self, UpstreamFetchOutcome::Indeterminate)
+        matches!(
+            self,
+            UpstreamFetchOutcome::Indeterminate | UpstreamFetchOutcome::UpstreamAuthFailed
+        )
+    }
+
+    /// The OCI error a direct Remote manifest request returns for an upstream
+    /// authentication failure (#4453): 502 with code `DENIED`, never a 404
+    /// `MANIFEST_UNKNOWN` (a client must not read a credentials problem as
+    /// "this image does not exist"), and never a 401, which would make the
+    /// client retry with ITS credentials against this registry.
+    fn upstream_auth_error(&self) -> Option<Response> {
+        matches!(self, UpstreamFetchOutcome::UpstreamAuthFailed).then(|| {
+            oci_error(
+                StatusCode::BAD_GATEWAY,
+                "DENIED",
+                "upstream registry authentication failed: the upstream token service \
+                 rejected this repository's upstream credentials",
+            )
+        })
     }
 }
 
@@ -4541,7 +4565,37 @@ async fn try_upstream_fetch_with_accept(
     {
         Ok((content, content_type)) => UpstreamFetchOutcome::Fetched(content, content_type),
         Err(error) if upstream_error_is_definitive_miss(&error) => UpstreamFetchOutcome::Missing,
+        Err(error) if proxy_helpers::is_upstream_auth_failure(&error) => {
+            UpstreamFetchOutcome::UpstreamAuthFailed
+        }
         Err(_) => UpstreamFetchOutcome::Indeterminate,
+    }
+}
+
+/// The direct Remote manifest fetch shared by GET and HEAD: the bytes, or
+/// `Ok(None)` for a miss the caller reports as `MANIFEST_UNKNOWN`, or the
+/// response to return as-is when the upstream refused the Remote's
+/// credentials (#4453): a gateway error the operator must fix, not a missing
+/// manifest.
+async fn fetch_remote_manifest(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    reference: &str,
+    accept: &str,
+) -> Result<Option<(Bytes, Option<String>)>, Response> {
+    // UNRECORDED-PROXY-SERVE: this only fetches; nothing is served here. The
+    // GET caller records the pull through `record_oci_manifest_pull` after its
+    // scan gate, and HEAD serves no body, so it is exempt (#3446).
+    let outcome = try_upstream_fetch_with_accept(
+        repo,
+        state,
+        &format!("manifests/{reference}"),
+        Some(accept),
+    )
+    .await;
+    match outcome.upstream_auth_error() {
+        Some(resp) => Err(resp),
+        None => Ok(outcome.into_fetched()),
     }
 }
 
@@ -8869,15 +8923,11 @@ async fn handle_head_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    if let Some((content, ct)) = try_upstream_fetch_with_accept(
-        &repo,
-        state,
-        &format!("manifests/{}", reference),
-        Some(&accept),
-    )
-    .await
-    .into_fetched()
-    {
+    let fetched = match fetch_remote_manifest(&repo, state, reference, &accept).await {
+        Ok(fetched) => fetched,
+        Err(resp) => return resp,
+    };
+    if let Some((content, ct)) = fetched {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -10327,15 +10377,11 @@ async fn handle_get_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    if let Some((content, ct)) = try_upstream_fetch_with_accept(
-        &repo,
-        state,
-        &format!("manifests/{}", reference),
-        Some(&accept),
-    )
-    .await
-    .into_fetched()
-    {
+    let fetched = match fetch_remote_manifest(&repo, state, reference, &accept).await {
+        Ok(fetched) => fetched,
+        Err(resp) => return resp,
+    };
+    if let Some((content, ct)) = fetched {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -12057,10 +12103,10 @@ async fn handle_delete_manifest(
     };
 
     // Preserve the OCI contract exactly: a digest reference is a
-    // content-addressed delete (every tag pointing at the digest goes), a tag
-    // reference removes only that tag. The digest here was resolved FROM this
-    // repository's index, which is what makes the content-addressed scope
-    // correct on this route.
+    // content-addressed delete (every tag of this image name pointing at the
+    // digest goes, #4466), a tag reference removes only that tag. The digest
+    // here was resolved FROM this repository's index, which is what makes the
+    // content-addressed scope correct on this route.
     let scope = if is_digest_reference(reference) {
         OciIndexDeleteScope::ContentAddressed
     } else {
@@ -12105,7 +12151,9 @@ async fn handle_delete_manifest(
 /// * [`OciIndexDeleteScope::ContentAddressed`] is the OCI `DELETE
 ///   /v2/<name>/manifests/<digest>` contract — the reference *is* the digest and
 ///   it was resolved from this repository's own index, so removing every tag row
-///   pointing at that digest is the documented behaviour (#1776).
+///   of the named image pointing at that digest is the documented behaviour
+///   (#1776). Tags of the same digest under OTHER image names in the
+///   repository stay (#4466).
 /// * [`OciIndexDeleteScope::NamedReference`] removes exactly the
 ///   `(name = image, tag = reference)` row. The REST artifact delete always uses
 ///   this scope: it deletes ONE `artifacts` row, and that row's index footprint
@@ -12115,7 +12163,8 @@ async fn handle_delete_manifest(
 ///   belong to a different image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OciIndexDeleteScope {
-    /// Remove every tag row in the repository pointing at `digest`.
+    /// Remove every tag row OF THE NAMED IMAGE pointing at `digest` (#4466);
+    /// the same digest under another image name in the repository stays.
     ContentAddressed,
     /// Remove only the `(name = image, tag = reference)` tag row.
     NamedReference,
@@ -12190,39 +12239,64 @@ pub(crate) fn rest_unwind_digest<'a>(
 /// Soft-deletes the `artifacts` rows a `/v2` manifest delete removes (#4450).
 ///
 /// Binds: `$1` repository id, `$2` the exact `v2/<image>/manifests/<reference>`
-/// path the request named, `$3` whether the delete is content-addressed, `$4`
-/// the deleted digest's sha256 hex (NULL for a non-sha256 digest).
+/// path the request named, `$3` the ids of the other rows to tombstone (empty
+/// for a tag-name delete; see [`SELECT_DIGEST_MANIFEST_ROWS_SQL`]).
 ///
 /// * Every delete tombstones the row at the named path.
 /// * A content-addressed delete (`DELETE .../manifests/<digest>`) also
-///   tombstones every other manifest-shaped row in the repository whose bytes
-///   ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
-///   migrated source-layout rows. The index unwind already removed every
-///   `oci_tags` row for the digest repository-wide, so these rows are the last
-///   record claiming the manifest exists. Left live, the startup
-///   `oci_migration_reindex` took them for never-indexed migrated manifests
-///   and re-registered the deleted image on the next restart, and storage GC
-///   could never reclaim its body.
+///   tombstones every other manifest-shaped row OF THE SAME IMAGE NAME whose
+///   bytes ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
+///   migrated source-layout rows for `<image>`. The index unwind already
+///   removed `<image>`'s `oci_tags` rows for the digest, so these rows are the
+///   last record claiming the manifest exists under `<image>`. Left live, the
+///   startup `oci_migration_reindex` took them for never-indexed migrated
+///   manifests and re-registered the deleted image on the next restart.
+/// * Rows of OTHER image names in the repository that hold the same digest are
+///   never touched (#4466): in the distribution spec `<name>` is
+///   `<repo_key>/<image>`, so the delete is scoped to `<image>`.
 ///
-/// The path shape is the one the reindex scans
-/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
-/// so no row the reindex could pick up for this digest survives the delete.
 /// Blob and non-manifest rows are never touched. Rows already in the trash are
 /// skipped so their `updated_at` keeps the time they were really deleted.
-pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = concat!(
-    r#"
+pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = r#"
     UPDATE artifacts a
     SET is_deleted = true, updated_at = NOW()
     WHERE a.repository_id = $1
       AND a.is_deleted = false
-      AND (
-            a.path = $2
-         OR ($3 AND a.checksum_sha256 = $4 AND "#,
+      AND (a.path = $2 OR a.id = ANY($3))
+    "#;
+
+/// Live manifest-shaped `artifacts` rows of a repository whose bytes are one
+/// digest (`$1` repository id, `$2` sha256 hex), with the repository key so
+/// the caller can attribute each path to an image name
+/// ([`crate::services::oci_migration_reindex::manifest_row_image`]).
+///
+/// The path shape is the one the reindex scans
+/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
+/// so no row the reindex could pick up for this digest under the deleted image
+/// survives a by-digest delete.
+pub(crate) const SELECT_DIGEST_MANIFEST_ROWS_SQL: &str = concat!(
+    r#"
+    SELECT a.id, a.path::text AS path, r.key AS repo_key
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+      AND a.checksum_sha256 = $2
+      AND "#,
     crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
-    r#")
-      )
-    "#
 );
+
+/// The ids among `rows` (`(id, path, repo_key)` from
+/// [`SELECT_DIGEST_MANIFEST_ROWS_SQL`]) that belong to `image` (#4466). Pure.
+pub(crate) fn manifest_rows_of_image(rows: &[(Uuid, String, String)], image: &str) -> Vec<Uuid> {
+    rows.iter()
+        .filter(|(_, path, repo_key)| {
+            crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+                == Some(image)
+        })
+        .map(|(id, _, _)| *id)
+        .collect()
+}
 
 /// The `artifacts` path a `/v2` manifest request names.
 fn v2_manifest_artifact_path(image: &str, reference: &str) -> String {
@@ -12240,11 +12314,21 @@ pub(crate) async fn soft_delete_manifest_artifacts_in_tx(
     digest: &str,
     scope: OciIndexDeleteScope,
 ) -> Result<u64, sqlx::Error> {
+    let mut same_image_rows: Vec<Uuid> = Vec::new();
+    if let (OciIndexDeleteScope::ContentAddressed, Some(hex)) =
+        (scope, digest.strip_prefix("sha256:"))
+    {
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(SELECT_DIGEST_MANIFEST_ROWS_SQL)
+            .bind(repo_id)
+            .bind(hex)
+            .fetch_all(&mut **tx)
+            .await?;
+        same_image_rows = manifest_rows_of_image(&rows, image);
+    }
     let res = sqlx::query(SOFT_DELETE_MANIFEST_ARTIFACTS_SQL)
         .bind(repo_id)
         .bind(v2_manifest_artifact_path(image, reference))
-        .bind(scope == OciIndexDeleteScope::ContentAddressed)
-        .bind(digest.strip_prefix("sha256:"))
+        .bind(&same_image_rows)
         .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected())
@@ -12292,15 +12376,18 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
     scope: OciIndexDeleteScope,
 ) -> Result<(), sqlx::Error> {
     // Remove tag rows for this delete. A content-addressed delete (the OCI
-    // `DELETE .../manifests/<digest>` contract) removes every tag pointing at
-    // that digest in this repo. A named-reference delete removes ONLY the named
-    // tag row, leaving sibling tags that happen to share the same manifest
-    // digest intact (#1776).
+    // `DELETE .../manifests/<digest>` contract) removes every tag OF THIS IMAGE
+    // NAME pointing at that digest: `<name>` in the distribution spec is
+    // `<repo_key>/<image>`, so the same digest tagged under another image in
+    // the repository is not part of the delete (#4466). A named-reference
+    // delete removes ONLY the named tag row, leaving sibling tags that happen
+    // to share the same manifest digest intact (#1776).
     match scope {
         OciIndexDeleteScope::ContentAddressed => {
             sqlx::query!(
-                "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3",
                 repo_id,
+                image,
                 digest
             )
             .execute(&mut **tx)
@@ -12318,10 +12405,22 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
         }
     }
 
-    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
-    // this repo still points at the same manifest digest, the manifest is still
-    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
-    // intact. The cleanup only runs once the last tag for the digest is gone.
+    // A tag-name delete only removes the named tag (#1776), and a by-digest
+    // delete only the tags of its own image name (#4466). If a sibling tag in
+    // this repo, under any image name, still points at the same manifest
+    // digest, the manifest is still live: skip the ref/blob-ref cleanup so its
+    // index edges and blob pins stay intact. The cleanup only runs once the
+    // last tag for the digest in the repository is gone.
+    //
+    // #4449: lock the manifest's `oci_manifests` row BEFORE reading whether
+    // anything still references the digest. A concurrent push of the same
+    // digest upserts that row after its `oci_tags` row (the #4441 order:
+    // index rows, `oci_manifests`, `artifacts`), so either the push holds it
+    // and the reads below run after its commit and see its tag, or this
+    // delete holds it and the push re-creates the row after this commit.
+    // Without the lock a push committing between the reads and the delete
+    // left a tagged manifest with no record.
+    crate::services::oci_manifests::lock_in_tx(tx, repo_id, digest).await?;
     let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
@@ -12353,12 +12452,28 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
 
         // #1683 / #4433: a delete that names the manifest by digest deletes
         // the manifest itself, so forget its existence record (kept while a
-        // live parent index still references it). A tag-name delete only
-        // removes a tag; the manifest stays addressable by digest.
+        // live parent index still references it). A tag-name delete that
+        // removed the last tag forgets it too unless a live manifest-shaped
+        // `artifacts` row for the digest survives this delete: without one
+        // the manifest 404s by digest (#4449). A plain read, so the #4441
+        // lock order (index rows, `oci_manifests`, then `artifacts`) holds.
+        let content_addressed = scope == OciIndexDeleteScope::ContentAddressed;
+        let live_manifest_row_remains = if content_addressed || reference == digest {
+            false
+        } else {
+            crate::services::oci_manifests::live_manifest_row_remains_in_tx(
+                tx,
+                repo_id,
+                digest,
+                &v2_manifest_artifact_path(image, reference),
+            )
+            .await?
+        };
         if crate::services::oci_manifests::delete_removes_record(
-            scope == OciIndexDeleteScope::ContentAddressed,
+            content_addressed,
             reference,
             digest,
+            live_manifest_row_remains,
         ) {
             crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
         }
@@ -17285,6 +17400,68 @@ mod remote_blob_streaming_fallback_tests {
             "an over-cap manifest must be rejected by the buffered/capped fallback, \
              proving manifests are NOT streamed"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4453: an upstream whose token service refuses the Remote's
+    /// credentials (401) is an upstream authentication failure, reported to
+    /// the client as 502 `DENIED`, not as an indeterminate miss that the
+    /// manifest handlers turned into 404 `MANIFEST_UNKNOWN`. Never a negative.
+    #[tokio::test]
+    async fn remote_manifest_token_401_is_an_upstream_auth_failure_4453() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/v1"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="reg.test",scope="repository:myorg/app:pull""#,
+                    server.uri()
+                )
+                .as_str(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-token-401-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        let outcome =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/v1", None).await;
+        assert!(matches!(outcome, UpstreamFetchOutcome::UpstreamAuthFailed));
+        assert!(outcome.is_indeterminate(), "never negative-cacheable");
+        let resp = outcome.upstream_auth_error().expect("an error response");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("DENIED"), "{body}");
+        assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
+
+        // Other outcomes carry no auth error.
+        assert!(UpstreamFetchOutcome::Indeterminate
+            .upstream_auth_error()
+            .is_none());
+        assert!(UpstreamFetchOutcome::Missing
+            .upstream_auth_error()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -36008,6 +36185,71 @@ mod remote_pull_through_cache_tests {
              {tag_manifest_ttl}s — this negative control keeps the immutable \
              assertions honest"
         );
+    }
+
+    /// #4453 through the real handlers: a Remote whose upstream token service
+    /// rejects the request answers GET and HEAD with 502 `DENIED`, not 404
+    /// `MANIFEST_UNKNOWN`.
+    #[tokio::test]
+    async fn get_and_head_manifest_report_upstream_auth_failure_as_502_4453() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/myimage/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="reg.test""#,
+                        server.uri()
+                    )
+                    .as_str(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let tmp = std::env::temp_dir().join(format!("oci-4453-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let image = format!("{repo_key}/myimage");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let head =
+            super::handle_head_manifest(&state, &anon_headers(), "http://ak.test", &image, "v1")
+                .await;
+        let get = super::handle_get_manifest(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &image,
+            "v1",
+            &ctx,
+        )
+        .await;
+        let (get_status, get_body, _h) = tdh::collect_response(get).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(head.status(), StatusCode::BAD_GATEWAY, "HEAD");
+        assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET");
+        let body = String::from_utf8_lossy(&get_body);
+        assert!(body.contains("DENIED"), "{body}");
+        assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
     }
 }
 

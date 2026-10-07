@@ -171,9 +171,94 @@ pub async fn resolve_repo_params(db: &PgPool, repository_id: Uuid) -> Result<Age
 /// registry. Binding the identity to the upstream means a repoint starts a
 /// fresh clock by construction, instead of requiring every repository-update
 /// path to remember to invalidate observations.
+///
+/// Userinfo is not part of the identity (#4467): rotating credentials embedded
+/// in the URL names the same registry, so it must not restart every version's
+/// clock or void manual approvals. Host and path still are.
 pub fn upstream_fingerprint(upstream_url: Option<&str>) -> String {
-    let normalized = normalize_upstream_url(upstream_url.unwrap_or_default());
-    hex::encode(Sha256::digest(normalized.as_bytes()))
+    let raw = upstream_url.unwrap_or_default().trim();
+    let (stripped, _) = crate::services::proxy_service::strip_url_userinfo(raw);
+    hex::encode(Sha256::digest(normalize_upstream_url(&stripped).as_bytes()))
+}
+
+/// The fingerprint releases before #4467 computed for `upstream_url` (userinfo
+/// included), when it differs from [`upstream_fingerprint`]; `None` for a URL
+/// without userinfo, whose fingerprint did not change.
+pub(crate) fn legacy_upstream_fingerprint(upstream_url: Option<&str>) -> Option<String> {
+    let legacy = hex::encode(Sha256::digest(
+        normalize_upstream_url(upstream_url.unwrap_or_default()).as_bytes(),
+    ));
+    (legacy != upstream_fingerprint(upstream_url)).then_some(legacy)
+}
+
+/// Move one repository's age-gate state recorded under the legacy
+/// (userinfo-bearing) fingerprint of `upstream_url` to the current one (#4467):
+/// first-seen observations keep their EARLIEST time and review rows keep their
+/// decisions, so the fingerprint change neither restarts clocks nor voids
+/// approvals. Idempotent; a no-op for a URL without userinfo. Returns the
+/// number of rows moved.
+pub async fn rekey_legacy_fingerprint(
+    db: &PgPool,
+    repo_id: Uuid,
+    upstream_url: Option<&str>,
+) -> Result<u64> {
+    let Some(legacy) = legacy_upstream_fingerprint(upstream_url) else {
+        return Ok(0);
+    };
+    let current = upstream_fingerprint(upstream_url);
+    let mut tx = db.begin().await?;
+    let moved = sqlx::query(
+        "INSERT INTO age_gate_version_observations
+             (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at)
+         SELECT repository_id, $3, package_name, package_version, first_seen_at
+         FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2
+         ON CONFLICT (repository_id, upstream_fingerprint, package_name, package_version)
+         DO UPDATE SET first_seen_at =
+             LEAST(age_gate_version_observations.first_seen_at, EXCLUDED.first_seen_at)",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "DELETE FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .execute(&mut *tx)
+    .await?;
+    let reviews = sqlx::query(
+        "UPDATE age_gate_reviews SET basis_upstream_fingerprint = $3
+         WHERE repository_id = $1 AND basis_upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(moved + reviews)
+}
+
+/// Startup pass: [`rekey_legacy_fingerprint`] for every repository whose
+/// upstream URL carries userinfo. Best-effort and idempotent, so every replica
+/// may run it; rows an older replica writes during a rolling upgrade are
+/// picked up by the next start or by the PATCH that rotates the URL.
+pub async fn rekey_all_legacy_fingerprints(db: &PgPool) -> Result<u64> {
+    let repos: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT id, upstream_url FROM repositories WHERE upstream_url LIKE '%@%'")
+            .fetch_all(db)
+            .await?;
+    let mut moved = 0;
+    for (id, url) in repos {
+        moved += rekey_legacy_fingerprint(db, id, url.as_deref()).await?;
+    }
+    Ok(moved)
 }
 
 /// Normalize an upstream URL so that cosmetically different spellings of the
@@ -2284,6 +2369,102 @@ mod tests {
 
     const TEST_UPSTREAM: &str = "https://upstream.example.test";
 
+    /// #4467: state recorded under the pre-#4467 (userinfo-bearing)
+    /// fingerprint moves to the current one with its earliest first-seen time
+    /// and its review decision, so neither the upgrade nor a later credential
+    /// rotation restarts a clock or voids an approval. A repoint to another
+    /// host still gets a fresh identity.
+    #[tokio::test]
+    async fn rekey_keeps_first_seen_and_reviews_across_credential_rotation_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let old_url = "https://svc:old-4467@registry.example.test/npm";
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(old_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = legacy_upstream_fingerprint(Some(old_url)).expect("credentialed url");
+        let current = upstream_fingerprint(Some(old_url));
+        // 1.0.0 seen 30 days ago under the legacy key, and again just now
+        // under the new key (a request served after the upgrade): the
+        // earliest time must win.
+        for (fp, age) in [(&legacy, 30), (&current, 0)] {
+            sqlx::query(
+                "INSERT INTO age_gate_version_observations \
+                 (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at) \
+                 VALUES ($1, $2, 'pkg', '1.0.0', NOW() - make_interval(days => $3))",
+            )
+            .bind(repo_id)
+            .bind(fp)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status, \
+             basis_mode, basis_upstream_fingerprint) \
+             VALUES ($1, 'pkg', '2.0.0', 'approved', 'first_seen', $2)",
+        )
+        .bind(repo_id)
+        .bind(&legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        rekey_all_legacy_fingerprints(&pool).await.expect("rekey");
+        // Idempotent.
+        assert_eq!(
+            rekey_legacy_fingerprint(&pool, repo_id, Some(old_url))
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The credential rotation keeps the (now current) identity.
+        let rotated = "https://svc:new-4467@registry.example.test/npm";
+        assert_eq!(upstream_fingerprint(Some(rotated)), current);
+        let observations: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT upstream_fingerprint, \
+             EXTRACT(DAY FROM NOW() - first_seen_at)::int \
+             FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let basis: Option<String> = sqlx::query_scalar(
+            "SELECT basis_upstream_fingerprint FROM age_gate_reviews WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert_eq!(observations, vec![(current.clone(), 30)]);
+        assert_eq!(basis.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            review_identity_match(
+                Some("first_seen"),
+                basis.as_deref(),
+                AgeGateMode::FirstSeen,
+                &upstream_fingerprint(Some(rotated)),
+            ),
+            ReviewIdentityMatch::Matches
+        );
+        // A repoint to another host is a different identity.
+        assert_ne!(
+            upstream_fingerprint(Some("https://svc:new-4467@other.example.test/npm")),
+            current
+        );
+    }
+
     fn npm_params(id: Uuid, key: String, min_age_days: i32) -> AgeGateRepoParams {
         params_with_mode(
             id,
@@ -3451,6 +3632,35 @@ mod tests {
             upstream_fingerprint(Some("https://evil.example.test"))
         );
         assert_ne!(canonical, upstream_fingerprint(None));
+        // #4467: rotating userinfo keeps the identity; host and path do not.
+        let rotated_old = Some("https://alice:old@registry.example.test/npm");
+        let rotated_new = Some("https://alice:new@registry.example.test/npm");
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://registry.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@other.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@registry.example.test/pypi"))
+        );
+        assert!(legacy_upstream_fingerprint(rotated_old).is_some());
+        assert_ne!(
+            legacy_upstream_fingerprint(rotated_old),
+            legacy_upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            legacy_upstream_fingerprint(Some("https://registry.npmjs.org")),
+            None
+        );
+        assert_eq!(legacy_upstream_fingerprint(None), None);
         // Paths stay case-sensitive: most registries treat them that way.
         assert_ne!(
             upstream_fingerprint(Some("https://example.test/Repo")),

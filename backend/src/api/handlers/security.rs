@@ -1866,6 +1866,7 @@ fn scan_config_change_audit(
                 scan_config: Some(scan_config_audit_state(&after)),
                 previous_scan_config: Some(scan_config_audit_state(&before)),
                 scan_config_changed: Some(changed),
+                upstream_change: None,
             }),
     )
 }

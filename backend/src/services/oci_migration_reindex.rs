@@ -41,10 +41,10 @@ use crate::storage::{StorageLocation, StorageRegistry};
 ///
 /// A macro rather than a `const` so it can be spliced into other SQL literals
 /// with `concat!`. The OCI by-digest delete
-/// ([`crate::api::handlers::oci_v2::SOFT_DELETE_MANIFEST_ARTIFACTS_SQL`])
-/// soft-deletes exactly this shape, so every row this repair could pick up for
-/// a deleted digest is tombstoned by that delete (#4450). One definition keeps
-/// the two from drifting.
+/// ([`crate::api::handlers::oci_v2::SELECT_DIGEST_MANIFEST_ROWS_SQL`])
+/// soft-deletes exactly this shape for the image it names, so every row this
+/// repair could pick up for a deleted digest under that image is tombstoned by
+/// that delete (#4450, #4466). One definition keeps the two from drifting.
 macro_rules! reindex_manifest_path_shape_sql {
     () => {
         "(a.path LIKE '%/manifest.json' \
@@ -56,11 +56,18 @@ pub(crate) use reindex_manifest_path_shape_sql;
 
 /// Candidate scan for [`select_unregistered_manifests`].
 ///
-/// The last `NOT EXISTS` is the #4450 guard: a live manifest row is NOT a
-/// candidate when the same manifest (same repository, same checksum) was
-/// explicitly deleted by digest no earlier than this row was last written. The
-/// marker is the soft-deleted `.../manifests/sha256:<hex>` row that delete
-/// leaves; a tag-name delete only tombstones a tag-path row and never matches.
+/// `deleted_by_digest_paths` feeds the #4450 guard: a live manifest row is NOT
+/// a candidate when the same manifest (same repository, same checksum) was
+/// explicitly deleted by digest UNDER THE SAME IMAGE NAME no earlier than this
+/// row was last written. The marker is the soft-deleted
+/// `.../manifests/sha256:<hex>` row that delete leaves; a tag-name delete only
+/// tombstones a tag-path row and never matches. The query returns the marker
+/// paths and [`select_unregistered_manifests`] applies the image-name scope
+/// ([`deleted_by_digest_marker_applies`]), because a by-digest delete is
+/// scoped to its image name (#4466): a marker under `xa` must not stop the
+/// repair of `xb`'s row for the same digest. The image a path names is
+/// derived by the same classifier the repair uses, which no SQL predicate
+/// could mirror across the source layouts.
 /// Without it, a tag row that a by-digest delete missed (an older replica
 /// during a rolling upgrade, or data written before the fix) is
 /// indistinguishable from a never-indexed migrated manifest, and the repair
@@ -87,7 +94,15 @@ const SELECT_UNREGISTERED_MANIFESTS_SQL: &str = concat!(
                a.size_bytes AS size_bytes,
                a.storage_key AS storage_key,
                r.storage_backend AS storage_backend,
-               r.storage_path AS storage_path
+               r.storage_path AS storage_path,
+               ARRAY(
+                   SELECT d.path::text FROM artifacts d
+                   WHERE d.repository_id = a.repository_id
+                     AND d.checksum_sha256 = a.checksum_sha256
+                     AND d.is_deleted = true
+                     AND d.path LIKE ('%/manifests/sha256:' || a.checksum_sha256)
+                     AND COALESCE(d.deleted_at, d.updated_at) >= a.updated_at
+               ) AS deleted_by_digest_paths
         FROM artifacts a
         JOIN repositories r ON r.id = a.repository_id
         WHERE lower(r.format::text) IN ('docker', 'oci')
@@ -99,14 +114,6 @@ const SELECT_UNREGISTERED_MANIFESTS_SQL: &str = concat!(
                 SELECT 1 FROM oci_tags ot
                 WHERE ot.repository_id = a.repository_id
                   AND ot.manifest_digest = 'sha256:' || a.checksum_sha256
-          )
-          AND NOT EXISTS (
-                SELECT 1 FROM artifacts d
-                WHERE d.repository_id = a.repository_id
-                  AND d.checksum_sha256 = a.checksum_sha256
-                  AND d.is_deleted = true
-                  AND d.path LIKE ('%/manifests/sha256:' || a.checksum_sha256)
-                  AND COALESCE(d.deleted_at, d.updated_at) >= a.updated_at
           )
         "#
 );
@@ -372,17 +379,69 @@ async fn select_unregistered_manifests(db: &PgPool) -> sqlx::Result<Vec<RepairCa
 
     let candidates = rows
         .into_iter()
-        .map(|r| RepairCandidate {
-            repository_id: r.try_get("repository_id").unwrap_or_default(),
-            repo_key: r.try_get("repo_key").unwrap_or_default(),
-            path: r.try_get("path").unwrap_or_default(),
-            size_bytes: r.try_get("size_bytes").unwrap_or_default(),
-            storage_key: r.try_get("storage_key").unwrap_or_default(),
-            storage_backend: r.try_get("storage_backend").unwrap_or_default(),
-            storage_path: r.try_get("storage_path").unwrap_or_default(),
+        .map(|r| {
+            let candidate = RepairCandidate {
+                repository_id: r.try_get("repository_id").unwrap_or_default(),
+                repo_key: r.try_get("repo_key").unwrap_or_default(),
+                path: r.try_get("path").unwrap_or_default(),
+                size_bytes: r.try_get("size_bytes").unwrap_or_default(),
+                storage_key: r.try_get("storage_key").unwrap_or_default(),
+                storage_backend: r.try_get("storage_backend").unwrap_or_default(),
+                storage_path: r.try_get("storage_path").unwrap_or_default(),
+            };
+            let markers: Vec<String> = r.try_get("deleted_by_digest_paths").unwrap_or_default();
+            (candidate, markers)
         })
+        .filter(|(c, markers)| {
+            !markers
+                .iter()
+                .any(|m| deleted_by_digest_marker_applies(&c.path, m, &c.repo_key))
+        })
+        .map(|(c, _)| c)
         .collect();
     Ok(candidates)
+}
+
+/// The image name a manifest-shaped `artifacts` row belongs to, derived the
+/// way the repair derives it (`<repo_key>/` prefix stripped, then the source
+/// layout classified). `None` for a path that does not classify as a manifest.
+/// Shared with the OCI by-digest delete, which tombstones only the rows of the
+/// image it names (#4466).
+pub(crate) fn manifest_row_image(path: &str, repo_key: &str) -> Option<String> {
+    let path = strip_repo_prefix(path, repo_key);
+    // The canonical push shape first: a tag may literally be `manifest.json`,
+    // which the source-layout classifier would read as an Artifactory folder.
+    if let Some((image, reference)) = path
+        .strip_prefix("v2/")
+        .and_then(|rest| rest.rsplit_once("/manifests/"))
+    {
+        let image = image.strip_prefix("-/").unwrap_or(image);
+        if !image.is_empty() && !reference.is_empty() && !reference.contains('/') {
+            return Some(image.to_string());
+        }
+    }
+    match classify_oci_source_artifact(path) {
+        OciRole::Manifest { image, .. } => Some(image),
+        _ => None,
+    }
+}
+
+/// Whether the by-digest tombstone at `marker_path` keeps the live row at
+/// `candidate_path` (same repository, same checksum) out of the repair: only
+/// when both name the same image (#4466). A path that does not classify errs
+/// on the side of "deleted stays deleted" (#4450).
+fn deleted_by_digest_marker_applies(
+    candidate_path: &str,
+    marker_path: &str,
+    repo_key: &str,
+) -> bool {
+    match (
+        manifest_row_image(candidate_path, repo_key),
+        manifest_row_image(marker_path, repo_key),
+    ) {
+        (Some(candidate), Some(marker)) => candidate == marker,
+        _ => true,
+    }
 }
 
 /// Strip the `<repo_key>/` prefix that imports before #3533 wrote onto
@@ -1214,12 +1273,96 @@ mod tests {
         // predicate, so the delete tombstones every row the scan could pick up.
         let shape = reindex_manifest_path_shape_sql!();
         assert!(SELECT_UNREGISTERED_MANIFESTS_SQL.contains(shape));
-        assert!(crate::api::handlers::oci_v2::SOFT_DELETE_MANIFEST_ARTIFACTS_SQL.contains(shape));
+        assert!(crate::api::handlers::oci_v2::SELECT_DIGEST_MANIFEST_ROWS_SQL.contains(shape));
         // The guard keys on an explicit by-digest tombstone, bounded in time.
         assert!(SELECT_UNREGISTERED_MANIFESTS_SQL
             .contains("d.path LIKE ('%/manifests/sha256:' || a.checksum_sha256)"));
         assert!(SELECT_UNREGISTERED_MANIFESTS_SQL
             .contains("COALESCE(d.deleted_at, d.updated_at) >= a.updated_at"));
+    }
+
+    /// #4466: the image a manifest row belongs to, across every layout the
+    /// repair understands, with and without the pre-#3533 `<repo_key>/` prefix.
+    #[test]
+    fn manifest_row_image_names_the_image_of_every_layout() {
+        let cases = [
+            ("v2/xa/manifests/v1", Some("xa")),
+            ("v2/team/xa/manifests/sha256:abc", Some("team/xa")),
+            ("v2/-/xa/manifests/v1", Some("xa")),
+            ("xa/v1/manifest.json", Some("xa")),
+            ("xa/sha256__abc/list.manifest.json", Some("xa")),
+            ("rk/v2/xa/manifests/v1", Some("xa")),
+            ("rk/xa/v1/manifest.json", Some("xa")),
+            ("v2/xa/manifests/manifest.json", Some("xa")),
+            ("v2/xa/manifests/list.manifest.json", Some("xa")),
+            ("v2/xa/blobs/sha256:abc", None),
+            ("readme.txt", None),
+        ];
+        for (path, want) in cases {
+            assert_eq!(manifest_row_image(path, "rk").as_deref(), want, "{path}");
+        }
+    }
+
+    /// #4466: a by-digest tombstone only keeps rows of its own image out of
+    /// the repair; an unclassifiable path keeps the #4450 "deleted stays
+    /// deleted" default.
+    #[test]
+    fn deleted_by_digest_marker_applies_only_to_its_image() {
+        let marker = "v2/xa/manifests/sha256:abc";
+        assert!(deleted_by_digest_marker_applies(
+            "v2/xa/manifests/v1",
+            marker,
+            "rk"
+        ));
+        assert!(deleted_by_digest_marker_applies(
+            "rk/xa/v1/manifest.json",
+            marker,
+            "rk"
+        ));
+        assert!(!deleted_by_digest_marker_applies(
+            "v2/xb/manifests/v1",
+            marker,
+            "rk"
+        ));
+        assert!(!deleted_by_digest_marker_applies(
+            "xb/v1/manifest.json",
+            marker,
+            "rk"
+        ));
+        assert!(deleted_by_digest_marker_applies("odd", marker, "rk"));
+        assert!(deleted_by_digest_marker_applies(
+            "v2/xb/manifests/v1",
+            "odd",
+            "rk"
+        ));
+    }
+
+    /// #4466: the by-digest sweep keeps only the rows of the named image.
+    #[test]
+    fn manifest_rows_of_image_keeps_only_the_named_image() {
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let rows = vec![
+            (ids[0], "v2/xa/manifests/v1".to_string(), "rk".to_string()),
+            (ids[1], "v2/xb/manifests/v1".to_string(), "rk".to_string()),
+            (
+                ids[2],
+                "rk/xa/v1/manifest.json".to_string(),
+                "rk".to_string(),
+            ),
+            (
+                ids[3],
+                "v2/xa/blobs/sha256:abc".to_string(),
+                "rk".to_string(),
+            ),
+        ];
+        assert_eq!(
+            crate::api::handlers::oci_v2::manifest_rows_of_image(&rows, "xa"),
+            vec![ids[0], ids[2]]
+        );
+        assert_eq!(
+            crate::api::handlers::oci_v2::manifest_rows_of_image(&rows, "xb"),
+            vec![ids[1]]
+        );
     }
 
     const OCI_MANIFEST_CT: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -1230,6 +1373,7 @@ mod tests {
     struct Rig4450 {
         pool: PgPool,
         repo_id: Uuid,
+        repo_key: String,
         _tmp: tempfile::TempDir,
         storage: crate::storage::filesystem::FilesystemStorage,
         registry: Arc<StorageRegistry>,
@@ -1259,6 +1403,7 @@ mod tests {
             Self {
                 pool,
                 repo_id,
+                repo_key,
                 _tmp: tmp,
                 storage,
                 registry,
@@ -1682,11 +1827,12 @@ mod tests {
         .expect("row state")
     }
 
-    /// The edges of `SOFT_DELETE_MANIFEST_ARTIFACTS_SQL`: a by-digest delete
-    /// tombstones older source-layout `manifest.json` / `list.manifest.json`
-    /// rows for the digest, never touches a non-manifest row with the same
-    /// checksum or the same digest in ANOTHER repository, and leaves rows
-    /// already in the trash (and their `deleted_at`) alone.
+    /// The edges of the by-digest sweep: a by-digest delete tombstones older
+    /// source-layout `manifest.json` / `list.manifest.json` rows of the named
+    /// image for the digest, never touches a non-manifest row with the same
+    /// checksum, the same digest under another image name (#4466) or in
+    /// ANOTHER repository, and leaves rows already in the trash (and their
+    /// `deleted_at`) alone.
     #[tokio::test]
     async fn digest_delete_sweep_scope_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -1703,22 +1849,18 @@ mod tests {
         // The same manifest pushed to a second repository.
         other_repo.push("app", "v1", &body, OCI_MANIFEST_CT).await;
 
-        let legacy = insert_row_4450(
-            &pool,
-            rig.repo_id,
-            "legacy/app/v1/manifest.json",
-            &hex,
-            None,
-        )
-        .await;
+        let legacy = insert_row_4450(&pool, rig.repo_id, "app/v1/manifest.json", &hex, None).await;
         let legacy_list = insert_row_4450(
             &pool,
             rig.repo_id,
-            "legacy/app/v1/list.manifest.json",
+            &format!("{}/app/v1/list.manifest.json", rig.repo_key),
             &hex,
             None,
         )
         .await;
+        // #4466: the same digest under another image name is not swept.
+        let other_image_legacy =
+            insert_row_4450(&pool, rig.repo_id, "other/v1/manifest.json", &hex, None).await;
         let blob_shaped = insert_row_4450(
             &pool,
             rig.repo_id,
@@ -1750,6 +1892,10 @@ mod tests {
             !row_state_4450(&pool, blob_shaped).await.0,
             "a non-manifest row with the same checksum must stay live"
         );
+        assert!(
+            !row_state_4450(&pool, other_image_legacy).await.0,
+            "another image's row for the same digest must stay live (#4466)"
+        );
         assert_eq!(
             row_state_4450(&pool, trashed).await,
             (true, Some("2020-01-02".to_string())),
@@ -1763,6 +1909,136 @@ mod tests {
 
         rig.teardown().await;
         other_repo.teardown().await;
+    }
+
+    /// The state #4466 requires after `xa@digest` is deleted.
+    async fn check_4466(rig: &Rig4450, digest: &str, label: &str) {
+        assert_eq!(rig.tag("xa", "v1").await, None, "{label}: xa:v1 goes");
+        assert_eq!(rig.tag("xa", digest).await, None, "{label}: xa@digest goes");
+        assert_eq!(
+            rig.tag("xb", "v1").await.as_deref(),
+            Some(digest),
+            "{label}: xb:v1 stays"
+        );
+        assert_eq!(
+            rig.tag("xb", digest).await.as_deref(),
+            Some(digest),
+            "{label}: xb@digest stays"
+        );
+        assert_eq!(
+            rig.live_artifacts_for(digest).await,
+            2,
+            "{label}: only xb's two rows stay live"
+        );
+        assert_eq!(rig.manifest_record(digest).await, 1, "{label}");
+    }
+
+    /// #4466 repro: the same manifest pushed under two image names in one
+    /// repository. `DELETE /v2/<repo>/xa/manifests/<digest>` removes `xa`'s
+    /// tags and rows only; `xb:v1` and `xb@digest` stay indexed and live, the
+    /// shared index records (`oci_manifests`, blob refs) stay because `xb`
+    /// still tags the digest, and a restart changes nothing. If `xb` later
+    /// loses its index rows, the tombstone `xa`'s delete left does not stop
+    /// the repair from re-registering `xb`.
+    #[tokio::test]
+    async fn digest_delete_is_scoped_to_the_image_name_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool.clone(), "reidx4466").await;
+
+        let body = image_manifest_4450("shared-4466");
+        let digest = rig.push("xa", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push("xa", &digest, &body, OCI_MANIFEST_CT).await;
+        rig.push("xb", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push("xb", &digest, &body, OCI_MANIFEST_CT).await;
+        let blob_refs = "SELECT COUNT(*) FROM manifest_blob_refs \
+                         WHERE repository_id = $1 AND manifest_digest = $2";
+        let refs_before = rig.count(blob_refs, &digest).await;
+        assert!(refs_before > 0);
+        assert_eq!(rig.live_artifacts_for(&digest).await, 4);
+
+        rig.delete("xa", &digest, &digest).await;
+
+        check_4466(&rig, &digest, "after delete").await;
+        assert_eq!(rig.count(blob_refs, &digest).await, refs_before);
+        rig.restart().await;
+        check_4466(&rig, &digest, "after restart").await;
+
+        // xb loses its index rows by some other route; xa's tombstone must not
+        // keep the repair from restoring xb.
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND name = 'xb'")
+            .bind(rig.repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET updated_at = NOW() - INTERVAL '1 hour' \
+             WHERE repository_id = $1 AND path LIKE 'v2/xb/%' AND is_deleted = false",
+        )
+        .bind(rig.repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        rig.restart().await;
+        assert_eq!(rig.tag("xb", "v1").await.as_deref(), Some(&*digest));
+        assert_eq!(rig.tag("xa", "v1").await, None, "xa:v1 must not come back");
+
+        rig.teardown().await;
+    }
+
+    async fn live_v1_row(rig: &Rig4450, image: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 \
+             AND path = $2 AND is_deleted = false)",
+        )
+        .bind(rig.repo_id)
+        .bind(format!("v2/{image}/manifests/v1"))
+        .fetch_one(&rig.pool)
+        .await
+        .expect("row state")
+    }
+
+    /// #4466, the exact W4C repro: `xa:v1` and `xb:v1` are the same manifest
+    /// pushed BY TAG ONLY (no by-digest row, so no reindex marker is ever
+    /// written). `DELETE xa@digest` removes `xa:v1` and its row only; `xb:v1`
+    /// and its row, the `oci_manifests` record and the blob refs stay, and a
+    /// restart neither drops `xb:v1` nor brings `xa:v1` back.
+    #[tokio::test]
+    async fn digest_delete_of_tag_only_images_is_scoped_to_the_image_name_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool.clone(), "reidx4466t").await;
+
+        let body = image_manifest_4450("tag-only-4466");
+        let digest = rig.push("xa", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push("xb", "v1", &body, OCI_MANIFEST_CT).await;
+        let blob_refs = "SELECT COUNT(*) FROM manifest_blob_refs \
+                         WHERE repository_id = $1 AND manifest_digest = $2";
+        let refs_before = rig.count(blob_refs, &digest).await;
+        rig.delete("xa", &digest, &digest).await;
+        for label in ["after delete", "after restart"] {
+            if label == "after restart" {
+                rig.restart().await;
+            }
+            assert_eq!(rig.tag("xa", "v1").await, None, "{label}: xa:v1 goes");
+            assert!(!live_v1_row(&rig, "xa").await, "{label}: xa's row goes");
+            assert_eq!(
+                rig.tag("xb", "v1").await.as_deref(),
+                Some(&*digest),
+                "{label}: xb:v1 stays"
+            );
+            assert!(live_v1_row(&rig, "xb").await, "{label}: xb's row stays");
+            assert_eq!(rig.manifest_record(&digest).await, 1, "{label}");
+            assert_eq!(rig.count(blob_refs, &digest).await, refs_before, "{label}");
+        }
+
+        rig.teardown().await;
     }
 
     /// Current behaviour of the REST/UI delete of a by-digest row

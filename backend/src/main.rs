@@ -946,6 +946,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
     app_state.set_age_gate_service(age_gate_service);
+    // #4467: move age-gate state recorded under the pre-#4467 fingerprint of a
+    // credentialed upstream URL to the userinfo-free one, so the upgrade does
+    // not restart first-seen clocks or void approvals. Background, idempotent.
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            match artifact_keeper_backend::services::age_gate_service::rekey_all_legacy_fingerprints(&pool).await {
+                Ok(0) => {}
+                Ok(moved) => tracing::info!(moved, "age gate: re-keyed legacy upstream fingerprints"),
+                Err(e) => tracing::warn!(error = %e, "age gate: legacy upstream fingerprint re-key failed; retried on next start"),
+            }
+        });
+    }
 
     // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
     match SmtpService::new(&config) {

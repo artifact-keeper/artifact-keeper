@@ -874,6 +874,39 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The error for an OCI token endpoint that answered `status` (not 2xx).
+///
+/// A 401/403 means the token service refused the Remote's credentials (or the
+/// anonymous request, when none were sent): [`AppError::UpstreamAuth`], a
+/// 502 with its own code, plus a `security`-target line naming the redacted
+/// realm so an operator sees a credentials problem rather than the
+/// `Storage error` / `MANIFEST_UNKNOWN` it used to surface as (#4453).
+/// Neither the log nor the message carries credentials. Any other status
+/// keeps the previous `Storage` classification.
+pub(crate) fn token_endpoint_status_error(
+    realm: &str,
+    status: StatusCode,
+    credentials_sent: bool,
+) -> AppError {
+    let realm = redact_url_for_diagnostics(realm);
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        tracing::warn!(
+            target: "security",
+            realm = %realm,
+            status = %status,
+            credentials_sent,
+            "upstream OCI token service rejected the proxy's authentication; check the \
+             Remote's upstream credentials (and oci_trusted_bearer_realms for a cross-origin \
+             realm)"
+        );
+        return AppError::UpstreamAuth(format!(
+            "upstream token service {realm} returned {status}; check the repository's \
+             upstream credentials"
+        ));
+    }
+    AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
+}
+
 /// Whether `err` is the error [`validate_upstream_status`] produces for an
 /// upstream `403 Forbidden`.
 ///
@@ -3203,11 +3236,11 @@ impl UpstreamClient {
         })?;
 
         if !token_response.status().is_success() {
-            return Err(AppError::Storage(format!(
-                "Token endpoint {} returned status {}",
+            return Err(token_endpoint_status_error(
                 realm,
-                token_response.status()
-            )));
+                token_response.status(),
+                upstream_auth.is_some(),
+            ));
         }
 
         let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
@@ -16951,6 +16984,112 @@ mod tests {
         );
     }
 
+    // -- #4453: a token-service 401/403 is an upstream auth failure ----------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_401_is_upstream_auth_failure_4453() {
+        use crate::services::upstream_auth::UpstreamAuthType;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/broken/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = Uuid::new_v4().simple().to_string();
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc-4453".to_string(),
+            password: secret.clone(),
+        });
+
+        for (realm_path, creds, sent) in [
+            ("/token", &creds, "credentials_sent=true"),
+            ("/forbidden/token", &None, "credentials_sent=false"),
+        ] {
+            let realm = format!("{}{realm_path}?account=svc-4453", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    creds,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            let redacted = format!("{}{realm_path}", server.uri());
+            match err {
+                AppError::UpstreamAuth(msg) => {
+                    assert!(msg.contains(&redacted), "names the token service: {msg}");
+                    assert!(!msg.contains(&secret) && !msg.contains("svc-4453"), "{msg}");
+                }
+                other => panic!("{realm_path}: expected UpstreamAuth, got {other:?}"),
+            }
+            // The operator-facing line: WARN on the `security` target, the
+            // redacted realm, whether credentials were sent, and no secret.
+            let logs = capture.text();
+            assert!(
+                logs.contains("WARN") && logs.contains("security") && logs.contains(sent),
+                "{logs}"
+            );
+            assert!(logs.contains(&redacted), "{logs}");
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4453"),
+                "{logs}"
+            );
+        }
+
+        let realm = format!("{}/broken/token", server.uri());
+        let err = client
+            .obtain_bearer_token(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &creds,
+                &client.http_client,
+            )
+            .await
+            .expect_err("a 500 token response must fail");
+        assert!(matches!(err, AppError::Storage(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_token_endpoint_status_error_redacts_the_realm_4453() {
+        let err = token_endpoint_status_error(
+            "https://bob:pw@auth.example.test/token?account=bob",
+            StatusCode::UNAUTHORIZED,
+            true,
+        );
+        let AppError::UpstreamAuth(msg) = err else {
+            panic!("expected UpstreamAuth");
+        };
+        assert!(msg.contains("https://auth.example.test/token"), "{msg}");
+        assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false),
+            AppError::Storage(_)
+        ));
+    }
+
     // -- #3606: the token cache is scoped to the credential ------------------
 
     #[test]
@@ -17574,7 +17713,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/token"))
-            .respond_with(ResponseTemplate::new(403))
+            .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
@@ -17585,10 +17724,12 @@ mod tests {
         let err = client
             .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
-            .expect_err("a 403 from the token endpoint must surface as an error");
+            .expect_err("a 404 from the token endpoint must surface as an error");
+        // 401/403 are upstream auth failures (#4453, tested separately); any
+        // other non-2xx status stays a Storage error.
         assert!(
             matches!(err, AppError::Storage(_)),
-            "non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
+            "non-auth non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
         );
     }
 
