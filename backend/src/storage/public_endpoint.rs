@@ -47,7 +47,11 @@ pub(crate) fn parse_public_endpoint(
     if raw.is_empty() {
         return Ok(None);
     }
-    let invalid = |why: &str| AppError::Config(format!("{var}={raw:?} is invalid: {why}"));
+    // The value is echoed into a fatal startup error (or a WARN for a
+    // secondary backend), so never with its userinfo: a value refused for
+    // carrying credentials must not log them (#4503).
+    let shown = redact_userinfo(raw);
+    let invalid = |why: &str| AppError::Config(format!("{var}={shown:?} is invalid: {why}"));
     let url = url::Url::parse(raw).map_err(|e| invalid(&format!("not an absolute URL ({e})")))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid("the scheme must be http or https"));
@@ -70,6 +74,21 @@ pub(crate) fn parse_public_endpoint(
     }
     let origin = &url[..url::Position::BeforePath];
     Ok(Some(format!("{origin}{url_path}")))
+}
+
+/// `raw` with any userinfo (`user:password@`) in its authority replaced by
+/// `***`, for error messages (#4503). Works on the raw text, not on a parsed
+/// URL, so a value too malformed to parse is redacted too: the authority is
+/// what follows `scheme://` (or the start, without one) up to the first `/`,
+/// `?` or `#`, and everything before its last `@` is userinfo.
+fn redact_userinfo(raw: &str) -> String {
+    let start = raw.find("://").map_or(0, |i| i + 3);
+    let rest = &raw[start..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_len].rfind('@') {
+        Some(at) => format!("{}***{}", &raw[..start], &rest[at..]),
+        None => raw.to_string(),
+    }
 }
 
 /// Read and validate the public endpoint named `var` from the environment.
@@ -137,6 +156,63 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("S3_PUBLIC_ENDPOINT"), "{raw}: {msg}");
         }
+    }
+
+    /// #4503: a value refused for carrying credentials (or for anything
+    /// else) never echoes them into the startup error or WARN.
+    #[test]
+    fn rejection_messages_never_contain_credentials_4503() {
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = uuid::Uuid::new_v4().simple().to_string();
+        for (raw, shown) in [
+            (
+                format!("http://svc:{secret}@192.168.42.150:32613"),
+                "http://***@192.168.42.150:32613",
+            ),
+            (
+                format!("https://{secret}@storage.example.com/s3"),
+                "https://***@storage.example.com/s3",
+            ),
+            // Rejected for another reason first, still redacted.
+            (
+                format!("ftp://svc:{secret}@storage.example.com"),
+                "ftp://***@storage.example.com",
+            ),
+            // No scheme: not an absolute URL, still redacted.
+            (
+                format!("svc:{secret}@storage.example.com:9000"),
+                "***@storage.example.com:9000",
+            ),
+        ] {
+            for (var, path) in [
+                ("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden),
+                ("AZURE_STORAGE_PUBLIC_ENDPOINT", EndpointPath::Allowed),
+            ] {
+                let msg = parse_public_endpoint(var, &raw, path)
+                    .expect_err(&raw)
+                    .to_string();
+                assert!(!msg.contains(&secret), "{var}: {msg}");
+                assert!(!msg.contains("svc"), "{var}: {msg}");
+                assert!(msg.contains(var) && msg.contains(shown), "{var}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_userinfo_leaves_other_values_alone_4503() {
+        for raw in [
+            "https://s3.example.com",
+            "https://storage.example.com/path@v1",
+            "https://storage.example.com?x=a@b",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw);
+        }
+        assert_eq!(
+            redact_userinfo("http://a@b@host:1/p"),
+            "http://***@host:1/p"
+        );
     }
 
     #[test]
