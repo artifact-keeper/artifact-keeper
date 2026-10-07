@@ -64,6 +64,11 @@ pub async fn upsert(
     upstream_url: Option<&str>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    // #4463: the fetched URL is built from the Remote's `upstream_url`, which
+    // may embed `user:password@`. The column is only a record of where the
+    // bytes came from, so it never needs the credentials.
+    let upstream_url =
+        upstream_url.map(|u| crate::services::proxy_service::strip_url_userinfo(u).0);
     sqlx::query(
         r#"
         INSERT INTO proxy_cache_artifacts
@@ -1015,6 +1020,40 @@ mod tests {
         assert_eq!(rows[0].size_bytes, 250, "size updated to the latest write");
         assert_eq!(rows[0].checksum_sha256.as_deref(), Some("bbb"));
         assert_eq!(sum_by_repo(&pool, repo).await.unwrap(), 250);
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #4463: a fetch through a Remote whose URL embeds credentials records
+    /// the upstream URL without them.
+    #[tokio::test]
+    async fn test_upsert_strips_upstream_userinfo_4463() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let fetched = format!("https://{}@up.example.test/base/p", "alice:s3cret");
+        upsert(
+            &pool,
+            repo,
+            "p",
+            "k",
+            "m",
+            1,
+            None,
+            None,
+            Some(&fetched),
+            None,
+        )
+        .await
+        .expect("upsert");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT upstream_url FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .expect("read row");
+        assert_eq!(stored.as_deref(), Some("https://up.example.test/base/p"));
         cleanup_repo(&pool, repo).await;
     }
 

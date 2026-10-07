@@ -23,14 +23,15 @@ enum ResolverMode {
     /// but keep metadata/loopback/link-local blocked.
     TrustedInternal,
     /// Webhook delivery target: private/CGNAT/ULA permitted only when
-    /// `WEBHOOK_ALLOW_PRIVATE_IPS` (or the shared
-    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist) opts the address in;
-    /// otherwise identical to [`ResolverMode::Upstream`].
+    /// `WEBHOOK_ALLOW_PRIVATE_IPS` or the shared
+    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist opts the address in (the two
+    /// are additive here, #4428); otherwise identical to
+    /// [`ResolverMode::Upstream`].
     Webhook,
     /// SSO/OIDC discovery-token-JWKS-userinfo fetch against a configured
     /// IdP: private/CGNAT/ULA permitted only when `SSO_ALLOW_PRIVATE_IPS`
-    /// (or `AK_SSRF_ALLOW_PRIVATE_CIDRS`) opts the address in; otherwise
-    /// identical to [`ResolverMode::Upstream`].
+    /// or `AK_SSRF_ALLOW_PRIVATE_CIDRS` opts the address in (the two are
+    /// additive, #4474); otherwise identical to [`ResolverMode::Upstream`].
     SsoDiscovery,
 }
 
@@ -209,16 +210,19 @@ pub fn ssrf_guard_resolver_internal() -> Arc<dyn Resolve> {
 
 /// `Arc<dyn Resolve>` for webhook-delivery clients: private/CGNAT/ULA
 /// targets pass only when the operator has opted in via
-/// `WEBHOOK_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
-/// metadata/loopback/link-local hard-blocks always apply (issue #2380).
+/// `WEBHOOK_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS` (either
+/// suffices: the toggle is not switched off by a configured CIDR list,
+/// #4428); the metadata/loopback/link-local hard-blocks always apply
+/// (issue #2380).
 pub fn ssrf_guard_resolver_webhook() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::Webhook))
 }
 
 /// `Arc<dyn Resolve>` for SSO/OIDC-fetch clients: private/CGNAT/ULA
 /// targets pass only when the operator has opted in via
-/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
-/// metadata/loopback/link-local hard-blocks always apply (issue #2380).
+/// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS` (either
+/// suffices, #4474); the metadata/loopback/link-local hard-blocks always
+/// apply (issue #2380).
 pub fn ssrf_guard_resolver_sso() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::SsoDiscovery))
 }
@@ -506,6 +510,38 @@ mod tests {
                 "sso mode must STILL drop the private address (webhook toggle must not leak)"
             );
         });
+    }
+
+    /// #4428 / #4474: the webhook and SSO resolver modes honour their
+    /// toggles even when the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` list is
+    /// configured and does not cover the address; upstream keeps the list
+    /// authoritative under the same environment.
+    #[test]
+    fn webhook_mode_toggle_is_additive_to_shared_cidr_list() {
+        with_toggles(
+            &[
+                ("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16"),
+                ("WEBHOOK_ALLOW_PRIVATE_IPS", "true"),
+                ("SSO_ALLOW_PRIVATE_IPS", "true"),
+                ("UPSTREAM_ALLOW_PRIVATE_IPS", "true"),
+            ],
+            || {
+                let outside: SocketAddr = "10.0.0.5:0".parse().unwrap();
+                let inside: SocketAddr = "10.244.0.5:0".parse().unwrap();
+                for mode in [ResolverMode::Webhook, ResolverMode::SsoDiscovery] {
+                    assert_eq!(
+                        filter_allowed(mode, [outside, inside]),
+                        vec![outside, inside],
+                        "{mode:?} must keep a private address outside the CIDR list"
+                    );
+                }
+                assert_eq!(
+                    filter_allowed(ResolverMode::Upstream, [outside, inside]),
+                    vec![inside],
+                    "upstream mode must keep the CIDR list authoritative"
+                );
+            },
+        );
     }
 
     /// SSO mode with no toggle set must drop a private address.

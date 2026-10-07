@@ -57,6 +57,15 @@ impl CreateLifecyclePolicyRequest {
     }
 }
 
+/// Repositories an update must check for an inert Remote assignment (#3734):
+/// all of them when the config changes, else only those the update adds.
+fn inert_check_scope(config_changed: bool, ids: &[Uuid], existing: &[Uuid]) -> Vec<Uuid> {
+    ids.iter()
+        .filter(|id| config_changed || !existing.contains(id))
+        .copied()
+        .collect()
+}
+
 fn validate_schedule(schedule: Option<&str>) -> Result<()> {
     if let Some(expression) = schedule {
         if cron::Schedule::from_str(&normalize_cron_expression(expression)).is_err() {
@@ -182,6 +191,9 @@ impl LifecycleService {
         let ids = req.assigned_repositories()?;
         self.validate_policy_config(&req.policy_type, &req.config)?;
         validate_schedule(req.cron_schedule.as_deref())?;
+        // Compiled on its own connection before the write transaction takes
+        // any lock (#4461).
+        validate_regexes_in_postgres(&self.db, &req.policy_type, &req.config).await?;
 
         let mut tx = self
             .db
@@ -190,6 +202,7 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         let found = Self::lock_repositories(&mut tx, &ids).await?;
         Self::require_repositories(&ids, &found)?;
+        Self::reject_inert_remote_assignments(&mut tx, &req.policy_type, &req.config, &ids).await?;
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO lifecycle_policies \
              (applies_to_all, name, description, policy_type, config, priority, cron_schedule, \
@@ -243,16 +256,36 @@ impl LifecycleService {
         id: Uuid,
         req: UpdateLifecyclePolicyRequest,
     ) -> Result<LifecyclePolicy> {
+        // A changed config's regexes are compiled on their own connection
+        // before the write transaction takes any lock (#4461). `policy_type`
+        // is immutable, so this unlocked read is safe; a client re-sending
+        // the stored config is not changing it and is not re-checked.
+        if let Some(config) = &req.config {
+            let current = self.get_policy(id).await?;
+            if *config != current.config {
+                validate_regexes_in_postgres(&self.db, &current.policy_type, config).await?;
+            }
+        }
         let (mut tx, existing) = self
             .assignment_transaction(id, req.repository_ids.as_deref().unwrap_or_default())
             .await?;
         let applies_to_all = req.applies_to_all.unwrap_or(existing.applies_to_all);
         let ids = normalize_scope(
             applies_to_all,
-            req.repository_ids.unwrap_or(existing.repository_ids),
+            req.repository_ids
+                .unwrap_or_else(|| existing.repository_ids.clone()),
         )?;
+        // Compared, not `is_some()`: a client that always re-sends the stored
+        // config is not changing it.
+        let config_changed = req.config.as_ref().is_some_and(|c| *c != existing.config);
         let config = req.config.unwrap_or(existing.config);
         self.validate_policy_config(&existing.policy_type, &config)?;
+        // A new config is checked against every assignment; otherwise only
+        // newly added repositories are, so a policy assigned before #3734 can
+        // still be renamed or disabled.
+        let checked = inert_check_scope(config_changed, &ids, &existing.repository_ids);
+        Self::reject_inert_remote_assignments(&mut tx, &existing.policy_type, &config, &checked)
+            .await?;
         let schedule = req.cron_schedule.or(existing.cron_schedule);
         validate_schedule(schedule.as_deref())?;
         sqlx::query(
@@ -292,6 +325,15 @@ impl LifecycleService {
                 "Global policies cannot be attached to or detached from individual repositories"
                     .into(),
             ));
+        }
+        if attached && !policy.repository_ids.contains(&repository_id) {
+            Self::reject_inert_remote_assignments(
+                &mut tx,
+                &policy.policy_type,
+                &policy.config,
+                &[repository_id],
+            )
+            .await?;
         }
         let mut ids = policy.repository_ids;
         if attached {

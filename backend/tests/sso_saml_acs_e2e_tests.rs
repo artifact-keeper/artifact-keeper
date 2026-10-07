@@ -1234,10 +1234,12 @@ fn fresh_slug(prefix: &str) -> String {
 }
 
 /// Recover the AuthnRequest XML the SP emitted from the login redirect: the
-/// `SAMLRequest` query parameter is URL-encoded, base64 (standard alphabet)
-/// XML — see `SamlService::create_authn_request`.
+/// `SAMLRequest` query parameter is URL-encoded, base64 (standard alphabet),
+/// raw-DEFLATE XML (HTTP-Redirect binding, #4475) — see
+/// `SamlService::create_authn_request`.
 fn decode_authn_request(redirect_url: &str) -> String {
     use base64::Engine;
+    use std::io::Read;
     let encoded = redirect_url
         .split(['?', '&'])
         .find_map(|p| p.strip_prefix("SAMLRequest="))
@@ -1246,7 +1248,11 @@ fn decode_authn_request(redirect_url: &str) -> String {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(decoded.as_bytes())
         .expect("SAMLRequest is base64");
-    String::from_utf8(bytes).expect("AuthnRequest is UTF-8")
+    let mut xml = String::new();
+    flate2::read::DeflateDecoder::new(bytes.as_slice())
+        .read_to_string(&mut xml)
+        .expect("SAMLRequest is raw DEFLATE of UTF-8 XML");
+    xml
 }
 
 /// A validly signed assertion POSTed to `/saml/{slug}/acs` authenticates

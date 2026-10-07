@@ -274,7 +274,9 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 
 /// Core handler keys whose Remote/Virtual download path enforces the inline
 /// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
-/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, npm, PyPI, VS Code) or,
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Maven, npm,
+/// NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
+/// repositories, and `nuget` serves `chocolatey` and `powershell`) or,
 /// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
 ///
 /// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
@@ -283,7 +285,9 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// reads every format handler's source and fails when a handler reaches the
 /// gate without being listed here, or is listed without reaching it, so the
 /// capability cannot drift from the router. Adopting the gate in a new format
-/// (#4100 Maven, #4102 NuGet, ...) adds its key here.
+/// adds its key here, and a row to the coverage table in
+/// `docs/security/scan-on-proxy.md` (#4114), which
+/// `scan_on_proxy_coverage_doc_matches_the_capability` keeps in step.
 ///
 /// `enforced` is a per-FORMAT capability: the format's proxy path runs the
 /// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
@@ -291,8 +295,20 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
 /// the formats API carries no mode indicator: under `record_only` an
 /// `enforced` format still scans and records every pull, and serves it.
+///
+/// It is also per handler, not per file type. Maven/sbt scan every proxied
+/// file except an allowlist of non-package files (POMs, `.xml` metadata,
+/// Gradle `.module`, checksums, signatures, and `-sources`/`-javadoc` jars,
+/// skipped by name). Only `.jar`/`.war`/`.ear` carry an identity pin, and
+/// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
+/// they are scanned as raw files, not unpacked (#4100). NuGet scans every
+/// proxied flat-container and V2 package file except the `.nuspec` manifest
+/// (#4102).
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
     "cargo", // #4101
+    "maven", // #4100 (also serves gradle)
+    "nuget", // #4102 (also serves chocolatey and powershell)
+    "sbt",   // #4100
     "npm", "oci", "pypi", "vscode",
 ];
 

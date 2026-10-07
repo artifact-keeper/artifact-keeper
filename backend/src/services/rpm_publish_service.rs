@@ -32,6 +32,7 @@ use crate::api::handlers::rpm::{
 };
 use crate::error::AppError;
 use crate::formats::rpm::{generate_repomd, RepoMdChecksum, RepoMdData, RepoMdLocation};
+use crate::services::cluster_lock::{lease_object_id, ClusterLease, ClusterLock, PgAdvisoryLock};
 use crate::services::curation_sync::RpmPackageMetadata;
 use crate::services::signing_service::SigningService;
 use crate::storage::StorageBackend;
@@ -306,6 +307,16 @@ pub async fn publish(
     repo_id: Uuid,
     version_number: i64,
 ) -> Result<PublishSummary, AppError> {
+    // Serialise publishes of this version (#4421). Without it, two concurrent
+    // calls both pass the `published_at` check below and write the same
+    // repodata keys, so repomd.xml and repomd.xml.asc can come from different
+    // writers. The loser fails fast with 409 instead of overwriting the
+    // winner's blobs. Held until this publish has marked the version; the
+    // immutability check runs under it, so a publish that starts after the
+    // winner finished sees `published_at` set. Any early return drops the
+    // lease, which releases the lock.
+    let publish_lock = acquire_publish_lock(db, repo_id, version_number).await?;
+
     // Resolve the version and guard immutability. Scope to repo_id so a version
     // number is only ever resolvable within its own repository.
     let row: Option<(Uuid, Option<DateTime<Utc>>)> = sqlx::query_as(
@@ -494,6 +505,10 @@ pub async fn publish(
         &storage_prefix,
     )
     .await?;
+    // The version is published; releasing the lock is best effort and can
+    // never turn this success into an error (`release` logs its own failures,
+    // and the lock dies with its detached connection regardless).
+    publish_lock.release().await;
 
     Ok(PublishSummary {
         version_number,
@@ -503,8 +518,52 @@ pub async fn publish(
     })
 }
 
+/// Advisory-lock class (`classid`) for RPM curation publishes (#4421).
+const RPM_PUBLISH_LOCK_CLASS: i32 = 0x4421;
+
+/// Take the per-version publish lock (#4421): a session advisory lock on
+/// `(RPM_PUBLISH_LOCK_CLASS, hash(repo_id, version_number))`, held on a
+/// DETACHED connection ([`PgAdvisoryLock`]). Detached means it is not an idle
+/// open transaction (so `idle_in_transaction_session_timeout` cannot kill it
+/// mid-publish) and it does not hold a pooled connection while the publish
+/// itself runs its queries on `db`; the lock is released when the lease is
+/// released or dropped, or when that connection dies. A second concurrent
+/// publish of the same version gets 409 rather than waiting and then
+/// rewriting the winner's immutable repodata. A 32-bit hash collision between
+/// two versions can only cause a spurious 409, never a missed one.
+///
+/// [`PgAdvisoryLock`]: crate::services::cluster_lock::PgAdvisoryLock
+async fn acquire_publish_lock(
+    db: &PgPool,
+    repo_id: Uuid,
+    version_number: i64,
+) -> Result<ClusterLease, AppError> {
+    let object = lease_object_id(&publish_lock_key(repo_id, version_number));
+    PgAdvisoryLock::new(db.clone())
+        .try_acquire(RPM_PUBLISH_LOCK_CLASS, object)
+        .await?
+        .ok_or_else(|| publish_in_progress(version_number))
+}
+
+/// Advisory-lock key text for publishing `version_number` of `repo_id`.
+fn publish_lock_key(repo_id: Uuid, version_number: i64) -> String {
+    format!("rpm-publish:{repo_id}:{version_number}")
+}
+
+/// 409 for a publish that lost the race to a concurrent one (#4421).
+fn publish_in_progress(version_number: i64) -> AppError {
+    AppError::Conflict(format!(
+        "Version {version_number} is already being published by another request"
+    ))
+}
+
 /// Mark `version_id` published under `storage_prefix` and make it the
 /// repository's active publication.
+///
+/// The UPDATE only matches an unpublished version (`published_at IS NULL`,
+/// #4421), so a version is marked published exactly once. When the version
+/// exists but is already published, this returns 409 WITHOUT touching
+/// storage: the blobs under the prefix are the winner's.
 ///
 /// The repository row is locked FIRST, in the same order the version retention
 /// pass takes its locks (#2359), so the two cannot deadlock. If retention
@@ -532,7 +591,7 @@ async fn mark_published(
         r#"UPDATE repository_versions
            SET published_at = now(), repomd_storage_key = $2,
                storage_prefix = $3, signature_storage_key = $4
-           WHERE id = $1"#,
+           WHERE id = $1 AND published_at IS NULL"#,
     )
     .bind(version_id)
     .bind(&repomd_key)
@@ -542,7 +601,17 @@ async fn mark_published(
     .await?
     .rows_affected();
     if marked == 0 {
+        let still_exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM repository_versions WHERE id = $1")
+                .bind(version_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         drop(tx);
+        if still_exists.is_some() {
+            return Err(AppError::Conflict(format!(
+                "Version {version_number} is already published and its @N metadata is immutable"
+            )));
+        }
         for name in PUBLICATION_REPODATA_FILES {
             let _ = storage.delete(&format!("{storage_prefix}/{name}")).await;
         }
@@ -1293,6 +1362,190 @@ mod tests {
         tdh::cleanup(&pool, repo, actor).await;
     }
 
+    /// A staging RPM repository with one approved package, a gpg signing key
+    /// bound for metadata signing, and one created (unpublished) version.
+    struct PublishFixture {
+        staging: Uuid,
+        remote: Uuid,
+        actor: Uuid,
+        signing: SigningService,
+        storage: std::sync::Arc<dyn StorageBackend>,
+        created: VersionSummary,
+    }
+
+    impl PublishFixture {
+        async fn new(pool: &PgPool, key_name: &str) -> Self {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::services::signing_service::CreateKeyRequest;
+            let (staging, _sk, dir) = tdh::create_repo(pool, "staging", "rpm").await;
+            let (remote, _rk, _rd) = tdh::create_repo(pool, "remote", "rpm").await;
+            let (actor, _n) = tdh::create_user(pool).await;
+            seed_approved_pkg(
+                pool,
+                staging,
+                remote,
+                "bash",
+                Some(sample_meta_json("bash")),
+            )
+            .await;
+            // A GPG (OpenPGP) key so publish emits a real detached signature.
+            let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
+            let key = signing
+                .create_key(CreateKeyRequest {
+                    repository_id: Some(staging),
+                    name: key_name.to_string(),
+                    key_type: "gpg".to_string(),
+                    algorithm: "rsa2048".to_string(),
+                    uid_name: None,
+                    uid_email: None,
+                    created_by: Some(actor),
+                })
+                .await
+                .expect("create signing key");
+            signing
+                .update_signing_config(staging, Some(key.id), true, false, false)
+                .await
+                .expect("set signing config");
+            let created = create_version(pool, staging, actor).await.expect("version");
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let backend: String =
+                sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
+                    .bind(staging)
+                    .fetch_one(pool)
+                    .await
+                    .expect("repo storage backend");
+            let storage = state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend,
+                    path: dir.to_string_lossy().to_string(),
+                })
+                .expect("storage backend");
+            Self {
+                staging,
+                remote,
+                actor,
+                signing,
+                storage,
+                created,
+            }
+        }
+    }
+
+    // #4421: two publishers of one version. The second to mark it gets 409
+    // and must leave the first publisher's repodata alone; it must not move
+    // `published_at` or reuse the prune-cleanup path.
+    #[tokio::test]
+    async fn test_mark_published_twice_conflicts_without_cleanup_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.to_str().unwrap());
+        let version_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repository_versions (repository_id, version_number) \
+             VALUES ($1, 3) RETURNING id",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let prefix = publication_prefix(repo, 3);
+        for name in PUBLICATION_REPODATA_FILES {
+            put_blob(&storage, &format!("{prefix}/{name}"), b"winner".to_vec())
+                .await
+                .unwrap();
+        }
+        let db = &pool;
+        let published_at = || async move {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT published_at FROM repository_versions WHERE id = $1",
+            )
+            .bind(version_id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+        };
+
+        mark_published(&pool, &storage, repo, version_id, 3, &prefix)
+            .await
+            .expect("first publisher marks the version");
+        let first = published_at().await.expect("published");
+        let err = mark_published(&pool, &storage, repo, version_id, 3, &prefix)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Conflict(m) if m.contains("already published")),
+            "{err:?}"
+        );
+        assert_eq!(
+            published_at().await,
+            Some(first),
+            "published_at is not moved"
+        );
+        for name in PUBLICATION_REPODATA_FILES {
+            let blob = storage.get(&format!("{prefix}/{name}")).await.unwrap();
+            assert_eq!(&blob[..], b"winner", "{name} must survive the loser");
+        }
+        tdh::cleanup(&pool, repo, actor).await;
+    }
+
+    // #4421: while one publish of a version holds the publish lock, a second
+    // concurrent publish of the same, real, publishable version is refused
+    // with 409 and writes nothing; once the lock is released the version
+    // publishes normally.
+    #[tokio::test]
+    async fn test_concurrent_publish_of_one_version_conflicts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let PublishFixture {
+            staging,
+            remote,
+            actor,
+            signing,
+            storage,
+            created,
+        } = PublishFixture::new(&pool, "race-key").await;
+        let n = created.version_number;
+
+        let first = acquire_publish_lock(&pool, staging, n)
+            .await
+            .expect("first publisher takes the lock");
+        let second = publish(&pool, storage.as_ref(), &signing, staging, n).await;
+        assert!(
+            matches!(&second, Err(AppError::Conflict(m)) if m.contains("being published")),
+            "{second:?}"
+        );
+        let prefix = publication_prefix(staging, n);
+        for name in PUBLICATION_REPODATA_FILES {
+            assert!(
+                !storage.exists(&format!("{prefix}/{name}")).await.unwrap(),
+                "the refused publisher must not write {name}"
+            );
+        }
+        let published: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT published_at FROM repository_versions WHERE id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(published, None);
+
+        first.release().await;
+        publish(&pool, storage.as_ref(), &signing, staging, n)
+            .await
+            .expect("the lock is released; the version publishes");
+        assert_eq!(
+            publish_lock_key(staging, n),
+            format!("rpm-publish:{staging}:{n}")
+        );
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
     // Two creates allocate monotonic, distinct version numbers (1 then 2).
     #[tokio::test]
     async fn test_create_version_monotonic_db() {
@@ -1506,59 +1759,17 @@ mod tests {
     #[tokio::test]
     async fn test_publish_stores_signed_repodata_and_sets_active_db() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::signing_service::{CreateKeyRequest, SigningService};
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
-        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
-        let (actor, _n) = tdh::create_user(&pool).await;
-        seed_approved_pkg(
-            &pool,
+        let PublishFixture {
             staging,
             remote,
-            "bash",
-            Some(sample_meta_json("bash")),
-        )
-        .await;
-
-        // A GPG (OpenPGP) signing key + metadata-signing config so publish emits
-        // a real detached OpenPGP repomd.xml.asc.
-        let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
-        let key = signing
-            .create_key(CreateKeyRequest {
-                repository_id: Some(staging),
-                name: "e2e-key".to_string(),
-                key_type: "gpg".to_string(),
-                algorithm: "rsa2048".to_string(),
-                uid_name: None,
-                uid_email: None,
-                created_by: Some(actor),
-            })
-            .await
-            .expect("create signing key");
-        signing
-            .update_signing_config(staging, Some(key.id), true, false, false)
-            .await
-            .expect("set signing config");
-
-        let created = create_version(&pool, staging, actor)
-            .await
-            .expect("version");
-
-        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
-        let backend: String =
-            sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
-                .bind(staging)
-                .fetch_one(&pool)
-                .await
-                .expect("repo storage backend");
-        let storage = state
-            .storage_for_repo(&crate::storage::StorageLocation {
-                backend,
-                path: dir.to_string_lossy().to_string(),
-            })
-            .expect("storage backend");
+            actor,
+            signing,
+            storage,
+            created,
+        } = PublishFixture::new(&pool, "e2e-key").await;
 
         let summary = publish(
             &pool,
@@ -1722,57 +1933,18 @@ mod tests {
     #[tokio::test]
     async fn test_published_at_n_signature_verifies_and_rejects_tamper_db() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::signing_service::{verify_detached, CreateKeyRequest, SigningService};
+        use crate::services::signing_service::verify_detached;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
-        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
-        let (actor, _n) = tdh::create_user(&pool).await;
-        seed_approved_pkg(
-            &pool,
+        let PublishFixture {
             staging,
             remote,
-            "bash",
-            Some(sample_meta_json("bash")),
-        )
-        .await;
-
-        // A GPG (OpenPGP) key so the detached signature is real armored OpenPGP.
-        let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
-        let key = signing
-            .create_key(CreateKeyRequest {
-                repository_id: Some(staging),
-                name: "e2e-verify-key".to_string(),
-                key_type: "gpg".to_string(),
-                algorithm: "rsa2048".to_string(),
-                uid_name: None,
-                uid_email: None,
-                created_by: Some(actor),
-            })
-            .await
-            .expect("create signing key");
-        signing
-            .update_signing_config(staging, Some(key.id), true, false, false)
-            .await
-            .expect("set signing config");
-
-        let created = create_version(&pool, staging, actor)
-            .await
-            .expect("version");
-        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
-        let backend: String =
-            sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
-                .bind(staging)
-                .fetch_one(&pool)
-                .await
-                .expect("repo storage backend");
-        let storage = state
-            .storage_for_repo(&crate::storage::StorageLocation {
-                backend,
-                path: dir.to_string_lossy().to_string(),
-            })
-            .expect("storage backend");
+            actor,
+            signing,
+            storage,
+            created,
+        } = PublishFixture::new(&pool, "e2e-verify-key").await;
 
         let summary = publish(
             &pool,

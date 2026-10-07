@@ -250,6 +250,31 @@ pub struct TokenPair {
     pub expires_in: u64,
 }
 
+/// An access token minted without a refresh token
+/// ([`AuthService::generate_access_token_capped`]).
+#[derive(Debug, Serialize)]
+pub struct AccessToken {
+    pub access_token: String,
+    pub expires_in: u64,
+}
+
+impl From<TokenPair> for AccessToken {
+    fn from(pair: TokenPair) -> Self {
+        Self {
+            access_token: pair.access_token,
+            expires_in: pair.expires_in,
+        }
+    }
+}
+
+/// An [`AccessToken`] plus the instants a paired refresh token must share.
+struct MintedAccess {
+    token: AccessToken,
+    now: DateTime<Utc>,
+    iat_secs: i64,
+    iat_ms: i64,
+}
+
 /// How long a validated API token result is kept in the in-memory cache before
 /// the full DB + bcrypt verification is repeated.  Five minutes balances
 /// performance (cargo makes ~40 authenticated requests per build) against
@@ -1883,8 +1908,6 @@ impl AuthService {
         )
     }
 
-    /// The single place a scoped access claim is built, so the read-only
-    /// subset is stamped exactly once (#4213 review).
     #[allow(clippy::too_many_arguments)]
     fn generate_token_pair_capped_with_read_expansion(
         &self,
@@ -1896,6 +1919,75 @@ impl AuthService {
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
     ) -> Result<TokenPair> {
+        let access = self.mint_access_token(
+            user,
+            allowed_repo_ids,
+            read_expansion_repo_ids,
+            scopes.clone(),
+            credential_exp,
+        )?;
+        let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
+
+        let refresh_jti = Uuid::new_v4();
+        let refresh_claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
+            iat: access.iat_secs,
+            iat_ms: Some(access.iat_ms),
+            exp: refresh_exp.timestamp(),
+            token_type: refresh_token_type.to_string(),
+            jti: Some(refresh_jti),
+            family_id: Some(family_id),
+            scan_pull_repo: None,
+            scopes,
+        };
+
+        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
+
+        Ok(TokenPair {
+            access_token: access.token.access_token,
+            refresh_token,
+            expires_in: access.token.expires_in,
+        })
+    }
+
+    /// Mint an ACCESS token only, with the same expiry cap and claims as the
+    /// access half of [`AuthService::generate_tokens_with_scope_capped`], and
+    /// no refresh token at all.
+    ///
+    /// For exchanges whose credential must not be renewable, such as a
+    /// Kubernetes CI OIDC exchange whose result a kubelet caches on a node:
+    /// no refresh JWT is signed, so there is nothing to persist, leak or
+    /// replay, rather than one minted and then discarded.
+    pub fn generate_access_token_capped(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<AccessToken> {
+        Ok(self
+            .mint_access_token(user, allowed_repo_ids, Vec::new(), scopes, credential_exp)?
+            .token)
+    }
+
+    /// The access half of every token mint: claims, the exchange cap on
+    /// `exp`, and the `iat`/`iat_ms` anchor a paired refresh token shares.
+    /// The single place a scoped access claim is built, so the read-only
+    /// subset is stamped exactly once (#4213 review).
+    fn mint_access_token(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
+        scopes: Option<Vec<String>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<MintedAccess> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
@@ -1920,7 +2012,6 @@ impl AuthService {
             now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
             credential_exp,
         );
-        let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let access_claims = Claims {
             sub: user.id,
@@ -1939,39 +2030,22 @@ impl AuthService {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
-            scopes: scopes.clone(),
-        };
-
-        let refresh_jti = Uuid::new_v4();
-        let refresh_claims = Claims {
-            sub: user.id,
-            username: user.username.clone(),
-            email: user.email.clone(),
-            is_admin: user.is_admin,
-            allowed_repo_ids: None,
-            read_expansion_repo_ids: None,
-            iat: iat_secs,
-            iat_ms: Some(now_ms),
-            exp: refresh_exp.timestamp(),
-            token_type: refresh_token_type.to_string(),
-            jti: Some(refresh_jti),
-            family_id: Some(family_id),
-            scan_pull_repo: None,
             scopes,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
 
-        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
-            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
-
-        Ok(TokenPair {
-            access_token,
-            refresh_token,
-            // Reflect the (possibly capped) real expiry so exchange clients
-            // schedule renewal correctly.
-            expires_in: (access_exp - now).num_seconds().max(0) as u64,
+        Ok(MintedAccess {
+            token: AccessToken {
+                access_token,
+                // Reflect the (possibly capped) real expiry so exchange
+                // clients schedule renewal correctly.
+                expires_in: (access_exp - now).num_seconds().max(0) as u64,
+            },
+            now,
+            iat_secs,
+            iat_ms: now_ms,
         })
     }
 
@@ -9906,5 +9980,130 @@ mod tests {
             .generate_tokens_with_scope_capped(&user, None, None, Some(far))
             .expect("mint far-capped");
         assert_eq!(far_pair.expires_in as i64, base_secs);
+    }
+
+    #[tokio::test]
+    async fn test_shared_access_minter_preserves_capped_read_expansion() {
+        use crate::api::middleware::auth::AuthExtension;
+        let svc = make_lazy_auth_service();
+        let user = make_test_user();
+        let named = Uuid::new_v4();
+        let members = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let scopes = vec!["*".to_string()];
+        let cap = Utc::now() + Duration::minutes(5);
+        let pair = svc
+            .generate_tokens_with_scope_capped_read_expansion(
+                &user,
+                Some(scopes.clone()),
+                Some(vec![named]),
+                members.clone(),
+                Some(cap),
+            )
+            .expect("mint capped pair with read expansion");
+        let decode_claims = |token: &str| {
+            decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(make_test_config().jwt_secret.as_bytes()),
+                &Validation::new(Algorithm::HS256),
+            )
+            .expect("decode token")
+            .claims
+        };
+        let access = decode_claims(&pair.access_token);
+        let refresh = decode_claims(&pair.refresh_token);
+        assert_eq!(access.allowed_repo_ids, Some(vec![named]));
+        assert_eq!(access.read_expansion_repo_ids, Some(members.clone()));
+        assert_eq!(access.scopes, Some(scopes.clone()));
+        assert_eq!(access.exp, cap.timestamp());
+        assert!((1..=300).contains(&pair.expires_in));
+        assert_eq!(refresh.token_type, "refresh");
+        assert!(refresh.jti.is_some());
+        assert!(refresh.family_id.is_some());
+        assert_eq!(refresh.allowed_repo_ids, None);
+        assert_eq!(refresh.read_expansion_repo_ids, None);
+        assert_eq!(refresh.scopes, Some(scopes.clone()));
+        assert_eq!(refresh.iat, access.iat);
+        assert_eq!(refresh.iat_ms, access.iat_ms);
+
+        let read = AuthExtension::from_claims_for_request(access.clone(), true);
+        let write = AuthExtension::from_claims_for_request(access, false);
+        assert!(read.can_access_repo(named));
+        assert!(write.can_access_repo(named));
+        assert!(write.has_scope("write:artifacts"));
+        for member in members {
+            assert!(read.can_access_repo(member));
+            assert!(!write.can_access_repo(member));
+        }
+        let plain = svc
+            .generate_tokens_with_scope_capped(&user, Some(scopes), Some(vec![named]), Some(cap))
+            .expect("mint capped pair without expansion");
+        let plain = decode_claims(&plain.access_token);
+        assert_eq!(plain.allowed_repo_ids, Some(vec![named]));
+        assert_eq!(plain.read_expansion_repo_ids, None);
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("read_expansion_repo_ids")
+            .is_none());
+    }
+
+    /// The access-only mint (add-ci-oidc-kubernetes-provider 4.1): the same
+    /// expiry cap and scopes as the paired mint, and nothing to refresh
+    /// with — `AccessToken` has no refresh field, so the check left is that
+    /// the token itself is an access token capped at the credential.
+    #[tokio::test]
+    async fn test_generate_access_token_capped_signs_no_refresh_and_honours_the_cap() {
+        let svc = make_lazy_auth_service();
+        let user = make_test_user();
+        let base_secs = make_test_config().jwt_access_token_expiry_minutes * 60;
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "read:repositories".to_string(),
+        ];
+        let decode_access = |token: &str| {
+            decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(make_test_config().jwt_secret.as_bytes()),
+                &Validation::new(Algorithm::HS256),
+            )
+            .expect("decode access token")
+            .claims
+        };
+
+        let cap = Utc::now() + Duration::minutes(5);
+        let repo_ids = vec![Uuid::new_v4()];
+        let token = svc
+            .generate_access_token_capped(
+                &user,
+                Some(scopes.clone()),
+                Some(repo_ids.clone()),
+                Some(cap),
+            )
+            .expect("mint access-only");
+        let claims = decode_access(&token.access_token);
+        assert!(
+            claims.exp <= cap.timestamp(),
+            "exp must not outlive the credential"
+        );
+        assert!(
+            (295..=300).contains(&token.expires_in),
+            "{}",
+            token.expires_in
+        );
+        assert_eq!(claims.token_type, "access");
+        assert_eq!(claims.jti, None, "no refresh-token identity on it");
+        assert_eq!(claims.family_id, None);
+        assert_eq!(claims.scopes, Some(scopes));
+        assert_eq!(claims.allowed_repo_ids, Some(repo_ids));
+        assert_eq!(claims.read_expansion_repo_ids, None);
+        assert!(serde_json::to_value(&claims)
+            .unwrap()
+            .get("read_expansion_repo_ids")
+            .is_none());
+
+        // The same cap as the paired mint: a far credential leaves the base TTL.
+        let far = svc
+            .generate_access_token_capped(&user, None, None, Some(Utc::now() + Duration::days(30)))
+            .expect("mint far");
+        assert_eq!(far.expires_in as i64, base_secs);
     }
 }

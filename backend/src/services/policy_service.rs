@@ -511,6 +511,15 @@ struct OriginFacts {
     upstream_url: Option<String>,
 }
 
+/// Render an origin upstream URL into a violation message (#4452). Violation
+/// messages reach promotion / approval responses and persisted
+/// `policy_result` records. Since migration 271 (#4463) stored origins carry
+/// no userinfo, so this strip is defence in depth against a document written
+/// by a path that bypassed the normalizer. Matching uses the stored value.
+fn origin_upstream_for_message(upstream: &str) -> String {
+    crate::services::proxy_service::strip_url_userinfo(upstream).0
+}
+
 /// Evaluate one policy's origin predicates against one artifact's origin
 /// facts (#4050). Cross-format: these fire for every artifact, whatever
 /// its format, because where the bytes came from is format-independent.
@@ -534,8 +543,9 @@ fn evaluate_origin_predicates(
         match &upstream {
             Some(u) if preds.allowed_upstreams.iter().any(|a| a == u) => {}
             Some(u) => violations.push(format!(
-                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' \
-                 is not in the policy's allowed upstreams"
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{}' \
+                 is not in the policy's allowed upstreams",
+                origin_upstream_for_message(u)
             )),
             None => violations.push(format!(
                 "Policy '{policy_name}' [origin.upstream]: upstream of origin is unknown \
@@ -546,7 +556,8 @@ fn evaluate_origin_predicates(
     if let Some(u) = &upstream {
         if preds.denied_upstreams.iter().any(|d| d == u) {
             violations.push(format!(
-                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' is denied"
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{}' is denied",
+                origin_upstream_for_message(u)
             ));
         }
     }
@@ -3573,6 +3584,31 @@ mod tests {
     }
 
     #[test]
+    fn test_origin_upstream_violation_messages_never_carry_userinfo_4452() {
+        // #4452: should a stored origin ever carry userinfo (migration 271
+        // strips it at rest, #4463), the violation text, which reaches
+        // promotion and approval responses, must still drop it; matching uses
+        // the stored value (the denylist entry below only matches it).
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@repo1.maven.org/maven2", "alice:s3cret");
+        let facts = OriginFacts {
+            upstream_url: Some(stored.clone()),
+            ..origin_facts_4050()
+        };
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            allowed_upstreams: vec!["https://repo1.maven.org/maven2".to_string()],
+            denied_upstreams: vec![stored],
+            ..Default::default()
+        });
+        let violations = evaluate_origin_predicates("p", &preds, &facts);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        for v in &violations {
+            assert!(!v.contains("s3cret") && !v.contains("alice"), "leaked: {v}");
+            assert!(v.contains("'https://repo1.maven.org/maven2'"), "{v}");
+        }
+    }
+
+    #[test]
     fn test_origin_upstream_denylist_blocks_matching_upstream() {
         let preds = origin_preds_4050(OriginPolicyPredicates {
             denied_upstreams: vec!["https://repo1.maven.org/maven2".to_string()],
@@ -3718,6 +3754,76 @@ mod tests {
             normalize_predicates(&empty_entry),
             Err(AppError::Validation(_))
         ));
+    }
+
+    /// #4463: before migration 271 the stored origin of an artifact proxied
+    /// through a credentialed Remote kept `user:password@`, so a
+    /// credential-free `allowed_upstreams` entry never admitted it and a
+    /// `denied_upstreams` entry never denied it. Both now match.
+    #[tokio::test]
+    async fn test_origin_upstream_lists_match_credentialed_remote_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let upstream = format!("https://{}@Upstream.Example.TEST/base/", "alice:s3cret");
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(&upstream)
+            .execute(&fx.pool)
+            .await
+            .expect("set credentialed upstream");
+        let artifact: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, 'o/1/o.bin', 'o', 1, $2, \
+             'application/octet-stream', 'o/1/o.bin') RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{:064x}", 4463))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert proxied artifact");
+        let svc = PolicyService::new(fx.pool.clone());
+
+        for (allow, deny) in [(true, false), (false, true)] {
+            let listed = vec!["https://upstream.example.test/base".to_string()];
+            svc.create_policy(
+                &format!("4463-{allow}-{}", fx.repo_id),
+                Some(fx.repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    origin: OriginPolicyPredicates {
+                        allowed_upstreams: if allow { listed.clone() } else { vec![] },
+                        denied_upstreams: if deny { listed } else { vec![] },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create origin policy");
+            let result = svc
+                .evaluate_artifact(artifact, fx.repo_id)
+                .await
+                .expect("evaluate");
+            let fired: Vec<_> = result
+                .violations
+                .iter()
+                .filter(|v| v.contains("[origin.upstream]"))
+                .collect();
+            assert_eq!(
+                fired.len(),
+                usize::from(deny),
+                "allow={allow} deny={deny}: {result:?}"
+            );
+            delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        }
+        fx.teardown().await;
     }
 
     /// DB-backed: an origin policy is expressible through the service API and

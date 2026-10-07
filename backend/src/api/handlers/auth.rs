@@ -689,6 +689,10 @@ pub async fn create_api_token(
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    // A CI OIDC exchanged credential must not outlive its CI token by minting
+    // an API token for its service account.
+    crate::services::token_service::refuse_ci_account_mint(&state.db, auth.user_id).await?;
+
     if let Some(selector) = &payload.repo_selector {
         crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
     }

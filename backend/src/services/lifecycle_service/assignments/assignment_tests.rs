@@ -24,6 +24,14 @@ fn policy_configs() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 #[test]
+fn inert_check_scope_covers_new_assignments_or_a_new_config_3734() {
+    let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+    assert_eq!(inert_check_scope(false, &[a, b, c], &[a]), vec![b, c]);
+    assert!(inert_check_scope(false, &[a], &[a, b]).is_empty());
+    assert_eq!(inert_check_scope(true, &[a, b], &[a, b]), vec![a, b]);
+}
+
+#[test]
 fn scope_normalization_3794() {
     let a = Uuid::from_u128(1);
     let b = Uuid::from_u128(2);

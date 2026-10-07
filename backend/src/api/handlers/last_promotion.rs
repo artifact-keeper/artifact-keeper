@@ -132,20 +132,43 @@ pub(crate) async fn fetch_last_promotions(
         return HashMap::new();
     }
 
-    let target_ids: Vec<Uuid> = rows
-        .iter()
-        .map(|r| r.target_repo_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
+    let readable = readable_repo_ids(
+        db,
+        rows.iter().map(|r| (r.target_repo_id, r.target_visibility)),
+        auth,
+    )
+    .await;
+    last_promotions_from_rows(rows, |id, _| readable.contains(&id))
+}
+
+/// The subset of `repos` (id plus visibility) whose key the caller may see:
+/// the grant half (`filter_visible_repo_ids`) and the token-scope half
+/// (`member_passes_token_scope`), the same predicate the virtual-member
+/// listings use. A failed visibility query yields the empty set, so callers
+/// redact rather than widen. Shared by the per-artifact `last_promotion`
+/// state and the promotion-history view (#4418).
+pub(crate) async fn readable_repo_ids(
+    db: &sqlx::PgPool,
+    repos: impl IntoIterator<Item = (Uuid, RepositoryVisibility)>,
+    auth: Option<&AuthExtension>,
+) -> HashSet<Uuid> {
+    let repos: HashMap<Uuid, RepositoryVisibility> = repos.into_iter().collect();
+    if repos.is_empty() {
+        return HashSet::new();
+    }
+    let ids: Vec<Uuid> = repos.keys().copied().collect();
     let granted: HashSet<Uuid> = RepositoryService::new(db.clone())
-        .filter_visible_repo_ids(&target_ids, &member_grant_visibility(auth))
+        .filter_visible_repo_ids(&ids, &member_grant_visibility(auth))
         .await
         .map(|ids| ids.into_iter().collect())
         .unwrap_or_default();
-    last_promotions_from_rows(rows, |id, visibility| {
-        granted.contains(&id) && member_passes_token_scope(auth, id, id, visibility)
-    })
+    repos
+        .into_iter()
+        .filter(|(id, visibility)| {
+            granted.contains(id) && member_passes_token_scope(auth, *id, *id, *visibility)
+        })
+        .map(|(id, _)| id)
+        .collect()
 }
 
 #[cfg(test)]

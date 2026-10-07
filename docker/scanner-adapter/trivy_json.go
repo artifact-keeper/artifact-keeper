@@ -6,7 +6,10 @@ package main
 
 // TrivyReport is the top-level trivy JSON document.
 type TrivyReport struct {
-	Results []TrivyResult `json:"Results"`
+	// Trivy carries the client version and, in client mode, the server's
+	// version and DB (see trivyReportInfo).
+	Trivy   trivyReportInfo `json:"Trivy"`
+	Results []TrivyResult   `json:"Results"`
 }
 
 // TrivyResult is one scanned target (an OS package set or a language lockfile).

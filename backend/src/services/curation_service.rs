@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::models::curation::{CurationDecision, CurationPackage, CurationRule};
+use crate::services::version_order::compare_natural_segment;
 
 /// Result of evaluating a package against curation rules.
 #[derive(Debug, Clone, Serialize)]
@@ -1068,7 +1069,8 @@ impl CurationService {
 // ---------------------------------------------------------------------------
 
 /// Compare two version strings. Returns -1, 0, or 1.
-/// Splits on `.` and `-`, compares segments numerically when possible.
+/// Splits on `.` and `-` and compares segments in natural order: the leading
+/// digits by value, then the rest lexically.
 pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
     let seg_a: Vec<&str> = a.split(['.', '-']).collect();
     let seg_b: Vec<&str> = b.split(['.', '-']).collect();
@@ -1077,24 +1079,10 @@ pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
         let sa = seg_a.get(i).unwrap_or(&"0");
         let sb = seg_b.get(i).unwrap_or(&"0");
 
-        // Try numeric comparison first
-        match (sa.parse::<u64>(), sb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                if na < nb {
-                    return -1;
-                }
-                if na > nb {
-                    return 1;
-                }
-            }
-            _ => {
-                // Lexicographic fallback
-                match sa.cmp(sb) {
-                    std::cmp::Ordering::Less => return -1,
-                    std::cmp::Ordering::Greater => return 1,
-                    std::cmp::Ordering::Equal => {}
-                }
-            }
+        match compare_natural_segment(sa, sb) {
+            std::cmp::Ordering::Less => return -1,
+            std::cmp::Ordering::Greater => return 1,
+            std::cmp::Ordering::Equal => {}
         }
     }
     0
@@ -1105,6 +1093,53 @@ pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
 #[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
+
+    // -- version_compare --
+
+    #[test]
+    fn test_version_compare_orders_hash_and_numeric_segments_consistently() {
+        // A lexical fallback for the mixed case made 74 < 103 < 2150693d < 74.
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.103") < 0);
+        assert!(version_compare("2.0.0-next.103", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("1.0.0-1", "1.0.0-alpha") < 0);
+    }
+
+    #[test]
+    fn test_version_compare_keeps_digit_led_suffixes_below_the_next_release() {
+        // PEP 440 pre-releases and local versions, Debian revisions, Go
+        // `+incompatible`: a segment that starts with digits ranks by them.
+        assert!(version_compare("1.1rc1", "1.2") < 0);
+        assert!(version_compare("2.0.0rc1", "2.0.1") < 0);
+        assert!(version_compare("2.0.0+cu118", "2.0.1") < 0);
+        assert!(version_compare("v2.0.0+incompatible", "v2.0.1") < 0);
+        assert!(version_compare("2.30-1ubuntu1", "2.30-2") < 0);
+    }
+
+    #[test]
+    fn test_version_compare_is_transitive_on_mixed_prereleases() {
+        // confusing-browser-globals mixes `next.<n>` and `next.<hash>`
+        // prereleases. A lexical fallback for the mixed case made
+        // `74 < 103 < 2150693d < 74`. Check every triple rather than sort:
+        // whether `sort_by` notices a cycle depends on the input order.
+        let versions: Vec<&str> = concat!(
+            "1.0.5 1.0.5-next.9b4009d7 1.0.10 1.0.11 1.1.0-next.14 1.1.0-next.103 ",
+            "2.0.0-next.03604a46 2.0.0-next.096703ab 2.0.0-next.101 2.0.0-next.103 ",
+            "2.0.0-next.2150693d 2.0.0-next.300 2.0.0-next.3e165448 2.0.0-next.74 ",
+            "2.0.0-next.91 2.0.0-next.9754a231 2.0.0-next.fb6e6f70 ",
+        )
+        .split_whitespace()
+        .collect();
+        for a in &versions {
+            for b in &versions {
+                for c in &versions {
+                    if version_compare(a, b) < 0 && version_compare(b, c) < 0 {
+                        assert!(version_compare(a, c) < 0, "{a} < {b} < {c}");
+                    }
+                }
+            }
+        }
+    }
 
     // -- glob matching --
 

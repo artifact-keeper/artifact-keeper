@@ -104,6 +104,10 @@ async fn create_access_token(
     // are unaffected.
     auth.enforce_mint_ceiling(&scopes)?;
 
+    // A CI OIDC exchanged credential must not outlive its CI token by minting
+    // an API token for its service account.
+    crate::services::token_service::refuse_ci_account_mint(&state.db, auth.user_id).await?;
+
     // Repository ceiling (#4225): a repository-restricted credential passes
     // its restriction on to the token it mints.
     let inherited = auth.mint_repo_ceiling(false)?;

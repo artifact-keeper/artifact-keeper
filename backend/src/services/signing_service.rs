@@ -640,11 +640,19 @@ fn rotation_audit_details(
     overlap_seconds: u64,
     overlap_ends_at: DateTime<Utc>,
     co_sign_problem: Option<&str>,
+    repointed_repository_ids: &[Uuid],
 ) -> serde_json::Value {
     let ends_at = (overlap_seconds > 0).then(|| overlap_ends_at.to_rfc3339());
+    let repointed: Vec<String> = repointed_repository_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect();
     let mut details = serde_json::json!({
         "new_key_id": new_key_id.to_string(),
         "overlap_ends_at": ends_at,
+        // Every repository whose signing config moved to the successor
+        // (#4416); a key can be bound to repositories other than its own.
+        "repointed_repository_ids": repointed,
     });
     if let Some(reason) = co_sign_problem {
         details["overlap_skipped"] = serde_json::Value::from(reason);
@@ -1976,19 +1984,21 @@ impl SigningService {
         )
         .await?;
 
-        // (2) Repoint the signing config to the new (active) key — the config
-        //     now references an active key. Guarded on the old id so a
-        //     concurrent winner's repoint is never clobbered.
-        if let Some(repo_id) = locked.repository_id {
-            sqlx::query!(
-                "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE repository_id = $2 AND signing_key_id = $3",
-                new_id,
-                repo_id,
-                old_key_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        // (2) Repoint EVERY signing config bound to the old key at the new
+        //     (active) key. Keyed on the binding, not on the old key's
+        //     `repository_id`: a key created without one and bound to one or
+        //     more repositories through their signing config would otherwise
+        //     leave those configs on a retired key, and every InRelease /
+        //     Release.gpg / repomd.xml.asc request 404s (#4416). Guarded on
+        //     the old id so a concurrent winner's repoint is never clobbered.
+        //     The repointed repositories are recorded in the `rotated` audit.
+        let repointed = sqlx::query_scalar!(
+            "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE signing_key_id = $2 RETURNING repository_id",
+            new_id,
+            old_key_id,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
 
         // (3) Deactivate the old key LAST, recording when its rotation overlap
         //     window ends (#1329): until then it keeps co-signing metadata.
@@ -2018,6 +2028,7 @@ impl SigningService {
                 overlap_seconds,
                 overlap_ends_at,
                 co_sign_problem,
+                &repointed,
             )),
         )
         .await?;
@@ -4498,15 +4509,20 @@ mod tests {
     fn rotation_audit_records_the_window_end_or_why_there_is_none() {
         let id = Uuid::new_v4();
         let end = Utc::now() + Duration::days(14);
-        let d = rotation_audit_details(id, 60, end, None);
+        let repo = Uuid::new_v4();
+        let d = rotation_audit_details(id, 60, end, None, &[repo]);
         assert_eq!(d["new_key_id"], id.to_string());
+        assert_eq!(
+            d["repointed_repository_ids"],
+            serde_json::json!([repo.to_string()])
+        );
         assert_eq!(d["overlap_ends_at"], end.to_rfc3339());
         assert!(d.get("overlap_skipped").is_none());
 
-        let d = rotation_audit_details(id, 0, end, None);
+        let d = rotation_audit_details(id, 0, end, None, &[]);
         assert!(d["overlap_ends_at"].is_null(), "overlap disabled");
 
-        let d = rotation_audit_details(id, 0, end, Some("public key is not OpenPGP"));
+        let d = rotation_audit_details(id, 0, end, Some("public key is not OpenPGP"), &[]);
         assert!(d["overlap_ends_at"].is_null());
         assert_eq!(d["overlap_skipped"], "public key is not OpenPGP");
     }
@@ -4804,6 +4820,78 @@ mod tests {
             .into_iter()
             .map(|k| k.id)
             .collect()
+    }
+
+    /// #4416: a key created without `repository_id` and bound to Debian
+    /// repositories through their signing config. Rotating it must repoint
+    /// every one of those configs at the successor; before the fix they kept
+    /// pointing at the retired key and metadata signing 404ed.
+    #[tokio::test]
+    async fn rotating_an_unscoped_key_repoints_every_bound_config_4416() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let unscoped = service
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("unscoped-{}", Uuid::new_v4().as_simple()),
+                key_type: "gpg".to_string(),
+                algorithm: ED25519_ALGORITHM.to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let repos = [
+            seed_repo_of_format(&pool, "debian").await,
+            seed_repo_of_format(&pool, "debian").await,
+        ];
+        for repo in repos {
+            service
+                .update_signing_config(repo, Some(unscoped.id), true, false, false)
+                .await
+                .unwrap();
+        }
+        // A repository bound to a different key is not touched.
+        let other_repo = seed_repo_of_format(&pool, "debian").await;
+        let other_key = bound_key(&service, other_repo, "gpg", ED25519_ALGORITHM).await;
+
+        let successor = service.rotate_key(unscoped.id, None).await.unwrap();
+        assert_eq!(
+            successor.repository_id, None,
+            "the successor stays unscoped"
+        );
+        assert!(
+            !load_key(&pool, unscoped.id).await.is_active,
+            "old key retired"
+        );
+        for repo in repos {
+            let active = service
+                .get_active_key_for_repo(repo)
+                .await
+                .unwrap()
+                .expect("the bound repository still has an active signing key");
+            assert_eq!(active.id, successor.id);
+            assert_eq!(
+                signer_ids(&service, repo).await,
+                vec![successor.id, unscoped.id],
+                "the retired key co-signs through the overlap window"
+            );
+        }
+        let other = service.get_active_key_for_repo(other_repo).await.unwrap();
+        assert_eq!(other.map(|k| k.id), Some(other_key));
+        let audit = audit_details(&pool, unscoped.id, "rotated").await;
+        let mut recorded: Vec<String> =
+            serde_json::from_value(audit[0]["repointed_repository_ids"].clone()).unwrap();
+        recorded.sort();
+        let mut expected: Vec<String> = repos.iter().map(Uuid::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            recorded, expected,
+            "the rotation audit names every repointed repository"
+        );
     }
 
     #[tokio::test]

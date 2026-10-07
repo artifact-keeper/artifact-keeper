@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod nul_path;
 pub(crate) mod oci_errors;
 pub mod rate_limit;
+pub mod request_span;
 pub mod security_headers;
 pub mod setup;
 pub mod tracing;

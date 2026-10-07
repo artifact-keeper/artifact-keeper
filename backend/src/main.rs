@@ -434,10 +434,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(
                 target: "security",
                 "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
-                 now target ALL RFC1918 / unique-local addresses. Cloud \
-                 metadata IPs and loopback remain blocked. Prefer \
+                 now target ALL RFC1918 / unique-local addresses, whether or \
+                 not AK_SSRF_ALLOW_PRIVATE_CIDRS is also set. Cloud \
+                 metadata IPs and loopback remain blocked. Unset it and use \
                  AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
-                 narrower SSRF surface (issue #1435)."
+                 narrower SSRF surface (issues #1435, #4428)."
             );
         }
     }
@@ -511,20 +512,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // Try to register additional backends if credentials are available and
         // they are not already the primary backend.
         if config.storage_backend != "s3" {
-            if let Ok(s3) = artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
-                tracing::info!("Additional S3 storage backend registered");
-                backends.insert("s3".to_string(), Arc::new(s3));
+            match artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
+                Ok(s3) => {
+                    tracing::info!("Additional S3 storage backend registered");
+                    backends.insert("s3".to_string(), Arc::new(s3));
+                }
+                // Not configured (no S3_BUCKET, no credentials) is the normal
+                // case and stays silent; a malformed public endpoint is an
+                // operator mistake worth surfacing (#4417).
+                Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional S3 storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "azure" {
-            if let Ok(azure_cfg) = artifact_keeper_backend::storage::azure::AzureConfig::from_env()
-            {
-                if let Ok(azure) =
-                    artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
-                {
-                    tracing::info!("Additional Azure storage backend registered");
-                    backends.insert("azure".to_string(), Arc::new(azure));
+            match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
+                Ok(azure_cfg) => {
+                    if let Ok(azure) =
+                        artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
+                    {
+                        tracing::info!("Additional Azure storage backend registered");
+                        backends.insert("azure".to_string(), Arc::new(azure));
+                    }
                 }
+                Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional Azure storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
@@ -624,6 +639,25 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // One-shot backfill of the first-class `oci_manifests` existence table
+    // (#1683 / #4433) for manifests committed before migration 268. Every
+    // push/cache since then records its row inline. Backgrounded: nothing
+    // reads the table yet, the pass is additive and idempotent (no-op once
+    // every manifest has a row), and it reads each body from storage, so it
+    // must not delay the HTTP listener bind. Failures are logged inside and
+    // retried on the next start.
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::oci_manifests::run_backfill(
+                &db_pool,
+                storage_registry,
+            )
+            .await;
+        });
+    }
+
     // One-shot repair for Docker/OCI artifacts imported by migration runs
     // that pre-date #2457: those runs stored manifest/blob bytes under
     // generic CAS keys with only `artifacts` rows, so migrated tags were
@@ -682,6 +716,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         let db_pool = db_pool.clone();
         tokio::spawn(async move {
             artifact_keeper_backend::services::quarantine_service::warn_unsupported_virtual_quarantine(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
+    // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
+    // were compiled by PostgreSQL at create/update time can carry a pattern
+    // that fails every run or (`\b`) protects nothing; name them once per
+    // boot without changing them.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::lifecycle_service::warn_invalid_lifecycle_regexes(
                 &db_pool,
             )
             .await;
@@ -1067,6 +1115,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.smtp_service.clone(),
         state.event_bus.clone(),
         advisory_client.clone(),
+        state.proxy_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -1193,6 +1242,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     &trace_context_trusted_proxies,
                 )
             },
+        )
+        // Status, body size and 5xx error status onto the same span (#4455),
+        // then the default DEBUG "finished processing request" event.
+        .on_response(
+            artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
 
     // The concrete shutdown token used by all servers and background tasks

@@ -275,6 +275,63 @@ pub enum WebhookEvent {
     AgeGateReopened,
 }
 
+impl WebhookEvent {
+    /// Every event a webhook can subscribe to. The `webhooks.events` column
+    /// stores the [`Display`](std::fmt::Display) form of these (e.g.
+    /// `artifact_uploaded`); the producer matches deliveries on exactly that
+    /// string, so any other name can never fire (#4419).
+    pub const ALL: [WebhookEvent; 13] = [
+        WebhookEvent::ArtifactUploaded,
+        WebhookEvent::ArtifactDeleted,
+        WebhookEvent::RepositoryCreated,
+        WebhookEvent::RepositoryDeleted,
+        WebhookEvent::UserCreated,
+        WebhookEvent::UserDeleted,
+        WebhookEvent::BuildStarted,
+        WebhookEvent::BuildCompleted,
+        WebhookEvent::BuildFailed,
+        WebhookEvent::AgeGateQueued,
+        WebhookEvent::AgeGateApproved,
+        WebhookEvent::AgeGateRejected,
+        WebhookEvent::AgeGateReopened,
+    ];
+
+    /// The subscribable event names, in [`WebhookEvent::ALL`] order.
+    pub fn accepted_names() -> Vec<String> {
+        Self::ALL.iter().map(ToString::to_string).collect()
+    }
+}
+
+/// Validate a webhook's subscribed event names (#4419).
+///
+/// The list must be non-empty and every entry must be one of
+/// [`WebhookEvent::accepted_names`]. Before #4419 any string was stored, so a
+/// plausible typo such as the EventBus spelling `artifact.uploaded` was
+/// accepted and the webhook silently never fired. The rejection names every
+/// unknown entry and lists the accepted names so the caller can fix the
+/// request without reading the source.
+fn validate_webhook_events(events: &[String]) -> Result<()> {
+    if events.is_empty() {
+        return Err(AppError::Validation(
+            "At least one event required".to_string(),
+        ));
+    }
+    let accepted = WebhookEvent::accepted_names();
+    let unknown: Vec<&str> = events
+        .iter()
+        .map(String::as_str)
+        .filter(|e| !accepted.iter().any(|a| a == e))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Validation(format!(
+        "unknown webhook event(s): {}; accepted events: {}",
+        unknown.join(", "),
+        accepted.join(", ")
+    )))
+}
+
 impl std::fmt::Display for WebhookEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -307,6 +364,12 @@ pub struct ListWebhooksQuery {
 pub struct CreateWebhookRequest {
     pub name: String,
     pub url: String,
+    /// Events to subscribe to, at least one. Each must be one of:
+    /// `artifact_uploaded`, `artifact_deleted`, `repository_created`,
+    /// `repository_deleted`, `user_created`, `user_deleted`,
+    /// `build_started`, `build_completed`, `build_failed`,
+    /// `age_gate_queued`, `age_gate_approved`, `age_gate_rejected`,
+    /// `age_gate_reopened`. Any other name is rejected with HTTP 400.
     pub events: Vec<String>,
     /// Optional caller-supplied secret. When omitted the server generates a
     /// fresh `whsec_*` secret. Either way the raw value is returned in the
@@ -620,6 +683,7 @@ pub async fn list_webhooks(
     request_body = CreateWebhookRequest,
     responses(
         (status = 200, description = "Webhook created. Body includes the raw secret exactly once (omitted when created unsigned).", body = WebhookSecretCreatedResponse),
+        (status = 400, description = "Validation error: invalid URL, no events, an event name outside the accepted set (the message lists the accepted names), or an unsupported event_schema_version", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error, including: a secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest (create the webhook without a secret, or have an administrator configure the signing key); or signing_mode asymmetric/both was requested but AK_WEBHOOK_SECRET_KEY is not configured, or cannot decrypt the stored instance signing key (it was changed after the key was created)"),
         (status = 500, description = "Internal server error")
     ),
@@ -648,12 +712,8 @@ pub async fn create_webhook(
     // Validate URL (SSRF prevention)
     validate_webhook_url(&payload.url)?;
 
-    // Validate events
-    if payload.events.is_empty() {
-        return Err(AppError::Validation(
-            "At least one event required".to_string(),
-        ));
-    }
+    // Validate events: non-empty, and every name one the producer emits.
+    validate_webhook_events(&payload.events)?;
 
     let event_version = payload
         .event_schema_version
@@ -3719,6 +3779,74 @@ mod tests {
     }
 
     #[test]
+    fn validate_webhook_events_accepts_every_emitted_name() {
+        let all = WebhookEvent::accepted_names();
+        assert_eq!(all.len(), WebhookEvent::ALL.len());
+        assert!(validate_webhook_events(&all).is_ok());
+        assert!(validate_webhook_events(&["age_gate_reopened".to_string()]).is_ok());
+    }
+
+    /// #4419: the subscribable set is EXACTLY the set the producer can
+    /// deliver, in both directions: every accepted name is emitted by some
+    /// bus event (no dead subscriptions), and every emitted name is
+    /// accepted (no event a new `BUS_TO_WEBHOOK_EVENT` entry makes
+    /// impossible to subscribe to).
+    #[test]
+    fn webhook_event_set_matches_the_producer_table() {
+        use crate::services::webhook_producer::{map_event_type, BUS_TO_WEBHOOK_EVENT};
+        use std::collections::BTreeSet;
+        let accepted: BTreeSet<String> = WebhookEvent::accepted_names().into_iter().collect();
+        let emitted: BTreeSet<String> = BUS_TO_WEBHOOK_EVENT
+            .iter()
+            .map(|(bus, webhook)| {
+                assert_eq!(map_event_type(bus), Some(*webhook), "{bus}");
+                webhook.to_string()
+            })
+            .collect();
+        assert_eq!(accepted, emitted);
+    }
+
+    /// The `CreateWebhookRequest.events` schema doc is static text (utoipa
+    /// reads literal doc comments), so pin it to `WebhookEvent::ALL`: it
+    /// must name every accepted event.
+    #[test]
+    fn create_webhook_events_schema_doc_lists_every_accepted_name() {
+        let spec = serde_json::to_value(WebhooksApiDoc::openapi()).unwrap();
+        let doc = spec["components"]["schemas"]["CreateWebhookRequest"]["properties"]["events"]
+            ["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        for name in WebhookEvent::accepted_names() {
+            assert!(
+                doc.contains(&format!("`{name}`")),
+                "{name} missing from: {doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_webhook_events_rejects_empty_and_unknown_names() {
+        match validate_webhook_events(&[]) {
+            Err(AppError::Validation(m)) => assert!(m.contains("At least one event")),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let events = vec![
+            "artifact_uploaded".to_string(),
+            "artifact.uploaded".to_string(),
+            "ARTIFACT_DELETED".to_string(),
+        ];
+        match validate_webhook_events(&events) {
+            Err(AppError::Validation(m)) => {
+                assert!(m.contains("artifact.uploaded, ARTIFACT_DELETED"), "{m}");
+                assert!(m.contains("accepted events: artifact_uploaded"), "{m}");
+                assert!(m.contains("age_gate_reopened"), "{m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validate_event_version_rejects_unknown() {
         let err = validate_event_version("9999-99-99").unwrap_err();
         match err {
@@ -5706,7 +5834,7 @@ mod tests {
                 axum::Json(CreateWebhookRequest {
                     name: format!("created-by-{}", &creator.to_string()[..8]),
                     url: "http://198.51.100.9/hook".to_string(),
-                    events: vec!["artifact.created".to_string()],
+                    events: vec!["artifact_uploaded".to_string()],
                     repository_id: None,
                     headers: None,
                     secret: None,
@@ -5744,6 +5872,65 @@ mod tests {
             cleanup(&pool, &[], &[creator]).await;
         }
 
+        /// #4419: an event name the producer never emits (here the dotted
+        /// EventBus spelling) is rejected with 400 naming the bad entry and
+        /// the accepted set, and nothing is stored; the underscore spelling
+        /// of the same event is accepted.
+        #[tokio::test]
+        async fn create_webhook_rejects_unknown_event_names() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let name = format!("evt-4419-{}", &admin.to_string()[..8]);
+            let request = |events: serde_json::Value| -> CreateWebhookRequest {
+                serde_json::from_value(serde_json::json!({
+                    "name": name, "url": "http://198.51.100.9/hook", "events": events,
+                }))
+                .expect("request body")
+            };
+
+            let err = create_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::Json(request(serde_json::json!(["artifact.uploaded"]))),
+            )
+            .await
+            .expect_err("a dotted event name must be rejected");
+            let msg = match &err {
+                AppError::Validation(m) => m.clone(),
+                other => panic!("expected a validation error, got {other:?}"),
+            };
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+            assert!(msg.contains("artifact.uploaded"), "{msg}");
+            assert!(msg.contains("artifact_uploaded"), "{msg}");
+            let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhooks WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(stored, 0, "a rejected create must not store a webhook");
+
+            let created = create_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::Json(request(serde_json::json!(["artifact_uploaded"]))),
+            )
+            .await
+            .expect("the emitted event name is accepted");
+            assert_eq!(created.0.webhook.events, vec!["artifact_uploaded"]);
+
+            let _ = sqlx::query("DELETE FROM webhooks WHERE name = $1")
+                .bind(&name)
+                .execute(&pool)
+                .await;
+            cleanup(&pool, &[], &[admin]).await;
+        }
+
         /// #2321 G4 (denial): a non-admin caller cannot create a webhook. The
         /// gate fires BEFORE URL validation / secret generation / any DB write,
         /// so a valid request body still returns 403.
@@ -5761,7 +5948,7 @@ mod tests {
                 axum::Json(CreateWebhookRequest {
                     name: "nonadmin-denied".to_string(),
                     url: "http://198.51.100.9/hook".to_string(),
-                    events: vec!["artifact.created".to_string()],
+                    events: vec!["artifact_uploaded".to_string()],
                     repository_id: None,
                     headers: None,
                     secret: None,
@@ -5863,7 +6050,7 @@ mod tests {
                 axum::Json(CreateWebhookRequest {
                     name: format!("asym-{}", &admin.to_string()[..8]),
                     url: "http://198.51.100.9/hook".to_string(),
-                    events: vec!["artifact.created".to_string()],
+                    events: vec!["artifact_uploaded".to_string()],
                     repository_id: None,
                     headers: None,
                     secret: None,

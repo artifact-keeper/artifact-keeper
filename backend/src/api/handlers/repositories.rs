@@ -44,8 +44,9 @@ use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
-    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
-    RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
+    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
+    MemberVisibility, RepoVisibility, RepositoryService,
+    UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
@@ -1083,6 +1084,16 @@ pub struct CreateRepositoryRequest {
     /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
     /// `false` for the default union semantics.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591). Each entry is an exact
+    /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
+    /// and canonicalized. By default the credentials only follow a realm on
+    /// the upstream's own origin (GHSA-78h6-3wp8-2542); list the token
+    /// service here when the registry serves it from another host, e.g.
+    /// `https://auth.docker.io` for a credentialed `https://registry-1.docker.io`
+    /// remote, or `https://gitlab.example.com` for a GitLab registry on
+    /// `https://registry.example.com`. Only valid for Remote repositories.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote (proxy) distribution/component/architecture filter
     /// (#2460, epic #2458). Only valid for Debian *Remote* repositories.
     /// Passthrough-only: allowed paths are proxied byte-for-byte; denied
@@ -1297,6 +1308,11 @@ pub struct UpdateRepositoryRequest {
     /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
     /// Virtual repositories; omit to leave it unchanged.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Replace the trusted cross-origin OCI Bearer token realms for this
+    /// Remote repository (#3591); same rules as on create. Omit to leave the
+    /// list unchanged; send `[]` to clear it and restore the strict
+    /// same-origin default.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Update the Debian remote proxy filter (#2460). Three-way semantics:
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
@@ -1399,7 +1415,17 @@ pub struct RepositoryResponse {
     /// (`NOT NULL DEFAULT 'filesystem'`), so like `curation_enabled` this
     /// needs no separate lookup and is always concrete.
     pub storage_backend: String,
+    /// Bytes stored in this repository itself. Always 0 for a virtual
+    /// repository, which stores nothing of its own, so summing this field
+    /// over repositories (for example per project) counts each byte once
+    /// (#4423).
     pub storage_used_bytes: i64,
+    /// Virtual repositories only: the combined bytes of the member
+    /// repositories the caller can see, each member counted once (#2785,
+    /// #3081). These bytes are already in the members' own
+    /// `storage_used_bytes`; do not add them to a total. `null` for every
+    /// other repository type (#4423).
+    pub member_storage_used_bytes: Option<i64>,
     pub quota_bytes: Option<i64>,
     /// Project this repository is assigned to (#2472), if any.
     pub project_id: Option<Uuid>,
@@ -1410,7 +1436,17 @@ pub struct RepositoryResponse {
     /// update) and the listing; `repo_to_response` alone defaults it to `false`
     /// (it is db-less and cannot read the column).
     pub has_trusted_gpg_key: bool,
+    /// The Remote repository's upstream URL with any embedded userinfo
+    /// (`user:password@` or `token@`) removed (#4452). Credentials embedded in
+    /// the URL at create time are still stored and still sent upstream as
+    /// HTTP Basic auth, but are never returned; `upstream_url_has_credentials`
+    /// says whether any are configured.
     pub upstream_url: Option<String>,
+    /// Whether the stored `upstream_url` carries embedded userinfo
+    /// credentials that were stripped from `upstream_url` above (#4452).
+    /// Independent of `upstream_auth_configured`, which covers the dedicated
+    /// (encrypted) upstream credential fields.
+    pub upstream_url_has_credentials: bool,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
     /// Whether the Package Age / quarantine policy is enabled for this
@@ -1456,6 +1492,11 @@ pub struct RepositoryResponse {
     /// repositories; omitted for every other repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591), canonical origins. Omitted
+    /// when none are configured (the strict same-origin default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote proxy filter (#2460), read back from `repository_config`.
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1522,11 +1563,45 @@ async fn with_repodata_depth(
     Ok(response)
 }
 
+/// Render a stored `upstream_url` for an API response (#4452): the URL with
+/// its userinfo stripped, plus whether any userinfo was present. Every
+/// response that carries a repository's upstream URL goes through here so the
+/// embedded password can never be echoed.
+fn upstream_url_for_response(stored: Option<&str>) -> (Option<String>, bool) {
+    match stored.map(crate::services::proxy_service::strip_url_userinfo) {
+        Some((url, has_credentials)) => (Some(url), has_credentials),
+        None => (None, false),
+    }
+}
+
+/// [`repo_to_response`] with both display storage figures (#4423): the
+/// repository's own bytes, and for a virtual repository its members' bytes.
+fn repo_to_display_response(
+    repo: crate::models::repository::Repository,
+    usage: DisplayStorageUsage,
+) -> RepositoryResponse {
+    let mut response = repo_to_response(repo, usage.own_bytes);
+    response.member_storage_used_bytes = usage.member_bytes;
+    response
+}
+
+/// Display storage figures of a repository that was just created: nothing
+/// stored, and for a virtual repository a member figure of 0 (#4423).
+fn new_repository_storage(repo_type: &RepositoryType) -> DisplayStorageUsage {
+    if *repo_type == RepositoryType::Virtual {
+        DisplayStorageUsage::virtual_repo(0)
+    } else {
+        DisplayStorageUsage::own(0)
+    }
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
     storage_used_bytes: i64,
 ) -> RepositoryResponse {
+    let (upstream_url, upstream_url_has_credentials) =
+        upstream_url_for_response(repo.upstream_url.as_deref());
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
@@ -1547,12 +1622,14 @@ fn repo_to_response(
         versioning_enabled: repo.versioning_enabled,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
+        member_storage_used_bytes: None,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
         // db-less: single-repo handlers overwrite this via `with_row_presence_fields`
         // and the listing sets it from a batch presence query (#2568).
         has_trusted_gpg_key: false,
-        upstream_url: repo.upstream_url,
+        upstream_url,
+        upstream_url_has_credentials,
         upstream_auth_type: None,
         upstream_auth_configured: false,
         // Populated by the handlers that have a DB handle (see
@@ -1569,6 +1646,7 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         npm_virtual_isolate_hosted_names: None,
+        oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
@@ -2525,6 +2603,41 @@ fn npm_virtual_isolate_to_store(
     }
 }
 
+/// Validate a supplied `oci_trusted_bearer_realms` list (#3591) and return
+/// the canonical list to persist. `Ok(None)` for an absent field and for an
+/// empty list on a repository the setting does not apply to (an untouched
+/// settings form configures nothing, the #3299 rule). A non-empty list on a
+/// non-Remote repository is a 400: no other type fetches from an upstream.
+fn oci_trusted_realms_to_store(
+    repo_type: &RepositoryType,
+    requested: Option<&[String]>,
+) -> Result<Option<Vec<String>>> {
+    match requested {
+        None => Ok(None),
+        Some(list) if *repo_type == RepositoryType::Remote => {
+            crate::services::oci_trusted_realms::normalize_trusted_realms(list).map(Some)
+        }
+        Some([]) => Ok(None),
+        Some(_) => Err(AppError::Validation(
+            "oci_trusted_bearer_realms is only valid for remote repositories".to_string(),
+        )),
+    }
+}
+
+/// Echo the trusted OCI bearer realms (#3591) on Remote repositories.
+async fn with_oci_trusted_realms(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if *repo_type == RepositoryType::Remote {
+        let list = crate::services::oci_trusted_realms::load_trusted_realms(db, repo_id).await?;
+        response.oci_trusted_bearer_realms = (!list.is_empty()).then_some(list);
+    }
+    Ok(response)
+}
+
 /// Persist a validated isolate-mode toggle (#3767). No cache invalidation is
 /// needed: the toggle is part of every npm virtual packument cache key, so the
 /// next read on every replica (and the shared Redis tier) misses and
@@ -3183,35 +3296,34 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    // #2785: the batched per-repo figure above keys off `repository_id`, which
-    // is (near) empty for a virtual repo — it owns no artifact rows, only
-    // member links. Overwrite each virtual repo's figure with the union of its
-    // resolvable members so the listing total matches the child repos.
+    // #2785: a virtual repo owns no artifact rows, only member links, so its
+    // own figure is 0 (#4423: it must not repeat its members' bytes, or any
+    // sum over the listing counts them twice). The union of its resolvable
+    // members is reported separately as `member_storage_used_bytes`.
     //
     // #3078: resolve every virtual on the page in ONE query (the old shape
     // called `get_virtual_storage_usage` once per virtual — an N+1 that
-    // re-scanned every reachable member's artifact rows per call). Seeding 0
-    // first preserves the old always-overwrite semantics: a virtual with no
-    // resolvable members has no row in the batch result and must render 0.
-    let mut storage_map = storage_map;
+    // re-scanned every reachable member's artifact rows per call). A virtual
+    // with no resolvable members has no row in the batch result and renders
+    // a member figure of 0.
     let virtual_ids: Vec<Uuid> = repos
         .iter()
         .filter(|r| r.repo_type == RepositoryType::Virtual)
         .map(|r| r.id)
         .collect();
-    if !virtual_ids.is_empty() {
-        for id in &virtual_ids {
-            storage_map.insert(*id, 0);
+    // #3081: aggregate only over the members THIS caller may see — a member
+    // the caller cannot read must not disclose its byte size through the
+    // virtual's total. An empty `virtual_ids` returns without a query.
+    let member_map = service
+        .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
+        .await?;
+    let display_usage = |id: Uuid| {
+        if virtual_ids.contains(&id) {
+            DisplayStorageUsage::virtual_repo(member_map.get(&id).copied().unwrap_or(0))
+        } else {
+            DisplayStorageUsage::own(storage_map.get(&id).copied().unwrap_or(0))
         }
-        // #3081: aggregate only over the members THIS caller may see — a
-        // member the caller cannot read must not disclose its byte size
-        // through the virtual's total.
-        storage_map.extend(
-            service
-                .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
-                .await?,
-        );
-    }
+    };
 
     // Batch fetch which repos have a trusted GPG key configured (#2568) and
     // any plugin `format_key` (#3070) so the listing reports both without an
@@ -3237,9 +3349,9 @@ pub async fn list_repositories(
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
-            let storage = storage_map.get(&r.id).copied().unwrap_or(0);
+            let storage = display_usage(r.id);
             let (has_gpg, format_key) = row_fields.get(&r.id).cloned().unwrap_or_default();
-            let mut resp = repo_to_response(r, storage);
+            let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
             resp.format_key = custom_format_key(&resp.format, format_key);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
@@ -3403,6 +3515,10 @@ pub async fn create_repository(
         &format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
+    // the same reason; persisted once `repo.id` exists.
+    let oci_trusted_realms =
+        oci_trusted_realms_to_store(&repo_type, payload.oci_trusted_bearer_realms.as_deref())?;
 
     // Debian remote proxy filter (#2460): validate up-front — before the
     // repository row is created — so a rejected config (wrong repo type or an
@@ -3608,6 +3724,10 @@ pub async fn create_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
+    }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
     // create), so here we only write the trimmed values to `repository_config`.
@@ -3761,7 +3881,9 @@ pub async fn create_repository(
     let repo_id = repo.id;
     let repo_type_out = repo.repo_type.clone();
     let repo_format_out = repo.format.clone();
-    let mut response = repo_to_response(repo, 0);
+    // A new repository stores nothing yet; a new virtual reports a member
+    // figure of 0 like every other virtual response (#4423).
+    let mut response = repo_to_display_response(repo, new_repository_storage(&repo_type_out));
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -3795,6 +3917,7 @@ pub async fn create_repository(
         response,
     )
     .await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type_out, response).await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
@@ -3842,7 +3965,7 @@ pub async fn get_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let mut response = repo_to_response(repo, storage_used);
+    let mut response = repo_to_display_response(repo, storage_used);
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
@@ -3861,6 +3984,7 @@ pub async fn get_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -4455,6 +4579,13 @@ pub async fn update_repository(
         &existing.format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated before the
+    // update for the same reason. Writing them is gated by the repository
+    // `admin` check above, like every other credential-routing setting.
+    let oci_trusted_realms = oci_trusted_realms_to_store(
+        &existing.repo_type,
+        payload.oci_trusted_bearer_realms.as_deref(),
+    )?;
 
     let repo = service
         .update_with_repodata_depth(
@@ -4527,6 +4658,10 @@ pub async fn update_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -4796,7 +4931,7 @@ pub async fn update_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let response = repo_to_response(repo, storage_used);
+    let response = repo_to_display_response(repo, storage_used);
     let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
@@ -4819,6 +4954,7 @@ pub async fn update_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -8494,7 +8630,7 @@ pub async fn get_artifact_metadata(
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
                 .flatten()
-                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v));
+                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::for_response(&v));
         let last_promotion = fetch_last_promotions(&state.db, &[artifact.id], auth.as_ref())
             .await
             .remove(&artifact.id);
@@ -8551,14 +8687,28 @@ pub async fn get_artifact_metadata(
         } else {
             state.proxy_service.as_deref()
         };
+        // #4442: this route streams a member's BYTES like `download_artifact`,
+        // so it takes the same check: the caller-authorized members, then a
+        // refusal when the shadowing guard left Remote members in play and one
+        // of them scans on proxy.
+        let not_found =
+            || AppError::NotFound("Artifact not found in any member repository".to_string());
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+            .await
+            .map_err(|_| not_found())?;
+        if proxy_for_virtual.is_some() {
+            if let Some(refusal) =
+                generic_route_virtual_refusal(&state.db, &repo, &members, &path).await
+            {
+                return Ok(refusal);
+            }
+        }
         let db = state.db.clone();
         let path_clone = path.clone();
         let state_clone = state.clone();
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
-            auth.as_ref(),
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &path,
             move |member_id, location| {
                 let db = db.clone();
@@ -8735,8 +8885,11 @@ pub async fn list_artifact_versions(
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
         (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
+        (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -8979,6 +9132,11 @@ async fn authorize_generic_upload(
     require_repo_action(auth, repo.id, "write", &state.permission_service)
         .await
         .map_err(|e| e.into_response())?;
+
+    // Hosted-only gate (#4420): the generic PUT and both multipart entry
+    // points refuse remote and virtual repositories with the same response the
+    // native publish routes give, before any byte is staged.
+    proxy_helpers::reject_write_if_not_hosted(repo.repo_type.as_str())?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
@@ -9870,6 +10028,127 @@ async fn download_artifact_version(
     ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
+/// What the generic download route does with a proxied file of a format whose
+/// handler enforces scan-on-proxy (#4442).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericRouteProxyServe {
+    /// The repository does not scan on proxy: stream as before.
+    Stream,
+    /// The repository scans on proxy: refuse, naming the format route.
+    Refuse,
+    /// The `scan_on_proxy` flag could not be read: fail closed with a 503.
+    ConfigUnreadable,
+}
+
+/// The #4442 decision for an enforced format's Remote miss, from the
+/// repository's `scan_on_proxy` flag.
+///
+/// The generic download route (`/api/v1/repositories/{key}/download/*path`,
+/// and the same handler at `/general/{key}/*path`) streams a Remote miss from
+/// the proxy cache or the upstream with no scan gate. The format routes
+/// (`/npm`, `/maven`, `/cargo`, ...) gate the same bytes, from the same proxy
+/// cache, through `proxy_helpers::serve_scanned_proxy_file`, so for a
+/// repository that scans on proxy this route was the way around their 403. It
+/// cannot run the gate itself: the gate grades the package coordinate each
+/// format route parses from its own request shape (#3003), and npm and Cargo
+/// even fetch from a source their own metadata names (the packument's tarball
+/// URL, the index's `dl` template). This route has no per-format parser for
+/// any of that, so when the repository scans, it refuses.
+///
+/// That holds for every `proxy_scan_action`: `record_only` promises that every
+/// pull is scanned and recorded, which this route cannot do either. It also
+/// holds for every path, metadata included, because a per-format "is this a
+/// package file" carve-out is the classification drift #4365 item 1 warns
+/// about.
+///
+/// An unreadable flag fails closed. The format routes read it as off (#4365
+/// item 5), but this is a refusal gate, and reading it as off would reopen the
+/// bypass for exactly as long as the database is failing.
+fn generic_route_proxy_serve(scan_on_proxy: &Result<bool>) -> GenericRouteProxyServe {
+    match scan_on_proxy {
+        Ok(false) => GenericRouteProxyServe::Stream,
+        Ok(true) => GenericRouteProxyServe::Refuse,
+        Err(_) => GenericRouteProxyServe::ConfigUnreadable,
+    }
+}
+
+/// Whether #4442 applies to `format` on the generic download route: exactly the
+/// formats `GET /api/v1/formats` reports as `scan_on_proxy: "enforced"`, so a
+/// format that adopts the gate closes this route in the same change.
+fn generic_route_checks_scan_on_proxy(format: &RepositoryFormat) -> bool {
+    crate::formats::handler_enforces_scan_on_proxy(format.handler_key())
+}
+
+/// The #4442 refusal for `path`, logged so an operator can see clients using
+/// the wrong route.
+fn generic_route_scan_refusal(repo_key: &str, path: &str, format: &RepositoryFormat) -> Response {
+    let handler = format.handler_key();
+    tracing::warn!(
+        repo = %repo_key, path = %path, handler = %handler,
+        "refusing a proxied download on the generic route: the repository scans \
+         on proxy, so the file is served only through its format route (#4442)"
+    );
+    proxy_helpers::scan_on_proxy_route_required_response(download_filename(path), handler)
+}
+
+/// #4442 for a direct Remote miss: `Ok(Some(403))` refuses, `Ok(None)` streams
+/// as before, and an unreadable flag is a 503. A format that does not enforce
+/// scan-on-proxy streams without a query.
+async fn generic_route_remote_refusal(
+    db: &sqlx::PgPool,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<Response>> {
+    if !generic_route_checks_scan_on_proxy(&repo.format) {
+        return Ok(None);
+    }
+    let scan_on_proxy = crate::services::scan_config_service::ScanConfigService::new(db.clone())
+        .is_proxy_scan_enabled(repo.id)
+        .await;
+    match generic_route_proxy_serve(&scan_on_proxy) {
+        GenericRouteProxyServe::Stream => Ok(None),
+        GenericRouteProxyServe::Refuse => Ok(Some(generic_route_scan_refusal(
+            &repo.key,
+            path,
+            &repo.format,
+        ))),
+        GenericRouteProxyServe::ConfigUnreadable => {
+            tracing::warn!(
+                repo = %repo.key, result = ?scan_on_proxy,
+                "scan-on-proxy flag unreadable on the generic download route; \
+                 failing closed (#4442)"
+            );
+            Err(AppError::ServiceUnavailable(
+                "scan-on-proxy configuration is temporarily unreadable".to_string(),
+            ))
+        }
+    }
+}
+
+/// #4442 for a Virtual miss that would reach Remote members: refuse when any
+/// member the caller may read scans on proxy under the stricter-of-two policy
+/// (the virtual's own configuration or the member's), and pass through the 503
+/// `virtual_member_scan_policies` answers when that configuration cannot be
+/// read. `members` must already be narrowed to the caller, so the answer says
+/// nothing about members the caller cannot see.
+async fn generic_route_virtual_refusal(
+    db: &sqlx::PgPool,
+    repo: &crate::models::repository::Repository,
+    members: &[crate::models::repository::Repository],
+    path: &str,
+) -> Option<Response> {
+    if !generic_route_checks_scan_on_proxy(&repo.format) {
+        return None;
+    }
+    match proxy_helpers::virtual_member_scan_policies(db, repo.id, members).await {
+        Err(unreadable) => Some(unreadable),
+        Ok(policies) if policies.iter().any(Option::is_some) => {
+            Some(generic_route_scan_refusal(&repo.key, path, &repo.format))
+        }
+        Ok(_) => None,
+    }
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -9884,7 +10163,9 @@ async fn download_artifact_version(
     responses(
         (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
         (status = 302, description = "Redirect to S3 presigned URL"),
+        (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy: download it through the format's own route (`error: scan_on_proxy_route_required`)"),
         (status = 404, description = "Artifact not found"),
+        (status = 503, description = "The repository's scan-on-proxy configuration could not be read"),
     )
 )]
 pub async fn download_artifact(
@@ -10154,6 +10435,14 @@ pub async fn download_artifact(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // #4442: a repository that scans on proxy serves an enforced
+                // format's files only through the format route, which runs the
+                // gate. Refused before any routing-rule read, cache read or
+                // upstream request, so a HEAD cannot reach the upstream either.
+                if let Some(refusal) = generic_route_remote_refusal(&state.db, &repo, &path).await?
+                {
+                    return Ok(refusal);
+                }
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let rewritten = routing_rules::apply_routing_rules(&path, &rules);
                 let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
@@ -10242,13 +10531,31 @@ pub async fn download_artifact(
             } else {
                 state.proxy_service.as_deref()
             };
+            // The members the caller may read directly (#3178), fetched here
+            // rather than inside the walk so the #4442 check below sees exactly
+            // the set the walk serves from. A failure keeps the 404 every
+            // other walk failure on this route answers with.
+            let not_found =
+                || AppError::NotFound("Artifact not found in any member repository".to_string());
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await
+                    .map_err(|_| not_found())?;
+            // #4442: the walk streams Remote members unscanned. When the
+            // shadowing guard left them in play and one of them scans on proxy,
+            // refuse instead of serving around the format route's gate.
+            if proxy_for_virtual.is_some() {
+                if let Some(refusal) =
+                    generic_route_virtual_refusal(&state.db, &repo, &members, &path).await
+                {
+                    return Ok(refusal);
+                }
+            }
             let db = state.db.clone();
             let path_clone = path.clone();
-            let result = proxy_helpers::resolve_virtual_download(
-                &state.db,
-                auth.as_ref(),
+            let result = proxy_helpers::resolve_virtual_download_from_members(
+                members,
                 proxy_for_virtual,
-                repo.id,
                 &path,
                 |member_id, location| {
                     let db = db.clone();
@@ -10261,9 +10568,7 @@ pub async fn download_artifact(
                 },
             )
             .await
-            .map_err(|_| {
-                AppError::NotFound("Artifact not found in any member repository".to_string())
-            })?;
+            .map_err(|_| not_found())?;
 
             // #2398 (sibling of #2394): this arm is only reached when
             // `download_stream` returned NotFound for the virtual repo
@@ -11453,10 +11758,13 @@ pub async fn test_upstream(
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
     if response.status().is_success() || status == 404 {
+        let (upstream_url, upstream_url_has_credentials) =
+            upstream_url_for_response(Some(upstream_url));
         Ok(Json(serde_json::json!({
             "status": "ok",
             "upstream_status": status,
             "upstream_url": upstream_url,
+            "upstream_url_has_credentials": upstream_url_has_credentials,
         })))
     } else {
         Err(AppError::BadGateway(format!(
@@ -14597,6 +14905,31 @@ mod tests {
         }
     }
 
+    /// #4423: the member figure is present as an explicit `null` for a
+    /// non-virtual repository and is a number for a virtual one, including
+    /// the response to creating it.
+    #[test]
+    fn member_storage_field_is_null_or_number_4423() {
+        let hosted = serde_json::to_value(repo_to_display_response(
+            sample_repo(),
+            new_repository_storage(&RepositoryType::Local),
+        ))
+        .unwrap();
+        assert_eq!(
+            hosted.get("member_storage_used_bytes"),
+            Some(&serde_json::Value::Null)
+        );
+        let mut virt = sample_repo();
+        virt.repo_type = RepositoryType::Virtual;
+        let created = serde_json::to_value(repo_to_display_response(
+            virt,
+            new_repository_storage(&RepositoryType::Virtual),
+        ))
+        .unwrap();
+        assert_eq!(created["storage_used_bytes"], 0);
+        assert_eq!(created["member_storage_used_bytes"], 0);
+    }
+
     #[test]
     fn test_repository_response_redacts_key_exposes_only_boolean() {
         // #2568: the response serializes a `has_trusted_gpg_key` boolean and
@@ -14617,6 +14950,37 @@ mod tests {
         resp2.has_trusted_gpg_key = false;
         let json2 = serde_json::to_string(&resp2).unwrap();
         assert!(json2.contains("\"has_trusted_gpg_key\":false"), "{json2}");
+    }
+
+    #[test]
+    fn test_repository_response_never_echoes_upstream_url_password() {
+        // #4452: a Remote created with `https://user:pass@host/...` must not
+        // hand the password back on create / get / list / update, which all
+        // render through `repo_to_response`.
+        let mut repo = sample_repo();
+        repo.repo_type = RepositoryType::Remote;
+        repo.upstream_url =
+            Some("https://alice:s3cret-4452@registry.example.com/anything/base".to_string());
+        let json = serde_json::to_value(repo_to_response(repo, 0)).unwrap();
+        let text = json.to_string();
+        assert!(!text.contains("s3cret-4452"), "password leaked: {text}");
+        assert!(!text.contains("alice"), "username leaked: {text}");
+        assert_eq!(
+            json["upstream_url"],
+            "https://registry.example.com/anything/base"
+        );
+        assert_eq!(json["upstream_url_has_credentials"], true);
+
+        // A credential-free URL is echoed verbatim with the flag false, and a
+        // repository without an upstream keeps `null`.
+        let mut plain = sample_repo();
+        plain.upstream_url = Some("https://registry.npmjs.org".to_string());
+        let json = serde_json::to_value(repo_to_response(plain, 0)).unwrap();
+        assert_eq!(json["upstream_url"], "https://registry.npmjs.org");
+        assert_eq!(json["upstream_url_has_credentials"], false);
+        let json = serde_json::to_value(repo_to_response(sample_repo(), 0)).unwrap();
+        assert!(json["upstream_url"].is_null());
+        assert_eq!(json["upstream_url_has_credentials"], false);
     }
 
     #[test]
@@ -14973,8 +15337,10 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 1024,
+            member_storage_used_bytes: None,
             quota_bytes: Some(1048576),
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -14989,6 +15355,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -16386,8 +16753,10 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: Some(true),
@@ -16402,6 +16771,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -19106,6 +19476,95 @@ mod tests {
         tdh::cleanup(&pool, local.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4420: the generic PUT and both multipart upload entry points refuse a
+    /// remote repository with 405 and a virtual one with 400 (the native
+    /// publish-route responses), even for an admin, and store nothing; a
+    /// hosted repository still accepts the same request.
+    #[tokio::test]
+    async fn generic_uploads_reject_remote_and_virtual_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(user_id, &username);
+        let form = "--XB\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\
+                    \r\n\
+                    x\r\n\
+                    --XB--\r\n";
+        for (repo_type, want) in [
+            (
+                "remote",
+                Some((
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Cannot publish to a remote (proxy) repository",
+                )),
+            ),
+            (
+                "virtual",
+                Some((
+                    StatusCode::BAD_REQUEST,
+                    "Cannot publish to a virtual repository",
+                )),
+            ),
+            ("local", None),
+        ] {
+            let (repo_id, key, dir) = tdh::create_repo(&pool, repo_type, "generic").await;
+            let state = tdh::build_state(pool.clone(), &dir.to_string_lossy());
+            let put = upload_artifact(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/put.bin".to_string())),
+                HeaderMap::new(),
+                Body::from(Bytes::from_static(b"BYTES")),
+            )
+            .await;
+            let multipart = upload_artifact_multipart(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path(key.clone()),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let with_path = upload_artifact_multipart_with_path(
+                State(state),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/mp.bin".to_string())),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let stored: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or(-1);
+            tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut refusals = Vec::new();
+            for result in [put, multipart, with_path] {
+                refusals.push(match result {
+                    Ok(_) => None,
+                    Err(resp) => {
+                        let status = resp.status();
+                        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                            .await
+                            .expect("refusal body");
+                        Some((status, String::from_utf8_lossy(&body).into_owned()))
+                    }
+                });
+            }
+            let want_owned = want.map(|(status, text)| (status, text.to_string()));
+            assert_eq!(refusals, vec![want_owned; 3], "{repo_type}");
+            let expected_rows = if want.is_some() { 0 } else { 3 };
+            assert_eq!(stored, expected_rows, "{repo_type}");
+        }
+        tdh::cleanup(&pool, Uuid::nil(), user_id).await;
     }
 
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
@@ -24978,6 +25437,504 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // #4442: the generic download route must not serve around the
+    // scan-on-proxy gate.
+    //
+    // For a Remote of a format whose handler enforces scan-on-proxy, the
+    // format route (/npm, /maven, /cargo, ...) gates every proxied file, while
+    // this route streamed the same bytes, from the same proxy cache, with no
+    // gate. When the repository scans on proxy this route now refuses with
+    // a 403 naming the format handler, before any routing-rule read, cache
+    // read or upstream request. The DB tests assert that the upstream saw no
+    // request, which is what "refused before the proxy" means on the wire.
+    // ---------------------------------------------------------------------
+
+    /// The flag alone picks the arm, and an unreadable flag fails closed
+    /// rather than reading as off.
+    #[test]
+    fn generic_route_proxy_serve_decides_from_the_scan_flag_4442() {
+        assert_eq!(
+            generic_route_proxy_serve(&Ok(true)),
+            GenericRouteProxyServe::Refuse
+        );
+        assert_eq!(
+            generic_route_proxy_serve(&Ok(false)),
+            GenericRouteProxyServe::Stream
+        );
+        assert_eq!(
+            generic_route_proxy_serve(&Err(AppError::Database("connection reset".to_string()))),
+            GenericRouteProxyServe::ConfigUnreadable,
+            "an unreadable scan-on-proxy flag must fail closed on the generic route"
+        );
+    }
+
+    /// The route checks exactly the formats `GET /api/v1/formats` reports as
+    /// enforced, aliases included, so a format that adopts the gate closes this
+    /// route with no second list to update.
+    #[test]
+    fn generic_route_checks_exactly_the_enforced_formats_4442() {
+        use RepositoryFormat::*;
+        for format in RepositoryFormat::ALL {
+            assert_eq!(
+                generic_route_checks_scan_on_proxy(format),
+                crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&format.handler_key()),
+                "{format:?}"
+            );
+        }
+        for format in [
+            Npm, Yarn, Pnpm, Bower, Pypi, Poetry, Jupyter, Maven, Gradle, Sbt, Cargo, Nuget,
+            Chocolatey, Powershell, Vscode, Docker, HelmOci,
+        ] {
+            assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
+        }
+        for format in [
+            Generic,
+            Github,
+            Helm,
+            Go,
+            Rubygems,
+            Conda,
+            CondaNative,
+            Debian,
+        ] {
+            assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
+        }
+    }
+
+    /// The 403 body: the `scan_blocked` family with its own `error`, the
+    /// requested file's basename, and the handler key a client retries on.
+    #[tokio::test]
+    async fn generic_route_refusal_names_the_format_handler_4442() {
+        let resp = generic_route_scan_refusal(
+            "gradle-remote",
+            "com/example/lib/1.0/lib-1.0.jar",
+            &RepositoryFormat::Gradle,
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("refusal body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["error"], "scan_on_proxy_route_required");
+        assert_eq!(json["file"], "lib-1.0.jar");
+        assert_eq!(
+            json["handler"], "maven",
+            "a Gradle repository is served by the maven handler"
+        );
+        assert!(
+            json["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("maven format route")),
+            "{json}"
+        );
+    }
+
+    /// The refusals sit in front of every proxied serve in `download_artifact`.
+    /// `repositories.rs` is not in `proxy_helpers`' `SERVE_SOURCES`, so the
+    /// scan-on-proxy capability test there does not police this handler; this
+    /// pin does. A refusal moved after the routing-rule read or the streaming
+    /// fetch would let a request reach the cache or the upstream first.
+    #[test]
+    fn download_artifact_refuses_before_any_proxied_serve_4442() {
+        let src = include_str!("repositories.rs");
+        let start = src
+            .find("pub async fn download_artifact(")
+            .expect("download_artifact must exist");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("download_artifact must end with a column-0 brace")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("download_artifact must contain `{needle}`"))
+        };
+        let remote_refusal = at("generic_route_remote_refusal(&state.db");
+        assert!(
+            remote_refusal < at("load_routing_rules(&state.db"),
+            "#4442: the Remote refusal must precede the routing-rule read"
+        );
+        assert!(
+            remote_refusal < at("proxy_helpers::proxy_fetch_streaming_with_format("),
+            "#4442: the Remote refusal must precede the streaming proxy fetch"
+        );
+        assert!(
+            at("generic_route_virtual_refusal(&state.db")
+                < at("proxy_helpers::resolve_virtual_download_from_members("),
+            "#4442: the Virtual refusal must precede the member walk"
+        );
+
+        // `get_artifact_metadata` streams a Virtual member's bytes on
+        // `/artifacts/*path` and takes the same Virtual refusal first.
+        let start = src
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata must exist");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("get_artifact_metadata must end with a column-0 brace")];
+        let refusal = body
+            .find("generic_route_virtual_refusal(&state.db")
+            .expect("#4442: get_artifact_metadata must run the Virtual refusal");
+        let walk = body
+            .find("proxy_helpers::resolve_virtual_download_from_members(")
+            .expect("get_artifact_metadata must walk the authorized members");
+        assert!(
+            refusal < walk,
+            "#4442: the Virtual refusal must precede get_artifact_metadata's member walk"
+        );
+    }
+
+    /// A wiremock upstream that answers every GET with `body`.
+    async fn upstream_answering_4442(body: &'static [u8]) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn upstream_requests_4442(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock request recording is enabled")
+            .len()
+    }
+
+    /// A state whose proxy caches under `dir`.
+    fn proxy_state_4442(pool: &sqlx::PgPool, dir: &std::path::Path) -> SharedState {
+        let dir = dir.to_str().expect("utf-8 temp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir);
+        tdh::build_state_with_proxy(pool.clone(), dir, proxy)
+    }
+
+    /// Assert a response is the #4442 refusal of `file`, naming `handler`.
+    fn assert_scan_route_refusal_4442(
+        status: StatusCode,
+        body: &[u8],
+        file: &str,
+        handler: &str,
+        what: &str,
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(body).unwrap_or_else(|e| panic!("{what}: not JSON ({e})"));
+        assert_eq!(json["error"], "scan_on_proxy_route_required", "{what}");
+        assert_eq!(json["file"], file, "{what}");
+        assert_eq!(json["handler"], handler, "{what}");
+    }
+
+    /// An enforced-format Remote that scans on proxy is refused on the generic
+    /// route under every `proxy_scan_action`, with no upstream request.
+    #[tokio::test]
+    async fn generic_route_refuses_a_scanning_enforced_remote_4442() {
+        for (format, path, file) in [
+            ("npm", "left-pad/-/left-pad-1.3.0.tgz", "left-pad-1.3.0.tgz"),
+            ("maven", "com/example/lib/1.0/lib-1.0.jar", "lib-1.0.jar"),
+            (
+                "cargo",
+                "crates/serde/serde-1.0.0.crate",
+                "serde-1.0.0.crate",
+            ),
+        ] {
+            for action in ["fail_open", "fail_closed", "record_only"] {
+                let what = format!("{format} {action}");
+                let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                    return;
+                };
+                let server = upstream_answering_4442(b"unscanned-package-bytes").await;
+                point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+                tdh::enable_proxy_scan(&fx.pool, fx.repo_id, action).await;
+                let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+                let (status, body) = tdh::send(
+                    tdh::router_anon(download_router(), state),
+                    tdh::get(format!("/{}/download/{path}", fx.repo_key)),
+                )
+                .await;
+                assert_scan_route_refusal_4442(status, &body, file, format, &what);
+                assert_eq!(
+                    upstream_requests_4442(&server).await,
+                    0,
+                    "{what}: refused before any upstream request"
+                );
+                fx.teardown().await;
+            }
+        }
+    }
+
+    /// HEAD runs the same handler and is refused the same way, so it can
+    /// neither confirm an upstream file nor cost an upstream request. The
+    /// `/general/`
+    /// mount re-exports this handler for every format and is refused too.
+    #[tokio::test]
+    async fn generic_route_refusal_covers_head_and_the_general_mount_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"unscanned-package-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+        let path = "left-pad/-/left-pad-1.3.0.tgz";
+
+        let (status, _) = tdh::send(
+            tdh::router_anon(download_router(), state.clone()),
+            tdh::head(format!("/{}/download/{path}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "HEAD on the generic route");
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(crate::api::handlers::general::router(), state),
+            tdh::get(format!("/{}/{path}", fx.repo_key)),
+        )
+        .await;
+        assert_scan_route_refusal_4442(status, &body, "left-pad-1.3.0.tgz", "npm", "/general/");
+
+        assert_eq!(upstream_requests_4442(&server).await, 0);
+        fx.teardown().await;
+    }
+
+    /// The refusal precedes the cache read: a file an earlier pull cached
+    /// while scanning was off is not served once the repository scans.
+    #[tokio::test]
+    async fn generic_route_refuses_a_warm_cache_entry_once_scanning_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"cached-jar-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+        let uri = format!("/{}/download/com/example/lib/1.0/lib-1.0.jar", fx.repo_key);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(download_router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scan off: the route still streams");
+        assert_eq!(&body[..], b"cached-jar-bytes");
+        tdh::wait_for_cache_commit(&fx.storage_dir, body.len() as u64).await;
+        let warmed = upstream_requests_4442(&server).await;
+
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let (status, body) =
+            tdh::send(tdh::router_anon(download_router(), state), tdh::get(uri)).await;
+        assert_scan_route_refusal_4442(status, &body, "lib-1.0.jar", "maven", "warm cache");
+        assert_eq!(
+            upstream_requests_4442(&server).await,
+            warmed,
+            "no upstream request after the refusal"
+        );
+        fx.teardown().await;
+    }
+
+    /// What #4442 must not change: an enforced format with scan-on-proxy off,
+    /// and an `accepted` format with it on, still stream from the upstream.
+    #[tokio::test]
+    async fn generic_route_still_streams_where_the_gate_does_not_apply_4442() {
+        for (format, scan) in [("npm", false), ("generic", true)] {
+            let what = format!("{format} scan_on_proxy={scan}");
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = upstream_answering_4442(b"streamed-bytes").await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            if scan {
+                tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+            }
+            let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+            let (status, body) = tdh::send(
+                tdh::router_anon(download_router(), state),
+                tdh::get(format!("/{}/download/pkg/file-1.0.bin", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{what}");
+            assert_eq!(&body[..], b"streamed-bytes", "{what}");
+            fx.teardown().await;
+        }
+    }
+
+    /// A Virtual reaching a Remote member that scans on proxy is refused,
+    /// whichever side turns scanning on (the stricter-of-two rule the format
+    /// routes apply); with scanning off on both sides it still streams.
+    #[tokio::test]
+    async fn generic_route_virtual_follows_the_members_scan_policy_4442() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for scan_on in [None, Some("member"), Some("virtual")] {
+            let what = format!("scan on {scan_on:?}");
+            let server = upstream_answering_4442(b"virtual-member-bytes").await;
+            let (remote_id, _remote_key, virtual_id, virtual_key) =
+                tdh::create_remote_and_virtual(&pool, "npm", &server.uri()).await;
+            tdh::publish_repo(&pool, virtual_id).await;
+            match scan_on {
+                Some("member") => tdh::enable_proxy_scan(&pool, remote_id, "fail_open").await,
+                Some(_) => tdh::enable_proxy_scan(&pool, virtual_id, "fail_open").await,
+                None => {}
+            }
+            let dir = std::env::temp_dir().join(format!("ph-test-4442-{virtual_id}"));
+            std::fs::create_dir_all(&dir).expect("cache dir");
+            let state = proxy_state_4442(&pool, &dir);
+
+            // Both generic routes that stream a member's bytes: the download
+            // route and the artifacts route (`get_artifact_metadata`).
+            for route in ["download", "artifacts"] {
+                let what = format!("{what}, /{route}/");
+                let (status, body) = tdh::send(
+                    tdh::router_anon(download_router().merge(router()), state.clone()),
+                    tdh::get(format!(
+                        "/{virtual_key}/{route}/left-pad/-/left-pad-1.3.0.tgz"
+                    )),
+                )
+                .await;
+                if scan_on.is_some() {
+                    assert_scan_route_refusal_4442(
+                        status,
+                        &body,
+                        "left-pad-1.3.0.tgz",
+                        "npm",
+                        &what,
+                    );
+                    assert_eq!(upstream_requests_4442(&server).await, 0, "{what}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{what}");
+                    assert_eq!(&body[..], b"virtual-member-bytes", "{what}");
+                }
+            }
+
+            for id in [virtual_id, remote_id] {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("ph-test-{id}")));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The shadowing guard still decides first: when a hosted member owns the
+    /// exact path, Remote members are never consulted, so a scanning Remote
+    /// member does not stop the hosted bytes from being served.
+    #[tokio::test]
+    async fn generic_route_virtual_serves_a_hosted_owner_beside_a_scanning_remote_4442() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"upstream-bytes").await;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "npm").await;
+        point_repo_at_upstream(&fx.pool, remote_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        for (member, priority) in [(remote_id, 1), (local_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("add virtual member");
+        }
+        for id in [fx.repo_id, local_id] {
+            tdh::publish_repo(&fx.pool, id).await;
+        }
+        let hosted: &[u8] = b"hosted-member-bytes";
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &local_repo,
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "vdl/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(hosted),
+            fx.user_id,
+        )
+        .await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+        for route in ["download", "artifacts"] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(download_router().merge(router()), state.clone()),
+                tdh::get(format!("/{}/{route}/vdl/blob.bin", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/{route}/: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(&body[..], hosted, "/{route}/");
+            assert_eq!(
+                upstream_requests_4442(&server).await,
+                0,
+                "/{route}/: the Remote member is never consulted"
+            );
+        }
+
+        for (id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            tdh::cleanup_member_repo(&fx.pool, id, dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// A file stored in a scanning Remote repository itself (an `artifacts`
+    /// row) is still served from storage: the refusal sits on the proxy
+    /// fallback only, after the row lookup, and the upstream is not contacted.
+    #[tokio::test]
+    async fn generic_route_still_serves_a_stored_file_of_a_scanning_remote_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"upstream-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let stored: &[u8] = b"stored-in-the-remote-bytes";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("remote", Some(&server.uri())),
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "pkg/stored-1.0.0.tgz",
+            "stored",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(stored),
+            fx.user_id,
+        )
+        .await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(download_router(), state),
+            tdh::get(format!("/{}/download/pkg/stored-1.0.0.tgz", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], stored);
+        assert_eq!(upstream_requests_4442(&server).await, 0);
+        fx.teardown().await;
+    }
+
+    // ---------------------------------------------------------------------
     // compose_artifact_path (#1237)
     //
     // The web UI's "Custom path (optional)" field is sent as a `path` form
@@ -26403,6 +27360,181 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // oci_trusted_bearer_realms (#3591): validation + create/update/get plumbing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oci_trusted_realms_to_store_gates_on_remote() {
+        let list = vec!["https://Auth.Docker.io/".to_string()];
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&list)).unwrap(),
+            Some(vec!["https://auth.docker.io".to_string()])
+        );
+        // `[]` on a remote is an explicit clear.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[])).unwrap(),
+            Some(vec![])
+        );
+        // An untouched form (`[]`) on a non-remote is a no-op; a real list is a 400.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Local, Some(&[])).unwrap(),
+            None
+        );
+        let err = oci_trusted_realms_to_store(&RepositoryType::Virtual, Some(&list)).unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        // Invalid entries are rejected on a remote.
+        for bad in [
+            "http://auth.docker.io",
+            "https://*.docker.io",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[bad.to_string()]))
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oci_trusted_realms_create_update_get_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::load_trusted_realms;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("realm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+
+        // A non-remote create carrying a list is rejected before any row is written.
+        let local_key = format!("realm-local-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &local_key,
+                "local",
+                "docker",
+                serde_json::json!({ "oci_trusted_bearer_realms": ["https://auth.docker.io"] }),
+            ),
+        )
+        .await
+        .expect_err("non-remote must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&local_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            written, 0,
+            "a rejected create must not write the repository row"
+        );
+
+        let repo_key = format!("realm-remote-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &repo_key,
+                "Docker Hub",
+                "docker",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://registry-1.docker.io",
+                    "oci_trusted_bearer_realms": ["https://AUTH.docker.io/", "https://auth.docker.io"]
+                }),
+            ),
+        )
+        .await
+        .expect("remote create with trusted realms must succeed");
+        let docker = vec!["https://auth.docker.io".to_string()];
+        assert_eq!(created.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            docker
+        );
+
+        let Json(fetched) = get_repository(State(state.clone()), auth(), Path(repo_key.clone()))
+            .await
+            .expect("GET must succeed");
+        assert_eq!(fetched.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+
+        // Replace.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({
+                "oci_trusted_bearer_realms": ["https://gitlab.example.com:8443"]
+            })),
+        )
+        .await
+        .expect("update must succeed");
+        let gitlab = vec!["https://gitlab.example.com:8443".to_string()];
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // An invalid entry is rejected and leaves the stored list unchanged.
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(
+                serde_json::json!({ "oci_trusted_bearer_realms": ["http://gitlab.example.com"] }),
+            ),
+        )
+        .await
+        .expect_err("http realm must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("https")));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            gitlab
+        );
+
+        // Omitting the field leaves it unchanged.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "description": "x" })),
+        )
+        .await
+        .expect("unrelated update must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // `[]` clears and the response omits the field.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "oci_trusted_bearer_realms": [] })),
+        )
+        .await
+        .expect("clear must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms, None);
+        assert!(load_trusted_realms(&pool, created.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
     // custom_user_agent: handler plumbing (create / update / get round-trips)
     // -----------------------------------------------------------------------
 
@@ -27089,8 +28221,10 @@ mod tests {
             versioning_enabled: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -27105,6 +28239,7 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -28635,14 +29770,21 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
-        let listed: std::collections::HashMap<String, i64> = json["items"]
+        let listed: std::collections::HashMap<String, (i64, Option<i64>)> = json["items"]
             .as_array()
             .expect("items array")
             .iter()
             .map(|item| {
                 (
                     item["key"].as_str().expect("key").to_string(),
-                    item["storage_used_bytes"].as_i64().expect("storage figure"),
+                    (
+                        item["storage_used_bytes"].as_i64().expect("storage figure"),
+                        match item.get("member_storage_used_bytes") {
+                            Some(serde_json::Value::Null) => None,
+                            Some(figure) => Some(figure.as_i64().expect("member figure")),
+                            None => panic!("member_storage_used_bytes must always be present"),
+                        },
+                    ),
                 )
             })
             .collect();
@@ -28658,7 +29800,8 @@ mod apt_validation_tests {
             (hollow, "hollow", 0),
         ];
         for (id, tag, expected) in matrix {
-            let oracle = if tag == "virt" || tag == "hollow" {
+            let is_virtual = tag == "virt" || tag == "hollow";
+            let oracle = if is_virtual {
                 service
                     .get_virtual_storage_usage(id, &MemberVisibility::Unfiltered)
                     .await
@@ -28673,9 +29816,16 @@ mod apt_validation_tests {
                 oracle, expected,
                 "live-SUM oracle drifted from the seeded expectation for {tag}"
             );
+            // #4423: a virtual's own figure is 0; its members' union is the
+            // separate `member_storage_used_bytes`.
+            let figures = if is_virtual {
+                (0, Some(expected))
+            } else {
+                (expected, None)
+            };
             assert_eq!(
                 listed.get(&format!("{prefix}-{tag}")).copied(),
-                Some(expected),
+                Some(figures),
                 "ledger-backed listing figure must equal the live-SUM oracle for {tag}"
             );
         }
@@ -29195,9 +30345,16 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
-        detail["storage_used_bytes"]
+        virtual_member_figure_4423(&detail)
+    }
+
+    /// A virtual repository's member total from a response item, after
+    /// checking its own `storage_used_bytes` is 0 (#4423).
+    fn virtual_member_figure_4423(item: &serde_json::Value) -> i64 {
+        assert_eq!(item["storage_used_bytes"].as_i64(), Some(0), "{item}");
+        item["member_storage_used_bytes"]
             .as_i64()
-            .expect("detail storage figure")
+            .expect("virtual member storage figure")
     }
 
     /// Read `storage_used_bytes` for `key` from `GET /?q={prefix}` — the
@@ -29226,7 +30383,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(key))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("virtual repo present in listing")
     }
 
@@ -29632,8 +30789,8 @@ mod apt_validation_tests {
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
         assert_eq!(
-            detail["storage_used_bytes"].as_i64(),
-            Some(3_000),
+            virtual_member_figure_4423(&detail),
+            3_000,
             "anonymous total must count the public member only, not the private one"
         );
 
@@ -29647,7 +30804,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(virt_key.as_str()))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("public virtual present in anonymous listing");
         assert_eq!(
             listed, 3_000,
@@ -29813,9 +30970,7 @@ mod apt_validation_tests {
                     String::from_utf8_lossy(&body)
                 );
                 let resp: serde_json::Value = serde_json::from_slice(&body).expect("patch json");
-                resp["storage_used_bytes"]
-                    .as_i64()
-                    .expect("patch storage figure")
+                virtual_member_figure_4423(&resp)
             }
         };
 
@@ -30112,20 +31267,27 @@ mod content_encoding_forwarding_tests {
         assert_eq!(&body[..], &coded[..]);
     }
 
-    /// #4050: the artifact detail response exposes the immutable origin
-    /// record — for a proxied artifact, the fetch-through repository AND the
-    /// upstream that supplied the bytes.
-    #[tokio::test]
-    async fn test_get_artifact_metadata_exposes_origin_4050() {
+    /// Seed one proxied artifact into a fresh Remote whose stored
+    /// `upstream_url` is `stored_upstream`, then read it back through BOTH
+    /// artifact detail routes (`GET /repositories/{key}/artifacts/{path}` and
+    /// `GET /artifacts/{id}`). Returns the two JSON bodies and the repo key.
+    async fn origin_detail_bodies(
+        stored_upstream: &str,
+    ) -> Option<(serde_json::Value, serde_json::Value, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
-            return;
-        };
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
-        tdh::seed_artifact(
+        // The origin fill trigger copies the repositories row's upstream_url.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(stored_upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+        let artifact_id = tdh::seed_artifact(
             &fx.state,
             &fx.pool,
-            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            &fx.repo_info("remote", Some(stored_upstream)),
             "org/origin/1.0/origin-1.0.bin",
             "org/origin/1.0/origin-1.0.bin",
             "origin",
@@ -30147,22 +31309,112 @@ mod content_encoding_forwarding_tests {
             Default::default(),
         )
         .await;
+        let by_id = crate::api::handlers::artifacts::get_artifact(
+            axum::extract::State(fx.state.clone()),
+            Extension(None),
+            axum::extract::Path(artifact_id),
+        )
+        .await;
+        let repo_key = fx.repo_key.clone();
         fx.teardown().await;
 
         let resp = result.unwrap_or_else(|e| panic!("metadata serve failed: {e:?}"));
         let (status, body, _headers) = tdh::collect_response(resp).await;
         assert_eq!(status, StatusCode::OK);
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_path: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_id = serde_json::to_value(
+            by_id
+                .unwrap_or_else(|e| panic!("get_artifact failed: {e:?}"))
+                .0,
+        )
+        .expect("artifact json");
+        Some((by_path, by_id, repo_key))
+    }
+
+    /// #4050: the artifact detail response exposes the immutable origin
+    /// record — for a proxied artifact, the fetch-through repository AND the
+    /// upstream that supplied the bytes.
+    #[tokio::test]
+    async fn test_get_artifact_metadata_exposes_origin_4050() {
+        let Some((json, by_id, repo_key)) =
+            origin_detail_bodies("https://upstream.example.test").await
+        else {
+            return;
+        };
         assert_eq!(
             json["origin"]["v"], 1,
             "origin must be on the detail response: {json}"
         );
         assert_eq!(json["origin"]["kind"], "proxy");
-        assert_eq!(json["origin"]["repository_key"], fx.repo_key);
+        assert_eq!(json["origin"]["repository_key"], repo_key);
         assert_eq!(
             json["origin"]["upstream_url"], "https://upstream.example.test",
             "the detail response must name the upstream that supplied the bytes: {json}"
         );
+        assert_eq!(by_id["origin"], json["origin"], "{by_id}");
+    }
+
+    /// #4452: a Remote whose upstream_url embeds credentials stamps them into
+    /// the stored origin; neither artifact detail route may return them.
+    #[tokio::test]
+    async fn test_artifact_detail_origin_redacts_upstream_userinfo_4452() {
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@upstream.example.test", "alice:s3cret");
+        let Some((by_path, by_id, _)) = origin_detail_bodies(&stored).await else {
+            return;
+        };
+        for json in [&by_path, &by_id] {
+            let text = json.to_string();
+            assert!(
+                !text.contains("s3cret") && !text.contains("alice"),
+                "leaked: {text}"
+            );
+            assert_eq!(
+                json["origin"]["upstream_url"],
+                "https://upstream.example.test"
+            );
+        }
+    }
+
+    /// #4452: the `test-upstream` probe reaches an upstream that requires the
+    /// URL's embedded Basic credentials, and its 200 body reports the URL
+    /// without them plus `upstream_url_has_credentials`.
+    #[tokio::test]
+    async fn test_test_upstream_redacts_upstream_userinfo_4452() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/base"))
+            .and(wiremock::matchers::basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let plain = format!("{}/base", server.uri());
+        let stored = plain.replacen("://", "://alice:s3cret@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&stored)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let result = super::test_upstream(
+            axum::extract::State(fx.state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            axum::extract::Path(fx.repo_key.clone()),
+        )
+        .await;
+        fx.teardown().await;
+
+        let json = result
+            .unwrap_or_else(|e| panic!("test-upstream must reach the authed mock: {e:?}"))
+            .0;
+        assert_eq!(json["upstream_status"], 200, "{json}");
+        assert_eq!(json["upstream_url"], plain.as_str(), "{json}");
+        assert_eq!(json["upstream_url_has_credentials"], true, "{json}");
+        assert!(!json.to_string().contains("s3cret"), "leaked: {json}");
     }
 }
 

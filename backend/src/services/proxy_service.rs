@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
+use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
@@ -34,6 +35,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_tracing::send_upstream;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
@@ -684,31 +686,82 @@ pub(crate) fn redact_url_for_diagnostics(url: &str) -> String {
         (None, Some(f)) => f,
         (None, None) => url.len(),
     };
-    strip_userinfo_fallback(&url[..end])
+    strip_url_userinfo(&url[..end]).0
 }
 
-/// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
-/// not parse. Removes a `userinfo@` segment from the authority (the part
-/// after an optional `scheme://` and before the first `/`), leaving the rest
-/// untouched.
-fn strip_userinfo_fallback(url: &str) -> String {
-    let (prefix, rest) = match url.find("://") {
-        Some(pos) => url.split_at(pos + 3),
-        None if url.starts_with("//") => url.split_at(2),
-        None => ("", url),
+/// Remove the `userinfo@` segment (`user:password@`, or a bare `token@`) from
+/// a URL's authority and report whether one was present (#4452).
+///
+/// This is the read-back sibling of [`redact_url_for_diagnostics`]: it keeps
+/// the path, query and fragment byte-for-byte and touches nothing but the
+/// userinfo, so a credential-free URL comes back exactly as stored (no
+/// `reqwest::Url` normalization such as an added trailing `/`). It is what
+/// every API surface that echoes a Remote repository's `upstream_url` renders
+/// through, paired with the returned flag so a client can still tell that
+/// credentials are configured.
+///
+/// The scheme is only recognised at the start of the string, followed by any
+/// run of `/` or `\` (WHATWG parsers accept `https:user:pass@host`,
+/// `https:/user:pass@host` and `https:\\user:pass@host` as credentialed
+/// URLs). The authority then runs to the first `/`, `?` or `#` (and `\` for
+/// the special schemes, as the URL parser does), and its userinfo is
+/// everything up to the LAST `@`. As a final guard, if `reqwest::Url` still
+/// sees a username or password in the result, the parsed URL with its
+/// userinfo cleared is returned instead, so the output never carries
+/// credentials the fetch path would send.
+pub(crate) fn strip_url_userinfo(url: &str) -> (String, bool) {
+    let (stripped, had) = strip_url_userinfo_textual(url);
+    match reqwest::Url::parse(&stripped) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_password(None);
+            let _ = parsed.set_username("");
+            (parsed.to_string(), true)
+        }
+        _ => (stripped, had),
+    }
+}
+
+/// The string-level half of [`strip_url_userinfo`]. Also the userinfo step
+/// of [`crate::services::artifact_origin::normalize_upstream_url`], whose SQL
+/// twin is `ak_strip_url_userinfo` (migration 271): keep the two in lockstep.
+pub(crate) fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
+    let scheme_len = url.find(':').filter(|&i| {
+        let scheme = &url[..i];
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    let (prefix_len, special) = match scheme_len {
+        Some(i) => {
+            let slashes = url[i + 1..]
+                .bytes()
+                .take_while(|b| *b == b'/' || *b == b'\\')
+                .count();
+            let special = matches!(
+                url[..i].to_ascii_lowercase().as_str(),
+                "http" | "https" | "ws" | "wss" | "ftp"
+            );
+            // A non-special scheme only counts with a `//` authority marker;
+            // otherwise `user:pass@host/x` (no scheme at all) would keep its
+            // username as a "scheme".
+            if special || url[i + 1..].starts_with("//") {
+                (i + 1 + slashes, special)
+            } else {
+                (0, false)
+            }
+        }
+        None if url.starts_with("//") => (2, false),
+        None => (0, false),
     };
-    // The authority ends at the first path separator.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if let Some(at) = authority.rfind('@') {
-        format!(
-            "{}{}{}",
-            prefix,
-            &authority[at + 1..],
-            &rest[authority_end..]
-        )
-    } else {
-        url.to_string()
+    let (prefix, rest) = url.split_at(prefix_len);
+    let authority_end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => (format!("{prefix}{}{tail}", &authority[at + 1..]), at > 0),
+        None => (url.to_string(), false),
     }
 }
 
@@ -1321,6 +1374,21 @@ pub(crate) struct CacheKeys {
     pub(crate) content: String,
     /// Storage key for the cache metadata sidecar (`__cache_meta__.json`).
     pub(crate) metadata: String,
+}
+
+/// The path a proxy-cache entry is keyed on: the request path with every
+/// leading and trailing `/` removed (the only normalization
+/// [`ProxyService::validate_cache_path`] applies; dot and empty segments are
+/// rejected there rather than rewritten).
+///
+/// Exposed so a serve path that classifies a request (e.g. "is this a
+/// package archive the scan gate must see?", #4100) classifies EXACTLY the
+/// key the cache will read and write. Classifying the raw path instead let
+/// `.../widget-1.0.jar/` (empty file name, so "not an archive") stream
+/// unscanned from the same cache entry `.../widget-1.0.jar` had just been
+/// refused for.
+pub(crate) fn normalize_cache_path(path: &str) -> &str {
+    path.trim_start_matches('/').trim_end_matches('/')
 }
 
 impl CacheKeys {
@@ -2429,6 +2497,28 @@ impl CachePersister {
     }
 }
 
+/// The `security` WARN logged when a credentialed remote's OCI bearer realm is
+/// cross-origin and not trusted, so its token is requested anonymously
+/// (GHSA-78h6-3wp8-2542, #3591).
+const REALM_CREDENTIALS_WITHHELD: &str =
+    "OCI bearer realm is a different origin than the configured upstream; requesting the \
+     token WITHOUT the upstream's Basic credentials (GHSA-78h6-3wp8-2542). If this token \
+     service is trusted, add its https origin to the repository's oci_trusted_bearer_realms \
+     (#3591)";
+
+/// Outcome of the OCI bearer-realm credential-forwarding decision
+/// ([`UpstreamClient::realm_credential_forwarding`], GHSA-78h6-3wp8-2542,
+/// #3591).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealmCredentialForwarding {
+    /// The realm shares the configured upstream's origin.
+    SameOrigin,
+    /// Cross-origin, but explicitly trusted for this repository.
+    TrustedRealm,
+    /// Cross-origin and not trusted: request the token anonymously.
+    Withheld,
+}
+
 /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
 /// (#1618 S8 — the highest-risk structural extraction).
 ///
@@ -2652,7 +2742,7 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -2666,7 +2756,7 @@ impl UpstreamClient {
             // helper itself never touches these headers; the closure owns that
             // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
@@ -2723,7 +2813,7 @@ impl UpstreamClient {
         }
         request = apply_custom_ua(request, custom_ua.as_deref());
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
         })?;
 
@@ -2875,7 +2965,7 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -2886,7 +2976,7 @@ impl UpstreamClient {
             // but adds NO `Accept` header, preserving the asymmetry with the
             // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     apply_custom_ua(req, custom_ua.as_deref())
                 })
                 .await?
@@ -2941,6 +3031,7 @@ impl UpstreamClient {
         &self,
         response: reqwest::Response,
         url: &str,
+        repo_id: Uuid,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
         client: &Client,
         build_request: F,
@@ -2981,21 +3072,17 @@ impl UpstreamClient {
                 // endpoints (Docker Hub's auth.docker.io among them) answer
                 // such requests, and a realm that genuinely requires the
                 // upstream's credentials simply rejects the exchange, which
-                // fails closed. There is deliberately no cross-host
-                // allowance: this codebase pins credentials to the
-                // operator-configured origin everywhere else.
-                let realm_auth = if Self::realm_matches_upstream_origin(realm, url) {
-                    upstream_auth.clone()
-                } else {
-                    tracing::warn!(
-                        target: "security",
-                        realm = %redact_url_for_diagnostics(realm),
-                        "OCI bearer realm is a different origin than the configured upstream; \
-                         requesting the token WITHOUT the upstream's Basic credentials \
-                         (GHSA-78h6-3wp8-2542)"
-                    );
-                    None
-                };
+                // fails closed.
+                //
+                // The only cross-origin allowance is the one a repository
+                // administrator configured explicitly for THIS repository
+                // (#3591): `oci_trusted_bearer_realms`, a list of exact
+                // https origins validated on write. Nothing is trusted
+                // implicitly — not even Docker Hub's registry-1 ->
+                // auth.docker.io pair. See `realm_credentials`.
+                let realm_auth = self
+                    .realm_credentials(realm, url, repo_id, upstream_auth)
+                    .await?;
 
                 let token = self
                     .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
@@ -3012,7 +3099,7 @@ impl UpstreamClient {
                 let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
-                let retry_response = retry_request.send().await.map_err(|e| {
+                let retry_response = send_upstream(retry_request).await.map_err(|e| {
                     classify_send_error(
                         e,
                         &format!(
@@ -3108,7 +3195,7 @@ impl UpstreamClient {
 
         tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
 
-        let token_response = token_request.send().await.map_err(|e| {
+        let token_response = send_upstream(token_request).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to request bearer token from {}: {}",
                 realm, e
@@ -3334,6 +3421,80 @@ impl UpstreamClient {
         }
     }
 
+    /// The credentials to send to an OCI bearer `realm`'s token endpoint
+    /// for repository `repo_id` (GHSA-78h6-3wp8-2542, #3591): the configured
+    /// upstream auth when the realm is same-origin or listed in the
+    /// repository's `oci_trusted_bearer_realms`, `None` otherwise. The list
+    /// is only read when there are credentials to forward and the realm is
+    /// cross-origin, so the same-origin and anonymous paths do no lookup.
+    async fn realm_credentials(
+        &self,
+        realm: &str,
+        url: &str,
+        repo_id: Uuid,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        let trusted = if upstream_auth.is_some() && !Self::realm_matches_upstream_origin(realm, url)
+        {
+            crate::services::oci_trusted_realms::load_trusted_realms(&self.db, repo_id).await?
+        } else {
+            Vec::new()
+        };
+        let forwarded = match Self::realm_credential_forwarding(realm, url, &trusted) {
+            RealmCredentialForwarding::SameOrigin => upstream_auth.clone(),
+            RealmCredentialForwarding::TrustedRealm => {
+                // Audit trail: credentials are leaving for another origin
+                // because an administrator said so.
+                tracing::info!(
+                    target: "security",
+                    realm = %redact_url_for_diagnostics(realm),
+                    "forwarding the upstream's credentials to a cross-origin OCI bearer realm \
+                     listed in the repository's oci_trusted_bearer_realms (#3591)"
+                );
+                upstream_auth.clone()
+            }
+            RealmCredentialForwarding::Withheld if upstream_auth.is_some() => {
+                tracing::warn!(
+                    target: "security",
+                    realm = %redact_url_for_diagnostics(realm),
+                    "{}",
+                    REALM_CREDENTIALS_WITHHELD
+                );
+                None
+            }
+            // Anonymous remote: nothing is withheld, so nothing to warn about
+            // (and the allowlist hint would not apply).
+            RealmCredentialForwarding::Withheld => {
+                tracing::debug!(
+                    realm = %redact_url_for_diagnostics(realm),
+                    "cross-origin OCI bearer realm on a remote without upstream credentials"
+                );
+                None
+            }
+        };
+        Ok(forwarded)
+    }
+
+    /// Whether the configured upstream credentials may follow an OCI bearer
+    /// `realm` to its token endpoint: same origin as the upstream request URL
+    /// (GHSA-78h6-3wp8-2542), or an origin the repository administrator
+    /// listed in `oci_trusted_bearer_realms` (#3591, exact https origin
+    /// only, see [`crate::services::oci_trusted_realms::realm_is_trusted`]).
+    /// Anything else withholds them.
+    fn realm_credential_forwarding(
+        realm: &str,
+        upstream_url: &str,
+        trusted: &[String],
+    ) -> RealmCredentialForwarding {
+        if Self::realm_matches_upstream_origin(realm, upstream_url) {
+            RealmCredentialForwarding::SameOrigin
+        } else if crate::services::oci_trusted_realms::realm_is_trusted(realm, trusted) {
+            RealmCredentialForwarding::TrustedRealm
+        } else {
+            RealmCredentialForwarding::Withheld
+        }
+    }
+
     /// Check if upstream ETag has changed (returns true if changed/newer).
     /// Relocated verbatim from `ProxyService::check_etag_changed`.
     ///
@@ -3366,13 +3527,16 @@ impl UpstreamClient {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             AppError::Storage(format!("Failed to check upstream for changes: {}", e))
         })?;
+        // The URL may embed upstream `user:password@` credentials (#4452);
+        // every log line below renders the redacted form.
+        let shown = redact_url_for_diagnostics(url);
 
         match response.status() {
             StatusCode::NOT_MODIFIED => {
-                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
+                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", shown);
                 Ok(false)
             }
             StatusCode::OK => {
@@ -3381,11 +3545,11 @@ impl UpstreamClient {
 
                 match new_etag {
                     Some(etag) if etag == cached_etag => {
-                        tracing::debug!("Upstream ETag unchanged for {}", url);
+                        tracing::debug!("Upstream ETag unchanged for {}", shown);
                         Ok(false)
                     }
                     _ => {
-                        tracing::debug!("Upstream has newer content for {}", url);
+                        tracing::debug!("Upstream has newer content for {}", shown);
                         Ok(true)
                     }
                 }
@@ -3397,7 +3561,7 @@ impl UpstreamClient {
                 // handle the full 401 flow on the next access.
                 tracing::debug!(
                     "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -3434,7 +3598,7 @@ impl UpstreamClient {
                     "Upstream returned {} for ETag check on {}; no content information, \
                      treating as a revalidation failure",
                     status,
-                    url
+                    shown
                 );
                 match validate_upstream_status(status, url) {
                     Err(err) => Err(err),
@@ -3447,7 +3611,7 @@ impl UpstreamClient {
                 tracing::warn!(
                     "Unexpected status {} checking upstream {}, assuming changed",
                     status,
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -4055,6 +4219,12 @@ impl ProxyService {
     /// result because reqwest no longer decodes upstream bodies, so a buffered
     /// metadata document may itself be content coded and the handler has to
     /// declare that when it serves the bytes on.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "buffered")
+    )]
     pub async fn fetch_artifact_with_cache_path_and_accept_capped(
         &self,
         repo: &Repository,
@@ -4356,7 +4526,7 @@ impl ProxyService {
                         {
                             tracing::warn!(
                                 "Upstream fetch failed for {}; serving stale cached copy: {}",
-                                full_url,
+                                redact_url_for_diagnostics(&full_url),
                                 upstream_err
                             );
                             Ok((stale_content, stale_content_type, stale_content_encoding))
@@ -4510,6 +4680,17 @@ impl ProxyService {
 
     /// The single-flight streaming body shared by every digest-gated public
     /// variant.
+    ///
+    /// This and [`Self::fetch_artifact_with_cache_path_and_accept_capped`] are
+    /// the two funnels of the proxy fetch, so each runs in an `INTERNAL`
+    /// `proxy_fetch` phase span (#4455) holding the cache lookup, the
+    /// upstream `CLIENT` span and the cache write.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "streaming")
+    )]
     async fn streaming_gated_fetch(
         &self,
         repo: &Repository,
@@ -4648,6 +4829,7 @@ impl ProxyService {
             .await?
         {
             StreamingCacheReadOutcome::Hit(result, metadata) => {
+                record_cache_outcome("hit");
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
@@ -4667,11 +4849,17 @@ impl ProxyService {
                 );
                 Ok(Some(result))
             }
-            StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
-                "Upstream returned 404 (negative-cached) for {}",
-                cache_path
-            ))),
-            StreamingCacheReadOutcome::Miss => Ok(None),
+            StreamingCacheReadOutcome::NegativeHit => {
+                record_cache_outcome("negative_hit");
+                Err(AppError::NotFound(format!(
+                    "Upstream returned 404 (negative-cached) for {}",
+                    cache_path
+                )))
+            }
+            StreamingCacheReadOutcome::Miss => {
+                record_cache_outcome("miss");
+                Ok(None)
+            }
         }
     }
 
@@ -5319,6 +5507,71 @@ impl ProxyService {
         self.cache_store.invalidate(&keys).await
     }
 
+    /// Retention eviction of one cataloged proxy-cache entry (#3734): delete
+    /// its body and `__cache_meta__.json` sidecar from the proxy-cache store.
+    ///
+    /// The lifecycle sweep's sibling of [`Self::invalidate_cache_by_key`]. It
+    /// targets the same keys ([`CacheKeys::derive`] for `(repo_key, path)`),
+    /// plus the keys the catalog row itself recorded when they differ (an
+    /// entry cached before #3454 sits in the unscoped tree). It differs from
+    /// invalidation in two deliberate ways, both so a failure keeps the
+    /// catalogue row (the caller deletes it only after this returns `Ok`) and
+    /// the entry is retried or reported instead of forgotten:
+    ///
+    /// * a storage error is returned instead of swallowed. Storage GC leaves
+    ///   `proxy-cache/*` objects alone, so dropping the row after a failed
+    ///   delete would strand the object where nothing ever reclaims it;
+    /// * a recorded key that [`ProxyCacheScope::owns_entry_key`] does not
+    ///   place in this repository's cache is an error and nothing is deleted.
+    ///   That is a corrupt row, or a repository renamed after the entry was
+    ///   cached (its objects still sit under the old key's root); either way
+    ///   the row is the only record of those objects.
+    ///
+    /// Returns the number of objects that existed and were deleted. Zero is
+    /// not an error: a placeholder row may never have had a body.
+    pub async fn evict_cached_entry(
+        &self,
+        repo_key: &str,
+        path: &str,
+        recorded_keys: [&str; 2],
+    ) -> Result<usize> {
+        let mut keys: Vec<String> = Vec::with_capacity(4);
+        if let Ok(derived) = CacheKeys::derive(&self.cache_scope, repo_key, path) {
+            keys.push(derived.content);
+            keys.push(derived.metadata);
+        }
+        for recorded in recorded_keys {
+            if keys.iter().any(|k| k == recorded) {
+                continue;
+            }
+            if !self.cache_scope.owns_entry_key(repo_key, recorded) {
+                return Err(AppError::Conflict(format!(
+                    "catalogue row records '{recorded}', which is outside the proxy cache of \
+                     '{repo_key}' (renamed repository or corrupt row); entry kept"
+                )));
+            }
+            keys.push(recorded.to_string());
+        }
+        // Bodies before sidecars, as invalidation orders them.
+        keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
+
+        let mut deleted = 0usize;
+        for key in &keys {
+            if !self.storage.exists(key).await? {
+                continue;
+            }
+            match self.storage.delete(key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            if key.ends_with("__cache_meta__.json") {
+                invalidate_proxy_metadata_lru(key).await;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
     /// `upstream_etag`, `storage_etag`, `content_type`, `size_bytes`) for
     /// a given path on a repository, without checking expiry.
@@ -5481,7 +5734,7 @@ impl ProxyService {
                     if let Ok(content) = self.storage.get(&cache_key).await {
                         tracing::warn!(
                             "Upstream fetch failed for {}; serving stale: {}",
-                            full_url,
+                            redact_url_for_diagnostics(&full_url),
                             upstream_err
                         );
                         let ct = meta.content_type.clone();
@@ -5568,7 +5821,7 @@ impl ProxyService {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             // Redact the target URL (may carry `user:pass@` upstream creds) and
             // drop the URL reqwest embeds in its own error (#2926) before this
             // surfaces to a client.
@@ -5586,7 +5839,7 @@ impl ProxyService {
             StatusCode::UNAUTHORIZED => {
                 if let Some(retry_response) = self
                     .upstream_client
-                    .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                    .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                         req.header(IF_NONE_MATCH, etag)
                     })
                     .await?
@@ -5606,7 +5859,8 @@ impl ProxyService {
 
                 Err(AppError::Storage(format!(
                     "Upstream returned error status {}: {}",
-                    status, url
+                    status,
+                    redact_url_for_diagnostics(url)
                 )))
             }
             _ => {
@@ -6407,26 +6661,13 @@ impl ProxyService {
         // the #2047 hazard (a repository recreated with the same key serving
         // the deleted one's upstream content) would survive as long as the
         // legacy tree does. It deletes only; it can never serve bytes.
+        // `repo_roots` also guards the collision where `repo_key` equals THIS
+        // deployment's scope segment: the legacy prefix would then be the root
+        // of the ENTIRE deployment's cache. Repository creation/rename rejects
+        // the collision too (`repositories::validate_key_not_scope_collision`);
+        // the guard is the half that still holds for older repositories.
         let mut deleted = 0usize;
-        let mut prefixes = vec![self.cache_scope.repo_root(repo_key)];
-        // The legacy unscoped sweep (`proxy-cache/<repo_key>/`) reclaims objects
-        // this deployment cached before #3454. But `proxy-cache/<repo_key>/` is
-        // ALSO the shape of a scope root: when `repo_key` equals THIS
-        // deployment's own scope segment the legacy prefix collapses to
-        // `proxy-cache/<scope>/` — the root of the ENTIRE deployment's cache —
-        // and sweeping it would delete every other repository's cached content.
-        // A repository key can legally equal the scope segment (both are drawn
-        // from `[A-Za-z0-9._-]`, so a UUID or a token like `prod-eu` is a valid
-        // key), so guard the collision explicitly and sweep only the scoped
-        // subtree in that case. Repository creation/rename rejects the collision
-        // too (`repositories::validate_key_not_scope_collision`); this guard is
-        // the half that still holds for a repository that predates that check.
-        if self.cache_scope.segment() != Some(repo_key) {
-            let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
-            if !prefixes.contains(&legacy) {
-                prefixes.push(legacy);
-            }
-        }
+        let prefixes = self.cache_scope.repo_roots(repo_key);
         let mut keys = Vec::new();
         for prefix in &prefixes {
             keys.extend(self.storage.list(Some(prefix)).await?);
@@ -6506,7 +6747,7 @@ impl ProxyService {
     /// suspenders so a future call site that bypasses the storage check
     /// still cannot escape (#1018 R3-7 / #1052).
     fn validate_cache_path(path: &str) -> Result<&str> {
-        let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+        let trimmed = normalize_cache_path(path);
 
         if trimmed.is_empty() {
             return Err(AppError::Validation(
@@ -13569,6 +13810,90 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_url_userinfo_keeps_everything_but_the_userinfo() {
+        // #4452: the read-back form drops only the userinfo; path, query and
+        // fragment survive byte-for-byte, and the flag reports the strip.
+        for (raw, want, had) in [
+            (
+                "https://alice:s3cret@registry.example.com/simple?x=1#f",
+                "https://registry.example.com/simple?x=1#f",
+                true,
+            ),
+            ("https://token@host:8443", "https://host:8443", true),
+            ("https://u:p@ss@host/a", "https://host/a", true),
+            ("//user:pass@host/path", "//host/path", true),
+            ("user:pass@host/path", "host/path", true),
+            ("https://u:p@[::1]:8443/x", "https://[::1]:8443/x", true),
+            ("https://user%40corp:p%40ss@host/", "https://host/", true),
+            ("https://:pw@host/", "https://host/", true),
+            // WHATWG accepts these slash-less / backslash forms as
+            // credentialed special-scheme URLs; a `://` later in the query
+            // must not be mistaken for the scheme separator.
+            (
+                "https:user:pass@host/x?q=http://z",
+                "https:host/x?q=http://z",
+                true,
+            ),
+            ("https:/user:pass@host", "https:/host", true),
+            ("https:\\\\user:pass@host", "https:\\\\host", true),
+            // `\` ends a special-scheme authority, as in the URL parser: the
+            // host is `host`, and `\x@y/z` is path.
+            ("https://u:p@host\\x@y/z", "https://host\\x@y/z", true),
+            ("https://host\\@evil/", "https://host\\@evil/", false),
+            // Credential-free URLs come back exactly as stored (no parser
+            // normalization such as an added trailing slash).
+            (
+                "https://registry.npmjs.org",
+                "https://registry.npmjs.org",
+                false,
+            ),
+            ("https://host/a@b?c=d@e", "https://host/a@b?c=d@e", false),
+            ("https://host?q=a@b", "https://host?q=a@b", false),
+            ("https://@host/", "https://host/", false),
+            ("not a url", "not a url", false),
+        ] {
+            assert_eq!(strip_url_userinfo(raw), (want.to_string(), had), "{raw}");
+        }
+    }
+
+    /// #4452: redacting `upstream_url` on read must not change what the
+    /// proxy sends upstream. Userinfo embedded in a Remote's upstream URL is
+    /// still presented as HTTP Basic auth; the mock only answers 200 when the
+    /// request carries exactly those credentials.
+    #[tokio::test]
+    async fn test_fetch_sends_upstream_url_userinfo_as_basic_auth() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{basic_auth, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/base/pkg/file.txt"))
+            .and(basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"authed".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-4452-basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let upstream = server.uri().replacen("://", "://alice:s3cret@", 1) + "/base";
+        let mut repo = remote_repo_for("generic-4452", &upstream, tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Generic;
+
+        let result = proxy.fetch_artifact(&repo, "pkg/file.txt").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct) = result.expect(
+            "the upstream only answers when the URL's userinfo arrives as \
+             Basic auth; a failure means the proxy stopped sending it",
+        );
+        assert_eq!(&body[..], b"authed");
+    }
+
+    #[test]
     fn test_redact_url_for_diagnostics_strips_userinfo_unparseable_fallback() {
         // The non-`reqwest::Url` fallback path must strip userinfo too.
         assert_eq!(
@@ -16838,6 +17163,309 @@ mod tests {
         ));
     }
 
+    // -- #3591: explicitly trusted cross-origin realms ------------------------
+    //
+    // The per-repository `oci_trusted_bearer_realms` allowlist is the ONLY
+    // cross-origin allowance. These pin the decision `exchange_bearer_then`
+    // acts on: same origin forwards, a listed exact https origin forwards,
+    // everything else (unlisted, http downgrade, lookalike hosts, port
+    // mismatch) withholds the credentials exactly as before.
+
+    fn trusted(origins: &[&str]) -> Vec<String> {
+        origins.iter().map(|o| o.to_string()).collect()
+    }
+
+    const DOCKER_HUB_MANIFEST: &str =
+        "https://registry-1.docker.io/v2/acme/private/manifests/latest";
+
+    #[test]
+    fn test_realm_forwarding_same_origin_needs_no_allowlist() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://registry.example.com/token",
+                "https://registry.example.com/v2/x",
+                &[]
+            ),
+            RealmCredentialForwarding::SameOrigin
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_trusted_cross_origin_realm() {
+        // Docker Hub private repositories: the documented configuration.
+        let docker = trusted(&["https://auth.docker.io"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &docker
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+        // Split-host GitLab, with an explicit non-default port.
+        let gitlab = trusted(&["https://gitlab.example.com:8443"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://gitlab.example.com:8443/jwt/auth",
+                "https://registry.example.com/v2/group/project/manifests/1",
+                &gitlab
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_untrusted_cross_origin_realm() {
+        // Nothing is trusted implicitly: the Docker Hub pair without an
+        // allowlist entry keeps the GHSA-78h6-3wp8-2542 behavior.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &[]
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+        // An allowlist for a different origin does not help an attacker realm.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://attacker.example/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_http_realm_even_when_host_is_trusted() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "http://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_lookalike_hosts_and_ports() {
+        let list = trusted(&["https://auth.docker.io"]);
+        for realm in [
+            "https://auth.docker.io.attacker.example/token",
+            "https://evilauth.docker.io/token",
+            "https://sub.auth.docker.io/token",
+            "https://auth.docker.io@attacker.example/token",
+            "https://auth-docker.io/token",
+            "https://auth.docker.io:8443/token",
+            "not a url",
+        ] {
+            assert_eq!(
+                UpstreamClient::realm_credential_forwarding(realm, DOCKER_HUB_MANIFEST, &list),
+                RealmCredentialForwarding::Withheld,
+                "{realm} must not receive the upstream credentials"
+            );
+        }
+    }
+
+    /// End-to-end over the seam `exchange_bearer_then` calls: the stored
+    /// per-repository allowlist decides whether the configured credentials
+    /// follow a cross-origin realm (#3591), and nothing else does.
+    #[tokio::test]
+    async fn test_realm_credentials_reads_the_repository_allowlist_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::UpstreamAuthType;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let client = UpstreamClient::new(pool.clone(), Client::new());
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let realm = "https://auth.docker.io/token";
+        // Each call returns the forwarded credentials and the INFO+ log lines
+        // it emitted, so the security logging is pinned alongside the decision.
+        let call = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let client = &client;
+            async move {
+                let capture = tdh::LogCapture::default();
+                let guard = capture.install(tracing::Level::INFO);
+                let out = client
+                    .realm_credentials(realm, DOCKER_HUB_MANIFEST, repo_id, &auth)
+                    .await
+                    .expect("realm_credentials");
+                drop(guard);
+                (out, capture.text())
+            }
+        };
+        let get = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let call = &call;
+            async move { call(realm, auth).await.0 }
+        };
+
+        // No allowlist: cross-origin realm gets no credentials (GHSA-78h6),
+        // and the security WARN names the setting.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out.is_none());
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("WITHOUT")
+                && logs.contains("oci_trusted_bearer_realms"),
+            "withheld credentials must log the security warning: {logs}"
+        );
+        // Anonymous remotes: nothing withheld, so no WARN (debug only).
+        let (out, logs) = call(realm, None).await;
+        assert!(out.is_none());
+        assert!(
+            !logs.contains("WARN"),
+            "anonymous remote must not warn: {logs}"
+        );
+        // Same origin forwards without any allowlist.
+        assert!(get("https://registry-1.docker.io/token", creds.clone()).await == creds);
+
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+        // Trusted: forwarded, with an INFO audit line and no warning.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out == creds);
+        assert!(
+            logs.contains("INFO") && logs.contains("forwarding") && !logs.contains("WARN"),
+            "trusted forwarding must leave an INFO audit line: {logs}"
+        );
+        // Still withheld: http downgrade, lookalike host.
+        assert!(get("http://auth.docker.io/token", creds.clone())
+            .await
+            .is_none());
+        assert!(get(
+            "https://auth.docker.io.attacker.example/token",
+            creds.clone()
+        )
+        .await
+        .is_none());
+        // Anonymous remotes stay anonymous even when the realm is listed.
+        assert!(get(realm, None).await.is_none());
+
+        // Clearing restores the strict default.
+        save_trusted_realms(&pool, repo_id, &[])
+            .await
+            .expect("clear");
+        assert!(get(realm, creds.clone()).await.is_none());
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// End to end through `fetch_from_upstream` (pins the call site in
+    /// `exchange_bearer_then`): a credentialed remote whose registry names a
+    /// cross-origin realm that is NOT in its allowlist must request the token
+    /// with no `Authorization` header, while the registry itself still gets
+    /// the Basic credentials. Two non-loopback wiremock origins (different
+    /// ports) stand in for registry and token service. The trusted-forwarding
+    /// counterpart cannot run here: trusted entries are https-only and
+    /// wiremock serves http, so that side is pinned by
+    /// `test_realm_credentials_reads_the_repository_allowlist_db`.
+    #[tokio::test]
+    async fn test_fetch_from_upstream_withholds_credentials_from_unlisted_realm_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "anon-token",
+            })))
+            .mount(&token_service)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .and(header("authorization", "Bearer anon-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"manifest".as_ref()))
+            .with_priority(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    "Bearer realm=\"{}/token\",service=\"registry\",scope=\"repository:acme/app:pull\"",
+                    token_service.uri()
+                )
+                .as_str(),
+            ))
+            .with_priority(10)
+            .mount(&registry)
+            .await;
+
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc".to_string(),
+                password: "s3cret".to_string(),
+            }),
+        )
+        .await
+        .expect("save upstream auth");
+        // An allowlist that does not name the token service.
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+        let url = format!("{}/v2/acme/app/manifests/1", registry.uri());
+        let fetched = proxy.fetch_from_upstream(&url, repo_id, 1 << 20).await;
+
+        let token_requests = token_service.received_requests().await.expect("recorded");
+        let registry_requests = registry.received_requests().await.expect("recorded");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let fetched = fetched.expect("anonymous token exchange must complete the fetch");
+        assert_eq!(fetched.content.as_ref(), b"manifest");
+        assert_eq!(token_requests.len(), 1, "exactly one token exchange");
+        assert!(
+            token_requests[0].headers.get("authorization").is_none(),
+            "an unlisted cross-origin realm must NOT receive the upstream credentials"
+        );
+        assert!(
+            registry_requests[0]
+                .headers
+                .get("authorization")
+                .is_some_and(|v| v.to_str().unwrap_or("").starts_with("Basic ")),
+            "the registry itself is same-origin and still gets the Basic credentials"
+        );
+    }
+
     #[tokio::test]
     async fn test_obtain_bearer_token_attaches_basic_credentials_only_when_given() {
         use wiremock::matchers::{method, path};
@@ -18234,6 +18862,78 @@ mod tests {
             .expect("second fetch must be served from the proxy cache");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
+    }
+
+    /// #4455: a buffered proxy fetch runs in a `proxy_fetch` phase span under
+    /// the request span, the upstream `CLIENT` span sits inside it, and the
+    /// cache lookup's outcome lands on the request span (last write wins:
+    /// the second, cached fetch is a `hit`).
+    #[tokio::test]
+    async fn test_buffered_fetch_traces_phase_span_and_cache_outcome() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::request_span::{with_request_span, CACHE_OUTCOME_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dl/traced.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball".as_ref()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("traced-fetch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("traced-fetch", &server.uri(), tmp.to_str().unwrap());
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let request = axum::http::Request::builder().uri("/x").body(()).unwrap();
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        with_request_span(span.clone(), async {
+            for _ in 0..2 {
+                proxy
+                    .fetch_artifact_with_cache_path(&repo, "dl/traced.tgz", "dl/traced.tgz")
+                    .await
+                    .expect("fetch (upstream, then cache)");
+            }
+        })
+        .instrument(span)
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, CACHE_OUTCOME_FIELD),
+            Some(opentelemetry::Value::from("hit"))
+        );
+        let phases = exported.named("proxy_fetch");
+        assert_eq!(phases.len(), 2, "one proxy_fetch span per fetch");
+        for phase in &phases {
+            assert_eq!(phase.parent_span_id, root.span_context.span_id());
+            assert_eq!(
+                attr(phase, "artifact_keeper.repository.key"),
+                Some(opentelemetry::Value::from("traced-fetch"))
+            );
+            assert_eq!(
+                attr(phase, "artifact_keeper.proxy.mode"),
+                Some(opentelemetry::Value::from("buffered"))
+            );
+        }
+        let upstream = exported.one("GET");
+        assert_eq!(upstream.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert!(
+            phases
+                .iter()
+                .any(|p| p.span_context.span_id() == upstream.parent_span_id),
+            "the upstream CLIENT span is a child of a proxy_fetch span"
+        );
     }
 
     // -- parse_bearer_challenge: unquoted-value and trailing branches --------
