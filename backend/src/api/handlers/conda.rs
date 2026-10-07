@@ -3461,7 +3461,7 @@ async fn upload_package_put(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, &subdir, &filename, body, user_id).await
+    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3482,11 +3482,12 @@ async fn upload_post(
     repo.reject_if_promotion_only(false)?;
 
     // Determine subdir and filename from headers
+    // Without the header the package's own `index.json` decides (F8).
     let subdir = headers
         .get("X-Conda-Subdir")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "noarch".to_string());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let filename = extract_upload_filename(&headers)?;
 
@@ -3498,7 +3499,7 @@ async fn upload_post(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, &subdir, &filename, body, user_id).await
+    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3532,7 +3533,7 @@ async fn upload_package_put_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, &subdir, &filename, body, user_id).await
+    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
 }
 
 /// POST upload using URL path token: /conda/t/<TOKEN>/<repo_key>/upload
@@ -3555,11 +3556,12 @@ async fn upload_post_with_token(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
+    // Without the header the package's own `index.json` decides (F8).
     let subdir = headers
         .get("X-Conda-Subdir")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "noarch".to_string());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let filename = extract_upload_filename(&headers)?;
 
@@ -3571,7 +3573,7 @@ async fn upload_post_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, &subdir, &filename, body, user_id).await
+    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -4962,14 +4964,53 @@ fn conda_identity_input<'a>(
     }
 }
 
+/// Decide the subdir an upload lands in from the one the request named (the
+/// PUT path segment or the POST `X-Conda-Subdir` header) and the one the
+/// package declares in `info/index.json`.
+///
+/// The package is authoritative: conda clients solve against the record's
+/// `subdir`, so a `linux-64` build filed under `noarch/` is offered to every
+/// platform and breaks the ones it was not built for. A request that names a
+/// different subdir is refused with both values in the message; a POST that
+/// names none takes the package's own. Only a package that declares nothing
+/// (no readable `index.json` subdir) falls back to the request, then to
+/// `noarch` as before.
+#[allow(clippy::result_large_err)]
+fn resolve_upload_subdir(
+    requested: Option<&str>,
+    declared: Option<&str>,
+) -> Result<String, Response> {
+    match (requested, declared) {
+        (Some(req), Some(decl)) if req != decl => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Subdir mismatch: the upload targets '{req}' but the package's info/index.json \
+                 declares subdir '{decl}'"
+            ),
+        )
+            .into_response()),
+        (Some(req), _) => Ok(req.to_string()),
+        (None, Some(decl)) => Ok(decl.to_string()),
+        (None, None) => Ok("noarch".to_string()),
+    }
+}
+
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
-    subdir: &str,
+    requested_subdir: Option<&str>,
     filename: &str,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
+    // The subdir the package itself declares (#2561: permit-scoped decode).
+    let declared_subdir = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_conda_metadata(&content, filename)
+            .and_then(|m| m.get("subdir").and_then(|v| v.as_str()).map(str::to_string))
+    })
+    .map_err(|e| e.into_response())?;
+    let subdir = resolve_upload_subdir(requested_subdir, declared_subdir.as_deref())?;
+    let subdir = subdir.as_str();
     // Parse the filename using the existing conda_native handler
     let conda_path = build_conda_artifact_path(subdir, filename);
     let path_info = CondaNativeHandler::parse_path(&conda_path).map_err(|e| {
@@ -15302,5 +15343,105 @@ mod virtual_channel_tests {
             Some("no-store")
         );
         assert!(headers.get("warning").is_some());
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod upload_subdir_tests {
+    //! F8: the upload's subdir must agree with the package's `index.json`.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A valid conda v1 package declaring `subdir` in its `index.json`.
+    fn v1_package_for(name: &str, version: &str, build: &str, subdir: &str) -> Vec<u8> {
+        let index = serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "subdir": subdir,
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("info/index.json").unwrap();
+            header.set_size(index.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &index[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        bzip2_compress(&tar_data)
+    }
+
+    #[test]
+    fn resolve_upload_subdir_prefers_the_package_and_refuses_disagreement() {
+        assert_eq!(
+            resolve_upload_subdir(Some("linux-64"), Some("linux-64")).unwrap(),
+            "linux-64"
+        );
+        assert_eq!(
+            resolve_upload_subdir(None, Some("linux-64")).unwrap(),
+            "linux-64"
+        );
+        assert_eq!(
+            resolve_upload_subdir(Some("osx-arm64"), None).unwrap(),
+            "osx-arm64"
+        );
+        assert_eq!(resolve_upload_subdir(None, None).unwrap(), "noarch");
+        let err = resolve_upload_subdir(Some("noarch"), Some("linux-64")).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A `linux-64` package PUT under `noarch/` is refused with 400 naming
+    /// both subdirs; POSTed without `X-Conda-Subdir` it lands in `linux-64`.
+    #[tokio::test]
+    async fn upload_subdir_is_checked_against_index_json() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let filename = "acme-fastmath-1.0-h1_0.tar.bz2";
+        let body = v1_package_for("acme-fastmath", "1.0", "h1_0", "linux-64");
+
+        let (put_status, put_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/noarch/{filename}", fx.repo_key),
+                Bytes::from(body.clone()),
+            ),
+        )
+        .await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Package-Filename", filename)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (post_status, post_body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        let paths: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        fx.teardown().await;
+
+        let put_body = String::from_utf8_lossy(&put_body);
+        assert_eq!(put_status, StatusCode::BAD_REQUEST, "{put_body}");
+        assert!(
+            put_body.contains("noarch") && put_body.contains("linux-64"),
+            "the refusal must name both subdirs: {put_body}"
+        );
+        assert!(
+            post_status.is_success(),
+            "{post_status} {}",
+            String::from_utf8_lossy(&post_body)
+        );
+        assert_eq!(paths, vec![format!("linux-64/{filename}")]);
     }
 }
