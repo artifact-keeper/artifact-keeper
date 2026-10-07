@@ -291,6 +291,7 @@ pub(super) async fn fetch_member_document(
     member: &Repository,
     candidates: &[(String, FileCodec)],
     limits: MemberLimits,
+    missing_is_empty: bool,
 ) -> Result<MemberDocument, MemberFailure> {
     let fail = |kind: &'static str, reason: String| MemberFailure {
         member: member.key.clone(),
@@ -363,6 +364,16 @@ pub(super) async fn fetch_member_document(
             }
         }
     }
+    if missing_is_empty && last_status == Some(StatusCode::NOT_FOUND) {
+        // Every candidate answered 404: the upstream does not publish this
+        // subdir at all (conda-forge has no `unknown/`, most channels lack
+        // most platforms). A conda client treats a missing subdir as empty, so
+        // the member contributes nothing rather than failing the merge.
+        return Ok(MemberDocument {
+            member: member.key.clone(),
+            json: b"{}".to_vec(),
+        });
+    }
     Err(fail(
         "fetch",
         format!(
@@ -380,6 +391,7 @@ pub(super) async fn fetch_remote_members(
     members: &[Repository],
     candidates: &[(String, FileCodec)],
     limits: MemberLimits,
+    missing_is_empty: bool,
 ) -> (Vec<MemberDocument>, Vec<MemberFailure>) {
     let mut documents = Vec::new();
     let mut failures = Vec::new();
@@ -395,7 +407,7 @@ pub(super) async fn fetch_remote_members(
             });
             continue;
         };
-        match fetch_member_document(proxy, member, candidates, limits).await {
+        match fetch_member_document(proxy, member, candidates, limits, missing_is_empty).await {
             Ok(doc) => documents.push(doc),
             Err(failure) => failures.push(failure),
         }

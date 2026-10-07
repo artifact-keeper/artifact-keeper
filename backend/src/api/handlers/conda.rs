@@ -206,6 +206,17 @@ fn validate_cep26_filename(filename: &str) -> Result<(), String> {
 /// Validate a conda subdir name per CEP-26.
 ///
 /// Must be `noarch` or match `^[a-z0-9]+-[a-z0-9]+$`, max 32 characters.
+/// Subdir validation for READ paths: everything an upload may use, plus
+/// `unknown`, the platform rattler and pixi query when no platform is given
+/// (`pixi search` without `-p`). It never holds packages, so it is served as
+/// an empty index instead of a 400 that aborts the client's whole solve.
+fn validate_read_subdir(subdir: &str) -> Result<(), String> {
+    if subdir == "unknown" {
+        return Ok(());
+    }
+    validate_cep26_subdir(subdir)
+}
+
 fn validate_cep26_subdir(subdir: &str) -> Result<(), String> {
     if subdir.len() > 32 {
         return Err(format!(
@@ -2776,7 +2787,7 @@ async fn build_repodata(
     latest_only: bool,
 ) -> Result<serde_json::Value, Response> {
     // Validate subdir on read paths (defense-in-depth)
-    validate_cep26_subdir(subdir)
+    validate_read_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
     let all_artifacts = list_conda_artifacts(db, repo_id).await?;
@@ -2957,7 +2968,7 @@ async fn build_virtual_repodata(
     subdir: &str,
     encoding: RepodataEncoding,
 ) -> Result<VirtualMerge, Response> {
-    validate_cep26_subdir(subdir)
+    validate_read_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
     // Caller-authorized member walk (#3323): repodata is content, so a member
@@ -2993,6 +3004,7 @@ async fn build_virtual_repodata(
         &members,
         &virtual_merge::repodata_candidates(subdir),
         virtual_merge::MemberLimits::from_env(),
+        true,
     )
     .await;
 
@@ -3073,6 +3085,7 @@ async fn build_virtual_channeldata(
         &members,
         &virtual_merge::channeldata_candidates(),
         virtual_merge::MemberLimits::from_env(),
+        false,
     )
     .await;
     let (body, parse_failures) = tokio::task::spawn_blocking(move || {
@@ -15318,6 +15331,7 @@ mod virtual_channel_tests {
                 fetched: 1024,
                 decoded: 1024 * 1024,
             },
+            true,
         )
         .await;
         rig.cleanup().await;
@@ -15438,6 +15452,44 @@ mod virtual_channel_tests {
             Some("no-store")
         );
         assert!(headers.get("warning").is_some());
+    }
+
+    #[test]
+    fn unknown_subdir_is_a_valid_read_subdir_only() {
+        assert!(validate_read_subdir("unknown").is_ok());
+        assert!(validate_read_subdir("linux-64").is_ok());
+        assert!(validate_read_subdir("Linux-64").is_err());
+        assert!(validate_cep26_subdir("unknown").is_err());
+    }
+
+    /// F16: `unknown` (what pixi asks for without `-p`) is an empty index, for
+    /// a hosted channel and for a virtual whose remote member publishes no
+    /// such subdir (every candidate 404s), instead of a 400 or a 502.
+    #[tokio::test]
+    async fn unknown_subdir_is_served_empty() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await; // every path 404s
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let (v_status, v_doc) = rig.repodata("unknown").await;
+        let (h_status, h_body, _) = rig
+            .get(format!("/{hosted_key}/unknown/repodata.json"))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(v_status, StatusCode::OK, "{v_doc}");
+        assert!(listed(&v_doc).is_empty());
+        assert_eq!(h_status, StatusCode::OK);
+        let h_doc: serde_json::Value = serde_json::from_slice(&h_body).unwrap();
+        assert!(listed(&h_doc).is_empty());
+        assert_eq!(h_doc["info"]["subdir"], "unknown");
     }
 }
 
