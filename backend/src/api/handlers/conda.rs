@@ -23,6 +23,7 @@
 //!
 //! All read routes are also available with URL path token authentication:
 //!   GET  /conda/t/{token}/{repo_key}/...                     - Token-authenticated access
+//!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -739,7 +740,7 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
-/// Router for token-authenticated conda endpoints.
+/// Router for token-authenticated conda endpoints, mounted at `/conda/t`.
 ///
 /// Conda clients can embed authentication tokens in the URL path:
 ///   /conda/t/<TOKEN>/<repo_key>/<subdir>/repodata.json
@@ -748,66 +749,87 @@ pub fn router() -> Router<SharedState> {
 ///   channels:
 ///     - https://host/conda/t/<TOKEN>/my-channel
 pub fn token_router() -> Router<SharedState> {
+    token_routes("")
+}
+
+/// Router for rattler's token layout (pixi `--conda-token`), mounted at `/t`.
+///
+/// rattler stores a conda token per host and inserts `/t/<TOKEN>` at the
+/// FRONT of every request path, so a channel configured as
+/// `https://host/conda/my-channel` is fetched as
+/// `https://host/t/<TOKEN>/conda/my-channel/...`. The handlers are the same
+/// ones [`token_router`] serves; only the position of the token differs.
+pub fn rattler_token_router() -> Router<SharedState> {
+    token_routes("/conda")
+}
+
+/// The token-channel routes, with `conda` inserted between the token and the
+/// repository key (`"/conda"`, rattler) or not (`""`, conda's `.condarc`).
+/// Every handler binds `(token, repo_key, ...)` either way.
+fn token_routes(conda: &str) -> Router<SharedState> {
     Router::new()
         .route(
-            "/:token/:repo_key/channeldata.json",
+            &format!("/:token{conda}/:repo_key/channeldata.json"),
             get(channeldata_json_with_token),
         )
         .route(
-            "/:token/:repo_key/notices.json",
+            &format!("/:token{conda}/:repo_key/notices.json"),
             get(notices_json_with_token),
         )
         .route(
-            "/:token/:repo_key/keys/repo.pub",
+            &format!("/:token{conda}/:repo_key/keys/repo.pub"),
             get(repo_public_key_with_token),
         )
-        .route("/:token/:repo_key/upload", post(upload_post_with_token))
         .route(
-            "/:token/:repo_key/:subdir/repodata.json",
+            &format!("/:token{conda}/:repo_key/upload"),
+            post(upload_post_with_token),
+        )
+        .route(
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.json"),
             get(repodata_json_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/repodata.json.bz2",
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.json.bz2"),
             get(repodata_json_bz2_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/repodata.json.sig",
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.json.sig"),
             get(repodata_json_sig_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/repodata.json.zst",
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.json.zst"),
             get(repodata_json_zst_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/repodata.json.jlap",
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.json.jlap"),
             get(repodata_json_jlap_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/current_repodata.json",
+            &format!("/:token{conda}/:repo_key/:subdir/current_repodata.json"),
             get(current_repodata_json_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/run_exports.json",
+            &format!("/:token{conda}/:repo_key/:subdir/run_exports.json"),
             get(run_exports_json_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/patch_instructions.json",
+            &format!("/:token{conda}/:repo_key/:subdir/patch_instructions.json"),
             get(patch_instructions_json_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/repodata_shards.msgpack.zst",
+            &format!("/:token{conda}/:repo_key/:subdir/repodata_shards.msgpack.zst"),
             get(sharded_repodata_index_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/shards/:shard_hash",
+            &format!("/:token{conda}/:repo_key/:subdir/shards/:shard_hash"),
             get(sharded_repodata_shard_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/:filename",
+            &format!("/:token{conda}/:repo_key/:subdir/:filename"),
             get(download_package_with_token).put(upload_package_put_with_token),
         )
         .route(
-            "/:token/:repo_key/:subdir/:filename/attestation",
+            &format!("/:token{conda}/:repo_key/:subdir/:filename/attestation"),
             get(get_attestation_with_token).put(put_attestation_with_token),
         )
         // Token URLs embed secrets in the path. Prevent leakage via Referer
@@ -15516,5 +15538,88 @@ mod upload_subdir_tests {
             String::from_utf8_lossy(&post_body)
         );
         assert_eq!(paths, vec![format!("linux-64/{filename}")]);
+    }
+}
+
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod rattler_token_layout_tests {
+    //! F11: rattler's `/t/<TOKEN>/conda/<repo_key>/...` token layout.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Through the full router: a private channel is readable with the token
+    /// in front of the path, as pixi `--conda-token` sends it, the package
+    /// downloads the same way, and the same request without (or with a bad)
+    /// token is refused.
+    #[tokio::test]
+    async fn rattler_token_layout_reads_a_private_channel() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "pkg-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        let content = Bytes::from_static(b"fake-conda-package-bytes");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{}/{path}", fx.repo_id),
+            &path,
+            "pkg",
+            "1.0",
+            "application/x-tar",
+            content.clone(),
+            fx.user_id,
+        )
+        .await;
+        let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _id) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                "rattler-layout",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let key = fx.repo_key.clone();
+        let (repodata_status, repodata) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/t/{token}/conda/{key}/noarch/repodata.json")),
+        )
+        .await;
+        let (dl_status, dl_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/t/{token}/conda/{key}/noarch/{filename}")),
+        )
+        .await;
+        let (anon_status, _) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/conda/{key}/noarch/repodata.json")),
+        )
+        .await;
+        let (bad_status, _) = tdh::send(
+            app,
+            tdh::get(format!("/t/not-a-token/conda/{key}/noarch/repodata.json")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            repodata_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&repodata)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&repodata).unwrap();
+        assert!(doc["packages"].get(filename).is_some(), "{doc}");
+        assert_eq!(dl_status, StatusCode::OK);
+        assert_eq!(&dl_body[..], &content[..]);
+        assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
     }
 }

@@ -99,6 +99,9 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/pacman", handlers::pacman::router())
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
+        // rattler (pixi `auth login --conda-token`) puts the token in FRONT of
+        // the whole path: `/t/<TOKEN>/conda/<repo_key>/...`.
+        .nest("/t", handlers::conda::rattler_token_router())
         .nest("/swift", handlers::swift::router())
         .nest(
             handlers::terraform::MOUNT_PREFIX,

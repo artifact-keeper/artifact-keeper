@@ -1744,6 +1744,13 @@ fn percent_decode_path_segment(segment: &str) -> Option<Cow<'_, str>> {
 pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
+    // rattler's conda token layout puts the credential in front of the whole
+    // path: `/t/<TOKEN>/conda/<repo_key>/...`. Drop the `t/<TOKEN>` pair so
+    // the rest is the ordinary `/conda/<repo_key>/...` shape below.
+    if rattler_conda_token_rest(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // Format prefix (pypi, npm, maven, ...).
     let format = segments.next().unwrap_or("");
     // Conda token channels embed the credential in the URL path:
@@ -1818,6 +1825,9 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
 /// token segment.
 pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
+    if let Some((token, _rest)) = rattler_conda_token_rest(trimmed) {
+        return Some(token);
+    }
     let mut segments = trimmed.split('/');
     if segments.next()? != "conda" {
         return None;
@@ -1838,6 +1848,21 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
     Some(token)
+}
+
+/// Split rattler's conda token layout, `t/<TOKEN>/conda/<repo_key>/...`
+/// (leading `/` already trimmed), into the token and the path after it.
+/// `None` unless the token is non-empty and a repository key follows `conda`,
+/// so no other `/t/...` path is mistaken for a credential.
+fn rattler_conda_token_rest(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let after = rest.strip_prefix("conda/")?;
+    let repo_key = after.split('/').next().unwrap_or("");
+    if token.is_empty() || repo_key.is_empty() {
+        return None;
+    }
+    Some((token, rest))
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -4325,6 +4350,22 @@ mod tests {
         assert_eq!(extract_repo_key("/maven/privat%"), "privat%");
         // `%ff` decodes to a byte that is not valid UTF-8 on its own.
         assert_eq!(extract_repo_key("/maven/privat%ff/com/acme"), "privat%ff");
+    }
+
+    #[test]
+    fn test_rattler_conda_token_layout() {
+        let path = "/t/abc123token/conda/my-channel/noarch/repodata.json";
+        assert_eq!(extract_conda_url_token(path), Some("abc123token"));
+        assert_eq!(extract_repo_key(path), "my-channel");
+        assert_eq!(
+            extract_repo_key("/t/tok/conda/my-channel/channeldata.json"),
+            "my-channel"
+        );
+        // Not the rattler layout: no token, no `conda`, or no repository key.
+        assert_eq!(extract_conda_url_token("/t//conda/my-channel/x"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/pypi/my-repo/simple"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda/"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda"), None);
     }
 
     #[test]
