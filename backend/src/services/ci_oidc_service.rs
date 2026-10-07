@@ -872,12 +872,29 @@ impl CiOidcService {
 
     /// Update a provider. Key material is resolved and validated before
     /// anything is written, so a refused JWKS leaves the provider unchanged.
+    ///
+    /// The read and the write share one transaction with the row locked, so
+    /// two concurrent updates serialise: each merges its fields onto the
+    /// other's result, and `key_material_changed` / `previous_provider_type`
+    /// (which drive the `security` log lines) compare against the row this
+    /// update actually replaced.
     pub async fn update(
         &self,
         id: Uuid,
         req: UpdateCiOidcProviderRequest,
     ) -> Result<ProviderUpdate> {
-        let existing = self.get(id).await?;
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let mut tx = self.db.begin().await.map_err(db_err)?;
+        let existing = sqlx::query_as::<_, CiOidcProvider>(concat!(
+            "SELECT ",
+            provider_columns!(),
+            " FROM ci_oidc_providers WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| AppError::NotFound("CI OIDC provider not found".into()))?;
         let provider_type =
             resolve_updated_provider_type(req.provider_type.as_deref(), &existing.provider_type)?;
         let previous_provider_type =
@@ -910,9 +927,10 @@ impl CiOidcService {
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
         .bind(&key_source)
         .bind(&static_jwks)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
 
         Ok(ProviderUpdate {
             provider: self.get_response(id).await?,
@@ -2871,6 +2889,73 @@ mod tests {
         assert_eq!(moved.previous_provider_type.as_deref(), Some("circleci"));
 
         svc.delete(id).await.expect("cleanup");
+    }
+
+    /// An update reads the row it replaces under a lock: one that starts
+    /// while another transaction is changing the key material waits for it,
+    /// then reports the change against the committed row rather than the
+    /// stale one it would have read first.
+    #[tokio::test]
+    async fn provider_update_serialises_with_a_concurrent_writer() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let created = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("rmw-{}", uuid::Uuid::new_v4()),
+                provider_type: Some("kubernetes".to_string()),
+                issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
+                audience: None,
+                is_enabled: None,
+                key_source: None,
+                static_jwks: None,
+            })
+            .await
+            .expect("create a discovery provider");
+
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE ci_oidc_providers SET key_source = 'static', static_jwks = $2 WHERE id = $1",
+        )
+        .bind(created.id)
+        .bind(json!({"keys": [super::test_public_jwk("k1")]}))
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+        let update = tokio::spawn({
+            let svc = CiOidcService::new(pool.clone());
+            let id = created.id;
+            async move {
+                svc.update(
+                    id,
+                    super::UpdateCiOidcProviderRequest {
+                        name: None,
+                        provider_type: None,
+                        issuer_url: None,
+                        audience: None,
+                        is_enabled: None,
+                        key_source: Some("discovery".to_string()),
+                        static_jwks: None,
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!update.is_finished(), "the update waits for the row lock");
+        writer.commit().await.unwrap();
+
+        let updated = update.await.unwrap().expect("update after the writer");
+        assert!(
+            updated.key_material_changed,
+            "compared against the committed static set, not the stale discovery row"
+        );
+        assert_eq!(updated.provider.key_source, "discovery");
+        assert_eq!(updated.provider.static_jwks, None);
+
+        svc.delete(created.id).await.expect("cleanup");
     }
 
     #[tokio::test]

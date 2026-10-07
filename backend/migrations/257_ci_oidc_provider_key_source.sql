@@ -20,7 +20,13 @@
 --
 -- `ci_oidc_providers` is a handful of operator-created rows and not a hot
 -- table (`migration_safety::HOT_TABLES`), so a constant default and CHECK
--- constraints validated inline are free here.
+-- constraints validated inline are free here. It is read on every CI OIDC
+-- exchange, though, so lock_timeout bounds the wait for the ACCESS EXCLUSIVE
+-- lock behind an old replica's open transaction: the upgrade fails fast and
+-- retries on the next start instead of queueing every exchange behind it
+-- (docs/operations/online-migrations.md).
+
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE ci_oidc_providers
     ADD COLUMN IF NOT EXISTS key_source VARCHAR(16) NOT NULL DEFAULT 'discovery',
