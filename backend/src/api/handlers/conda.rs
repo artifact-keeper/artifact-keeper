@@ -2597,6 +2597,13 @@ fn build_artifact_entry(
     if let Some(indexed_at) = artifact.indexed_at {
         entry["indexed_timestamp"] = serde_json::json!(indexed_at.timestamp_millis());
     }
+    // CEP-50: advertise the attestation sidecar by the hash of its bytes, so
+    // clients fetch the immutable `<file>.sigs.<sha256>`. Every encoding
+    // (json/bz2/zst, current_repodata, shards) is built from this entry, so
+    // they all agree.
+    if let Some(sha) = attestations_sha256_of(meta) {
+        entry["attestations_sha256"] = serde_json::Value::String(sha);
+    }
 
     entry
 }
@@ -2678,7 +2685,12 @@ fn build_sharded_index<'a>(
 }
 
 /// Record keys CEP-16 carries as raw digest bytes, with their digest length.
-const SHARD_DIGEST_KEYS: [(&str, usize); 3] = [("sha256", 32), ("md5", 16), ("legacy_bz2_md5", 16)];
+const SHARD_DIGEST_KEYS: [(&str, usize); 4] = [
+    ("sha256", 32),
+    ("md5", 16),
+    ("legacy_bz2_md5", 16),
+    ("attestations_sha256", 32),
+];
 
 /// One field of a shard record on the wire.
 enum ShardField<'a> {
@@ -3203,6 +3215,12 @@ async fn download_package(
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
 
     check_read_access(&state.db, auth.clone(), &repo).await?;
+
+    // CEP-50 attestation sidecars share the package route's shape
+    // (`{subdir}/{file}.sigs[.<sha256>]`) and its read access.
+    if let Some(request) = parse_sidecar_request(&filename) {
+        return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
+    }
 
     // Look up artifact by path
     let artifact_path = build_conda_artifact_path(&subdir, &filename);
@@ -4730,40 +4748,458 @@ async fn store_attestation(
     // Store the attestation and the verification record beside it, so the
     // outcome (including a failed one, under the explicit opt-out) is
     // persisted for `cep27::record_to_verdict` to read back.
+    //
+    // CEP-50: attestations are append-only. A second bundle for the same
+    // package (a re-publish attestation, a countersignature) is added to the
+    // package's sidecar instead of replacing the first, and the sidecar bytes
+    // the channel serves at `<file>.sigs` / `<file>.sigs.<sha256>` are stored
+    // verbatim so the hash advertised in repodata never drifts from them.
     let record = cep27::verification_record(&verdict, chrono::Utc::now());
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'conda', jsonb_build_object('attestation', $2::jsonb, $3::text, $4::jsonb))
-        ON CONFLICT (artifact_id) DO UPDATE
-        SET metadata = artifact_metadata.metadata || jsonb_build_object('attestation', $2::jsonb, $3::text, $4::jsonb)
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(&attestation)
-    .bind(cep27::VERIFICATION_METADATA_KEY)
-    .bind(&record)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to store attestation: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let appended = append_attestation(&state.db, artifact_id, &attestation, &record)
+        .await
+        .map_err(|e| match e {
+            AttestationAppendError::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Attestation sidecar would exceed the {} byte CEP-50 limit",
+                    MAX_SIDECAR_BYTES
+                ),
+            )
+                .into_response(),
+            AttestationAppendError::Db(e) => {
+                tracing::error!("Failed to store attestation: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+            }
+        })?;
 
     info!(
         repo = %repo_key,
         package = %filename,
         verified = verdict.is_verified(),
+        appended = appended.appended,
         "CEP-27 attestation stored"
     );
 
+    let status = if appended.appended {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     Ok(Response::builder()
-        .status(StatusCode::CREATED)
+        .status(status)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({"status": "attestation stored"}).to_string(),
+            serde_json::json!({
+                "status": if appended.appended {
+                    "attestation stored"
+                } else {
+                    "attestation already stored"
+                },
+                "attestations_sha256": appended.sidecar_sha256,
+                "attestation_count": appended.count,
+                "verification": record,
+            })
+            .to_string(),
         ))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// CEP-50 attestation sidecars
+// ---------------------------------------------------------------------------
+
+/// Suffix CEP-50 appends to a package filename to name its attestation sidecar.
+const SIGS_SUFFIX: &str = ".sigs";
+
+/// Metadata key holding the sidecar document verbatim: the JSON array of
+/// Sigstore bundles served at `<file>.sigs`. Stored as a string, not as JSONB,
+/// because JSONB normalizes key order and whitespace — the served bytes must be
+/// exactly the bytes whose hash repodata advertises.
+const SIDECAR_METADATA_KEY: &str = "attestations_sidecar";
+
+/// Metadata key holding the hex SHA-256 of [`SIDECAR_METADATA_KEY`]'s bytes;
+/// emitted as `attestations_sha256` in every repodata record (CEP-50).
+const SIDECAR_SHA256_METADATA_KEY: &str = "attestations_sha256";
+
+/// Metadata key holding one verification record per stored bundle, in the
+/// order the bundles appear in the sidecar.
+const ATTESTATION_HISTORY_METADATA_KEY: &str = "attestation_history";
+
+/// Ceiling on a package's sidecar, matching the default bound rattler applies
+/// when it downloads one (`rattler_sigstore::sidecar::DEFAULT_MAX_SIDECAR_SIZE`),
+/// so the registry never stores a sidecar its main client would refuse.
+const MAX_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
+
+/// Which sidecar a request path names.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarRequest<'a> {
+    /// `<file>.sigs`: the current sidecar (mutable: grows as attestations are
+    /// appended).
+    Mutable { package: &'a str },
+    /// `<file>.sigs.<sha256>`: one immutable, content-addressed revision.
+    ContentAddressed { package: &'a str, sha256: &'a str },
+}
+
+impl<'a> SidecarRequest<'a> {
+    fn package(&self) -> &'a str {
+        match self {
+            Self::Mutable { package } | Self::ContentAddressed { package, .. } => package,
+        }
+    }
+}
+
+/// Recognize a CEP-50 sidecar filename: `<file>.sigs` or
+/// `<file>.sigs.<64 hex>`. The sidecar names whatever file its attestation was
+/// stored against (a `.conda`/`.tar.bz2` in practice); a malformed hash is left
+/// to the package route.
+fn parse_sidecar_request(filename: &str) -> Option<SidecarRequest<'_>> {
+    let named = |package: &str| !package.is_empty() && !package.ends_with(SIGS_SUFFIX);
+    if let Some(package) = filename.strip_suffix(SIGS_SUFFIX) {
+        return named(package).then_some(SidecarRequest::Mutable { package });
+    }
+    let (head, hash) = filename.rsplit_once('.')?;
+    let package = head.strip_suffix(SIGS_SUFFIX)?;
+    let is_hash = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
+    (is_hash && named(package)).then_some(SidecarRequest::ContentAddressed {
+        package,
+        sha256: hash,
+    })
+}
+
+/// The sidecar bytes and their hex SHA-256 for one package's metadata.
+///
+/// A package whose attestation predates CEP-50 storage (only `attestation`,
+/// no stored sidecar) is served as a one-bundle sidecar, serialized the same
+/// deterministic way every read, so its advertised hash is stable too.
+fn sidecar_of(metadata: Option<&serde_json::Value>) -> Option<(String, String)> {
+    let meta = metadata?;
+    if let (Some(text), Some(sha)) = (
+        meta.get(SIDECAR_METADATA_KEY).and_then(|v| v.as_str()),
+        meta.get(SIDECAR_SHA256_METADATA_KEY)
+            .and_then(|v| v.as_str()),
+    ) {
+        return Some((text.to_string(), sha.to_string()));
+    }
+    let legacy = meta.get("attestation").filter(|v| !v.is_null())?;
+    let text = serde_json::to_string(&[legacy]).ok()?;
+    let sha = hex::encode(Sha256::digest(text.as_bytes()));
+    Some((text, sha))
+}
+
+/// The hex sidecar hash for a repodata record, if the package has attestations.
+fn attestations_sha256_of(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let meta = metadata?;
+    if let Some(sha) = meta
+        .get(SIDECAR_SHA256_METADATA_KEY)
+        .and_then(|v| v.as_str())
+    {
+        return Some(sha.to_string());
+    }
+    sidecar_of(Some(meta)).map(|(_, sha)| sha)
+}
+
+/// Result of appending one bundle to a package's sidecar.
+#[derive(Debug, PartialEq, Eq)]
+struct SidecarUpdate {
+    /// The new sidecar document.
+    text: String,
+    /// Hex SHA-256 of `text`.
+    sha256: String,
+    /// Number of bundles in the sidecar.
+    count: usize,
+    /// False when the bundle was already present (the sidecar is unchanged).
+    appended: bool,
+}
+
+/// Append `bundle` to the sidecar `existing` (a JSON array), deduplicating an
+/// identical bundle. Pure so the append-only and size rules are unit-testable.
+fn append_to_sidecar(
+    existing: Option<&str>,
+    legacy: Option<&serde_json::Value>,
+    bundle: &serde_json::Value,
+) -> Result<SidecarUpdate, AttestationAppendError> {
+    let mut bundles: Vec<serde_json::Value> = existing
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_else(|| {
+            legacy
+                .filter(|v| !v.is_null())
+                .cloned()
+                .into_iter()
+                .collect()
+        });
+    let appended = !bundles.iter().any(|b| b == bundle);
+    if appended {
+        bundles.push(bundle.clone());
+    }
+    let text = serde_json::to_string(&bundles).map_err(|_| AttestationAppendError::TooLarge)?;
+    if text.len() > MAX_SIDECAR_BYTES {
+        return Err(AttestationAppendError::TooLarge);
+    }
+    let sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    Ok(SidecarUpdate {
+        text,
+        sha256,
+        count: bundles.len(),
+        appended,
+    })
+}
+
+#[derive(Debug)]
+enum AttestationAppendError {
+    TooLarge,
+    Db(sqlx::Error),
+}
+
+impl PartialEq for AttestationAppendError {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::TooLarge, Self::TooLarge))
+    }
+}
+
+impl From<sqlx::Error> for AttestationAppendError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// What [`append_attestation`] did, for the upload response.
+struct AppendOutcome {
+    appended: bool,
+    sidecar_sha256: String,
+    count: usize,
+}
+
+/// Append one verified (or, under the explicit opt-out, recorded-as-failed)
+/// bundle to the artifact's attestations, atomically.
+///
+/// The row is locked for the read-modify-write so two concurrent attestation
+/// uploads both survive (the same lost-update shape `append_channel_notice`
+/// guards against). `attestation` / `attestation_verification` keep naming
+/// the LATEST upload, as they always have; the sidecar and the per-bundle
+/// history carry every one.
+async fn append_attestation(
+    db: &sqlx::PgPool,
+    artifact_id: uuid::Uuid,
+    bundle: &serde_json::Value,
+    record: &serde_json::Value,
+) -> Result<AppendOutcome, AttestationAppendError> {
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'conda', '{}'::jsonb) ON CONFLICT (artifact_id) DO NOTHING",
+    )
+    .bind(artifact_id)
+    .execute(&mut *tx)
+    .await?;
+    let (current,): (serde_json::Value,) =
+        sqlx::query_as("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1 FOR UPDATE")
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let update = append_to_sidecar(
+        current.get(SIDECAR_METADATA_KEY).and_then(|v| v.as_str()),
+        current.get("attestation"),
+        bundle,
+    )?;
+    let mut history: Vec<serde_json::Value> = current
+        .get(ATTESTATION_HISTORY_METADATA_KEY)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if update.appended {
+        history.push(serde_json::json!({
+            "bundle_sha256": hex::encode(Sha256::digest(
+                serde_json::to_vec(bundle).unwrap_or_default()
+            )),
+            "verification": record,
+        }));
+    }
+
+    let mut patch = serde_json::Map::new();
+    patch.insert("attestation".into(), bundle.clone());
+    patch.insert(cep27::VERIFICATION_METADATA_KEY.into(), record.clone());
+    patch.insert(
+        SIDECAR_METADATA_KEY.into(),
+        serde_json::Value::String(update.text.clone()),
+    );
+    patch.insert(
+        SIDECAR_SHA256_METADATA_KEY.into(),
+        serde_json::Value::String(update.sha256.clone()),
+    );
+    patch.insert(ATTESTATION_HISTORY_METADATA_KEY.into(), history.into());
+
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = metadata || $2::jsonb WHERE artifact_id = $1",
+    )
+    .bind(artifact_id)
+    .bind(serde_json::Value::Object(patch))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(AppendOutcome {
+        appended: update.appended,
+        sidecar_sha256: update.sha256,
+        count: update.count,
+    })
+}
+
+/// Load a hosted package's sidecar from `repo_id`, honouring the same
+/// withdrawal/quarantine gate the package download does: a sidecar is served
+/// exactly when its package is.
+async fn load_hosted_sidecar(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    subdir: &str,
+    package: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let path = build_conda_artifact_path(subdir, package);
+    let row: Option<(uuid::Uuid, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT a.id, am.metadata FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error looking up attestation sidecar: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+    let Some((artifact_id, metadata)) = row else {
+        return Ok(None);
+    };
+    crate::services::quarantine_service::check_artifact_download(db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(sidecar_of(metadata.as_ref()))
+}
+
+/// Build the sidecar response, enforcing the content address when one was
+/// requested. The content-addressed form is immutable, so it may be cached
+/// forever; the mutable form changes whenever an attestation is appended.
+#[allow(clippy::result_large_err)]
+fn sidecar_response(
+    request: &SidecarRequest<'_>,
+    text: String,
+    sha256: &str,
+) -> Result<Response, Response> {
+    let cache_control = match request {
+        SidecarRequest::ContentAddressed { sha256: wanted, .. } => {
+            if !wanted.eq_ignore_ascii_case(sha256) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "No attestation sidecar with that digest",
+                )
+                    .into_response());
+            }
+            "max-age=31536000, immutable"
+        }
+        SidecarRequest::Mutable { .. } => "no-cache",
+    };
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, text.len().to_string())
+        .header(CACHE_CONTROL, cache_control)
+        .header(ETAG, format!("\"{sha256}\""))
+        .body(Body::from(text))
+        .unwrap())
+}
+
+/// Proxy a sidecar from a remote channel, capped at the bound the hosted path
+/// stores under.
+async fn proxy_sidecar(
+    state: &SharedState,
+    member_id: uuid::Uuid,
+    member_key: &str,
+    upstream_url: Option<&str>,
+    subdir: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let (Some(upstream_url), Some(proxy)) = (upstream_url, state.proxy_service.as_deref()) else {
+        return Err((StatusCode::NOT_FOUND, "Attestation sidecar not found").into_response());
+    };
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        member_id,
+        member_key,
+        upstream_url,
+        &format!("{subdir}/{filename}"),
+        MAX_SIDECAR_BYTES,
+    )
+    .await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap())
+}
+
+/// `GET /conda/{repo}/{subdir}/{file}.sigs[.<sha256>]` (CEP-50).
+///
+/// Readable by exactly who can read the package (the caller already passed
+/// [`check_read_access`]). Hosted repositories serve their stored sidecar; a
+/// remote repository proxies the upstream's; a virtual repository serves the
+/// first member, in priority order, that has one — the same member walk the
+/// package download takes, so the sidecar comes from where the package does.
+async fn serve_sidecar(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    subdir: &str,
+    filename: &str,
+    request: SidecarRequest<'_>,
+) -> Result<Response, Response> {
+    validate_cep26_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    let not_found = || (StatusCode::NOT_FOUND, "Attestation sidecar not found").into_response();
+
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_sidecar(
+            state,
+            repo.id,
+            &repo.key,
+            repo.upstream_url.as_deref(),
+            subdir,
+            filename,
+        )
+        .await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        for member in &members {
+            if member.repo_type == RepositoryType::Remote {
+                if let Ok(response) = proxy_sidecar(
+                    state,
+                    member.id,
+                    &member.key,
+                    member.upstream_url.as_deref(),
+                    subdir,
+                    filename,
+                )
+                .await
+                {
+                    return Ok(response);
+                }
+                continue;
+            }
+            if let Some((text, sha)) =
+                load_hosted_sidecar(&state.db, member.id, subdir, request.package()).await?
+            {
+                return sidecar_response(&request, text, &sha);
+            }
+        }
+        return Err(not_found());
+    }
+
+    let (text, sha) = load_hosted_sidecar(&state.db, repo.id, subdir, request.package())
+        .await?
+        .ok_or_else(not_found)?;
+    sidecar_response(&request, text, &sha)
 }
 
 /// Core logic for retrieving a CEP-27 attestation.
@@ -4829,17 +5265,18 @@ async fn put_attestation(
 
 /// GET /conda/{repo_key}/{subdir}/{filename}/attestation
 ///
-/// Requires authentication to match the repository's read-auth posture.
+/// Readable by exactly who can read the package: anonymous on a public
+/// repository, authenticated on a private one ([`check_read_access`]). An
+/// attestation is published evidence about a package, so it must never be
+/// harder to fetch than the package it vouches for — consumers verify before
+/// linking, and an anonymous consumer of a public channel has to be able to.
 async fn get_attestation(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    // Attestations follow the repo's auth requirements. If the repo is
-    // public the authenticate call will succeed with anonymous access
-    // via the optional auth middleware on the outer router.
-    let _user_id = require_auth_basic(auth, "conda")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    check_read_access(&state.db, auth, &repo).await?;
     fetch_attestation(&state, &repo, &subdir, &filename).await
 }
 
@@ -4866,12 +5303,10 @@ async fn get_attestation_with_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let _user_id = if auth.is_some() {
-        require_auth_basic(auth, "conda")?.user_id
-    } else {
-        authenticate_with_token(&state.db, &state.config, &token).await?
-    };
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    if check_read_access(&state.db, auth, &repo).await.is_err() {
+        authenticate_with_token(&state.db, &state.config, &token).await?;
+    }
     fetch_attestation(&state, &repo, &subdir, &filename).await
 }
 
@@ -12944,6 +13379,93 @@ mod tests {
             vec![("meta.yaml".to_string(), b"package:\n  name: p\n".to_vec())]
         );
     }
+
+    // -----------------------------------------------------------------------
+    // CEP-50 sidecar helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sidecar_request_recognizes_both_cep50_forms() {
+        let h = "a".repeat(64);
+        assert_eq!(
+            parse_sidecar_request("pkg-1.0-0.conda.sigs"),
+            Some(SidecarRequest::Mutable {
+                package: "pkg-1.0-0.conda"
+            })
+        );
+        let ca = format!("pkg-1.0-0.tar.bz2.sigs.{h}");
+        assert_eq!(
+            parse_sidecar_request(&ca),
+            Some(SidecarRequest::ContentAddressed {
+                package: "pkg-1.0-0.tar.bz2",
+                sha256: &h
+            })
+        );
+        // Not sidecars: the package itself, a short hash, an empty name.
+        assert_eq!(parse_sidecar_request("pkg-1.0-0.conda"), None);
+        assert_eq!(parse_sidecar_request("pkg-1.0-0.conda.sigs.abc"), None);
+        assert_eq!(parse_sidecar_request(".sigs"), None);
+        assert_eq!(
+            parse_sidecar_request(&format!("pkg-1.0-0.conda.sigs.{}", "z".repeat(64))),
+            None
+        );
+    }
+
+    #[test]
+    fn append_to_sidecar_is_append_only_and_deduplicates() {
+        let a = serde_json::json!({"mediaType": "x", "n": 1});
+        let b = serde_json::json!({"mediaType": "x", "n": 2});
+        let first = append_to_sidecar(None, None, &a).unwrap();
+        assert!(first.appended);
+        assert_eq!(first.count, 1);
+        assert_eq!(
+            first.sha256,
+            hex::encode(Sha256::digest(first.text.as_bytes()))
+        );
+
+        let same = append_to_sidecar(Some(&first.text), None, &a).unwrap();
+        assert!(!same.appended);
+        assert_eq!(
+            same.text, first.text,
+            "a duplicate leaves the bytes unchanged"
+        );
+
+        let second = append_to_sidecar(Some(&first.text), None, &b).unwrap();
+        assert!(second.appended);
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&second.text).unwrap();
+        assert_eq!(arr, vec![a.clone(), b.clone()]);
+
+        // A pre-CEP-50 single `attestation` seeds the sidecar.
+        let seeded = append_to_sidecar(None, Some(&a), &b).unwrap();
+        assert_eq!(seeded.count, 2);
+
+        let huge = serde_json::json!({"blob": "x".repeat(MAX_SIDECAR_BYTES)});
+        assert_eq!(
+            append_to_sidecar(None, None, &huge).unwrap_err(),
+            AttestationAppendError::TooLarge
+        );
+    }
+
+    #[test]
+    fn sidecar_of_prefers_stored_bytes_and_falls_back_to_legacy_attestation() {
+        assert_eq!(sidecar_of(None), None);
+        assert_eq!(sidecar_of(Some(&serde_json::json!({}))), None);
+        let stored = serde_json::json!({
+            SIDECAR_METADATA_KEY: "[{\"b\":1}]",
+            SIDECAR_SHA256_METADATA_KEY: "abc",
+            "attestation": {"ignored": true},
+        });
+        assert_eq!(
+            sidecar_of(Some(&stored)),
+            Some(("[{\"b\":1}]".to_string(), "abc".to_string()))
+        );
+        let legacy = serde_json::json!({"attestation": {"b": 1}});
+        let (text, sha) = sidecar_of(Some(&legacy)).unwrap();
+        assert_eq!(text, "[{\"b\":1}]");
+        assert_eq!(sha, hex::encode(Sha256::digest(text.as_bytes())));
+        assert_eq!(attestations_sha256_of(Some(&legacy)), Some(sha));
+        assert_eq!(attestations_sha256_of(Some(&stored)), Some("abc".into()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14331,6 +14853,171 @@ mod attestation_verification_tests {
             attestation_verify::AttestationState::Failed,
             "the stored record must read back as Failed: {verdict:?}"
         );
+
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // CEP-50 sidecars
+    // -----------------------------------------------------------------------
+
+    /// A Fixture whose state stores attestations without requiring them to
+    /// verify, so the captured (genuine, but PEP 740) bundle can be stored and
+    /// the CEP-50 storage/serving contract exercised on its own.
+    async fn opted_out_fixture() -> Option<tdh::Fixture> {
+        let fx = tdh::Fixture::setup("local", "conda").await?;
+        seed_wheel(&fx).await;
+        let state = tdh::build_state_with(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), |c| {
+            c.conda_attestation_require_verified = false
+        });
+        Some(tdh::Fixture { state, ..fx })
+    }
+
+    fn get_req(uri: String) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A second, distinct bundle: the captured one with an extra top-level
+    /// field. It is stored (opt-out) but is a different sidecar entry.
+    fn second_bundle() -> serde_json::Value {
+        let mut b = bundle();
+        b["x-test-note"] = serde_json::json!("second attestation");
+        b
+    }
+
+    #[tokio::test]
+    async fn sidecar_is_append_only_content_addressed_and_advertised_in_repodata() {
+        let Some(fx) = opted_out_fixture().await else {
+            return;
+        };
+
+        let (status, body) =
+            tdh::send(write_router(&fx), put_attestation_req(&fx, &bundle())).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let first_sha = first["attestations_sha256"].as_str().unwrap().to_string();
+
+        // Re-uploading the identical bundle is idempotent: nothing appended.
+        let (status, body) =
+            tdh::send(write_router(&fx), put_attestation_req(&fx, &bundle())).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let again: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(again["attestation_count"], 1);
+        assert_eq!(again["attestations_sha256"], first_sha.as_str());
+
+        // A different bundle is appended, not substituted.
+        let (status, body) = tdh::send(
+            write_router(&fx),
+            put_attestation_req(&fx, &second_bundle()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["attestation_count"], 2);
+        let sha = second["attestations_sha256"].as_str().unwrap().to_string();
+        assert_ne!(sha, first_sha, "appending changes the sidecar revision");
+
+        // The mutable sidecar is the JSON array of both bundles, and its bytes
+        // hash to the advertised value.
+        let (status, sigs) = tdh::send(
+            write_router(&fx),
+            get_req(format!("/{}/noarch/{WHL_NAME}.sigs", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hex::encode(Sha256::digest(&sigs)), sha);
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&sigs).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], bundle(), "the first bundle keeps its place");
+        assert_eq!(arr[1], second_bundle());
+
+        // The content-addressed form serves the same bytes, immutably…
+        let (status, ca) = tdh::send(
+            write_router(&fx),
+            get_req(format!("/{}/noarch/{WHL_NAME}.sigs.{sha}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ca, sigs);
+        // …and a superseded or unknown revision is not served.
+        let (status, _) = tdh::send(
+            write_router(&fx),
+            get_req(format!(
+                "/{}/noarch/{WHL_NAME}.sigs.{first_sha}",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The record built for repodata (every encoding and the shards use
+        // the same entry builder) advertises the current sidecar hash.
+        let artifacts = list_conda_artifacts(&fx.pool, fx.repo_id)
+            .await
+            .expect("list artifacts");
+        let artifact = artifacts.first().expect("seeded artifact");
+        let entry = build_artifact_entry(artifact, WHL_NAME, "noarch");
+        assert_eq!(entry["attestations_sha256"], sha.as_str(), "{entry}");
+
+        // `attestation` / `attestation_verification` keep naming the latest.
+        let metadata = stored_metadata(&fx).await.unwrap();
+        assert_eq!(metadata["attestation"], second_bundle());
+        assert_eq!(
+            metadata[ATTESTATION_HISTORY_METADATA_KEY]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn attestation_and_sidecar_follow_the_repository_read_posture() {
+        let Some(fx) = opted_out_fixture().await else {
+            return;
+        };
+        let (status, _) = tdh::send(write_router(&fx), put_attestation_req(&fx, &bundle())).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let anon = || tdh::router_anon(router(), fx.state.clone());
+        let paths = [
+            format!("/{}/noarch/{WHL_NAME}/attestation", fx.repo_key),
+            format!("/{}/noarch/{WHL_NAME}.sigs", fx.repo_key),
+        ];
+
+        // Private repository: anonymous callers are challenged.
+        for path in &paths {
+            let (status, _) = tdh::send(anon(), get_req(path.clone())).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} on a private repo");
+        }
+
+        // Public repository: anyone who can read the package reads its
+        // attestations, with no extra authentication.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        for path in &paths {
+            let (status, body) = tdh::send(anon(), get_req(path.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path} on a public repo: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
 
         fx.teardown().await;
     }
