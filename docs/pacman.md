@@ -54,7 +54,8 @@ package whose archive is truncated or corrupt is refused (400).
 File lists are stored apart from the package metadata (`pacman_file_lists`),
 so serving `{name}.db` never reads them. A rendered `{name}.files` database is
 kept in memory (up to 256 MiB in total) for as long as the set of packages it
-lists is unchanged; a publish, delete or signature upload is picked up on the
+lists is unchanged, shared by every architecture name that selects the same
+packages, with at most one render in flight per repository; a publish, delete or signature upload is picked up on the
 next request, because the cache key is derived from the live package rows.
 
 ## Publishing

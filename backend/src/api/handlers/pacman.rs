@@ -132,27 +132,45 @@ fn render_database(
 }
 
 /// Everything a rendered `.files` database depends on, hashed: the selected
-/// artifacts in order plus each entry's mutable or desc-visible fields. An
-/// artifact's `.PKGINFO` and file list never change after upload; only the
-/// set-once `%PGPSIG%` does. A publish, delete or signature upload therefore
-/// changes the fingerprint, and the cache needs no explicit invalidation.
+/// artifacts in order plus each entry's row fields and whole metadata
+/// document (`.PKGINFO`, filename, `%PGPSIG%`). A file list never changes
+/// after upload. A publish, delete, signature upload or any rewrite of the
+/// metadata document (`set_metadata`, replication) therefore changes the
+/// fingerprint, and the cache needs no explicit invalidation.
 fn files_fingerprint(packages: &[IndexedPackage]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for p in packages {
         hasher.update(p.artifact_id.as_bytes());
         hasher.update(p.csize.to_le_bytes());
         hasher.update(p.mtime.to_le_bytes());
-        for field in [p.sha256.as_str(), p.meta.pgpsig.as_deref().unwrap_or("")] {
+        // Serializing the struct cannot fail (strings and options only).
+        let meta = serde_json::to_vec(&p.meta).unwrap_or_default();
+        for field in [p.sha256.as_bytes(), meta.as_slice()] {
             hasher.update((field.len() as u64).to_le_bytes());
-            hasher.update(field.as_bytes());
+            hasher.update(field);
         }
     }
     hasher.finalize().into()
 }
 
-/// Cache key of a rendered `.files` database: the repository, the
-/// architecture it was rendered for, and the package-set fingerprint.
-type FilesCacheKey = (uuid::Uuid, String, [u8; 32]);
+/// Cache key of a rendered `.files` database: the repository and the
+/// package-set fingerprint. The requested architecture is deliberately not
+/// part of it: any `{arch}` string is accepted, and every made-up one selects
+/// the same `any`-only package set, so they must share one entry instead of
+/// each forcing a full render.
+type FilesCacheKey = (uuid::Uuid, [u8; 32]);
+
+/// One `.files` render in flight per repository: a miss for a different
+/// package set of the same repository (another architecture) waits for the
+/// running one instead of holding a second set of file lists in memory.
+static FILES_RENDER_LOCKS: once_cell::sync::Lazy<
+    moka::future::Cache<uuid::Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = once_cell::sync::Lazy::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_idle(FILES_CACHE_IDLE)
+        .build()
+});
 
 /// Upper bound on the bytes of rendered `.files` databases kept in memory.
 const FILES_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -386,7 +404,7 @@ async fn serve_database(
 ) -> Result<Response, Response> {
     let packages = latest_per_name(list_packages(&state.db, repo.id, arch).await?);
     let database = if with_files {
-        files_database(&state.db, repo.id, arch, packages).await
+        files_database(&state.db, repo.id, packages).await
     } else {
         render_database(&packages, None)
             .map(Bytes::from)
@@ -435,13 +453,16 @@ async fn serve_database(
 async fn files_database(
     db: &PgPool,
     repo_id: uuid::Uuid,
-    arch: &str,
     packages: Vec<IndexedPackage>,
 ) -> Result<Bytes, String> {
-    let key = (repo_id, arch.to_string(), files_fingerprint(&packages));
+    let key = (repo_id, files_fingerprint(&packages));
     let db = db.clone();
     FILES_CACHE
         .try_get_with(key, async move {
+            let lock = FILES_RENDER_LOCKS
+                .get_with(repo_id, async { Default::default() })
+                .await;
+            let _render = lock.lock().await;
             let ids: Vec<uuid::Uuid> = packages.iter().map(|p| p.artifact_id).collect();
             let lists = load_file_lists(&db, &ids)
                 .await
@@ -976,12 +997,15 @@ mod tests {
         let mut signed = b.clone();
         signed.meta.pgpsig = Some("AAE=".into());
         assert_ne!(base, files_fingerprint(&[a.clone(), signed]));
+        // So does any other rewrite of the metadata document.
+        let mut edited = b.clone();
+        edited.meta.pkginfo.pkgdesc = Some("rewritten".into());
+        assert_ne!(base, files_fingerprint(&[a.clone(), edited]));
         // Field boundaries are length-prefixed: no ambiguity between fields.
         let (mut x, mut y) = (a.clone(), a.clone());
         x.sha256 = "ab".into();
-        x.meta.pgpsig = Some("c".into());
         y.sha256 = "a".into();
-        y.meta.pgpsig = Some("bc".into());
+        y.meta.filename = format!("b{}", y.meta.filename);
         assert_ne!(files_fingerprint(&[x]), files_fingerprint(&[y]));
     }
 
@@ -1423,8 +1447,16 @@ mod db_tests {
         let (_, db) = get(&fx, "x86_64/myrepo.db").await;
         assert!(db_members(&db).iter().all(|(p, _)| p.ends_with("/desc")));
 
+        // A cold-cache flood of made-up architectures: every one selects the
+        // same `any`-only package set, so they share one entry and one render.
+        let flood: Vec<String> = (0..16).map(|i| format!("x{i}/myrepo.files")).collect();
+        let answers = futures::future::join_all(flood.iter().map(|rel| get(&fx, rel))).await;
+        assert_eq!(renders(), 1);
         let (status, first) = get(&fx, "x86_64/myrepo.files").await;
         assert_eq!(status, StatusCode::OK);
+        assert!(answers
+            .iter()
+            .all(|a| *a == (StatusCode::OK, first.clone())));
         let files = db_members(&first);
         assert!(files[1].1.contains("usr/share/ak-marker/marker.txt\n"));
         assert_eq!(renders(), 1);
@@ -1434,9 +1466,10 @@ mod db_tests {
         assert_eq!(again, first);
         get(&fx, "x86_64/myrepo.files.sig").await;
         assert_eq!(renders(), 1);
-        // Another architecture is another package set.
-        get(&fx, "aarch64/myrepo.files").await;
-        assert_eq!(renders(), 2);
+        // Another real architecture with the same package set shares it too.
+        let (_, aarch64) = get(&fx, "aarch64/myrepo.files").await;
+        assert_eq!(aarch64, first);
+        assert_eq!(renders(), 1);
 
         // A signature changes the desc: re-rendered once, then cached again.
         assert_eq!(
@@ -1446,7 +1479,7 @@ mod db_tests {
         let (_, signed) = get(&fx, "x86_64/myrepo.files").await;
         assert!(db_members(&signed)[0].1.contains("%PGPSIG%"));
         get(&fx, "x86_64/myrepo.files").await;
-        assert_eq!(renders(), 3);
+        assert_eq!(renders(), 2);
 
         // A publish adds the new package's list.
         let (tool_file, tool_pkg) = build_package("tool", "1.0-1", "x86_64");
@@ -1454,7 +1487,7 @@ mod db_tests {
         let (_, published) = get(&fx, "x86_64/myrepo.files").await;
         let paths: Vec<_> = db_members(&published).into_iter().map(|(p, _)| p).collect();
         assert!(paths.contains(&"tool-1.0-1/files".to_string()), "{paths:?}");
-        assert_eq!(renders(), 4);
+        assert_eq!(renders(), 3);
 
         // A delete drops it again. The package set is then the signed one
         // from before, whose render is still cached.
@@ -1464,7 +1497,7 @@ mod db_tests {
         );
         let (_, deleted) = get(&fx, "x86_64/myrepo.files").await;
         assert_eq!(deleted, signed);
-        assert_eq!(renders(), 4);
+        assert_eq!(renders(), 3);
         fx.teardown().await;
     }
 
