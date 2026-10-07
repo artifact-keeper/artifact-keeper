@@ -637,6 +637,29 @@ async fn an_expired_token_is_refused() {
     fx.teardown().await;
 }
 
+/// #4511: a token whose `nbf` is beyond the verifier's 60 s leeway in the
+/// future is refused on the discovery path too; one within the leeway (clock
+/// skew) still verifies.
+#[tokio::test]
+#[ignore]
+async fn a_not_yet_valid_token_is_refused() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    fx.create_mapping(json!({})).await;
+    let mut claims = fx
+        .issuer
+        .gitlab_claims(AUDIENCE, "group/app", "branch", "main");
+    let now = chrono::Utc::now().timestamp();
+    claims["nbf"] = json!(now + 300);
+    claims["exp"] = json!(now + 900);
+    assert_refused(&fx, &fx.issuer.sign(&claims), "nbf in the future").await;
+    claims["nbf"] = json!(now + 30);
+    let (status, body) = fx.exchange(&fx.issuer.sign(&claims)).await;
+    assert_eq!(status, StatusCode::OK, "nbf within the leeway: {body}");
+    fx.teardown().await;
+}
+
 /// A token signed by this issuer but naming another enabled provider's
 /// issuer selects that provider, whose JWKS does not hold the key.
 #[tokio::test]
