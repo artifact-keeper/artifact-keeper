@@ -3742,6 +3742,26 @@ fn remote_policy_from_read(
     }
 }
 
+/// [`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)
+/// over the client-derived segments of a request a format route proxies
+/// (#4365 item 3, strict form), as a `400` response; a no-op when the
+/// repository does not proxy (`proxied == false`: a hosted repository never
+/// builds an upstream URL).
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_ambiguous_client_segments(
+    proxied: bool,
+    segments: &[&str],
+) -> Result<(), Response> {
+    if !proxied {
+        return Ok(());
+    }
+    for segment in segments {
+        crate::services::proxy_service::reject_ambiguous_client_path(segment, false)
+            .map_err(IntoResponse::into_response)?;
+    }
+    Ok(())
+}
+
 /// The retryable 503 every proxy serve path answers when the scan-on-proxy
 /// configuration cannot be read (#4365 item 5).
 pub(crate) fn scan_config_unreadable() -> Response {

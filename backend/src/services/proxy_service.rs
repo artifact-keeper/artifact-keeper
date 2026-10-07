@@ -1463,10 +1463,32 @@ pub(crate) fn check_upstream_fetch_path(fetch_path: &str) -> Result<()> {
         None => (fetch_path, None),
     };
     if has_ambiguous_path_chars(path) {
-        return refuse("';', control characters or a '%' that is not a valid escape");
+        return refuse("';', '\\', control characters or a '%' that is not a valid escape");
+    }
+    // URL parsing trims trailing spaces, so `x.jar ` would fetch `x.jar`.
+    if query.is_none() && path.ends_with(' ') {
+        return refuse("a trailing space");
     }
     if query.is_some_and(|q| q.is_empty() || q.contains('/')) {
         return refuse("a '?' inside the path");
+    }
+    Ok(())
+}
+
+/// Refuse a CLIENT-DERIVED proxied path or path segment that is not a plain
+/// path (#4365 item 3, strict form): any `?`, `#`, `;`, `\`, control
+/// character or stray `%` ([`has_ambiguous_path_chars`]), and a raw space
+/// unless `allow_spaces`. Unlike [`check_upstream_fetch_path`], which also
+/// sees queries a handler appends itself, this runs on what the client sent,
+/// where a `?` can only be an attempt to move part of the path into the
+/// upstream query. A `400` before anything is fetched or cached.
+pub(crate) fn reject_ambiguous_client_path(path: &str, allow_spaces: bool) -> Result<()> {
+    if has_ambiguous_path_chars(path) || (!allow_spaces && path.contains(' ')) {
+        return Err(AppError::Validation(
+            "Proxied path must not contain '?', '#', ';', '\\', control characters, \
+             a '%' that is not a valid escape, or spaces"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -1519,13 +1541,14 @@ pub(crate) fn route_package_serve_key(path: &str) -> ProxyServeKey {
 
 /// Whether `path` holds a character an upstream may read as something other
 /// than a path byte (#4365 items 1 and 3): `?` (query), `#` (fragment), `;`
-/// (path parameter), an ASCII control character (dropped by URL parsing), or
-/// a `%` that does not start a valid `%XX` escape (decoded again, or
-/// rejected, by the upstream). A valid escape such as npm's `%2F` is allowed.
+/// (path parameter), `\` (turned into `/` by URL parsing), an ASCII control
+/// character (dropped by URL parsing), or a `%` that does not start a valid
+/// `%XX` escape (decoded again, or rejected, by the upstream). A valid escape
+/// such as npm's `%2F` is allowed.
 pub(crate) fn has_ambiguous_path_chars(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| match b {
-        b'?' | b'#' | b';' => true,
+        b'?' | b'#' | b';' | b'\\' => true,
         b'%' => !matches!(
             (bytes.get(i + 1), bytes.get(i + 2)),
             (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit()
@@ -22896,11 +22919,56 @@ mod upstream_fetch_path_tests {
             "org/acme/w/1.0/w-1.0.ja\u{7f}r",
             "org/acme/w/1.0/w-1.0.jar?",
             "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+            "org/acme/w/1.0/w-1.0.jar\\..\\x.pom",
+            "org/acme/w/1.0/w-1.0.jar ",
         ] {
             assert!(
                 matches!(check_upstream_fetch_path(bad), Err(AppError::Validation(_))),
                 "{bad:?}"
             );
+        }
+    }
+}
+
+/// #4365 item 3 (strict form): what a client may put in a proxied path.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod client_path_tests {
+    use super::*;
+
+    #[test]
+    fn client_paths_with_query_fragment_or_stray_escapes_are_400() {
+        for bad in [
+            "pkg/-/x.tgz?versionId=abc",
+            "x.tgz?acl",
+            "x.tgz#frag",
+            "x.jar;jsessionid=1",
+            "x\\y.jar",
+            "x.jar%",
+            "x.jar%zz",
+            "x\tjar",
+        ] {
+            for allow_spaces in [false, true] {
+                assert!(
+                    matches!(
+                        reject_ambiguous_client_path(bad, allow_spaces),
+                        Err(AppError::Validation(_))
+                    ),
+                    "{bad:?}"
+                );
+            }
+        }
+        // A raw space is refused on format routes, allowed on the generic one.
+        assert!(reject_ambiguous_client_path("my file.txt", false).is_err());
+        assert!(reject_ambiguous_client_path("my file.txt", true).is_ok());
+        for ok in [
+            "@scope/name",
+            "pkg/-/pkg-1.0.0.tgz",
+            "serde",
+            "1.0.0+build.1",
+            "a%2Fb",
+        ] {
+            assert!(reject_ambiguous_client_path(ok, false).is_ok(), "{ok}");
         }
     }
 }

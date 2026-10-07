@@ -1909,6 +1909,11 @@ async fn download(
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
+    // #4365 item 3: the name and version are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&name, &version],
+    )?;
 
     // Curation enforcement (#2930): block a curated crate before it is resolved
     // locally or proxied from upstream. The cargo handler's private `RepoInfo`

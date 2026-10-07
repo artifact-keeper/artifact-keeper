@@ -4426,6 +4426,11 @@ async fn serve_tarball(
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
     // tarball route matched, so the remote-proxy fetch 404'd (B7).
+    // #4365 item 3: the name and file name are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[package_name, filename],
+    )?;
     let upstream_path = build_tarball_upstream_path(package_name, filename);
 
     // For remote repos, always proxy tarballs from upstream (hits cache if

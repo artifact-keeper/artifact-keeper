@@ -2676,6 +2676,12 @@ async fn serve_file(
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 3: the file name is joined into the upstream path and keys
+    // the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
         r#"
