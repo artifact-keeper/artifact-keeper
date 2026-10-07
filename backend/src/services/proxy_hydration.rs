@@ -2622,6 +2622,100 @@ mod tests {
         );
     }
 
+    /// Tier-2 (#4013, hardware verification): the leader replica dies
+    /// mid-fill (its session ended, as the keepalive reaper does for a
+    /// vanished node; here `pg_terminate_backend`). The waiting replica must
+    /// not sit out its wait budget: it wakes, re-enters onto the miss, and
+    /// re-elects itself as leader, all within about 2 s.
+    #[tokio::test]
+    async fn pg_waiting_replica_reelects_when_the_leader_session_dies() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cluster_lock::PgAdvisoryLock;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let admin = pool_a.clone();
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b: Arc<dyn ClusterLock> = Arc::new(PgAdvisoryLock::new(pool_b));
+        let key = format!("proxy-stream:pg-dead-leader-{}", uuid::Uuid::new_v4());
+
+        // Replica A leads and never publishes (it is about to die).
+        let (inner, _never_published) = handle_with_publish(&[b"partial"]);
+        let permits = tokio::sync::Semaphore::new(4);
+        let LeaderOpen::Body(_leader_body) = open_as_cluster_leader(
+            ClusterWait {
+                lock: &replica_a,
+                timeout: Duration::from_secs(60),
+                permits: &permits,
+            },
+            &key,
+            || async move { Ok(inner) },
+        )
+        .await
+        .expect("leader open") else {
+            panic!("replica A must lead");
+        };
+
+        // Replica B's request waits on A (60 s budget).
+        let coord_b = Arc::new(AdvisoryLockCoordinator::new(
+            Arc::clone(&replica_b),
+            Duration::from_millis(5),
+            Duration::from_secs(60),
+        ));
+        let waiting = {
+            let coord_b = Arc::clone(&coord_b);
+            let key = key.clone();
+            tokio::spawn(async move { coord_b.coordinate_stream(&key, never_opens).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "B waits while A's session is alive");
+
+        let started = std::time::Instant::now();
+        let terminated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid::bigint = $1 \
+               AND objid::bigint = $2 AND granted) t",
+        )
+        .bind(i64::from(PROXY_HYDRATION_LOCK_CLASS))
+        .bind(i64::from(lease_object_id(&key) as u32))
+        .fetch_one(&admin)
+        .await
+        .expect("terminate A's session");
+        assert_eq!(terminated, 1);
+
+        let reentered = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("B wakes when A's session is gone")
+            .expect("join")
+            .expect("no error");
+        assert!(
+            reentered.is_none(),
+            "B re-enters (and finds no cache entry)"
+        );
+        let opens = AtomicUsize::new(0);
+        let handle = coord_b
+            .coordinate_stream(&key, || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(StreamHandle {
+                    body: body_of(&[b"refetched"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            })
+            .await
+            .expect("ok")
+            .expect("B is the new leader");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "re-elected within 2 s of A's death, not after the 60 s budget"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(drain(handle.body).await.expect("bytes"), b"refetched");
+    }
+
     /// Tier-2 (#4013) timeout path on the real lock: a waiter whose remote
     /// leader outlives `wait_timeout` opens upstream itself, once.
     #[tokio::test]

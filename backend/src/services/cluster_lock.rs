@@ -123,6 +123,35 @@ pub trait ClusterLock: Send + Sync {
 /// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
 pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
 
+/// Server-side TCP keepalives for a session that holds or waits on an advisory
+/// lock (#4013): idle seconds, probe interval seconds, probe count.
+///
+/// When a replica's node disappears (force-deleted pod, node loss) its
+/// sockets close silently: no FIN, no RST. Postgres then keeps the dead
+/// session, and the advisory lock it holds, until the kernel's default
+/// keepalive gives up (about two hours on Linux). With these the server
+/// declares the peer dead after about `idle + interval * count` = 30 s and
+/// ends the session, which releases the lock and wakes the waiters on the
+/// other replicas. Only the dedicated lock sessions get them, never the pool.
+const LOCK_SESSION_KEEPALIVES: (&str, &str, &str) = ("15", "5", "3");
+
+/// Arm [`LOCK_SESSION_KEEPALIVES`] on a dedicated lock session. Best-effort:
+/// a Unix-socket session ignores them and a failure only keeps the server's
+/// defaults, so errors are not surfaced.
+async fn arm_dead_peer_keepalives(conn: &mut sqlx::PgConnection) {
+    let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
+    let _ = sqlx::query(
+        "SELECT set_config('tcp_keepalives_idle', $1, false), \
+                set_config('tcp_keepalives_interval', $2, false), \
+                set_config('tcp_keepalives_count', $3, false)",
+    )
+    .bind(idle)
+    .bind(interval)
+    .bind(count)
+    .execute(conn)
+    .await;
+}
+
 /// How often the server checks that a blocked waiter's client is still
 /// connected (`client_connection_check_interval`, PG 14+), so a cancelled wait
 /// frees its backend within about this long instead of after `lock_timeout`.
@@ -186,7 +215,8 @@ impl ClusterLock for PgAdvisoryLock {
         // connection we own outright. On the happy path `release` unlocks and
         // drops it; on panic/cancel/pod-kill the guard drops, the detached
         // connection CLOSES, and Postgres releases the session lock (crash-safe).
-        let detached = conn.detach();
+        let mut detached = conn.detach();
+        arm_dead_peer_keepalives(&mut detached).await;
         Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
             conn: Some(detached),
             class,
@@ -222,6 +252,9 @@ impl ClusterLock for PgAdvisoryLock {
             .bind(CLIENT_CONNECTION_CHECK_INTERVAL)
             .execute(&mut conn)
             .await;
+        // A waiter that is granted the lock holds it until it releases; if its
+        // node died meanwhile, only keepalives free it.
+        arm_dead_peer_keepalives(&mut conn).await;
         match sqlx::query("SELECT pg_advisory_lock($1, $2)")
             .bind(class)
             .bind(obj)
@@ -742,5 +775,128 @@ mod tests {
             "ended by statement_timeout, not lock_timeout"
         );
         held.release().await;
+    }
+    /// #4013 (hardware verification): the leader's lock-holding session and a
+    /// waiter's session both carry server-side keepalives, so a replica whose
+    /// node vanished is reaped in about 30 s instead of the kernel default.
+    #[tokio::test]
+    async fn pg_lock_sessions_carry_dead_peer_keepalives() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let lock = PgAdvisoryLock::new(pool);
+        let key = format!("proxy-cache:pgkeepalive-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let mut leases = vec![lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("leader")];
+        let other = lease_object_id(&format!("{key}-waiter"));
+        leases.push(
+            lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, other, Duration::from_secs(5))
+                .await
+                .expect("query ok")
+                .expect("free key is granted at once"),
+        );
+        for lease in &mut leases {
+            let ClusterLease::Postgres(lease) = lease else {
+                panic!("postgres lease");
+            };
+            let conn = lease.conn.as_mut().expect("held connection");
+            let tcp: bool = sqlx::query_scalar("SELECT inet_client_addr() IS NOT NULL")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("transport");
+            if !tcp {
+                continue; // keepalives do not apply to a Unix socket
+            }
+            let settings: (String, String, String) = sqlx::query_as(
+                "SELECT current_setting('tcp_keepalives_idle'), \
+                        current_setting('tcp_keepalives_interval'), \
+                        current_setting('tcp_keepalives_count')",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .expect("settings");
+            let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
+            assert_eq!(
+                settings,
+                (idle.to_string(), interval.to_string(), count.to_string())
+            );
+        }
+        for lease in leases {
+            lease.release().await;
+        }
+    }
+
+    /// #4013 (hardware verification): when the leader's session dies (here
+    /// `pg_terminate_backend`, what the keepalive reaper does to a vanished
+    /// node), its lock is released and a waiter on another replica wakes at
+    /// once, then wins the re-election, well inside 2 s.
+    #[tokio::test]
+    async fn pg_waiter_reelects_promptly_when_the_leader_session_dies() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let admin = pool_a.clone();
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b = PgAdvisoryLock::new(pool_b);
+        let key = format!("proxy-cache:pgdeadleader-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let leader = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("leader");
+        let waiter = tokio::spawn(async move {
+            let woke = replica_b
+                .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(60))
+                .await;
+            (replica_b, woke)
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter blocks behind the live leader"
+        );
+
+        let started = std::time::Instant::now();
+        let terminated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid::bigint = $1 \
+               AND objid::bigint = $2 AND granted) t",
+        )
+        .bind(i64::from(PROXY_HYDRATION_LOCK_CLASS))
+        .bind(i64::from(obj as u32))
+        .fetch_one(&admin)
+        .await
+        .expect("terminate the leader session");
+        assert_eq!(terminated, 1, "exactly the leader's session held the lock");
+
+        let (replica_b, woke) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiter wakes as soon as the leader session is gone")
+            .expect("join");
+        let woke = woke.expect("query ok").expect("granted, not timed out");
+        // The woken waiter releases and re-elects (ReElect -> re-enter); the
+        // re-election finds the lock free and wins it.
+        woke.release().await;
+        let reelected = replica_b
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("re-elected leader");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "re-election within 2 s of the leader's death, not the 60 s wait"
+        );
+        reelected.release().await;
+        drop(leader); // its connection is already dead
     }
 }

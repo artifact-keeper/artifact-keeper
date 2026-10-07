@@ -89,7 +89,11 @@ replica that loses the lock waits up to `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SE
 (default 65) for the leader before fetching itself. Keep that below the
 ingress / load balancer read timeout (this harness's nginx LB allows 300 s;
 nginx-ingress defaults to 60 s), or clients are cut off and retry into a fresh
-wait.
+wait. If the leader replica's node is lost mid-fill (force-deleted pod, node
+failure), its sockets close silently; server-side TCP keepalives on the lock
+session (15 s idle + 3 probes x 5 s) let Postgres reap it in about 30 s, which
+releases the lock, and the waiting replicas re-elect at once. Expect about 30 s
+of extra latency for the requests waiting on that object, not the full wait.
 
 To widen or narrow the race window, set `LATENCY_MS` / `ARTIFACT_SIZE_BYTES` on
 the `mock-upstream` service before `up` (or via the workflow inputs).
