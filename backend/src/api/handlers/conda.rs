@@ -55,6 +55,8 @@ use crate::services::conda_identity::{
 use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
+mod virtual_merge;
+
 // ---------------------------------------------------------------------------
 // CEP-26: Conda naming constraints
 // ---------------------------------------------------------------------------
@@ -1263,17 +1265,9 @@ async fn channeldata_json(
 
     // Virtual repos: merge channeldata from all members
     if repo.repo_type == RepositoryType::Virtual {
-        let channeldata = build_virtual_channeldata(
-            &state.db,
-            auth.as_ref(),
-            state.proxy_service.as_deref(),
-            repo.id,
-        )
-        .await?;
-        let body = serde_json::to_string_pretty(&channeldata)
-            .unwrap()
-            .into_bytes();
-        return Ok(cacheable_response(body, "application/json", &headers).await);
+        let merged = build_virtual_channeldata(&state, auth.as_ref(), repo.id).await?;
+        log_member_failures(&repo_key, "channeldata.json", &merged.failed);
+        return Ok(cacheable_response(merged.body, "application/json", &headers).await);
     }
 
     // For remote repos, proxy channeldata from upstream.
@@ -1668,6 +1662,7 @@ async fn patch_instructions_json(
 // Repodata encoding helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 enum RepodataEncoding {
     Json,
     Bz2,
@@ -1692,9 +1687,9 @@ impl RepodataEncoding {
     }
 
     #[allow(clippy::result_large_err)]
-    fn encode(&self, repodata: &serde_json::Value) -> Result<Vec<u8>, Response> {
+    fn encode<T: serde::Serialize + ?Sized>(&self, repodata: &T) -> Result<Vec<u8>, Response> {
         match self {
-            Self::Json => Ok(serde_json::to_string_pretty(repodata).unwrap().into_bytes()),
+            Self::Json => Ok(serde_json::to_vec_pretty(repodata).unwrap()),
             Self::Bz2 => {
                 let json_bytes = serde_json::to_vec(repodata).unwrap();
                 Ok(bzip2_compress(&json_bytes))
@@ -1836,17 +1831,11 @@ async fn serve_repodata(
 
     // Virtual repos: merge repodata from all members
     if repo.repo_type == RepositoryType::Virtual {
-        let repodata = build_virtual_repodata(
-            &state.db,
-            auth.as_ref(),
-            state.proxy_service.as_deref(),
-            repo.id,
-            repo_key,
-            subdir,
-        )
-        .await?;
-        let body = encoding.encode(&repodata)?;
-        return Ok(cacheable_response(body, ct, headers).await);
+        let merged =
+            build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir, encoding)
+                .await?;
+        log_member_failures(repo_key, encoding.upstream_filename(), &merged.failed);
+        return Ok(cacheable_response(merged.body, ct, headers).await);
     }
 
     // For remote repos, proxy repodata from upstream. Real conda-forge
@@ -2700,19 +2689,6 @@ async fn build_repodata(
     ))
 }
 
-/// Merge package maps from a source into an accumulator using first-writer-wins.
-///
-/// Entries already present in the accumulator are not overwritten, so higher-priority
-/// members (inserted first) win on conflicts.
-fn merge_package_maps(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    source: &serde_json::Map<String, serde_json::Value>,
-) {
-    for (k, v) in source {
-        target.entry(k.clone()).or_insert(v.clone());
-    }
-}
-
 /// The package name a conda filename carries: `<name>-<version>-<build>` plus
 /// `.conda` or `.tar.bz2`. Version and build strings never contain `-`
 /// (CEP-26), so the name is everything before the second-to-last hyphen.
@@ -2780,66 +2756,6 @@ async fn virtual_hosted_owned_names(
     Ok(names.into_iter().collect())
 }
 
-/// Whether a repodata record from a remote member names a package a hosted
-/// member owns. The record's own `name` is authoritative; the filename is the
-/// fallback for a record that omits it.
-fn record_is_hosted_owned(
-    filename: &str,
-    record: &serde_json::Value,
-    owned: &std::collections::HashSet<String>,
-) -> bool {
-    let name = record
-        .get("name")
-        .and_then(|v| v.as_str())
-        .or_else(|| conda_name_from_filename(filename));
-    name.is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
-}
-
-/// Remove every record a hosted member owns from a remote member's package
-/// map, returning how many were dropped (logged by the caller).
-fn drop_hosted_owned_records(
-    map: &mut serde_json::Map<String, serde_json::Value>,
-    owned: &std::collections::HashSet<String>,
-) -> usize {
-    if owned.is_empty() {
-        return 0;
-    }
-    let before = map.len();
-    map.retain(|filename, record| !record_is_hosted_owned(filename, record, owned));
-    before - map.len()
-}
-
-/// Parse upstream repodata JSON and extract `packages` and `packages.conda` maps.
-///
-/// Returns `(packages, packages_conda)`. Missing keys are returned as empty maps.
-fn parse_upstream_repodata(
-    content: &[u8],
-) -> Option<(
-    serde_json::Map<String, serde_json::Value>,
-    serde_json::Map<String, serde_json::Value>,
-)> {
-    let value: serde_json::Value = serde_json::from_slice(content).ok()?;
-    let packages = value
-        .get("packages")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let packages_conda = value
-        .get("packages.conda")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    Some((packages, packages_conda))
-}
-
-/// Parse upstream channeldata JSON and extract the `packages` map.
-fn parse_upstream_channeldata(
-    content: &[u8],
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let value: serde_json::Value = serde_json::from_slice(content).ok()?;
-    value.get("packages").and_then(|v| v.as_object()).cloned()
-}
-
 /// Build a channeldata entry for a single conda artifact from its metadata.
 fn build_channeldata_entry(
     version: Option<&str>,
@@ -2871,167 +2787,174 @@ fn build_channeldata_entry(
     entry
 }
 
-/// Build merged repodata.json for a virtual repository by combining member repos.
+/// A merged virtual document plus the remote members that could not
+/// contribute to it.
+struct VirtualMerge {
+    body: Vec<u8>,
+    failed: Vec<virtual_merge::MemberFailure>,
+}
+
+/// Build merged repodata for a virtual repository, encoded as `encoding`.
 ///
-/// Members are iterated in priority order (from `virtual_repo_members` table).
-/// For hosted/local members, we query their artifacts directly. For remote members,
-/// we proxy their upstream repodata and parse it. The merge uses first-writer-wins
-/// semantics: if two members provide the same filename, the higher-priority member
-/// (lower priority number) wins.
+/// Hosted (local/staging) members are merged first, then remote members, each
+/// group in member priority order, first-writer-wins per filename; a remote
+/// record whose name a hosted member owns is excluded
+/// ([`virtual_hosted_owned_names`]). Remote members are fetched compressed and
+/// capped, one at a time, and merged as raw JSON on a blocking thread — see
+/// [`virtual_merge`].
 async fn build_virtual_repodata(
-    db: &sqlx::PgPool,
+    state: &SharedState,
     auth: Option<&AuthExtension>,
-    proxy_service: Option<&crate::services::proxy_service::ProxyService>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     subdir: &str,
-) -> Result<serde_json::Value, Response> {
+    encoding: RepodataEncoding,
+) -> Result<VirtualMerge, Response> {
     validate_cep26_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
     // Caller-authorized member walk (#3323): repodata is content, so a member
     // this caller may not read directly contributes neither its packages nor
     // its upstream's.
-    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
+    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
 
-    let mut merged_packages = serde_json::Map::new();
-    let mut merged_packages_conda = serde_json::Map::new();
-
-    // Collect from remote members using shared helper
-    let upstream_path = format!("{}/repodata.json", subdir);
-    let remote_data = proxy_helpers::collect_virtual_metadata(
-        db,
-        auth,
-        proxy_service,
-        virtual_repo_id,
-        &upstream_path,
-        |bytes, _member_key| async move {
-            parse_upstream_repodata(&bytes).ok_or_else(|| {
-                (StatusCode::BAD_GATEWAY, "Failed to parse upstream repodata").into_response()
-            })
-        },
-    )
-    .await?;
-
-    // Hosted members own their names (dependency-confusion guard): a remote
-    // member contributes nothing under a name a hosted member has published.
-    let owned = virtual_hosted_owned_names(db, virtual_repo_id).await?;
-    for (member_key, (mut pkgs, mut pkgs_conda)) in remote_data {
-        let dropped = drop_hosted_owned_records(&mut pkgs, &owned)
-            + drop_hosted_owned_records(&mut pkgs_conda, &owned);
-        if dropped > 0 {
-            tracing::info!(
-                virtual_repo = %virtual_repo_key,
-                member = %member_key,
-                subdir,
-                dropped,
-                "excluded remote conda records whose names a hosted member owns"
-            );
-        }
-        merge_package_maps(&mut merged_packages, &pkgs);
-        merge_package_maps(&mut merged_packages_conda, &pkgs_conda);
-    }
-
-    // Handle hosted/local members
-    for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            let artifacts = list_conda_artifacts(db, member.id).await?;
-            let subdir_artifacts = artifacts_for_subdir(&artifacts, subdir);
-
-            for artifact in &subdir_artifacts {
-                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-                if !is_conda_package(filename) {
-                    continue;
-                }
-                let entry = build_artifact_entry(artifact, filename, subdir);
-                if is_conda_v2(filename) {
-                    merged_packages_conda
-                        .entry(filename.to_string())
-                        .or_insert(entry);
-                } else {
-                    merged_packages.entry(filename.to_string()).or_insert(entry);
-                }
+    let mut hosted = Vec::new();
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+    {
+        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
+        for artifact in artifacts_for_subdir(&artifacts, subdir) {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if !is_conda_package(filename) {
+                continue;
             }
+            let entry = build_artifact_entry(artifact, filename, subdir);
+            hosted.push(virtual_merge::HostedRecord {
+                filename: filename.to_string(),
+                is_v2: is_conda_v2(filename),
+                record: serde_json::value::to_raw_value(&entry)
+                    .map_err(virtual_merge::internal_error)?,
+            });
         }
     }
+
+    let (documents, mut failed) = virtual_merge::fetch_remote_members(
+        state.proxy_service.as_deref(),
+        &members,
+        &virtual_merge::repodata_candidates(subdir),
+        virtual_merge::MemberLimits::from_env(),
+    )
+    .await;
 
     let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
-
-    Ok(build_repodata_envelope(
-        subdir,
-        &base_url,
-        &merged_packages,
-        &merged_packages_conda,
-        &serde_json::json!([]),
-    ))
+    let subdir_owned = subdir.to_string();
+    let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
+        virtual_merge::merge_repodata(
+            &subdir_owned,
+            &base_url,
+            &hosted,
+            &documents,
+            &owned,
+            encoding,
+        )
+    })
+    .await
+    .map_err(virtual_merge::internal_error)?;
+    if dropped > 0 {
+        tracing::info!(
+            virtual_repo = %virtual_repo_key,
+            subdir,
+            dropped,
+            "excluded remote conda records whose names a hosted member owns"
+        );
+    }
+    failed.extend(parse_failures);
+    Ok(VirtualMerge {
+        body: body?,
+        failed,
+    })
 }
 
-/// Build merged channeldata.json for a virtual repository.
+/// Build merged channeldata.json for a virtual repository: hosted members
+/// first, then remote members (fetched capped, one at a time), with remote
+/// entries for hosted-owned names excluded.
 async fn build_virtual_channeldata(
-    db: &sqlx::PgPool,
+    state: &SharedState,
     auth: Option<&AuthExtension>,
-    proxy_service: Option<&crate::services::proxy_service::ProxyService>,
     virtual_repo_id: uuid::Uuid,
-) -> Result<serde_json::Value, Response> {
+) -> Result<VirtualMerge, Response> {
     // Caller-authorized member walk (#3323).
-    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
+    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
 
-    let mut merged_packages = serde_json::Map::new();
-
-    // Collect from remote members using shared helper
-    let remote_data = proxy_helpers::collect_virtual_metadata(
-        db,
-        auth,
-        proxy_service,
-        virtual_repo_id,
-        "channeldata.json",
-        |bytes, _member_key| async move {
-            parse_upstream_channeldata(&bytes).ok_or_else(|| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Failed to parse upstream channeldata",
-                )
-                    .into_response()
-            })
-        },
-    )
-    .await?;
-
-    // Hosted members own their names here too, so channeldata cannot describe
-    // an upstream package the merged repodata refuses to list.
-    let owned = virtual_hosted_owned_names(db, virtual_repo_id).await?;
-    for (_member_key, mut pkgs) in remote_data {
-        pkgs.retain(|name, _| !owned.contains(&name.to_ascii_lowercase()));
-        merge_package_maps(&mut merged_packages, &pkgs);
-    }
-
-    // Handle hosted/local members
-    for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            let artifacts = list_conda_artifacts(db, member.id).await?;
-            for artifact in &artifacts {
-                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-                if !is_conda_package(filename) {
-                    continue;
-                }
-                let pkg_name = artifact
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| artifact.name.clone());
-
-                merged_packages.entry(pkg_name).or_insert_with(|| {
-                    build_channeldata_entry(artifact.version.as_deref(), artifact.metadata.as_ref())
-                });
+    let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+    {
+        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
+        for artifact in &artifacts {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if !is_conda_package(filename) {
+                continue;
             }
+            let pkg_name = artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| artifact.name.clone());
+            if !seen.insert(pkg_name.clone()) {
+                continue;
+            }
+            let entry =
+                build_channeldata_entry(artifact.version.as_deref(), artifact.metadata.as_ref());
+            hosted.push((
+                pkg_name,
+                serde_json::value::to_raw_value(&entry).map_err(virtual_merge::internal_error)?,
+            ));
         }
     }
 
-    Ok(serde_json::json!({
-        "channeldata_version": 1,
-        "packages": merged_packages,
-    }))
+    let (documents, mut failed) = virtual_merge::fetch_remote_members(
+        state.proxy_service.as_deref(),
+        &members,
+        &virtual_merge::channeldata_candidates(),
+        virtual_merge::MemberLimits::from_env(),
+    )
+    .await;
+    let (body, parse_failures) = tokio::task::spawn_blocking(move || {
+        virtual_merge::merge_channeldata(&hosted, &documents, &owned)
+    })
+    .await
+    .map_err(virtual_merge::internal_error)?;
+    failed.extend(parse_failures);
+    Ok(VirtualMerge {
+        body: body.map_err(virtual_merge::internal_error)?,
+        failed,
+    })
+}
+
+/// Log the remote members a virtual merge had to leave out.
+fn log_member_failures(
+    virtual_repo_key: &str,
+    document: &str,
+    failed: &[virtual_merge::MemberFailure],
+) {
+    for f in failed {
+        tracing::warn!(
+            virtual_repo = %virtual_repo_key,
+            member = %f.member,
+            document,
+            reason = %f.reason,
+            "conda virtual member could not contribute to the merged document"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8564,153 +8487,8 @@ mod tests {
     }
 
     // =======================================================================
-    // Pure helper tests: merge_package_maps, parse_upstream_*, build_channeldata_entry
+    // Pure helper tests: build_channeldata_entry
     // =======================================================================
-
-    #[test]
-    fn test_merge_package_maps_adds_new_entries() {
-        let mut target = serde_json::Map::new();
-        target.insert("a".into(), serde_json::json!(1));
-
-        let mut source = serde_json::Map::new();
-        source.insert("b".into(), serde_json::json!(2));
-
-        merge_package_maps(&mut target, &source);
-        assert_eq!(target.len(), 2);
-        assert_eq!(target["a"], 1);
-        assert_eq!(target["b"], 2);
-    }
-
-    #[test]
-    fn test_merge_package_maps_first_writer_wins() {
-        let mut target = serde_json::Map::new();
-        target.insert("pkg".into(), serde_json::json!({"version": "1.0"}));
-
-        let mut source = serde_json::Map::new();
-        source.insert("pkg".into(), serde_json::json!({"version": "2.0"}));
-
-        merge_package_maps(&mut target, &source);
-        assert_eq!(target.len(), 1);
-        assert_eq!(target["pkg"]["version"], "1.0");
-    }
-
-    #[test]
-    fn test_merge_package_maps_empty_source() {
-        let mut target = serde_json::Map::new();
-        target.insert("a".into(), serde_json::json!(1));
-
-        let source = serde_json::Map::new();
-        merge_package_maps(&mut target, &source);
-        assert_eq!(target.len(), 1);
-    }
-
-    #[test]
-    fn test_merge_package_maps_empty_target() {
-        let mut target = serde_json::Map::new();
-
-        let mut source = serde_json::Map::new();
-        source.insert("a".into(), serde_json::json!(1));
-        source.insert("b".into(), serde_json::json!(2));
-
-        merge_package_maps(&mut target, &source);
-        assert_eq!(target.len(), 2);
-    }
-
-    #[test]
-    fn test_merge_package_maps_partial_overlap() {
-        let mut target = serde_json::Map::new();
-        target.insert("a".into(), serde_json::json!("target_a"));
-        target.insert("b".into(), serde_json::json!("target_b"));
-
-        let mut source = serde_json::Map::new();
-        source.insert("b".into(), serde_json::json!("source_b"));
-        source.insert("c".into(), serde_json::json!("source_c"));
-
-        merge_package_maps(&mut target, &source);
-        assert_eq!(target.len(), 3);
-        assert_eq!(target["a"], "target_a");
-        assert_eq!(target["b"], "target_b"); // target wins
-        assert_eq!(target["c"], "source_c");
-    }
-
-    #[test]
-    fn test_parse_upstream_repodata_both_sections() {
-        let content = serde_json::to_vec(&serde_json::json!({
-            "info": {"subdir": "linux-64"},
-            "packages": {
-                "old-1.0-0.tar.bz2": {"name": "old", "version": "1.0"}
-            },
-            "packages.conda": {
-                "new-2.0-0.conda": {"name": "new", "version": "2.0"}
-            },
-            "repodata_version": 1,
-        }))
-        .unwrap();
-
-        let (pkgs, pkgs_conda) = parse_upstream_repodata(&content).unwrap();
-        assert_eq!(pkgs.len(), 1);
-        assert!(pkgs.contains_key("old-1.0-0.tar.bz2"));
-        assert_eq!(pkgs_conda.len(), 1);
-        assert!(pkgs_conda.contains_key("new-2.0-0.conda"));
-    }
-
-    #[test]
-    fn test_parse_upstream_repodata_missing_packages_conda() {
-        let content = serde_json::to_vec(&serde_json::json!({
-            "packages": {
-                "pkg-1.0-0.tar.bz2": {"name": "pkg"}
-            },
-            "repodata_version": 1,
-        }))
-        .unwrap();
-
-        let (pkgs, pkgs_conda) = parse_upstream_repodata(&content).unwrap();
-        assert_eq!(pkgs.len(), 1);
-        assert!(pkgs_conda.is_empty());
-    }
-
-    #[test]
-    fn test_parse_upstream_repodata_empty_json() {
-        let content = b"{}";
-        let (pkgs, pkgs_conda) = parse_upstream_repodata(content).unwrap();
-        assert!(pkgs.is_empty());
-        assert!(pkgs_conda.is_empty());
-    }
-
-    #[test]
-    fn test_parse_upstream_repodata_invalid_json() {
-        let content = b"not json";
-        assert!(parse_upstream_repodata(content).is_none());
-    }
-
-    #[test]
-    fn test_parse_upstream_channeldata_with_packages() {
-        let content = serde_json::to_vec(&serde_json::json!({
-            "channeldata_version": 1,
-            "packages": {
-                "numpy": {"subdirs": ["linux-64"], "version": "1.26"},
-                "scipy": {"subdirs": ["noarch"], "version": "1.11"},
-            }
-        }))
-        .unwrap();
-
-        let pkgs = parse_upstream_channeldata(&content).unwrap();
-        assert_eq!(pkgs.len(), 2);
-        assert!(pkgs.contains_key("numpy"));
-        assert!(pkgs.contains_key("scipy"));
-    }
-
-    #[test]
-    fn test_parse_upstream_channeldata_missing_packages() {
-        let content = b"{}";
-        assert!(parse_upstream_channeldata(content).is_none());
-    }
-
-    #[test]
-    fn test_parse_upstream_channeldata_invalid_json() {
-        let content = b"invalid";
-        assert!(parse_upstream_channeldata(content).is_none());
-    }
 
     #[test]
     fn test_build_channeldata_entry_full_metadata() {
@@ -8754,68 +8532,6 @@ mod tests {
         assert_eq!(entry["license"], "MIT");
         assert_eq!(entry["summary"], ""); // missing from metadata
         assert_eq!(entry["subdirs"][0], "noarch"); // missing subdir defaults to noarch
-    }
-
-    #[test]
-    fn test_merge_package_maps_multi_member_priority() {
-        // Simulate 3-member virtual repo merge
-        let mut merged = serde_json::Map::new();
-
-        // Member 1 (highest priority)
-        let mut m1 = serde_json::Map::new();
-        m1.insert("shared".into(), serde_json::json!({"from": "m1"}));
-        m1.insert("only_m1".into(), serde_json::json!({"from": "m1"}));
-        merge_package_maps(&mut merged, &m1);
-
-        // Member 2
-        let mut m2 = serde_json::Map::new();
-        m2.insert("shared".into(), serde_json::json!({"from": "m2"}));
-        m2.insert("only_m2".into(), serde_json::json!({"from": "m2"}));
-        merge_package_maps(&mut merged, &m2);
-
-        // Member 3 (lowest priority)
-        let mut m3 = serde_json::Map::new();
-        m3.insert("shared".into(), serde_json::json!({"from": "m3"}));
-        m3.insert("only_m3".into(), serde_json::json!({"from": "m3"}));
-        merge_package_maps(&mut merged, &m3);
-
-        assert_eq!(merged.len(), 4);
-        assert_eq!(merged["shared"]["from"], "m1"); // highest priority wins
-        assert_eq!(merged["only_m1"]["from"], "m1");
-        assert_eq!(merged["only_m2"]["from"], "m2");
-        assert_eq!(merged["only_m3"]["from"], "m3");
-    }
-
-    #[test]
-    fn test_parse_upstream_repodata_preserves_metadata_fields() {
-        let content = serde_json::to_vec(&serde_json::json!({
-            "packages.conda": {
-                "numpy-1.26.4-py312_0.conda": {
-                    "name": "numpy",
-                    "version": "1.26.4",
-                    "build": "py312_0",
-                    "build_number": 0,
-                    "depends": ["python >=3.12"],
-                    "constrains": [],
-                    "license": "BSD-3-Clause",
-                    "md5": "abc123",
-                    "sha256": "def456",
-                    "size": 8192,
-                    "subdir": "linux-64",
-                    "timestamp": 1700000000000_u64
-                }
-            }
-        }))
-        .unwrap();
-
-        let (_, pkgs_conda) = parse_upstream_repodata(&content).unwrap();
-        let entry = &pkgs_conda["numpy-1.26.4-py312_0.conda"];
-        assert_eq!(entry["name"], "numpy");
-        assert_eq!(entry["version"], "1.26.4");
-        assert_eq!(entry["build"], "py312_0");
-        assert_eq!(entry["license"], "BSD-3-Clause");
-        assert_eq!(entry["sha256"], "def456");
-        assert_eq!(entry["size"], 8192);
     }
 
     // =======================================================================
@@ -15038,26 +14754,6 @@ mod virtual_channel_tests {
         assert_eq!(conda_name_from_filename("acme-core-1.0-0.whl"), None);
     }
 
-    #[test]
-    fn drop_hosted_owned_records_matches_record_name_case_insensitively() {
-        let owned: std::collections::HashSet<String> = ["acme-core".to_string()].into();
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "acme-core-99.0-0.conda".into(),
-            upstream_record("noarch", "acme-core-99.0-0.conda"),
-        );
-        map.insert(
-            "rich-13.0-0.conda".into(),
-            upstream_record("noarch", "rich-13.0-0.conda"),
-        );
-        // A record whose own `name` differs in case from the owned name.
-        let mut shouty = upstream_record("noarch", "acme-core-98.0-0.conda");
-        shouty["name"] = "ACME-Core".into();
-        map.insert("acme-core-98.0-0.conda".into(), shouty);
-        assert_eq!(drop_hosted_owned_records(&mut map, &owned), 2);
-        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["rich-13.0-0.conda"]);
-    }
-
     /// F1: a hosted `acme-core 1.0` and an upstream `acme-core 99.0` behind one
     /// virtual: the merged repodata lists only the hosted version (in every
     /// subdir, not only the one the hosted package lives in), keeps the
@@ -15121,6 +14817,223 @@ mod virtual_channel_tests {
             StatusCode::NOT_FOUND,
             "the impostor must not download through the virtual, got {:?}",
             String::from_utf8_lossy(&dl_body)
+        );
+    }
+
+    fn zst(bytes: &[u8]) -> Vec<u8> {
+        zstd::encode_all(bytes, 3).expect("zstd encode")
+    }
+
+    #[test]
+    fn decode_member_document_undoes_file_and_transfer_codings() {
+        use virtual_merge::{decode_member_document, FileCodec};
+        let doc = br#"{"packages":{}}"#;
+        assert_eq!(
+            decode_member_document(doc, None, FileCodec::Plain, 1024).unwrap(),
+            doc
+        );
+        assert_eq!(
+            decode_member_document(&zst(doc), None, FileCodec::Zstd, 1024).unwrap(),
+            doc
+        );
+        assert_eq!(
+            decode_member_document(&bzip2_compress(doc), None, FileCodec::Bzip2, 1024).unwrap(),
+            doc
+        );
+        // A transfer coding on top of the file compression is undone first.
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(&zst(doc)).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(
+            decode_member_document(&gz, Some("gzip"), FileCodec::Zstd, 1024).unwrap(),
+            doc
+        );
+        assert!(decode_member_document(doc, Some("br"), FileCodec::Plain, 1024).is_err());
+    }
+
+    /// The decoded ceiling is enforced while decoding: a small `.zst` that
+    /// inflates past it is refused, not buffered.
+    #[test]
+    fn decode_member_document_enforces_the_decoded_ceiling() {
+        use virtual_merge::{decode_member_document, FileCodec};
+        let bomb = zst(&vec![b' '; 4 * 1024 * 1024]);
+        assert!(bomb.len() < 4096, "fixture must compress well");
+        let err = decode_member_document(&bomb, None, FileCodec::Zstd, 1024 * 1024).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
+        assert!(decode_member_document(&bomb, None, FileCodec::Zstd, 4 * 1024 * 1024).is_ok());
+    }
+
+    fn hosted_record(filename: &str, marker: &str) -> virtual_merge::HostedRecord {
+        let mut rec = upstream_record("noarch", filename);
+        rec["from"] = marker.into();
+        virtual_merge::HostedRecord {
+            filename: filename.to_string(),
+            is_v2: filename.ends_with(".conda"),
+            record: serde_json::value::to_raw_value(&rec).unwrap(),
+        }
+    }
+
+    fn member_doc(member: &str, filenames: &[&str]) -> virtual_merge::MemberDocument {
+        let mut doc = upstream_repodata("noarch", filenames);
+        for (_, rec) in doc["packages.conda"].as_object_mut().unwrap() {
+            rec["from"] = member.into();
+        }
+        virtual_merge::MemberDocument {
+            member: member.to_string(),
+            json: serde_json::to_vec(&doc).unwrap(),
+        }
+    }
+
+    /// Hosted records win over remote ones for the same filename, remote
+    /// members merge in order, owned names are dropped by the record's own
+    /// `name` even under an innocent filename, and an unparseable member is
+    /// reported rather than silently merged as empty.
+    #[test]
+    fn merge_repodata_is_hosted_first_and_guards_owned_names() {
+        let owned: std::collections::HashSet<String> = ["acme-core".to_string()].into();
+        let hosted = vec![hosted_record("shared-1.0-0.conda", "hosted")];
+        let mut sneaky = member_doc("remote-a", &["shared-1.0-0.conda", "rich-13.0-0.conda"]);
+        // `rich-13.1-0.conda` whose record claims to be acme-core.
+        let mut doc: serde_json::Value = serde_json::from_slice(&sneaky.json).unwrap();
+        let mut rec = upstream_record("noarch", "rich-13.1-0.conda");
+        rec["name"] = "acme-core".into();
+        doc["packages.conda"]["rich-13.1-0.conda"] = rec;
+        sneaky.json = serde_json::to_vec(&doc).unwrap();
+        let remote = vec![
+            sneaky,
+            member_doc("remote-b", &["rich-13.0-0.conda", "numpy-2.0-0.conda"]),
+            virtual_merge::MemberDocument {
+                member: "remote-c".into(),
+                json: b"not json".to_vec(),
+            },
+        ];
+        let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "noarch",
+            "/conda/v/noarch/",
+            &hosted,
+            &remote,
+            &owned,
+            RepodataEncoding::Json,
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let conda = doc["packages.conda"].as_object().unwrap();
+        assert_eq!(conda["shared-1.0-0.conda"]["from"], "hosted");
+        assert_eq!(conda["rich-13.0-0.conda"]["from"], "remote-a");
+        assert_eq!(conda["numpy-2.0-0.conda"]["from"], "remote-b");
+        assert!(!conda.contains_key("rich-13.1-0.conda"));
+        assert_eq!(dropped, 1);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].member, "remote-c");
+        assert_eq!(doc["info"]["base_url"], "/conda/v/noarch/");
+        assert_eq!(doc["repodata_version"], 1);
+    }
+
+    /// F2: a remote member is fetched as `repodata.json.zst`; the plain
+    /// document is never requested when the compressed one is there, and the
+    /// zst/bz2 encodings of the merged document agree with the JSON one.
+    #[tokio::test]
+    async fn virtual_fetches_remote_members_compressed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let upstream = serde_json::to_vec(&upstream_repodata(
+            "noarch",
+            &["rich-13.0-0.conda", "pandas-2.2-0.conda"],
+        ))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zst(&upstream)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (status, doc) = rig.repodata("noarch").await;
+        let (zst_status, zst_body, _) = rig
+            .get(format!("/{}/noarch/repodata.json.zst", rig.virtual_key))
+            .await;
+        let plain_hits = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/noarch/repodata.json")
+            .count();
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed(&doc),
+            vec![
+                "acme-core-1.0-0.conda",
+                "pandas-2.2-0.conda",
+                "rich-13.0-0.conda"
+            ]
+        );
+        assert_eq!(
+            plain_hits, 0,
+            "the uncompressed document must not be fetched"
+        );
+        assert_eq!(zst_status, StatusCode::OK);
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&zst_body[..]).unwrap()).unwrap();
+        assert_eq!(
+            decoded, doc,
+            "every encoding serves the same merged document"
+        );
+    }
+
+    /// F2: the fetched-bytes ceiling applies to each member and is reported
+    /// as that member's failure, naming the cap.
+    #[tokio::test]
+    async fn virtual_member_fetch_is_capped() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64 * 1024]))
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        // UNFILTERED-ENFORCEMENT (#3323): test fixture lookup of the remote
+        // member's model, not a content-serving walk.
+        let members = proxy_helpers::fetch_virtual_members(&rig.pool, rig.virtual_id)
+            .await
+            .expect("members");
+        let remote = members
+            .iter()
+            .find(|m| m.id == rig.remote_id)
+            .expect("remote member")
+            .clone();
+        let proxy = rig.state.proxy_service.clone().expect("proxy service");
+        let result = virtual_merge::fetch_member_document(
+            &proxy,
+            &remote,
+            &virtual_merge::repodata_candidates("noarch"),
+            virtual_merge::MemberLimits {
+                fetched: 1024,
+                decoded: 1024 * 1024,
+            },
+        )
+        .await;
+        rig.cleanup().await;
+        let failure = result.err().expect("an over-cap member must fail");
+        assert_eq!(failure.member, remote.key);
+        assert!(
+            failure.reason.contains(virtual_merge::MEMBER_MAX_BYTES_ENV),
+            "{}",
+            failure.reason
         );
     }
 }

@@ -1,0 +1,447 @@
+//! Virtual conda channel merge: `repodata.json` and `channeldata.json` for a
+//! virtual repository, assembled from its members.
+//!
+//! The merge order is fixed: every hosted (local/staging) member first, in
+//! member priority order, then every remote member, in member priority order,
+//! with first-writer-wins per filename. Hosted members also OWN their package
+//! names ([`super::virtual_hosted_owned_names`]): a remote member contributes
+//! no record under a name a hosted member has published.
+//!
+//! Remote members are fetched in their compressed encodings, never as the
+//! plain document: `repodata.json.zst`, then `.bz2`, then `.json`, each through
+//! the capped, budgeted proxy path with the same 128 MiB default ceiling the
+//! single-remote path uses (#4180). The ceiling bounds what is read from the
+//! upstream; the decoded document has its own, larger ceiling, enforced while
+//! the streaming decoder runs, so a decompression bomb stops at the cap instead
+//! of at the allocator. Records are carried through the merge as raw JSON
+//! (`serde_json::value::RawValue`) and never materialised as `Value` trees: a
+//! conda-forge subdir is a few hundred MiB of JSON, and the tree form of it is
+//! several times that.
+
+use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+
+use crate::api::handlers::proxy_helpers;
+use crate::models::repository::{Repository, RepositoryType};
+use crate::services::proxy_service::ProxyService;
+
+/// Ceiling on the bytes read from one remote member for one document, as
+/// fetched (i.e. compressed). Defaults to the single-remote repodata tier,
+/// [`proxy_helpers::LARGE_METADATA_MAX_BYTES`].
+pub(super) const MEMBER_MAX_BYTES_ENV: &str = "CONDA_VIRTUAL_MEMBER_MAX_BYTES";
+
+/// Ceiling on one member document after decoding. conda-forge's largest
+/// subdirs decode to roughly 300 MiB today; 1 GiB leaves headroom without
+/// letting a crafted `.zst` inflate without bound.
+pub(super) const MEMBER_MAX_DECODED_BYTES_ENV: &str = "CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES";
+const DEFAULT_MEMBER_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Byte ceilings applied to each remote member fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MemberLimits {
+    /// Bytes read from the upstream (compressed, as served).
+    pub fetched: usize,
+    /// Bytes after undoing the transfer coding and the file compression.
+    pub decoded: usize,
+}
+
+impl MemberLimits {
+    /// Read the ceilings from the environment; an unset, unparseable or zero
+    /// value falls back to the default rather than disabling the cap.
+    pub(super) fn from_env() -> Self {
+        let read = |key: &str, default: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            fetched: read(
+                MEMBER_MAX_BYTES_ENV,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            ),
+            decoded: read(
+                MEMBER_MAX_DECODED_BYTES_ENV,
+                DEFAULT_MEMBER_MAX_DECODED_BYTES,
+            ),
+        }
+    }
+}
+
+/// File compression of one candidate upstream document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileCodec {
+    Zstd,
+    Bzip2,
+    Plain,
+}
+
+/// The upstream files that carry `{subdir}/repodata.json`, most compact first.
+pub(super) fn repodata_candidates(subdir: &str) -> Vec<(String, FileCodec)> {
+    vec![
+        (format!("{subdir}/repodata.json.zst"), FileCodec::Zstd),
+        (format!("{subdir}/repodata.json.bz2"), FileCodec::Bzip2),
+        (format!("{subdir}/repodata.json"), FileCodec::Plain),
+    ]
+}
+
+/// The upstream files that carry `channeldata.json`. Channels publish it only
+/// uncompressed.
+pub(super) fn channeldata_candidates() -> Vec<(String, FileCodec)> {
+    vec![("channeldata.json".to_string(), FileCodec::Plain)]
+}
+
+/// Why a remote member contributed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MemberFailure {
+    /// The member repository's key.
+    pub member: String,
+    /// What went wrong, phrased for an operator reading a 502 body.
+    pub reason: String,
+}
+
+/// A remote member's document, decoded to JSON bytes.
+pub(super) struct MemberDocument {
+    pub member: String,
+    pub json: Vec<u8>,
+}
+
+/// Undo the HTTP transfer coding (normally none: the proxy asks for identity)
+/// and then the file compression, refusing to produce more than `cap` bytes.
+pub(super) fn decode_member_document(
+    content: &[u8],
+    transfer_coding: Option<&str>,
+    codec: FileCodec,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    let transfer: Box<dyn Read + '_> = match transfer_coding.map(str::trim) {
+        None | Some("") | Some("identity") => Box::new(content),
+        Some(c) if c.eq_ignore_ascii_case("gzip") || c.eq_ignore_ascii_case("x-gzip") => {
+            Box::new(flate2::read::MultiGzDecoder::new(content))
+        }
+        Some(c) if c.eq_ignore_ascii_case("deflate") => {
+            Box::new(flate2::read::ZlibDecoder::new(content))
+        }
+        Some(c) if c.eq_ignore_ascii_case("zstd") => Box::new(
+            zstd::stream::read::Decoder::new(content)
+                .map_err(|e| format!("zstd transfer coding: {e}"))?,
+        ),
+        Some(other) => return Err(format!("unsupported Content-Encoding {other:?}")),
+    };
+    let file: Box<dyn Read + '_> = match codec {
+        FileCodec::Plain => transfer,
+        FileCodec::Zstd => {
+            Box::new(zstd::stream::read::Decoder::new(transfer).map_err(|e| format!("zstd: {e}"))?)
+        }
+        FileCodec::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(transfer)),
+    };
+    let mut out = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    if out.len() > cap {
+        return Err(format!(
+            "decoded document exceeds the {cap}-byte member ceiling ({MEMBER_MAX_DECODED_BYTES_ENV})"
+        ));
+    }
+    Ok(out)
+}
+
+/// Fetch one remote member's document, trying `candidates` in order and moving
+/// to the next only when the upstream answers 404 for the current one.
+///
+/// Members are fetched one at a time by the caller, and each fetch releases
+/// its share of the shared buffered-metadata budget before returning, so a
+/// virtual request never holds one reservation while waiting for another (the
+/// hold-and-wait shape #4129 removed from the single-remote path).
+pub(super) async fn fetch_member_document(
+    proxy: &ProxyService,
+    member: &Repository,
+    candidates: &[(String, FileCodec)],
+    limits: MemberLimits,
+) -> Result<MemberDocument, MemberFailure> {
+    let fail = |reason: String| MemberFailure {
+        member: member.key.clone(),
+        reason,
+    };
+    let Some(upstream_url) = member.upstream_url.as_deref() else {
+        return Err(fail("remote member has no upstream URL".to_string()));
+    };
+    let mut last_status = None;
+    for (path, codec) in candidates {
+        let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            path,
+            limits.fetched,
+        )
+        .await;
+        match fetched {
+            Ok(proxy_helpers::CappedMetadataGet::Buffered {
+                content,
+                content_encoding,
+                budget_permit,
+                ..
+            }) => {
+                let codec = *codec;
+                let path = path.clone();
+                let decoded = tokio::task::spawn_blocking(move || {
+                    // Held until the compressed buffer is decoded and dropped.
+                    let _budget_permit = budget_permit;
+                    decode_member_document(
+                        &content,
+                        content_encoding.as_deref(),
+                        codec,
+                        limits.decoded,
+                    )
+                })
+                .await
+                .map_err(|e| fail(format!("decoder task failed: {e}")))?;
+                return decoded
+                    .map(|json| MemberDocument {
+                        member: member.key.clone(),
+                        json,
+                    })
+                    .map_err(|e| fail(format!("{path}: {e}")));
+            }
+            Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
+                return Err(fail(format!(
+                    "{path} exceeds the {}-byte member ceiling ({MEMBER_MAX_BYTES_ENV})",
+                    limits.fetched
+                )));
+            }
+            Err(response) if response.status() == StatusCode::NOT_FOUND => {
+                last_status = Some(response.status());
+                continue;
+            }
+            Err(response) => {
+                return Err(fail(format!(
+                    "{path}: upstream fetch failed with {}",
+                    response.status()
+                )));
+            }
+        }
+    }
+    Err(fail(format!(
+        "no candidate document available upstream (last status {})",
+        last_status.map_or_else(|| "none".to_string(), |s| s.to_string())
+    )))
+}
+
+/// Fetch every remote member in `members` (already in priority order),
+/// sequentially. Successful documents and failures are returned separately,
+/// each in member order.
+pub(super) async fn fetch_remote_members(
+    proxy: Option<&ProxyService>,
+    members: &[Repository],
+    candidates: &[(String, FileCodec)],
+    limits: MemberLimits,
+) -> (Vec<MemberDocument>, Vec<MemberFailure>) {
+    let mut documents = Vec::new();
+    let mut failures = Vec::new();
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+    {
+        let Some(proxy) = proxy else {
+            failures.push(MemberFailure {
+                member: member.key.clone(),
+                reason: "the proxy service is not available".to_string(),
+            });
+            continue;
+        };
+        match fetch_member_document(proxy, member, candidates, limits).await {
+            Ok(doc) => documents.push(doc),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    (documents, failures)
+}
+
+// ---------------------------------------------------------------------------
+// repodata.json
+// ---------------------------------------------------------------------------
+
+/// The parts of an upstream `repodata.json` the merge reads. Records stay raw.
+#[derive(Deserialize)]
+struct UpstreamRepodata<'a> {
+    #[serde(default, borrow)]
+    packages: BTreeMap<String, &'a RawValue>,
+    #[serde(default, borrow, rename = "packages.conda")]
+    packages_conda: BTreeMap<String, &'a RawValue>,
+}
+
+/// Just the `name` of a record, borrowed where the JSON has no escapes.
+#[derive(Deserialize)]
+struct RecordName<'a> {
+    #[serde(default, borrow)]
+    name: Option<std::borrow::Cow<'a, str>>,
+}
+
+/// The merged document. Field order is the serialized key order, which is the
+/// sorted order the hosted document uses.
+#[derive(Serialize)]
+struct MergedRepodata<'a> {
+    info: RepodataInfo<'a>,
+    packages: BTreeMap<&'a str, &'a RawValue>,
+    #[serde(rename = "packages.conda")]
+    packages_conda: BTreeMap<&'a str, &'a RawValue>,
+    removed: [&'a str; 0],
+    repodata_version: u32,
+}
+
+#[derive(Serialize)]
+struct RepodataInfo<'a> {
+    base_url: &'a str,
+    subdir: &'a str,
+}
+
+/// One hosted record, ready to merge.
+pub(super) struct HostedRecord {
+    pub filename: String,
+    pub is_v2: bool,
+    pub record: Box<RawValue>,
+}
+
+/// Whether a remote record names a package a hosted member owns, by the
+/// record's own `name` or by its filename.
+fn remote_record_is_owned(filename: &str, raw: &RawValue, owned: &HashSet<String>) -> bool {
+    if owned.is_empty() {
+        return false;
+    }
+    let by_filename = super::conda_name_from_filename(filename)
+        .is_some_and(|n| owned.contains(&n.to_ascii_lowercase()));
+    by_filename
+        || serde_json::from_str::<RecordName<'_>>(raw.get())
+            .ok()
+            .and_then(|r| r.name)
+            .is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
+}
+
+/// Merge hosted records and remote member documents into one encoded
+/// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
+/// thread. A member document that does not parse is reported as that member's
+/// failure; the others still merge.
+pub(super) fn merge_repodata(
+    subdir: &str,
+    base_url: &str,
+    hosted: &[HostedRecord],
+    remote: &[MemberDocument],
+    owned: &HashSet<String>,
+    encoding: super::RepodataEncoding,
+) -> (Result<Vec<u8>, Response>, Vec<MemberFailure>, usize) {
+    let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
+    let mut packages_conda: BTreeMap<&str, &RawValue> = BTreeMap::new();
+    for h in hosted {
+        let target = if h.is_v2 {
+            &mut packages_conda
+        } else {
+            &mut packages
+        };
+        target.entry(h.filename.as_str()).or_insert(&h.record);
+    }
+
+    let mut failures = Vec::new();
+    let mut dropped = 0usize;
+    let mut parsed: Vec<UpstreamRepodata<'_>> = Vec::with_capacity(remote.len());
+    for doc in remote {
+        match serde_json::from_slice::<UpstreamRepodata<'_>>(&doc.json) {
+            Ok(p) => parsed.push(p),
+            Err(e) => failures.push(MemberFailure {
+                member: doc.member.clone(),
+                reason: format!("repodata does not parse: {e}"),
+            }),
+        }
+    }
+    for p in &parsed {
+        for (source, target) in [
+            (&p.packages, &mut packages),
+            (&p.packages_conda, &mut packages_conda),
+        ] {
+            for (filename, raw) in source {
+                if remote_record_is_owned(filename, raw, owned) {
+                    dropped += 1;
+                    continue;
+                }
+                target.entry(filename.as_str()).or_insert(*raw);
+            }
+        }
+    }
+
+    let merged = MergedRepodata {
+        info: RepodataInfo { base_url, subdir },
+        packages,
+        packages_conda,
+        removed: [],
+        repodata_version: 1,
+    };
+    (encoding.encode(&merged), failures, dropped)
+}
+
+// ---------------------------------------------------------------------------
+// channeldata.json
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct UpstreamChanneldata<'a> {
+    #[serde(default, borrow)]
+    packages: BTreeMap<String, &'a RawValue>,
+}
+
+#[derive(Serialize)]
+struct MergedChanneldata<'a> {
+    channeldata_version: u32,
+    packages: BTreeMap<&'a str, &'a RawValue>,
+}
+
+/// Merge hosted channeldata entries (name -> entry, already first-writer-wins
+/// across hosted members) with remote member documents into a pretty-printed
+/// `channeldata.json`. Remote entries for owned names are dropped.
+pub(super) fn merge_channeldata(
+    hosted: &[(String, Box<RawValue>)],
+    remote: &[MemberDocument],
+    owned: &HashSet<String>,
+) -> (serde_json::Result<Vec<u8>>, Vec<MemberFailure>) {
+    let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
+    for (name, entry) in hosted {
+        packages.entry(name.as_str()).or_insert(entry);
+    }
+    let mut failures = Vec::new();
+    let mut parsed = Vec::with_capacity(remote.len());
+    for doc in remote {
+        match serde_json::from_slice::<UpstreamChanneldata<'_>>(&doc.json) {
+            Ok(p) => parsed.push(p),
+            Err(e) => failures.push(MemberFailure {
+                member: doc.member.clone(),
+                reason: format!("channeldata does not parse: {e}"),
+            }),
+        }
+    }
+    for p in &parsed {
+        for (name, raw) in &p.packages {
+            if owned.contains(&name.to_ascii_lowercase()) {
+                continue;
+            }
+            packages.entry(name.as_str()).or_insert(*raw);
+        }
+    }
+    let merged = MergedChanneldata {
+        channeldata_version: 1,
+        packages,
+    };
+    (serde_json::to_vec_pretty(&merged), failures)
+}
+
+/// The 500 a failed merge task or serialization answers with.
+pub(super) fn internal_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!("conda virtual merge failed: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+}

@@ -44,7 +44,7 @@ sqlx.workspace = true
 
 # Serialization
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 
 # Authentication
 jsonwebtoken.workspace = true
