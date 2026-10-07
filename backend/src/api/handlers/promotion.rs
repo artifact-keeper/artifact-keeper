@@ -760,11 +760,17 @@ enum BulkItemScreening {
     Proceed {
         violations: Vec<PolicyViolation>,
         policy_result: serde_json::Value,
+        /// Every gate rule evaluated for the item, passed or not.
+        gate_results: Vec<GateResult>,
     },
     /// The item fails with `message`; the batch continues.
     Refused {
         message: String,
         violations: Vec<PolicyViolation>,
+        /// Every gate rule evaluated before the refusal, passed or not, so a
+        /// bulk item reports the same per-rule decision a single promotion
+        /// does.
+        gate_results: Vec<GateResult>,
     },
 }
 
@@ -784,8 +790,14 @@ fn screen_bulk_item(
     >,
 ) -> BulkItemScreening {
     if let GateOutcome::Block(ref eval) = gate_outcome {
+        let message = gate_block_message(eval);
         return BulkItemScreening::Refused {
-            message: gate_block_message(eval),
+            gate_results: vec![GateResult {
+                rule: "quality-gate".to_string(),
+                passed: false,
+                reason: message.clone(),
+            }],
+            message,
             violations: vec![],
         };
     }
@@ -794,6 +806,7 @@ fn screen_bulk_item(
     // the full evaluation when the policy ran, the empty pass otherwise.
     let mut violations: Vec<PolicyViolation> = vec![];
     let mut policy_result = serde_json::json!({"passed": true, "violations": []});
+    let mut gate_results: Vec<GateResult> = vec![];
 
     match policy {
         None => {}
@@ -801,6 +814,7 @@ fn screen_bulk_item(
             return BulkItemScreening::Refused {
                 message: format!("Policy evaluation failed: {}", e),
                 violations: vec![],
+                gate_results: vec![],
             };
         }
         Some(Ok(eval_result)) => {
@@ -814,10 +828,12 @@ fn screen_bulk_item(
                 })
                 .collect();
             policy_result = build_policy_result_json(&eval_result);
+            gate_results = eval_result.gate_results.clone();
             if !eval_result.passed && eval_result.action == PolicyAction::Block {
                 return BulkItemScreening::Refused {
                     message: "Promotion blocked by policy violations".to_string(),
                     violations,
+                    gate_results,
                 };
             }
         }
@@ -834,6 +850,7 @@ fn screen_bulk_item(
     BulkItemScreening::Proceed {
         violations,
         policy_result,
+        gate_results,
     }
 }
 
@@ -1456,19 +1473,22 @@ pub async fn promote_artifacts_bulk(
             )
         };
 
-        let (item_violations, screening_policy_result) =
+        let (item_violations, screening_policy_result, item_gate_results) =
             match screen_bulk_item(gate_outcome, policy) {
                 BulkItemScreening::Proceed {
                     violations,
                     policy_result,
-                } => (violations, policy_result),
+                    gate_results,
+                } => (violations, policy_result, gate_results),
                 BulkItemScreening::Refused {
                     message,
                     violations,
+                    gate_results,
                 } => {
                     failed += 1;
                     let mut resp = failed_response(source_display, target_display, message);
                     resp.policy_violations = violations;
+                    resp.gate_results = gate_results;
                     results.push(resp);
                     continue;
                 }
@@ -1503,7 +1523,11 @@ pub async fn promote_artifacts_bulk(
                         "Promotion blocked by promotion rule violations".to_string(),
                     );
                     resp.policy_violations = rule_violations_to_policy_violations(&failing);
-                    resp.gate_results = rule_failures_to_gate_results(&failing);
+                    resp.gate_results = item_gate_results
+                        .iter()
+                        .cloned()
+                        .chain(rule_failures_to_gate_results(&failing))
+                        .collect();
                     results.push(resp);
                     continue;
                 }
@@ -1658,7 +1682,7 @@ pub async fn promote_artifacts_bulk(
             promotion_id: Some(promotion_id),
             policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
-            gate_results: vec![],
+            gate_results: item_gate_results,
         });
     }
 
@@ -3263,6 +3287,43 @@ mod tests {
     // screen_bulk_item (per-item gate + policy decision on the bulk path, #3977)
     // -----------------------------------------------------------------------
 
+    /// F18: a bulk item refused by a scan-policy predicate reports the same
+    /// per-rule gate results the single route returns, passed rules included,
+    /// and a promoted item reports its passed rules too.
+    #[test]
+    fn screen_bulk_item_carries_every_gate_result() {
+        let gate = |rule: &str, passed: bool| GateResult {
+            rule: rule.to_string(),
+            passed,
+            reason: format!("{rule} {passed}"),
+        };
+        let mut blocked = policy_eval(false, PolicyAction::Block, &["policy-predicate"]);
+        blocked.gate_results = vec![
+            gate("cve-severity-threshold", true),
+            gate("license-compliance", true),
+            gate("policy-predicate", false),
+        ];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(blocked))) {
+            BulkItemScreening::Refused { gate_results, .. } => {
+                assert_eq!(gate_results.len(), 3);
+                assert!(gate_results
+                    .iter()
+                    .any(|g| g.rule == "policy-predicate" && !g.passed));
+                assert!(gate_results.iter().filter(|g| g.passed).count() == 2);
+            }
+            _ => panic!("a predicate block must refuse the item"),
+        }
+
+        let mut clean = policy_eval(true, PolicyAction::Allow, &[]);
+        clean.gate_results = vec![gate("require-signature", true)];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(clean))) {
+            BulkItemScreening::Proceed { gate_results, .. } => {
+                assert_eq!(gate_results, vec![gate("require-signature", true)]);
+            }
+            _ => panic!("a clean item must proceed"),
+        }
+    }
+
     fn policy_eval(
         passed: bool,
         action: PolicyAction,
@@ -3300,6 +3361,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(message, expected);
                 assert!(violations.is_empty());
@@ -3329,6 +3391,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(message, "Promotion blocked by policy violations");
                 assert_eq!(
@@ -3348,6 +3411,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(
                     message,
@@ -3371,6 +3435,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert_eq!(rules_of(&violations), vec!["max_cve_severity"]);
                 assert_eq!(policy_result["passed"], false);
@@ -3408,6 +3473,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert_eq!(rules_of(&violations), vec!["min_health_score"]);
                 assert_eq!(
@@ -3426,6 +3492,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert!(violations.is_empty());
                 assert_eq!(policy_result["passed"], true);
