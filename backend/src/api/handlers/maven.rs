@@ -1186,6 +1186,19 @@ pub(crate) fn is_jvm_archive_name(filename: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// The `(groupId:artifactId, version)` a Maven download is curated as, both
+/// from the cache-normalized path (#4365 item 6), so every spelling the proxy
+/// cache serves as one entry is curated as one package. `None` for metadata,
+/// checksums and paths that name no coordinate.
+fn maven_curation_target(path: &str) -> Option<(String, Option<String>)> {
+    let pkg = crate::services::proxy_service::maven_proxy_package_name(path)?;
+    let version =
+        MavenHandler::parse_coordinates(crate::services::proxy_service::normalize_cache_path(path))
+            .ok()
+            .map(|c| c.version);
+    Some((pkg, version))
+}
+
 /// Refuse a Maven/sbt proxy path that the upstream request could read
 /// differently from the classified and cached path (#4100): a decoded `?`
 /// or `#` becomes a query or fragment when joined into the upstream URL,
@@ -1226,15 +1239,23 @@ pub(crate) fn reject_ambiguous_proxy_path(path: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// The canonical `(cache_key, scannable)` decision for a Maven or sbt proxy
+/// path (#4365 item 1): everything is scanned except the known non-package
+/// files of [`is_unscanned_jvm_companion`], decided on the cache key's file
+/// name.
+pub(crate) fn jvm_proxy_serve_key(path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(path, |file| !is_unscanned_jvm_companion(file))
+}
+
 /// A proxied request the scan-on-proxy gate must see (#4100).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JvmScanTarget<'p> {
+pub(crate) struct JvmScanTarget {
     /// The request path normalized EXACTLY as the proxy cache keys it
     /// ([`normalize_cache_path`](crate::services::proxy_service::normalize_cache_path)),
     /// which is also the path the gate fetches and caches under. Classifying
     /// any other spelling would let an alias of a refused archive (a trailing
     /// `/`) stream the same cached bytes unscanned.
-    pub path: &'p str,
+    pub path: String,
     /// The coordinate the path names, when it parses. `None` is still
     /// scanned, with no identity pin.
     pub coordinate: Option<JvmArchiveCoordinate>,
@@ -1249,14 +1270,15 @@ pub(crate) struct JvmScanTarget<'p> {
 /// anything else is scanned with no pin. A classifier (`-tests`,
 /// `-linux-x86_64`, ...) names the same coordinate, since Maven's archiver
 /// writes the project's `pom.properties` into every classified jar it builds.
-pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget<'_>> {
-    let path = crate::services::proxy_service::normalize_cache_path(path);
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    if filename.is_empty() || is_unscanned_jvm_companion(filename) {
+pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget> {
+    let key = jvm_proxy_serve_key(path);
+    if !key.scannable {
         return None;
     }
+    let path = key.cache_key;
+    let filename = path.rsplit('/').next().unwrap_or(&path);
     let coordinate = is_jvm_archive_name(filename)
-        .then(|| MavenHandler::parse_coordinates(path).ok())
+        .then(|| MavenHandler::parse_coordinates(&path).ok())
         .flatten()
         .map(|coords| JvmArchiveCoordinate {
             group_id: coords.group_id,
@@ -1677,10 +1699,10 @@ async fn download(
     // so a rule authored for the curation catalog matches here. Metadata and
     // checksum/signature sidecars derive no package identity (the helper returns
     // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
-    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
-        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
-            .ok()
-            .map(|c| c.version);
+    //
+    // Both the name and the version come from the cache-normalized path
+    // (#4365 item 6), so a trailing `/` cannot dodge a rule.
+    if let Some((pkg, version)) = maven_curation_target(&path) {
         proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
     }
 
@@ -2924,15 +2946,9 @@ async fn serve_artifact(
                     // enabled scan-on-proxy keeps the streaming path below
                     // untouched.
                     if let Some(target) = maven_scan_target(path) {
-                        if crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .is_proxy_scan_enabled(repo.id)
-                        .await
-                        .unwrap_or(false)
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                         {
-                            let policy =
-                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                             let remote = MavenRemote {
                                 proxy,
                                 repo_id: repo.id,
@@ -2942,7 +2958,7 @@ async fn serve_artifact(
                             return serve_scanned_maven_archive(
                                 state,
                                 &remote,
-                                target.path,
+                                &target.path,
                                 target.coordinate.as_ref(),
                                 policy,
                                 ctx,
@@ -3149,7 +3165,7 @@ async fn serve_artifact(
                         serve_scanned_maven_archive(
                             state,
                             &remote,
-                            target.path,
+                            &target.path,
                             target.coordinate.as_ref(),
                             policy,
                             ctx,
@@ -10731,15 +10747,11 @@ mod scan_on_proxy_tests {
                         .await
                         .unwrap_or_else(|_| panic!("policies readable"));
                 for (member, got) in members.iter().zip(batched) {
-                    let (enabled, action, gate) =
+                    let single =
                         proxy_helpers::effective_virtual_scan_policy(&pool, virtual_id, member.id)
-                            .await;
-                    assert_eq!(
-                        got,
-                        enabled.then_some((action, gate)),
-                        "{label}: {}",
-                        member.key
-                    );
+                            .await
+                            .unwrap_or_else(|_| panic!("policy readable"));
+                    assert_eq!(got, single, "{label}: {}", member.key);
                 }
             }
         };
@@ -10751,6 +10763,15 @@ mod scan_on_proxy_tests {
         let dead = tdh::try_pool().await.expect("pool");
         dead.close().await;
         let err = proxy_helpers::virtual_member_scan_policies(&dead, fx.repo_id, &members)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // #4365 item 5: the per-member read and the direct Remote read agree.
+        let err = proxy_helpers::effective_virtual_scan_policy(&dead, fx.repo_id, closed)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = proxy_helpers::remote_scan_policy(&dead, closed)
             .await
             .expect_err("closed pool");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -10989,5 +11010,232 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
         tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: Maven/sbt `(cache_key, scannable)` decisions, per layout. For
+/// every well-formed path the key is exactly the path the cache already used,
+/// so no warm entry is orphaned.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn jvm_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.war",
+                "com/acme/widget/1.0/widget-1.0.war",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.aar",
+                "com/acme/widget/1.0/widget-1.0.aar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.JAR/",
+                "com/acme/widget/1.0/widget-1.0.JAR",
+                true,
+            ),
+            (
+                "/com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom/",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.module",
+                "com/acme/widget/1.0/widget-1.0.module",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                false,
+            ),
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "com/acme/widget/maven-metadata.xml",
+                false,
+            ),
+            // sbt / Ivy layout.
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            // An ambiguous spelling never classifies as a companion file.
+            (
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                true,
+            ),
+        ] {
+            let got = jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            // The scan target agrees with the key on every path.
+            assert_eq!(maven_scan_target(path).is_some(), scannable, "{path}");
+            if let Some(target) = maven_scan_target(path) {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
+    }
+
+    /// #4365 item 6: the curated package AND version come from the
+    /// cache-normalized path, so a trailing or doubled `/` names the same
+    /// curation target as the canonical spelling.
+    #[test]
+    fn curation_target_uses_the_cache_normalized_path() {
+        let expected = Some(("com.acme:widget".to_string(), Some("1.0".to_string())));
+        for path in [
+            "com/acme/widget/1.0/widget-1.0.jar",
+            "com/acme/widget/1.0/widget-1.0.jar/",
+            "/com/acme/widget/1.0/widget-1.0.jar//",
+        ] {
+            assert_eq!(maven_curation_target(path), expected, "{path}");
+        }
+        assert_eq!(
+            maven_curation_target("com/acme/widget/1.0/widget-1.0.jar.sha1/"),
+            None
+        );
+        assert_eq!(
+            maven_curation_target("com/acme/widget/maven-metadata.xml"),
+            None
+        );
+    }
+}
+
+/// #4365 item 5 at the route: an unreadable scan-on-proxy config is a 503 on
+/// the direct Remote route and on the Virtual walk, before any upstream
+/// request (it used to stream the Remote pull unscanned).
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unreadable_config_route_4365_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const JAR: &str = "com/acme/widget/1.0/widget-1.0.jar";
+
+    async fn upstream() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"jar".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn hits(server: &wiremock::MockServer) -> usize {
+        server.received_requests().await.expect("recording").len()
+    }
+
+    #[tokio::test]
+    async fn unreadable_config_is_503_on_remote_and_virtual_routes() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let Some((faulty, schema)) = tdh::pool_with_unreadable_scan_configs().await else {
+            fx.teardown().await;
+            return;
+        };
+        let server = upstream().await;
+        sqlx::query("UPDATE repositories SET upstream_url = $2, is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(server.uri())
+            .execute(&fx.pool)
+            .await
+            .expect("point at upstream");
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let dir = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state_with_proxy(
+            faulty.clone(),
+            &dir,
+            tdh::build_proxy_service_with_fs(faulty.clone(), &dir),
+        );
+        let (remote_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{JAR}", fx.repo_key)),
+        )
+        .await;
+        let remote_hits = hits(&server).await;
+
+        // A Virtual over the same (scanning) Remote member.
+        let Some(vfx) = tdh::Fixture::setup("virtual", "maven").await else {
+            tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+            fx.teardown().await;
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await
+            .expect("public virtual");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(vfx.repo_id)
+        .bind(fx.repo_id)
+        .execute(&vfx.pool)
+        .await
+        .expect("attach member");
+        let (virtual_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/{JAR}", vfx.repo_key)),
+        )
+        .await;
+        let virtual_hits = hits(&server).await;
+
+        tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+        faulty.close().await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await;
+        vfx.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(
+            remote_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct Remote"
+        );
+        assert_eq!(
+            virtual_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Virtual walk"
+        );
+        assert_eq!(remote_hits, 0, "refused before any upstream request");
+        assert_eq!(virtual_hits, 0, "refused before any upstream request");
     }
 }

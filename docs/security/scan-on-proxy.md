@@ -54,6 +54,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Scan configuration unreadable (database fault) | `503` | Retry later; never served unscanned |
 | Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
 **Identity.** The gate takes the package coordinate from the request (for
@@ -64,6 +65,40 @@ coordinate before a clean verdict counts. When they do not agree, or the bytes
 are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
+
+**One decision per request.** Each enforced format derives the proxy-cache key
+and the "is this a package the gate must see" decision from the same
+normalized request path, so two spellings of one file (a trailing `/`, a
+re-capitalised VS Code asset type) share one cache entry and one decision. A
+path holding `?`, `#`, `;`, a control character or a stray `%` is always
+treated as a package.
+
+**Ambiguous proxied paths.** Two checks keep the upstream from answering for a
+different file than the one classified and cached, each a `400` before any
+upstream request:
+
+- *What the client sent.* On the npm tarball, PyPI file and Cargo download
+  routes, the VS Code gallery routes (asset, `vspackage`, legacy download),
+  the generic download route's Remote arm, and (already before) the Maven,
+  sbt and NuGet routes, a client path containing any `?`,
+  `#`, `;`, `\`, a control character or a `%` that is not a valid `%XX`
+  escape is refused. The format routes also refuse raw spaces; the generic
+  route allows them, since stored file names may contain them.
+- *The upstream path ProxyService builds.* Every relative upstream path a
+  Remote fetch sends, for every format, is refused if its path part contains
+  `#`, `;`, `\`, a control character, a stray `%` or a trailing space, or if
+  a `?` starts an empty query or one containing `/`. Queries a handler
+  appends itself (Ansible version pages, Conan search, OCI `tags/list`) pass.
+  Absolute URLs a handler builds or takes from an upstream index (Helm,
+  PyPI, npm, NuGet, the VS Code gallery) are not checked here; those
+  handlers validate the client's segments themselves before building them.
+
+Valid escapes (npm's scoped `%2F`) and Go's `!` case-escaping are unaffected.
+
+**Unreadable configuration.** If a repository's scan configuration cannot be
+read, the pull fails with a retryable `503` on every enforced format's Remote
+arm, every Virtual walk and the generic download route. It is never treated
+as "scanning off" (#4365).
 
 ## Actions
 
@@ -185,7 +220,7 @@ have no core proxy path to gate.
 | `puppet` | `puppet` | accepted | |
 | `ansible` | `ansible` | accepted | |
 | `gitlfs` | `gitlfs` | accepted | |
-| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). |
+| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). Gallery asset types are matched ignoring case; only display metadata (manifest, details, changelog, license, icons, `.vsixmanifest`, signature, language-pack translations) streams unscanned, and any other asset type is `404` while scanning is on. |
 | `jetbrains` | `jetbrains` | accepted | |
 | `huggingface` | `huggingface` | accepted | |
 | `mlmodel` | `mlmodel` | accepted | |
@@ -203,15 +238,12 @@ have no core proxy path to gate.
 
 - **Cache commit before the verdict.** The buffered fetch commits upstream
   bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4365). The generic download
+  re-check the verdict can then serve them warm (#4514; see the design note
+  [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)). The generic download
   route refuses before it reads the cache for a repository that scans on
   proxy. A non-scanning Remote member of a scanning Virtual is still subject
   to this gap: bytes the Virtual refused can be served warm by addressing the
   member directly, on its format route or on the generic route.
-- **Unreadable configuration on a direct Remote pull.** If a Remote
-  repository's `scan_on_proxy` flag cannot be read, a format route serves the
-  pull as if scanning were off (#4365). The Virtual walk and the generic
-  download route fail closed instead (see above).
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.

@@ -2421,6 +2421,59 @@ pub fn build_state_with_proxy_and_scanner(
 /// Enable scan-on-proxy for a repository with the given
 /// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
 /// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+/// A pool on which the `scan_configs` table cannot be read (#4365 item 5):
+/// every session's `search_path` puts a private schema first, holding a
+/// `scan_configs` view that raises `division_by_zero` on any row it reads.
+/// Every other table resolves to the real one, so a handler gets as far as
+/// its scan-policy read and fails there, exactly as on a database fault.
+/// Only rows that exist fault, so the repository under test needs a
+/// `scan_configs` row ([`enable_proxy_scan`]). Returns the pool and the
+/// schema to pass to [`drop_unreadable_scan_configs`]. `None` without a DB.
+pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
+    let base = try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let schema = format!("ak_fault_{}", Uuid::new_v4().simple());
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE VIEW {schema}.scan_configs AS \
+             SELECT s.* FROM public.scan_configs s \
+             WHERE 1 / (s.block_on_policy_violation::int * 0) = 1"
+        ),
+    ] {
+        // The schema name is generated here (a UUID), never caller input.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&base)
+            .await
+            .expect("create the unreadable scan_configs view");
+    }
+    let search_path = format!("SET search_path TO {schema}, public");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(search_path))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect the unreadable-config pool");
+    Some((pool, schema))
+}
+
+/// Drop the schema [`pool_with_unreadable_scan_configs`] created.
+pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await;
+}
+
 pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     sqlx::query(
         "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \

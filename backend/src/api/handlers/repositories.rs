@@ -10392,6 +10392,11 @@ pub async fn download_artifact(
                 {
                     return Ok(refusal);
                 }
+                // #4365 item 3: the client's path is joined into the upstream
+                // URL and keys the proxy cache, so a `?`, `#`, `;`, `\` or a
+                // stray `%` in it is refused (spaces are legitimate file names
+                // here and are left to URL encoding).
+                crate::services::proxy_service::reject_ambiguous_client_path(&path, true)?;
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let rewritten = routing_rules::apply_routing_rules(&path, &rules);
                 let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
@@ -25612,6 +25617,71 @@ mod tests {
                 );
                 fx.teardown().await;
             }
+        }
+    }
+
+    /// #4365 item 3 (strict): a decoded `?` in a client path is refused with
+    /// 400 before any upstream request, on the generic route of a format that
+    /// does not scan and on the npm format route. The same file without the
+    /// `?` is fetched (positive control), so zero hits is meaningful.
+    #[tokio::test]
+    async fn client_path_with_a_query_is_400_on_generic_and_format_routes_4365() {
+        for (format, mk_router, ok_path, bad_path) in [
+            (
+                "generic",
+                download_router as fn() -> Router<SharedState>,
+                "download/files/x.tgz",
+                "download/files/x.tgz%3FversionId=abc",
+            ),
+            (
+                "npm",
+                crate::api::handlers::npm::router as fn() -> Router<SharedState>,
+                "left-pad/-/left-pad-1.3.0.tgz",
+                "left-pad/-/left-pad-1.3.0.tgz%3FversionId=abc",
+            ),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = upstream_answering_4442(b"bytes").await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+            let (status, _) = tdh::send(
+                tdh::router_anon(mk_router(), state.clone()),
+                tdh::get(format!("/{}/{bad_path}", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {bad_path}");
+            assert_eq!(
+                upstream_requests_4442(&server).await,
+                0,
+                "{format}: refused before any upstream request"
+            );
+            for bad in ["x%5Cy.tgz", "x%3By.tgz", "x%23y.tgz"] {
+                let path = ok_path
+                    .replace("x.tgz", bad)
+                    .replace("left-pad-1.3.0.tgz", bad);
+                let (status, _) = tdh::send(
+                    tdh::router_anon(mk_router(), state.clone()),
+                    tdh::get(format!("/{}/{path}", fx.repo_key)),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {path}");
+            }
+            assert_eq!(upstream_requests_4442(&server).await, 0, "{format}");
+
+            let (status, _) = tdh::send(
+                tdh::router_anon(mk_router(), state),
+                tdh::get(format!("/{}/{ok_path}", fx.repo_key)),
+            )
+            .await;
+            assert_ne!(status, StatusCode::BAD_REQUEST, "{format}: {ok_path}");
+            assert!(
+                upstream_requests_4442(&server).await > 0,
+                "{format}: the plain path reaches the upstream"
+            );
+            fx.teardown().await;
         }
     }
 

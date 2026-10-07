@@ -2364,8 +2364,25 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
 /// spellings of one request could address two different cache entries -- or,
 /// worse, one spelling could address the entry another package's bytes were
 /// written under. The newtype makes that unrepresentable.
+///
+/// The key of [`pypi_file_serve_key`], so every PyPI proxy-cache key goes
+/// through the shared helper (#4365 item 1).
 fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) -> String {
-    format!("simple/{}/{}", project.as_str(), filename)
+    pypi_file_serve_key(project, filename).cache_key
+}
+
+/// The canonical `(cache_key, scannable)` decision for a proxied PyPI file
+/// (#4365 item 1), cached under `simple/{project}/{filename}`. Every
+/// distribution is a package; a PEP 658 `.metadata` sidecar (the core
+/// metadata the resolver reads, served by its own route) is not.
+fn pypi_file_serve_key(
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(
+        &format!("simple/{}/{}", project.as_str(), filename),
+        |file| !file.to_ascii_lowercase().ends_with(".metadata"),
+    )
 }
 
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
@@ -2664,6 +2681,12 @@ async fn serve_file(
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 3: the file name is joined into the upstream path and keys
+    // the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
         r#"
@@ -2712,15 +2735,9 @@ async fn serve_file(
                     // which serve bytes without consulting a scan verdict. Repos
                     // that have not enabled scan-on-proxy skip this entirely and
                     // keep today's untouched streaming behavior (no regression).
-                    if crate::services::scan_config_service::ScanConfigService::new(
-                        state.db.clone(),
-                    )
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(false)
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                     {
-                        let (action, severity_gate) =
-                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -3037,12 +3054,11 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action, severity_gate) =
-                                proxy_helpers::effective_virtual_scan_policy(
-                                    &state.db, repo.id, member.id,
-                                )
-                                .await;
-                            if scan_enabled {
+                            let scan = proxy_helpers::effective_virtual_scan_policy(
+                                &state.db, repo.id, member.id,
+                            )
+                            .await?;
+                            if let Some((action, severity_gate)) = scan {
                                 match serve_scanned_pypi_file(
                                     state,
                                     proxy,
@@ -3720,7 +3736,7 @@ async fn resolve_pypi_remote_fetch_target(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let cache_path = format!("simple/{}/{}", normalized, filename);
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
@@ -22624,5 +22640,37 @@ mod legacy_json_xmlrpc_route_tests {
                 .starts_with(&format!("{ROUTE_BASE}/pypi/{key}/")),
             "{doc}"
         );
+    }
+}
+
+/// #4365 item 1: PyPI decides by route (every distribution is a package);
+/// the cache key is the stable `simple/{project}/{filename}` path.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pypi_file_serve_key_table() {
+        let project = NormalizedProjectName::parse("requests").expect("valid name");
+        for (file, scannable) in [
+            ("requests-2.31.0.tar.gz", true),
+            ("requests-2.31.0-py3-none-any.whl", true),
+            ("requests-2.31.0-py3-none-any.whl.metadata", false),
+        ] {
+            let got = pypi_file_serve_key(&project, file);
+            assert_eq!(got.cache_key, format!("simple/requests/{file}"));
+            assert_eq!(got.cache_key, build_pypi_proxy_cache_path(&project, file));
+            assert_eq!(got.scannable, scannable, "{file}");
+        }
+        // PEP 503: every spelling of a project name reaches one key.
+        for raw in ["Foo_Bar.baz", "foo-bar-baz", "FOO__bar--BAZ", "foo.bar_baz"] {
+            let project = NormalizedProjectName::parse(raw).expect("valid name");
+            assert_eq!(
+                pypi_file_serve_key(&project, "foo_bar_baz-1.0.tar.gz").cache_key,
+                "simple/foo-bar-baz/foo_bar_baz-1.0.tar.gz",
+                "{raw}"
+            );
+        }
     }
 }

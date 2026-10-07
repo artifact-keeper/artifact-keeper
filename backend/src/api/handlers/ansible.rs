@@ -476,6 +476,18 @@ fn galaxy_page_params(query: Option<&str>) -> (Option<usize>, usize) {
     (limit, offset)
 }
 
+/// One page of a collection's upstream version list, relative to the
+/// remote's base (#4365 item 3: the query carries no `/`, so
+/// `ProxyService::check_upstream_fetch_path` accepts it).
+pub(crate) fn upstream_versions_page_path(namespace: &str, name: &str, page: usize) -> String {
+    format!(
+        "api/v3/collections/{}/{}/versions/?limit={}&offset={}",
+        namespace,
+        name,
+        UPSTREAM_VERSIONS_PAGE_SIZE,
+        page * UPSTREAM_VERSIONS_PAGE_SIZE
+    )
+}
 /// Fetch every version an upstream Galaxy server publishes for one collection.
 ///
 /// # Why offset paging rather than following `links.next`
@@ -508,13 +520,7 @@ async fn fetch_upstream_versions(
     let mut versions: Vec<String> = Vec::new();
 
     for page in 0..UPSTREAM_VERSIONS_MAX_PAGES {
-        let upstream_path = format!(
-            "api/v3/collections/{}/{}/versions/?limit={}&offset={}",
-            namespace,
-            name,
-            UPSTREAM_VERSIONS_PAGE_SIZE,
-            page * UPSTREAM_VERSIONS_PAGE_SIZE
-        );
+        let upstream_path = upstream_versions_page_path(namespace, name, page);
 
         // Buffered and byte-capped by design: a version list is a small
         // metadata document that has to be parsed in-process before anything

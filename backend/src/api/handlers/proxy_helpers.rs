@@ -3669,97 +3669,117 @@ pub(crate) fn combined_severity_gate(
 
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
 /// from a member (#3023): the stricter-of-two over the virtual's own config and
-/// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
-/// `enabled` and thread the returned `action` and severity gate into the
+/// the member's (see [`stricter_scan_policy`]). Callers gate on `Some` and
+/// thread the returned `action` and severity gate into the
 /// per-format scan gate so the virtual path enforces the same digest-keyed
 /// verdict as a direct pull. The severity gate combines stricter-of-two the
 /// same way (#3243 stage 3): `BlockOnAny` on either side dominates, so a
 /// virtual that has not opted into threshold gating cannot become the lax
 /// route around a member's block-on-any posture, and vice versa.
-pub async fn effective_virtual_scan_policy(
+///
+/// One `scan_configs` read for both sides. An unreadable config is a
+/// retryable 503 (#4365 item 5), as in [`virtual_member_scan_policies`]:
+/// reading it as "off" used to serve the member unscanned.
+pub(crate) async fn effective_virtual_scan_policy(
     db: &PgPool,
     virtual_id: Uuid,
     member_id: Uuid,
+) -> Result<Option<MemberScanPolicy>, Response> {
+    let rows = read_scan_config_rows(db, virtual_id, &[virtual_id, member_id]).await?;
+    Ok(combined_member_policy(&rows, virtual_id, member_id))
+}
+
+/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
+/// when the repository has not enabled scan-on-proxy (#4102): the check every
+/// format's Remote arm runs before choosing the gate over its streaming path.
+///
+/// One `scan_configs` read for the flag, the action and the severity gate,
+/// mapped by [`scan_policy_from_row`], the same mapping the Virtual walk's
+/// [`virtual_member_scan_policies`] uses, so a member and a direct pull of the
+/// same repository resolve one policy. A missing row is scanning off. An
+/// UNREADABLE row fails closed with a retryable 503 (#4365 item 5): reading
+/// the flag as off would stream the pull unscanned for as long as the database
+/// is failing, which is the opposite of what the Virtual walk and the generic
+/// download route do.
+pub(crate) async fn remote_scan_policy(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<Option<MemberScanPolicy>, Response> {
+    let rows = read_scan_config_rows(db, repo_id, &[repo_id]).await?;
+    Ok(direct_policy_from_rows(&rows, repo_id))
+}
+
+/// One `scan_configs` row as the proxy scan policy reads it:
+/// `(scan_on_proxy, proxy_scan_action, block_on_policy_violation,
+/// severity_threshold)`.
+type ScanConfigRow = (bool, String, bool, String);
+
+/// The DB-free half of [`remote_scan_policy`]: `repo_id`'s own row, if any,
+/// mapped by [`scan_policy_from_row`]; a missing row or a disabled flag is
+/// `None`.
+fn direct_policy_from_rows(
+    rows: &[(Uuid, ScanConfigRow)],
+    repo_id: Uuid,
+) -> Option<MemberScanPolicy> {
+    let (enabled, action, gate) =
+        scan_policy_from_row(rows.iter().find(|r| r.0 == repo_id).map(|r| &r.1));
+    enabled.then_some((action, gate))
+}
+
+/// [`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)
+/// over the client-derived segments of a request a format route proxies
+/// (#4365 item 3, strict form), as a `400` response; a no-op when the
+/// repository does not proxy (`proxied == false`: a hosted repository never
+/// builds an upstream URL).
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_ambiguous_client_segments(
+    proxied: bool,
+    segments: &[&str],
+) -> Result<(), Response> {
+    if !proxied {
+        return Ok(());
+    }
+    for segment in segments {
+        crate::services::proxy_service::reject_ambiguous_client_path(segment, false)
+            .map_err(IntoResponse::into_response)?;
+    }
+    Ok(())
+}
+
+/// The retryable 503 every proxy serve path answers when the scan-on-proxy
+/// configuration cannot be read (#4365 item 5).
+pub(crate) fn scan_config_unreadable() -> Response {
+    AppError::ServiceUnavailable(
+        "scan-on-proxy configuration is temporarily unreadable".to_string(),
+    )
+    .into_response()
+}
+
+/// `(enabled, action, severity_gate)` for one repository's `scan_configs`
+/// row. A missing row is disabled / fail-open / block-on-any, the column
+/// defaults. Shared by the direct and the Virtual policy reads.
+fn scan_policy_from_row(
+    row: Option<&ScanConfigRow>,
 ) -> (
     bool,
     crate::services::proxy_scan_service::ProxyScanAction,
     crate::services::proxy_scan_service::ProxySeverityGate,
 ) {
     use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
-    let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
-    let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
-    let virtual_action = svc
-        .proxy_scan_action(virtual_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    let member_action = svc
-        .proxy_scan_action(member_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    // Fail closed on a config read fault: an unreadable gate is block-on-any.
-    let virtual_gate = svc
-        .proxy_severity_gate(virtual_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    let member_gate = svc
-        .proxy_severity_gate(member_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    let (enabled, action) = stricter_scan_policy(
-        virtual_enabled,
-        virtual_action,
-        member_enabled,
-        member_action,
-    );
-    (
-        enabled,
-        action,
-        combined_severity_gate(action, virtual_gate, member_gate),
-    )
-}
-
-/// The proxy-scan `(action, severity_gate)` pair for a DIRECT (non-virtual)
-/// repo pull, with the shared fail-safe defaults: an unreadable action is
-/// fail-open (availability-first, matching the column default) while an
-/// unreadable severity gate is block-on-any (the fail-closed direction —
-/// a config fault must not weaken the blocking decision, #3243).
-pub async fn direct_scan_policy(
-    db: &PgPool,
-    repo_id: Uuid,
-) -> (
-    crate::services::proxy_scan_service::ProxyScanAction,
-    crate::services::proxy_scan_service::ProxySeverityGate,
-) {
-    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
-    let action = svc
-        .proxy_scan_action(repo_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    let gate = svc
-        .proxy_severity_gate(repo_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    (action, gate)
-}
-
-/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
-/// when the repository has not enabled scan-on-proxy (#4102): the
-/// enabled-check plus [`direct_scan_policy`] a format's Remote arm runs before
-/// choosing the gate over its streaming path. NuGet uses it; the older
-/// formats still inline the same two calls. An unreadable
-/// enabled flag reads as off, the reading the npm / PyPI / Cargo / Maven
-/// arms already take (#4365 item 5 tracks failing it closed).
-pub(crate) async fn remote_scan_policy(db: &PgPool, repo_id: Uuid) -> Option<MemberScanPolicy> {
-    let enabled = crate::services::scan_config_service::ScanConfigService::new(db.clone())
-        .is_proxy_scan_enabled(repo_id)
-        .await
-        .unwrap_or(false);
-    if !enabled {
-        return None;
-    }
-    Some(direct_scan_policy(db, repo_id).await)
+    row.map(|(enabled, action, block, threshold)| {
+        (
+            *enabled,
+            ProxyScanAction::from_db(action),
+            crate::services::scan_config_service::proxy_severity_gate_for_row(
+                *block, threshold, action,
+            ),
+        )
+    })
+    .unwrap_or((
+        false,
+        ProxyScanAction::FailOpen,
+        ProxySeverityGate::BlockOnAny,
+    ))
 }
 
 /// Edges of the membership subgraph reachable from a virtual repository root,
@@ -8859,9 +8879,9 @@ pub(crate) async fn gate_proxy_scan_serve(
 // Adopting the gate in a new format (#4100 Maven, #4101 Cargo, #4102 NuGet, …)
 // is: implement `ScannedProxyFile` on a small struct holding the request's
 // coordinate, and at the Remote download arm, when
-// `ScanConfigService::is_proxy_scan_enabled` is true, call
-// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from
-// `direct_scan_policy` (or `effective_virtual_scan_policy` per virtual member)
+// [`remote_scan_policy`] returns a policy, call
+// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from it
+// (or from `virtual_member_scan_policies` on the Virtual walk)
 // instead of streaming. Then add the format's handler key to
 // `crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` so `GET /api/v1/formats`
 // reports it enforced (#4099; `scan_on_proxy_capability_matches_the_gate`
@@ -9182,7 +9202,6 @@ pub(crate) async fn virtual_member_scan_policies(
     virtual_id: Uuid,
     members: &[Repository],
 ) -> Result<Vec<Option<MemberScanPolicy>>, Response> {
-    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let scannable =
         |m: &Repository| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some();
     if !members.iter().any(scannable) {
@@ -9194,67 +9213,73 @@ pub(crate) async fn virtual_member_scan_policies(
         .map(|m| m.id)
         .collect();
     ids.push(virtual_id);
-    let rows: Vec<(Uuid, bool, String, bool, String)> = match sqlx::query_as(
+    let rows = read_scan_config_rows(db, virtual_id, &ids).await?;
+    Ok(members
+        .iter()
+        .map(|member| {
+            scannable(member)
+                .then(|| combined_member_policy(&rows, virtual_id, member.id))
+                .flatten()
+        })
+        .collect())
+}
+
+/// `scan_configs` rows for `ids`, keyed by repository id, in ONE read: the
+/// only query the proxy scan policy runs, for a direct pull (one id) and a
+/// Virtual walk alike. An unreadable config is the retryable 503 of
+/// [`scan_config_unreadable`]: whether any side is fail-closed is exactly
+/// what cannot be read, so the caller must not serve unscanned.
+/// `context_id` (the pulled repository) only labels the log line.
+async fn read_scan_config_rows(
+    db: &PgPool,
+    context_id: Uuid,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, ScanConfigRow)>, Response> {
+    let rows: Vec<(Uuid, bool, String, bool, String)> = sqlx::query_as(
         r#"SELECT repository_id, scan_on_proxy, proxy_scan_action,
                   block_on_policy_violation, severity_threshold
            FROM scan_configs WHERE repository_id = ANY($1)"#,
     )
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(db)
     .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(
-                virtual_id = %virtual_id, error = %e,
-                "could not read member scan-on-proxy configs; failing the walk closed"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "scan-on-proxy configuration is temporarily unreadable".to_string(),
-            )
-            .into_response());
-        }
-    };
-    let config = |id: Uuid| {
-        rows.iter()
-            .find(|row| row.0 == id)
-            .map(|(_, enabled, action, block, threshold)| {
-                (
-                    *enabled,
-                    ProxyScanAction::from_db(action),
-                    crate::services::scan_config_service::proxy_severity_gate_for_row(
-                        *block, threshold, action,
-                    ),
-                )
-            })
-            .unwrap_or((
-                false,
-                ProxyScanAction::FailOpen,
-                ProxySeverityGate::BlockOnAny,
-            ))
-    };
-    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
-    Ok(members
-        .iter()
-        .map(|member| {
-            if !scannable(member) {
-                return None;
-            }
-            let (member_enabled, member_action, member_gate) = config(member.id);
-            let (enabled, action) = stricter_scan_policy(
-                virtual_enabled,
-                virtual_action,
-                member_enabled,
-                member_action,
-            );
-            enabled.then(|| {
-                (
-                    action,
-                    combined_severity_gate(action, virtual_gate, member_gate),
-                )
-            })
-        })
+    .map_err(|e| {
+        tracing::warn!(
+            repo_id = %context_id, error = %e,
+            "could not read the scan-on-proxy config; failing the pull closed (#4365)"
+        );
+        scan_config_unreadable()
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, enabled, action, block, threshold)| (id, (enabled, action, block, threshold)))
         .collect())
+}
+
+/// The stricter-of-two policy for `member_id` behind `virtual_id`, from rows
+/// already read by [`read_scan_config_rows`]: [`stricter_scan_policy`] plus
+/// [`combined_severity_gate`] (so record-only, #3645, resolves the same way
+/// everywhere). `None` when neither side scans.
+fn combined_member_policy(
+    rows: &[(Uuid, ScanConfigRow)],
+    virtual_id: Uuid,
+    member_id: Uuid,
+) -> Option<MemberScanPolicy> {
+    let config = |id: Uuid| scan_policy_from_row(rows.iter().find(|r| r.0 == id).map(|r| &r.1));
+    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
+    let (member_enabled, member_action, member_gate) = config(member_id);
+    let (enabled, action) = stricter_scan_policy(
+        virtual_enabled,
+        virtual_action,
+        member_enabled,
+        member_action,
+    );
+    enabled.then(|| {
+        (
+            action,
+            combined_severity_gate(action, virtual_gate, member_gate),
+        )
+    })
 }
 
 /// A Virtual download walk with scan-on-proxy (#4100), over an
@@ -9954,7 +9979,7 @@ mod scanned_proxy_file_tests {
     // ── #3645: record-only proxy scan mode ──
     //
     // These drive the gate from a REAL `scan_configs` row through
-    // `direct_scan_policy`, so the config -> (action, gate) resolution is
+    // `remote_scan_policy`, so the config -> (action, gate) resolution is
     // covered along with the serve decision.
 
     /// Write the repository's scan config through the same service the
@@ -10012,7 +10037,10 @@ mod scanned_proxy_file_tests {
         base: &str,
         file: &FakeFormat,
     ) -> Result<Response, Response> {
-        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let (action, gate) = remote_scan_policy(&fx.pool, fx.repo_id)
+            .await
+            .expect("config readable")
+            .expect("scan-on-proxy on");
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let mut req = request(fx.repo_id, &fx.repo_key, base, action);
         req.severity_gate = gate;
@@ -10170,7 +10198,10 @@ mod scanned_proxy_file_tests {
         assert_eq!(scan_header(&resp), "pending");
         assert_eq!(&body_of(resp).await[..], &bytes[..]);
 
-        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let (action, gate) = remote_scan_policy(&fx.pool, fx.repo_id)
+            .await
+            .expect("config readable")
+            .expect("scan-on-proxy on");
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let mut over = request(fx.repo_id, &fx.repo_key, &base, action);
         over.severity_gate = gate;
@@ -22097,6 +22128,68 @@ mod proxy_download_recording_tests {
         }
     }
 
+    /// #4365 item 1 exhaustiveness: every handler that enforces scan-on-proxy
+    /// derives its proxy-cache key (and, where it classifies by file name, its
+    /// scan decision) through the shared `proxy_service::proxy_serve_key`
+    /// helper, and pins that with a `serve_key_4365_tests` table. A new
+    /// enforced format fails here until it does both, so it cannot classify
+    /// one spelling and cache another.
+    #[test]
+    fn every_enforced_format_derives_its_key_through_the_shared_helper() {
+        // Calls that reach `proxy_service::proxy_serve_key`: the helper, its
+        // route-decided wrapper, and the per-format helpers built on them.
+        const SERVE_KEY_CALLS: &[&str] = &[
+            "proxy_serve_key(",
+            "route_package_serve_key(",
+            "jvm_proxy_serve_key(",
+        ];
+        // OCI decides by CONTENT (the manifest's media type and its config
+        // descriptor), not by a request file name, and its cache keys are
+        // content digests; there is no name-based classification to unify.
+        const DECIDES_BY_CONTENT: &[&str] = &["oci"];
+
+        fn handler_file(key: &str) -> String {
+            match key {
+                "go" => "goproxy.rs".to_string(),
+                "oci" => "oci_v2.rs".to_string(),
+                "pub" => "pub_registry.rs".to_string(),
+                other => format!("{other}.rs"),
+            }
+        }
+
+        for key in crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS {
+            if DECIDES_BY_CONTENT.contains(key) {
+                continue;
+            }
+            let file = handler_file(key);
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(f, _)| *f == file)
+                .unwrap_or_else(|| panic!("{file} missing from SERVE_SOURCES"));
+            let spans = test_spans(src);
+            let routes_through_helper = SERVE_KEY_CALLS.iter().any(|call| {
+                src.match_indices(call).any(|(at, _)| {
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    !spans.iter().any(|(a, b)| *a <= at && at < *b)
+                        && !prefix.trim_start().starts_with("//")
+                        && !prefix.trim_start().starts_with("fn ")
+                        && !prefix.contains("fn ")
+                })
+            });
+            assert!(
+                routes_through_helper,
+                "#4365: `{key}` enforces scan-on-proxy but {file} never calls the shared \
+                 (cache_key, scannable) helper outside tests"
+            );
+            assert!(
+                src.contains("mod serve_key_4365_tests"),
+                "#4365: `{key}` enforces scan-on-proxy but {file} has no \
+                 `serve_key_4365_tests` table pinning its (cache_key, scannable) decisions"
+            );
+        }
+    }
+
     /// Count the formats still carrying a DEFERRAL marker (as opposed to a
     /// policy exemption like a HEAD or an OCI blob). This is the remaining
     /// #3446 surface, asserted so it can only ever shrink: a new format that
@@ -22188,6 +22281,76 @@ mod proxy_download_recording_tests {
              `record_proxy_download(` or its deferred sibling: {missing:?}. A \
              proxy-only repository of that format reports zero downloads while \
              serving continuous traffic, which is exactly what #3649 reported."
+        );
+    }
+}
+
+/// #4365 item 5: the direct Remote and the Virtual policy reads share one
+/// row mapping, and an unreadable config is a 503 on both, never "off".
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_policy_read_tests {
+    use super::*;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+
+    fn row(enabled: bool, action: &str) -> ScanConfigRow {
+        (enabled, action.to_string(), false, "critical".to_string())
+    }
+
+    #[test]
+    fn missing_row_is_scanning_off_with_the_column_defaults() {
+        let (enabled, action, gate) = scan_policy_from_row(None);
+        assert!(!enabled);
+        assert_eq!(action, ProxyScanAction::FailOpen);
+        assert_eq!(gate, ProxySeverityGate::BlockOnAny);
+        assert_eq!(direct_policy_from_rows(&[], Uuid::nil()), None);
+    }
+
+    #[test]
+    fn enabled_row_yields_its_policy_and_disabled_row_none() {
+        let (repo, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            direct_policy_from_rows(&[(repo, row(true, "fail_closed"))], repo),
+            Some((ProxyScanAction::FailClosed, ProxySeverityGate::BlockOnAny))
+        );
+        assert_eq!(
+            direct_policy_from_rows(&[(repo, row(false, "fail_closed"))], repo),
+            None
+        );
+        // Another repository's row says nothing about this one.
+        assert_eq!(
+            direct_policy_from_rows(&[(other, row(true, "fail_closed"))], repo),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_config_is_a_503() {
+        assert_eq!(
+            scan_config_unreadable().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn combined_member_policy_is_the_stricter_of_two() {
+        let (virt, member, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let rows = vec![
+            (virt, row(false, "fail_closed")),
+            (member, row(true, "fail_open")),
+        ];
+        // The virtual's fail-closed action wins even though only the member scans.
+        assert_eq!(
+            combined_member_policy(&rows, virt, member).map(|p| p.0),
+            Some(ProxyScanAction::FailClosed)
+        );
+        // Neither side scans: no policy.
+        assert_eq!(combined_member_policy(&rows, virt, other), None);
+        // Record-only on every enabled side stays record-only.
+        let rec = vec![(member, row(true, "record_only"))];
+        assert_eq!(
+            combined_member_policy(&rec, virt, member),
+            Some((ProxyScanAction::RecordOnly, ProxySeverityGate::RecordOnly))
         );
     }
 }

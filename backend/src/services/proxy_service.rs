@@ -1424,6 +1424,139 @@ pub(crate) fn normalize_cache_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
+/// Refuse an upstream fetch path the upstream could read as a different
+/// resource than the one requested, classified and cached (#4365 item 3).
+///
+/// `build_upstream_url` joins the path into the upstream URL verbatim, so a
+/// decoded `#` turns the rest into a fragment (never sent), a `;` into a path
+/// parameter, and a `%` that is not a valid escape is decoded again (or
+/// rejected) by the upstream. Rejecting is used instead of percent-encoding
+/// every segment, which would change the outbound URL of every format at once
+/// (npm's scoped `%2F`, OCI `sha256:` references, PyPI `+`/`~`).
+///
+/// * An absolute URL (a Helm `urls` entry, a PyPI or npm file URL from an
+///   upstream index) is the upstream's own and passes unchanged.
+/// * `#` anywhere is refused.
+/// * In the path part (before the first `?`), any segment with `;`, an
+///   ASCII control character or a `%` not followed by two hex digits is
+///   refused. Valid escapes (`%2F`, `%20`) and Go's `!` case-escaping pass.
+/// * A `?` must start a query the handler built: non-empty and with no `/`,
+///   so a decoded `?` inside a path (`x.jar?/../y.pom`, `x.jar?`) cannot
+///   push the rest of the path into the query string.
+///
+/// Every refusal is [`AppError::Validation`], a `400`, before any upstream
+/// request.
+pub(crate) fn check_upstream_fetch_path(fetch_path: &str) -> Result<()> {
+    if fetch_path.starts_with("http://") || fetch_path.starts_with("https://") {
+        return Ok(());
+    }
+    let refuse = |what: &str| {
+        Err(AppError::Validation(format!(
+            "Proxied upstream path must not contain {what}"
+        )))
+    };
+    if fetch_path.contains('#') {
+        return refuse("'#'");
+    }
+    let (path, query) = match fetch_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (fetch_path, None),
+    };
+    if has_ambiguous_path_chars(path) {
+        return refuse("';', '\\', control characters or a '%' that is not a valid escape");
+    }
+    // URL parsing trims trailing spaces, so `x.jar ` would fetch `x.jar`.
+    if query.is_none() && path.ends_with(' ') {
+        return refuse("a trailing space");
+    }
+    if query.is_some_and(|q| q.is_empty() || q.contains('/')) {
+        return refuse("a '?' inside the path");
+    }
+    Ok(())
+}
+
+/// Refuse a CLIENT-DERIVED proxied path or path segment that is not a plain
+/// path (#4365 item 3, strict form): any `?`, `#`, `;`, `\`, control
+/// character or stray `%` ([`has_ambiguous_path_chars`]), and a raw space
+/// unless `allow_spaces`. Unlike [`check_upstream_fetch_path`], which also
+/// sees queries a handler appends itself, this runs on what the client sent,
+/// where a `?` can only be an attempt to move part of the path into the
+/// upstream query. A `400` before anything is fetched or cached.
+pub(crate) fn reject_ambiguous_client_path(path: &str, allow_spaces: bool) -> Result<()> {
+    if has_ambiguous_path_chars(path) || (!allow_spaces && path.contains(' ')) {
+        return Err(AppError::Validation(
+            "Proxied path must not contain '?', '#', ';', '\\', control characters, \
+             a '%' that is not a valid escape, or spaces"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// One proxied request's canonical decision (#4365 item 1): the proxy-cache
+/// key it is fetched, cached and counted under, and whether the scan-on-proxy
+/// gate must see it. Both come from the same [`normalize_cache_path`] value,
+/// so two spellings of one request (a trailing `/`, a doubled leading `/`)
+/// can never be cached as one entry and classified as two things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyServeKey {
+    /// The [`normalize_cache_path`] form of the request's cache path.
+    pub(crate) cache_key: String,
+    /// Whether the scan gate must see this file when the repository scans
+    /// on proxy.
+    pub(crate) scannable: bool,
+}
+
+/// The one helper every scan-on-proxy format derives its cache key and scan
+/// decision from (#4365 item 1).
+///
+/// `is_package_file` decides on the cache key's final segment (the file
+/// name), never on the raw request. Two rules sit above it, both failing
+/// towards the gate: an empty file name is not a package (nothing to scan,
+/// and nothing is served as one), and a key [`has_ambiguous_path_chars`]
+/// is always scannable, because a `?`, `#`, `;` or stray `%` can make an
+/// upstream read a different file than the name says. Formats that decide by
+/// route rather than by name (every file on the route is a package) use
+/// [`route_package_serve_key`].
+pub(crate) fn proxy_serve_key(
+    path: &str,
+    is_package_file: impl FnOnce(&str) -> bool,
+) -> ProxyServeKey {
+    let cache_key = normalize_cache_path(path);
+    let file_name = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let scannable = !file_name.is_empty()
+        && (has_ambiguous_path_chars(cache_key) || is_package_file(file_name));
+    ProxyServeKey {
+        cache_key: cache_key.to_string(),
+        scannable,
+    }
+}
+
+/// [`proxy_serve_key`] for a route whose every file is a package (an npm
+/// tarball, a PyPI distribution, a `.crate`, a `.vsix`): the decision is the
+/// route's, and only the cache key is normalized.
+pub(crate) fn route_package_serve_key(path: &str) -> ProxyServeKey {
+    proxy_serve_key(path, |_| true)
+}
+
+/// Whether `path` holds a character an upstream may read as something other
+/// than a path byte (#4365 items 1 and 3): `?` (query), `#` (fragment), `;`
+/// (path parameter), `\` (turned into `/` by URL parsing), an ASCII control
+/// character (dropped by URL parsing), or a `%` that does not start a valid
+/// `%XX` escape (decoded again, or rejected, by the upstream). A valid escape
+/// such as npm's `%2F` is allowed.
+pub(crate) fn has_ambiguous_path_chars(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' | b'#' | b';' | b'\\' => true,
+        b'%' => !matches!(
+            (bytes.get(i + 1), bytes.get(i + 2)),
+            (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit()
+        ),
+        _ => b.is_ascii_control(),
+    })
+}
+
 impl CacheKeys {
     /// Derive both the content and metadata storage keys for a proxy-cache
     /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
@@ -6607,6 +6740,8 @@ impl ProxyService {
         upstream_url: &str,
         fetch_path: &str,
     ) -> Result<()> {
+        // #4365 item 3: an ambiguous path never reaches the upstream.
+        check_upstream_fetch_path(fetch_path)?;
         crate::services::upstream_filter::ensure_upstream_allowed(
             &self.db,
             repo.id,
@@ -7685,8 +7820,13 @@ impl ProxyService {
 /// local-upload path stores) keeps proxy package names globally unambiguous and
 /// lets the remote component-grouping branch reconstruct the `groupId` /
 /// `artifactId` split without consulting the storage path.
+///
+/// Derived from [`normalize_cache_path`], the spelling the proxy cache keys
+/// the file on and the scan gate classifies (#4365 item 6). Trimming only the
+/// leading `/` let `.../widget-1.0.jar/` (empty file name, no coordinate)
+/// skip a curation rule while being served from `.../widget-1.0.jar`'s entry.
 pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/');
+    let path = normalize_cache_path(path);
     let filename = path.rsplit('/').next().unwrap_or(path);
     let lower = filename.to_ascii_lowercase();
 
@@ -9776,6 +9916,28 @@ mod tests {
     fn test_maven_proxy_package_name_skips_unparseable_path() {
         // Too few segments to be a GAV → no package.
         assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    /// #4365 item 6: every spelling the proxy cache keys as one entry names
+    /// the same curated package, so a trailing `/` cannot skip a rule.
+    #[test]
+    fn test_maven_proxy_package_name_uses_the_cache_normalized_path() {
+        let canonical = "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar";
+        let expected = maven_proxy_package_name(canonical);
+        assert!(expected.is_some());
+        for alias in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar/",
+            "/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar//",
+            "//org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar",
+        ] {
+            assert_eq!(normalize_cache_path(alias), canonical, "{alias}");
+            assert_eq!(maven_proxy_package_name(alias), expected, "{alias}");
+        }
+        // A trailing slash on a sidecar still names no package.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1/")
+                .is_none()
+        );
     }
 
     #[test]
@@ -22600,5 +22762,223 @@ mod upstream_filter_cache_tests {
             expired_streaming.err()
         );
         assert_eq!(hits, 0, "a refused path must never reach the upstream");
+    }
+
+    /// #4365 item 3: an ambiguous fetch path is a 400 (`Validation`) on the
+    /// buffered and the streaming fetch, before any upstream request.
+    #[tokio::test]
+    async fn ambiguous_fetch_path_is_refused_before_the_upstream_4365() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("jar"))
+            .mount(&upstream)
+            .await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let mut outcomes = Vec::new();
+        for path in [
+            "org/acme/w/1.0/w-1.0.jar;x.pom",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+        ] {
+            outcomes.push((path, svc.fetch_artifact(&repo, path).await.err()));
+            outcomes.push((path, svc.fetch_artifact_streaming(&repo, path).await.err()));
+        }
+        let hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        for (path, err) in outcomes {
+            assert!(
+                matches!(err, Some(AppError::Validation(_))),
+                "{path}: {err:?}"
+            );
+        }
+        assert_eq!(hits, 0, "an ambiguous path must never reach the upstream");
+    }
+}
+
+/// #4365 item 1: the shared `(cache_key, scannable)` helper.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod proxy_serve_key_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_the_normalized_path_and_the_decision_is_on_its_file_name() {
+        let is_jar = |f: &str| f.ends_with(".jar");
+        for (path, key, scannable) in [
+            ("a/b/c.jar", "a/b/c.jar", true),
+            ("/a/b/c.jar/", "a/b/c.jar", true),
+            ("//a/b/c.jar//", "a/b/c.jar", true),
+            ("a/b/c.pom", "a/b/c.pom", false),
+            ("a/b/c.pom/", "a/b/c.pom", false),
+            // Nothing to serve as a package.
+            ("", "", false),
+            ("/", "", false),
+            // Ambiguous keys always reach the gate, whatever the name says.
+            ("a/b/c.jar?.pom", "a/b/c.jar?.pom", true),
+            ("a/b/c.jar#.pom", "a/b/c.jar#.pom", true),
+            ("a/b/c.jar;.pom", "a/b/c.jar;.pom", true),
+            ("a/b/c.jar%.pom", "a/b/c.jar%.pom", true),
+            ("a/b/c\t.pom", "a/b/c\t.pom", true),
+            // A valid escape is not ambiguous.
+            ("a/b%20c/d.pom", "a/b%20c/d.pom", false),
+        ] {
+            assert_eq!(
+                proxy_serve_key(path, is_jar),
+                ProxyServeKey {
+                    cache_key: key.to_string(),
+                    scannable
+                },
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            route_package_serve_key("/pkg/-/pkg-1.0.0.tgz"),
+            ProxyServeKey {
+                cache_key: "pkg/-/pkg-1.0.0.tgz".to_string(),
+                scannable: true
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_path_chars() {
+        for ambiguous in [
+            "a?b", "a#b", "a;b", "a%", "a%2", "a%zz", "a%2g", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(has_ambiguous_path_chars(ambiguous), "{ambiguous:?}");
+        }
+        for plain in [
+            "@scope%2Fname",
+            "@scope%2fname/-/name-1.0.0.tgz",
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            "a/b%20c%2Bd/e",
+            "pkg+1.0~rc1.tar.gz",
+            "sha256:abc",
+        ] {
+            assert!(!has_ambiguous_path_chars(plain), "{plain:?}");
+        }
+    }
+}
+
+/// #4365 item 3: reject, do not encode. Every format's legitimate upstream
+/// path shape passes unchanged; a path an upstream could read as another
+/// resource is refused.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_fetch_path_tests {
+    use super::*;
+
+    #[test]
+    fn legitimate_upstream_paths_pass_unchanged() {
+        for ok in [
+            // npm scoped packument and tarball.
+            "@types%2Fnode",
+            "@types/node/-/node-20.0.0.tgz",
+            // Go module proxy `!`-case escaping.
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            // Helm `urls` entries and index-resolved file URLs are absolute.
+            "https://github.com/org/chart/releases/download/v1/chart-1.0.0.tgz",
+            "https://files.example/pkg.whl?token=a/b#sha256=abc",
+            // Handler-built queries (Ansible, Conan search, OCI tags/list).
+            "api/v3/collections/ns/name/versions/?limit=100&offset=0",
+            "v2/conans/search?q=zlib%2A",
+            "library/alpine/tags/list?n=101&last=3.19",
+            // Maven, PyPI, Cargo, VS Code legacy paths.
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+            "packages/requests/2.31.0/requests-2.31.0+local~rc1.tar.gz",
+            "api/v1/crates/serde/1.0.0/download",
+            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download",
+            "sha256:0123abcd",
+        ] {
+            assert!(check_upstream_fetch_path(ok).is_ok(), "{ok}");
+        }
+        // The handler-built relative queries, from the handlers' own builders,
+        // with inputs that would put a `/` or a `#` in a naive query.
+        for built in [
+            crate::api::handlers::ansible::upstream_versions_page_path("ns", "name", 3),
+            crate::api::handlers::conan::upstream_search_path("zlib/1.*#rev"),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(100, Some("v1/+build#x")),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(10, None),
+        ] {
+            assert!(check_upstream_fetch_path(&built).is_ok(), "{built}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_upstream_paths_are_400() {
+        for bad in [
+            "org/acme/w/1.0/w-1.0.jar#/x.pom",
+            "pkg/-/pkg-1.0.0.tgz#",
+            "org/acme/w/1.0/w-1.0.jar;jsessionid=1",
+            "org/acme/w/1.0/w-1.0.jar%",
+            "org/acme/w/1.0/w-1.0.jar%2",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.ja\tr",
+            "org/acme/w/1.0/w-1.0.ja\u{7f}r",
+            "org/acme/w/1.0/w-1.0.jar?",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+            "org/acme/w/1.0/w-1.0.jar\\..\\x.pom",
+            "org/acme/w/1.0/w-1.0.jar ",
+        ] {
+            assert!(
+                matches!(check_upstream_fetch_path(bad), Err(AppError::Validation(_))),
+                "{bad:?}"
+            );
+        }
+    }
+}
+
+/// #4365 item 3 (strict form): what a client may put in a proxied path.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod client_path_tests {
+    use super::*;
+
+    #[test]
+    fn client_paths_with_query_fragment_or_stray_escapes_are_400() {
+        for bad in [
+            "pkg/-/x.tgz?versionId=abc",
+            "x.tgz?acl",
+            "x.tgz#frag",
+            "x.jar;jsessionid=1",
+            "x\\y.jar",
+            "x.jar%",
+            "x.jar%zz",
+            "x\tjar",
+        ] {
+            for allow_spaces in [false, true] {
+                assert!(
+                    matches!(
+                        reject_ambiguous_client_path(bad, allow_spaces),
+                        Err(AppError::Validation(_))
+                    ),
+                    "{bad:?}"
+                );
+            }
+        }
+        // A raw space is refused on format routes, allowed on the generic one.
+        assert!(reject_ambiguous_client_path("my file.txt", false).is_err());
+        assert!(reject_ambiguous_client_path("my file.txt", true).is_ok());
+        for ok in [
+            "@scope/name",
+            "pkg/-/pkg-1.0.0.tgz",
+            "serde",
+            "1.0.0+build.1",
+            "a%2Fb",
+        ] {
+            assert!(reject_ambiguous_client_path(ok, false).is_ok(), "{ok}");
+        }
     }
 }

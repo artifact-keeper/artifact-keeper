@@ -1909,6 +1909,11 @@ async fn download(
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
+    // #4365 item 3: the name and version are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&name, &version],
+    )?;
 
     // Curation enforcement (#2930): block a curated crate before it is resolved
     // locally or proxied from upstream. The cargo handler's private `RepoInfo`
@@ -2001,7 +2006,7 @@ async fn download(
                     // Use the canonical local cache path regardless of which
                     // upstream URL was resolved so that subsequent requests hit
                     // the proxy cache even after a config.json TTL change.
-                    let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    let cache_path = crate_serve_key(&name_lower, &version).cache_key;
 
                     // Stream the crate rather than buffering it (#895 / #2192,
                     // the cargo instance of that class). This used to be a
@@ -2063,8 +2068,9 @@ async fn download(
                     // bytes without consulting a verdict. Same cache key, same
                     // index `cksum` check. Repositories that have not opted in
                     // keep the untouched streaming path.
-                    if crate_proxy_scan_enabled(&state, repo.id).await {
-                        let policy = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+                    if let Some(policy) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
                         let coordinate = CrateCoordinate {
                             name: &name_lower,
                             version: &version,
@@ -2128,7 +2134,7 @@ async fn download(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
-                let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                let upstream_path = crate_serve_key(&name_lower, &version).cache_key;
 
                 // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s;
                 // narrowed to name + EXACT VERSION by #3953). If a non-Remote
@@ -2375,13 +2381,17 @@ fn virtual_crate_response(
     streamed_crate_response(filename, content_type, result)
 }
 
-/// Whether scan-on-proxy is on for `repo_id`. An unreadable config is off,
-/// the same reading the npm / PyPI serve paths take.
-async fn crate_proxy_scan_enabled(state: &SharedState, repo_id: uuid::Uuid) -> bool {
-    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .is_proxy_scan_enabled(repo_id)
-        .await
-        .unwrap_or(false)
+/// The canonical `(cache_key, scannable)` decision for a proxied `.crate`
+/// (#4365 item 1): every download is a package, cached under the canonical
+/// `api/v1/crates/{name}/{version}/download` path whichever upstream URL
+/// serves it.
+fn crate_serve_key(
+    name_lower: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "api/v1/crates/{name_lower}/{version}/download"
+    ))
 }
 
 type CrateScanPolicy = (
@@ -2643,19 +2653,13 @@ async fn serve_scanned_virtual_crate(
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
 ) -> Option<Result<Response, Response>> {
-    let mut policies = Vec::with_capacity(members.len());
-    for member in members {
-        let policy = if member.repo_type == RepositoryType::Remote && member.upstream_url.is_some()
-        {
-            let (enabled, action, severity_gate) =
-                proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, member.id)
-                    .await;
-            enabled.then_some((action, severity_gate))
-        } else {
-            None
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
         };
-        policies.push(policy);
-    }
     if policies.iter().all(Option::is_none) {
         return None;
     }
@@ -9573,6 +9577,30 @@ mod age_gate_tests {
             assert_eq!(scan_header(&headers), None);
             assert_eq!(&served[..], &body[..]);
             rig.teardown().await;
+        }
+    }
+}
+
+/// #4365 item 1: Cargo decides by route (every download is a crate); the
+/// cache key is the canonical download path whichever `dl` URL served it.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn crate_serve_key_table() {
+        for (name, version, key) in [
+            ("serde", "1.0.0", "api/v1/crates/serde/1.0.0/download"),
+            (
+                "tokio-util",
+                "0.7.10-alpha.1",
+                "api/v1/crates/tokio-util/0.7.10-alpha.1/download",
+            ),
+        ] {
+            let got = crate_serve_key(name, version);
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
         }
     }
 }

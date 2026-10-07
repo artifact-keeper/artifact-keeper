@@ -4426,6 +4426,11 @@ async fn serve_tarball(
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
     // tarball route matched, so the remote-proxy fetch 404'd (B7).
+    // #4365 item 3: the name and file name are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[package_name, filename],
+    )?;
     let upstream_path = build_tarball_upstream_path(package_name, filename);
 
     // For remote repos, always proxy tarballs from upstream (hits cache if
@@ -4482,13 +4487,9 @@ async fn serve_tarball(
             // scan-on-proxy skip this entirely and keep today's untouched
             // streaming behavior (no regression). Runs after the age gate so
             // a last-known-good substitution is scanned as what is served.
-            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-                .is_proxy_scan_enabled(repo.id)
-                .await
-                .unwrap_or(false)
+            if let Some((action, severity_gate)) =
+                proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
             {
-                let (action, severity_gate) =
-                    proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4740,12 +4741,12 @@ async fn serve_tarball(
                 let Some(ref member_upstream) = member.upstream_url else {
                     continue;
                 };
-                let (enabled, action, severity_gate) =
+                let Some((action, severity_gate)) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
-                        .await;
-                if !enabled {
+                        .await?
+                else {
                     continue;
-                }
+                };
                 // #3785: a member upstream outside the `/-/` layout (GitHub
                 // Packages) is fetched from the URL its packument advertises.
                 let source_path = resolve_npm_tarball_upstream(
@@ -5136,13 +5137,16 @@ async fn serve_scanned_npm_tarball(
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 1: every file on the tarball route is a package; the cache
+    // key is the canonical form of the tarball path.
+    let key = crate::services::proxy_service::route_package_serve_key(fetch_path);
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
         fetch_base: upstream_url,
         format: RepositoryFormat::Npm,
         source_path,
-        cache_path: fetch_path,
+        cache_path: &key.cache_key,
         filename,
         action,
         severity_gate,
@@ -17944,5 +17948,35 @@ mod virtual_packument_member_authz_tests {
         tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
         tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: npm decides by route (every tarball is a package); the
+/// cache key is the tarball path the fetch already used.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn npm_tarball_serve_key_table() {
+        for (name, file, key) in [
+            (
+                "lodash",
+                "lodash-4.17.21.tgz",
+                "lodash/-/lodash-4.17.21.tgz",
+            ),
+            (
+                "@types/node",
+                "node-20.0.0.tgz",
+                "@types/node/-/node-20.0.0.tgz",
+            ),
+        ] {
+            let got = crate::services::proxy_service::route_package_serve_key(
+                &build_tarball_upstream_path(name, file),
+            );
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
+        }
     }
 }
