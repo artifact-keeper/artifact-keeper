@@ -244,7 +244,9 @@ changes three things about an exchange:
   account's groups would otherwise allow. A push with it, as the Docker
   password or through a bearer from `/v2/token`, is refused with `403`. The
   mapping's `allowed_repo_ids` ceiling and the usual expiry cap still apply.
-- **It cannot be renewed.** No refresh token is minted or stored. The response
+- **It cannot be renewed.** No refresh token is minted or stored, and the
+  credential cannot mint an API token either: the token endpoints refuse every
+  CI OIDC service account with `403`, whatever the provider type. The response
   keeps its shape (`access_token`, `token_type`, `expires_in`, `username`).
 - **The workload is logged.** The exchange's `security` line adds
   `k8s_namespace`, `k8s_serviceaccount`, `k8s_pod` and `k8s_node` from the

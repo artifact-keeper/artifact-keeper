@@ -921,6 +921,78 @@ async fn kubernetes_token_pulls_but_cannot_push() {
     fx.teardown().await;
 }
 
+/// The two self-service mint endpoints, which a credential exchanged by any
+/// provider type must not reach.
+const MINT_ROUTES: [&str; 2] = ["/api/v1/profile/access-tokens", "/api/v1/auth/tokens"];
+
+impl Fixture {
+    /// POST a `read:artifacts` mint to both [`MINT_ROUTES`] with `token`,
+    /// asserting 403 from each and that no API token row was written.
+    async fn assert_cannot_mint(&self, token: &str, case: &str) {
+        for uri in MINT_ROUTES {
+            let (status, body) = self
+                .send(
+                    "POST",
+                    uri,
+                    Some(token),
+                    Some(json!({"name": "persist", "scopes": ["read:artifacts"]})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{case} {uri}: {body}");
+        }
+        let account: Uuid = {
+            let claims = AuthService::new(
+                self.pool.clone(),
+                std::sync::Arc::new(self.state.config.clone()),
+            )
+            .validate_access_token(token)
+            .expect("a valid access token");
+            claims.sub
+        };
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+            .bind(account)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "{case}: no API token was minted");
+    }
+}
+
+/// 6.3 — the pull-only, non-renewable Kubernetes credential cannot be turned
+/// into a permanent one by minting an API token, and neither can a GitLab
+/// pipeline's credential outlive its job that way.
+#[tokio::test]
+#[ignore]
+async fn an_exchanged_credential_cannot_mint_an_api_token() {
+    let Some(mut fx) = Fixture::new().await else {
+        return;
+    };
+    let issuer = fx.issuer.issuer().to_string();
+    let provider = fx.kubernetes_provider(&issuer, None).await;
+    fx.create_mapping_on(
+        provider,
+        json!({
+            "name": "payments",
+            "claim_filters": {"/kubernetes.io/namespace": "payments"},
+        }),
+    )
+    .await;
+    let (status, body) = fx
+        .exchange(&fx.issuer.sign(&k8s_claims(&issuer, "payments")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fx.assert_cannot_mint(body["access_token"].as_str().unwrap(), "kubernetes")
+        .await;
+
+    fx.create_mapping(json!({ "project_path": "group/app" }))
+        .await;
+    let (status, body) = fx.exchange_pipeline("group/app", "branch", "main").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fx.assert_cannot_mint(body["access_token"].as_str().unwrap(), "gitlab")
+        .await;
+    fx.teardown().await;
+}
+
 /// 6.2 — a `static` provider on an issuer that cannot be resolved: the
 /// exchange verifies against the stored JWKS without contacting it, and a
 /// token under a `kid` the set does not hold is refused with 401.

@@ -2448,6 +2448,61 @@ mod tests {
             fx.cleanup().await;
         }
 
+        /// No exchanged credential can mint an API token for its account: a
+        /// pull-only, non-renewable Kubernetes credential would otherwise
+        /// turn into a permanent one, and a GitHub/GitLab credential would
+        /// outlive the pipeline. Both self-service mint endpoints, through
+        /// the full router, refuse with 403 and write no token row.
+        #[tokio::test]
+        async fn an_exchanged_credential_cannot_mint_an_api_token() {
+            for provider_type in ["kubernetes", "gitlab"] {
+                let Some(fx) = Fixture::with_provider_type(provider_type).await else {
+                    return;
+                };
+                let (assertion, filters) = if provider_type == "kubernetes" {
+                    (
+                        k8s("payments", "api", Some("api-7d9f")),
+                        json!({"/kubernetes.io/namespace": "payments"}),
+                    )
+                } else {
+                    (
+                        gitlab("group/app", "main"),
+                        json!({"project_path": "group/app"}),
+                    )
+                };
+                fx.mapping(filters, None, None).await;
+                let (user, tokens) = fx.exchange(assertion).await.unwrap();
+
+                for uri in ["/api/v1/profile/access-tokens", "/api/v1/auth/tokens"] {
+                    let req = axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Authorization", format!("Bearer {}", tokens.access_token))
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({"name": "keep", "scopes": ["read:artifacts"]}).to_string(),
+                        ))
+                        .unwrap();
+                    let (status, body) =
+                        tdh::send(crate::api::routes::create_router(fx.state.clone()), req).await;
+                    assert_eq!(
+                        status,
+                        axum::http::StatusCode::FORBIDDEN,
+                        "{provider_type} {uri}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                let minted: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+                        .bind(user.id)
+                        .fetch_one(&fx.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(minted, 0, "{provider_type}: no token row");
+                fx.cleanup().await;
+            }
+        }
+
         /// 4.3 — two workloads through one mapping leave the same display
         /// name, which carries neither of them.
         #[tokio::test]

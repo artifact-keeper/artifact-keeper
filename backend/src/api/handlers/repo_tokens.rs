@@ -439,6 +439,10 @@ pub async fn create_repo_token(
     // repo-action check above.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    // A CI OIDC exchanged credential must not outlive its CI token by minting
+    // an API token for its service account.
+    crate::services::token_service::refuse_ci_account_mint(&state.db, auth.user_id).await?;
+
     // Generate the token
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
