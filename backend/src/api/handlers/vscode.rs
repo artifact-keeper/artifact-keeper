@@ -2740,13 +2740,12 @@ async fn proxy_gallery_asset(
     //
     // Repositories that have not enabled scan-on-proxy skip this entirely and
     // keep the untouched streaming behavior.
-    if source.is_package
-        && crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-            .is_proxy_scan_enabled(repo.id)
-            .await
-            .unwrap_or(false)
-    {
-        let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+    let scan = if source.is_package {
+        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+    } else {
+        None
+    };
+    if let Some((action, severity_gate)) = scan {
         return serve_scanned_gallery_package(
             state,
             proxy,
@@ -3859,19 +3858,13 @@ async fn serve_scanned_legacy_virtual_vsix(
         Ok(members) => members,
         Err(resp) => return Some(Err(resp)),
     };
-    let mut policies = Vec::with_capacity(members.len());
-    for member in &members {
-        let policy = if member.repo_type == RepositoryType::Remote && member.upstream_url.is_some()
-        {
-            let (enabled, action, severity_gate) =
-                proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, member.id)
-                    .await;
-            enabled.then_some((action, severity_gate))
-        } else {
-            None
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, &members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
         };
-        policies.push(policy);
-    }
     if policies.iter().all(Option::is_none) {
         return None;
     }
@@ -4023,15 +4016,9 @@ async fn download_vsix(
                     // #4099: the legacy route is a second door to the same
                     // VSIX, so scan-on-proxy gates it exactly as it gates the
                     // gallery package route.
-                    if crate::services::scan_config_service::ScanConfigService::new(
-                        state.db.clone(),
-                    )
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(false)
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                     {
-                        let (action, severity_gate) =
-                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         let filename = build_vsix_filename(&publisher, &name, &version);
                         let legacy = LegacyVsixRequest {
                             upstream_path: &upstream_path,

@@ -7685,8 +7685,13 @@ impl ProxyService {
 /// local-upload path stores) keeps proxy package names globally unambiguous and
 /// lets the remote component-grouping branch reconstruct the `groupId` /
 /// `artifactId` split without consulting the storage path.
+///
+/// Derived from [`normalize_cache_path`], the spelling the proxy cache keys
+/// the file on and the scan gate classifies (#4365 item 6). Trimming only the
+/// leading `/` let `.../widget-1.0.jar/` (empty file name, no coordinate)
+/// skip a curation rule while being served from `.../widget-1.0.jar`'s entry.
 pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/');
+    let path = normalize_cache_path(path);
     let filename = path.rsplit('/').next().unwrap_or(path);
     let lower = filename.to_ascii_lowercase();
 
@@ -9776,6 +9781,28 @@ mod tests {
     fn test_maven_proxy_package_name_skips_unparseable_path() {
         // Too few segments to be a GAV → no package.
         assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    /// #4365 item 6: every spelling the proxy cache keys as one entry names
+    /// the same curated package, so a trailing `/` cannot skip a rule.
+    #[test]
+    fn test_maven_proxy_package_name_uses_the_cache_normalized_path() {
+        let canonical = "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar";
+        let expected = maven_proxy_package_name(canonical);
+        assert!(expected.is_some());
+        for alias in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar/",
+            "/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar//",
+            "//org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar",
+        ] {
+            assert_eq!(normalize_cache_path(alias), canonical, "{alias}");
+            assert_eq!(maven_proxy_package_name(alias), expected, "{alias}");
+        }
+        // A trailing slash on a sidecar still names no package.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1/")
+                .is_none()
+        );
     }
 
     #[test]

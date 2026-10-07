@@ -330,15 +330,9 @@ async fn download_by_path(
                     // checksums pass through, and a repository that has not
                     // enabled scan-on-proxy keeps the streaming path below.
                     if let Some(target) = sbt_scan_target(artifact_path) {
-                        if crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .is_proxy_scan_enabled(repo.id)
-                        .await
-                        .unwrap_or(false)
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                         {
-                            let policy =
-                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                             return serve_scanned_sbt_archive(
                                 &state,
                                 proxy,

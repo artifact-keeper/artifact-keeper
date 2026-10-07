@@ -2063,8 +2063,9 @@ async fn download(
                     // bytes without consulting a verdict. Same cache key, same
                     // index `cksum` check. Repositories that have not opted in
                     // keep the untouched streaming path.
-                    if crate_proxy_scan_enabled(&state, repo.id).await {
-                        let policy = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+                    if let Some(policy) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
                         let coordinate = CrateCoordinate {
                             name: &name_lower,
                             version: &version,
@@ -2375,15 +2376,6 @@ fn virtual_crate_response(
     streamed_crate_response(filename, content_type, result)
 }
 
-/// Whether scan-on-proxy is on for `repo_id`. An unreadable config is off,
-/// the same reading the npm / PyPI serve paths take.
-async fn crate_proxy_scan_enabled(state: &SharedState, repo_id: uuid::Uuid) -> bool {
-    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .is_proxy_scan_enabled(repo_id)
-        .await
-        .unwrap_or(false)
-}
-
 type CrateScanPolicy = (
     crate::services::proxy_scan_service::ProxyScanAction,
     crate::services::proxy_scan_service::ProxySeverityGate,
@@ -2643,19 +2635,13 @@ async fn serve_scanned_virtual_crate(
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
 ) -> Option<Result<Response, Response>> {
-    let mut policies = Vec::with_capacity(members.len());
-    for member in members {
-        let policy = if member.repo_type == RepositoryType::Remote && member.upstream_url.is_some()
-        {
-            let (enabled, action, severity_gate) =
-                proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, member.id)
-                    .await;
-            enabled.then_some((action, severity_gate))
-        } else {
-            None
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
         };
-        policies.push(policy);
-    }
     if policies.iter().all(Option::is_none) {
         return None;
     }

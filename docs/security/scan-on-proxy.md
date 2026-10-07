@@ -54,6 +54,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Scan configuration unreadable (database fault) | `503` | Retry later; never served unscanned |
 | Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
 **Identity.** The gate takes the package coordinate from the request (for
@@ -64,6 +65,11 @@ coordinate before a clean verdict counts. When they do not agree, or the bytes
 are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
+
+**Unreadable configuration.** If a repository's scan configuration cannot be
+read, the pull fails with a retryable `503` on every enforced format's Remote
+arm, every Virtual walk and the generic download route. It is never treated
+as "scanning off" (#4365).
 
 ## Actions
 
@@ -208,10 +214,6 @@ have no core proxy path to gate.
   proxy. A non-scanning Remote member of a scanning Virtual is still subject
   to this gap: bytes the Virtual refused can be served warm by addressing the
   member directly, on its format route or on the generic route.
-- **Unreadable configuration on a direct Remote pull.** If a Remote
-  repository's `scan_on_proxy` flag cannot be read, a format route serves the
-  pull as if scanning were off (#4365). The Virtual walk and the generic
-  download route fail closed instead (see above).
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.

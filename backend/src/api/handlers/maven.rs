@@ -1677,10 +1677,15 @@ async fn download(
     // so a rule authored for the curation catalog matches here. Metadata and
     // checksum/signature sidecars derive no package identity (the helper returns
     // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
+    //
+    // Both the name and the version come from the cache-normalized path
+    // (#4365 item 6), so a trailing `/` cannot dodge a rule.
     if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
-        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
-            .ok()
-            .map(|c| c.version);
+        let version = crate::formats::maven::MavenHandler::parse_coordinates(
+            crate::services::proxy_service::normalize_cache_path(&path),
+        )
+        .ok()
+        .map(|c| c.version);
         proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
     }
 
@@ -2924,15 +2929,9 @@ async fn serve_artifact(
                     // enabled scan-on-proxy keeps the streaming path below
                     // untouched.
                     if let Some(target) = maven_scan_target(path) {
-                        if crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .is_proxy_scan_enabled(repo.id)
-                        .await
-                        .unwrap_or(false)
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                         {
-                            let policy =
-                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                             let remote = MavenRemote {
                                 proxy,
                                 repo_id: repo.id,
@@ -10731,15 +10730,11 @@ mod scan_on_proxy_tests {
                         .await
                         .unwrap_or_else(|_| panic!("policies readable"));
                 for (member, got) in members.iter().zip(batched) {
-                    let (enabled, action, gate) =
+                    let single =
                         proxy_helpers::effective_virtual_scan_policy(&pool, virtual_id, member.id)
-                            .await;
-                    assert_eq!(
-                        got,
-                        enabled.then_some((action, gate)),
-                        "{label}: {}",
-                        member.key
-                    );
+                            .await
+                            .unwrap_or_else(|_| panic!("policy readable"));
+                    assert_eq!(got, single, "{label}: {}", member.key);
                 }
             }
         };
@@ -10751,6 +10746,15 @@ mod scan_on_proxy_tests {
         let dead = tdh::try_pool().await.expect("pool");
         dead.close().await;
         let err = proxy_helpers::virtual_member_scan_policies(&dead, fx.repo_id, &members)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // #4365 item 5: the per-member read and the direct Remote read agree.
+        let err = proxy_helpers::effective_virtual_scan_policy(&dead, fx.repo_id, closed)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = proxy_helpers::remote_scan_policy(&dead, closed)
             .await
             .expect_err("closed pool");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);

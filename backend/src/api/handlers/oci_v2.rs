@@ -9955,13 +9955,12 @@ async fn maybe_gate_remote_manifest_scan(
     if repo.repo_type != RepositoryType::Remote || oci_pull_is_scan_scoped(claims) {
         return Ok(None);
     }
-    if !crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .is_proxy_scan_enabled(repo.id)
-        .await
-        .unwrap_or(false)
-    {
+    // #4365 item 5: an unreadable config is a retryable 503, not "off".
+    let Some((action, severity_gate)) =
+        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+    else {
         return Ok(None);
-    }
+    };
     // #3024: a Docker schema1 (v2s1) manifest has no config descriptor, so
     // the runnable-image predicate below can never gate it AND the scanner
     // cannot reassemble it — a v2s1 manifest was the one runnable-on-legacy
@@ -9982,7 +9981,6 @@ async fn maybe_gate_remote_manifest_scan(
     if !oci_manifest_requires_proxy_scan(manifest_body) {
         return Ok(None);
     }
-    let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
     gate_oci_proxy_manifest_scan(
         state,
         repo,
@@ -10295,10 +10293,17 @@ async fn handle_get_manifest(
             // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
             let mut scan_pending = None;
             if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
-                let (enabled, action, severity_gate) =
-                    proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
-                        .await;
-                if enabled && oci_manifest_requires_proxy_scan(&data) {
+                let policy = match proxy_helpers::effective_virtual_scan_policy(
+                    &state.db, repo.id, member.id,
+                )
+                .await
+                {
+                    Ok(policy) => policy,
+                    Err(resp) => return resp,
+                };
+                if let Some((action, severity_gate)) =
+                    policy.filter(|_| oci_manifest_requires_proxy_scan(&data))
+                {
                     let member_ct = content_type.clone().unwrap_or_else(|| {
                         "application/vnd.oci.image.manifest.v1+json".to_string()
                     });

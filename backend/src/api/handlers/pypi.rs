@@ -2712,15 +2712,9 @@ async fn serve_file(
                     // which serve bytes without consulting a scan verdict. Repos
                     // that have not enabled scan-on-proxy skip this entirely and
                     // keep today's untouched streaming behavior (no regression).
-                    if crate::services::scan_config_service::ScanConfigService::new(
-                        state.db.clone(),
-                    )
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(false)
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                     {
-                        let (action, severity_gate) =
-                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -3037,12 +3031,11 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action, severity_gate) =
-                                proxy_helpers::effective_virtual_scan_policy(
-                                    &state.db, repo.id, member.id,
-                                )
-                                .await;
-                            if scan_enabled {
+                            let scan = proxy_helpers::effective_virtual_scan_policy(
+                                &state.db, repo.id, member.id,
+                            )
+                            .await?;
+                            if let Some((action, severity_gate)) = scan {
                                 match serve_scanned_pypi_file(
                                     state,
                                     proxy,

@@ -3679,7 +3679,7 @@ async fn flatcontainer_download(
                         &sub_path,
                         true,
                         Some(&ctx),
-                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await,
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?,
                     )
                     .await;
                 }
@@ -3831,7 +3831,7 @@ async fn flatcontainer_download(
 
                 let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
                 // #4102: the scan-on-proxy policy both repair arms honour.
-                let repair_scan = proxy_helpers::remote_scan_policy(&state.db, repo.id).await;
+                let repair_scan = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
 
                 match proxy_helpers::normalize_expected_sha256(&artifact.checksum_sha256) {
                     Some(expected) => {
@@ -4530,7 +4530,7 @@ async fn v2_download(
                 upstream_url,
                 (id, version),
                 ProbeFallback::Always,
-                proxy_helpers::remote_scan_policy(&state.db, repo.id).await,
+                proxy_helpers::remote_scan_policy(&state.db, repo.id).await?,
                 ctx,
             )
             .await;

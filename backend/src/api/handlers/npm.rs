@@ -4482,13 +4482,9 @@ async fn serve_tarball(
             // scan-on-proxy skip this entirely and keep today's untouched
             // streaming behavior (no regression). Runs after the age gate so
             // a last-known-good substitution is scanned as what is served.
-            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-                .is_proxy_scan_enabled(repo.id)
-                .await
-                .unwrap_or(false)
+            if let Some((action, severity_gate)) =
+                proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
             {
-                let (action, severity_gate) =
-                    proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4740,12 +4736,12 @@ async fn serve_tarball(
                 let Some(ref member_upstream) = member.upstream_url else {
                     continue;
                 };
-                let (enabled, action, severity_gate) =
+                let Some((action, severity_gate)) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
-                        .await;
-                if !enabled {
+                        .await?
+                else {
                     continue;
-                }
+                };
                 // #3785: a member upstream outside the `/-/` layout (GitHub
                 // Packages) is fetched from the URL its packument advertises.
                 let source_path = resolve_npm_tarball_upstream(
