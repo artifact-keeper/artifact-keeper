@@ -520,16 +520,16 @@ async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
 
     let service = LifecycleService::new(pool.clone());
     for (id, field) in ids.iter().zip(["match.version_pattern", "pattern"]) {
+        // The exact field-naming text of `postgres_regex_error`: a bare
+        // `contains(field)` would also match "... run this pattern ...".
+        let named = format!("{field} is not a valid PostgreSQL regular expression");
         let preview = service.execute_policy(*id, true).await.expect("preview");
         assert!(
-            preview.errors.iter().any(|e| e.contains(field)),
+            preview.errors.iter().any(|e| e.starts_with(&named)),
             "{preview:?}"
         );
         match service.execute_policy(*id, false).await {
-            Err(AppError::Validation(m)) => assert!(
-                m.contains(field) && m.contains("not a valid PostgreSQL regular expression"),
-                "{m}"
-            ),
+            Err(AppError::Validation(m)) => assert!(m.contains(&format!("': {named}")), "{m}"),
             other => panic!("{field}: expected a 400 validation error, got {other:?}"),
         }
     }
