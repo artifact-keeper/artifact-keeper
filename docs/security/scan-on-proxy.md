@@ -66,6 +66,22 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**One decision per request.** Each enforced format derives the proxy-cache key
+and the "is this a package the gate must see" decision from the same
+normalized request path, so two spellings of one file (a trailing `/`, a
+re-capitalised VS Code asset type) share one cache entry and one decision. A
+path holding `?`, `#`, `;`, a control character or a stray `%` is always
+treated as a package.
+
+**Ambiguous upstream paths.** For every format, a Remote fetch whose relative
+upstream path contains `#`, a `;`, a control character or a `%` that is not a
+valid `%XX` escape in a path segment, or a `?` that does not start a non-empty
+query without `/`, is refused with `400` before any upstream request. Such a
+path could make the upstream answer for a different file than the one
+classified and cached. Valid escapes (npm's scoped `%2F`), Go's `!`
+case-escaping and absolute URLs taken from an upstream index (Helm, PyPI,
+npm) are unaffected.
+
 **Unreadable configuration.** If a repository's scan configuration cannot be
 read, the pull fails with a retryable `503` on every enforced format's Remote
 arm, every Virtual walk and the generic download route. It is never treated
@@ -209,7 +225,8 @@ have no core proxy path to gate.
 
 - **Cache commit before the verdict.** The buffered fetch commits upstream
   bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4365). The generic download
+  re-check the verdict can then serve them warm (#4514; see the design note
+  [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)). The generic download
   route refuses before it reads the cache for a repository that scans on
   proxy. A non-scanning Remote member of a scanning Virtual is still subject
   to this gap: bytes the Virtual refused can be served warm by addressing the

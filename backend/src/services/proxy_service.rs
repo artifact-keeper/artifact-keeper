@@ -1424,6 +1424,53 @@ pub(crate) fn normalize_cache_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
+/// Refuse an upstream fetch path the upstream could read as a different
+/// resource than the one requested, classified and cached (#4365 item 3).
+///
+/// `build_upstream_url` joins the path into the upstream URL verbatim, so a
+/// decoded `#` turns the rest into a fragment (never sent), a `;` into a path
+/// parameter, and a `%` that is not a valid escape is decoded again (or
+/// rejected) by the upstream. Rejecting is used instead of percent-encoding
+/// every segment, which would change the outbound URL of every format at once
+/// (npm's scoped `%2F`, OCI `sha256:` references, PyPI `+`/`~`).
+///
+/// * An absolute URL (a Helm `urls` entry, a PyPI or npm file URL from an
+///   upstream index) is the upstream's own and passes unchanged.
+/// * `#` anywhere is refused.
+/// * In the path part (before the first `?`), any segment with `;`, an
+///   ASCII control character or a `%` not followed by two hex digits is
+///   refused. Valid escapes (`%2F`, `%20`) and Go's `!` case-escaping pass.
+/// * A `?` must start a query the handler built: non-empty and with no `/`,
+///   so a decoded `?` inside a path (`x.jar?/../y.pom`, `x.jar?`) cannot
+///   push the rest of the path into the query string.
+///
+/// Every refusal is [`AppError::Validation`], a `400`, before any upstream
+/// request.
+pub(crate) fn check_upstream_fetch_path(fetch_path: &str) -> Result<()> {
+    if fetch_path.starts_with("http://") || fetch_path.starts_with("https://") {
+        return Ok(());
+    }
+    let refuse = |what: &str| {
+        Err(AppError::Validation(format!(
+            "Proxied upstream path must not contain {what}"
+        )))
+    };
+    if fetch_path.contains('#') {
+        return refuse("'#'");
+    }
+    let (path, query) = match fetch_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (fetch_path, None),
+    };
+    if has_ambiguous_path_chars(path) {
+        return refuse("';', control characters or a '%' that is not a valid escape");
+    }
+    if query.is_some_and(|q| q.is_empty() || q.contains('/')) {
+        return refuse("a '?' inside the path");
+    }
+    Ok(())
+}
+
 /// One proxied request's canonical decision (#4365 item 1): the proxy-cache
 /// key it is fetched, cached and counted under, and whether the scan-on-proxy
 /// gate must see it. Both come from the same [`normalize_cache_path`] value,
@@ -6670,6 +6717,8 @@ impl ProxyService {
         upstream_url: &str,
         fetch_path: &str,
     ) -> Result<()> {
+        // #4365 item 3: an ambiguous path never reaches the upstream.
+        check_upstream_fetch_path(fetch_path)?;
         crate::services::upstream_filter::ensure_upstream_allowed(
             &self.db,
             repo.id,
@@ -22691,9 +22740,52 @@ mod upstream_filter_cache_tests {
         );
         assert_eq!(hits, 0, "a refused path must never reach the upstream");
     }
+
+    /// #4365 item 3: an ambiguous fetch path is a 400 (`Validation`) on the
+    /// buffered and the streaming fetch, before any upstream request.
+    #[tokio::test]
+    async fn ambiguous_fetch_path_is_refused_before_the_upstream_4365() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("jar"))
+            .mount(&upstream)
+            .await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let mut outcomes = Vec::new();
+        for path in [
+            "org/acme/w/1.0/w-1.0.jar;x.pom",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+        ] {
+            outcomes.push((path, svc.fetch_artifact(&repo, path).await.err()));
+            outcomes.push((path, svc.fetch_artifact_streaming(&repo, path).await.err()));
+        }
+        let hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        for (path, err) in outcomes {
+            assert!(
+                matches!(err, Some(AppError::Validation(_))),
+                "{path}: {err:?}"
+            );
+        }
+        assert_eq!(hits, 0, "an ambiguous path must never reach the upstream");
+    }
 }
 
 /// #4365 item 1: the shared `(cache_key, scannable)` helper.
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod proxy_serve_key_tests {
     use super::*;
@@ -22753,6 +22845,62 @@ mod proxy_serve_key_tests {
             "sha256:abc",
         ] {
             assert!(!has_ambiguous_path_chars(plain), "{plain:?}");
+        }
+    }
+}
+
+/// #4365 item 3: reject, do not encode. Every format's legitimate upstream
+/// path shape passes unchanged; a path an upstream could read as another
+/// resource is refused.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_fetch_path_tests {
+    use super::*;
+
+    #[test]
+    fn legitimate_upstream_paths_pass_unchanged() {
+        for ok in [
+            // npm scoped packument and tarball.
+            "@types%2Fnode",
+            "@types/node/-/node-20.0.0.tgz",
+            // Go module proxy `!`-case escaping.
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            // Helm `urls` entries and index-resolved file URLs are absolute.
+            "https://github.com/org/chart/releases/download/v1/chart-1.0.0.tgz",
+            "https://files.example/pkg.whl?token=a/b#sha256=abc",
+            // Handler-built queries (Ansible, Conan search, OCI tags/list).
+            "api/v3/collections/ns/name/versions/?limit=100&offset=0",
+            "v2/conans/search?q=zlib%2A",
+            "library/alpine/tags/list?n=101&last=3.19",
+            // Maven, PyPI, Cargo, VS Code legacy paths.
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+            "packages/requests/2.31.0/requests-2.31.0+local~rc1.tar.gz",
+            "api/v1/crates/serde/1.0.0/download",
+            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download",
+            "sha256:0123abcd",
+        ] {
+            assert!(check_upstream_fetch_path(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_upstream_paths_are_400() {
+        for bad in [
+            "org/acme/w/1.0/w-1.0.jar#/x.pom",
+            "pkg/-/pkg-1.0.0.tgz#",
+            "org/acme/w/1.0/w-1.0.jar;jsessionid=1",
+            "org/acme/w/1.0/w-1.0.jar%",
+            "org/acme/w/1.0/w-1.0.jar%2",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.ja\tr",
+            "org/acme/w/1.0/w-1.0.ja\u{7f}r",
+            "org/acme/w/1.0/w-1.0.jar?",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+        ] {
+            assert!(
+                matches!(check_upstream_fetch_path(bad), Err(AppError::Validation(_))),
+                "{bad:?}"
+            );
         }
     }
 }
