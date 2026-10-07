@@ -965,7 +965,7 @@ mod tests {
         let base = files_fingerprint(&[a.clone(), b.clone()]);
         assert_eq!(base, files_fingerprint(&[a.clone(), b.clone()]));
         // Publish, delete and reorder all change it.
-        assert_ne!(base, files_fingerprint(&[a.clone()]));
+        assert_ne!(base, files_fingerprint(std::slice::from_ref(&a)));
         assert_ne!(base, files_fingerprint(&[b.clone(), a.clone()]));
         assert_ne!(base, files_fingerprint(&[]));
         // A newer upload of the same name is a different artifact.
