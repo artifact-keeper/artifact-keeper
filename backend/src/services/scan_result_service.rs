@@ -315,6 +315,54 @@ pub struct ScanResultService {
     db: PgPool,
 }
 
+/// Columns of a [`ScanResult`] row, shared by the reusable-scan queries.
+macro_rules! scan_result_columns {
+    () => {
+        "id, artifact_id, repository_id, scan_type, status, \
+         findings_count, critical_count, high_count, medium_count, low_count, info_count, \
+         scanner_version, error_message, started_at, completed_at, created_at, \
+         is_reused, source_scan_id, scan_completeness, scan_completeness_reason, \
+         vuln_db_version, vuln_db_published_at"
+    };
+}
+
+/// Filters every reusable completed scan must pass: same bytes, scanner and
+/// pin, a gradeable local verdict, inside the TTL. `$1::bpchar` because
+/// `checksum_sha256` is `CHAR(64)` and sqlx binds `&str` as `text`: without
+/// the cast Postgres compares `checksum_sha256::text = $1` and cannot use
+/// the column as an index condition (#4426).
+macro_rules! reusable_scan_filters {
+    () => {
+        "checksum_sha256 = $1::bpchar \
+         AND scan_type = $2 \
+         AND status = 'completed' \
+         AND scan_completeness <> 'not_cataloged' \
+         AND origin = 'local_scan' \
+         AND pin_identity IS NOT DISTINCT FROM $5 \
+         AND completed_at > NOW() - (CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days')::interval"
+    };
+}
+
+/// [`ScanResultService::find_reusable_scan`]: the newest ORIGINAL scan
+/// (`source_scan_id IS NULL`, #4425). Served by `idx_scan_results_dedup_local`.
+pub(crate) const FIND_REUSABLE_SCAN_SQL: &str = concat!(
+    "SELECT ",
+    scan_result_columns!(),
+    " FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND source_scan_id IS NULL ORDER BY completed_at DESC LIMIT 1"
+);
+
+/// [`ScanResultService::find_own_reusable_scan`]: the same filters on one
+/// artifact's own rows, reused copies included.
+pub(crate) const FIND_OWN_REUSABLE_SCAN_SQL: &str = concat!(
+    "SELECT ",
+    scan_result_columns!(),
+    " FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND artifact_id = $6 ORDER BY completed_at DESC LIMIT 1"
+);
+
 impl ScanResultService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
@@ -774,6 +822,18 @@ impl ScanResultService {
     /// ([`Self::find_existing_scan_for_artifact`] and step 1 of
     /// [`Self::prepare_scan_placeholder`]) apply the same filter, so an
     /// imported row can never stand in for an artifact's own local scan.
+    ///
+    /// #4425: only an ORIGINAL scan is a dedup source (`source_scan_id IS
+    /// NULL`). A reused row (`is_reused = true`) is a copy of some other
+    /// row's verdict; handing it out as a source would chain copies of
+    /// copies, and because `convert_to_reused` stamps `completed_at = NOW()`
+    /// on the copy, each hop would also restart the TTL window so a verdict
+    /// could outlive its real scan indefinitely. Requiring the original keeps
+    /// every reused row exactly one hop from a scan that actually ran, and
+    /// bounds reuse by that scan's age. This query does not know which
+    /// artifact is asking, so an artifact whose own row is a reused copy now
+    /// gets the original (another artifact's) row back; the scanner checks
+    /// the artifact's own row before copying (see `scan_artifact_inner`).
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -782,38 +842,74 @@ impl ScanResultService {
         zero_findings_ttl_days: i32,
         pin_identity: Option<&str>,
     ) -> Result<Option<ScanResult>> {
-        let result = sqlx::query_as!(
-            ScanResult,
-            r#"
-            SELECT id, artifact_id, repository_id, scan_type, status,
-                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
-            FROM scan_results
-            WHERE checksum_sha256 = $1
-              AND scan_type = $2
-              AND status = 'completed'
-              AND scan_completeness <> 'not_cataloged'
-              AND origin = 'local_scan'
-              AND pin_identity IS NOT DISTINCT FROM $5
-              AND completed_at > NOW() - (
-                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
-              )::interval
-            ORDER BY completed_at DESC
-            LIMIT 1
-            "#,
+        self.fetch_reusable_scan(
+            FIND_REUSABLE_SCAN_SQL,
             checksum_sha256,
             scan_type,
-            ttl_days.to_string(),
-            zero_findings_ttl_days.to_string(),
+            ttl_days,
+            zero_findings_ttl_days,
             pin_identity,
+            None,
         )
-        .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
 
-        Ok(result)
+    /// [`Self::find_reusable_scan`]'s filters (TTLs, pin, `not_cataloged`,
+    /// `origin`) applied to THIS artifact's own completed rows, reused copies
+    /// included: "is this artifact already scanned for these bytes, under
+    /// this pin, with a gradeable verdict?" The scanner asks it before
+    /// copying another artifact's original into a new row (#4425), so a
+    /// rescan of an artifact whose own row is a reused copy does not add a
+    /// second completed row, while a stale-pin or `not_cataloged` own row
+    /// still lets a gradeable verdict be copied in exactly as before.
+    pub async fn find_own_reusable_scan(
+        &self,
+        artifact_id: Uuid,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+        zero_findings_ttl_days: i32,
+        pin_identity: Option<&str>,
+    ) -> Result<Option<ScanResult>> {
+        self.fetch_reusable_scan(
+            FIND_OWN_REUSABLE_SCAN_SQL,
+            checksum_sha256,
+            scan_type,
+            ttl_days,
+            zero_findings_ttl_days,
+            pin_identity,
+            Some(artifact_id),
+        )
+        .await
+    }
+
+    /// Run one of the reusable-scan queries. Unchecked `query_as` because the
+    /// SQL is a shared const (the EXPLAIN test runs the same text); the DB
+    /// tests exercise both queries.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_reusable_scan(
+        &self,
+        sql: &'static str,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+        zero_findings_ttl_days: i32,
+        pin_identity: Option<&str>,
+        artifact_id: Option<Uuid>,
+    ) -> Result<Option<ScanResult>> {
+        let mut query = sqlx::query_as::<_, ScanResult>(sql)
+            .bind(checksum_sha256)
+            .bind(scan_type)
+            .bind(ttl_days.to_string())
+            .bind(zero_findings_ttl_days.to_string())
+            .bind(pin_identity);
+        if let Some(artifact_id) = artifact_id {
+            query = query.bind(artifact_id);
+        }
+        query
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Find an existing completed scan for THIS artifact_id with the given
@@ -851,7 +947,7 @@ impl ScanResultService {
                       vuln_db_version, vuln_db_published_at
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'completed'
               AND origin = 'local_scan'
@@ -945,7 +1041,7 @@ impl ScanResultService {
             SELECT id
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'completed'
               AND origin = 'local_scan'
@@ -980,7 +1076,7 @@ impl ScanResultService {
             SELECT id
             FROM scan_results
             WHERE artifact_id = $1
-              AND checksum_sha256 = $2
+              AND checksum_sha256 = $2::bpchar
               AND scan_type = $3
               AND status = 'running'
             ORDER BY started_at DESC NULLS LAST, created_at DESC
@@ -3913,6 +4009,206 @@ mod tests {
                 .execute(&pool)
                 .await;
             assert!(bogus.is_err(), "origin is constrained to known values");
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4425: a reused row (`source_scan_id` set) is never a dedup
+        /// source. `convert_to_reused` stamps `completed_at = NOW()` on the
+        /// copy, so before the fix the copy was the NEWEST matching row and
+        /// `ORDER BY completed_at DESC` handed it out: copies chained onto
+        /// copies, and the chain kept a verdict alive past its original
+        /// scan's TTL. The artifact's own short-circuit still sees its copy.
+        #[tokio::test]
+        async fn find_reusable_scan_never_returns_a_reused_row() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (orig_aid, ck) = insert_test_artifact(&pool, repo_id, "orig").await;
+            let original = seed_completed_scan_with_pin(&svc, orig_aid, repo_id, &ck, None).await;
+            // The original ran ten days ago.
+            sqlx::query(
+                "UPDATE scan_results SET completed_at = NOW() - INTERVAL '10 days' WHERE id = $1",
+            )
+            .bind(original)
+            .execute(&pool)
+            .await
+            .expect("age original");
+
+            // A second artifact with the same bytes inherits it via the
+            // prepare-then-convert path, which stamps completed_at = NOW().
+            let (copy_aid, _) = insert_test_artifact(&pool, repo_id, "copy").await;
+            let placeholder = svc
+                .create_scan_result_with_checksum(copy_aid, repo_id, "grype", Some(&ck))
+                .await
+                .expect("placeholder");
+            let reused = svc
+                .convert_to_reused(placeholder.id, original, copy_aid, None)
+                .await
+                .expect("convert_to_reused");
+            assert!(reused.is_reused);
+            assert_eq!(reused.source_scan_id, Some(original));
+
+            let hit = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok")
+                .expect("the original is reusable");
+            assert_eq!(
+                hit.id, original,
+                "the newer reused copy must never be handed out as a dedup source"
+            );
+            assert_eq!(hit.source_scan_id, None);
+
+            // Inside the copy's window but outside the original's: the copy
+            // must not extend the verdict's life.
+            let stale = svc
+                .find_reusable_scan(&ck, "grype", 5, 5, None)
+                .await
+                .expect("query ok");
+            assert!(
+                stale.is_none(),
+                "a reused copy must not keep an expired original's verdict reusable"
+            );
+
+            // The per-artifact short-circuit (#1373) is unchanged: the copy is
+            // that artifact's own completed scan.
+            let own = svc
+                .find_existing_scan_for_artifact(copy_aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert_eq!(own.map(|r| r.id), Some(reused.id));
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4426: the dedup partial index carries `origin = 'local_scan'`
+        /// (migrations 273-275) and the old index without it is gone.
+        #[tokio::test]
+        async fn dedup_index_predicate_requires_local_scan_origin() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let defs: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT c.relname::text, pg_get_indexdef(i.indexrelid), i.indisvalid \
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                  WHERE i.indrelid = 'scan_results'::regclass \
+                    AND c.relname IN ('idx_scan_results_dedup', 'idx_scan_results_dedup_local')",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("index catalog");
+            assert_eq!(defs.len(), 1, "exactly one dedup index: {defs:?}");
+            let (name, def, valid) = &defs[0];
+            assert_eq!(name, "idx_scan_results_dedup_local");
+            assert!(valid, "the concurrent build must leave a valid index");
+            assert!(
+                def.contains("origin = 'local_scan'"),
+                "dedup index predicate must require local_scan: {def}"
+            );
+            assert!(def.contains("= 'completed'"), "{def}");
+        }
+
+        /// #4426: the planner serves the REAL `find_reusable_scan` SQL from
+        /// the rebuilt index, with both leading columns as index conditions.
+        /// The statement is PREPAREd with `text` parameters, as sqlx binds
+        /// `&str`, and EXPLAINed as a generic plan, so a missing `::bpchar`
+        /// cast (which demotes the CHAR(64) checksum to a filter) or a
+        /// query/index predicate drift fails here. Sequential scan is off so
+        /// the assertion is about the index being usable, not about row
+        /// estimates on a test-sized table.
+        #[tokio::test]
+        async fn find_reusable_scan_can_use_the_dedup_index() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut conn = pool.acquire().await.expect("conn");
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("tx");
+            for stmt in [
+                "SET LOCAL enable_seqscan = off",
+                "SET LOCAL plan_cache_mode = force_generic_plan",
+            ] {
+                sqlx::query(stmt).execute(&mut *tx).await.expect("set");
+            }
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "PREPARE ak4426_reuse (text, text, text, text, text) AS {FIND_REUSABLE_SCAN_SQL}"
+            )))
+            .execute(&mut *tx)
+            .await
+            .expect("prepare");
+            let plans: Vec<String> = sqlx::query_scalar(
+                "EXPLAIN EXECUTE ak4426_reuse ('abc', 'grype', '30', '1', NULL)",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .expect("explain");
+            tx.rollback().await.expect("rollback");
+            sqlx::query("DEALLOCATE ak4426_reuse")
+                .execute(&mut *conn)
+                .await
+                .expect("deallocate");
+            let plan = plans.join("\n");
+            assert!(
+                plan.contains("idx_scan_results_dedup_local"),
+                "find_reusable_scan must use the dedup index, got:\n{plan}"
+            );
+            let index_cond = plans
+                .iter()
+                .find(|l| l.contains("Index Cond"))
+                .unwrap_or_else(|| panic!("no Index Cond in:\n{plan}"));
+            assert!(
+                index_cond.contains("checksum_sha256") && index_cond.contains("scan_type"),
+                "checksum and scan_type must both be index conditions, got:\n{plan}"
+            );
+        }
+
+        /// #4425: the own-row lookup applies `find_reusable_scan`'s filters
+        /// to the artifact's own rows, reused copies included: a matching
+        /// copy is found, a differently-pinned or `not_cataloged` own row is
+        /// not, and another artifact's row never is.
+        #[tokio::test]
+        async fn find_own_reusable_scan_applies_the_reuse_filters() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (orig_aid, ck) = insert_test_artifact(&pool, repo_id, "own-orig").await;
+            let original = seed_completed_scan_with_pin(&svc, orig_aid, repo_id, &ck, None).await;
+            let (copy_aid, _) = insert_test_artifact(&pool, repo_id, "own-copy").await;
+            let copy = svc
+                .copy_scan_results(original, copy_aid, repo_id, "grype", &ck, None)
+                .await
+                .expect("copy");
+
+            let own = |pin: Option<&'static str>| {
+                let svc = &svc;
+                let ck = ck.clone();
+                async move {
+                    svc.find_own_reusable_scan(copy_aid, &ck, "grype", 3650, 3650, pin)
+                        .await
+                        .expect("query ok")
+                        .map(|r| r.id)
+                }
+            };
+            assert_eq!(own(None).await, Some(copy.id), "the own reused copy counts");
+            assert_eq!(own(Some("npm|x|1")).await, None, "a different pin does not");
+            let other = svc
+                .find_own_reusable_scan(Uuid::new_v4(), &ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert!(other.is_none(), "never another artifact's row");
+
+            sqlx::query(
+                "UPDATE scan_results SET scan_completeness = 'not_cataloged' WHERE id = $1",
+            )
+            .bind(copy.id)
+            .execute(&pool)
+            .await
+            .expect("mark not_cataloged");
+            assert_eq!(own(None).await, None, "a not_cataloged own row does not");
 
             cleanup_repo(&pool, repo_id).await;
         }

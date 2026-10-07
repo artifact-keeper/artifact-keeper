@@ -572,6 +572,117 @@ pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// `(migration version, index name)` for every `-- no-transaction`
+/// `CREATE INDEX CONCURRENTLY` migration whose interrupted build must be
+/// cleaned up before the migrator retries it.
+///
+/// sqlx records a migration only after its SQL succeeds. A concurrent build
+/// that fails part-way (lock timeout behind a long transaction, pod killed
+/// mid-build) is not recorded, so it re-runs on the next boot, but it leaves
+/// an INVALID index behind, and `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
+/// skips that leftover and records success. A transactional
+/// `DROP INDEX IF EXISTS` migration placed before the build does not help:
+/// it is recorded on the first boot and never runs again. So the cleanup has
+/// to happen here, before every migrator run, for each pair whose migration
+/// is not yet recorded. See #4426.
+///
+/// Add a pair whenever a new concurrent index migration lands. Migrations
+/// before 266 predate this table; their builds completed long ago.
+pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
+    (266, "idx_artifacts_download_holds_quarantine"),
+    (272, "idx_proxy_cache_download_holds"),
+    (274, "idx_scan_results_dedup_local"),
+];
+
+/// The index names from `table` whose migration version is not in
+/// `applied`. Only those can carry a leftover from an interrupted build; an
+/// applied migration's index is left alone even if it is invalid.
+pub fn unapplied_concurrent_indexes<'a>(
+    table: &'a [(i64, &'a str)],
+    applied: &[i64],
+) -> Vec<&'a str> {
+    table
+        .iter()
+        .filter(|(version, _)| !applied.contains(version))
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Drop INVALID leftovers of interrupted `CREATE INDEX CONCURRENTLY`
+/// migrations (see [`CONCURRENT_INDEX_MIGRATIONS`]) so the migrator's retry
+/// builds the index from scratch. Returns the names it dropped.
+///
+/// Runs on the migration connection under sqlx's own migrator advisory
+/// lock: a concurrent build in progress on another replica also shows
+/// `indisvalid = false`, and holding the lock the migrator holds while it
+/// builds guarantees no build is in flight when this looks. A no-op on a
+/// fresh install (no ledger yet) and on every healthy database. The drop is
+/// `DROP INDEX CONCURRENTLY`, so it never blocks writers on the table.
+pub async fn repair_invalid_concurrent_indexes(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<String>> {
+    use sqlx::migrate::Migrate;
+
+    let table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+
+    conn.lock()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let dropped = drop_invalid_unapplied_indexes(conn).await;
+    conn.unlock()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let dropped = dropped?;
+    if !dropped.is_empty() {
+        tracing::warn!(
+            indexes = ?dropped,
+            "Dropped INVALID index(es) left by an interrupted concurrent index \
+             migration; the migrator will rebuild them. See issue #4426."
+        );
+    }
+    Ok(dropped)
+}
+
+async fn drop_invalid_unapplied_indexes(conn: &mut sqlx::PgConnection) -> Result<Vec<String>> {
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut dropped = Vec::new();
+    for name in unapplied_concurrent_indexes(CONCURRENT_INDEX_MIGRATIONS, &applied) {
+        // `to_regclass` resolves against the connection's search_path, like
+        // the migrator itself; NULL (no such index) matches no row.
+        let invalid: Option<bool> = sqlx::query_scalar(
+            "SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        )
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if invalid != Some(true) {
+            continue;
+        }
+        // `name` is a compile-time constant from CONCURRENT_INDEX_MIGRATIONS
+        // (plain lowercase identifiers, pinned by a unit test).
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP INDEX CONCURRENTLY IF EXISTS \"{name}\""
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        dropped.push(name.to_string());
+    }
+    Ok(dropped)
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -1500,5 +1611,147 @@ mod tests {
         );
 
         drop_scratch_database(&admin_url, pool, &name).await;
+    }
+
+    // ---- #4426: invalid leftovers of concurrent index migrations ----------
+
+    #[test]
+    fn unapplied_concurrent_indexes_skips_recorded_migrations() {
+        let table: &[(i64, &str)] = &[(266, "idx_a"), (274, "idx_b")];
+        assert_eq!(
+            unapplied_concurrent_indexes(table, &[]),
+            vec!["idx_a", "idx_b"]
+        );
+        assert_eq!(unapplied_concurrent_indexes(table, &[266]), vec!["idx_b"]);
+        assert!(unapplied_concurrent_indexes(table, &[266, 274, 275]).is_empty());
+        assert!(unapplied_concurrent_indexes(&[], &[1]).is_empty());
+    }
+
+    /// Every registered pair names a real `-- no-transaction` migration that
+    /// builds exactly that index concurrently, and the name is a plain
+    /// identifier (it is interpolated into the DROP).
+    #[test]
+    fn concurrent_index_migrations_table_matches_the_migration_files() {
+        let migrator = sqlx::migrate!("./migrations");
+        for (version, name) in CONCURRENT_INDEX_MIGRATIONS {
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{name} must be a plain identifier"
+            );
+            let m = migrator
+                .iter()
+                .find(|m| m.version == *version)
+                .unwrap_or_else(|| panic!("migration {version} must exist"));
+            assert!(m.sql.as_str().starts_with("-- no-transaction"), "{version}");
+            assert!(
+                m.sql
+                    .as_str()
+                    .contains(&format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name}")),
+                "migration {version} must build {name} concurrently"
+            );
+        }
+    }
+
+    async fn index_validity(pool: &PgPool, name: &str) -> Option<bool> {
+        sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .expect("pg_index")
+    }
+
+    async fn mark_index_invalid(pool: &PgPool, name: &str) {
+        // Stand-in for an interrupted CREATE INDEX CONCURRENTLY, which cannot
+        // be interrupted deterministically from a test. Needs superuser, as
+        // the CI and local test roles are.
+        sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass($1)")
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("mark index invalid");
+    }
+
+    /// #4426: a concurrent build interrupted after 273 was recorded leaves an
+    /// INVALID `idx_scan_results_dedup_local` and no 274 row. The repair
+    /// drops it, the real migrator then rebuilds a VALID index and drops the
+    /// old one. Once 274 is recorded the repair leaves the index alone.
+    #[tokio::test]
+    async fn invalid_concurrent_index_leftover_is_rebuilt_on_retry() {
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue4426_cic").await else {
+            return;
+        };
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_locking(false);
+        migrator
+            .run_to(273, &pool)
+            .await
+            .expect("migrate through 273");
+        sqlx::raw_sql(include_str!(
+            "../migrations/274_scan_results_dedup_local_index.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("build index");
+        mark_index_invalid(&pool, "idx_scan_results_dedup_local").await;
+
+        let mut conn = pool.acquire().await.expect("conn");
+        let dropped = repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("repair");
+        assert_eq!(dropped, vec!["idx_scan_results_dedup_local".to_string()]);
+        assert_eq!(
+            index_validity(&pool, "idx_scan_results_dedup_local").await,
+            None
+        );
+
+        migrator.run(&mut *conn).await.expect("migrator retry");
+        assert_eq!(
+            index_validity(&pool, "idx_scan_results_dedup_local").await,
+            Some(true),
+            "the retry must build a valid index"
+        );
+        assert_eq!(
+            index_validity(&pool, "idx_scan_results_dedup").await,
+            None,
+            "the old index is dropped only after the new one is valid"
+        );
+
+        // 274 is recorded now: an invalid index is no longer this step's
+        // business (it is not a build leftover).
+        mark_index_invalid(&pool, "idx_scan_results_dedup_local").await;
+        let dropped = repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("repair no-op");
+        assert!(dropped.is_empty());
+        assert_eq!(
+            index_validity(&pool, "idx_scan_results_dedup_local").await,
+            Some(false)
+        );
+        drop(conn);
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// Fresh install (no ledger) and a healthy ledger are no-ops.
+    #[tokio::test]
+    async fn invalid_concurrent_index_repair_no_op_on_fresh_install() {
+        let Some((url, schema, pool)) = setup_isolated_pool("issue4426_noop").await else {
+            return;
+        };
+        let mut conn = pool.acquire().await.expect("conn");
+        assert!(repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("fresh")
+            .is_empty());
+        drop(conn);
+        create_sqlx_migrations_table(&pool).await;
+        let mut conn = pool.acquire().await.expect("conn");
+        assert!(repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("empty ledger, no index")
+            .is_empty());
+        drop(conn);
+        drop(pool);
+        drop_isolation_schema(&url, &schema).await;
     }
 }
