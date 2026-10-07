@@ -1123,6 +1123,15 @@ pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Replace the repository's upstream URL (#4467), e.g. to rotate
+    /// credentials embedded as userinfo or to repoint a Remote. Validated
+    /// exactly like `upstream_url` on create (anti-SSRF, scheme/host and the
+    /// per-format checks). The response redacts userinfo and reports
+    /// `upstream_url_has_credentials`. Moving to a different origin
+    /// (scheme, host or port) while upstream-auth credentials are configured
+    /// is refused (409): remove them first, so they are never sent to a host
+    /// they were not configured for. Omit to leave the URL unchanged.
+    pub upstream_url: Option<String>,
     /// Baseline read audience: `public`, `internal`, or `private`.
     ///
     /// This is the authoritative field. `is_public` and its alias
@@ -1476,6 +1485,29 @@ async fn with_repodata_depth(
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
     Ok(response)
+}
+
+/// Refusal for a PATCH that moves `upstream_url` to another origin while
+/// upstream-auth credentials are configured (#4467).
+const UPSTREAM_ORIGIN_CHANGE_WITH_AUTH: &str =
+    "upstream_url cannot move to a different origin (scheme, host or port) while upstream \
+     credentials are configured: remove them first (PUT /api/v1/repositories/{key}/upstream-auth \
+     with auth_type \"none\"), change upstream_url, then configure credentials for the new upstream";
+
+/// Whether replacing the stored upstream URL with `requested` changes its
+/// origin (scheme, host, port; userinfo, path and query do not count). An
+/// absent or unparseable URL on either side counts as a change (#4467).
+fn upstream_url_origin_changes(stored: Option<&str>, requested: &str) -> bool {
+    let origin = |url: &str| {
+        reqwest::Url::parse(url)
+            .ok()
+            .map(|u| u.origin())
+            .filter(|o| o.is_tuple())
+    };
+    match (stored.and_then(origin), origin(requested)) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
+    }
 }
 
 /// Render a stored `upstream_url` for an API response (#4452): the URL with
@@ -4369,7 +4401,7 @@ pub async fn get_repository_storage_tree(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id"),
         (status = 404, description = "Repository not found"),
-        (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
+        (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
@@ -4501,6 +4533,20 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
+    // #4467: an upstream URL change is applied (the service validates it like
+    // create does), but never silently re-targets stored upstream-auth
+    // credentials at a host they were not configured for.
+    if let Some(ref new_url) = payload.upstream_url {
+        if upstream_url_origin_changes(existing.upstream_url.as_deref(), new_url)
+            && crate::services::upstream_auth::get_upstream_auth_type(&state.db, existing.id)
+                .await?
+                .is_some()
+        {
+            return Err(AppError::Conflict(
+                UPSTREAM_ORIGIN_CHANGE_WITH_AUTH.to_string(),
+            ));
+        }
+    }
 
     let repo = service
         .update_with_repodata_depth(
@@ -4512,7 +4558,7 @@ pub async fn update_repository(
                 visibility: effective_visibility,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
-                upstream_url: None,
+                upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
                 // P1 set-only (#2472): a present field maps to Some(Some(id));
@@ -27419,6 +27465,181 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4467: PATCH applies upstream_url instead of silently dropping it
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_url_origin_changes_compares_scheme_host_port_only_4467() {
+        let old = Some("https://alice:old@upstream.example.com/etag");
+        for same in [
+            "https://alice:new@upstream.example.com/status",
+            "https://UPSTREAM.example.com:443/other?x=1",
+            "https://upstream.example.com",
+        ] {
+            assert!(!upstream_url_origin_changes(old, same), "{same}");
+        }
+        for moved in [
+            "http://upstream.example.com/etag",
+            "https://upstream.example.com:8443/etag",
+            "https://other.example.com/etag",
+            "not a url",
+        ] {
+            assert!(upstream_url_origin_changes(old, moved), "{moved}");
+        }
+        assert!(upstream_url_origin_changes(
+            None,
+            "https://upstream.example.com"
+        ));
+    }
+
+    #[test]
+    fn update_request_accepts_upstream_url_4467() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "upstream_url": "https://h.example.com" }))
+                .expect("deserialize");
+        assert_eq!(req.upstream_url.as_deref(), Some("https://h.example.com"));
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "description": "x" })).expect("deserialize");
+        assert!(req.upstream_url.is_none());
+    }
+
+    async fn stored_upstream_4467(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT upstream_url FROM repositories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("stored upstream_url")
+    }
+
+    #[tokio::test]
+    async fn test_patch_upstream_url_is_applied_and_validated_db_4467() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upstream-4467-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+
+        let repo_key = format!("upstream-4467-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &repo_key,
+                "rotating",
+                "generic",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://alice:old-4467@upstream.example.com/etag"
+                }),
+            ),
+        )
+        .await
+        .expect("remote create must succeed");
+
+        // Rotation of embedded credentials is applied, and redacted on the way out.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({
+                "upstream_url": "https://alice:new-4467@upstream.example.com/status"
+            })),
+        )
+        .await
+        .expect("upstream_url update must succeed");
+        assert_eq!(
+            resp.upstream_url.as_deref(),
+            Some("https://upstream.example.com/status")
+        );
+        assert!(resp.upstream_url_has_credentials);
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // Create-time validation applies: an SSRF target is a 400 and changes nothing.
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "http://169.254.169.254/latest" })),
+        )
+        .await
+        .expect_err("metadata address must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // An unrelated update leaves the URL alone.
+        update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "description": "x" })),
+        )
+        .await
+        .expect("unrelated update must succeed");
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // With upstream-auth credentials configured, a different origin is a
+        // 409 and the same origin is still allowed.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'upstream_auth_type', 'basic')",
+        )
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("configure upstream auth");
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "https://other.example.com/status" })),
+        )
+        .await
+        .expect_err("origin change with credentials configured must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m.contains("upstream-auth")),
+            "{err:?}"
+        );
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "https://upstream.example.com/v2" })),
+        )
+        .await
+        .expect("same-origin change must succeed");
+        assert_eq!(
+            resp.upstream_url.as_deref(),
+            Some("https://upstream.example.com/v2")
+        );
+        assert!(!resp.upstream_url_has_credentials);
 
         tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
