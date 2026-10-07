@@ -258,6 +258,9 @@ impl From<PackageRow> for PackageResponse {
 pub struct PackageListResponse {
     pub items: Vec<PackageResponse>,
     pub pagination: Pagination,
+    /// Non-fatal remarks about this page (#4130). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::api::dto::ListNotice>,
 }
 
 /// List packages
@@ -294,6 +297,7 @@ pub async fn list_packages(
 
     if !table_exists {
         return Ok(Json(PackageListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page,
@@ -394,7 +398,37 @@ pub async fn list_packages(
         })
         .collect();
 
+    // #4130: a token scoped to the virtual repository but not to its members
+    // gets an empty page here, because the filter expands to the MEMBER ids.
+    // Say so rather than letting it read as "this repository is empty".
+    //
+    // Gated on `require_visible` (#4213 review): the notice is computed from
+    // the caller's grants on the MEMBERS, so a caller with grants on members
+    // but no visibility of the virtual PARENT could otherwise probe keys and
+    // learn that a private virtual repository exists and how many of their
+    // repositories it contains. Before the notice existed, that request was an
+    // empty 200 either way, and it must stay one.
+    let mut notices = Vec::new();
+    if let Some(key) = query.repository_key.as_deref() {
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(state.db.clone());
+        if let Ok(repo) = repo_service.get_by_key(key).await {
+            if crate::api::handlers::repositories::require_visible(&repo, &auth, &repo_service)
+                .await
+                .is_ok()
+            {
+                notices = crate::api::handlers::repositories::member_scope_notices(
+                    &state.db,
+                    auth.as_ref(),
+                    &repo,
+                )
+                .await;
+            }
+        }
+    }
+
     Ok(Json(PackageListResponse {
+        notices,
         items,
         pagination: Pagination {
             page,
@@ -1017,6 +1051,7 @@ mod tests {
     #[test]
     fn test_package_list_response_serialize() {
         let resp = PackageListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -1091,6 +1126,136 @@ mod tests {
         ) -> StatusCode {
             let (status, _) = tdh::send(app_for(f, auth), tdh::get(path)).await;
             status
+        }
+
+        /// #4130: a token scoped to a virtual repository but not to its
+        /// members gets an empty page. That is the intended rule, but the
+        /// response must say so instead of reading as "this repository is
+        /// empty".
+        #[tokio::test]
+        async fn virtual_listing_reports_members_hidden_by_token_scope() {
+            let Some(f) = tdh::Fixture::setup("virtual", "nuget").await else {
+                return;
+            };
+            let (member_id, _mkey, mdir) = tdh::create_repo(&f.pool, "local", "nuget").await;
+            tdh::link_virtual_member(&f.pool, f.repo_id, member_id, 1).await;
+            super::catalog_liveness_db::seed_backed_package(
+                &f.pool,
+                member_id,
+                "member-pkg",
+                "1.0.0",
+            )
+            .await;
+            // The caller is ENTITLED to both; only the token's scope is narrow.
+            tdh::grant_repo_access(&f.pool, f.repo_id, f.user_id).await;
+            tdh::grant_repo_access(&f.pool, member_id, f.user_id).await;
+
+            let notices_for = |allowed: Option<Vec<Uuid>>| {
+                let f = &f;
+                async move {
+                    let auth = make_auth(f.user_id, false, allowed);
+                    let (status, body) = tdh::send(
+                        app_for(f, Some(auth)),
+                        tdh::get(format!("/?repository_key={}", f.repo_key)),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let items = json["items"].as_array().map(Vec::len).unwrap_or(0);
+                    let codes: Vec<String> = json["notices"]
+                        .as_array()
+                        .map(|ns| {
+                            ns.iter()
+                                .filter_map(|n| n["code"].as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (items, codes)
+                }
+            };
+
+            let scoped_to_virtual = notices_for(Some(vec![f.repo_id])).await;
+            let scoped_to_both = notices_for(Some(vec![f.repo_id, member_id])).await;
+            let unrestricted = notices_for(None).await;
+
+            let outsider = make_auth(Uuid::new_v4(), false, Some(vec![f.repo_id]));
+            let (_s, outsider_body) = tdh::send(
+                app_for(&f, Some(outsider)),
+                tdh::get(format!("/?repository_key={}", f.repo_key)),
+            )
+            .await;
+            let outsider_json: serde_json::Value = serde_json::from_slice(&outsider_body).unwrap();
+
+            tdh::cleanup_member_repo(&f.pool, member_id, &mdir).await;
+            f.teardown().await;
+
+            assert_eq!(
+                scoped_to_virtual,
+                (
+                    0,
+                    vec![crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE.to_string()]
+                ),
+                "an empty page caused by token scope must say so"
+            );
+            assert_eq!(
+                scoped_to_both,
+                (1, vec![]),
+                "a token scoped to the member lists it and needs no notice"
+            );
+            assert_eq!(
+                unrestricted,
+                (1, vec![]),
+                "an unscoped token lists it and needs no notice"
+            );
+            // A caller with no grant on the member is told nothing about it:
+            // the notice counts only members the caller may already read.
+            assert!(
+                outsider_json["notices"].is_null(),
+                "no notice may be emitted for a member the caller cannot read: {outsider_json}"
+            );
+        }
+
+        /// #4213 review: the notice is derived from the caller's grants on the
+        /// MEMBERS, so computing it before checking the caller may see the
+        /// PARENT let a scoped-token owner probe keys and learn that a private
+        /// virtual repository exists and how many of their repositories it
+        /// holds. That request was an empty 200 before the notice existed and
+        /// must stay one.
+        #[tokio::test]
+        async fn virtual_listing_reveals_nothing_about_a_repository_the_caller_cannot_see() {
+            let Some(f) = tdh::Fixture::setup("virtual", "nuget").await else {
+                return;
+            };
+            let (member_id, _mkey, mdir) = tdh::create_repo(&f.pool, "local", "nuget").await;
+            tdh::link_virtual_member(&f.pool, f.repo_id, member_id, 1).await;
+            // The caller is granted the MEMBER but NOT the virtual parent, and
+            // its token names only the parent — the probing shape. The fixture
+            // grants its user the parent on setup, so that grant is removed
+            // here; without this the test would not be the case under review.
+            tdh::grant_repo_access(&f.pool, member_id, f.user_id).await;
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.user_id)
+                .bind(f.repo_id)
+                .execute(&f.pool)
+                .await
+                .expect("revoke the fixture's grant on the virtual parent");
+
+            let auth = make_auth(f.user_id, false, Some(vec![f.repo_id]));
+            let (status, body) = tdh::send(
+                app_for(&f, Some(auth)),
+                tdh::get(format!("/?repository_key={}", f.repo_key)),
+            )
+            .await;
+
+            tdh::cleanup_member_repo(&f.pool, member_id, &mdir).await;
+            f.teardown().await;
+
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["notices"].is_null(),
+                "a caller who cannot see the virtual repository must not learn it exists: {json}"
+            );
         }
 
         #[tokio::test]

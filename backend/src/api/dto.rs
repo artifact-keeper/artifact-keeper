@@ -36,6 +36,40 @@ pub struct Pagination {
     pub total_pages: u32,
 }
 
+/// A non-fatal remark attached to a successful list response (#4130).
+///
+/// Exists because an empty page and an empty page the caller's own credential
+/// caused look identical: a token scoped to a virtual repository but not to
+/// its members gets `200` with no items, no error and nothing in the body
+/// saying why. `code` is the stable identifier a client matches on; `message`
+/// is for a human.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ListNotice {
+    pub code: String,
+    pub message: String,
+}
+
+/// Code for [`ListNotice`]: members of a virtual repository were omitted
+/// because they are outside the presenting token's repository scope.
+pub const NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE: &str = "members_out_of_token_scope";
+
+impl ListNotice {
+    /// Build the notice for `hidden` members dropped by token scope.
+    pub fn members_out_of_token_scope(hidden: usize) -> Self {
+        Self {
+            code: NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE.to_string(),
+            message: format!(
+                "{hidden} member repositor{} of this virtual repository {} outside this token's \
+                 repository scope and {} omitted. Scope the token to the members as well, or use \
+                 a selector with include_virtual_members.",
+                if hidden == 1 { "y" } else { "ies" },
+                if hidden == 1 { "is" } else { "are" },
+                if hidden == 1 { "was" } else { "were" },
+            ),
+        }
+    }
+}
+
 impl Pagination {
     /// Create pagination from query parameters and total count.
     ///

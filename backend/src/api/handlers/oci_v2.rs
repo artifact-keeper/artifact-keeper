@@ -400,7 +400,11 @@ async fn authenticate_oci_with_scopes(
                 let allowed_repo_ids: Option<Vec<Uuid>> =
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
+                    .generate_tokens_with_repo_scope_and_read_expansion(
+                        &validation.user,
+                        allowed_repo_ids,
+                        validation.read_expansion_repo_ids.clone(),
+                    )
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -443,7 +447,11 @@ async fn authenticate_oci_with_scopes(
                 let allowed_repo_ids: Option<Vec<Uuid>> =
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
+                    .generate_tokens_with_repo_scope_and_read_expansion(
+                        &validation.user,
+                        allowed_repo_ids,
+                        validation.read_expansion_repo_ids.clone(),
+                    )
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -503,7 +511,11 @@ async fn authenticate_oci_with_scopes(
                     .await
                 {
                     return auth_service
-                        .generate_tokens_with_repo_scope(&user, allowed_repo_ids)
+                        .generate_tokens_with_repo_scope_and_read_expansion(
+                            &user,
+                            allowed_repo_ids,
+                            claims.read_expansion_repo_ids.clone().unwrap_or_default(),
+                        )
                         .map_err(|_| ())
                         .and_then(|tokens| {
                             auth_service
@@ -672,6 +684,17 @@ fn enforce_token_repo_scope_on_read(
     // repository, not the 403 `DENIED` the write gate keeps. Repository-scoped
     // tokens are self-service, so the 403 was a 200/403/404 existence oracle
     // over every private key for any user holding a token of their own.
+    //
+    // #4213 review: a read also admits the token's `include_virtual_members`
+    // expansion. `enforce_token_repo_scope`, which every push and delete
+    // calls, never looks at it.
+    if claims
+        .read_expansion_repo_ids
+        .as_ref()
+        .is_some_and(|ids| ids.contains(&repo_id))
+    {
+        return Ok(());
+    }
     enforce_token_repo_scope(claims, repo_id).map_err(|_| {
         // Same fields and level as the ACL read denial in `oci_read_permitted`,
         // so the operator can still tell this from a missing repository.
@@ -3520,12 +3543,16 @@ pub fn virtual_negative_cache_clear() {
 /// members only. `From<Claims>` is the single conversion the REST surface uses,
 /// so the token-scope ceiling (`allowed_repo_ids`) and the scope-gated admin
 /// demotion (GHSA-vvc3) come along unchanged.
+///
+/// Every caller is a READ handler (nothing can be pushed to a virtual
+/// repository), so the token's `include_virtual_members` expansion applies
+/// (#4213 review).
 fn virtual_caller_auth(
     claims: Option<&crate::services::auth_service::Claims>,
 ) -> Option<crate::api::middleware::auth::AuthExtension> {
-    claims
-        .cloned()
-        .map(crate::api::middleware::auth::AuthExtension::from)
+    claims.cloned().map(|claims| {
+        crate::api::middleware::auth::AuthExtension::from_claims_for_request(claims, true)
+    })
 }
 
 /// Fetch a virtual repository's members, narrow them to those the CALLER may
@@ -5226,10 +5253,14 @@ async fn token(
                         // must never EXTEND lifetime, or chaining swaps would
                         // renew access forever without re-presenting a real
                         // credential.
-                        match auth_service.generate_tokens_with_scope_capped(
+                        match auth_service.generate_tokens_with_scope_capped_read_expansion(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            // #4213 review: carry the read expansion across the
+                            // swap, kept apart from the scope, so the new bearer
+                            // reads members as before and still cannot write.
+                            claims.read_expansion_repo_ids.clone().unwrap_or_default(),
                             chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => (t.access_token, t.expires_in),
@@ -5355,10 +5386,13 @@ async fn token(
             let user = validation.user;
             // Cap the minted bearer at the API token's own expiry (#3460) so
             // an exchanged JWT never outlives the credential that minted it.
-            let tokens = match auth_service.generate_tokens_with_scope_capped(
+            let tokens = match auth_service.generate_tokens_with_scope_capped_read_expansion(
                 &user,
                 token_scopes,
                 allowed_repo_ids,
+                // #4213 review: the members a flagged token reads through a
+                // virtual repository ride separately, applied to reads only.
+                validation.read_expansion_repo_ids.clone(),
                 validation.expires_at,
             ) {
                 Ok(t) => t,
@@ -5409,12 +5443,16 @@ async fn token(
                         // so this keyless fallback cannot re-widen a restricted
                         // token (#2430/#2290). Cap at the presented token's
                         // `exp` (#3460): the re-mint must not extend lifetime.
-                        let tokens = match auth_service.generate_tokens_with_scope_capped(
-                            &user,
-                            claims.scopes.clone(),
-                            claims.allowed_repo_ids.clone(),
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
-                        ) {
+                        // #4213 review: and carry the read expansion across,
+                        // like the other two JWT re-mints on this route.
+                        let tokens = match auth_service
+                            .generate_tokens_with_scope_capped_read_expansion(
+                                &user,
+                                claims.scopes.clone(),
+                                claims.allowed_repo_ids.clone(),
+                                claims.read_expansion_repo_ids.clone().unwrap_or_default(),
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
+                            ) {
                             Ok(t) => t,
                             Err(_) => {
                                 return oci_error(
@@ -13011,6 +13049,7 @@ mod tests {
 
     fn claims_with_scan_scope(scope: Option<&str>) -> crate::services::auth_service::Claims {
         crate::services::auth_service::Claims {
+            read_expansion_repo_ids: None,
             sub: uuid::Uuid::new_v4(),
             username: "_ak_scanner".to_string(),
             email: "scanner@artifact-keeper.internal".to_string(),
@@ -13059,6 +13098,7 @@ mod tests {
         is_admin: bool,
     ) -> crate::services::auth_service::Claims {
         crate::services::auth_service::Claims {
+            read_expansion_repo_ids: None,
             sub: uuid::Uuid::new_v4(),
             username: "ci-bot".to_string(),
             email: "ci-bot@artifact-keeper.internal".to_string(),
@@ -15204,6 +15244,7 @@ mod tests {
         // the credential-change watermark (strict `<`) accepts the token.
         let now = Utc::now();
         let claims = crate::services::auth_service::Claims {
+            read_expansion_repo_ids: None,
             sub,
             username: username.to_string(),
             email: format!("{}@example.test", username),
@@ -30756,6 +30797,7 @@ mod proxy_scan_block_tests {
 
     fn scan_scoped_claims(repo_key: &str) -> crate::services::auth_service::Claims {
         crate::services::auth_service::Claims {
+            read_expansion_repo_ids: None,
             sub: Uuid::new_v4(),
             username: "_ak_scanner".to_string(),
             email: "scanner@artifact-keeper.internal".to_string(),

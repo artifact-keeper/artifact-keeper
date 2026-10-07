@@ -39,6 +39,16 @@ The unit-test job is also the coverage run: it builds once with `cargo llvm-cov`
 instrumentation, runs the suite once, and uploads `lcov.info`; the
 `📊 Code Coverage` job only evaluates the gates from that report.
 
+### Local Coverage Storage
+
+For full instrumented nextest shard runs on a shared local Docker disk, export
+`cargo llvm-cov show-env` first, then set a shard-specific `LLVM_PROFILE_FILE`,
+for example `/tmp/ak-coverage-handlers-1-%16m.profraw`. Omit `%p`: nextest starts
+one process per test, and per-process raw profiles can consume over 80 GiB in
+one shard. `%16m` shares a bounded 16-file merge pool per instrumented binary.
+Export coverage from the exact binaries built by that run, not stale binaries
+in a reused target directory.
+
 ### Integration Tests (Tier 2) - Pushes & Backend PRs
 
 CI names an explicit list of test files and runs their `#[ignore]`d cases

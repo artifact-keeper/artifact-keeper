@@ -326,7 +326,7 @@ async fn ping(
         .unwrap())
 }
 
-/// Expiry of the credential the caller actually presented, or `None` when it
+/// The credential the caller actually presented: its expiry, or `None` when it
 /// never expires (a real username/password login) or cannot be determined.
 ///
 /// `users_authenticate` mints a JWT from whatever credential authenticated the
@@ -342,10 +342,33 @@ async fn ping(
 /// password (which never expires) first, then JWT, then API token. Both
 /// re-validations hit the token caches the middleware populated moments
 /// earlier, so this costs no extra bcrypt work.
-async fn presented_credential_expiry(
+///
+/// The same re-derivation also yields the credential's `include_virtual_members`
+/// read expansion (#4213 review). `authenticate` is never classified as a read,
+/// so the principal holds only the base scope, and the expansion has to come
+/// from the credential itself to reach the minted JWT, as its own claim.
+struct PresentedCredential {
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    read_expansion_repo_ids: Vec<uuid::Uuid>,
+}
+
+async fn presented_credential(
     headers: &HeaderMap,
     auth_service: &AuthService,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> PresentedCredential {
+    let none = PresentedCredential {
+        expires_at: None,
+        read_expansion_repo_ids: Vec::new(),
+    };
+    presented_credential_inner(headers, auth_service)
+        .await
+        .unwrap_or(none)
+}
+
+async fn presented_credential_inner(
+    headers: &HeaderMap,
+    auth_service: &AuthService,
+) -> Option<PresentedCredential> {
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let secret = match header {
         Some(v) if v.len() > 6 && v[..6].eq_ignore_ascii_case("basic ") => {
@@ -360,13 +383,16 @@ async fn presented_credential_expiry(
         None => headers.get("x-api-key")?.to_str().ok()?.to_string(),
     };
     if let Ok(claims) = auth_service.validate_access_token_async(&secret).await {
-        return chrono::DateTime::from_timestamp(claims.exp, 0);
+        return Some(PresentedCredential {
+            expires_at: chrono::DateTime::from_timestamp(claims.exp, 0),
+            read_expansion_repo_ids: claims.read_expansion_repo_ids.unwrap_or_default(),
+        });
     }
-    auth_service
-        .validate_api_token(&secret)
-        .await
-        .ok()?
-        .expires_at
+    let validation = auth_service.validate_api_token(&secret).await.ok()?;
+    Some(PresentedCredential {
+        expires_at: validation.expires_at,
+        read_expansion_repo_ids: validation.read_expansion_repo_ids,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -423,14 +449,20 @@ async fn users_authenticate(
         AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
     // Cap the minted JWT at the presenting credential's own expiry (#3460):
     // this exchange must never EXTEND lifetime, or chaining it renews access
-    // past the API token that anchored it. See `presented_credential_expiry`.
-    let credential_exp = presented_credential_expiry(&headers, &auth_service).await;
+    // past the API token that anchored it. See `presented_credential`.
+    let presented = presented_credential(&headers, &auth_service).await;
+    // #4213 review: `ext` holds the BASE scope here, because a credential
+    // exchange is never classified as a read. The members a flagged token
+    // reads through a virtual repository travel as their own claim, which
+    // later requests apply to reads only. If re-deriving the credential fails
+    // the expansion is empty: member reads are lost, never writes gained.
     let tokens = auth_service
-        .generate_tokens_with_scope_capped(
+        .generate_tokens_with_scope_capped_read_expansion(
             &user,
             ext.scopes.clone(),
             ext.access_scope().as_allowed_repo_ids().map(<[_]>::to_vec),
-            credential_exp,
+            presented.read_expansion_repo_ids,
+            presented.expires_at,
         )
         .map_err(|_| {
             Response::builder()
@@ -10035,5 +10067,155 @@ mod not_found_3887 {
                 assert_eq!(hidden.2, reader_absent[i].2, "{who} body for {uri}");
             }
         }
+    }
+}
+
+/// #4213 review: `users/authenticate` is served on GET as well as POST, and a
+/// GET used to count as a read, so the principal it minted from already held
+/// the `include_virtual_members` expansion. The JWT carried the members in its
+/// action-independent ceiling, and a PUT to a member then passed the scope
+/// gate. A credential exchange is now never a read; the expansion rides the
+/// JWT as its own claim and applies to reads only.
+///
+/// Through the real `repo_visibility_middleware`. The account holds a write
+/// grant on the member, so only the TOKEN's scope can refuse the write.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod read_expansion_through_authenticate_4213 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+    use crate::services::auth_service::AuthService;
+    use crate::services::permission_service::PermissionService;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_jwt_minted_by_get_authenticate_reads_the_member_but_cannot_write_it() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _pw) = create_user(&pool).await;
+        let (member_id, member_key, member_dir) = create_conan_repo(&pool, "local").await;
+        let (virtual_id, virtual_key, virtual_dir) = create_conan_repo(&pool, "virtual").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 0).await;
+        tdh::grant_repo_access(&pool, virtual_id, user_id).await;
+        tdh::grant_repo_actions(&pool, member_id, user_id, &["read", "write", "delete"]).await;
+        seed_recipe_row(
+            &pool,
+            member_id,
+            "vlib",
+            "1.0",
+            "_",
+            "_",
+            "rv",
+            "conanfile.py",
+        )
+        .await;
+
+        let state = build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let auth = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let (api_token, token_id) = auth
+            .generate_api_token(
+                user_id,
+                "conan-flagged",
+                vec!["read:artifacts".into(), "write:artifacts".into()],
+                None,
+            )
+            .await
+            .expect("mint api token");
+        sqlx::query("UPDATE api_tokens SET repo_selector = $1 WHERE id = $2")
+            .bind(serde_json::json!({
+                "match_repos": [virtual_id],
+                "include_virtual_members": true,
+            }))
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("store selector");
+
+        let vis_state = RepoVisibilityState {
+            auth_service: auth.clone(),
+            db: pool.clone(),
+            repo_cache: state.repo_cache.clone(),
+            repo_miss_cache: state.repo_miss_cache.clone(),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let app = axum::Router::new()
+            .nest("/conan", super::router())
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                vis_state,
+                repo_visibility_middleware,
+            ));
+        let call =
+            |method: &'static str, uri: String, authorization: String, body: &'static [u8]| {
+                let app = app.clone();
+                async move {
+                    let req = axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(axum::http::header::AUTHORIZATION, authorization)
+                        .body(axum::body::Body::from(body))
+                        .expect("request");
+                    let (status, body, _headers) = tdh::send_with_headers(app, req).await;
+                    (status, String::from_utf8_lossy(&body).to_string())
+                }
+            };
+
+        // The exchange, by GET, with the flagged API token.
+        let (auth_status, jwt) = call(
+            "GET",
+            format!("/conan/{virtual_key}/v2/users/authenticate"),
+            basic_auth(&username, &api_token),
+            b"",
+        )
+        .await;
+        let claims = auth.validate_access_token_async(&jwt).await;
+        let bearer = format!("Bearer {jwt}");
+        let (read_status, _) = call(
+            "GET",
+            format!("/conan/{member_key}/v2/conans/vlib/1.0/_/_/revisions"),
+            bearer.clone(),
+            b"",
+        )
+        .await;
+        let (write_status, _) = call(
+            "PUT",
+            format!("/conan/{member_key}/v2/conans/wlib/1.0/_/_/revisions/r1/files/conanfile.py"),
+            bearer,
+            b"print('x')",
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            auth_status,
+            StatusCode::OK,
+            "the exchange itself works: {jwt}"
+        );
+        let claims = claims.expect("the body is a valid JWT");
+        assert_eq!(
+            claims.allowed_repo_ids,
+            Some(vec![virtual_id]),
+            "the member must not enter the JWT's action-independent ceiling"
+        );
+        assert_eq!(
+            claims.read_expansion_repo_ids,
+            Some(vec![member_id]),
+            "it rides as its own claim instead"
+        );
+        assert_eq!(
+            read_status,
+            StatusCode::OK,
+            "the minted JWT reads the member"
+        );
+        assert_eq!(write_status, StatusCode::FORBIDDEN, "and cannot write it");
     }
 }

@@ -389,7 +389,10 @@ pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisib
 ///
 /// Consequence, accepted deliberately: a token scoped only to a virtual sees
 /// an empty listing. That is consistent with the download, which also refuses.
-/// Scope tokens to the members, or to both.
+/// Scope tokens to the members, to both, or with a selector carrying
+/// `include_virtual_members` (#4130). The listing says so rather than
+/// answering an unexplained empty page — see
+/// [`members_hidden_by_token_scope`].
 pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
     parent_repo_id: Uuid,
@@ -408,6 +411,88 @@ pub(crate) fn member_passes_token_scope(
         None => member_visibility.allows_anonymous_read(),
         Some(a) => member_visibility.allows_anonymous_read() || a.can_access_repo(member_id),
     }
+}
+
+/// How many of `repo`'s members this caller is ENTITLED to read but its token
+/// is not scoped to (#4130).
+///
+/// The two halves of the member predicate are counted separately on purpose.
+/// Only members that pass the GRANT half and fail the SCOPE half are counted,
+/// so the number describes the caller's own token against the caller's own
+/// entitlements — facts it can already establish by presenting a
+/// differently-scoped credential of its own. A member the caller has no grant
+/// for is never counted and never mentioned, so this reveals nothing that
+/// `require_visible` would not.
+///
+/// `0` for anything that is not a virtual repository read by a repo-scoped
+/// token, which is the only case that can produce the silent empty page.
+pub(crate) async fn members_hidden_by_token_scope(
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> usize {
+    if repo.repo_type != RepositoryType::Virtual {
+        return 0;
+    }
+    // Only a scope-restricted credential can lose members this way; a browser
+    // session and an unscoped token both grant every repository.
+    if !auth.is_some_and(|a| matches!(a.access_scope(), AccessScope::Restricted(_))) {
+        return 0;
+    }
+    let Ok(members) = proxy_helpers::fetch_virtual_members(db, repo.id).await else {
+        return 0;
+    };
+    let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
+    let repo_service = RepositoryService::new(db.clone());
+    let Ok(granted) = repo_service
+        .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth))
+        .await
+    else {
+        return 0;
+    };
+    let granted: std::collections::HashSet<Uuid> = granted.into_iter().collect();
+    members
+        .iter()
+        .filter(|m| {
+            granted.contains(&m.id) && !member_passes_token_scope(auth, repo.id, m.id, m.visibility)
+        })
+        .count()
+}
+
+/// The #4130 notices for a repository, empty unless token scope dropped
+/// members this caller is entitled to.
+pub(crate) async fn member_scope_notices(
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Vec<crate::api::dto::ListNotice> {
+    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
+    match hidden {
+        0 => Vec::new(),
+        n => vec![crate::api::dto::ListNotice::members_out_of_token_scope(n)],
+    }
+}
+
+/// Attach the #4130 notice to an artifact listing when token scope dropped
+/// members the caller is entitled to. Applied to the grouped `list_artifacts`
+/// returns; the flat branch calls [`member_scope_notices`] directly.
+async fn with_member_scope_notice(
+    result: Result<Json<ArtifactListResponse>>,
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Result<Json<ArtifactListResponse>> {
+    let mut response = result?;
+    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
+    if hidden > 0 {
+        response
+            .0
+            .notices
+            .push(crate::api::dto::ListNotice::members_out_of_token_scope(
+                hidden,
+            ));
+    }
+    Ok(response)
 }
 
 /// Ensure a repository is READABLE by the current user.
@@ -5790,6 +5875,9 @@ pub struct ArtifactResponse {
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
+    /// Non-fatal remarks about this page (#4130). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::api::dto::ListNotice>,
     /// Maven component grouping.  Only present when `group_by=maven_component`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<MavenComponentResponse>>,
@@ -5946,18 +6034,24 @@ pub async fn list_artifacts(
     let count_exact = query.count.as_deref() == Some("exact");
 
     if want_component_grouping {
-        return list_artifacts_grouped_by_maven_component(
-            &artifact_service,
-            &state,
-            &repo,
-            &key,
-            query.path_prefix.as_deref(),
-            query.q.as_deref(),
-            query.cursor.as_deref(),
-            count_exact,
-            page,
-            per_page,
+        return with_member_scope_notice(
+            list_artifacts_grouped_by_maven_component(
+                &artifact_service,
+                &state,
+                &repo,
+                &key,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                query.cursor.as_deref(),
+                count_exact,
+                page,
+                per_page,
+                auth.as_ref(),
+            )
+            .await,
+            &state.db,
             auth.as_ref(),
+            &repo,
         )
         .await;
     }
@@ -5973,16 +6067,22 @@ pub async fn list_artifacts(
     let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
 
     if want_docker_grouping {
-        return list_artifacts_grouped_by_docker_tag(
-            &state,
-            &repo,
-            &key,
-            query.q.as_deref(),
-            query.cursor.as_deref(),
-            count_exact,
-            page,
-            per_page,
+        return with_member_scope_notice(
+            list_artifacts_grouped_by_docker_tag(
+                &state,
+                &repo,
+                &key,
+                query.q.as_deref(),
+                query.cursor.as_deref(),
+                count_exact,
+                page,
+                per_page,
+                auth.as_ref(),
+            )
+            .await,
+            &state.db,
             auth.as_ref(),
+            &repo,
         )
         .await;
     }
@@ -6183,6 +6283,7 @@ pub async fn list_artifacts(
     );
 
     Ok(Json(ArtifactListResponse {
+        notices: member_scope_notices(&state.db, auth.as_ref(), &repo).await,
         items,
         pagination: Pagination {
             page,
@@ -6281,6 +6382,7 @@ async fn list_remote_cached_artifacts(
         .collect();
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -6394,6 +6496,7 @@ async fn list_remote_cached_from_catalog(
         .collect();
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -7153,6 +7256,7 @@ async fn list_artifacts_grouped_by_maven_component(
         };
         let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
         return Ok(Json(ArtifactListResponse {
+            notices: Vec::new(),
             items: Vec::new(),
             pagination: Pagination {
                 page,
@@ -7254,6 +7358,7 @@ async fn list_artifacts_grouped_by_maven_component(
     .await?;
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -8016,6 +8121,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -13800,6 +13906,7 @@ mod tests {
     #[test]
     fn artifact_list_response_serializes_keyset_fields_when_present() {
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15711,6 +15818,7 @@ mod tests {
     #[test]
     fn test_artifact_list_response_without_components() {
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15745,6 +15853,7 @@ mod tests {
             last_promotion: None,
         };
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15778,6 +15887,7 @@ mod tests {
             last_promotion: None,
         };
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -31941,6 +32051,84 @@ mod virtual_member_visibility_tests {
     /// the same virtual already serves member bytes to such a token, so
     /// without it the listing returns `200 OK` with zero items while the
     /// download of those same items succeeds.
+    /// #4213 review: the notice must reach the FLAT artifacts listing, which
+    /// is the one #4130 is about. Only the grouped and remote branches were
+    /// wrapped, and the remote wrap was dead — a Remote repository is never
+    /// Virtual, so its count is always zero.
+    #[tokio::test]
+    async fn artifacts_listing_reports_members_dropped_by_token_scope() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+
+        // `insider` may read the private member; its token names the parent
+        // only, so that member is dropped and the listing must say so.
+        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
+        let (status, json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
+            .await;
+
+        // Same caller, member in scope: nothing to report.
+        let scoped_to_both = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
+        let (full_status, full_json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_both)
+            .await;
+
+        fx.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["notices"][0]["code"].as_str(),
+            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
+            "the flat artifacts listing must carry the notice: {json}"
+        );
+
+        assert_eq!(full_status, StatusCode::OK);
+        assert!(
+            full_json["notices"].is_null(),
+            "a token scoped to the member has nothing to be told: {full_json}"
+        );
+    }
+
+    /// #4213 review, after #3813: an INTERNAL member is not exempt from token
+    /// scope the way a public one is (an anonymous caller gets nothing from
+    /// it, so there is no baseline to protect). Dropped by the token's scope,
+    /// it must be reported like a private one, while the public member, which
+    /// passes the scope, is not counted.
+    #[tokio::test]
+    async fn notice_counts_an_internal_member_like_a_private_one() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.private_id)
+            .execute(&pool)
+            .await
+            .expect("make the member internal");
+
+        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
+        let (status, json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
+            .await;
+
+        fx.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["notices"][0]["code"].as_str(),
+            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
+            "an internal member dropped by token scope is reported: {json}"
+        );
+        assert!(
+            json["notices"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("1 member")),
+            "only the internal member counts; the public one passes the scope: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn members_endpoint_honours_token_scope_and_grants_3163() {
         let Some(pool) = tdh::try_pool().await else {
