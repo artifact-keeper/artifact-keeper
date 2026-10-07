@@ -137,12 +137,19 @@ fn lock_timeout_setting(timeout: Duration) -> String {
     format!("{ms}ms")
 }
 
-/// `true` when `err` is Postgres `lock_not_available` (SQLSTATE 55P03), which
-/// is what a lock wait that outlives `lock_timeout` raises.
-fn is_lock_timeout(err: &sqlx::Error) -> bool {
+/// `true` when `err` ended a lock wait because time ran out: `lock_timeout`
+/// (SQLSTATE 55P03 `lock_not_available`), or a role/database
+/// `statement_timeout` shorter than it (57014 `query_canceled`). Either way the
+/// holder is still working and the waiter should fetch on its own; neither is
+/// a lock-infrastructure failure.
+fn is_wait_expired(err: &sqlx::Error) -> bool {
     err.as_database_error()
         .and_then(|db| db.code())
-        .is_some_and(|code| code == "55P03")
+        .is_some_and(|code| is_wait_expiry_code(&code))
+}
+
+fn is_wait_expiry_code(code: &str) -> bool {
+    matches!(code, "55P03" | "57014")
 }
 
 /// Real PostgreSQL advisory-lock implementation (#1609).
@@ -228,7 +235,7 @@ impl ClusterLock for PgAdvisoryLock {
             }))),
             // The holder is still working after `timeout`: not an error, the
             // caller falls back to fetching on its own. `conn` closes here.
-            Err(e) if is_lock_timeout(&e) => Ok(None),
+            Err(e) if is_wait_expired(&e) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -501,8 +508,19 @@ mod tests {
 
     #[test]
     fn non_database_errors_are_not_lock_timeouts() {
-        assert!(!is_lock_timeout(&sqlx::Error::RowNotFound));
-        assert!(!is_lock_timeout(&sqlx::Error::PoolTimedOut));
+        assert!(!is_wait_expired(&sqlx::Error::RowNotFound));
+        assert!(!is_wait_expired(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[test]
+    fn statement_timeout_counts_as_an_expired_wait() {
+        assert!(is_wait_expiry_code("55P03"), "lock_timeout");
+        assert!(is_wait_expiry_code("57014"), "statement_timeout");
+        assert!(!is_wait_expiry_code("40P01"), "deadlock is a real error");
+        assert!(
+            !is_wait_expiry_code("08006"),
+            "connection failure is a real error"
+        );
     }
 
     #[tokio::test]
@@ -681,6 +699,46 @@ mod tests {
         assert!(
             freed,
             "the server must drop a cancelled waiter well before lock_timeout (60 s)"
+        );
+        held.release().await;
+    }
+    /// #4013 review: a session `statement_timeout` shorter than the wait
+    /// cancels `pg_advisory_lock` with 57014. That is an expired wait
+    /// (`Ok(None)`, fetch on our own), not a lock-infrastructure error.
+    #[tokio::test]
+    async fn pg_statement_timeout_ends_the_wait_like_lock_timeout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::str::FromStr;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let url = std::env::var("DATABASE_URL").expect("try_pool implies DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("url")
+            .options([("statement_timeout", "150")]);
+        let short = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("pool with a short statement_timeout");
+        let holder = PgAdvisoryLock::new(pool);
+        let waiter = PgAdvisoryLock::new(short);
+        let key = format!("proxy-cache:pgstmt-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let held = holder
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+        let started = std::time::Instant::now();
+        let got = waiter
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30))
+            .await
+            .expect("57014 maps to Ok(None), not Err");
+        assert!(got.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ended by statement_timeout, not lock_timeout"
         );
         held.release().await;
     }
