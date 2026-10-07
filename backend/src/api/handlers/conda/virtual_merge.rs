@@ -102,8 +102,134 @@ pub(super) fn channeldata_candidates() -> Vec<(String, FileCodec)> {
 pub(super) struct MemberFailure {
     /// The member repository's key.
     pub member: String,
+    /// Stable, low-cardinality class for the failure metric: `fetch`, `cap`,
+    /// `decode` or `parse`.
+    pub kind: &'static str,
     /// What went wrong, phrased for an operator reading a 502 body.
     pub reason: String,
+}
+
+/// `repository_config` key on a VIRTUAL repository that opts it into
+/// degraded merges (#4192). Absent or anything but `true`: strict.
+pub(super) const PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
+
+/// Response header naming the members a degraded merge left out.
+pub(super) const PARTIAL_MEMBERS_HEADER: &str = "x-ak-partial-members";
+
+/// What a virtual merge does when a member fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailurePolicy {
+    /// Any member failure fails the request with 502 naming the member. The
+    /// default: a merged index that silently lacks a member makes the client
+    /// conclude those packages do not exist, or resolve a name present in
+    /// two members to the lower-priority one.
+    Strict,
+    /// Serve the merge of the members that succeeded, marked partial and
+    /// uncacheable. Opt-in per virtual repository.
+    AllowPartial,
+}
+
+impl FailurePolicy {
+    pub(super) fn from_config(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("allow") => {
+                Self::AllowPartial
+            }
+            _ => Self::Strict,
+        }
+    }
+
+    /// Read the policy for `virtual_repo_id`. A failed read is strict: the
+    /// lookup failing must not loosen the guarantee.
+    pub(super) async fn load(db: &sqlx::PgPool, virtual_repo_id: uuid::Uuid) -> Self {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(virtual_repo_id)
+        .bind(PARTIAL_CONFIG_KEY)
+        .fetch_optional(db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "reading {PARTIAL_CONFIG_KEY} failed; using strict");
+            None
+        });
+        Self::from_config(value.as_deref())
+    }
+}
+
+/// Count every member failure (both policies) and turn the outcome into the
+/// response the policy calls for. `Ok(None)`: no failures, serve as usual.
+/// `Ok(Some(members))`: degraded, serve with the partial marking.
+/// `Err(502)`: strict and something failed.
+pub(super) fn apply_failure_policy(
+    policy: FailurePolicy,
+    virtual_repo_key: &str,
+    document: &str,
+    failed: &[MemberFailure],
+) -> Result<Option<String>, Response> {
+    if failed.is_empty() {
+        return Ok(None);
+    }
+    for f in failed {
+        metrics::counter!(
+            "ak_virtual_member_metadata_failures_total",
+            "format" => "conda",
+            "virtual_repo" => virtual_repo_key.to_string(),
+            "member" => f.member.clone(),
+            "reason" => f.kind,
+        )
+        .increment(1);
+        tracing::warn!(
+            virtual_repo = %virtual_repo_key,
+            member = %f.member,
+            document,
+            reason = %f.reason,
+            ?policy,
+            "conda virtual member could not contribute to the merged document"
+        );
+    }
+    match policy {
+        FailurePolicy::Strict => {
+            let detail = failed
+                .iter()
+                .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Virtual conda channel '{virtual_repo_key}' cannot serve {document}: {detail}"
+                ),
+            )
+                .into_response())
+        }
+        FailurePolicy::AllowPartial => Ok(Some(
+            failed
+                .iter()
+                .map(|f| f.member.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )),
+    }
+}
+
+/// Mark a degraded response: name the missing members, forbid caching (a
+/// partial document must never be cached as the complete one) and add a
+/// `Warning: 199`.
+pub(super) fn mark_partial(response: &mut Response, missing: &str) {
+    use axum::http::header::{CACHE_CONTROL, ETAG, WARNING};
+    use axum::http::HeaderValue;
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(missing) {
+        headers.insert(PARTIAL_MEMBERS_HEADER, v);
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.remove(ETAG);
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "199 - \"partial merge: members {missing} are missing\""
+    )) {
+        headers.insert(WARNING, v);
+    }
 }
 
 /// A remote member's document, decoded to JSON bytes.
@@ -166,12 +292,16 @@ pub(super) async fn fetch_member_document(
     candidates: &[(String, FileCodec)],
     limits: MemberLimits,
 ) -> Result<MemberDocument, MemberFailure> {
-    let fail = |reason: String| MemberFailure {
+    let fail = |kind: &'static str, reason: String| MemberFailure {
         member: member.key.clone(),
+        kind,
         reason,
     };
     let Some(upstream_url) = member.upstream_url.as_deref() else {
-        return Err(fail("remote member has no upstream URL".to_string()));
+        return Err(fail(
+            "fetch",
+            "remote member has no upstream URL".to_string(),
+        ));
     };
     let mut last_status = None;
     for (path, codec) in candidates {
@@ -204,36 +334,42 @@ pub(super) async fn fetch_member_document(
                     )
                 })
                 .await
-                .map_err(|e| fail(format!("decoder task failed: {e}")))?;
+                .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?;
                 return decoded
                     .map(|json| MemberDocument {
                         member: member.key.clone(),
                         json,
                     })
-                    .map_err(|e| fail(format!("{path}: {e}")));
+                    .map_err(|e| fail("decode", format!("{path}: {e}")));
             }
             Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
-                return Err(fail(format!(
-                    "{path} exceeds the {}-byte member ceiling ({MEMBER_MAX_BYTES_ENV})",
-                    limits.fetched
-                )));
+                return Err(fail(
+                    "cap",
+                    format!(
+                        "{path} exceeds the {}-byte member ceiling ({MEMBER_MAX_BYTES_ENV})",
+                        limits.fetched
+                    ),
+                ));
             }
             Err(response) if response.status() == StatusCode::NOT_FOUND => {
                 last_status = Some(response.status());
                 continue;
             }
             Err(response) => {
-                return Err(fail(format!(
-                    "{path}: upstream fetch failed with {}",
-                    response.status()
-                )));
+                return Err(fail(
+                    "fetch",
+                    format!("{path}: upstream fetch failed with {}", response.status()),
+                ));
             }
         }
     }
-    Err(fail(format!(
-        "no candidate document available upstream (last status {})",
-        last_status.map_or_else(|| "none".to_string(), |s| s.to_string())
-    )))
+    Err(fail(
+        "fetch",
+        format!(
+            "no candidate document available upstream (last status {})",
+            last_status.map_or_else(|| "none".to_string(), |s| s.to_string())
+        ),
+    ))
 }
 
 /// Fetch every remote member in `members` (already in priority order),
@@ -254,6 +390,7 @@ pub(super) async fn fetch_remote_members(
         let Some(proxy) = proxy else {
             failures.push(MemberFailure {
                 member: member.key.clone(),
+                kind: "fetch",
                 reason: "the proxy service is not available".to_string(),
             });
             continue;
@@ -357,6 +494,7 @@ pub(super) fn merge_repodata(
             Ok(p) => parsed.push(p),
             Err(e) => failures.push(MemberFailure {
                 member: doc.member.clone(),
+                kind: "parse",
                 reason: format!("repodata does not parse: {e}"),
             }),
         }
@@ -421,6 +559,7 @@ pub(super) fn merge_channeldata(
             Ok(p) => parsed.push(p),
             Err(e) => failures.push(MemberFailure {
                 member: doc.member.clone(),
+                kind: "parse",
                 reason: format!("channeldata does not parse: {e}"),
             }),
         }

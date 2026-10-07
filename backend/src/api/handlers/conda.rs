@@ -1266,8 +1266,16 @@ async fn channeldata_json(
     // Virtual repos: merge channeldata from all members
     if repo.repo_type == RepositoryType::Virtual {
         let merged = build_virtual_channeldata(&state, auth.as_ref(), repo.id).await?;
-        log_member_failures(&repo_key, "channeldata.json", &merged.failed);
-        return Ok(cacheable_response(merged.body, "application/json", &headers).await);
+        return serve_virtual_merge(
+            &state.db,
+            repo.id,
+            &repo_key,
+            "channeldata.json",
+            merged,
+            "application/json",
+            &headers,
+        )
+        .await;
     }
 
     // For remote repos, proxy channeldata from upstream.
@@ -1834,8 +1842,9 @@ async fn serve_repodata(
         let merged =
             build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir, encoding)
                 .await?;
-        log_member_failures(repo_key, encoding.upstream_filename(), &merged.failed);
-        return Ok(cacheable_response(merged.body, ct, headers).await);
+        let document = format!("{subdir}/{}", encoding.upstream_filename());
+        return serve_virtual_merge(&state.db, repo.id, repo_key, &document, merged, ct, headers)
+            .await;
     }
 
     // For remote repos, proxy repodata from upstream. Real conda-forge
@@ -2940,21 +2949,31 @@ async fn build_virtual_channeldata(
     })
 }
 
-/// Log the remote members a virtual merge had to leave out.
-fn log_member_failures(
+/// Serve a virtual merge under the repository's member-failure policy
+/// (#4192): strict by default (502 naming the failed members), or a degraded
+/// document marked partial and uncacheable when the virtual opts in through
+/// `repository_config` key [`virtual_merge::PARTIAL_CONFIG_KEY`].
+async fn serve_virtual_merge(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     document: &str,
-    failed: &[virtual_merge::MemberFailure],
-) {
-    for f in failed {
-        tracing::warn!(
-            virtual_repo = %virtual_repo_key,
-            member = %f.member,
-            document,
-            reason = %f.reason,
-            "conda virtual member could not contribute to the merged document"
-        );
+    merged: VirtualMerge,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let policy = if merged.failed.is_empty() {
+        virtual_merge::FailurePolicy::Strict
+    } else {
+        virtual_merge::FailurePolicy::load(db, virtual_repo_id).await
+    };
+    let partial =
+        virtual_merge::apply_failure_policy(policy, virtual_repo_key, document, &merged.failed)?;
+    let mut response = cacheable_response(merged.body, content_type, headers).await;
+    if let Some(missing) = partial {
+        virtual_merge::mark_partial(&mut response, &missing);
     }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -15035,5 +15054,115 @@ mod virtual_channel_tests {
             "{}",
             failure.reason
         );
+    }
+
+    #[test]
+    fn failure_policy_defaults_to_strict() {
+        use virtual_merge::FailurePolicy;
+        assert_eq!(FailurePolicy::from_config(None), FailurePolicy::Strict);
+        assert_eq!(
+            FailurePolicy::from_config(Some("false")),
+            FailurePolicy::Strict
+        );
+        assert_eq!(
+            FailurePolicy::from_config(Some("yes")),
+            FailurePolicy::Strict
+        );
+        assert_eq!(
+            FailurePolicy::from_config(Some(" TRUE ")),
+            FailurePolicy::AllowPartial
+        );
+        assert_eq!(
+            FailurePolicy::from_config(Some("allow")),
+            FailurePolicy::AllowPartial
+        );
+    }
+
+    /// Mount an upstream whose every repodata encoding fails with 500.
+    async fn broken_upstream() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// F3 (#4192): by default a member that cannot be fetched fails the
+    /// virtual request with 502 naming the member, for repodata and
+    /// channeldata alike, instead of serving a smaller index with 200.
+    #[tokio::test]
+    async fn failed_member_fails_the_virtual_request_by_default() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = broken_upstream().await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let remote_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.remote_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let (status, body, _) = rig
+            .get(format!("/{}/noarch/repodata.json", rig.virtual_key))
+            .await;
+        let (cd_status, cd_body, _) = rig
+            .get(format!("/{}/channeldata.json", rig.virtual_key))
+            .await;
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains(&remote_key),
+            "the 502 must name the member: {body}"
+        );
+        assert_eq!(cd_status, StatusCode::BAD_GATEWAY);
+        assert!(String::from_utf8_lossy(&cd_body).contains(&remote_key));
+    }
+
+    /// F3 (#4192): a virtual that opted into degraded merges serves what the
+    /// healthy members have, names the missing member, and forbids caching.
+    #[tokio::test]
+    async fn failed_member_is_served_partial_when_the_virtual_allows_it() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = broken_upstream().await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
+        )
+        .bind(rig.virtual_id)
+        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+        let remote_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.remote_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let (status, body, headers) = rig
+            .get(format!("/{}/noarch/repodata.json", rig.virtual_key))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed(&doc), vec!["acme-core-1.0-0.conda"]);
+        assert_eq!(
+            headers
+                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(remote_key.as_str())
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get("warning").is_some());
     }
 }
