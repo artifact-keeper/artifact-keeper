@@ -1130,7 +1130,9 @@ pub struct UpdateRepositoryRequest {
     /// `upstream_url_has_credentials`. Moving to a different origin
     /// (scheme, host or port) while upstream-auth credentials are configured
     /// is refused (409): remove them first, so they are never sent to a host
-    /// they were not configured for. Omit to leave the URL unchanged.
+    /// they were not configured for. Rotating embedded credentials keeps the
+    /// age gate's first-seen times and approvals; a host or path change starts
+    /// them afresh. Omit to leave the URL unchanged.
     pub upstream_url: Option<String>,
     /// Baseline read audience: `public`, `internal`, or `private`.
     ///
@@ -1487,27 +1489,30 @@ async fn with_repodata_depth(
     Ok(response)
 }
 
-/// Refusal for a PATCH that moves `upstream_url` to another origin while
-/// upstream-auth credentials are configured (#4467).
-const UPSTREAM_ORIGIN_CHANGE_WITH_AUTH: &str =
-    "upstream_url cannot move to a different origin (scheme, host or port) while upstream \
-     credentials are configured: remove them first (PUT /api/v1/repositories/{key}/upstream-auth \
-     with auth_type \"none\"), change upstream_url, then configure credentials for the new upstream";
-
-/// Whether replacing the stored upstream URL with `requested` changes its
-/// origin (scheme, host, port; userinfo, path and query do not count). An
-/// absent or unparseable URL on either side counts as a change (#4467).
-fn upstream_url_origin_changes(stored: Option<&str>, requested: &str) -> bool {
-    let origin = |url: &str| {
-        reqwest::Url::parse(url)
-            .ok()
-            .map(|u| u.origin())
-            .filter(|o| o.is_tuple())
-    };
-    match (stored.and_then(origin), origin(requested)) {
-        (Some(old), Some(new)) => old != new,
-        _ => true,
+/// The audit record of a PATCH's `upstream_url` change (#4467): both URLs with
+/// userinfo stripped, and whether the embedded credentials changed. `None`
+/// when the request did not change the URL.
+fn upstream_change_audit(
+    previous: Option<&str>,
+    requested: Option<&str>,
+) -> Option<audit_details::UpstreamChangeAudit> {
+    let requested = requested?;
+    if previous == Some(requested) {
+        return None;
     }
+    let strip = |url: &str| crate::services::proxy_service::strip_url_userinfo(url).0;
+    Some(audit_details::UpstreamChangeAudit {
+        previous_upstream_url: previous.map(strip),
+        upstream_url: Some(strip(requested)),
+        credentials_changed: previous.and_then(url_userinfo) != url_userinfo(requested),
+    })
+}
+
+/// The `userinfo` of a `scheme://userinfo@host/...` URL, if any.
+fn url_userinfo(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority.rsplit_once('@').map(|(userinfo, _)| userinfo)
 }
 
 /// Render a stored `upstream_url` for an API response (#4452): the URL with
@@ -3821,6 +3826,7 @@ pub async fn create_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: None,
             }),
     )
     .await;
@@ -4533,19 +4539,17 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
-    // #4467: an upstream URL change is applied (the service validates it like
-    // create does), but never silently re-targets stored upstream-auth
-    // credentials at a host they were not configured for.
-    if let Some(ref new_url) = payload.upstream_url {
-        if upstream_url_origin_changes(existing.upstream_url.as_deref(), new_url)
-            && crate::services::upstream_auth::get_upstream_auth_type(&state.db, existing.id)
-                .await?
-                .is_some()
-        {
-            return Err(AppError::Conflict(
-                UPSTREAM_ORIGIN_CHANGE_WITH_AUTH.to_string(),
-            ));
-        }
+    // #4467: an upstream URL change is applied. The service validates it like
+    // create does and refuses (409) an origin change while upstream-auth
+    // credentials are configured. Age-gate state still keyed by the old URL's
+    // pre-#4467 fingerprint moves first, so a credential rotation keeps it.
+    if payload.upstream_url.is_some() {
+        crate::services::age_gate_service::rekey_legacy_fingerprint(
+            &state.db,
+            existing.id,
+            existing.upstream_url.as_deref(),
+        )
+        .await?;
     }
 
     let repo = service
@@ -4883,6 +4887,10 @@ pub async fn update_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: upstream_change_audit(
+                    existing.upstream_url.as_deref(),
+                    payload.upstream_url.as_deref(),
+                ),
             }),
     )
     .await;
@@ -5600,6 +5608,7 @@ pub async fn delete_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: None,
             }),
     )
     .await;
@@ -27482,7 +27491,10 @@ mod tests {
             "https://UPSTREAM.example.com:443/other?x=1",
             "https://upstream.example.com",
         ] {
-            assert!(!upstream_url_origin_changes(old, same), "{same}");
+            assert!(
+                !crate::services::repository_service::upstream_url_origin_changes(old, same),
+                "{same}"
+            );
         }
         for moved in [
             "http://upstream.example.com/etag",
@@ -27490,12 +27502,44 @@ mod tests {
             "https://other.example.com/etag",
             "not a url",
         ] {
-            assert!(upstream_url_origin_changes(old, moved), "{moved}");
+            assert!(
+                crate::services::repository_service::upstream_url_origin_changes(old, moved),
+                "{moved}"
+            );
         }
-        assert!(upstream_url_origin_changes(
-            None,
-            "https://upstream.example.com"
-        ));
+        assert!(
+            crate::services::repository_service::upstream_url_origin_changes(
+                None,
+                "https://upstream.example.com"
+            )
+        );
+    }
+
+    #[test]
+    fn upstream_change_audit_redacts_and_flags_credential_changes_4467() {
+        let old = Some("https://alice:old@h.example.com/x");
+        assert_eq!(upstream_change_audit(old, None), None);
+        assert_eq!(upstream_change_audit(old, old), None);
+        let rotated =
+            upstream_change_audit(old, Some("https://alice:new@h.example.com/x")).expect("changed");
+        assert_eq!(
+            rotated.previous_upstream_url.as_deref(),
+            Some("https://h.example.com/x")
+        );
+        assert_eq!(
+            rotated.upstream_url.as_deref(),
+            Some("https://h.example.com/x")
+        );
+        assert!(rotated.credentials_changed);
+        let json = serde_json::to_string(&rotated).unwrap();
+        assert!(!json.contains("old") && !json.contains("new") && !json.contains("alice"));
+        let moved = upstream_change_audit(old, Some("https://alice:old@o.example.com/x")).unwrap();
+        assert!(!moved.credentials_changed);
+        assert_eq!(
+            moved.upstream_url.as_deref(),
+            Some("https://o.example.com/x")
+        );
+        assert!(upstream_change_audit(None, Some("https://h.example.com")).is_some());
     }
 
     #[test]

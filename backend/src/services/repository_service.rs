@@ -432,6 +432,29 @@ fn reject_url_controls_and_whitespace(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refusal for an update that moves `upstream_url` to another origin while
+/// upstream-auth credentials are configured (#4467).
+pub(crate) const UPSTREAM_ORIGIN_CHANGE_WITH_AUTH: &str =
+    "upstream_url cannot move to a different origin (scheme, host or port) while upstream \
+     credentials are configured: remove them first (PUT /api/v1/repositories/{key}/upstream-auth \
+     with auth_type \"none\"), change upstream_url, then configure credentials for the new upstream";
+
+/// Whether replacing the stored upstream URL with `requested` changes its
+/// origin (scheme, host, port; userinfo, path and query do not count). An
+/// absent or unparseable URL on either side counts as a change (#4467).
+pub(crate) fn upstream_url_origin_changes(stored: Option<&str>, requested: &str) -> bool {
+    let origin = |url: &str| {
+        reqwest::Url::parse(url)
+            .ok()
+            .map(|u| u.origin())
+            .filter(|o| o.is_tuple())
+    };
+    match (stored.and_then(origin), origin(requested)) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
+    }
+}
+
 /// Heuristic: a URL whose path or query names a mirrorlist/metalink endpoint.
 fn is_mirrorlist_or_metalink(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -1740,6 +1763,30 @@ impl RepositoryService {
         }
 
         let mut tx = self.db.begin().await?;
+        if let Some(ref new_url) = req.upstream_url {
+            // #4467: never re-target stored upstream-auth credentials at a host
+            // they were not configured for. Checked in this transaction with
+            // the repository row locked; `save_upstream_auth` takes a share
+            // lock on the same row, so a concurrent credential write either
+            // lands first (and this sees it) or waits for this commit.
+            let stored: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT upstream_url FROM repositories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored) = stored {
+                if upstream_url_origin_changes(stored.as_deref(), new_url)
+                    && crate::services::upstream_auth::get_upstream_auth_type_in(&mut tx, id)
+                        .await?
+                        .is_some()
+                {
+                    return Err(AppError::Conflict(
+                        UPSTREAM_ORIGIN_CHANGE_WITH_AUTH.to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(depth) = repodata_depth {
             // Re-sending the current depth is a no-op and must stay one: the
             // config write takes the exclusive layout lock, which would refuse

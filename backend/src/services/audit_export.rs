@@ -408,6 +408,19 @@ pub mod details {
         /// Names of the `scan_config` fields that changed.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub scan_config_changed: Option<Vec<String>>,
+        /// An `upstream_url` change on update (#4467), userinfo redacted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_change: Option<UpstreamChangeAudit>,
+    }
+
+    /// Before/after of a repository's upstream URL, with userinfo stripped
+    /// (#4462); `credentials_changed` says whether the embedded credentials
+    /// differ, without recording either value.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct UpstreamChangeAudit {
+        pub previous_upstream_url: Option<String>,
+        pub upstream_url: Option<String>,
+        pub credentials_changed: bool,
     }
 
     /// One repository scan configuration, as carried by a
@@ -1169,6 +1182,7 @@ mod tests {
             scan_config: None,
             previous_scan_config: None,
             scan_config_changed: None,
+            upstream_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

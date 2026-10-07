@@ -284,6 +284,15 @@ pub async fn save_upstream_auth(
     credentials_json: &str,
 ) -> Result<()> {
     let encrypted_hex = encrypt_credentials_hex(credentials_json, &encryption_key());
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let mut tx = db.begin().await.map_err(db_err)?;
+    // #4467: serialise with an `upstream_url` change, which holds this row
+    // FOR UPDATE while it checks whether credentials are configured.
+    sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR SHARE")
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
     // Upsert auth type
     sqlx::query(
@@ -293,7 +302,7 @@ pub async fn save_upstream_auth(
     )
     .bind(repo_id)
     .bind(auth_type)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -305,9 +314,11 @@ pub async fn save_upstream_auth(
     )
     .bind(repo_id)
     .bind(&encrypted_hex)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tx.commit().await.map_err(db_err)?;
 
     // Credentials just changed: drop any stale "no auth" cache entry so the
     // next load reflects them immediately instead of after the TTL.
@@ -335,11 +346,23 @@ pub async fn remove_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<()> {
 /// Check whether upstream auth is configured for a repository.
 /// Returns the auth type string (e.g. "basic", "bearer") or None.
 pub async fn get_upstream_auth_type(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    get_upstream_auth_type_in(&mut conn, repo_id).await
+}
+
+/// [`get_upstream_auth_type`] on a caller's connection or transaction.
+pub(crate) async fn get_upstream_auth_type_in(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+) -> Result<Option<String>> {
     let val: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_type'",
     )
     .bind(repo_id)
-    .fetch_optional(db)
+    .fetch_optional(conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .flatten();

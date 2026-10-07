@@ -283,6 +283,7 @@ mod tests {
                     scan_config: None,
                     previous_scan_config: None,
                     scan_config_changed: None,
+                    upstream_change: None,
                 }),
         ];
         for entry in &entries {
@@ -361,6 +362,7 @@ mod tests {
                 scan_config: Some(state("record_only")),
                 previous_scan_config: Some(state("fail_open")),
                 scan_config_changed: Some(vec!["proxy_scan_action".into()]),
+                upstream_change: None,
             })
             .unwrap(),
         );
