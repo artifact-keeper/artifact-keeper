@@ -952,65 +952,96 @@ fn tables_created(masked: &str) -> std::collections::BTreeSet<String> {
 /// that carries the timeouts those files lacked.
 const TIMEOUT_RULE_FROM: u32 = 270;
 
-/// Why a migration must bound its lock waits and statement time (#4153), or
-/// `None` when it need not.
+/// Why a migration must bound its lock waits, or is forbidden outright
+/// (#4153); `None` when it is fine.
 ///
-/// Two shapes qualify when they touch a [`HOT_TABLES`] entry outside a
+/// Three shapes qualify when they touch a [`HOT_TABLES`] entry outside a
 /// routine body:
 ///
-/// * a backfill: any `UPDATE <hot>` or `DELETE FROM <hot>`, batched or not.
-///   Row locks queue behind a long transaction like any other lock, and a
-///   batch that cannot get its rows must give up and retry rather than stall
-///   the deploy for the session's 5-minute `lock_timeout` (main.rs);
-/// * `CREATE TRIGGER … ON <hot>`: it takes `SHARE ROW EXCLUSIVE`, which queues
-///   behind any open transaction on the table and blocks every write behind
-///   it while it waits.
+/// * a backfill: any `UPDATE <hot>`, `DELETE FROM <hot>` or
+///   `INSERT INTO <hot> … SELECT`, batched or not. Row locks queue behind a
+///   long transaction like any other lock, and a batch that cannot get its
+///   rows must give up and retry rather than stall the deploy for the
+///   session's 5-minute `lock_timeout` (main.rs);
+/// * `CREATE [OR REPLACE | CONSTRAINT] TRIGGER … ON <hot>`: it takes
+///   `SHARE ROW EXCLUSIVE`, which queues behind any open transaction on the
+///   table and blocks every write behind it while it waits;
+/// * `ALTER TABLE <hot> DISABLE|ENABLE [ALWAYS|REPLICA] TRIGGER`: forbidden,
+///   timeouts or not. Besides the table lock, in a `-- no-transaction` file
+///   the disabled state commits and is visible to every session. Relax a
+///   trigger through its function instead (docs/operations/online-migrations.md).
 ///
-/// Such a migration must contain both `SET [LOCAL] lock_timeout` and
-/// `SET [LOCAL] statement_timeout`. Inside a batching `DO` block, `SET LOCAL`
-/// lasts until the batch's `COMMIT`, so it is repeated per batch.
+/// The first two must contain `SET [LOCAL] lock_timeout`. The check is
+/// file-level: it cannot tell whether the SET reaches every batch, so a file
+/// that sets it once and then COMMITs inside a DO block passes; the runbook's
+/// per-batch `SET LOCAL` is the author's responsibility. `statement_timeout`
+/// is deliberately not required: set inside a DO block it does not apply to
+/// the block's statements (the timer is armed per top-level statement), so the
+/// migration session's 30-minute `statement_timeout` is the only bound there.
 fn timeout_findings(masked: &str, hot: &std::collections::BTreeSet<&str>) -> Option<String> {
     let routines = routine_bodies(masked);
     let outside = |at: usize| !routines.iter().any(|(s, e)| at >= *s && at < *e);
-    let mut reasons = Vec::new();
-    for (opener, what) in [
-        ("UPDATE", "backfill"),
-        ("DELETE FROM", "backfill"),
-        ("CREATE TRIGGER", "trigger"),
-    ] {
+    let is_hot = |t: &Option<String>| t.as_deref().is_some_and(|t| hot.contains(t));
+    let mut reasons: Vec<String> = Vec::new();
+    let mut forbidden: Vec<String> = Vec::new();
+    for (offset, stmt) in statements(masked) {
+        let note = |list: &mut Vec<String>, at: usize, what: &str, table: Option<String>| {
+            if is_hot(&table) && outside(offset + at) {
+                let entry = format!("{what} on `{}`", table.unwrap_or_default());
+                if !list.contains(&entry) {
+                    list.push(entry);
+                }
+            }
+        };
+        for opener in ["UPDATE", "DELETE FROM"] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, opener, from) {
+                from = e;
+                note(&mut reasons, s, "backfill", identifier_after(stmt, e));
+            }
+        }
         let mut from = 0usize;
-        while let Some((s, e)) = find_phrase(masked, opener, from) {
+        while let Some((s, e)) = find_phrase(stmt, "INSERT INTO", from) {
             from = e;
-            let table = if what == "trigger" {
-                find_phrase(masked, "ON", e).and_then(|(_, on)| identifier_after(masked, on))
-            } else {
-                identifier_after(masked, e)
-            };
-            if let Some(t) = table.filter(|t| hot.contains(t.as_str()) && outside(s)) {
-                reasons.push(format!("{what} on `{t}`"));
+            if find_phrase(stmt, "SELECT", e).is_some() {
+                note(&mut reasons, s, "backfill", identifier_after(stmt, e));
+            }
+        }
+        for opener in [
+            "CREATE TRIGGER",
+            "CREATE OR REPLACE TRIGGER",
+            "CREATE CONSTRAINT TRIGGER",
+        ] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, opener, from) {
+                from = e;
+                let table =
+                    find_phrase(stmt, "ON", e).and_then(|(_, on)| identifier_after(stmt, on));
+                note(&mut reasons, s, "trigger", table);
+            }
+        }
+        for toggle in [
+            "DISABLE TRIGGER",
+            "ENABLE TRIGGER",
+            "ENABLE ALWAYS TRIGGER",
+            "ENABLE REPLICA TRIGGER",
+        ] {
+            let mut from = 0usize;
+            while let Some((s, e)) = find_phrase(stmt, toggle, from) {
+                from = e;
+                note(&mut forbidden, s, toggle, alter_target(stmt, s));
             }
         }
     }
-    if reasons.is_empty() {
+    if !forbidden.is_empty() {
+        return Some(format!("forbidden: {}", forbidden.join(", ")));
+    }
+    let sets_lock_timeout = find_phrase(masked, "SET LOCAL lock_timeout", 0).is_some()
+        || find_phrase(masked, "SET lock_timeout", 0).is_some();
+    if reasons.is_empty() || sets_lock_timeout {
         return None;
     }
-    let sets = |guc: &str| {
-        find_phrase(masked, &format!("SET LOCAL {guc}"), 0).is_some()
-            || find_phrase(masked, &format!("SET {guc}"), 0).is_some()
-    };
-    let missing: Vec<&str> = ["lock_timeout", "statement_timeout"]
-        .into_iter()
-        .filter(|guc| !sets(guc))
-        .collect();
-    if missing.is_empty() {
-        return None;
-    }
-    reasons.dedup();
-    Some(format!(
-        "{} without SET {}",
-        reasons.join(", "),
-        missing.join(" / ")
-    ))
+    Some(format!("{} without SET lock_timeout", reasons.join(", ")))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -1250,8 +1281,8 @@ mod tests {
     }
 
     /// #4153: a migration from [`TIMEOUT_RULE_FROM`] on that backfills a hot
-    /// table or creates a trigger on one must bound its lock waits and its
-    /// statement time.
+    /// table or creates a trigger on one must bound its lock waits, and none
+    /// may disable or enable a trigger on one.
     #[test]
     fn hot_table_backfills_and_triggers_set_timeouts() {
         let hot: std::collections::BTreeSet<&str> = HOT_TABLES.iter().map(|(t, _)| *t).collect();
@@ -1271,12 +1302,12 @@ mod tests {
         }
         assert!(
             bad.is_empty(),
-            "migration(s) backfill or add a trigger on a hot table without bounding \
-             their waits (#4153): {}\n\
-             Add `SET LOCAL lock_timeout = '5s'` and `SET LOCAL statement_timeout = ...` \
-             to every transaction that runs the statement (inside a batching DO block, \
-             once per batch, since COMMIT ends SET LOCAL), and retry a batch that hits \
-             lock_not_available instead of waiting. See \
+            "migration(s) touch a hot table without bounding their lock waits, or toggle \
+             a trigger on one (#4153): {}\n\
+             Add `SET LOCAL lock_timeout = '5s'` to every transaction that runs the \
+             statement (inside a batching DO block, once per batch, since COMMIT ends SET \
+             LOCAL), and retry a batch that hits lock_not_available instead of waiting. \
+             Never DISABLE/ENABLE TRIGGER: relax the trigger through its function. See \
              docs/operations/online-migrations.md.",
             bad.join("; ")
         );
@@ -1287,27 +1318,54 @@ mod tests {
         let hot: std::collections::BTreeSet<&str> = ["artifacts"].into_iter().collect();
         let check = |sql: &str| timeout_findings(&mask_sql(sql), &hot);
 
-        // Backfill and trigger shapes without timeouts are flagged.
+        // Backfill and trigger shapes without a lock timeout are flagged.
         let backfill = "DO $$ BEGIN LOOP UPDATE artifacts SET x = 1 WHERE id IN \
                         (SELECT id FROM artifacts LIMIT 10); COMMIT; END LOOP; END $$;";
         assert_eq!(
             check(backfill).as_deref(),
-            Some("backfill on `artifacts` without SET lock_timeout / statement_timeout")
+            Some("backfill on `artifacts` without SET lock_timeout")
         );
-        let trigger = "CREATE TRIGGER t BEFORE UPDATE ON artifacts \
-                       FOR EACH ROW EXECUTE FUNCTION f();";
-        assert!(check(trigger).unwrap().contains("trigger on `artifacts`"));
-        let half = format!("SET LOCAL lock_timeout = '5s'; {trigger}");
+        for trigger in [
+            "CREATE TRIGGER t BEFORE UPDATE ON artifacts FOR EACH ROW EXECUTE FUNCTION f();",
+            "CREATE OR REPLACE TRIGGER t BEFORE UPDATE ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION f();",
+            "CREATE CONSTRAINT TRIGGER t AFTER INSERT ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION f();",
+        ] {
+            assert_eq!(
+                check(trigger).as_deref(),
+                Some("trigger on `artifacts` without SET lock_timeout"),
+                "{trigger}"
+            );
+        }
         assert_eq!(
-            check(&half).as_deref(),
-            Some("trigger on `artifacts` without SET statement_timeout")
+            check("INSERT INTO artifacts (id) SELECT id FROM legacy;").as_deref(),
+            Some("backfill on `artifacts` without SET lock_timeout")
         );
+        // A plain VALUES insert is not a backfill.
+        assert_eq!(check("INSERT INTO artifacts (id) VALUES (1);"), None);
+
+        // Toggling a trigger on a hot table is forbidden, timeouts or not.
+        for toggle in [
+            "DISABLE TRIGGER t",
+            "ENABLE TRIGGER t",
+            "ENABLE ALWAYS TRIGGER t",
+        ] {
+            let sql = format!("SET LOCAL lock_timeout = '5s'; ALTER TABLE artifacts {toggle};");
+            assert!(
+                check(&sql).is_some_and(|w| w.starts_with("forbidden:")),
+                "{sql}"
+            );
+        }
 
         // Bounded, a cold table, a routine body, or a comment: not flagged.
-        let bounded =
-            format!("SET LOCAL lock_timeout = '5s'; SET statement_timeout = '1min'; {backfill}");
+        let bounded = format!("SET LOCAL lock_timeout = '5s'; {backfill}");
         assert_eq!(check(&bounded), None);
         assert_eq!(check("UPDATE system_settings SET v = 1;"), None);
+        assert_eq!(
+            check("ALTER TABLE system_settings DISABLE TRIGGER t;"),
+            None
+        );
         assert_eq!(
             check(
                 "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \

@@ -218,10 +218,12 @@ EXCLUSIVE`, which queues behind any open transaction and blocks every write
 behind it while it waits), must not sit on the migration session's 5-minute
 `lock_timeout`. From migration 270 on, a gate
 (`hot_table_backfills_and_triggers_set_timeouts`) requires any migration that
-backfills or adds a trigger to a hot table to set both `lock_timeout` and
-`statement_timeout`. In a batching `DO` block `SET LOCAL` ends at each
-`COMMIT`, so set them per batch, and retry a batch that hits
-`lock_not_available` rather than failing the deploy:
+backfills (`UPDATE`, `DELETE`, `INSERT … SELECT`) or creates a trigger
+(`CREATE [OR REPLACE | CONSTRAINT] TRIGGER`) on a hot table to set
+`lock_timeout`, and fails any `ALTER TABLE <hot table> DISABLE|ENABLE TRIGGER`.
+In a batching `DO` block `SET LOCAL` ends at each `COMMIT`, so set it per
+batch, and retry a batch that hits `lock_not_available` rather than failing
+the deploy:
 
 ```sql
 LOOP
@@ -229,7 +231,6 @@ LOOP
     LOOP
         BEGIN
             SET LOCAL lock_timeout = '5s';
-            SET LOCAL statement_timeout = '5min';
             -- one batch
             EXIT;
         EXCEPTION WHEN lock_not_available THEN
@@ -243,18 +244,29 @@ LOOP
 END LOOP;
 ```
 
+The gate checks only that the file sets `lock_timeout` somewhere; that the SET
+reaches every batch is the author's job.
+
+`statement_timeout` is **not** a per-batch bound here. PostgreSQL arms the
+statement timer once per top-level statement, and the whole `DO` block is one
+statement: a `SET LOCAL statement_timeout` inside it, before or after a
+`COMMIT`, does not apply to the statements that follow in the block. A batched
+`DO` migration is bounded only by the migration session's
+`statement_timeout = '30min'` (main.rs) over the whole file, so keep batches
+small and the total work well inside that.
+
 #### Rewriting `artifacts.origin`
 
 `artifacts.origin` is immutable by trigger (`ak_artifacts_origin_immutable`).
 Never `ALTER TABLE artifacts DISABLE TRIGGER` to rewrite it: the ALTER takes a
 table lock, and in a `-- no-transaction` file the disabled state commits and is
-visible to every session until re-enabled. Since migration 270 the trigger
-function honours a transaction-local GUC instead, and only for two shapes: a
-`hosted` -> `migration` re-stamp with the same `repository_key`, and a change
-of the `upstream_url` facet alone. Set it per batch with
-`SET LOCAL ak.origin_rewrite = 'on'`; it ends with the batch's `COMMIT`. A new
-kind of rewrite needs its own clause in the trigger function, reviewed like any
-other change to the immutability guarantee.
+visible to every session until re-enabled. Instead, open a window in the
+migration itself, as 270 and 271 do: `CREATE OR REPLACE` the trigger function
+with a clause that admits exactly the one rewrite the migration performs, and
+only on a transaction that set `SET LOCAL ak.origin_rewrite = 'on'`; run the
+batches with that GUC; and end the file by restoring the strict function from
+migration 227. A file interrupted mid-run leaves its narrow clause in place
+until it is re-run on the next boot.
 
 ### 5. Column type change
 
