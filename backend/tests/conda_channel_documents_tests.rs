@@ -145,11 +145,15 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
-    let pre_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
-    let bad_shard_hash = pre_index["shards"]["bad"]
-        .as_str()
-        .expect("pre-withdrawal shard index must list bad")
-        .to_string();
+    // CEP-16 carries the shard hashes as raw bytes: decode with rattler's type.
+    let pre_index: rattler_conda_types::ShardedRepodata =
+        rmp_serde::from_slice(&idx_msgpack).unwrap();
+    let bad_shard_hash = hex::encode(
+        pre_index
+            .shards
+            .get("bad")
+            .expect("pre-withdrawal shard index must list bad"),
+    );
 
     let status = withdraw(
         app.clone(),
@@ -304,13 +308,9 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
-    let post_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
-    let shard_names: Vec<&str> = post_index["shards"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(k, _)| k.as_str())
-        .collect();
+    let post_index: rattler_conda_types::ShardedRepodata =
+        rmp_serde::from_slice(&idx_msgpack).unwrap();
+    let shard_names: Vec<&str> = post_index.shards.keys().map(String::as_str).collect();
     assert_eq!(
         shard_names,
         vec!["good"],

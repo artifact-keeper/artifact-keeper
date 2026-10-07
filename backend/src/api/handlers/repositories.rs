@@ -1184,6 +1184,13 @@ pub struct UpdateRepositoryRequest {
     /// Only valid for remote repositories. Pass an empty string to remove.
     /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
     pub custom_user_agent: Option<String>,
+    /// Virtual repositories only: when a member's metadata cannot be fetched
+    /// or parsed, serve the merge of the members that succeeded (marked with
+    /// `X-AK-Partial-Members` and `Cache-Control: no-store`) instead of
+    /// failing with 502. Defaults to `false` (strict). Honoured by conda
+    /// virtual channels. Stored in `repository_config` under
+    /// `virtual_metadata_partial`.
+    pub virtual_metadata_partial: Option<bool>,
     /// Assign this repository to a project (#2472). P1 is set-only: omitting
     /// the field leaves the assignment unchanged (unassignment ships with the
     /// project-admin surface in P2).
@@ -4640,6 +4647,21 @@ pub async fn update_repository(
             repo.id,
             "quarantine_enabled",
             if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+
+    if let Some(allow) = payload.virtual_metadata_partial {
+        if repo.repo_type != RepositoryType::Virtual {
+            return Err(AppError::Validation(
+                "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+            ));
+        }
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "virtual_metadata_partial",
+            if allow { "true" } else { "false" },
         )
         .await?;
     }
@@ -28110,6 +28132,65 @@ mod tests {
         tdh::cleanup(&pool, remote_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// DB-backed: `virtual_metadata_partial` (#4192) is accepted on a virtual
+    /// repository and persisted, and refused with a 400 anywhere else.
+    #[tokio::test]
+    async fn test_virtual_metadata_partial_only_on_virtual_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "conda").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let stored = |repo_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'virtual_metadata_partial'",
+                )
+                .bind(repo_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query repository_config")
+            }
+        };
+
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(virtual_key.clone()),
+            Json(update(r#"{"virtual_metadata_partial":true}"#)),
+        )
+        .await
+        .expect("a virtual repository accepts virtual_metadata_partial");
+        let virtual_value = stored(virtual_id).await;
+
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(local_key.clone()),
+            Json(update(r#"{"virtual_metadata_partial":true}"#)),
+        )
+        .await
+        .expect_err("a local repository must refuse virtual_metadata_partial");
+        let local_value = stored(local_id).await;
+
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        assert_eq!(virtual_value.as_deref(), Some("true"));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(local_value, None);
     }
 
     /// DB-backed: the hosted types are untouched — enabling quarantine on a

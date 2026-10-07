@@ -74,6 +74,7 @@ use sha2::{Digest, Sha256};
 pub mod bundle_convert;
 pub mod cep27;
 pub mod identity;
+pub mod policy;
 pub mod rekor_glue;
 pub mod trust_root;
 
@@ -129,6 +130,11 @@ pub enum Check {
     /// unlike the shape check it replaces, satisfying it requires the signing
     /// key, not just a text editor.
     StatementPolicy = 8,
+    /// The DSSE envelope signature verifies under an operator-configured
+    /// public key (`CONDA_ATTESTATION_PUBLIC_KEYS`). Key-based bundles only:
+    /// it stands in for the Fulcio chain, transparency and issuer checks,
+    /// which a bundle with no certificate cannot carry.
+    KeySignature = 9,
 }
 
 impl Check {
@@ -147,6 +153,7 @@ impl Check {
             Check::IdentityExtracted => "identity",
             Check::PublisherOwnerBound => "identity binding",
             Check::StatementPolicy => "statement policy",
+            Check::KeySignature => "signature (trusted key)",
         }
     }
 }
@@ -199,6 +206,15 @@ pub const CONDA_CHECKS: &[Check] = &[
     Check::StatementPolicy,
 ];
 
+/// The checks a key-based CEP-27 bundle must pass: well-formed, bound to the
+/// package, signed by a configured key, and carrying the CEP-27 statement.
+pub const CONDA_KEY_CHECKS: &[Check] = &[
+    Check::BundleWellFormed,
+    Check::SubjectDigestBound,
+    Check::KeySignature,
+    Check::StatementPolicy,
+];
+
 /// Which ecosystem's attestation profile a bundle is being verified under.
 ///
 /// The two formats share [`CORE_CHECKS`] and differ only in the single check
@@ -210,6 +226,9 @@ pub enum AttestationFormat {
     Pypi,
     /// CEP-27 conda publish attestations (#4048).
     Conda,
+    /// CEP-27 conda publish attestations signed by a configured public key
+    /// rather than a Fulcio certificate.
+    CondaKey,
 }
 
 impl AttestationFormat {
@@ -218,6 +237,7 @@ impl AttestationFormat {
         match self {
             AttestationFormat::Pypi => ALL_CHECKS,
             AttestationFormat::Conda => CONDA_CHECKS,
+            AttestationFormat::CondaKey => CONDA_KEY_CHECKS,
         }
     }
 
@@ -271,6 +291,14 @@ pub struct AttestationVerdict {
     pub error: Option<String>,
     /// Coverage bitmask of checks that passed.
     pub checks_passed: u16,
+    /// How the bundle was verified: [`policy::KEYLESS_METHOD`] or
+    /// [`policy::KEY_METHOD`]. Present only on success.
+    pub method: Option<&'static str>,
+    /// Hex SHA-256 of the verifying key's SPKI — key-based success only.
+    pub key_fingerprint: Option<String>,
+    /// The in-toto `_type` of the verified statement (CEP-27 specifies v1;
+    /// `cosign attest-blob` still emits v0.1). Conda verification only.
+    pub statement_type: Option<String>,
 }
 
 impl AttestationVerdict {
@@ -284,6 +312,9 @@ impl AttestationVerdict {
             issuer: None,
             error: None,
             checks_passed: 0,
+            method: None,
+            key_fingerprint: None,
+            statement_type: None,
         }
     }
 
@@ -297,6 +328,9 @@ impl AttestationVerdict {
             issuer: None,
             error: Some(format!("{}: {}", check.reason_label(), reason.into())),
             checks_passed: mask,
+            method: None,
+            key_fingerprint: None,
+            statement_type: None,
         }
     }
 
@@ -310,6 +344,9 @@ impl AttestationVerdict {
             issuer: None,
             error: Some(reason.into()),
             checks_passed: 0,
+            method: None,
+            key_fingerprint: None,
+            statement_type: None,
         }
     }
 
@@ -339,6 +376,34 @@ impl AttestationVerdict {
             issuer: id.issuer.clone(),
             error: None,
             checks_passed: mask,
+            method: Some(policy::KEYLESS_METHOD),
+            key_fingerprint: None,
+            statement_type: None,
+        }
+    }
+
+    /// Mint a `Verified` verdict for a key-based bundle. The same structural
+    /// guard as [`Self::from_mask`]: every check in [`CONDA_KEY_CHECKS`] must
+    /// have run. The identity recorded is the key's operator-facing name and
+    /// the issuer is `key:<id>` — the key is the trust anchor, so it is what
+    /// names the publisher.
+    fn from_key_mask(mask: u16, key: &policy::TrustedKey) -> Self {
+        if mask != AttestationFormat::CondaKey.required_mask() {
+            return Self::failure(format!(
+                "internal: key verification reached finalize with incomplete coverage mask {mask:#b}"
+            ));
+        }
+        Self {
+            state: AttestationState::Verified,
+            identity: Some(key.name.clone()),
+            owner: None,
+            repository: None,
+            issuer: Some(format!("key:{}", key.id)),
+            error: None,
+            checks_passed: mask,
+            method: Some(policy::KEY_METHOD),
+            key_fingerprint: Some(key.fingerprint.clone()),
+            statement_type: None,
         }
     }
 
@@ -359,6 +424,9 @@ impl AttestationVerdict {
             issuer: Some(issuer.to_string()),
             error: None,
             checks_passed: format.required_mask(),
+            method: Some(policy::KEYLESS_METHOD),
+            key_fingerprint: None,
+            statement_type: None,
         }
     }
 
@@ -427,6 +495,7 @@ struct VerifiedCore {
 /// materialising it (the conda upload path, #4048). The hasher is cloned once
 /// for the hex compare and moved into `verify_digest`, which is byte-for-byte
 /// what the pre-split code did with two separate hashes of the same bytes.
+#[allow(clippy::result_large_err)]
 async fn verify_bundle_core(
     bundle_json: &Value,
     artifact_digest: Sha256,

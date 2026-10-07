@@ -49,12 +49,24 @@
 use serde_json::Value;
 use sha2::Sha256;
 
+use base64::Engine;
+
+use super::policy::{dsse_pae, glob_match, TrustedKey};
 use super::{
     AttestationFormat, AttestationState, AttestationVerdict, Check, TrustRoot, VerifiedCore,
 };
 
+/// The DSSE payload type of an in-toto Statement.
+const INTOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
+
 /// The in-toto Statement v1 type URI.
 pub const INTOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
+
+/// The legacy in-toto Statement v0.1 type URI. The layout (`subject`,
+/// `predicateType`, `predicate`) is identical to v1, the in-toto spec asks
+/// consumers to keep accepting it, and `cosign attest-blob` — the tool an
+/// on-premises CI uses to produce a key-based CEP-27 bundle — still emits it.
+pub const INTOTO_STATEMENT_V01: &str = "https://in-toto.io/Statement/v0.1";
 
 /// The CEP-27 predicate type for conda publish attestations.
 pub const CEP27_PREDICATE_TYPE: &str =
@@ -98,9 +110,10 @@ pub fn check_statement(
         .get("_type")
         .and_then(Value::as_str)
         .ok_or("attestation missing '_type' field")?;
-    if stmt_type != INTOTO_STATEMENT_V1 {
+    if stmt_type != INTOTO_STATEMENT_V1 && stmt_type != INTOTO_STATEMENT_V01 {
         return Err(format!(
-            "attestation _type must be '{INTOTO_STATEMENT_V1}', got '{stmt_type}'"
+            "attestation _type must be '{INTOTO_STATEMENT_V1}' (or the legacy \
+             '{INTOTO_STATEMENT_V01}'), got '{stmt_type}'"
         ));
     }
 
@@ -184,8 +197,14 @@ pub struct CondaVerifyInput<'a> {
     pub artifact_digest: Sha256,
     /// The package filename (matched against the statement subject name).
     pub expected_filename: &'a str,
-    /// OIDC issuer allowlist (use [`super::DEFAULT_ISSUER_ALLOWLIST`]).
+    /// OIDC issuer allowlist for keyless bundles
+    /// ([`super::policy::CondaTrustPolicy::issuers`]).
     pub issuer_allowlist: &'a [String],
+    /// Certificate identity patterns for keyless bundles; empty means any
+    /// identity the issuer vouches for.
+    pub identity_allowlist: &'a [String],
+    /// Public keys a key-based bundle may be signed with.
+    pub trusted_keys: &'a [TrustedKey],
 }
 
 /// Is this JSON a bare in-toto Statement rather than a Sigstore bundle?
@@ -210,6 +229,9 @@ pub async fn verify_conda_bundle(
 ) -> AttestationVerdict {
     if is_bare_statement(bundle_json) {
         return AttestationVerdict::failure(BARE_STATEMENT_REASON.to_string());
+    }
+    if is_key_bundle(bundle_json) {
+        return verify_conda_key_bundle(bundle_json, input);
     }
 
     let core = match super::verify_bundle_core(
@@ -236,7 +258,217 @@ pub async fn verify_conda_bundle(
     }
     mask |= Check::StatementPolicy.bit();
 
-    AttestationVerdict::from_mask(mask, AttestationFormat::Conda, &id)
+    // Operator identity allowlist (`CONDA_ATTESTATION_IDENTITIES`), checked on
+    // the certificate the chain already vouched for. Not a coverage bit: an
+    // unset allowlist is "any identity the issuer vouches for", and a record
+    // minted before the setting existed must keep its meaning.
+    let identity = id.san.first().cloned().unwrap_or_default();
+    if !input.identity_allowlist.is_empty()
+        && !input
+            .identity_allowlist
+            .iter()
+            .any(|p| glob_match(p, &identity))
+    {
+        return AttestationVerdict::failure(format!(
+            "identity: certificate identity `{identity}` is not on the allowlist"
+        ));
+    }
+
+    with_statement_type(
+        AttestationVerdict::from_mask(mask, AttestationFormat::Conda, &id),
+        &statement,
+    )
+}
+
+/// Record the verified statement's in-toto `_type` on a successful verdict.
+fn with_statement_type(mut verdict: AttestationVerdict, statement: &Value) -> AttestationVerdict {
+    if verdict.is_verified() {
+        verdict.statement_type = statement
+            .get("_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    verdict
+}
+
+/// Is this a key-based Sigstore bundle (a `publicKey` hint and no
+/// certificate)? `cosign attest-blob --key` produces exactly this shape.
+fn is_key_bundle(v: &Value) -> bool {
+    let vm = v.get("verificationMaterial");
+    vm.and_then(|m| m.get("publicKey")).is_some()
+        && vm
+            .and_then(|m| {
+                m.get("certificate")
+                    .or_else(|| m.get("x509CertificateChain"))
+            })
+            .is_none()
+}
+
+/// Verify a key-based CEP-27 bundle: DSSE signature under a configured key,
+/// subject bound to the package bytes this server hashed, CEP-27 statement.
+///
+/// No Fulcio chain and no transparency log are consulted — that is the point
+/// of the key-based path (on-premises CI with its own key, often with no
+/// route to a public log). The configured key is the whole trust anchor, so
+/// the checks that remain are exactly the ones that bind THAT key's signature
+/// to THESE bytes. Fail-closed, in [`super::CONDA_KEY_CHECKS`] order.
+fn verify_conda_key_bundle(bundle_json: &Value, input: CondaVerifyInput<'_>) -> AttestationVerdict {
+    let mut mask: u16 = 0;
+    let fail = |check: Check, mask: u16, why: String| AttestationVerdict::failed(check, mask, why);
+
+    // 1) Well-formed: a DSSE envelope with an in-toto payload and at least one
+    //    signature.
+    let Some(envelope) = bundle_json.get("dsseEnvelope") else {
+        return fail(
+            Check::BundleWellFormed,
+            mask,
+            "key-based bundle carries no dsseEnvelope".into(),
+        );
+    };
+    let payload_type = envelope
+        .get("payloadType")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if payload_type != INTOTO_PAYLOAD_TYPE {
+        return fail(
+            Check::BundleWellFormed,
+            mask,
+            format!(
+                "dsseEnvelope.payloadType must be '{INTOTO_PAYLOAD_TYPE}', got '{payload_type}'"
+            ),
+        );
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let payload = match envelope
+        .get("payload")
+        .and_then(Value::as_str)
+        .map(|p| b64.decode(p))
+    {
+        Some(Ok(p)) => p,
+        _ => {
+            return fail(
+                Check::BundleWellFormed,
+                mask,
+                "dsseEnvelope.payload is missing or not base64".into(),
+            )
+        }
+    };
+    let signatures: Vec<Vec<u8>> = envelope
+        .get("signatures")
+        .and_then(Value::as_array)
+        .map(|sigs| {
+            sigs.iter()
+                .filter_map(|s| s.get("sig").and_then(Value::as_str))
+                .filter_map(|s| b64.decode(s).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if signatures.is_empty() {
+        return fail(
+            Check::BundleWellFormed,
+            mask,
+            "dsseEnvelope carries no decodable signature".into(),
+        );
+    }
+    let statement: Value = match serde_json::from_slice(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            return fail(
+                Check::BundleWellFormed,
+                mask,
+                format!("DSSE payload is not JSON: {e}"),
+            )
+        }
+    };
+    mask |= Check::BundleWellFormed.bit();
+
+    // 2) Subject binding against the digest this server computed.
+    let artifact_sha256 = hex::encode(sha2::Digest::finalize(input.artifact_digest));
+    match super::subject_of(&statement) {
+        Some((name, sha)) if sha.eq_ignore_ascii_case(&artifact_sha256) => {
+            if name != input.expected_filename {
+                return fail(
+                    Check::SubjectDigestBound,
+                    mask,
+                    format!(
+                        "statement subject name `{name}` != package filename `{}`",
+                        input.expected_filename
+                    ),
+                );
+            }
+        }
+        Some((_, sha)) => {
+            return fail(
+                Check::SubjectDigestBound,
+                mask,
+                format!(
+                    "statement subject sha256 {} does not match package sha256 {}",
+                    super::short(sha),
+                    super::short(&artifact_sha256)
+                ),
+            )
+        }
+        None => {
+            return fail(
+                Check::SubjectDigestBound,
+                mask,
+                "statement carries no subject[0].digest.sha256".into(),
+            )
+        }
+    }
+    mask |= Check::SubjectDigestBound.bit();
+
+    // 3) Signature under a configured key. A bundle that names its key by
+    //    hint is only tried against that key, so a hint for an unknown key is
+    //    reported as such rather than as a bad signature.
+    if input.trusted_keys.is_empty() {
+        return fail(
+            Check::KeySignature,
+            mask,
+            "key-based attestation, but no CONDA_ATTESTATION_PUBLIC_KEYS are configured".into(),
+        );
+    }
+    let hint = bundle_json
+        .pointer("/verificationMaterial/publicKey/hint")
+        .and_then(Value::as_str)
+        .filter(|h| !h.is_empty());
+    let candidates: Vec<&TrustedKey> = match hint {
+        Some(h) => input.trusted_keys.iter().filter(|k| k.hint == h).collect(),
+        None => input.trusted_keys.iter().collect(),
+    };
+    if candidates.is_empty() {
+        return fail(
+            Check::KeySignature,
+            mask,
+            format!(
+                "bundle is signed by key hint `{}`, which is not a configured trusted key",
+                hint.unwrap_or_default()
+            ),
+        );
+    }
+    let pae = dsse_pae(payload_type, &payload);
+    let Some(key) = candidates.into_iter().find(|k| {
+        signatures.iter().any(|sig| {
+            k.key
+                .verify_signature(sigstore::crypto::Signature::Raw(sig), &pae)
+                .is_ok()
+        })
+    }) else {
+        return fail(
+            Check::KeySignature,
+            mask,
+            "DSSE signature does not verify under any configured trusted key".into(),
+        );
+    };
+    mask |= Check::KeySignature.bit();
+
+    // 4) CEP-27 statement policy on the payload the signature covers.
+    if let Err(e) = check_statement(&statement, input.expected_filename) {
+        return fail(Check::StatementPolicy, mask, e);
+    }
+    mask |= Check::StatementPolicy.bit();
+
+    with_statement_type(AttestationVerdict::from_key_mask(mask, key), &statement)
 }
 
 /// Build the JSON record of a conda verification, for persisting next to the
@@ -257,6 +489,9 @@ pub fn verification_record(
         "owner": verdict.owner,
         "error": verdict.error,
         "checks_passed": verdict.checks_passed,
+        "method": verdict.method,
+        "key_fingerprint": verdict.key_fingerprint,
+        "statement_type": verdict.statement_type,
         "verified_at": now.to_rfc3339(),
     })
 }
@@ -290,6 +525,12 @@ pub fn record_to_verdict(record: &Value, issuer_allowlist: &[String]) -> Attesta
                     .get("checks_passed")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as u16,
+                method: None,
+                key_fingerprint: None,
+                statement_type: record
+                    .get("statement_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             };
         }
         return AttestationVerdict::unverified();

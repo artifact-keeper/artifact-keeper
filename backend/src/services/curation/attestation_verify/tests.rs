@@ -949,6 +949,8 @@ fn conda_inp<'a>(bytes: &[u8], filename: &'a str, al: &'a [String]) -> CondaVeri
         artifact_digest: digest_of(bytes),
         expected_filename: filename,
         issuer_allowlist: al,
+        identity_allowlist: &[],
+        trusted_keys: &[],
     }
 }
 
@@ -1188,7 +1190,7 @@ fn statement_policy_rejects_every_malformed_shape() {
         (
             {
                 let mut s = valid_statement("pkg.conda", TEST_SHA);
-                s["_type"] = serde_json::json!("https://in-toto.io/Statement/v0.1");
+                s["_type"] = serde_json::json!("https://in-toto.io/Statement/v2");
                 s
             },
             "_type",
@@ -1415,4 +1417,247 @@ fn a_failed_record_stays_failed_and_an_absent_one_stays_unverified() {
     let v = record_to_verdict(&serde_json::json!({}), &allowlist());
     assert_eq!(v.state, AttestationState::Unverified);
     assert!(v.error.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// #4033: key-based CEP-27 bundles (`cosign attest-blob --key`) and the
+// operator trust policy.
+// ---------------------------------------------------------------------------
+
+/// A real `cosign attest-blob --key cosign.key --tlog-upload=false
+/// --new-bundle-format --type <CEP-27> --predicate predicate.json` bundle
+/// (cosign v3.1.3) over `acme-core-1.0-py_0.conda`, and the public key it was
+/// signed with. Proves the verifier accepts what the tool on-premises CI uses
+/// actually emits — including its legacy `Statement/v0.1` `_type`.
+const COSIGN_BUNDLE: &str =
+    include_str!("testdata/conda-key/acme-core-1.0-py_0.conda.cosign-bundle.json");
+const COSIGN_PUB: &str = include_str!("testdata/conda-key/cosign.pub");
+const COSIGN_PKG: &[u8] = include_bytes!("testdata/conda-key/acme-core-1.0-py_0.conda");
+const COSIGN_PKG_NAME: &str = "acme-core-1.0-py_0.conda";
+
+fn key_inp<'a>(
+    bytes: &[u8],
+    filename: &'a str,
+    keys: &'a [policy::TrustedKey],
+) -> CondaVerifyInput<'a> {
+    CondaVerifyInput {
+        artifact_digest: digest_of(bytes),
+        expected_filename: filename,
+        issuer_allowlist: &[],
+        identity_allowlist: &[],
+        trusted_keys: keys,
+    }
+}
+
+fn cosign_key() -> policy::TrustedKey {
+    policy::trusted_key_from_pem("acme-ci".into(), COSIGN_PUB).unwrap()
+}
+
+/// Mint a fresh P-256 key and a key-based bundle over `statement`, shaped
+/// exactly like cosign's.
+fn minted_bundle(statement: &Value) -> (policy::TrustedKey, Value) {
+    let signer = sigstore::crypto::SigningScheme::ECDSA_P256_SHA256_ASN1
+        .create_signer()
+        .unwrap();
+    let pem = signer
+        .to_sigstore_keypair()
+        .unwrap()
+        .public_key_to_pem()
+        .unwrap();
+    let key = policy::trusted_key_from_pem("minted".into(), &pem).unwrap();
+    let payload = serde_json::to_vec(statement).unwrap();
+    let pae = policy::dsse_pae("application/vnd.in-toto+json", &payload);
+    let sig = signer.sign(&pae).unwrap();
+    let bundle = serde_json::json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": { "publicKey": { "hint": key.hint } },
+        "dsseEnvelope": {
+            "payload": B64.encode(&payload),
+            "payloadType": "application/vnd.in-toto+json",
+            "signatures": [{ "sig": B64.encode(sig) }],
+        },
+    });
+    (key, bundle)
+}
+
+#[tokio::test]
+async fn real_cosign_key_bundle_verifies_under_its_configured_key() {
+    let keys = vec![cosign_key()];
+    let v = verify_conda_bundle(
+        &load(COSIGN_BUNDLE),
+        key_inp(COSIGN_PKG, COSIGN_PKG_NAME, &keys),
+        &trust(),
+    )
+    .await;
+    assert!(v.is_verified(), "{v:?}");
+    assert_eq!(v.method, Some(policy::KEY_METHOD));
+    assert_eq!(
+        v.key_fingerprint.as_deref(),
+        Some("8ef972c8a32ae9895a41291a27819c5d87681024e8fd9c553bea38db5e0b93ec")
+    );
+    assert_eq!(v.identity.as_deref(), Some("acme-ci"));
+    assert_eq!(v.issuer.as_deref(), Some("key:8ef972c8a32ae989"));
+    // The real cosign output is an in-toto Statement v0.1 with no tlog entry.
+    assert_eq!(
+        v.statement_type.as_deref(),
+        Some(cep27::INTOTO_STATEMENT_V01)
+    );
+    assert_eq!(
+        v.checks_passed,
+        AttestationFormat::CondaKey.required_mask(),
+        "every key-path check must have run"
+    );
+
+    // The persisted record carries the method and the key.
+    let record = verification_record(&v, Utc::now());
+    assert_eq!(record["method"], "sigstore-key");
+    assert_eq!(record["state"], "verified");
+    assert_eq!(
+        record["key_fingerprint"],
+        v.key_fingerprint.clone().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn key_bundle_is_rejected_for_the_wrong_key_package_or_payload() {
+    let t = trust();
+    let bundle = load(COSIGN_BUNDLE);
+
+    // No keys configured at all.
+    let v = verify_conda_bundle(&bundle, key_inp(COSIGN_PKG, COSIGN_PKG_NAME, &[]), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().contains("CONDA_ATTESTATION_PUBLIC_KEYS"));
+
+    // A different trusted key: the bundle's hint names a key we do not trust.
+    let (other, _) = minted_bundle(&cep27_statement(COSIGN_PKG_NAME, COSIGN_PKG));
+    let keys = vec![other];
+    let v = verify_conda_bundle(&bundle, key_inp(COSIGN_PKG, COSIGN_PKG_NAME, &keys), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().contains("not a configured trusted key"));
+
+    // Same key, but no hint: tried against the wrong key, the signature fails.
+    let mut no_hint = bundle.clone();
+    no_hint["verificationMaterial"]["publicKey"]["hint"] = Value::String(String::new());
+    let v = verify_conda_bundle(&no_hint, key_inp(COSIGN_PKG, COSIGN_PKG_NAME, &keys), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().starts_with("signature (trusted key)"));
+
+    // Right key, different package bytes: the subject binding fails first.
+    let keys = vec![cosign_key()];
+    let v = verify_conda_bundle(
+        &bundle,
+        key_inp(b"tampered package", COSIGN_PKG_NAME, &keys),
+        &t,
+    )
+    .await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().starts_with("subject binding"));
+
+    // Right key, payload rewritten (subject unchanged in meaning, bytes not):
+    // the DSSE signature no longer covers it.
+    let mut tampered = bundle.clone();
+    let payload = B64
+        .decode(tampered["dsseEnvelope"]["payload"].as_str().unwrap())
+        .unwrap();
+    let mut statement: Value = serde_json::from_slice(&payload).unwrap();
+    statement["predicate"]["targetChannel"] = Value::String("https://evil.example".into());
+    tampered["dsseEnvelope"]["payload"] =
+        Value::String(B64.encode(serde_json::to_vec(&statement).unwrap()));
+    let v = verify_conda_bundle(&tampered, key_inp(COSIGN_PKG, COSIGN_PKG_NAME, &keys), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().starts_with("signature (trusted key)"));
+}
+
+#[tokio::test]
+async fn minted_key_bundle_enforces_the_cep27_statement() {
+    let t = trust();
+    let filename = "acme-fastmath-2.0-h1234_0.conda";
+    let bytes = b"fastmath bytes";
+
+    let (key, good) = minted_bundle(&cep27_statement(filename, bytes));
+    let keys = vec![key];
+    let v = verify_conda_bundle(&good, key_inp(bytes, filename, &keys), &t).await;
+    assert!(v.is_verified(), "{v:?}");
+    assert_eq!(
+        v.statement_type.as_deref(),
+        Some(cep27::INTOTO_STATEMENT_V1)
+    );
+
+    // The same statement as v0.1 (what `cosign attest-blob` emits) verifies.
+    let mut legacy = cep27_statement(filename, bytes);
+    legacy["_type"] = Value::String(cep27::INTOTO_STATEMENT_V01.into());
+    let (key, bundle) = minted_bundle(&legacy);
+    let keys = vec![key];
+    let v = verify_conda_bundle(&bundle, key_inp(bytes, filename, &keys), &t).await;
+    assert!(v.is_verified(), "{v:?}");
+    assert_eq!(
+        v.statement_type.as_deref(),
+        Some(cep27::INTOTO_STATEMENT_V01)
+    );
+
+    // Signed, bound to the bytes, but not a CEP-27 predicate.
+    let mut wrong_type = cep27_statement(filename, bytes);
+    wrong_type["predicateType"] = Value::String("https://slsa.dev/provenance/v1".into());
+    let (key, bundle) = minted_bundle(&wrong_type);
+    let keys = vec![key];
+    let v = verify_conda_bundle(&bundle, key_inp(bytes, filename, &keys), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().starts_with("statement policy"));
+
+    // Signed for a different filename.
+    let (key, bundle) = minted_bundle(&cep27_statement("other-1.0-0.conda", bytes));
+    let keys = vec![key];
+    let v = verify_conda_bundle(&bundle, key_inp(bytes, filename, &keys), &t).await;
+    assert!(!v.is_verified());
+    assert!(v.error.unwrap().starts_with("subject binding"));
+}
+
+#[test]
+fn trust_policy_parses_keys_identities_and_defaults() {
+    let p = policy::CondaTrustPolicy::from_parts(&[], &[], &[]);
+    assert_eq!(
+        p.issuers,
+        vec!["https://token.actions.githubusercontent.com".to_string()]
+    );
+    assert!(p.identity_allowed("anything"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("release-signing.pub");
+    std::fs::write(&path, COSIGN_PUB).unwrap();
+    let p = policy::CondaTrustPolicy::from_parts(
+        &["https://gitlab.example.internal".into()],
+        &["https://gitlab.example.internal/acme/*@refs/heads/main".into()],
+        &[
+            path.to_string_lossy().into_owned(),
+            format!("named={}", path.display()),
+            COSIGN_PUB.to_string(),
+            "/does/not/exist.pub".into(),
+            "not a key".into(),
+        ],
+    );
+    assert_eq!(
+        p.issuers,
+        vec!["https://gitlab.example.internal".to_string()]
+    );
+    let names: Vec<&str> = p.keys.iter().map(|k| k.name.as_str()).collect();
+    assert_eq!(names, vec!["release-signing", "named", "inline-2"]);
+    assert_eq!(p.key_errors.len(), 2, "{:?}", p.key_errors);
+    assert!(p.keys.iter().all(|k| k.algorithm == "ecdsa-p256-sha256"));
+    assert!(p.identity_allowed("https://gitlab.example.internal/acme/pkgs@refs/heads/main"));
+    assert!(!p.identity_allowed("https://gitlab.example.internal/acme/pkgs@refs/heads/dev"));
+    assert!(!p.identity_allowed("https://gitlab.example.internal/evil/x@refs/heads/main/acme/"));
+}
+
+#[test]
+fn glob_match_is_anchored() {
+    use policy::glob_match;
+    assert!(glob_match("*", ""));
+    assert!(glob_match("a*b", "ab"));
+    assert!(glob_match("a*b", "axxb"));
+    assert!(!glob_match("a*b", "axxbc"));
+    assert!(!glob_match("ab*ba", "aba"));
+    assert!(glob_match("x*y*z", "x1y2z"));
+    assert!(!glob_match("x*y*z", "x1z"));
+    assert!(glob_match("exact", "exact"));
+    assert!(!glob_match("exact", "exactly"));
 }

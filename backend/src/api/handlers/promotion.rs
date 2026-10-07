@@ -73,6 +73,26 @@ pub struct PromotionResponse {
     pub promotion_id: Option<Uuid>,
     pub policy_violations: Vec<PolicyViolation>,
     pub message: Option<String>,
+    /// Every gate rule the promotion was evaluated against, passed or not,
+    /// with the reason: `[{"rule","passed","reason"}]`. Empty when the policy
+    /// check was skipped or never reached.
+    pub gate_results: Vec<GateResult>,
+}
+
+pub use crate::services::promotion_policy_service::GateResult;
+
+/// Failing per-pair promotion rules as failed [`GateResult`]s.
+fn rule_failures_to_gate_results(
+    failing: &[crate::services::promotion_rule_service::RuleEvaluationResult],
+) -> Vec<GateResult> {
+    failing
+        .iter()
+        .map(|e| GateResult {
+            rule: e.rule_name.clone(),
+            passed: false,
+            reason: e.violations.join("; "),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -707,6 +727,7 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
         promotion_id: None,
         policy_violations: vec![],
         message: Some(message),
+        gate_results: vec![],
     }
 }
 
@@ -739,11 +760,17 @@ enum BulkItemScreening {
     Proceed {
         violations: Vec<PolicyViolation>,
         policy_result: serde_json::Value,
+        /// Every gate rule evaluated for the item, passed or not.
+        gate_results: Vec<GateResult>,
     },
     /// The item fails with `message`; the batch continues.
     Refused {
         message: String,
         violations: Vec<PolicyViolation>,
+        /// Every gate rule evaluated before the refusal, passed or not, so a
+        /// bulk item reports the same per-rule decision a single promotion
+        /// does.
+        gate_results: Vec<GateResult>,
     },
 }
 
@@ -763,8 +790,14 @@ fn screen_bulk_item(
     >,
 ) -> BulkItemScreening {
     if let GateOutcome::Block(ref eval) = gate_outcome {
+        let message = gate_block_message(eval);
         return BulkItemScreening::Refused {
-            message: gate_block_message(eval),
+            gate_results: vec![GateResult {
+                rule: "quality-gate".to_string(),
+                passed: false,
+                reason: message.clone(),
+            }],
+            message,
             violations: vec![],
         };
     }
@@ -773,6 +806,7 @@ fn screen_bulk_item(
     // the full evaluation when the policy ran, the empty pass otherwise.
     let mut violations: Vec<PolicyViolation> = vec![];
     let mut policy_result = serde_json::json!({"passed": true, "violations": []});
+    let mut gate_results: Vec<GateResult> = vec![];
 
     match policy {
         None => {}
@@ -780,6 +814,7 @@ fn screen_bulk_item(
             return BulkItemScreening::Refused {
                 message: format!("Policy evaluation failed: {}", e),
                 violations: vec![],
+                gate_results: vec![],
             };
         }
         Some(Ok(eval_result)) => {
@@ -793,10 +828,12 @@ fn screen_bulk_item(
                 })
                 .collect();
             policy_result = build_policy_result_json(&eval_result);
+            gate_results = eval_result.gate_results.clone();
             if !eval_result.passed && eval_result.action == PolicyAction::Block {
                 return BulkItemScreening::Refused {
                     message: "Promotion blocked by policy violations".to_string(),
                     violations,
+                    gate_results,
                 };
             }
         }
@@ -813,6 +850,7 @@ fn screen_bulk_item(
     BulkItemScreening::Proceed {
         violations,
         policy_result,
+        gate_results,
     }
 }
 
@@ -862,6 +900,22 @@ async fn insert_promoted_artifact_row(
         uploaded_by,
         origin
     )
+    .execute(db)
+    .await?;
+
+    // Carry the format metadata document across (F9). The copy is a new
+    // artifact row, and everything format handlers serve about it is read
+    // from `artifact_metadata` keyed by THAT row: a conda channel builds each
+    // repodata record (depends, constrains, md5, license, the CEP-50
+    // attestation sidecar and its verdict) from it. Without the copy a
+    // promoted package was served with no dependencies and no attestation.
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         SELECT $1, format, metadata FROM artifact_metadata WHERE artifact_id = $2 \
+         ON CONFLICT (artifact_id) DO NOTHING",
+    )
+    .bind(new_artifact_id)
+    .bind(artifact.id)
     .execute(db)
     .await
     .map(|_| ())
@@ -1032,6 +1086,7 @@ pub async fn promote_artifact(
         super::approval::check_approval_required(&state.db, source_repo.id).await?;
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
+    let mut gate_results: Vec<GateResult> = vec![];
     // #4203: an admin's skip_policy_check override is recorded in the audit
     // trail as exactly that — not as a policy that ran and passed.
     let mut policy_result_json = if req.skip_policy_check {
@@ -1064,6 +1119,7 @@ pub async fn promote_artifact(
             .collect();
 
         policy_result_json = build_policy_result_json(&eval_result);
+        gate_results = eval_result.gate_results.clone();
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
@@ -1073,6 +1129,7 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
+                gate_results,
             }));
         }
     }
@@ -1097,6 +1154,10 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations: rule_violations_to_policy_violations(&failing),
                 message: Some("Promotion blocked by promotion rule violations".to_string()),
+                gate_results: gate_results
+                    .into_iter()
+                    .chain(rule_failures_to_gate_results(&failing))
+                    .collect(),
             }));
         }
     }
@@ -1230,12 +1291,14 @@ pub async fn promote_artifact(
     // gate configured to `warn` visible to the caller at all. Before this was
     // wired the vector was pushed to and then dropped, so every successful
     // promotion reported an empty list no matter what the gate found.
-    Ok(Json(build_success_response(
+    let mut response = build_success_response(
         build_promotion_source_display(&repo_key, &artifact.path),
         build_promotion_target_display(&target_key, &artifact.path),
         promotion_id,
         policy_violations,
-    )))
+    );
+    response.gate_results = gate_results;
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1410,19 +1473,22 @@ pub async fn promote_artifacts_bulk(
             )
         };
 
-        let (item_violations, screening_policy_result) =
+        let (item_violations, screening_policy_result, item_gate_results) =
             match screen_bulk_item(gate_outcome, policy) {
                 BulkItemScreening::Proceed {
                     violations,
                     policy_result,
-                } => (violations, policy_result),
+                    gate_results,
+                } => (violations, policy_result, gate_results),
                 BulkItemScreening::Refused {
                     message,
                     violations,
+                    gate_results,
                 } => {
                     failed += 1;
                     let mut resp = failed_response(source_display, target_display, message);
                     resp.policy_violations = violations;
+                    resp.gate_results = gate_results;
                     results.push(resp);
                     continue;
                 }
@@ -1457,6 +1523,11 @@ pub async fn promote_artifacts_bulk(
                         "Promotion blocked by promotion rule violations".to_string(),
                     );
                     resp.policy_violations = rule_violations_to_policy_violations(&failing);
+                    resp.gate_results = item_gate_results
+                        .iter()
+                        .cloned()
+                        .chain(rule_failures_to_gate_results(&failing))
+                        .collect();
                     results.push(resp);
                     continue;
                 }
@@ -1611,6 +1682,7 @@ pub async fn promote_artifacts_bulk(
             promotion_id: Some(promotion_id),
             policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
+            gate_results: item_gate_results,
         });
     }
 
@@ -2139,6 +2211,7 @@ pub fn validate_release_target_link(
         BulkPromoteRequest,
         PromotionResponse,
         PolicyViolation,
+        GateResult,
         BulkPromotionResponse,
         RejectArtifactRequest,
         RejectionResponse,
@@ -2197,6 +2270,7 @@ fn build_success_response(
         promotion_id: Some(promotion_id),
         policy_violations,
         message: Some("Artifact promoted successfully".to_string()),
+        gate_results: vec![],
     }
 }
 
@@ -3213,6 +3287,43 @@ mod tests {
     // screen_bulk_item (per-item gate + policy decision on the bulk path, #3977)
     // -----------------------------------------------------------------------
 
+    /// F18: a bulk item refused by a scan-policy predicate reports the same
+    /// per-rule gate results the single route returns, passed rules included,
+    /// and a promoted item reports its passed rules too.
+    #[test]
+    fn screen_bulk_item_carries_every_gate_result() {
+        let gate = |rule: &str, passed: bool| GateResult {
+            rule: rule.to_string(),
+            passed,
+            reason: format!("{rule} {passed}"),
+        };
+        let mut blocked = policy_eval(false, PolicyAction::Block, &["policy-predicate"]);
+        blocked.gate_results = vec![
+            gate("cve-severity-threshold", true),
+            gate("license-compliance", true),
+            gate("policy-predicate", false),
+        ];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(blocked))) {
+            BulkItemScreening::Refused { gate_results, .. } => {
+                assert_eq!(gate_results.len(), 3);
+                assert!(gate_results
+                    .iter()
+                    .any(|g| g.rule == "policy-predicate" && !g.passed));
+                assert!(gate_results.iter().filter(|g| g.passed).count() == 2);
+            }
+            _ => panic!("a predicate block must refuse the item"),
+        }
+
+        let mut clean = policy_eval(true, PolicyAction::Allow, &[]);
+        clean.gate_results = vec![gate("require-signature", true)];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(clean))) {
+            BulkItemScreening::Proceed { gate_results, .. } => {
+                assert_eq!(gate_results, vec![gate("require-signature", true)]);
+            }
+            _ => panic!("a clean item must proceed"),
+        }
+    }
+
     fn policy_eval(
         passed: bool,
         action: PolicyAction,
@@ -3234,6 +3345,7 @@ mod tests {
                 .collect(),
             cve_summary: None,
             license_summary: None,
+            gate_results: vec![],
         }
     }
 
@@ -3249,6 +3361,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(message, expected);
                 assert!(violations.is_empty());
@@ -3278,6 +3391,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(message, "Promotion blocked by policy violations");
                 assert_eq!(
@@ -3297,6 +3411,7 @@ mod tests {
             BulkItemScreening::Refused {
                 message,
                 violations,
+                ..
             } => {
                 assert_eq!(
                     message,
@@ -3320,6 +3435,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert_eq!(rules_of(&violations), vec!["max_cve_severity"]);
                 assert_eq!(policy_result["passed"], false);
@@ -3357,6 +3473,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert_eq!(rules_of(&violations), vec!["min_health_score"]);
                 assert_eq!(
@@ -3375,6 +3492,7 @@ mod tests {
             BulkItemScreening::Proceed {
                 violations,
                 policy_result,
+                ..
             } => {
                 assert!(violations.is_empty());
                 assert_eq!(policy_result["passed"], true);
@@ -3505,8 +3623,21 @@ mod tests {
             promotion_id: Some(Uuid::nil()),
             policy_violations: vec![],
             message: Some("OK".to_string()),
+            gate_results: vec![GateResult {
+                rule: "require-signature".to_string(),
+                passed: true,
+                reason: "verified CEP-27 attestation".to_string(),
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["gate_results"],
+            serde_json::json!([{
+                "rule": "require-signature",
+                "passed": true,
+                "reason": "verified CEP-27 attestation"
+            }])
+        );
         assert_eq!(json["promoted"], true);
         assert_eq!(json["source"], "staging/lib.jar");
         assert_eq!(json["target"], "release/lib.jar");
@@ -4819,6 +4950,131 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- F9: promotion carries the artifact's metadata --------------------
+
+        /// Seed a conda artifact with the metadata document a conda upload and
+        /// an attestation upload write (depends, md5, attestation + verdict).
+        async fn make_conda_artifact_with_metadata(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            filename: &str,
+        ) -> (Uuid, serde_json::Value) {
+            let path = format!("noarch/{filename}");
+            let id = make_maven_artifact(pool, repo_id, storage, &path).await;
+            let metadata = serde_json::json!({
+                "name": "acme-core",
+                "version": "1.0",
+                "build": "py_0",
+                "subdir": "noarch",
+                "depends": ["python >=3.10", "rich"],
+                "md5": "0123456789abcdef0123456789abcdef",
+                "license": "BSD-3-Clause",
+                "attestation": {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"},
+                "attestation_verification": {"state": "verified", "method": "sigstore-key"},
+            });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'conda', $2)",
+            )
+            .bind(id)
+            .bind(&metadata)
+            .execute(pool)
+            .await
+            .expect("insert conda metadata");
+            (id, metadata)
+        }
+
+        async fn target_metadata(
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+        ) -> Option<serde_json::Value> {
+            sqlx::query_scalar(
+                "SELECT am.metadata FROM artifacts a \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+            )
+            .bind(repo)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .expect("query target metadata")
+        }
+
+        /// F9: a promoted conda package keeps its `depends`, `md5` and
+        /// attestation. The copy is a new `artifacts` row, and the target
+        /// channel's repodata is built from that row's `artifact_metadata`,
+        /// so a copy without it is served with no dependencies at all.
+        #[tokio::test]
+        async fn test_promotion_copies_artifact_metadata() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (src, src_key, sdir) = tdh::create_repo(&pool, "staging", "conda").await;
+            let (tgt, tgt_key, tdir) = tdh::create_repo(&pool, "local", "conda").await;
+            let user = make_admin(&pool, "f9meta").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (single, metadata) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-core-1.0-py_0.conda")
+                    .await;
+            let (bulk, _) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-util-1.0-py_0.conda")
+                    .await;
+
+            let single_res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), single)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("single promote");
+            let bulk_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![bulk],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote");
+            let single_meta = target_metadata(&pool, tgt, "noarch/acme-core-1.0-py_0.conda").await;
+            let bulk_meta = target_metadata(&pool, tgt, "noarch/acme-util-1.0-py_0.conda").await;
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(single_res.0.promoted, "{:?}", single_res.0.message);
+            assert_eq!(bulk_res.0.promoted, 1, "{:?}", bulk_res.0.results);
+            assert_eq!(
+                single_meta.as_ref(),
+                Some(&metadata),
+                "the promoted copy must carry the source's metadata"
+            );
+            let bulk_meta = bulk_meta.expect("bulk copy must carry metadata");
+            for key in [
+                "build",
+                "depends",
+                "md5",
+                "license",
+                "attestation",
+                "attestation_verification",
+            ] {
+                assert_eq!(bulk_meta[key], metadata[key], "bulk copy lost `{key}`");
+            }
         }
 
         // ---- promoted artifact must appear in the target's prefixes.txt ------

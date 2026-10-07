@@ -175,6 +175,32 @@ enum CondaAttestationFact {
     Verified,
 }
 
+/// Map a recorded attestation state to the predicate fact. `unverified` and
+/// `failed` (and anything unknown) are both "present but unverified": the
+/// vocabulary distinguishes absence from a record that exists but did not (or
+/// did not yet) pass verification.
+fn attestation_fact(state: Option<&str>) -> CondaAttestationFact {
+    match state {
+        None => CondaAttestationFact::Absent,
+        Some("verified") => CondaAttestationFact::Verified,
+        Some(_) => CondaAttestationFact::PresentUnverified,
+    }
+}
+
+/// Combine the curation record and the upload-time record: absent only when
+/// both are absent, verified only when every record present is verified.
+fn fold_attestation_facts(
+    a: CondaAttestationFact,
+    b: CondaAttestationFact,
+) -> CondaAttestationFact {
+    use CondaAttestationFact::*;
+    match (a, b) {
+        (Absent, x) | (x, Absent) => x,
+        (Verified, Verified) => Verified,
+        _ => PresentUnverified,
+    }
+}
+
 /// The conda facts one artifact carries, assembled once per
 /// `evaluate_artifact` call and only when an applicable policy actually
 /// configures conda predicates (so policy-free repos pay zero extra queries).
@@ -491,6 +517,96 @@ fn evaluate_conda_predicates(
     violations
 }
 
+/// The complement of [`evaluate_conda_predicates`]: one pass reason for every
+/// conda predicate this policy configures that did NOT fire, tagged with the
+/// same stable token, so a decision record can show what was checked and held
+/// (e.g. "[conda.attestation]: attestation is verified"), not only what failed.
+fn conda_predicate_passes(
+    policy_name: &str,
+    preds: &CondaPolicyPredicates,
+    facts: &CondaFacts,
+) -> Vec<String> {
+    let mut passes = Vec::new();
+    if preds.is_inert() || !facts.is_conda {
+        return passes;
+    }
+    let pass = |token: &str, what: String| format!("Policy '{policy_name}' [{token}]: {what}");
+    let channel = facts.channel.as_deref().map(str::to_ascii_lowercase);
+    if let Some(c) = &channel {
+        if !preds.allowed_channels.is_empty() && preds.allowed_channels.iter().any(|a| a == c) {
+            passes.push(pass(
+                "conda.channel",
+                format!("channel of origin '{c}' is allowed"),
+            ));
+        }
+        if !preds.denied_channels.is_empty() && !preds.denied_channels.iter().any(|d| d == c) {
+            passes.push(pass(
+                "conda.channel",
+                format!("channel of origin '{c}' is not denied"),
+            ));
+        }
+    }
+    if !preds.denied_licenses.is_empty() {
+        match facts.license.as_deref().map(str::to_ascii_lowercase) {
+            Some(l) if !preds.denied_licenses.iter().any(|d| d == &l) => {
+                passes.push(pass("conda.license", format!("license '{l}' is allowed")))
+            }
+            Some(_) => {}
+            None => passes.push(pass(
+                "conda.license",
+                "no license declared, so no denied license matches".to_string(),
+            )),
+        }
+    }
+    if !preds.denied_license_families.is_empty() {
+        match facts.license_family.as_deref().map(str::to_ascii_lowercase) {
+            Some(f) if !preds.denied_license_families.iter().any(|d| d == &f) => passes.push(pass(
+                "conda.license_family",
+                format!("license family '{f}' is allowed"),
+            )),
+            Some(_) => {}
+            None => passes.push(pass(
+                "conda.license_family",
+                "no license family declared, so no denied family matches".to_string(),
+            )),
+        }
+    }
+    if preds.block_install_scripts && facts.install_script_count == 0 {
+        passes.push(pass(
+            "conda.install_scripts",
+            "package carries no install-time scripts".to_string(),
+        ));
+    }
+    if let Some(threshold) = &preds.max_install_script_severity {
+        let threshold_rank = script_severity_rank(threshold).unwrap_or(0);
+        if facts
+            .max_script_finding_rank
+            .is_none_or(|r| r < threshold_rank)
+        {
+            passes.push(pass(
+                "conda.install_scripts",
+                format!("no install-script finding at or above '{threshold}'"),
+            ));
+        }
+    }
+    match (preds.min_attestation_state.as_deref(), facts.attestation) {
+        (Some("verified"), CondaAttestationFact::Verified) => passes.push(pass(
+            "conda.attestation",
+            "attestation is verified".to_string(),
+        )),
+        (Some("present"), CondaAttestationFact::Verified) => passes.push(pass(
+            "conda.attestation",
+            "attestation is present and verified".to_string(),
+        )),
+        (Some("present"), CondaAttestationFact::PresentUnverified) => passes.push(pass(
+            "conda.attestation",
+            "attestation is present".to_string(),
+        )),
+        _ => {}
+    }
+    passes
+}
+
 // ---------------------------------------------------------------------------
 // Origin policy predicates (#4050)
 // ---------------------------------------------------------------------------
@@ -602,6 +718,72 @@ fn evaluate_origin_predicates(
     violations
 }
 
+/// The complement of [`evaluate_origin_predicates`]: one pass reason per
+/// configured origin predicate that did not fire.
+fn origin_predicate_passes(
+    policy_name: &str,
+    preds: &OriginPolicyPredicates,
+    facts: &OriginFacts,
+) -> Vec<String> {
+    let mut passes = Vec::new();
+    if preds.is_inert() {
+        return passes;
+    }
+    let pass = |token: &str, what: String| format!("Policy '{policy_name}' [{token}]: {what}");
+    let check = |passes: &mut Vec<String>,
+                 token: &str,
+                 noun: &str,
+                 value: Option<String>,
+                 allowed: &[String],
+                 denied: &[String],
+                 shown: &dyn Fn(&str) -> String| {
+        let Some(v) = value else { return };
+        if !allowed.is_empty() && allowed.iter().any(|a| a == &v) {
+            passes.push(pass(token, format!("{noun} '{}' is allowed", shown(&v))));
+        }
+        if !denied.is_empty() && !denied.iter().any(|d| d == &v) {
+            passes.push(pass(token, format!("{noun} '{}' is not denied", shown(&v))));
+        }
+    };
+    check(
+        &mut passes,
+        "origin.upstream",
+        "upstream of origin",
+        facts.upstream_url.as_deref().map(str::to_ascii_lowercase),
+        &preds.allowed_upstreams,
+        &preds.denied_upstreams,
+        &origin_upstream_for_message,
+    );
+    check(
+        &mut passes,
+        "origin.repository",
+        "recording repository",
+        facts.repository_key.as_deref().map(str::to_ascii_lowercase),
+        &preds.allowed_repositories,
+        &preds.denied_repositories,
+        &|v: &str| v.to_string(),
+    );
+    check(
+        &mut passes,
+        "origin.kind",
+        "ingest kind",
+        facts.kind.as_deref().map(str::to_ascii_lowercase),
+        &preds.allowed_kinds,
+        &[],
+        &|v: &str| v.to_string(),
+    );
+    passes
+}
+
+/// Outcome of evaluating the predicate blocks: the violations (what the gates
+/// enforce) and the pass reasons of the configured predicates that held (what
+/// a decision record reports alongside them).
+#[derive(Debug, Default, Clone)]
+pub struct PredicateOutcome {
+    pub violations: Vec<String>,
+    pub passes: Vec<String>,
+}
+
 pub struct PolicyService {
     db: PgPool,
 }
@@ -659,12 +841,25 @@ impl PolicyService {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .evaluate_predicates_with_passes(artifact_id, repository_id)
+            .await?
+            .violations)
+    }
+
+    /// [`Self::evaluate_predicates`] plus the pass reason of every configured
+    /// predicate that held, for decision records that report every rule.
+    pub async fn evaluate_predicates_with_passes(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<PredicateOutcome> {
         let policies = self.load_applicable_policies(repository_id).await?;
         if policies.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PredicateOutcome::default());
         }
         let applicable: Vec<&ScanPolicy> = policies.iter().collect();
-        self.predicate_violations(artifact_id, &applicable).await
+        self.predicate_outcome(artifact_id, &applicable).await
     }
 
     /// Load the predicate fact sets (lazily, only for the fact families some
@@ -675,6 +870,17 @@ impl PolicyService {
         artifact_id: Uuid,
         policies: &[&ScanPolicy],
     ) -> Result<Vec<String>> {
+        Ok(self
+            .predicate_outcome(artifact_id, policies)
+            .await?
+            .violations)
+    }
+
+    async fn predicate_outcome(
+        &self,
+        artifact_id: Uuid,
+        policies: &[&ScanPolicy],
+    ) -> Result<PredicateOutcome> {
         // #4058: load the conda fact set only when at least one applicable
         // policy configures conda predicates — a repo whose policies carry no
         // predicates pays zero extra queries on the download path.
@@ -699,25 +905,35 @@ impl PolicyService {
             None
         };
 
-        let mut violations = Vec::new();
+        let mut outcome = PredicateOutcome::default();
         for policy in policies {
             let predicates = parse_policy_predicates(&policy.predicates);
             if let (Some(facts), false) = (&conda_facts, predicates.conda.is_inert()) {
-                violations.extend(evaluate_conda_predicates(
+                outcome.violations.extend(evaluate_conda_predicates(
+                    &policy.name,
+                    &predicates.conda,
+                    facts,
+                ));
+                outcome.passes.extend(conda_predicate_passes(
                     &policy.name,
                     &predicates.conda,
                     facts,
                 ));
             }
             if let (Some(facts), false) = (&origin_facts, predicates.origin.is_inert()) {
-                violations.extend(evaluate_origin_predicates(
+                outcome.violations.extend(evaluate_origin_predicates(
+                    &policy.name,
+                    &predicates.origin,
+                    facts,
+                ));
+                outcome.passes.extend(origin_predicate_passes(
                     &policy.name,
                     &predicates.origin,
                     facts,
                 ));
             }
         }
-        Ok(violations)
+        Ok(outcome)
     }
 
     /// Evaluate all applicable policies for an artifact download.
@@ -1002,14 +1218,20 @@ impl PolicyService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let attestation = match attestation_state.as_deref() {
-            None => CondaAttestationFact::Absent,
-            Some("verified") => CondaAttestationFact::Verified,
-            // 'unverified' and 'failed' are both "present but unverified":
-            // the predicate vocabulary distinguishes absence from a record
-            // that exists but did not (or did not yet) pass verification.
-            Some(_) => CondaAttestationFact::PresentUnverified,
-        };
+        // A hosted package has no curation record: its attestation was
+        // verified when it was uploaded to the conda attestation endpoint, and
+        // the verdict lives on the artifact itself
+        // (`artifact_metadata.attestation_verification`, cep27). Both sources
+        // count, folded to the weaker one, so neither can launder the other.
+        let uploaded_state = metadata
+            .get(crate::services::curation::attestation_verify::cep27::VERIFICATION_METADATA_KEY)
+            .and_then(|record| record.get("state"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let attestation = fold_attestation_facts(
+            attestation_fact(attestation_state.as_deref()),
+            attestation_fact(uploaded_state.as_deref()),
+        );
 
         Ok(CondaFacts {
             is_conda,
@@ -2349,6 +2571,61 @@ mod tests {
         preds
     }
 
+    // -- pass reasons (F20) ----------------------------------------------------
+
+    /// Every configured predicate that holds yields a pass reason with its
+    /// token; a predicate that fires yields none; unconfigured ones nothing.
+    #[test]
+    fn test_conda_predicate_passes_report_what_held() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["my-channel".to_string()],
+            denied_licenses: vec!["gpl-3.0".to_string()],
+            block_install_scripts: true,
+            min_attestation_state: Some("verified".to_string()),
+            ..Default::default()
+        });
+        let mut facts = conda_facts_4058();
+        facts.attestation = CondaAttestationFact::Verified;
+        let passes = conda_predicate_passes("gate", &preds, &facts);
+        assert_eq!(
+            passes,
+            vec![
+                "Policy 'gate' [conda.channel]: channel of origin 'my-channel' is allowed",
+                "Policy 'gate' [conda.license]: license 'mit' is allowed",
+                "Policy 'gate' [conda.install_scripts]: package carries no install-time scripts",
+                "Policy 'gate' [conda.attestation]: attestation is verified",
+            ]
+        );
+        assert!(evaluate_conda_predicates("gate", &preds, &facts).is_empty());
+
+        // A failing predicate is a violation, never also a pass.
+        facts.attestation = CondaAttestationFact::Absent;
+        let passes = conda_predicate_passes("gate", &preds, &facts);
+        assert!(!passes.iter().any(|p| p.contains("[conda.attestation]")));
+        assert_eq!(evaluate_conda_predicates("gate", &preds, &facts).len(), 1);
+    }
+
+    #[test]
+    fn test_origin_predicate_passes_report_what_held() {
+        let preds = OriginPolicyPredicates {
+            allowed_kinds: vec!["hosted".to_string()],
+            denied_repositories: vec!["evil".to_string()],
+            ..Default::default()
+        };
+        let facts = OriginFacts {
+            kind: Some("hosted".to_string()),
+            repository_key: Some("conda-staging".to_string()),
+            upstream_url: None,
+        };
+        assert_eq!(
+            origin_predicate_passes("gate", &preds, &facts),
+            vec![
+                "Policy 'gate' [origin.repository]: recording repository 'conda-staging' is not denied",
+                "Policy 'gate' [origin.kind]: ingest kind 'hosted' is allowed",
+            ]
+        );
+    }
+
     // -- channel of origin ---------------------------------------------------
 
     #[test]
@@ -3318,6 +3595,88 @@ mod tests {
             scriptless_result.allowed,
             "no scripts -> neither script predicate may fire, got: {:?}",
             scriptless_result.violations
+        );
+    }
+
+    #[test]
+    fn attestation_facts_fold_to_the_weaker_record() {
+        use CondaAttestationFact::*;
+        assert_eq!(attestation_fact(None), Absent);
+        assert_eq!(attestation_fact(Some("verified")), Verified);
+        assert_eq!(attestation_fact(Some("failed")), PresentUnverified);
+        assert_eq!(fold_attestation_facts(Absent, Absent), Absent);
+        assert_eq!(fold_attestation_facts(Absent, Verified), Verified);
+        assert_eq!(fold_attestation_facts(Verified, Absent), Verified);
+        assert_eq!(fold_attestation_facts(Verified, Verified), Verified);
+        assert_eq!(
+            fold_attestation_facts(Verified, PresentUnverified),
+            PresentUnverified
+        );
+        assert_eq!(
+            fold_attestation_facts(PresentUnverified, Absent),
+            PresentUnverified
+        );
+    }
+
+    /// F7: a HOSTED conda package has no curation record; the attestation
+    /// verified on upload (`artifact_metadata.attestation_verification`)
+    /// must satisfy `min_attestation_state = verified`, and a failed one
+    /// must not.
+    #[tokio::test]
+    async fn test_conda_uploaded_attestation_satisfies_min_attestation_state_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+        svc.create_policy(
+            &format!("f7-attestation-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    min_attestation_state: Some("verified".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create attestation policy");
+
+        let with_record = |state: &str| {
+            let mut m = conda_metadata_4058("my-channel", "MIT", "MIT");
+            m["attestation_verification"] = serde_json::json!({
+                "format": "conda",
+                "state": state,
+                "method": "sigstore-key",
+            });
+            m
+        };
+        let verified =
+            seed_conda_artifact_4058(&fx, "hosted-ok", "1.0.0", with_record("verified")).await;
+        let failed =
+            seed_conda_artifact_4058(&fx, "hosted-bad", "1.0.0", with_record("failed")).await;
+
+        let verified_result = svc.evaluate_artifact(verified, fx.repo_id).await;
+        let failed_result = svc.evaluate_artifact(failed, fx.repo_id).await;
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let verified_result = verified_result.expect("evaluate verified");
+        assert!(
+            verified_result.allowed,
+            "a verified upload attestation must satisfy the policy: {verified_result:?}"
+        );
+        let failed_result = failed_result.expect("evaluate failed");
+        assert!(
+            !failed_result.allowed,
+            "a failed upload attestation must not satisfy the policy: {failed_result:?}"
         );
     }
 

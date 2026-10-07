@@ -165,6 +165,26 @@ async fn promotion_gate_enforces_conda_channel_allowlist() {
         "an allowlisted channel must still promote, got: {:?}",
         allowed_result.violations
     );
+    // F20: the predicate that held is reported as a passed gate result.
+    assert!(
+        allowed_result
+            .gate_results
+            .iter()
+            .any(|g| g.rule == "policy-predicate"
+                && g.passed
+                && g.reason.contains("[conda.channel]")
+                && g.reason.contains("trusted-channel")),
+        "a passing predicate must be listed in gate_results, got: {:?}",
+        allowed_result.gate_results
+    );
+    assert!(
+        unlisted_result
+            .gate_results
+            .iter()
+            .any(|g| g.rule == "policy-predicate" && !g.passed),
+        "a failing predicate stays a failed gate result, got: {:?}",
+        unlisted_result.gate_results
+    );
 
     assert!(
         !unknown_result.passed

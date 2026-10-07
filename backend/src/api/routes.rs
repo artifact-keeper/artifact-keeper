@@ -99,6 +99,9 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/pacman", handlers::pacman::router())
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
+        // rattler (pixi `auth login --conda-token`) puts the token in FRONT of
+        // the whole path: `/t/<TOKEN>/conda/<repo_key>/...`.
+        .nest("/t", handlers::conda::rattler_token_router())
         .nest("/swift", handlers::swift::router())
         .nest(
             handlers::terraform::MOUNT_PREFIX,
@@ -1094,6 +1097,14 @@ fn api_v1_routes(
         .route(
             "/sbom/",
             get(|| async { axum::response::Redirect::permanent("/api/v1/sbom") }),
+        )
+        // CEP-27 attestation trust policy (#4033): any authenticated caller.
+        .nest(
+            "/attestations",
+            handlers::attestations::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
         )
         // Promotion routes with auth middleware (staging -> release workflow)
         .nest(
