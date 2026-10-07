@@ -21332,18 +21332,34 @@ mod scan_on_upload_coverage_tests {
     /// without anyone remembering to list it.
     fn handler_sources() -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
-        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
-            .expect("read src/api/handlers")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-            .map(|p| {
-                let name = p.file_name().unwrap().to_string_lossy().into_owned();
-                let src = std::fs::read_to_string(&p).expect("read handler source");
-                (name, src)
-            })
-            .collect();
+        let mut out = Vec::new();
+        collect_handler_sources(&dir, "", &mut out);
         out.sort();
         out
+    }
+
+    /// Every `.rs` file under `dir`, recursively, keyed by its path relative
+    /// to `src/api/handlers` (`rpm/depth_tests.rs`), so a handler written as a
+    /// directory module is scanned too (#4422 review). Files of a
+    /// subdirectory named `tests.rs` / `*_tests.rs` are test modules declared
+    /// from their parent under `#[cfg(test)]`, and are skipped.
+    fn collect_handler_sources(
+        dir: &std::path::Path,
+        prefix: &str,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read a handlers directory") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                collect_handler_sources(&path, &format!("{prefix}{name}/"), out);
+            } else if name.ends_with(".rs")
+                && !(!prefix.is_empty() && (name == "tests.rs" || name.ends_with("_tests.rs")))
+            {
+                let src = std::fs::read_to_string(&path).expect("read handler source");
+                out.push((format!("{prefix}{name}"), src));
+            }
+        }
     }
 
     /// One production insert site: the enclosing function and whether the
@@ -21377,6 +21393,9 @@ mod scan_on_upload_coverage_tests {
     /// insert at `at` carries the marker. Walks up from the insert's line
     /// through the statement's own code lines; a line ending a previous
     /// statement or block (`;`, `{`, `}`) or a blank line ends the search.
+    /// Shortest reason text a marker must carry after its colon.
+    const MIN_MARKER_REASON: usize = 15;
+
     fn marker_above(src: &str, at: usize, marker: &str) -> bool {
         let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let mut in_comment = false;
@@ -21384,8 +21403,10 @@ mod scan_on_upload_coverage_tests {
             let t = line.trim();
             if t.starts_with("//") {
                 in_comment = true;
-                if t.contains(marker) {
-                    return true;
+                // The marker must say WHY (#4422 review): a bare marker, or
+                // one followed by a word or two, does not exempt the site.
+                if let Some((_, why)) = t.split_once(marker) {
+                    return why.trim().len() >= MIN_MARKER_REASON;
                 }
             } else if in_comment
                 || t.is_empty()
@@ -21397,6 +21418,17 @@ mod scan_on_upload_coverage_tests {
             }
         }
         false
+    }
+
+    /// Whether `body` calls `call` (`name(`) as a whole word: `upload(` is not
+    /// matched by `recipe_file_upload(` (#4422 review).
+    fn calls(body: &str, call: &str) -> bool {
+        body.match_indices(call).any(|(at, _)| {
+            body[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
     }
 
     /// Calls of any of `triggers` on code (not comment) lines of `body`.
@@ -21467,7 +21499,7 @@ mod scan_on_upload_coverage_tests {
             let call = format!("{func}(");
             let caller_triggers = (0..fns.len()).any(|j| {
                 let caller = body_of(src, &fns, j);
-                j != idx && caller.contains(&call) && trigger_calls(caller, gate.triggers) > 0
+                j != idx && calls(caller, &call) && trigger_calls(caller, gate.triggers) > 0
             });
             let budget = trigger_calls(body_of(src, &fns, idx), gate.triggers)
                 + usize::from(caller_triggers);
@@ -21634,10 +21666,28 @@ mod scan_on_upload_coverage_tests {
         "try_mount_blob",
     ];
 
-    /// Uncovered sites and the `(file, func)` of every check-admitted site.
-    fn run_gate(gate: &InsertGate) -> (Vec<String>, std::collections::HashSet<(String, String)>) {
+    /// The only sites allowed to opt out of quota admission with a
+    /// `NO-QUOTA-ADMISSION:` reason (#4422 review): promotion copies, the
+    /// generated Protobuf label index, proxy-cache fills, and OCI manifest rows
+    /// (charged 0 until #4545). A new exemption is a review conversation: it
+    /// fails here until it is added to this list.
+    const ISSUE_4422_EXEMPT_SITES: &[(&str, &str)] = &[
+        ("approval.rs", "approve_promotion"),
+        ("oci_v2.rs", "cache_manifest_reference_locally"),
+        ("oci_v2.rs", "stage_proxy_image_blobs"),
+        ("oci_v2.rs", "upsert_manifest_artifact"),
+        ("promotion.rs", "insert_promoted_artifact_row"),
+        ("protobuf.rs", "save_label_index"),
+    ];
+
+    type SiteSet = std::collections::BTreeSet<(String, String)>;
+
+    /// Uncovered sites, the `(file, func)` of every check-admitted site, and
+    /// of every marker-exempted site.
+    fn run_gate(gate: &InsertGate) -> (Vec<String>, SiteSet, SiteSet) {
         let mut uncovered = Vec::new();
-        let mut admitted = std::collections::HashSet::new();
+        let mut admitted = SiteSet::new();
+        let mut exempt = SiteSet::new();
         for (file, src) in handler_sources() {
             if EXEMPT_FILES.contains(&file.as_str()) {
                 continue;
@@ -21645,12 +21695,14 @@ mod scan_on_upload_coverage_tests {
             for site in gate_sites(&file, &src, gate) {
                 if !site.covered {
                     uncovered.push(format!("{file}::{}", site.func));
-                } else if !site.exempt {
+                } else if site.exempt {
+                    exempt.insert((file.clone(), site.func));
+                } else {
                     admitted.insert((file.clone(), site.func));
                 }
             }
         }
-        (uncovered, admitted)
+        (uncovered, admitted, exempt)
     }
 
     /// THE #4422 gate: no production `artifacts` or `oci_blobs` insert in a
@@ -21658,7 +21710,7 @@ mod scan_on_upload_coverage_tests {
     /// handler is admitted by a check rather than exempted.
     #[test]
     fn every_format_publish_runs_quota_admission_4422() {
-        let (uncovered, admitted) = run_gate(&QUOTA_GATE);
+        let (uncovered, admitted, mut exempt) = run_gate(&QUOTA_GATE);
         assert!(
             uncovered.is_empty(),
             "these handlers insert an `artifacts` row without storage-quota \
@@ -21674,7 +21726,7 @@ mod scan_on_upload_coverage_tests {
             );
         }
 
-        let (uncovered, admitted) = run_gate(&OCI_BLOB_QUOTA_GATE);
+        let (uncovered, admitted, blob_exempt) = run_gate(&OCI_BLOB_QUOTA_GATE);
         assert!(
             uncovered.is_empty(),
             "these handlers insert an `oci_blobs` row without storage-quota \
@@ -21686,6 +21738,17 @@ mod scan_on_upload_coverage_tests {
                 "#4422 OCI blob writer oci_v2.rs::{func} is not quota-admitted"
             );
         }
+
+        exempt.extend(blob_exempt);
+        let pinned: SiteSet = ISSUE_4422_EXEMPT_SITES
+            .iter()
+            .map(|(f, func)| (f.to_string(), func.to_string()))
+            .collect();
+        assert_eq!(
+            exempt, pinned,
+            "the NO-QUOTA-ADMISSION exemptions changed; a new one must be justified \
+             and added to ISSUE_4422_EXEMPT_SITES"
+        );
     }
 
     /// The quota gate's matcher: an admission call covers one insert, a
@@ -21698,12 +21761,17 @@ mod scan_on_upload_coverage_tests {
                    async fn good() {\n    let mut tx = begin_admitted_publish(db, r, p, n).await?;\n    \
                    q(\"INSERT INTO artifacts\");\n}\n\
                    async fn helper() {\n    let id = insert_artifact(db, a).await;\n}\n\
-                   async fn marked() {\n    // NO-QUOTA-ADMISSION: a promotion copy\n    \
+                   async fn marked() {\n    // NO-QUOTA-ADMISSION: a promotion copy, not a publish\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn bare() {\n    // NO-QUOTA-ADMISSION: fine\n    \
                    q(\"INSERT INTO artifacts\");\n}\n\
                    async fn two() {\n    admit_publish_in_tx(tx, db, r, p, n);\n    \
                    insert_artifact_row(a);\n    insert_artifact_row(b);\n}\n\
                    fn prim() {\n    q(\"INSERT INTO artifacts\");\n}\n\
-                   async fn caller() {\n    locked_quota_denial(tx, db, r, p, n);\n    prim();\n}\n";
+                   async fn caller() {\n    locked_quota_denial(tx, db, r, p, n);\n    prim();\n}\n\
+                   fn short() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn long_short() {\n    begin_admitted_publish(db, r, p, n);\n    \
+                   very_short();\n}\n";
         let sites: Vec<(String, bool, bool)> = gate_sites("x.rs", src, &QUOTA_GATE)
             .into_iter()
             .map(|s| (s.func, s.covered, s.exempt))
@@ -21716,9 +21784,12 @@ mod scan_on_upload_coverage_tests {
                 site("good", true, false),
                 site("helper", true, false),
                 site("marked", true, true),
+                site("bare", false, false),
                 site("two", true, false),
                 site("two", false, false),
                 site("prim", true, false),
+                // `very_short(` must not vouch for `short`.
+                site("short", false, false),
             ]
         );
     }

@@ -4931,7 +4931,10 @@ async fn store_conda_package(
         tracing::error!("Database error inserting artifact: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
-    tx.commit().await.map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(|e| {
+        tracing::error!("Database error committing artifact: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;

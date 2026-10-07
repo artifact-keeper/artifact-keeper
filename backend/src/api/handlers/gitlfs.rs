@@ -581,7 +581,12 @@ async fn upload_object(
             crate::api::handlers::db_err_message(&e),
         )
     })?;
-    tx.commit().await.map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(|e| {
+        lfs_error_response(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;

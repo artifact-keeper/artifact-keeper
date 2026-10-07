@@ -4376,8 +4376,8 @@ async fn publish_extension(
         return Err((StatusCode::CONFLICT, "Extension version already exists").into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
     super::publish_quota::preflight_publish_quota(
         &state.db,
         repo.id,
@@ -4385,6 +4385,8 @@ async fn publish_extension(
         body.len() as i64,
     )
     .await?;
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
     let storage_key = build_vscode_storage_key(&publisher, &ext_name, &ext_version);

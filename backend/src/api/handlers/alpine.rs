@@ -1537,8 +1537,8 @@ async fn store_apk(
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
     super::publish_quota::preflight_publish_quota(
         &state.db,
         repo.id,
@@ -1546,6 +1546,8 @@ async fn store_apk(
         content.len() as i64,
     )
     .await?;
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
     let storage_key = build_alpine_storage_key(repo.id, &artifact_path);

@@ -603,8 +603,8 @@ async fn push_pod(
         return Err((StatusCode::CONFLICT, "Pod version already exists").into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
+    // Refuse an over-quota upload before a soft-deleted row at this path is
+    // purged (#4422).
     super::publish_quota::preflight_publish_quota(
         &state.db,
         repo.id,
@@ -612,6 +612,8 @@ async fn push_pod(
         body.len() as i64,
     )
     .await?;
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
     // Store the pod archive
     let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
