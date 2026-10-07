@@ -511,11 +511,11 @@ struct OriginFacts {
     upstream_url: Option<String>,
 }
 
-/// Render an origin upstream URL into a violation message (#4452). The
-/// stored origin of an artifact proxied through a Remote whose URL embeds
-/// `user:password@` carries those credentials, and violation messages reach
-/// promotion / approval responses and persisted `policy_result` records, so
-/// the message drops the userinfo. Matching keeps using the stored value.
+/// Render an origin upstream URL into a violation message (#4452). Violation
+/// messages reach promotion / approval responses and persisted
+/// `policy_result` records. Since migration 271 (#4463) stored origins carry
+/// no userinfo, so this strip is defence in depth against a document written
+/// by a path that bypassed the normalizer. Matching uses the stored value.
 fn origin_upstream_for_message(upstream: &str) -> String {
     crate::services::proxy_service::strip_url_userinfo(upstream).0
 }
@@ -3585,10 +3585,10 @@ mod tests {
 
     #[test]
     fn test_origin_upstream_violation_messages_never_carry_userinfo_4452() {
-        // #4452: a proxied artifact's stored origin mirrors a Remote's
-        // credentialed upstream_url. The violation text reaches promotion and
-        // approval responses, so it must drop the userinfo; matching still
-        // uses the stored value (the denylist entry below only matches it).
+        // #4452: should a stored origin ever carry userinfo (migration 271
+        // strips it at rest, #4463), the violation text, which reaches
+        // promotion and approval responses, must still drop it; matching uses
+        // the stored value (the denylist entry below only matches it).
         // Assembled at runtime so secret scanners do not flag a fixture.
         let stored = format!("https://{}@repo1.maven.org/maven2", "alice:s3cret");
         let facts = OriginFacts {

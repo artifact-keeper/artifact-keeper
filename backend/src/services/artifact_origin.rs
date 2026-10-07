@@ -1133,4 +1133,202 @@ mod tests {
         let _ = std::fs::remove_dir_all(&other_dir);
         fx.teardown().await;
     }
+
+    const MIGRATION_271: &str =
+        include_str!("../../migrations/271_origin_upstream_strip_userinfo.sql");
+
+    /// Seed rows as a pre-271 database held them: with the triggers off for
+    /// this transaction (`session_replication_role = replica`, superuser
+    /// only, which the test role is), so the 271 fill/cache triggers cannot
+    /// normalize them on the way in.
+    async fn seed_legacy_rows(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        origins: &[(&str, serde_json::Value)],
+        cache_url: Option<&str>,
+    ) -> Vec<uuid::Uuid> {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("replica role");
+        let mut ids = Vec::new();
+        for (path, origin) in origins {
+            ids.push(
+                sqlx::query_scalar(
+                    "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key, origin) \
+                     VALUES ($1, $2, $2, 1, $3, 'application/octet-stream', $2, $4) RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(*path)
+                .bind(format!("{:064x}", 4463))
+                .bind(origin)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("insert legacy row"),
+            );
+        }
+        if let Some(url) = cache_url {
+            sqlx::query(
+                "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, \
+                 metadata_key, size_bytes, upstream_url) VALUES ($1, 'f/1/f.bin', 'k', 'm', 1, $2)",
+            )
+            .bind(repo_id)
+            .bind(url)
+            .execute(&mut *tx)
+            .await
+            .expect("insert legacy cache row");
+        }
+        tx.commit().await.expect("commit");
+        ids
+    }
+
+    /// #4463: migration 271 strips userinfo from origins recorded before it
+    /// and from the proxy cache catalogue, normalizes only the
+    /// `upstream_url` facet, leaves already-normal and upstream-less rows
+    /// untouched, and a second run is a no-op. Afterwards the triggers keep
+    /// credentials out on every write path, and the rewrite window is closed.
+    #[tokio::test]
+    async fn test_migration_271_strips_recorded_userinfo_4463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let pool = &fx.pool;
+        let key = fx.repo_key.as_str();
+        let plain = "https://upstream.example.test/base";
+        let credentialed = format!("https://{}@upstream.example.test/base", "alice:s3cret");
+        let proxy = |url: &str| serde_json::json!({"v": 1, "kind": "proxy", "repository_key": key, "upstream_url": url});
+        let ids = seed_legacy_rows(
+            pool,
+            fx.repo_id,
+            &[
+                ("cred.bin", proxy(&credentialed)),
+                ("odd.bin", proxy("HTTPS://Upstream.Example.TEST/base/")),
+                ("normal.bin", proxy(plain)),
+                ("hosted.bin", ArtifactOrigin::hosted(key).to_json()),
+            ],
+            Some(&format!("{credentialed}/f/1/f.bin")),
+        )
+        .await;
+        let (cred, odd, normal, hosted) = (ids[0], ids[1], ids[2], ids[3]);
+        let xmin = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, String>("SELECT xmin::text FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+        };
+        let untouched = [
+            (normal, xmin(normal).await.expect("xmin")),
+            (hosted, xmin(hosted).await.expect("xmin")),
+        ];
+
+        for _ in 0..2 {
+            rerun_migration(pool, MIGRATION_271).await;
+            assert_eq!(
+                origin_of(pool, cred).await,
+                proxy(plain),
+                "credentials stripped"
+            );
+            assert_eq!(
+                origin_of(pool, odd).await,
+                proxy(plain),
+                "normalized without a strip"
+            );
+            for (id, before) in &untouched {
+                assert_eq!(&xmin(*id).await.expect("xmin"), before, "row rewritten");
+            }
+            let cached: String = sqlx::query_scalar(
+                "SELECT upstream_url FROM proxy_cache_artifacts WHERE repository_id = $1",
+            )
+            .bind(fx.repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read cache row");
+            assert_eq!(cached, format!("{plain}/f/1/f.bin"));
+        }
+        assert_eq!(
+            origin_of(pool, hosted).await,
+            ArtifactOrigin::hosted(key).to_json()
+        );
+
+        // Every write path now normalizes: an explicit origin (an old
+        // replica's migration worker, a promotion copy) and a raw cache write.
+        let explicit = insert_with_origin(
+            pool,
+            fx.repo_id,
+            "explicit.bin",
+            &format!("{:064x}", 1),
+            proxy(&credentialed),
+            0,
+        )
+        .await;
+        assert_eq!(origin_of(pool, explicit).await, proxy(plain));
+        sqlx::query("UPDATE proxy_cache_artifacts SET upstream_url = $2 WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .bind(format!("{credentialed}/g"))
+            .execute(pool)
+            .await
+            .expect("raw cache write");
+        let cached: String = sqlx::query_scalar(
+            "SELECT upstream_url FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("read cache row");
+        assert_eq!(cached, format!("{plain}/g"));
+
+        // Inside 271's window a GUC holder can only normalize: never repoint
+        // a row at another upstream, add one, or change anything else. A
+        // legacy credentialed row gives the window something to admit.
+        let legacy = seed_legacy_rows(
+            pool,
+            fx.repo_id,
+            &[("legacy.bin", proxy(&credentialed))],
+            None,
+        )
+        .await[0];
+        let mut conn = pool.acquire().await.expect("acquire");
+        let mut tx = open_window(&mut conn, window_ddl(MIGRATION_271)).await;
+        assert!(
+            try_rewrite(&mut tx, legacy, proxy(plain)).await,
+            "the sanctioned rewrite"
+        );
+        let mut as_hosted = proxy(plain);
+        as_hosted["kind"] = "hosted".into();
+        let mut with_upstream = ArtifactOrigin::hosted(key).to_json();
+        with_upstream["upstream_url"] = plain.into();
+        for (id, doc, why) in [
+            (
+                legacy,
+                proxy("https://allowed.example.test"),
+                "repoint a credentialed row",
+            ),
+            (
+                normal,
+                proxy("https://allowed.example.test"),
+                "repoint a normal row",
+            ),
+            (legacy, as_hosted, "proxy -> hosted"),
+            (hosted, with_upstream, "add an upstream to a hosted row"),
+        ] {
+            assert!(
+                !try_rewrite(&mut tx, id, doc).await,
+                "{why} must be refused"
+            );
+        }
+        drop(tx);
+        drop(conn);
+
+        // The window is closed after the migration.
+        assert_window_closed(pool).await;
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(pool)
+            .await
+            .expect("delete cache rows");
+        fx.teardown().await;
+    }
 }

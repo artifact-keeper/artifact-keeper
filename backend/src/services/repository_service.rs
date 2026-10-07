@@ -387,6 +387,7 @@ pub(crate) fn validate_remote_upstream(
                 ));
             }
             Some(url) => {
+                reject_url_controls_and_whitespace(url)?;
                 validate_outbound_url(url, "Upstream URL")?;
                 if *format == RepositoryFormat::Rpm && is_mirrorlist_or_metalink(url) {
                     return Err(AppError::Validation(
@@ -407,7 +408,26 @@ pub(crate) fn validate_remote_upstream(
             }
         }
     } else if let Some(url) = upstream_url {
+        reject_url_controls_and_whitespace(url)?;
         validate_outbound_url(url, "Upstream URL")?;
+    }
+    Ok(())
+}
+
+/// Refuse an upstream URL carrying ASCII control characters or whitespace
+/// (#4463). The WHATWG parser behind `validate_outbound_url` silently drops
+/// leading/trailing C0 controls and every tab/CR/LF, so `"\x01https://u:p@h/"`
+/// or `"ht\ttps://u:p@h/"` validate and authenticate, yet are stored raw;
+/// the origin normalizer, which works on the stored text, would not
+/// recognise their scheme and would keep the credentials at rest. No real
+/// upstream needs either: spaces must be percent-encoded.
+fn reject_url_controls_and_whitespace(url: &str) -> Result<()> {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::Validation(
+            "Upstream URL must not contain whitespace or control characters \
+             (percent-encode them)"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -3895,6 +3915,29 @@ mod tests {
             &RepositoryFormat::Generic,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_remote_upstream_rejects_controls_and_whitespace_4463() {
+        for url in [
+            "\x01https://u:p@upstream.example.test/",
+            "ht\ttps://u:p@upstream.example.test/x",
+            "https://upstream.example.test/a b",
+            "https://upstream.example.test/\n",
+            " https://upstream.example.test/",
+        ] {
+            for repo_type in [RepositoryType::Remote, RepositoryType::Local] {
+                let result = validate_remote_upstream(
+                    &repo_type,
+                    &Some(url.to_string()),
+                    &RepositoryFormat::Generic,
+                );
+                assert!(
+                    matches!(&result, Err(AppError::Validation(m)) if m.contains("whitespace")),
+                    "{url:?} ({repo_type:?}) must be refused, got {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
