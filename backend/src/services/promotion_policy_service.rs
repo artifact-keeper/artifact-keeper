@@ -86,6 +86,29 @@ pub fn build_gate_results(
     out
 }
 
+/// Passed `policy-predicate` gate results, one per predicate that held. An
+/// attestation predicate's reason is extended with how the attestation
+/// verified when that is known.
+pub fn predicate_pass_gate_results(
+    passes: Vec<String>,
+    attestation: Option<&str>,
+) -> Vec<GateResult> {
+    passes
+        .into_iter()
+        .map(|reason| {
+            let reason = match attestation {
+                Some(how) if reason.contains("[conda.attestation]") => format!("{reason}: {how}"),
+                _ => reason,
+            };
+            GateResult {
+                rule: "policy-predicate".to_string(),
+                passed: true,
+                reason,
+            }
+        })
+        .collect()
+}
+
 /// When the artifact carries a VERIFIED CEP-27 publish attestation
 /// (`artifact_metadata.attestation_verification`, written by the conda
 /// attestation endpoint), a human-readable reason naming how it verified.
@@ -599,11 +622,28 @@ impl PromotionPolicyService {
         // Block through the same rule `block-unscanned` and `require-signature`
         // use: a predicate is a categorical statement about what the artifact
         // IS, not a severity count, so there is no meaningful "warn" grade.
-        self.evaluate_policy_predicates(artifact_id, repository_id, &mut violations, &mut action)
+        let predicate_passes = self
+            .evaluate_policy_predicates(artifact_id, repository_id, &mut violations, &mut action)
             .await?;
 
         let passed = violations.is_empty();
-        let gate_results = build_gate_results(&applied, &violations);
+        let mut gate_results = build_gate_results(&applied, &violations);
+        // Every predicate that was checked and held is reported too, one entry
+        // each, under the same `policy-predicate` rule its failures use; the
+        // reason carries the predicate token. A verified attestation names how
+        // it verified (method, key or identity, issuer).
+        let attestation = if predicate_passes
+            .iter()
+            .any(|p| p.contains("[conda.attestation]"))
+        {
+            verified_attestation_reason(&self.db, artifact_id).await?
+        } else {
+            None
+        };
+        gate_results.extend(predicate_pass_gate_results(
+            predicate_passes,
+            attestation.as_deref(),
+        ));
 
         Ok(PolicyEvaluationResult {
             passed,
@@ -627,12 +667,12 @@ impl PromotionPolicyService {
         repository_id: Uuid,
         violations: &mut Vec<PolicyViolation>,
         action: &mut PolicyAction,
-    ) -> Result<()> {
-        let messages = PolicyService::new(self.db.clone())
-            .evaluate_predicates(artifact_id, repository_id)
+    ) -> Result<Vec<String>> {
+        let outcome = PolicyService::new(self.db.clone())
+            .evaluate_predicates_with_passes(artifact_id, repository_id)
             .await?;
 
-        for message in messages {
+        for message in outcome.violations {
             let violation = PolicyViolation {
                 rule: "policy-predicate".to_string(),
                 severity: "high".to_string(),
@@ -643,7 +683,7 @@ impl PromotionPolicyService {
             violations.push(violation);
         }
 
-        Ok(())
+        Ok(outcome.passes)
     }
 
     /// Evaluate age gates and signature requirements from a scan policy.
@@ -2928,6 +2968,28 @@ mod tests {
             message: message.to_string(),
             details: None,
         }
+    }
+
+    /// F20: passed predicates become passed `policy-predicate` results, and a
+    /// verified attestation's reason names how it verified.
+    #[test]
+    fn predicate_passes_become_passed_gate_results() {
+        let results = predicate_pass_gate_results(
+            vec![
+                "Policy 'g' [conda.license]: license 'mit' is allowed".to_string(),
+                "Policy 'g' [conda.attestation]: attestation is verified".to_string(),
+            ],
+            Some("verified CEP-27 attestation (sigstore-key, identity ci, issuer key:abc)"),
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|g| g.passed && g.rule == "policy-predicate"));
+        assert_eq!(
+            results[0].reason,
+            "Policy 'g' [conda.license]: license 'mit' is allowed"
+        );
+        assert!(results[1].reason.ends_with("identity ci, issuer key:abc)"));
     }
 
     #[test]
