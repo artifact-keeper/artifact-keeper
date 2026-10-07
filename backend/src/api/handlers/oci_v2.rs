@@ -12057,8 +12057,8 @@ async fn handle_delete_manifest(
     };
 
     // Preserve the OCI contract exactly: a digest reference is a
-    // content-addressed delete (every tag pointing at the digest goes), a tag
-    // reference removes only that tag. The digest here was resolved FROM this
+    // content-addressed delete (every tag of this image name pointing at the
+    // digest goes, #4466), a tag reference removes only that tag. The digest here was resolved FROM this
     // repository's index, which is what makes the content-addressed scope
     // correct on this route.
     let scope = if is_digest_reference(reference) {
@@ -12105,7 +12105,9 @@ async fn handle_delete_manifest(
 /// * [`OciIndexDeleteScope::ContentAddressed`] is the OCI `DELETE
 ///   /v2/<name>/manifests/<digest>` contract — the reference *is* the digest and
 ///   it was resolved from this repository's own index, so removing every tag row
-///   pointing at that digest is the documented behaviour (#1776).
+///   of the named image pointing at that digest is the documented behaviour
+///   (#1776). Tags of the same digest under OTHER image names in the
+///   repository stay (#4466).
 /// * [`OciIndexDeleteScope::NamedReference`] removes exactly the
 ///   `(name = image, tag = reference)` row. The REST artifact delete always uses
 ///   this scope: it deletes ONE `artifacts` row, and that row's index footprint
@@ -12190,39 +12192,64 @@ pub(crate) fn rest_unwind_digest<'a>(
 /// Soft-deletes the `artifacts` rows a `/v2` manifest delete removes (#4450).
 ///
 /// Binds: `$1` repository id, `$2` the exact `v2/<image>/manifests/<reference>`
-/// path the request named, `$3` whether the delete is content-addressed, `$4`
-/// the deleted digest's sha256 hex (NULL for a non-sha256 digest).
+/// path the request named, `$3` the ids of the other rows to tombstone (empty
+/// for a tag-name delete; see [`SELECT_DIGEST_MANIFEST_ROWS_SQL`]).
 ///
 /// * Every delete tombstones the row at the named path.
 /// * A content-addressed delete (`DELETE .../manifests/<digest>`) also
-///   tombstones every other manifest-shaped row in the repository whose bytes
-///   ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
-///   migrated source-layout rows. The index unwind already removed every
-///   `oci_tags` row for the digest repository-wide, so these rows are the last
-///   record claiming the manifest exists. Left live, the startup
-///   `oci_migration_reindex` took them for never-indexed migrated manifests
-///   and re-registered the deleted image on the next restart, and storage GC
-///   could never reclaim its body.
+///   tombstones every other manifest-shaped row OF THE SAME IMAGE NAME whose
+///   bytes ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
+///   migrated source-layout rows for `<image>`. The index unwind already
+///   removed `<image>`'s `oci_tags` rows for the digest, so these rows are the
+///   last record claiming the manifest exists under `<image>`. Left live, the
+///   startup `oci_migration_reindex` took them for never-indexed migrated
+///   manifests and re-registered the deleted image on the next restart.
+/// * Rows of OTHER image names in the repository that hold the same digest are
+///   never touched (#4466): in the distribution spec `<name>` is
+///   `<repo_key>/<image>`, so the delete is scoped to `<image>`.
 ///
-/// The path shape is the one the reindex scans
-/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
-/// so no row the reindex could pick up for this digest survives the delete.
 /// Blob and non-manifest rows are never touched. Rows already in the trash are
 /// skipped so their `updated_at` keeps the time they were really deleted.
-pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = concat!(
-    r#"
+pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = r#"
     UPDATE artifacts a
     SET is_deleted = true, updated_at = NOW()
     WHERE a.repository_id = $1
       AND a.is_deleted = false
-      AND (
-            a.path = $2
-         OR ($3 AND a.checksum_sha256 = $4 AND "#,
+      AND (a.path = $2 OR a.id = ANY($3))
+    "#;
+
+/// Live manifest-shaped `artifacts` rows of a repository whose bytes are one
+/// digest (`$1` repository id, `$2` sha256 hex), with the repository key so
+/// the caller can attribute each path to an image name
+/// ([`crate::services::oci_migration_reindex::manifest_row_image`]).
+///
+/// The path shape is the one the reindex scans
+/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
+/// so no row the reindex could pick up for this digest under the deleted image
+/// survives a by-digest delete.
+pub(crate) const SELECT_DIGEST_MANIFEST_ROWS_SQL: &str = concat!(
+    r#"
+    SELECT a.id, a.path::text AS path, r.key AS repo_key
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+      AND a.checksum_sha256 = $2
+      AND "#,
     crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
-    r#")
-      )
-    "#
 );
+
+/// The ids among `rows` (`(id, path, repo_key)` from
+/// [`SELECT_DIGEST_MANIFEST_ROWS_SQL`]) that belong to `image` (#4466). Pure.
+pub(crate) fn manifest_rows_of_image(rows: &[(Uuid, String, String)], image: &str) -> Vec<Uuid> {
+    rows.iter()
+        .filter(|(_, path, repo_key)| {
+            crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+                == Some(image)
+        })
+        .map(|(id, _, _)| *id)
+        .collect()
+}
 
 /// The `artifacts` path a `/v2` manifest request names.
 fn v2_manifest_artifact_path(image: &str, reference: &str) -> String {
@@ -12240,11 +12267,21 @@ pub(crate) async fn soft_delete_manifest_artifacts_in_tx(
     digest: &str,
     scope: OciIndexDeleteScope,
 ) -> Result<u64, sqlx::Error> {
+    let mut same_image_rows: Vec<Uuid> = Vec::new();
+    if let (OciIndexDeleteScope::ContentAddressed, Some(hex)) =
+        (scope, digest.strip_prefix("sha256:"))
+    {
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(SELECT_DIGEST_MANIFEST_ROWS_SQL)
+            .bind(repo_id)
+            .bind(hex)
+            .fetch_all(&mut **tx)
+            .await?;
+        same_image_rows = manifest_rows_of_image(&rows, image);
+    }
     let res = sqlx::query(SOFT_DELETE_MANIFEST_ARTIFACTS_SQL)
         .bind(repo_id)
         .bind(v2_manifest_artifact_path(image, reference))
-        .bind(scope == OciIndexDeleteScope::ContentAddressed)
-        .bind(digest.strip_prefix("sha256:"))
+        .bind(&same_image_rows)
         .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected())
@@ -12292,15 +12329,18 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
     scope: OciIndexDeleteScope,
 ) -> Result<(), sqlx::Error> {
     // Remove tag rows for this delete. A content-addressed delete (the OCI
-    // `DELETE .../manifests/<digest>` contract) removes every tag pointing at
-    // that digest in this repo. A named-reference delete removes ONLY the named
-    // tag row, leaving sibling tags that happen to share the same manifest
-    // digest intact (#1776).
+    // `DELETE .../manifests/<digest>` contract) removes every tag OF THIS IMAGE
+    // NAME pointing at that digest: `<name>` in the distribution spec is
+    // `<repo_key>/<image>`, so the same digest tagged under another image in
+    // the repository is not part of the delete (#4466). A named-reference
+    // delete removes ONLY the named tag row, leaving sibling tags that happen
+    // to share the same manifest digest intact (#1776).
     match scope {
         OciIndexDeleteScope::ContentAddressed => {
             sqlx::query!(
-                "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3",
                 repo_id,
+                image,
                 digest
             )
             .execute(&mut **tx)
@@ -12318,10 +12358,12 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
         }
     }
 
-    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
-    // this repo still points at the same manifest digest, the manifest is still
-    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
-    // intact. The cleanup only runs once the last tag for the digest is gone.
+    // A tag-name delete only removes the named tag (#1776), and a by-digest
+    // delete only the tags of its own image name (#4466). If a sibling tag in
+    // this repo, under any image name, still points at the same manifest
+    // digest, the manifest is still live: skip the ref/blob-ref cleanup so its
+    // index edges and blob pins stay intact. The cleanup only runs once the
+    // last tag for the digest in the repository is gone.
     let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
