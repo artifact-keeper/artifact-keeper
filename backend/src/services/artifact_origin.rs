@@ -311,6 +311,22 @@ mod tests {
         (id, origin)
     }
 
+    /// A staging repository is hosted: an upload into it is `hosted`, never
+    /// `virtual` (migration 284), and a promoted copy carries that origin.
+    #[tokio::test]
+    async fn test_upload_into_staging_repo_records_hosted_origin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("staging", "generic").await else {
+            return;
+        };
+        let (_id, origin) = insert_and_read_origin(&fx.pool, fx.repo_id, "s/1.0/s-1.0.bin").await;
+        let key = fx.repo_key.clone();
+        fx.teardown().await;
+        let doc = origin.expect("every artifact must carry an origin");
+        assert_eq!(doc["kind"], "hosted", "a staging upload is a direct upload");
+        assert_eq!(doc["repository_key"], key);
+    }
+
     #[tokio::test]
     async fn test_upload_into_local_repo_records_hosted_origin() {
         use crate::api::handlers::test_db_helpers as tdh;
