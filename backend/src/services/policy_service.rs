@@ -1319,6 +1319,7 @@ impl PolicyService {
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(repo_id) = repository_id {
             self.ensure_repository_exists(repo_id).await?;
+            self.ensure_policy_name_free(name, repo_id, None).await?;
         }
 
         let policy: ScanPolicy = sqlx::query_as(
@@ -1416,6 +1417,19 @@ impl PolicyService {
             .transpose()?
             .map(|p| serde_json::to_value(&p).unwrap_or_else(|_| serde_json::json!({})));
 
+        if let Some(name) = name {
+            let scope: Option<Option<Uuid>> =
+                sqlx::query_scalar("SELECT repository_id FROM scan_policies WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            if let Some(Some(repo_id)) = scope {
+                self.ensure_policy_name_free(name, repo_id, Some(id))
+                    .await?;
+            }
+        }
+
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             UPDATE scan_policies
@@ -1451,6 +1465,36 @@ impl PolicyService {
         .ok_or_else(|| AppError::NotFound("Policy not found".to_string()))?;
 
         Ok(policy)
+    }
+
+    /// Refuse a second scan policy with the same name (case-insensitive) on
+    /// the same repository. Two same-named policies on one repository are
+    /// indistinguishable in the UI and in promotion refusals, which name the
+    /// policy, and a re-run setup script silently stacked them. Unscoped
+    /// (global) policies are not checked here.
+    async fn ensure_policy_name_free(
+        &self,
+        name: &str,
+        repository_id: Uuid,
+        except: Option<Uuid>,
+    ) -> Result<()> {
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM scan_policies \
+             WHERE repository_id = $1 AND LOWER(name) = LOWER($2) \
+               AND ($3::uuid IS NULL OR id <> $3))",
+        )
+        .bind(repository_id)
+        .bind(name)
+        .bind(except)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if taken {
+            return Err(AppError::Conflict(format!(
+                "a scan policy named '{name}' already exists on this repository"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn delete_policy(&self, id: Uuid) -> Result<()> {
@@ -2411,6 +2455,83 @@ mod tests {
     // without a running Postgres still passes; the CI integration job
     // covers this branch.
     // -----------------------------------------------------------------------
+
+    /// Duplicate policy names on one repository are refused on create and on
+    /// rename, case-insensitively; the same name on another repository is fine.
+    #[tokio::test]
+    async fn test_policy_names_are_unique_per_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (other_repo, _k, _d) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let svc = PolicyService::new(fx.pool.clone());
+        let create = |name: &'static str, repo: Uuid| {
+            let svc = PolicyService::new(fx.pool.clone());
+            async move {
+                svc.create_policy(
+                    name,
+                    Some(repo),
+                    "high",
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+            }
+        };
+        let first = create("release-gate", fx.repo_id).await.expect("first");
+        let dup = create("Release-Gate", fx.repo_id).await;
+        let elsewhere = create("release-gate", other_repo).await;
+        let second = create("other", fx.repo_id).await.expect("second");
+        let rename = svc
+            .update_policy(
+                second.id,
+                Some("RELEASE-GATE"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let self_rename = svc
+            .update_policy(
+                first.id,
+                Some("release-gate"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        for repo in [fx.repo_id, other_repo] {
+            let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_repo)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(matches!(dup, Err(AppError::Conflict(_))), "{dup:?}");
+        assert!(elsewhere.is_ok(), "{elsewhere:?}");
+        assert!(matches!(rename, Err(AppError::Conflict(_))), "{rename:?}");
+        assert!(self_rename.is_ok(), "{self_rename:?}");
+    }
 
     #[tokio::test]
     async fn test_update_policy_persists_multiple_fields_1374() {
