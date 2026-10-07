@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4518]
+---
+- **An OCI Remote whose upstream registry refuses the manifest request itself now reports an upstream authentication failure instead of "manifest unknown"** (#4518). #4453 covered a 401/403 from the upstream's token service. A 401/403 from the registry on the manifest request was still reported as `404 MANIFEST_UNKNOWN`: after a successful token exchange (Docker Hub hands out an anonymous token for a private image, then refuses the manifest), or from an upstream that uses plain Basic auth and rejects the credentials. A direct Remote manifest GET or HEAD now fails with `502` and the OCI error code `DENIED`, and the backend logs a warning on the `security` target naming the upstream URL (redacted, no credentials) and whether credentials are configured. Generic proxy formats are unchanged. Note that Docker Hub also answers 401 for a repository that does not exist, so a mistyped Docker Hub image on such a Remote now reports `DENIED` rather than `MANIFEST_UNKNOWN`.

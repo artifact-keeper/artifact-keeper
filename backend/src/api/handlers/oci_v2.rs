@@ -4471,8 +4471,8 @@ enum UpstreamFetchOutcome {
     /// of those say anything about whether the object exists, so a walk that
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
-    /// The upstream (its OCI token service) refused the Remote's credentials
-    /// (#4453). As indeterminate as [`Self::Indeterminate`], but the direct
+    /// The upstream refused the Remote's credentials: its OCI token service
+    /// (#4453), or the registry itself on the request (#4518). As indeterminate as [`Self::Indeterminate`], but the direct
     /// Remote manifest GET/HEAD reports it as a gateway error instead of
     /// `MANIFEST_UNKNOWN`.
     UpstreamAuthFailed,
@@ -4505,8 +4505,8 @@ impl UpstreamFetchOutcome {
             oci_error(
                 StatusCode::BAD_GATEWAY,
                 "DENIED",
-                "upstream registry authentication failed: the upstream token service \
-                 rejected this repository's upstream credentials",
+                "upstream registry authentication failed: the upstream registry or its \
+                 token service rejected this repository's upstream credentials",
             )
         })
     }
@@ -36250,6 +36250,147 @@ mod remote_pull_through_cache_tests {
         let body = String::from_utf8_lossy(&get_body);
         assert!(body.contains("DENIED"), "{body}");
         assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
+    }
+
+    /// #4518: the registry refusing the manifest request ITSELF -- after a
+    /// successful token exchange (an anonymous-scope token for a private
+    /// image), or on plain Basic auth (401 without a Bearer challenge, or
+    /// 403) -- is reported like a refusing token service: 502 `DENIED` on GET
+    /// and HEAD, never 404 `MANIFEST_UNKNOWN`, plus a `security` WARN naming
+    /// the upstream URL, with no credentials in it.
+    #[tokio::test]
+    async fn manifest_request_refused_by_the_registry_is_a_502_4518() {
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::header;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        // 1. Token exchange succeeds; the registry refuses the token.
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/private/manifests/v1"))
+            .and(header("authorization", "Bearer scoped-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/private/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="reg.test""#,
+                        server.uri()
+                    )
+                    .as_str(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "scoped-token"})),
+            )
+            .mount(&server)
+            .await;
+        // 2. Plain Basic auth, refused with a Basic challenge or a 403.
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/basic401/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", r#"Basic realm="reg""#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/basic403/manifests/v1"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = Uuid::new_v4().simple().to_string();
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc-4518".to_string(),
+                password: secret.clone(),
+            }),
+        )
+        .await
+        .expect("save upstream credentials");
+        let tmp = std::env::temp_dir().join(format!("oci-4518-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let mut seen = Vec::new();
+        for name in ["private", "basic401", "basic403"] {
+            let image = format!("{repo_key}/{name}");
+            let capture = tdh::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let head = super::handle_head_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                "v1",
+            )
+            .await;
+            let get = super::handle_get_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                "v1",
+                &ctx,
+            )
+            .await;
+            drop(guard);
+            let (get_status, get_body, _h) = tdh::collect_response(get).await;
+            seen.push((
+                name,
+                head.status(),
+                get_status,
+                String::from_utf8_lossy(&get_body).into_owned(),
+                capture.text(),
+            ));
+        }
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        for (name, head, get, body, logs) in seen {
+            assert_eq!(head, StatusCode::BAD_GATEWAY, "{name} HEAD");
+            assert_eq!(get, StatusCode::BAD_GATEWAY, "{name} GET: {body}");
+            assert!(body.contains("DENIED"), "{name}: {body}");
+            assert!(!body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
+            assert!(
+                logs.contains("WARN")
+                    && logs.contains("security")
+                    && logs.contains("credentials_sent=true")
+                    && logs.contains(&format!("/v2/{name}/manifests/v1")),
+                "{name}: {logs}"
+            );
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4518"),
+                "{name}: {logs}"
+            );
+        }
     }
 }
 

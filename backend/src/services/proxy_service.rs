@@ -907,6 +907,53 @@ pub(crate) fn token_endpoint_status_error(
     AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
 }
 
+/// The status of an upstream `401`/`403` answer to the request ITSELF, when
+/// `err` is one (#4518): the `BadGateway` [`validate_upstream_status`] makes
+/// of a 401/403 (including one on the retry after a successful bearer token
+/// exchange), or the `Storage` error a 401 without a Bearer challenge
+/// becomes in [`UpstreamClient::fetch_buffered`] (an upstream on plain Basic
+/// auth). `None` for anything else.
+pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(msg) | AppError::Storage(msg)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+}
+
+/// Reclassify an OCI registry's `401`/`403` on the manifest request itself
+/// (see [`upstream_request_auth_refusal`]) as [`AppError::UpstreamAuth`],
+/// the error [`token_endpoint_status_error`] gives a refusal by the token
+/// service (#4453), with the same kind of `security`-target line naming the
+/// redacted URL and whether credentials were sent (#4518). Docker Hub, for
+/// one, hands out an anonymous token for a private image and then refuses
+/// the manifest. Any other error is returned unchanged.
+///
+/// OCI only: generic formats keep a 403 as `BadGateway`, which some of them
+/// read as "not here" ([`is_upstream_forbidden`], #3886).
+pub(crate) fn oci_registry_auth_error(
+    err: AppError,
+    url: &str,
+    credentials_sent: bool,
+) -> AppError {
+    let Some(status) = upstream_request_auth_refusal(&err) else {
+        return err;
+    };
+    let url = redact_url_for_diagnostics(url);
+    tracing::warn!(
+        target: "security",
+        upstream = %url,
+        status = %status,
+        credentials_sent,
+        "upstream OCI registry rejected the proxy's authentication on a manifest request; \
+         check the Remote's upstream credentials"
+    );
+    AppError::UpstreamAuth(format!(
+        "upstream registry {url} returned {status}; check the repository's upstream credentials"
+    ))
+}
+
 /// Whether `err` is the error [`validate_upstream_status`] produces for an
 /// upstream `403 Forbidden`.
 ///
@@ -3905,6 +3952,15 @@ impl ProxyService {
     ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
             .await
+    }
+
+    /// Whether repository `repo_id` has upstream credentials configured, for
+    /// diagnostics only (#4518). A failed lookup reads as `false`.
+    pub async fn has_upstream_credentials(&self, repo_id: Uuid) -> bool {
+        matches!(
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await,
+            Ok(Some(_))
+        )
     }
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact_with_accept`]
@@ -17088,6 +17144,47 @@ mod tests {
             token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false),
             AppError::Storage(_)
         ));
+    }
+
+    /// #4518: only an upstream 401/403 on the request itself becomes an
+    /// upstream auth failure, and the error names the redacted URL only.
+    #[test]
+    fn test_oci_registry_auth_error_classifies_request_refusals_4518() {
+        let url = "https://bob:pw@reg.example.test/v2/img/manifests/v1";
+        let refused = [
+            validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
+            validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
+            AppError::Storage(format!(
+                "Upstream returned error status {}: {url}",
+                StatusCode::UNAUTHORIZED
+            )),
+        ];
+        for err in refused {
+            assert!(upstream_request_auth_refusal(&err).is_some(), "{err:?}");
+            let AppError::UpstreamAuth(msg) = oci_registry_auth_error(err, url, true) else {
+                panic!("expected UpstreamAuth");
+            };
+            assert!(
+                msg.contains("https://reg.example.test/v2/img/manifests/v1"),
+                "{msg}"
+            );
+            assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        }
+        let unchanged = [
+            validate_upstream_status(StatusCode::NOT_FOUND, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_REQUEST, url).unwrap_err(),
+            validate_upstream_status(StatusCode::TOO_MANY_REQUESTS, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_GATEWAY, url).unwrap_err(),
+            AppError::Storage("Token endpoint x returned status 401 Unauthorized".into()),
+        ];
+        for err in unchanged {
+            assert!(upstream_request_auth_refusal(&err).is_none(), "{err:?}");
+            let before = format!("{err:?}");
+            assert_eq!(
+                format!("{:?}", oci_registry_auth_error(err, url, false)),
+                before
+            );
+        }
     }
 
     // -- #3606: the token cache is scoped to the credential ------------------
