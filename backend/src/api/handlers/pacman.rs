@@ -1195,11 +1195,16 @@ mod db_tests {
     /// A minimal zstd package for `name`/`version`/`arch`, returned with its
     /// canonical filename.
     fn build_package(name: &str, version: &str, arch: &str) -> (String, Vec<u8>) {
+        build_package_with(name, version, arch, "usr/bin/tool")
+    }
+
+    /// [`build_package`] whose one payload file is `file`.
+    fn build_package_with(name: &str, version: &str, arch: &str, file: &str) -> (String, Vec<u8>) {
         let pkginfo = format!("pkgname = {name}\npkgver = {version}\narch = {arch}\n");
         let mut builder = tar::Builder::new(Vec::new());
         for (path, body) in [
             (".PKGINFO", pkginfo.as_bytes()),
-            ("usr/bin/tool", b"#!/bin/sh\n".as_slice()),
+            (file, b"#!/bin/sh\n".as_slice()),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_mode(0o644);
@@ -1524,7 +1529,11 @@ mod db_tests {
         // `.tar.gz` alias and the signature request share the entry.
         let (_, again) = get(&fx, "x86_64/myrepo.files.tar.gz").await;
         assert_eq!(again, first);
-        get(&fx, "x86_64/myrepo.files.sig").await;
+        // Unsigned repository: 404, but only after the database was built.
+        assert_eq!(
+            get(&fx, "x86_64/myrepo.files.sig").await.0,
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(renders(), 1);
         // Another real architecture with the same package set shares it too.
         let (_, aarch64) = get(&fx, "aarch64/myrepo.files").await;
@@ -1558,6 +1567,21 @@ mod db_tests {
         let (_, deleted) = get(&fx, "x86_64/myrepo.files").await;
         assert_eq!(deleted, signed);
         assert_eq!(renders(), 3);
+
+        // Re-uploading the same version with different content is a new
+        // artifact (the soft-deleted row and its list are swept first), so it
+        // renders again and lists the new file.
+        let (again_file, again_pkg) =
+            build_package_with("tool", "1.0-1", "x86_64", "usr/bin/tool2");
+        assert_eq!(again_file, tool_file);
+        assert_eq!(put(&fx, &again_file, again_pkg).await, StatusCode::CREATED);
+        let (_, reuploaded) = get(&fx, "x86_64/myrepo.files").await;
+        let tool = db_members(&reuploaded)
+            .into_iter()
+            .find(|(p, _)| p == "tool-1.0-1/files")
+            .expect("re-uploaded package listed");
+        assert_eq!(tool.1, "%FILES%\nusr/bin/tool2\n");
+        assert_eq!(renders(), 4);
         fx.teardown().await;
     }
 
@@ -1595,6 +1619,33 @@ mod db_tests {
         .await
         .unwrap();
 
+        // Another format's `files` (Maven records one, migration 179) must
+        // survive: the migration only touches pacman rows.
+        let maven_id = crate::api::handlers::proxy_helpers::insert_artifact(
+            &fx.pool,
+            crate::api::handlers::proxy_helpers::NewArtifact {
+                repository_id: fx.repo_id,
+                path: "maven/lib-1.0.jar",
+                name: "lib",
+                version: "1.0",
+                size_bytes: 1,
+                checksum_sha256: "00",
+                content_type: "application/java-archive",
+                storage_key: "maven/lib-1.0.jar",
+                uploaded_by: fx.user_id,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'maven', '{\"files\": [\"lib/A.class\"]}')",
+        )
+        .bind(maven_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
         let migration = include_str!("../../../migrations/276_pacman_file_lists.sql");
         for _ in 0..2 {
             sqlx::raw_sql(migration).execute(&fx.pool).await.unwrap();
@@ -1619,6 +1670,7 @@ mod db_tests {
                     false,
                     Some(vec!["usr/".to_string(), "usr/bin/legacy".to_string()])
                 ),
+                ("lib".to_string(), true, None),
                 ("odd".to_string(), false, None),
             ]
         );
