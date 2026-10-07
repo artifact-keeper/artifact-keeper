@@ -35,6 +35,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -68,17 +69,15 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 
 /// The `artifact_metadata` document of a pacman package: everything the
-/// databases need, so rendering them never re-reads a package.
+/// `.db` database needs, so rendering it never re-reads a package. The file
+/// list is not part of it: it lives in `pacman_file_lists` (#4424) and is
+/// read only for the `.files` database.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct PacmanMetadata {
     filename: String,
     arch: String,
     pkginfo: PkgInfo,
-    /// File list for the `.files` database. Stripped from the row by the
-    /// `.db` query, which never needs it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<Vec<String>>,
     /// Base64 binary detached signature, once one is uploaded (`%PGPSIG%`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pgpsig: Option<String>,
@@ -87,6 +86,7 @@ struct PacmanMetadata {
 /// One live package row, as the databases list it.
 #[derive(Debug, Clone)]
 struct IndexedPackage {
+    artifact_id: uuid::Uuid,
     csize: i64,
     sha256: String,
     mtime: u64,
@@ -107,8 +107,13 @@ fn latest_per_name(packages: Vec<IndexedPackage>) -> Vec<IndexedPackage> {
     latest
 }
 
-/// Render `{repo}.db` (or `{repo}.files`) for an already-selected package set.
-fn render_database(packages: &[IndexedPackage], with_files: bool) -> std::io::Result<Vec<u8>> {
+/// Render `{repo}.db` for an already-selected package set, or `{repo}.files`
+/// when `file_lists` is given. A package with no stored list (its walk ran out
+/// of budget at upload) gets an empty `files` member, as before.
+fn render_database(
+    packages: &[IndexedPackage],
+    file_lists: Option<&HashMap<uuid::Uuid, Vec<String>>>,
+) -> std::io::Result<Vec<u8>> {
     let entries: Vec<fmt::DbEntry<'_>> = packages
         .iter()
         .map(|p| fmt::DbEntry {
@@ -117,11 +122,70 @@ fn render_database(packages: &[IndexedPackage], with_files: bool) -> std::io::Re
             sha256: &p.sha256,
             pgpsig: p.meta.pgpsig.as_deref(),
             info: &p.meta.pkginfo,
-            files: p.meta.files.as_deref(),
+            files: file_lists
+                .and_then(|lists| lists.get(&p.artifact_id))
+                .map(Vec::as_slice),
             mtime: p.mtime,
         })
         .collect();
-    fmt::build_database(&entries, with_files)
+    fmt::build_database(&entries, file_lists.is_some())
+}
+
+/// Everything a rendered `.files` database depends on, hashed: the selected
+/// artifacts in order plus each entry's mutable or desc-visible fields. An
+/// artifact's `.PKGINFO` and file list never change after upload; only the
+/// set-once `%PGPSIG%` does. A publish, delete or signature upload therefore
+/// changes the fingerprint, and the cache needs no explicit invalidation.
+fn files_fingerprint(packages: &[IndexedPackage]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for p in packages {
+        hasher.update(p.artifact_id.as_bytes());
+        hasher.update(p.csize.to_le_bytes());
+        hasher.update(p.mtime.to_le_bytes());
+        for field in [p.sha256.as_str(), p.meta.pgpsig.as_deref().unwrap_or("")] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// Cache key of a rendered `.files` database: the repository, the
+/// architecture it was rendered for, and the package-set fingerprint.
+type FilesCacheKey = (uuid::Uuid, String, [u8; 32]);
+
+/// Upper bound on the bytes of rendered `.files` databases kept in memory.
+const FILES_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How long an unused rendered `.files` database stays cached. Entries for an
+/// outdated package set are never hit again and simply age out.
+const FILES_CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Rendered `.files` databases per repository state (#4424). Each `-Fy` would
+/// otherwise re-read and re-gzip every file list in the repository.
+/// `try_get_with` single-flights a miss, and a failed render is never cached.
+static FILES_CACHE: once_cell::sync::Lazy<moka::future::Cache<FilesCacheKey, Bytes>> =
+    once_cell::sync::Lazy::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(FILES_CACHE_MAX_BYTES)
+            .weigher(|_k: &FilesCacheKey, v: &Bytes| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .time_to_idle(FILES_CACHE_IDLE)
+            .build()
+    });
+
+/// `.files` renders performed per repository, which the cache tests assert on.
+#[cfg(test)]
+static FILES_RENDERS: once_cell::sync::Lazy<std::sync::Mutex<HashMap<uuid::Uuid, u64>>> =
+    once_cell::sync::Lazy::new(Default::default);
+
+#[cfg(test)]
+fn files_renders(repo_id: uuid::Uuid) -> u64 {
+    FILES_RENDERS
+        .lock()
+        .unwrap()
+        .get(&repo_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Artifact path a package is stored under: `{pkgarch}/{filename}`.
@@ -152,7 +216,8 @@ fn storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
     format!("pacman/{repo_id}/{artifact_path}")
 }
 
-fn bytes_response(body: Vec<u8>, content_type: &str) -> Response {
+fn bytes_response(body: impl Into<Bytes>, content_type: &str) -> Response {
+    let body: Bytes = body.into();
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
@@ -192,6 +257,7 @@ fn reject_unsupported_repo_type(repo_type: &str) -> Result<(), Response> {
 
 #[derive(sqlx::FromRow)]
 struct PackageRow {
+    id: uuid::Uuid,
     size_bytes: i64,
     checksum_sha256: String,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -205,6 +271,7 @@ impl PackageRow {
             return None;
         }
         Some(IndexedPackage {
+            artifact_id: self.id,
             csize: self.size_bytes,
             sha256: self.checksum_sha256,
             mtime: self.created_at.timestamp().max(0) as u64,
@@ -214,17 +281,15 @@ impl PackageRow {
 }
 
 /// Live packages visible in `arch`'s databases (that arch plus `any`), newest
-/// first. The file lists are only loaded for the `.files` database.
+/// first. File lists are not read here; see [`load_file_lists`].
 async fn list_packages(
     db: &PgPool,
     repo_id: uuid::Uuid,
     arch: &str,
-    with_files: bool,
 ) -> Result<Vec<IndexedPackage>, Response> {
     let rows: Vec<PackageRow> = sqlx::query_as(
         r#"
-        SELECT a.size_bytes, a.checksum_sha256, a.created_at,
-               CASE WHEN $3 THEN am.metadata ELSE am.metadata - 'files' END AS metadata
+        SELECT a.id, a.size_bytes, a.checksum_sha256, a.created_at, am.metadata
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -235,7 +300,6 @@ async fn list_packages(
     )
     .bind(repo_id)
     .bind(super::escape_path_prefix(&[arch]))
-    .bind(with_files)
     .fetch_all(db)
     .await
     .map_err(super::db_err)?;
@@ -244,6 +308,20 @@ async fn list_packages(
         .into_iter()
         .filter_map(PackageRow::into_indexed)
         .collect())
+}
+
+/// The stored file lists of `artifact_ids`, for the `.files` database.
+async fn load_file_lists(
+    db: &PgPool,
+    artifact_ids: &[uuid::Uuid],
+) -> Result<HashMap<uuid::Uuid, Vec<String>>, sqlx::Error> {
+    let rows: Vec<(uuid::Uuid, Vec<String>)> = sqlx::query_as(
+        "SELECT artifact_id, files FROM pacman_file_lists WHERE artifact_id = ANY($1)",
+    )
+    .bind(artifact_ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// The live artifact row behind one of `paths`, with its metadata.
@@ -306,8 +384,15 @@ async fn serve_database(
     with_files: bool,
     signature: bool,
 ) -> Result<Response, Response> {
-    let packages = latest_per_name(list_packages(&state.db, repo.id, arch, with_files).await?);
-    let database = render_database(&packages, with_files).map_err(|e| {
+    let packages = latest_per_name(list_packages(&state.db, repo.id, arch).await?);
+    let database = if with_files {
+        files_database(&state.db, repo.id, arch, packages).await
+    } else {
+        render_database(&packages, None)
+            .map(Bytes::from)
+            .map_err(|e| e.to_string())
+    }
+    .map_err(|e| {
         tracing::error!(error = %e, "Failed to build pacman database");
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -342,6 +427,37 @@ async fn serve_database(
         })?;
     let binary = fmt::normalize_signature(armored.as_bytes()).map_err(|e| e.into_response())?;
     Ok(bytes_response(binary, SIGNATURE_CONTENT_TYPE))
+}
+
+/// `{repo}.files` for the selected `packages`, from the cache when the
+/// package set is unchanged since the last render. Only a miss reads the
+/// file lists, and only those of the selected (newest per name) packages.
+async fn files_database(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    arch: &str,
+    packages: Vec<IndexedPackage>,
+) -> Result<Bytes, String> {
+    let key = (repo_id, arch.to_string(), files_fingerprint(&packages));
+    let db = db.clone();
+    FILES_CACHE
+        .try_get_with(key, async move {
+            let ids: Vec<uuid::Uuid> = packages.iter().map(|p| p.artifact_id).collect();
+            let lists = load_file_lists(&db, &ids)
+                .await
+                .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            {
+                *FILES_RENDERS.lock().unwrap().entry(repo_id).or_default() += 1;
+            }
+            tokio::task::spawn_blocking(move || render_database(&packages, Some(&lists)))
+                .await
+                .map_err(|e| e.to_string())?
+                .map(Bytes::from)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e: std::sync::Arc<String>| e.to_string())
 }
 
 async fn serve_package(
@@ -477,14 +593,16 @@ fn check_upload_filename(filename: &str, info: &PkgInfo) -> Result<(), Response>
     Ok(())
 }
 
-/// Insert the artifact row and its `pacman` metadata in one transaction. The
-/// metadata row is what the databases are rendered from, so a package whose
+/// Insert the artifact row, its `pacman` metadata and its file list (when the
+/// walk produced one) in one transaction. The metadata row is what the
+/// databases are rendered from, so a package whose
 /// metadata could not be written must not be published at all (it would be
 /// invisible to pacman yet block re-upload with a 409).
 async fn insert_package_rows(
     db: &PgPool,
     artifact: proxy_helpers::NewArtifact<'_>,
     metadata: &PacmanMetadata,
+    files: Option<&[String]>,
 ) -> Result<uuid::Uuid, Response> {
     let repository_id = artifact.repository_id;
     let metadata = serde_json::to_value(metadata).map_err(|e| {
@@ -503,6 +621,14 @@ async fn insert_package_rows(
     .execute(&mut *tx)
     .await
     .map_err(super::db_err)?;
+    if let Some(files) = files {
+        sqlx::query("INSERT INTO pacman_file_lists (artifact_id, files) VALUES ($1, $2)")
+            .bind(artifact_id)
+            .bind(files)
+            .execute(&mut *tx)
+            .await
+            .map_err(super::db_err)?;
+    }
     tx.commit().await.map_err(super::db_err)?;
 
     let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
@@ -566,7 +692,6 @@ async fn store_package(
         filename: filename.to_string(),
         arch: info.arch.clone(),
         pkginfo: info.clone(),
-        files: contents.files,
         pgpsig: None,
     };
     let artifact_id = insert_package_rows(
@@ -583,6 +708,7 @@ async fn store_package(
             uploaded_by: user_id,
         },
         &metadata,
+        contents.files.as_deref(),
     )
     .await?;
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
@@ -745,6 +871,7 @@ mod tests {
 
     fn indexed(name: &str, filename: &str, mtime: u64) -> IndexedPackage {
         IndexedPackage {
+            artifact_id: uuid::Uuid::new_v4(),
             csize: 1,
             sha256: "00".into(),
             mtime,
@@ -757,7 +884,6 @@ mod tests {
                     arch: "x86_64".into(),
                     ..Default::default()
                 },
-                files: None,
                 pgpsig: None,
             },
         }
@@ -772,7 +898,7 @@ mod tests {
         ]);
         let names: Vec<_> = latest.iter().map(|p| p.meta.filename.as_str()).collect();
         assert_eq!(names, vec!["alpha-new", "zeta-2"]);
-        let db = render_database(&latest, false).unwrap();
+        let db = render_database(&latest, None).unwrap();
         let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&db[..]));
         let paths: Vec<String> = archive
             .entries()
@@ -788,6 +914,75 @@ mod tests {
                 "zeta-1.0-1/desc"
             ]
         );
+    }
+
+    /// `(entry path, contents)` of every regular file in a rendered database.
+    fn members(db: &[u8]) -> Vec<(String, String)> {
+        use std::io::Read;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(db));
+        let mut out = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type().is_file() {
+                let path = entry.path().unwrap().to_string_lossy().to_string();
+                let mut text = String::new();
+                entry.read_to_string(&mut text).unwrap();
+                out.push((path, text));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn files_database_takes_lists_by_artifact_and_db_has_none() {
+        let listed = indexed("listed", "listed.pkg.tar", 1);
+        let unlisted = indexed("unlisted", "unlisted.pkg.tar", 1);
+        let lists = HashMap::from([(listed.artifact_id, vec!["usr/".into(), "usr/bin/x".into()])]);
+        let packages = vec![listed, unlisted];
+
+        let files = members(&render_database(&packages, Some(&lists)).unwrap());
+        let names: Vec<_> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "listed-1.0-1/desc",
+                "listed-1.0-1/files",
+                "unlisted-1.0-1/desc",
+                "unlisted-1.0-1/files"
+            ]
+        );
+        assert_eq!(files[1].1, "%FILES%\nusr/\nusr/bin/x\n");
+        assert_eq!(files[3].1, "%FILES%\n");
+
+        let db = members(&render_database(&packages, None).unwrap());
+        assert!(db.iter().all(|(p, _)| p.ends_with("/desc")), "{db:?}");
+    }
+
+    #[test]
+    fn files_fingerprint_tracks_the_package_set() {
+        let a = indexed("a", "a.pkg.tar", 1);
+        let b = indexed("b", "b.pkg.tar", 2);
+        let base = files_fingerprint(&[a.clone(), b.clone()]);
+        assert_eq!(base, files_fingerprint(&[a.clone(), b.clone()]));
+        // Publish, delete and reorder all change it.
+        assert_ne!(base, files_fingerprint(&[a.clone()]));
+        assert_ne!(base, files_fingerprint(&[b.clone(), a.clone()]));
+        assert_ne!(base, files_fingerprint(&[]));
+        // A newer upload of the same name is a different artifact.
+        let mut rebuilt = b.clone();
+        rebuilt.artifact_id = uuid::Uuid::new_v4();
+        assert_ne!(base, files_fingerprint(&[a.clone(), rebuilt]));
+        // Attaching a signature changes the desc, so it changes the key too.
+        let mut signed = b.clone();
+        signed.meta.pgpsig = Some("AAE=".into());
+        assert_ne!(base, files_fingerprint(&[a.clone(), signed]));
+        // Field boundaries are length-prefixed: no ambiguity between fields.
+        let (mut x, mut y) = (a.clone(), a.clone());
+        x.sha256 = "ab".into();
+        x.meta.pgpsig = Some("c".into());
+        y.sha256 = "a".into();
+        y.meta.pgpsig = Some("bc".into());
+        assert_ne!(files_fingerprint(&[x]), files_fingerprint(&[y]));
     }
 
     #[test]
@@ -857,6 +1052,7 @@ mod tests {
     #[test]
     fn rows_without_usable_metadata_are_skipped() {
         let row = |metadata| PackageRow {
+            id: uuid::Uuid::nil(),
             size_bytes: 5,
             checksum_sha256: "ab".into(),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
@@ -1196,6 +1392,147 @@ mod db_tests {
             put(&fx, "other-1-1-any.pkg.tar.zst", other).await,
             StatusCode::CONFLICT
         );
+        fx.teardown().await;
+    }
+
+    /// #4424: the file list is stored in `pacman_file_lists`, never in the
+    /// metadata document the `.db` query reads, and the rendered `.files`
+    /// database is reused until the package set changes.
+    #[tokio::test]
+    async fn file_lists_live_outside_metadata_and_files_db_is_cached() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let renders = || super::files_renders(fx.repo_id);
+        assert_eq!(put(&fx, MARKER_FILE, MARKER_PKG).await, StatusCode::CREATED);
+
+        let (has_files_key, list): (bool, Vec<String>) = sqlx::query_as(
+            "SELECT am.metadata ? 'files', fl.files \
+             FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             JOIN pacman_file_lists fl ON fl.artifact_id = a.id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert!(!has_files_key, "file list leaked into artifact_metadata");
+        assert!(list.iter().any(|f| f == "usr/share/ak-marker/marker.txt"));
+
+        let (_, db) = get(&fx, "x86_64/myrepo.db").await;
+        assert!(db_members(&db).iter().all(|(p, _)| p.ends_with("/desc")));
+
+        let (status, first) = get(&fx, "x86_64/myrepo.files").await;
+        assert_eq!(status, StatusCode::OK);
+        let files = db_members(&first);
+        assert!(files[1].1.contains("usr/share/ak-marker/marker.txt\n"));
+        assert_eq!(renders(), 1);
+        // Same package set: served from the cache, byte-identical, and the
+        // `.tar.gz` alias and the signature request share the entry.
+        let (_, again) = get(&fx, "x86_64/myrepo.files.tar.gz").await;
+        assert_eq!(again, first);
+        get(&fx, "x86_64/myrepo.files.sig").await;
+        assert_eq!(renders(), 1);
+        // Another architecture is another package set.
+        get(&fx, "aarch64/myrepo.files").await;
+        assert_eq!(renders(), 2);
+
+        // A signature changes the desc: re-rendered once, then cached again.
+        assert_eq!(
+            put(&fx, &format!("{MARKER_FILE}.sig"), MARKER_SIG).await,
+            StatusCode::CREATED
+        );
+        let (_, signed) = get(&fx, "x86_64/myrepo.files").await;
+        assert!(db_members(&signed)[0].1.contains("%PGPSIG%"));
+        get(&fx, "x86_64/myrepo.files").await;
+        assert_eq!(renders(), 3);
+
+        // A publish adds the new package's list.
+        let (tool_file, tool_pkg) = build_package("tool", "1.0-1", "x86_64");
+        assert_eq!(put(&fx, &tool_file, tool_pkg).await, StatusCode::CREATED);
+        let (_, published) = get(&fx, "x86_64/myrepo.files").await;
+        let paths: Vec<_> = db_members(&published).into_iter().map(|(p, _)| p).collect();
+        assert!(paths.contains(&"tool-1.0-1/files".to_string()), "{paths:?}");
+        assert_eq!(renders(), 4);
+
+        // A delete drops it again. The package set is then the signed one
+        // from before, whose render is still cached.
+        assert_eq!(
+            delete(&fx, &format!("x86_64/{tool_file}")).await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, deleted) = get(&fx, "x86_64/myrepo.files").await;
+        assert_eq!(deleted, signed);
+        assert_eq!(renders(), 4);
+        fx.teardown().await;
+    }
+
+    /// Migration 272 moves a file list written by the pre-#4424 handler out
+    /// of `artifact_metadata`, and running it again changes nothing.
+    #[tokio::test]
+    async fn migration_272_moves_legacy_file_lists() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let (file, pkg) = build_package("legacy", "1.0-1", "x86_64");
+        assert_eq!(put(&fx, &file, pkg).await, StatusCode::CREATED);
+        let (bad_file, bad_pkg) = build_package("odd", "1.0-1", "x86_64");
+        assert_eq!(put(&fx, &bad_file, bad_pkg).await, StatusCode::CREATED);
+        // Rewrite both rows into the old shape: the list inside the document
+        // (one of them malformed), no pacman_file_lists row.
+        sqlx::query(
+            "WITH ids AS (SELECT id, name FROM artifacts WHERE repository_id = $1) \
+             UPDATE artifact_metadata am \
+             SET metadata = jsonb_set(am.metadata, '{files}', \
+                 CASE WHEN ids.name = 'legacy' THEN '[\"usr/\", \"usr/bin/legacy\"]'::jsonb \
+                      ELSE '\"not-a-list\"'::jsonb END) \
+             FROM ids WHERE am.artifact_id = ids.id",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM pacman_file_lists WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+        let migration = include_str!("../../../migrations/272_pacman_file_lists.sql");
+        for _ in 0..2 {
+            sqlx::raw_sql(migration).execute(&fx.pool).await.unwrap();
+        }
+
+        let rows: Vec<(String, bool, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT a.name, am.metadata ? 'files', fl.files \
+             FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             LEFT JOIN pacman_file_lists fl ON fl.artifact_id = a.id \
+             WHERE a.repository_id = $1 ORDER BY a.name",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "legacy".to_string(),
+                    false,
+                    Some(vec!["usr/".to_string(), "usr/bin/legacy".to_string()])
+                ),
+                ("odd".to_string(), false, None),
+            ]
+        );
+        let (_, files) = get(&fx, "x86_64/myrepo.files").await;
+        let members = db_members(&files);
+        assert_eq!(members[1].0, "legacy-1.0-1/files");
+        assert_eq!(members[1].1, "%FILES%\nusr/\nusr/bin/legacy\n");
         fx.teardown().await;
     }
 
