@@ -876,35 +876,234 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
 
 /// The error for an OCI token endpoint that answered `status` (not 2xx).
 ///
-/// A 401/403 means the token service refused the Remote's credentials (or the
-/// anonymous request, when none were sent): [`AppError::UpstreamAuth`], a
-/// 502 with its own code, plus a `security`-target line naming the redacted
-/// realm so an operator sees a credentials problem rather than the
-/// `Storage error` / `MANIFEST_UNKNOWN` it used to surface as (#4453).
-/// Neither the log nor the message carries credentials. Any other status
-/// keeps the previous `Storage` classification.
+/// A 401/403 when the Remote's credentials were actually SENT to the token
+/// service means it refused them: [`AppError::UpstreamAuth`], a 502 with its
+/// own code, plus a `security`-target line naming the redacted realm so an
+/// operator sees a credentials problem rather than the `Storage error` /
+/// `MANIFEST_UNKNOWN` it used to surface as (#4453). The WARN is sampled per
+/// Remote `repo_id` ([`security_warn_admitted`]; `None` always logs).
+///
+/// A 401/403 to an ANONYMOUS token request (no credentials configured, or
+/// withheld from an untrusted cross-origin realm, #3591) is not a
+/// credentials problem the operator can fix: it keeps the `Storage`
+/// classification, so the manifest handlers report a miss, and is logged at
+/// INFO (#4527). Neither the log nor the message carries credentials. Any
+/// other status keeps the `Storage` classification.
 pub(crate) fn token_endpoint_status_error(
     realm: &str,
     status: StatusCode,
     credentials_sent: bool,
+    repo_id: Option<Uuid>,
 ) -> AppError {
     let realm = redact_url_for_diagnostics(realm);
-    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        tracing::warn!(
-            target: "security",
-            realm = %realm,
-            status = %status,
-            credentials_sent,
-            "upstream OCI token service rejected the proxy's authentication; check the \
-             Remote's upstream credentials (and oci_trusted_bearer_realms for a cross-origin \
-             realm)"
-        );
+    let refused = status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN;
+    if refused && credentials_sent {
+        if let Some(suppressed) =
+            security_warn_admitted(SampledSecurityWarn::TokenServiceRejected, repo_id)
+        {
+            tracing::warn!(
+                target: "security",
+                realm = %realm,
+                status = %status,
+                credentials_sent,
+                suppressed,
+                "upstream OCI token service rejected the proxy's authentication; check the \
+                 Remote's upstream credentials (and oci_trusted_bearer_realms for a \
+                 cross-origin realm)"
+            );
+        }
         return AppError::UpstreamAuth(format!(
             "upstream token service {realm} returned {status}; check the repository's \
              upstream credentials"
         ));
     }
+    if refused {
+        tracing::info!(
+            realm = %realm,
+            status = %status,
+            "upstream OCI token service refused an anonymous token request (no credentials \
+             were sent); treating the object as not available"
+        );
+    }
     AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
+}
+
+/// The error for a registry that refused the request made with an
+/// ANONYMOUS bearer token (#4527): the token service got no credentials (none
+/// configured, or withheld from an untrusted cross-origin realm), so the
+/// refusal says nothing about the Remote's credentials. Usually the image
+/// does not exist or is private (Docker Hub answers 401 for a repository
+/// that does not exist). Logged at INFO; the error keeps the `BadGateway`
+/// class but NOT the `"... {status}:"` shape [`upstream_request_auth_refusal`]
+/// recognises, so an OCI manifest fetch reports a miss, never `DENIED`.
+fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
+    let url = redact_url_for_diagnostics(url);
+    tracing::info!(
+        upstream = %url,
+        status = %status,
+        "upstream registry refused a request made with an anonymous bearer token (no \
+         credentials were sent); treating the object as not available"
+    );
+    AppError::BadGateway(format!(
+        "Upstream returned error status {status} for an anonymous bearer token: {url}"
+    ))
+}
+
+/// The status of an upstream `401`/`403` answer to the request ITSELF, when
+/// `err` is one (#4518): the `BadGateway` [`validate_upstream_status`] makes
+/// of a 401/403 (including one on the retry after a successful bearer token
+/// exchange), or the `Storage` error a 401 without a Bearer challenge
+/// becomes in [`UpstreamClient::fetch_buffered`] (an upstream on plain Basic
+/// auth). `None` for anything else.
+pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(msg) | AppError::Storage(msg)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+}
+
+/// At most one of each upstream-auth `security` WARN per Remote per this
+/// interval (#4518, #4453, #3591); the rest are counted and the count is
+/// reported on the next one. A client pulling a missing or private image in
+/// a loop, or a Remote with wrong credentials, must not flood the security
+/// log with one line per pull.
+const SECURITY_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on the (WARN, Remote) pairs [`security_warn_state`] tracks; past it
+/// the state is reset (each Remote then warns once more).
+const SECURITY_WARN_KEYS: usize = 4096;
+
+/// The upstream-auth `security` WARNs sampled per Remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SampledSecurityWarn {
+    /// The OCI token service refused the proxy (#4453).
+    TokenServiceRejected,
+    /// The OCI registry refused the manifest request itself (#4518).
+    RegistryRejected,
+    /// The Remote's credentials were withheld from a cross-origin bearer
+    /// realm (#3591).
+    RealmCredentialsWithheld,
+}
+
+type SecurityWarnState = HashMap<(SampledSecurityWarn, Uuid), (Instant, u64)>;
+
+fn security_warn_state() -> &'static std::sync::Mutex<SecurityWarnState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<SecurityWarnState>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Whether to log `warn` for Remote `repo_id` now: `Some(n)` with the number
+/// suppressed since the last one, `None` to stay quiet. Without a Remote
+/// (`None`) it always logs.
+pub(crate) fn security_warn_admitted(
+    warn: SampledSecurityWarn,
+    repo_id: Option<Uuid>,
+) -> Option<u64> {
+    let Some(repo_id) = repo_id else {
+        return Some(0);
+    };
+    security_warn_state()
+        .lock()
+        .map(|mut state| {
+            admit_sampled_warn(
+                &mut state,
+                (warn, repo_id),
+                Instant::now(),
+                SECURITY_WARN_INTERVAL,
+                SECURITY_WARN_KEYS,
+            )
+        })
+        .unwrap_or(Some(0))
+}
+
+/// Sampling decision for a rate-limited WARN keyed by `key`: `Some(n)` to
+/// log now, `n` being how many were suppressed since the last one, or `None`
+/// to stay quiet (counted) because one was logged less than `interval` ago.
+fn admit_sampled_warn<K: std::hash::Hash + Eq>(
+    state: &mut HashMap<K, (Instant, u64)>,
+    key: K,
+    now: Instant,
+    interval: Duration,
+    max_keys: usize,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = state.get_mut(&key) {
+        if now.duration_since(*last) < interval {
+            *suppressed += 1;
+            return None;
+        }
+        let missed = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(missed);
+    }
+    if state.len() >= max_keys {
+        state.clear();
+    }
+    state.insert(key, (now, 0));
+    Some(0)
+}
+
+/// Reclassify an OCI registry's `401`/`403` on the manifest request itself
+/// (see [`upstream_request_auth_refusal`]) for Remote `repo_id` (#4518).
+///
+/// * Credentials were sent: [`AppError::UpstreamAuth`], the error
+///   [`token_endpoint_status_error`] gives a refusing token service (#4453),
+///   so the client gets 502 `DENIED`, plus a `security`-target WARN naming
+///   the redacted URL, sampled per Remote ([`SECURITY_WARN_INTERVAL`]).
+/// * No credentials sent: the error is returned unchanged, so the client
+///   keeps 404 `MANIFEST_UNKNOWN`, and the refusal is logged at INFO. There
+///   is nothing for the operator to fix, and an anonymous refusal usually
+///   means the image does not exist or is private (Docker Hub answers 401
+///   for a repository that does not exist).
+///
+/// `credentials_sent` is "credentials configured" for the errors that reach
+/// this: the registry gets the configured credentials on the plain request,
+/// and a refusal of a bearer token obtained WITHOUT them (none configured,
+/// or withheld from an untrusted cross-origin realm) never matches
+/// [`upstream_request_auth_refusal`] ([`anonymous_token_refused_error`],
+/// #4527).
+///
+/// Any other error is returned unchanged. OCI only: generic formats keep a
+/// 403 as `BadGateway`, which some read as "not here"
+/// ([`is_upstream_forbidden`], #3886).
+pub(crate) fn oci_registry_auth_error(
+    err: AppError,
+    repo_id: Uuid,
+    url: &str,
+    credentials_sent: bool,
+) -> AppError {
+    let Some(status) = upstream_request_auth_refusal(&err) else {
+        return err;
+    };
+    let url = redact_url_for_diagnostics(url);
+    if !credentials_sent {
+        tracing::info!(
+            upstream = %url,
+            status = %status,
+            "upstream OCI registry refused an anonymous manifest request; reporting the \
+             manifest as unknown (no upstream credentials are configured)"
+        );
+        return err;
+    }
+    if let Some(suppressed) =
+        security_warn_admitted(SampledSecurityWarn::RegistryRejected, Some(repo_id))
+    {
+        tracing::warn!(
+            target: "security",
+            upstream = %url,
+            status = %status,
+            credentials_sent,
+            suppressed,
+            "upstream OCI registry rejected the proxy's authentication on a manifest request; \
+             check the Remote's upstream credentials"
+        );
+    }
+    AppError::UpstreamAuth(format!(
+        "upstream registry {url} returned {status}; check the repository's upstream credentials"
+    ))
 }
 
 /// Whether `err` is the error [`validate_upstream_status`] produces for an
@@ -3251,7 +3450,14 @@ impl UpstreamClient {
                     .await?;
 
                 let token = self
-                    .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
+                    .obtain_bearer_token_for(
+                        Some(repo_id),
+                        realm,
+                        &service,
+                        &scope,
+                        &realm_auth,
+                        client,
+                    )
                     .await?;
 
                 // Retry with the bearer token only. The original upstream
@@ -3274,6 +3480,15 @@ impl UpstreamClient {
                         ),
                     )
                 })?;
+
+                // #4527: no credentials went to the token service, so a
+                // refusal of the anonymous token is not a credentials problem.
+                let status = retry_response.status();
+                if realm_auth.is_none()
+                    && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+                {
+                    return Err(anonymous_token_refused_error(status, url));
+                }
 
                 return Ok(Some(retry_response));
             }
@@ -3318,8 +3533,24 @@ impl UpstreamClient {
     /// Obtain a bearer token for an OCI registry, using the in-memory cache
     /// when possible. Relocated verbatim from
     /// `ProxyService::obtain_bearer_token`.
+    #[cfg(test)]
     async fn obtain_bearer_token(
         &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        client: &Client,
+    ) -> Result<String> {
+        self.obtain_bearer_token_for(None, realm, service, scope, upstream_auth, client)
+            .await
+    }
+
+    /// [`Self::obtain_bearer_token`] on behalf of Remote `repo_id`, which
+    /// keys the sampling of a token-service rejection WARN (#4453).
+    async fn obtain_bearer_token_for(
+        &self,
+        repo_id: Option<Uuid>,
         realm: &str,
         service: &str,
         scope: &str,
@@ -3373,6 +3604,7 @@ impl UpstreamClient {
                 realm,
                 token_response.status(),
                 upstream_auth.is_some(),
+                repo_id,
             ));
         }
 
@@ -3620,12 +3852,20 @@ impl UpstreamClient {
                 upstream_auth.clone()
             }
             RealmCredentialForwarding::Withheld if upstream_auth.is_some() => {
-                tracing::warn!(
-                    target: "security",
-                    realm = %redact_url_for_diagnostics(realm),
-                    "{}",
-                    REALM_CREDENTIALS_WITHHELD
-                );
+                // Fires on every pull of such a Remote, so it is sampled per
+                // Remote like the other upstream-auth lines (#4518).
+                if let Some(suppressed) = security_warn_admitted(
+                    SampledSecurityWarn::RealmCredentialsWithheld,
+                    Some(repo_id),
+                ) {
+                    tracing::warn!(
+                        target: "security",
+                        realm = %redact_url_for_diagnostics(realm),
+                        suppressed,
+                        "{}",
+                        REALM_CREDENTIALS_WITHHELD
+                    );
+                }
                 None
             }
             // Anonymous remote: nothing is withheld, so nothing to warn about
@@ -4038,6 +4278,15 @@ impl ProxyService {
     ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
             .await
+    }
+
+    /// Whether repository `repo_id` has upstream credentials configured, for
+    /// diagnostics only (#4518). A failed lookup reads as `false`.
+    pub async fn has_upstream_credentials(&self, repo_id: Uuid) -> bool {
+        matches!(
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await,
+            Ok(Some(_))
+        )
     }
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact_with_accept`]
@@ -17180,9 +17429,11 @@ mod tests {
             password: secret.clone(),
         });
 
+        // #4527: only a refusal of credentials actually sent is an upstream
+        // auth failure; both statuses with credentials here.
         for (realm_path, creds, sent) in [
             ("/token", &creds, "credentials_sent=true"),
-            ("/forbidden/token", &None, "credentials_sent=false"),
+            ("/forbidden/token", &creds, "credentials_sent=true"),
         ] {
             let realm = format!("{}{realm_path}?account=svc-4453", server.uri());
             let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
@@ -17220,6 +17471,33 @@ mod tests {
             );
         }
 
+        // #4527: an anonymous token request that is refused is not a
+        // credentials problem: Storage (a miss for the manifest handlers),
+        // logged at INFO, never on the `security` target.
+        for realm_path in ["/token", "/forbidden/token"] {
+            let realm = format!("{}{realm_path}", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    &None,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            assert!(matches!(err, AppError::Storage(_)), "{realm_path}: {err:?}");
+            let logs = capture.text();
+            assert!(!logs.contains("security"), "{logs}");
+            assert!(
+                logs.contains("refused an anonymous token request"),
+                "{logs}"
+            );
+        }
+
         let realm = format!("{}/broken/token", server.uri());
         let err = client
             .obtain_bearer_token(
@@ -17240,6 +17518,7 @@ mod tests {
             "https://bob:pw@auth.example.test/token?account=bob",
             StatusCode::UNAUTHORIZED,
             true,
+            None,
         );
         let AppError::UpstreamAuth(msg) = err else {
             panic!("expected UpstreamAuth");
@@ -17247,9 +17526,92 @@ mod tests {
         assert!(msg.contains("https://auth.example.test/token"), "{msg}");
         assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
         assert!(matches!(
-            token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false),
+            token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false, None),
             AppError::Storage(_)
         ));
+        // #4527: nothing was sent, so a refusal is not an auth failure.
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::UNAUTHORIZED, false, None),
+            AppError::Storage(_)
+        ));
+        let anon =
+            anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "https://u:p@r.test/v2/x");
+        assert!(upstream_request_auth_refusal(&anon).is_none(), "{anon:?}");
+        assert!(!format!("{anon:?}").contains("u:p"), "{anon:?}");
+    }
+
+    /// #4518: only an upstream 401/403 on the request itself becomes an
+    /// upstream auth failure, only when credentials were sent, and the error
+    /// names the redacted URL only.
+    #[test]
+    fn test_oci_registry_auth_error_classifies_request_refusals_4518() {
+        let url = "https://bob:pw@reg.example.test/v2/img/manifests/v1";
+        let refused = || {
+            [
+                validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
+                validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
+                AppError::Storage(format!(
+                    "Upstream returned error status {}: {url}",
+                    StatusCode::UNAUTHORIZED
+                )),
+            ]
+        };
+        for err in refused() {
+            assert!(upstream_request_auth_refusal(&err).is_some(), "{err:?}");
+            let AppError::UpstreamAuth(msg) =
+                oci_registry_auth_error(err, Uuid::new_v4(), url, true)
+            else {
+                panic!("expected UpstreamAuth");
+            };
+            assert!(
+                msg.contains("https://reg.example.test/v2/img/manifests/v1"),
+                "{msg}"
+            );
+            assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        }
+        // Anonymous: unchanged, so the manifest handlers keep the miss.
+        for err in refused() {
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, false);
+            assert_eq!(format!("{after:?}"), before);
+        }
+        let unchanged = [
+            validate_upstream_status(StatusCode::NOT_FOUND, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_REQUEST, url).unwrap_err(),
+            validate_upstream_status(StatusCode::TOO_MANY_REQUESTS, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_GATEWAY, url).unwrap_err(),
+            AppError::Storage("Token endpoint x returned status 401 Unauthorized".into()),
+        ];
+        for err in unchanged {
+            assert!(upstream_request_auth_refusal(&err).is_none(), "{err:?}");
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, true);
+            assert_eq!(format!("{after:?}"), before);
+        }
+    }
+
+    /// #4518: the registry-auth WARN is sampled per Remote: one per
+    /// interval, the rest counted and reported on the next one.
+    #[test]
+    fn test_admit_sampled_warn_4518() {
+        let mut state = HashMap::new();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), Some(0));
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), None);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(admit_sampled_warn(&mut state, a, later, every, 8), None);
+        // Another Remote is not throttled by the first.
+        assert_eq!(admit_sampled_warn(&mut state, b, later, every, 8), Some(0));
+        let next = t0 + every;
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), Some(2));
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), None);
+        // Bounded: a full table is reset rather than grown.
+        let mut full = HashMap::new();
+        assert_eq!(admit_sampled_warn(&mut full, a, t0, every, 1), Some(0));
+        assert_eq!(admit_sampled_warn(&mut full, b, t0, every, 1), Some(0));
+        assert_eq!(full.len(), 1);
     }
 
     // -- #3606: the token cache is scoped to the credential ------------------
@@ -17664,6 +18026,131 @@ mod tests {
             .await
             .ok();
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4518 follow-up (W6 verify FAIL 2): repeated pulls through a Remote
+    /// with wrong credentials log each upstream-auth `security` WARN once
+    /// per Remote per interval, not once per pull: the token-service
+    /// rejection of credentials actually sent (#4453, same-origin realm) and
+    /// the cross-origin "credentials withheld" line (#3591), through the real
+    /// `exchange_bearer_then` wiring. With the credentials withheld, the
+    /// refused anonymous token is not an auth failure at all (#4527).
+    #[tokio::test]
+    async fn test_upstream_auth_security_warns_are_sampled_per_remote_4518() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+        // Both token services refuse.
+        for server in [&registry, &token_service] {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(server)
+                .await;
+        }
+        let challenge = |realm_origin: String| {
+            ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!("Bearer realm=\"{realm_origin}/token\",service=\"registry\"").as_str(),
+            )
+        };
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/cross/manifests/1"))
+            .respond_with(challenge(token_service.uri()))
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/same/manifests/1"))
+            .respond_with(challenge(registry.uri()))
+            .mount(&registry)
+            .await;
+
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+            save_upstream_auth(
+                &pool,
+                repo_id,
+                "basic",
+                &build_credentials_json(&UpstreamAuthType::Basic {
+                    username: "svc-sampled".to_string(),
+                    password: Uuid::new_v4().simple().to_string(),
+                }),
+            )
+            .await
+            .expect("save upstream auth");
+            repos.push((repo_id, storage_dir));
+        }
+
+        let mut logs = Vec::new();
+        let mut outcomes = Vec::new();
+        for ((repo_id, storage_dir), image) in repos.iter().zip(["cross", "same"]) {
+            let proxy =
+                tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+            let url = format!("{}/v2/acme/{image}/manifests/1", registry.uri());
+            let capture = tdh::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            for _ in 0..3 {
+                let result = proxy.fetch_from_upstream(&url, *repo_id, 1 << 20).await;
+                let Err(err) = result else {
+                    panic!("{image}: the token service refuses");
+                };
+                outcomes.push((image, format!("{err:?}")));
+            }
+            drop(guard);
+            logs.push(capture.text());
+        }
+        for (repo_id, storage_dir) in &repos {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .ok();
+            let _ = std::fs::remove_dir_all(storage_dir);
+        }
+
+        let count = |logs: &str, needle: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security") && l.contains(needle))
+                .count()
+        };
+        let (cross, same) = (&logs[0], &logs[1]);
+        // Cross-origin realm: credentials withheld (one sampled WARN across
+        // three pulls); the anonymous token request is then refused, which is
+        // not a credentials problem (#4527): INFO only, and a miss.
+        assert_eq!(
+            count(cross, "WITHOUT the upstream's Basic credentials"),
+            1,
+            "{cross}"
+        );
+        assert_eq!(count(cross, "token service rejected"), 0, "{cross}");
+        assert!(
+            cross.contains("refused an anonymous token request"),
+            "{cross}"
+        );
+        for (image, err) in &outcomes {
+            let auth = err.starts_with("UpstreamAuth");
+            assert_eq!(auth, *image == "same", "{image}: {err}");
+        }
+        // Same-origin realm: credentials sent and refused, once.
+        assert_eq!(count(same, "token service rejected"), 1, "{same}");
+        assert_eq!(
+            count(same, "WITHOUT the upstream's Basic credentials"),
+            0,
+            "{same}"
+        );
+        assert!(same.contains("credentials_sent=true"), "{same}");
     }
 
     /// End to end through `fetch_from_upstream` (pins the call site in

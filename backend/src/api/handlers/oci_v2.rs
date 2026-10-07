@@ -4482,10 +4482,11 @@ enum UpstreamFetchOutcome {
     /// of those say anything about whether the object exists, so a walk that
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
-    /// The upstream (its OCI token service) refused the Remote's credentials
-    /// (#4453). As indeterminate as [`Self::Indeterminate`], but the direct
-    /// Remote manifest GET/HEAD reports it as a gateway error instead of
-    /// `MANIFEST_UNKNOWN`.
+    /// The upstream refused the Remote's credentials: its OCI token service
+    /// (#4453), or the registry itself on the request when credentials were
+    /// sent (#4518). As indeterminate as [`Self::Indeterminate`], but the
+    /// direct Remote manifest GET/HEAD reports it as a gateway error instead
+    /// of `MANIFEST_UNKNOWN`.
     UpstreamAuthFailed,
 }
 
@@ -4516,8 +4517,8 @@ impl UpstreamFetchOutcome {
             oci_error(
                 StatusCode::BAD_GATEWAY,
                 "DENIED",
-                "upstream registry authentication failed: the upstream token service \
-                 rejected this repository's upstream credentials",
+                "upstream registry authentication failed: the upstream registry or its \
+                 token service rejected this repository's upstream credentials",
             )
         })
     }
@@ -17456,11 +17457,44 @@ mod remote_blob_streaming_fallback_tests {
         let tmp = std::env::temp_dir().join(format!("oci-token-401-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("tmp");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
-        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
-        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
 
+        // #4527: an anonymous Remote sent no credentials, so the refused
+        // token request is a miss (never negative-cached), not DENIED.
+        let anonymous = remote_repo("docker-remote", &server.uri(), "myorg/app");
+        let outcome =
+            super::try_upstream_fetch_with_accept(&anonymous, &state, "manifests/v1", None).await;
+        assert!(
+            matches!(outcome, UpstreamFetchOutcome::Indeterminate),
+            "anonymous refusal is indeterminate, not an auth failure"
+        );
+        assert!(outcome.upstream_auth_error().is_none());
+
+        // With credentials configured (same-origin realm, so they are sent).
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &crate::services::upstream_auth::build_credentials_json(
+                &crate::services::upstream_auth::UpstreamAuthType::Basic {
+                    username: "svc-4453".to_string(),
+                    password: Uuid::new_v4().simple().to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("save upstream credentials");
+        let mut repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+        repo.id = repo_id;
         let outcome =
             super::try_upstream_fetch_with_accept(&repo, &state, "manifests/v1", None).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
         assert!(matches!(outcome, UpstreamFetchOutcome::UpstreamAuthFailed));
         assert!(outcome.is_indeterminate(), "never negative-cacheable");
         let resp = outcome.upstream_auth_error().expect("an error response");
@@ -36235,6 +36269,21 @@ mod remote_pull_through_cache_tests {
             .await;
 
         let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        // Credentials configured; the realm is same-origin, so they are sent
+        // to the token service (#4527: only then is a refusal DENIED).
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &crate::services::upstream_auth::build_credentials_json(
+                &crate::services::upstream_auth::UpstreamAuthType::Basic {
+                    username: "svc-4453".to_string(),
+                    password: Uuid::new_v4().simple().to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("save upstream credentials");
         let tmp = std::env::temp_dir().join(format!("oci-4453-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("tmp");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
@@ -36267,6 +36316,312 @@ mod remote_pull_through_cache_tests {
         let body = String::from_utf8_lossy(&get_body);
         assert!(body.contains("DENIED"), "{body}");
         assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
+    }
+
+    /// #4518: the registry refusing the manifest request ITSELF -- after a
+    /// successful token exchange (an anonymous-scope token for a private
+    /// image), or on plain Basic auth (401 without a Bearer challenge, or
+    /// 403). With upstream credentials configured it is reported like a
+    /// refusing token service: 502 `DENIED` on GET and HEAD, never 404
+    /// `MANIFEST_UNKNOWN`, plus a `security` WARN naming the upstream URL with
+    /// no credentials in it, sampled to one per Remote per interval. Without
+    /// credentials the miss stays 404 `MANIFEST_UNKNOWN`, logged at INFO and
+    /// never on the `security` target.
+    #[tokio::test]
+    async fn manifest_request_refused_by_the_registry_is_a_502_4518() {
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::header;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        // 1. Token exchange succeeds; the registry refuses the token.
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/private/manifests/v1"))
+            .and(header("authorization", "Bearer scoped-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/private/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="reg.test""#,
+                        server.uri()
+                    )
+                    .as_str(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "scoped-token"})),
+            )
+            .mount(&server)
+            .await;
+        // 2. Plain Basic auth, refused with a Basic challenge or a 403.
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/basic401/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", r#"Basic realm="reg""#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/basic403/manifests/v1"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let (anon_id, anon_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = Uuid::new_v4().simple().to_string();
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc-4518".to_string(),
+                password: secret.clone(),
+            }),
+        )
+        .await
+        .expect("save upstream credentials");
+        let tmp = std::env::temp_dir().join(format!("oci-4518-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let mut seen = Vec::new();
+        for (key, credentialed) in [(&repo_key, true), (&anon_key, false)] {
+            for name in ["private", "basic401", "basic403"] {
+                let image = format!("{key}/{name}");
+                let capture = tdh::LogCapture::default();
+                let guard = capture.install(tracing::Level::INFO);
+                let head = super::handle_head_manifest(
+                    &state,
+                    &anon_headers(),
+                    "http://ak.test",
+                    &image,
+                    "v1",
+                )
+                .await;
+                let get = super::handle_get_manifest(
+                    &state,
+                    &anon_headers(),
+                    "http://ak.test",
+                    &image,
+                    "v1",
+                    &ctx,
+                )
+                .await;
+                drop(guard);
+                let (get_status, get_body, _h) = tdh::collect_response(get).await;
+                seen.push((
+                    credentialed,
+                    name,
+                    head.status(),
+                    get_status,
+                    String::from_utf8_lossy(&get_body).into_owned(),
+                    capture.text(),
+                ));
+            }
+        }
+        for id in [repo_id, anon_id] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let security_warns = |logs: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security"))
+                .count()
+        };
+        let mut credentialed_warns = 0;
+        for (credentialed, name, head, get, body, logs) in seen {
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4518"),
+                "{name}: {logs}"
+            );
+            if credentialed {
+                assert_eq!(head, StatusCode::BAD_GATEWAY, "{name} HEAD");
+                assert_eq!(get, StatusCode::BAD_GATEWAY, "{name} GET: {body}");
+                assert!(body.contains("DENIED"), "{name}: {body}");
+                assert!(!body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
+                let warns = security_warns(&logs);
+                if warns > 0 {
+                    assert!(
+                        logs.contains("credentials_sent=true")
+                            && logs.contains(&format!("/v2/{name}/manifests/v1")),
+                        "{name}: {logs}"
+                    );
+                }
+                credentialed_warns += warns;
+            } else {
+                assert_eq!(head, StatusCode::NOT_FOUND, "{name} HEAD (anonymous)");
+                assert_eq!(get, StatusCode::NOT_FOUND, "{name} GET (anonymous): {body}");
+                assert!(body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
+                assert_eq!(security_warns(&logs), 0, "{name}: {logs}");
+                assert!(
+                    logs.contains("refused an anonymous manifest request")
+                        || logs.contains("anonymous bearer token"),
+                    "{name}: {logs}"
+                );
+            }
+        }
+        // Six refusals on one Remote within the interval: one security WARN.
+        assert_eq!(credentialed_warns, 1);
+    }
+
+    /// #4527: a credentialed Remote whose bearer realm is cross-origin and
+    /// NOT trusted never sends its credentials (#3591): the token is
+    /// anonymous, so the registry refusing it (Docker Hub's answer for a
+    /// missing image) stays 404 `MANIFEST_UNKNOWN`, not 502 `DENIED`, and
+    /// logs no credentials-rejected `security` WARN. The "credentials
+    /// withheld" WARN is sampled to one across the repeated pulls.
+    #[tokio::test]
+    async fn untrusted_realm_refusal_stays_manifest_unknown_4527() {
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "anon-token"})),
+            )
+            .mount(&token_service)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/missing/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="reg.test""#,
+                        token_service.uri()
+                    )
+                    .as_str(),
+                ),
+            )
+            .mount(&registry)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &registry.uri()).await;
+        let secret = Uuid::new_v4().simple().to_string();
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc-4527".to_string(),
+                password: secret.clone(),
+            }),
+        )
+        .await
+        .expect("save upstream credentials");
+        let tmp = std::env::temp_dir().join(format!("oci-4527-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let image = format!("{repo_key}/missing");
+
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::INFO);
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let head = super::handle_head_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                "v1",
+            )
+            .await;
+            let get = super::handle_get_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                "v1",
+                &ctx,
+            )
+            .await;
+            let (get_status, get_body, _h) = tdh::collect_response(get).await;
+            statuses.push((
+                head.status(),
+                get_status,
+                String::from_utf8_lossy(&get_body).into_owned(),
+            ));
+        }
+        drop(guard);
+        let token_requests = token_service.received_requests().await.expect("recorded");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(!token_requests.is_empty(), "the token exchange ran");
+        assert!(
+            token_requests
+                .iter()
+                .all(|r| r.headers.get("authorization").is_none()),
+            "credentials are withheld from the untrusted realm"
+        );
+        for (head, get, body) in statuses {
+            assert_eq!(head, StatusCode::NOT_FOUND, "HEAD");
+            assert_eq!(get, StatusCode::NOT_FOUND, "GET: {body}");
+            assert!(body.contains("MANIFEST_UNKNOWN"), "{body}");
+        }
+        let logs = capture.text();
+        let security_warns = |needle: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security") && l.contains(needle))
+                .count()
+        };
+        assert_eq!(
+            security_warns("rejected the proxy's authentication"),
+            0,
+            "{logs}"
+        );
+        assert_eq!(
+            security_warns("WITHOUT the upstream's Basic credentials"),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("anonymous bearer token"), "{logs}");
+        assert!(
+            !logs.contains(&secret) && !logs.contains("svc-4527"),
+            "{logs}"
+        );
     }
 }
 

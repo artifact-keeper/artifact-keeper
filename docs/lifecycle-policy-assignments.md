@@ -48,11 +48,16 @@ Policies stored before these checks are not changed. On every start the backend
 logs one WARN per stored policy with a pattern PostgreSQL cannot compile or
 that uses `\b` / `\B`. A preview (`POST /api/v1/admin/lifecycle/{id}/preview`)
 lists the problems in `errors`, and stops with zero matches when a pattern
-cannot compile. A live run refuses (400) a policy whose protective pattern --
-an `exclude.version_patterns` entry, or the `pattern` of `tag_pattern_keep` --
-has such a problem, because it would delete what it was written to keep. A
-`match.version_pattern` or `tag_pattern_delete` pattern with `\b` matches
-nothing, so it still runs and deletes nothing. Fix the policy with
+cannot compile or a selecting pattern -- `match.version_pattern`, or the
+`pattern` of `tag_pattern_delete` -- uses `\b` / `\B`. A live run refuses (400)
+a policy whose protective pattern -- an `exclude.version_patterns` entry, or
+the `pattern` of `tag_pattern_keep` -- has such a problem, because it would
+delete what it was written to keep. It also refuses (400) a policy whose
+selecting pattern uses `\b` / `\B`: "matches nothing" does not make a
+selector safe, since inside a negative lookahead such as `^(?!.*\bstable)` it
+selects every version or tag. A live run of a policy with any pattern
+PostgreSQL cannot compile is refused (400, naming the field) before it starts,
+rather than failing part-way. Fix the policy with
 `PATCH /api/v1/admin/lifecycle/{id}`.
 
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept

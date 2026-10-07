@@ -783,6 +783,20 @@ pub struct CiOidcService {
     http: reqwest::Client,
 }
 
+/// The claim checks every exchanged CI assertion must pass, whatever the
+/// provider type and key source: signature algorithm, `iss`, `aud`, `exp`,
+/// and `nbf` (#4511). `jsonwebtoken` leaves `nbf` unchecked by default, so a
+/// token that is not valid yet used to be accepted. Both time claims share the
+/// library's default leeway (60 s), so ordinary clock skew between the issuer
+/// and this server is tolerated in both directions.
+fn ci_jwt_validation(alg: Algorithm, provider: &CiOidcProvider) -> Validation {
+    let mut validation = Validation::new(alg);
+    validation.set_audience(&[provider.audience.as_str()]);
+    validation.set_issuer(&[provider.issuer_url.as_str()]);
+    validation.validate_nbf = true;
+    validation
+}
+
 impl CiOidcService {
     pub fn new(db: PgPool) -> Self {
         Self {
@@ -1745,10 +1759,7 @@ impl CiOidcService {
             }
         };
 
-        let mut validation = Validation::new(alg);
-        validation.set_audience(&[provider.audience.as_str()]);
-        validation.set_issuer(&[provider.issuer_url.as_str()]);
-
+        let validation = ci_jwt_validation(alg, provider);
         let token_data = decode::<serde_json::Value>(jwt_str, &decoding_key, &validation)
             .map_err(|e| AppError::Authentication(format!("CI JWT validation failed: {e}")))?;
 
@@ -4529,6 +4540,43 @@ mod tests {
             ),
             ..sample_provider("kubernetes")
         }
+    }
+
+    /// #4511: `nbf` is checked like `exp`, with the same leeway, whatever
+    /// the key source. A token not valid for another five minutes is
+    /// refused; one 30 s ahead (clock skew, inside the 60 s leeway) verifies.
+    #[tokio::test]
+    async fn a_token_whose_nbf_is_in_the_future_is_refused_4511() {
+        let validation =
+            super::ci_jwt_validation(jsonwebtoken::Algorithm::RS256, &sample_provider("gitlab"));
+        assert!(validation.validate_nbf && validation.validate_exp);
+        assert_eq!(validation.leeway, 60);
+
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let now = Utc::now().timestamp();
+        let with_nbf = |nbf: i64| {
+            let mut claims = k8s_token_claims(ONPREM_ISSUER);
+            claims["nbf"] = json!(nbf);
+            sign(&k1, Some("k1"), &claims)
+        };
+
+        let err = test_service()
+            .validate_ci_jwt(&provider, &with_nbf(now + 300))
+            .await
+            .expect_err("a token that is not valid yet is refused");
+        assert!(
+            matches!(&err, crate::error::AppError::Authentication(m) if m.contains("ImmatureSignature")),
+            "{err:?}"
+        );
+        test_service()
+            .validate_ci_jwt(&provider, &with_nbf(now + 30))
+            .await
+            .expect("an nbf within the clock-skew leeway still verifies");
+        test_service()
+            .validate_ci_jwt(&provider, &with_nbf(now - 30))
+            .await
+            .expect("an nbf in the past verifies");
     }
 
     /// 3.1 — a static provider verifies against its stored set and never

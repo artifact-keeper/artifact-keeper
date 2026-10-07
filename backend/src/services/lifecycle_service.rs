@@ -1350,12 +1350,12 @@ impl LifecycleService {
             // of tag_pattern_keep) that PostgreSQL reads differently from how
             // it was validated fails open and deletes what it should keep.
             // Refuse the live run; the stored config is left as it is.
-            if let Some(problem) = problems.iter().find(|p| p.fails_open(&policy.policy_type)) {
-                return Err(AppError::Validation(format!(
-                    "Refusing to run lifecycle policy '{}': {}. This pattern protects \
-                     artifacts and would protect nothing as written; fix the policy",
-                    policy.name, problem.message
-                )));
+            // So is a policy that cannot run as stored: a `\b` in
+            // `match.version_pattern` (#4459, #4502), or a pattern PostgreSQL
+            // cannot compile, which would otherwise fail mid-run as a 500
+            // (#4504).
+            if let Some(refusal) = live_run_refusal(&policy.name, &policy.policy_type, &problems) {
+                return Err(refusal);
             }
         }
 
@@ -1363,8 +1363,9 @@ impl LifecycleService {
         let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
         if dry_run {
             // Report every stored-regex problem in the preview, and stop when
-            // a pattern cannot compile at all (the run would only error out).
-            let blocked = problems.iter().any(|p| p.blocks_run());
+            // the policy cannot run as stored (a pattern that does not
+            // compile, or a `\b` selecting pattern that a run refuses, #4502).
+            let blocked = problems.iter().any(|p| p.blocks_run(&policy.policy_type));
             result
                 .errors
                 .extend(problems.into_iter().map(|p| p.message));
@@ -2210,11 +2211,11 @@ pub use regexes::warn_invalid_lifecycle_regexes;
 #[cfg(test)]
 pub(crate) use regexes::{
     compile_in_postgres, has_backspace_escape, invalid_regex_policies, postgres_regex_error,
-    StoredRegexIssue, MAX_REGEX_BYTES,
+    StoredRegexIssue, StoredRegexProblem, MAX_REGEX_BYTES,
 };
 pub(crate) use regexes::{
-    policy_regexes, reject_backspace_escape, reject_static_regex_problems, stored_regex_problems,
-    validate_regexes_in_postgres, MAX_VERSION_PATTERNS,
+    live_run_refusal, policy_regexes, reject_backspace_escape, reject_static_regex_problems,
+    stored_regex_problems, validate_regexes_in_postgres, MAX_VERSION_PATTERNS,
 };
 
 #[cfg(ak_test_shard = "services-1")]

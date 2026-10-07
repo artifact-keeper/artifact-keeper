@@ -930,10 +930,39 @@ pub async fn proxy_fetch_capped_with_accept(
     format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>), Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    proxy_service
+    let error = match proxy_service
         .fetch_artifact_with_accept_capped(&repo, path, accept, max)
         .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    {
+        Ok(fetched) => return Ok(fetched),
+        Err(error) => error,
+    };
+    // #4518: an OCI registry that refuses the request itself (after a
+    // successful token exchange, or on plain Basic auth) while the Remote
+    // sends credentials is an upstream authentication failure like a
+    // refusing token service (#4453), not an indeterminate miss. Without
+    // credentials it stays a miss (see `oci_registry_auth_error`).
+    let error = if repo.format == RepositoryFormat::Docker
+        && crate::services::proxy_service::upstream_request_auth_refusal(&error).is_some()
+    {
+        let url = format!(
+            "{}/{}",
+            upstream_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        // A refusal of an anonymous bearer token never gets here (#4527), so
+        // for what does, configured credentials were sent to the upstream.
+        let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
+        crate::services::proxy_service::oci_registry_auth_error(
+            error,
+            repo_id,
+            &url,
+            credentials_sent,
+        )
+    } else {
+        error
+    };
+    Err(map_proxy_error(repo_key, path, error))
 }
 
 /// As [`proxy_fetch_capped`], but also reports the upstream `Content-Encoding`

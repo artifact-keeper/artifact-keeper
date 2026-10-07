@@ -47,7 +47,11 @@ pub(crate) fn parse_public_endpoint(
     if raw.is_empty() {
         return Ok(None);
     }
-    let invalid = |why: &str| AppError::Config(format!("{var}={raw:?} is invalid: {why}"));
+    // The value is echoed into a fatal startup error (or a WARN for a
+    // secondary backend), so never with its userinfo: a value refused for
+    // carrying credentials must not log them (#4503).
+    let shown = redact_userinfo(raw);
+    let invalid = |why: &str| AppError::Config(format!("{var}={shown:?} is invalid: {why}"));
     let url = url::Url::parse(raw).map_err(|e| invalid(&format!("not an absolute URL ({e})")))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid("the scheme must be http or https"));
@@ -70,6 +74,21 @@ pub(crate) fn parse_public_endpoint(
     }
     let origin = &url[..url::Position::BeforePath];
     Ok(Some(format!("{origin}{url_path}")))
+}
+
+/// `raw` with everything between `scheme://` (or the start, without one) and
+/// the LAST `@` replaced by `***`, for error messages (#4503). Works on the
+/// raw text, not on a parsed URL: a password pasted without percent-encoding
+/// can contain `/`, `?`, `#` or `\` (AWS secret keys often contain `/`), which
+/// ends the URL authority early, so any `@` anywhere marks userinfo. A value
+/// with `@` only in its path is over-redacted, which costs nothing in an
+/// error message.
+fn redact_userinfo(raw: &str) -> String {
+    let start = raw.find("://").map_or(0, |i| i + 3);
+    match raw[start..].rfind('@') {
+        Some(at) => format!("{}***{}", &raw[..start], &raw[start + at..]),
+        None => raw.to_string(),
+    }
 }
 
 /// Read and validate the public endpoint named `var` from the environment.
@@ -137,6 +156,93 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("S3_PUBLIC_ENDPOINT"), "{raw}: {msg}");
         }
+    }
+
+    /// #4503: a value refused for carrying credentials (or for anything
+    /// else) never echoes them into the startup error or WARN.
+    #[test]
+    fn rejection_messages_never_contain_credentials_4503() {
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = uuid::Uuid::new_v4().simple().to_string();
+        for (raw, shown) in [
+            (
+                format!("http://svc:{secret}@192.168.42.150:32613"),
+                "http://***@192.168.42.150:32613",
+            ),
+            (
+                format!("https://{secret}@storage.example.com/s3"),
+                "https://***@storage.example.com/s3",
+            ),
+            // Rejected for another reason first, still redacted.
+            (
+                format!("ftp://svc:{secret}@storage.example.com"),
+                "ftp://***@storage.example.com",
+            ),
+            // No scheme: not an absolute URL, still redacted.
+            (
+                format!("svc:{secret}@storage.example.com:9000"),
+                "***@storage.example.com:9000",
+            ),
+            // Unencoded reserved characters end the URL authority early, so
+            // the parser fails or sees a path; the secret is still hidden.
+            (
+                format!("http://svc:{secret}/x@minio:9000"),
+                "http://***@minio:9000",
+            ),
+            (
+                format!("http://svc:{secret}?x@minio:9000"),
+                "http://***@minio:9000",
+            ),
+            (
+                format!("http://svc:{secret}#x@minio:9000"),
+                "http://***@minio:9000",
+            ),
+            (
+                format!("http://svc:{secret}\\x@minio:9000"),
+                "http://***@minio:9000",
+            ),
+            // Digit-led: parses as host `svc`, port 123, with a path (and a
+            // fragment, so the path-allowing Azure check rejects it too).
+            (
+                format!("http://svc:123/{secret}@minio:9000#f"),
+                "http://***@minio:9000#f",
+            ),
+        ] {
+            for (var, path) in [
+                ("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden),
+                ("AZURE_STORAGE_PUBLIC_ENDPOINT", EndpointPath::Allowed),
+            ] {
+                let msg = parse_public_endpoint(var, &raw, path)
+                    .expect_err(&raw)
+                    .to_string();
+                assert!(!msg.contains(&secret), "{var}: {msg}");
+                assert!(!msg.contains("svc"), "{var}: {msg}");
+                assert!(msg.contains(var) && msg.contains(shown), "{var}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_userinfo_leaves_other_values_alone_4503() {
+        for raw in [
+            "https://s3.example.com",
+            "https://s3.example.com:9000/bucket",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw);
+        }
+        // Any `@` is treated as the end of userinfo: the last one wins, and
+        // an `@` in a path or query is over-redacted rather than risked.
+        assert_eq!(
+            redact_userinfo("http://a@b@host:1/p"),
+            "http://***@host:1/p"
+        );
+        assert_eq!(
+            redact_userinfo("https://storage.example.com/path@v1"),
+            "https://***@v1"
+        );
+        assert_eq!(redact_userinfo("u:p/q@host"), "***@host");
     }
 
     #[test]

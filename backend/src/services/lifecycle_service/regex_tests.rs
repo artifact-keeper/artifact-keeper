@@ -210,11 +210,13 @@ async fn stored_policy_regex_problems_are_reported_4461() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].issue, StoredRegexIssue::WordBoundary);
     assert!(found[0].message.contains(r"\y"), "{found:?}");
-    assert!(found[0].fails_open("max_age_days") && !found[0].blocks_run());
+    assert!(found[0].fails_open("max_age_days") && !found[0].blocks_run("max_age_days"));
     let found = problems_of(broken).expect("the uncompilable pattern is reported");
     assert_eq!(found[0].issue, StoredRegexIssue::DoesNotCompile);
     assert!(found[0].message.contains("PostgreSQL"), "{found:?}");
-    assert!(found[0].blocks_run() && !found[0].fails_open("tag_pattern_delete"));
+    assert!(
+        found[0].blocks_run("tag_pattern_delete") && !found[0].fails_open("tag_pattern_delete")
+    );
     // `\b` AND a syntax error: compiled first, so it is classed as
     // not compiling (the preview stops rather than erroring out later).
     let found = problems_of(both).expect("the \\b + syntax error pattern is reported");
@@ -335,9 +337,9 @@ async fn slow_regex_compile_is_bounded_by_the_timeout_4461() {
 }
 
 /// A live run refuses a stored policy whose PROTECTIVE pattern (an
-/// exclusion, or the keep pattern of tag_pattern_keep) fails open; a
-/// selecting pattern (`match.version_pattern`, tag_pattern_delete) with the
-/// same `\b` matches nothing and still runs. Nothing stored is changed.
+/// exclusion, or the keep pattern of tag_pattern_keep) fails open, and one
+/// whose selecting pattern (`match.version_pattern`, or the `pattern` of
+/// tag_pattern_delete) uses `\b` (#4459, #4502). Nothing stored is changed.
 #[tokio::test]
 async fn live_run_refuses_fail_open_stored_patterns_4461() {
     let Some(pool) = crate::testing::try_pool_with(2).await else {
@@ -355,6 +357,11 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
         ),
         ("tag_pattern_keep", json!({"pattern": r"\bstable\b"})),
         ("tag_pattern_keep", json!({"pattern": r"(?P<n>x)"})),
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
+        ),
+        ("tag_pattern_delete", json!({"pattern": r"\btmp"})),
     ];
     for (policy_type, config) in refused {
         let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
@@ -365,19 +372,170 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
         assert_eq!(service.get_policy(id).await.unwrap().config, config);
         service.delete_policy(id).await.expect("cleanup");
     }
-    let report_only = [
+}
+
+/// A repository holding one 30-day-old artifact with `version`, for the
+/// stored-policy run tests below. Returns `(repository, artifact)`.
+async fn repository_with_artifact(conn: &mut sqlx::PgConnection, version: &str) -> (Uuid, Uuid) {
+    let repository_id = super::tests::insert_max_age_test_repository(conn).await;
+    let storage_key = format!("generic/{}", Uuid::new_v4());
+    let path = format!("builds/{version}");
+    let artifact = super::tests::insert_max_age_test_artifact(
+        conn,
+        repository_id,
+        &path,
+        version,
+        &storage_key,
+        30,
+    )
+    .await;
+    (repository_id, artifact)
+}
+
+/// Assign stored policy `policy_id` to `repository_id`.
+async fn assign_repository(conn: &mut sqlx::PgConnection, policy_id: Uuid, repository_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
+    )
+    .bind(policy_id)
+    .bind(repository_id)
+    .execute(conn)
+    .await
+    .expect("assign repository");
+}
+
+async fn drop_repository(conn: &mut sqlx::PgConnection, repository_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .execute(conn)
+        .await;
+}
+
+/// #4502: a stored `match.version_pattern` with `\b`, on a policy that has a
+/// repository with a matching-looking artifact. The preview reports it in
+/// `errors` and matches nothing (it used to be a 400 from `parse_match`), and
+/// a live run refuses it up front and deletes nothing.
+#[tokio::test]
+async fn stored_match_word_boundary_is_previewed_and_refused_4502() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (repository_id, artifact) = repository_with_artifact(&mut conn, "foo-1").await;
+    let config = json!({"days": 1, "match": {"version_pattern": r"\bfoo"}});
+    let id = insert_unvalidated(&pool, "max_age_days", config.clone()).await;
+    assign_repository(&mut conn, id, repository_id).await;
+
+    let service = LifecycleService::new(pool.clone());
+    let preview = service
+        .execute_policy(id, true)
+        .await
+        .expect("the preview reports the pattern instead of failing");
+    assert_eq!(preview.errors.len(), 1, "{preview:?}");
+    assert!(
+        preview.errors[0].contains("match.version_pattern") && preview.errors[0].contains(r"\y"),
+        "{preview:?}"
+    );
+    assert_eq!(preview.artifacts_matched, 0);
+    match service.execute_policy(id, false).await {
+        Err(AppError::Validation(m)) => assert!(
+            m.contains("Refusing to run") && m.contains("match.version_pattern"),
+            "{m}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!super::tests::is_deleted(&mut conn, artifact).await);
+    assert_eq!(service.get_policy(id).await.unwrap().config, config);
+
+    service.delete_policy(id).await.expect("cleanup");
+    drop_repository(&mut conn, repository_id).await;
+}
+
+/// Which stored-regex problems refuse a live run, and with what message.
+#[test]
+fn live_run_refusal_covers_protective_and_unrunnable_patterns_4502() {
+    let problem = |field: &str, issue| StoredRegexProblem {
+        field: field.to_string(),
+        message: format!("{field}: bad"),
+        issue,
+    };
+    let exclusion = problem(
+        "exclude.version_patterns[0]",
+        StoredRegexIssue::WordBoundary,
+    );
+    let matcher = problem("match.version_pattern", StoredRegexIssue::WordBoundary);
+    let delete = problem("pattern", StoredRegexIssue::WordBoundary);
+
+    let refusal = |policy_type: &str, problems: &[StoredRegexProblem]| {
+        live_run_refusal("p", policy_type, problems).map(|e| e.to_string())
+    };
+    let m = refusal("max_age_days", &[exclusion]).expect("exclusion");
+    assert!(m.contains("would protect nothing"), "{m}");
+    assert!(matcher.blocks_run("max_age_days"));
+    let m = refusal("max_age_days", &[matcher]).expect("match pattern");
+    assert!(
+        m.contains("match.version_pattern") && m.contains("cannot run this pattern"),
+        "{m}"
+    );
+    // #4504: a pattern that does not compile refuses every policy type.
+    let broken = problem("pattern", StoredRegexIssue::DoesNotCompile);
+    let m = refusal("tag_pattern_delete", &[broken]).expect("does not compile");
+    assert!(m.contains("cannot run this pattern"), "{m}");
+    assert!(refusal("tag_pattern_keep", std::slice::from_ref(&delete)).is_some());
+    // A `tag_pattern_delete` pattern with `\b` selects what to delete, like
+    // `match.version_pattern`, so it is refused for the same reason.
+    assert!(delete.blocks_run("tag_pattern_delete"));
+    let m = refusal("tag_pattern_delete", &[delete]).expect("delete pattern");
+    assert!(m.contains("cannot run this pattern"), "{m}");
+    // `pattern` is not a selector of other policy types.
+    let stray = problem("pattern", StoredRegexIssue::WordBoundary);
+    assert!(!stray.blocks_run("max_age_days"));
+    assert!(refusal("max_age_days", &[]).is_none());
+}
+
+/// #4504: a live run of a stored policy whose `match.version_pattern`
+/// PostgreSQL cannot compile is a 400 naming the field, not a 500
+/// `DATABASE_ERROR` from the delete query; the preview reports the same
+/// problem. Nothing is deleted.
+#[tokio::test]
+async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (repository_id, artifact) = repository_with_artifact(&mut conn, "foo").await;
+    let mut ids = Vec::new();
+    for (policy_type, config) in [
         (
             "max_age_days",
-            json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
+            json!({"days": 1, "match": {"version_pattern": r"foo\z"}}),
         ),
-        ("tag_pattern_delete", json!({"pattern": r"\btmp"})),
-    ];
-    for (policy_type, config) in report_only {
-        let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
-        service
-            .execute_policy(id, false)
-            .await
-            .unwrap_or_else(|e| panic!("{config}: a selecting pattern still runs: {e}"));
+        ("tag_pattern_delete", json!({"pattern": r"foo\z"})),
+    ] {
+        let id = insert_unvalidated(&pool, policy_type, config).await;
+        assign_repository(&mut conn, id, repository_id).await;
+        ids.push(id);
+    }
+
+    let service = LifecycleService::new(pool.clone());
+    for (id, field) in ids.iter().zip(["match.version_pattern", "pattern"]) {
+        // The exact field-naming text of `postgres_regex_error`: a bare
+        // `contains(field)` would also match "... run this pattern ...".
+        let named = format!("{field} is not a valid PostgreSQL regular expression");
+        let preview = service.execute_policy(*id, true).await.expect("preview");
+        assert!(
+            preview.errors.iter().any(|e| e.starts_with(&named)),
+            "{preview:?}"
+        );
+        match service.execute_policy(*id, false).await {
+            Err(AppError::Validation(m)) => assert!(m.contains(&format!("': {named}")), "{m}"),
+            other => panic!("{field}: expected a 400 validation error, got {other:?}"),
+        }
+    }
+    assert!(!super::tests::is_deleted(&mut conn, artifact).await);
+
+    for id in ids {
         service.delete_policy(id).await.expect("cleanup");
     }
+    drop_repository(&mut conn, repository_id).await;
 }
