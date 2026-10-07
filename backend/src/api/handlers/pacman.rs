@@ -1730,7 +1730,7 @@ mod db_tests {
             .map(|(name, has_key, files)| (name, (has_key, files)))
             .collect();
         assert_eq!(by_path.len(), 2, "{by_path:?}");
-        for (_, (has_key, _)) in by_path.iter() {
+        for (has_key, _) in by_path.values() {
             assert!(!has_key, "files left in artifact_metadata: {by_path:?}");
         }
         let lists: Vec<_> = by_path.values().filter_map(|(_, f)| f.clone()).collect();
