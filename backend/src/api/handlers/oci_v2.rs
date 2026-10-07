@@ -10538,31 +10538,124 @@ pub(crate) fn oci_reference_is_tag(reference: &str) -> bool {
     !reference.contains(':')
 }
 
+/// The largest descriptor `size` a pushed manifest may declare (1 PiB). A
+/// larger value is not a real blob; it only serves to overflow the sums the
+/// usage ledger is charged with (#4422).
+pub(crate) const MAX_DESCRIPTOR_SIZE: i64 = 1 << 50;
+
+/// A descriptor's declared `size`, when present and an integer.
+fn descriptor_size(descriptor: &serde_json::Value) -> Option<i64> {
+    descriptor.get("size").and_then(|s| s.as_i64())
+}
+
 /// Total image size derived from a manifest body: `config.size` plus the sum
 /// of `layers[].size`, falling back to the body length when the body is not
 /// JSON. Shared by the live manifest-PUT path and the migration importer
 /// (#2676) so both size the artifact/catalog rows identically.
+///
+/// The sizes are client- or upstream-declared, so a negative size counts as
+/// zero and the sum saturates (#4422): a forged descriptor must never drive
+/// the row negative, which would zero the repository's usage ledger.
 pub(crate) fn manifest_total_size(body: &[u8]) -> i64 {
     if let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(body) {
-        let config_size = manifest_json
-            .get("config")
-            .and_then(|c| c.get("size"))
-            .and_then(|s| s.as_i64())
-            .unwrap_or(0);
-        let layers_size: i64 = manifest_json
-            .get("layers")
-            .and_then(|l| l.as_array())
-            .map(|layers| {
-                layers
-                    .iter()
-                    .filter_map(|l| l.get("size").and_then(|s| s.as_i64()))
-                    .sum()
-            })
-            .unwrap_or(0);
-        config_size + layers_size
+        image_descriptors(&manifest_json)
+            .iter()
+            .map(|d| descriptor_size(d).unwrap_or(0).max(0))
+            .fold(0i64, i64::saturating_add)
     } else {
         body.len() as i64
     }
+}
+
+/// The config and layer descriptors of an image manifest (empty for an
+/// index, whose children are sized by their own manifests).
+fn image_descriptors(manifest: &serde_json::Value) -> Vec<&serde_json::Value> {
+    manifest
+        .get("config")
+        .into_iter()
+        .chain(
+            manifest
+                .get("layers")
+                .and_then(|l| l.as_array())
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
+/// #4422: reject a pushed manifest whose descriptors declare a negative or
+/// absurd (`> MAX_DESCRIPTOR_SIZE`) `size` (config, layers, and an index's
+/// child manifests). `Err` carries the `MANIFEST_INVALID` message.
+pub(crate) fn validate_descriptor_sizes(body: &[u8]) -> Result<(), &'static str> {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(());
+    };
+    let children = manifest
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten();
+    let out_of_range = image_descriptors(&manifest)
+        .into_iter()
+        .chain(children)
+        .filter_map(descriptor_size)
+        .any(|size| !(0..=MAX_DESCRIPTOR_SIZE).contains(&size));
+    if out_of_range {
+        Err("a descriptor declares a negative or out-of-range size")
+    } else {
+        Ok(())
+    }
+}
+
+/// #4422: the image size a pushed manifest's `artifacts` row records: each
+/// config/layer descriptor counts the size of the blob the repository
+/// actually holds (`held`, digest -> `oci_blobs.size_bytes`), and the declared
+/// size only for a blob it does not hold. Saturating, never negative.
+pub(crate) fn resolved_image_size(
+    body: &[u8],
+    held: &std::collections::HashMap<String, i64>,
+) -> i64 {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.len() as i64;
+    };
+    image_descriptors(&manifest)
+        .into_iter()
+        .map(|d| {
+            d.get("digest")
+                .and_then(|g| g.as_str())
+                .and_then(|g| held.get(g).copied())
+                .or_else(|| descriptor_size(d))
+                .unwrap_or(0)
+                .max(0)
+        })
+        .fold(0i64, i64::saturating_add)
+}
+
+/// The sizes of the config/layer blobs of `body` that `repo_id` holds.
+async fn held_descriptor_sizes(
+    db: &PgPool,
+    repo_id: Uuid,
+    body: &[u8],
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
+    let digests: Vec<String> = serde_json::from_slice::<serde_json::Value>(body)
+        .map(|m| {
+            image_descriptors(&m)
+                .into_iter()
+                .filter_map(|d| d.get("digest").and_then(|g| g.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if digests.is_empty() {
+        return Ok(Default::default());
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT digest, size_bytes FROM oci_blobs WHERE repository_id = $1 AND digest = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind(&digests)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Sum of the artifact sizes recorded for an index manifest's child
@@ -10883,9 +10976,24 @@ async fn handle_put_manifest(
     // stays correct because it reads this canonicalized value.
     let content_type = stored_media_type_for(&class, &content_type);
 
-    // Calculate total image size from manifest (config + layers): the size
-    // the manifest's `artifacts` row is charged.
-    let total_size: i64 = manifest_total_size(&body);
+    // #4422: descriptor sizes feed the usage ledger, so a negative or absurd
+    // declared size is an invalid manifest, not a number to trust.
+    if let Err(message) = validate_descriptor_sizes(&body) {
+        return oci_error(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", message);
+    }
+    // Image size (config + layers) the manifest's `artifacts` row records,
+    // from the blobs this repository actually holds where it holds them.
+    let total_size: i64 = match held_descriptor_sizes(&state.db, repo_id, &body).await {
+        Ok(held) => resolved_image_size(&body, &held),
+        Err(e) => {
+            tracing::error!("manifest push: reading held blob sizes failed: {e}");
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "failed to size the manifest",
+            );
+        }
+    };
     // #4422: refuse an over-quota push before the manifest is stored.
     if let Some(refusal) = oci_quota_refusal(
         super::publish_quota::preflight_quota_denial(&state.db, repo_id, total_size).await,
@@ -27573,6 +27681,97 @@ mod cross_repo_session_regression_tests {
             .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    /// #4422 review: client-declared descriptor sizes are validated, summed
+    /// with saturation, never negative, and replaced by the size of a blob the
+    /// repository actually holds.
+    #[test]
+    fn manifest_descriptor_sizes_cannot_poison_the_ledger_4422() {
+        let d = format!("sha256:{}", "c".repeat(64));
+        let ok = image_manifest(&d, 10, &[20, 30]);
+        assert_eq!(validate_descriptor_sizes(ok.as_bytes()), Ok(()));
+        assert_eq!(manifest_total_size(ok.as_bytes()), 60);
+        for bad in [
+            image_manifest(&d, 10, &[-1_000_000_000_000]),
+            image_manifest(&d, -1, &[]),
+            image_manifest(&d, 10, &[MAX_DESCRIPTOR_SIZE + 1]),
+            image_manifest(&d, 10, &[i64::MAX, i64::MAX]),
+        ] {
+            assert!(validate_descriptor_sizes(bad.as_bytes()).is_err(), "{bad}");
+            assert!(manifest_total_size(bad.as_bytes()) >= 0, "{bad}");
+        }
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{"digest": d, "size": -5}]
+        })
+        .to_string();
+        assert!(validate_descriptor_sizes(index.as_bytes()).is_err());
+        assert_eq!(validate_descriptor_sizes(b"not json"), Ok(()));
+
+        // A held blob counts its recorded size, whatever the manifest claims.
+        let held = std::collections::HashMap::from([(d.clone(), 7_i64)]);
+        assert_eq!(resolved_image_size(ok.as_bytes(), &held), 7 + 20 + 30);
+        assert_eq!(resolved_image_size(ok.as_bytes(), &Default::default()), 60);
+        assert_eq!(resolved_image_size(b"xyz", &Default::default()), 3);
+    }
+
+    /// #4422 review: a forged manifest with a negative layer size is refused
+    /// with `400 MANIFEST_INVALID` and leaves the usage ledger untouched (it
+    /// used to be admitted and zero the repository's hosted bytes).
+    #[tokio::test]
+    async fn forged_negative_manifest_size_is_refused_and_ledger_unchanged_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "forged").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 100 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let config = b"forged-manifest-config".to_vec();
+        let digest = push_blob(&state, &repo_key, &auth, &config).await;
+        let ledger = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (hosted_bytes + proxy_bytes + oci_bytes)::BIGINT \
+                   FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        };
+        let before = ledger().await;
+
+        let forged = image_manifest(&digest, config.len() as i64, &[-1_000_000_000_000]);
+        let (status, body) = tdh::send(
+            router(None).with_state(state.clone()),
+            put_manifest_request(&repo_key, "forged", &auth, forged),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("MANIFEST_INVALID"), "{body}");
+        assert_eq!(
+            ledger().await,
+            before,
+            "a refused manifest must not move the ledger"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND size_bytes < 0",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 
     /// #4422 review: a manifest PUT commits its tag, references, quota
