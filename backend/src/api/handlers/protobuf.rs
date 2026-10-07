@@ -1406,6 +1406,11 @@ async fn download(
                         state.proxy_service.as_deref(),
                         repo.id,
                         &upstream_path,
+                        // Parity with the Remote arm above, which reads the
+                        // bundle through the capped fetch and records no proxy
+                        // download: a Remote member's bundle is not counted
+                        // here either (#3844).
+                        None,
                         |member_id, location| {
                             let db = db.clone();
                             let state = state.clone();

@@ -8659,6 +8659,7 @@ pub async fn get_artifact_metadata(
             members,
             proxy_for_virtual,
             &path,
+            Some(&dl_ctx),
             move |member_id, location| {
                 let db = db.clone();
                 let state = state_clone.clone();
@@ -8678,8 +8679,8 @@ pub async fn get_artifact_metadata(
         // a real download — so it must reach the #2365 recorder. When the
         // shadowing guard proved a non-Remote member owns the exact path, the
         // served body is that local member's artifact (Remote members were
-        // suppressed); attribute the download to its row. Remote pass-through
-        // resolves no local `artifacts` row and stays unrecorded (#1278).
+        // suppressed); attribute the download to its row. A Remote member's
+        // winning serve is counted by the resolver itself (#3844).
         if owns_locally {
             if let Some(artifact_id) =
                 proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
@@ -10511,6 +10512,7 @@ pub async fn download_artifact(
                 members,
                 proxy_for_virtual,
                 &path,
+                Some(&dl_ctx),
                 |member_id, location| {
                     let db = db.clone();
                     let state = state.clone();
@@ -10530,8 +10532,8 @@ pub async fn download_artifact(
             // response streams a member's BYTES, a real download. When the
             // shadowing guard proved a non-Remote member owns the exact path
             // (Remote members were suppressed), attribute the download to
-            // that local member's artifact row. Remote pass-through resolves
-            // no local `artifacts` row and stays unrecorded (#1278). No
+            // that local member's artifact row. A Remote member's winning
+            // serve is counted by the resolver itself (#3844). No
             // double-count: the direct-row path records in `download_stream`
             // and cannot reach this arm.
             if owns_locally && !is_head {

@@ -3151,6 +3151,7 @@ async fn serve_artifact(
                             &local_fetch,
                             content_type_for_path(path),
                             Some((&state.db, ctx)),
+                            Some(ctx),
                         )
                     };
                     let target = &target;
@@ -3189,6 +3190,7 @@ async fn serve_artifact(
                     members,
                     proxy_for_virtual,
                     path,
+                    Some(ctx),
                     local_fetch,
                 )
                 .await?;

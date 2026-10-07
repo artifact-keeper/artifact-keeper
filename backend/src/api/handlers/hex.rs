@@ -800,6 +800,9 @@ async fn serve_virtual_tarball_local_only(
         None,
         virtual_repo_id,
         upstream_path,
+        // No proxy, so no Remote member can win: nothing for the resolver to
+        // record (#3844).
+        None,
         move |member_id, location| {
             let state = state_arc.clone();
             let suffix = suffix.clone();

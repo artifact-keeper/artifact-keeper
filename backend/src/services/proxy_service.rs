@@ -4172,6 +4172,13 @@ impl ProxyService {
         &self.cache_scope
     }
 
+    /// The pool this proxy records its catalog against. The buffered virtual
+    /// resolvers, which are handed the proxy but not the app state, record a
+    /// Remote member's winning serve through it (#3844).
+    pub(crate) fn db(&self) -> &PgPool {
+        &self.db
+    }
+
     /// Fetch artifact from upstream if not cached or cache expired.
     /// Returns (content, content_type) tuple.
     ///

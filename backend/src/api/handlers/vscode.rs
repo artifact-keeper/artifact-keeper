@@ -4065,6 +4065,7 @@ async fn resolve_legacy_vsix_unscanned(
         members,
         Some(proxy),
         legacy.upstream_path,
+        Some(legacy.ctx),
         |member_id, location| async move {
             proxy_helpers::local_fetch_by_name_version(
                 &state.db,
@@ -4226,6 +4227,7 @@ async fn download_vsix(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();

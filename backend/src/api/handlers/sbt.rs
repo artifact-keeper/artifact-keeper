@@ -201,6 +201,7 @@ async fn serve_scanned_sbt_virtual(
             &local_fetch,
             "application/octet-stream",
             None,
+            Some(ctx),
         )
     };
     let scanned = |member: crate::models::repository::Repository, policy| async move {
@@ -231,6 +232,7 @@ async fn serve_scanned_sbt_virtual(
         members,
         Some(proxy),
         request_path,
+        Some(ctx),
         &local_fetch,
     )
     .await?;
@@ -396,6 +398,7 @@ async fn download_by_path(
                     state.proxy_service.as_deref(),
                     repo.id,
                     artifact_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();

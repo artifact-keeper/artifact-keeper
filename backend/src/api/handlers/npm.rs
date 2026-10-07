@@ -4815,6 +4815,7 @@ async fn serve_tarball(
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
+            Some(ctx),
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();

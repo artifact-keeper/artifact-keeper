@@ -1186,6 +1186,10 @@ async fn get_mod_file(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    // go.mod is metadata: the Remote arm above serves it through the
+                    // capped fetch and records no proxy download, so a Remote member
+                    // serving it here is not counted either (#3844).
+                    None,
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1365,6 +1369,7 @@ async fn download_zip(
                     allowed,
                     state.proxy_service.as_deref(),
                     &upstream_path,
+                    Some(ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
