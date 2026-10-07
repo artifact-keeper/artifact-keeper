@@ -8312,21 +8312,33 @@ impl ScannerService {
                 // original (another artifact's) row. Without this check the
                 // InsertFresh path (auto-scan, repository scan) would copy it
                 // into a SECOND completed row for this artifact. Prefer the
-                // artifact's own completed row so the #1373 branch below
-                // treats it as already scanned.
+                // artifact's own row when it passes the same reuse filters
+                // (pin, not_cataloged, TTL), so the #1373 branch below treats
+                // it as already scanned. A lookup error falls through to the
+                // copy, the pre-#4425 behaviour.
                 if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
-                    if let Ok(Some(own)) = self
+                    match self
                         .scan_result_service
-                        .find_existing_scan_for_artifact(
+                        .find_own_reusable_scan(
                             artifact_id,
                             checksum,
                             scanner.scan_type(),
                             DEDUP_TTL_DAYS,
                             ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                            pin_identity.as_deref(),
                         )
                         .await
                     {
-                        source_scan = own;
+                        Ok(Some(own)) => source_scan = own,
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            "Own-scan lookup failed for artifact {} (scanner={}): {}; \
+                             reusing {} by copy",
+                            artifact_id,
+                            scanner.name(),
+                            e,
+                            source_scan.id
+                        ),
                     }
                 }
                 // #1373: when the matched source scan is for THIS artifact,
