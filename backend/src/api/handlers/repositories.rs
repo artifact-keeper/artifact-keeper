@@ -1500,6 +1500,16 @@ fn repo_to_display_response(
     response
 }
 
+/// Display storage figures of a repository that was just created: nothing
+/// stored, and for a virtual repository a member figure of 0 (#4423).
+fn new_repository_storage(repo_type: &RepositoryType) -> DisplayStorageUsage {
+    if *repo_type == RepositoryType::Virtual {
+        DisplayStorageUsage::virtual_repo(0)
+    } else {
+        DisplayStorageUsage::own(0)
+    }
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
@@ -3786,7 +3796,9 @@ pub async fn create_repository(
     let repo_id = repo.id;
     let repo_type_out = repo.repo_type.clone();
     let repo_format_out = repo.format.clone();
-    let mut response = repo_to_response(repo, 0);
+    // A new repository stores nothing yet; a new virtual reports a member
+    // figure of 0 like every other virtual response (#4423).
+    let mut response = repo_to_display_response(repo, new_repository_storage(&repo_type_out));
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -14623,6 +14635,31 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// #4423: the member figure is present as an explicit `null` for a
+    /// non-virtual repository and is a number for a virtual one, including
+    /// the response to creating it.
+    #[test]
+    fn member_storage_field_is_null_or_number_4423() {
+        let hosted = serde_json::to_value(repo_to_display_response(
+            sample_repo(),
+            new_repository_storage(&RepositoryType::Local),
+        ))
+        .unwrap();
+        assert_eq!(
+            hosted.get("member_storage_used_bytes"),
+            Some(&serde_json::Value::Null)
+        );
+        let mut virt = sample_repo();
+        virt.repo_type = RepositoryType::Virtual;
+        let created = serde_json::to_value(repo_to_display_response(
+            virt,
+            new_repository_storage(&RepositoryType::Virtual),
+        ))
+        .unwrap();
+        assert_eq!(created["storage_used_bytes"], 0);
+        assert_eq!(created["member_storage_used_bytes"], 0);
     }
 
     #[test]
@@ -28973,7 +29010,11 @@ mod apt_validation_tests {
                     item["key"].as_str().expect("key").to_string(),
                     (
                         item["storage_used_bytes"].as_i64().expect("storage figure"),
-                        item["member_storage_used_bytes"].as_i64(),
+                        match item.get("member_storage_used_bytes") {
+                            Some(serde_json::Value::Null) => None,
+                            Some(figure) => Some(figure.as_i64().expect("member figure")),
+                            None => panic!("member_storage_used_bytes must always be present"),
+                        },
                     ),
                 )
             })
