@@ -59,6 +59,20 @@ packages, with at most one render in flight per repository; a publish, delete or
 next request, because the cache key is derived from the live package rows.
 Peer replication carries the file list inside the replicated metadata
 document, and the receiving peer moves it back into `pacman_file_lists`.
+A repository whose rendered `.files` is larger than the whole 256 MiB budget
+is never kept, so each `.files` request renders it again; a new entry may also
+be refused admission while the cache is full of more frequently used ones.
+
+Upgrading from a build of `main` that predates migration 276: a replica still
+running the older code during a rolling upgrade writes file lists into
+`artifact_metadata` after the migration has moved the rest, and those packages
+show an empty file list until they are moved. Once every replica runs the new
+code, re-run the migration file by hand; it is idempotent and only touches
+pacman rows that still carry a list:
+
+```bash
+psql "$DATABASE_URL" -f backend/migrations/276_pacman_file_lists.sql
+```
 
 ## Publishing
 

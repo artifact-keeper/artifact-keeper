@@ -1573,12 +1573,12 @@ mod db_tests {
         let (bad_file, bad_pkg) = build_package("odd", "1.0-1", "x86_64");
         assert_eq!(put(&fx, &bad_file, bad_pkg).await, StatusCode::CREATED);
         // Rewrite both rows into the old shape: the list inside the document
-        // (one of them malformed), no pacman_file_lists row.
+        // (one with a JSON null entry, one malformed), no pacman_file_lists row.
         sqlx::query(
             "WITH ids AS (SELECT id, name FROM artifacts WHERE repository_id = $1) \
              UPDATE artifact_metadata am \
              SET metadata = jsonb_set(am.metadata, '{files}', \
-                 CASE WHEN ids.name = 'legacy' THEN '[\"usr/\", \"usr/bin/legacy\"]'::jsonb \
+                 CASE WHEN ids.name = 'legacy' THEN '[\"usr/\", null, \"usr/bin/legacy\"]'::jsonb \
                       ELSE '\"not-a-list\"'::jsonb END) \
              FROM ids WHERE am.artifact_id = ids.id",
         )
