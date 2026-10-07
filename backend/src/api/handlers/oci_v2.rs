@@ -4472,9 +4472,10 @@ enum UpstreamFetchOutcome {
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
     /// The upstream refused the Remote's credentials: its OCI token service
-    /// (#4453), or the registry itself on the request (#4518). As indeterminate as [`Self::Indeterminate`], but the direct
-    /// Remote manifest GET/HEAD reports it as a gateway error instead of
-    /// `MANIFEST_UNKNOWN`.
+    /// (#4453), or the registry itself on the request when credentials were
+    /// sent (#4518). As indeterminate as [`Self::Indeterminate`], but the
+    /// direct Remote manifest GET/HEAD reports it as a gateway error instead
+    /// of `MANIFEST_UNKNOWN`.
     UpstreamAuthFailed,
 }
 
@@ -36255,9 +36256,12 @@ mod remote_pull_through_cache_tests {
     /// #4518: the registry refusing the manifest request ITSELF -- after a
     /// successful token exchange (an anonymous-scope token for a private
     /// image), or on plain Basic auth (401 without a Bearer challenge, or
-    /// 403) -- is reported like a refusing token service: 502 `DENIED` on GET
-    /// and HEAD, never 404 `MANIFEST_UNKNOWN`, plus a `security` WARN naming
-    /// the upstream URL, with no credentials in it.
+    /// 403). With upstream credentials configured it is reported like a
+    /// refusing token service: 502 `DENIED` on GET and HEAD, never 404
+    /// `MANIFEST_UNKNOWN`, plus a `security` WARN naming the upstream URL with
+    /// no credentials in it, sampled to one per Remote per interval. Without
+    /// credentials the miss stays 404 `MANIFEST_UNKNOWN`, logged at INFO and
+    /// never on the `security` target.
     #[tokio::test]
     async fn manifest_request_refused_by_the_registry_is_a_502_4518() {
         use crate::services::upstream_auth::{
@@ -36316,6 +36320,7 @@ mod remote_pull_through_cache_tests {
             .await;
 
         let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let (anon_id, anon_key) = insert_public_remote_repo(&pool, &server.uri()).await;
         // Generated per run so no credential-shaped literal is committed.
         let secret = Uuid::new_v4().simple().to_string();
         save_upstream_auth(
@@ -36336,61 +36341,87 @@ mod remote_pull_through_cache_tests {
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let mut seen = Vec::new();
-        for name in ["private", "basic401", "basic403"] {
-            let image = format!("{repo_key}/{name}");
-            let capture = tdh::LogCapture::default();
-            let guard = capture.install(tracing::Level::INFO);
-            let head = super::handle_head_manifest(
-                &state,
-                &anon_headers(),
-                "http://ak.test",
-                &image,
-                "v1",
-            )
-            .await;
-            let get = super::handle_get_manifest(
-                &state,
-                &anon_headers(),
-                "http://ak.test",
-                &image,
-                "v1",
-                &ctx,
-            )
-            .await;
-            drop(guard);
-            let (get_status, get_body, _h) = tdh::collect_response(get).await;
-            seen.push((
-                name,
-                head.status(),
-                get_status,
-                String::from_utf8_lossy(&get_body).into_owned(),
-                capture.text(),
-            ));
+        for (key, credentialed) in [(&repo_key, true), (&anon_key, false)] {
+            for name in ["private", "basic401", "basic403"] {
+                let image = format!("{key}/{name}");
+                let capture = tdh::LogCapture::default();
+                let guard = capture.install(tracing::Level::INFO);
+                let head = super::handle_head_manifest(
+                    &state,
+                    &anon_headers(),
+                    "http://ak.test",
+                    &image,
+                    "v1",
+                )
+                .await;
+                let get = super::handle_get_manifest(
+                    &state,
+                    &anon_headers(),
+                    "http://ak.test",
+                    &image,
+                    "v1",
+                    &ctx,
+                )
+                .await;
+                drop(guard);
+                let (get_status, get_body, _h) = tdh::collect_response(get).await;
+                seen.push((
+                    credentialed,
+                    name,
+                    head.status(),
+                    get_status,
+                    String::from_utf8_lossy(&get_body).into_owned(),
+                    capture.text(),
+                ));
+            }
         }
-        sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(repo_id)
-            .execute(&pool)
-            .await
-            .ok();
+        for id in [repo_id, anon_id] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
         let _ = std::fs::remove_dir_all(&tmp);
 
-        for (name, head, get, body, logs) in seen {
-            assert_eq!(head, StatusCode::BAD_GATEWAY, "{name} HEAD");
-            assert_eq!(get, StatusCode::BAD_GATEWAY, "{name} GET: {body}");
-            assert!(body.contains("DENIED"), "{name}: {body}");
-            assert!(!body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
-            assert!(
-                logs.contains("WARN")
-                    && logs.contains("security")
-                    && logs.contains("credentials_sent=true")
-                    && logs.contains(&format!("/v2/{name}/manifests/v1")),
-                "{name}: {logs}"
-            );
+        let security_warns = |logs: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security"))
+                .count()
+        };
+        let mut credentialed_warns = 0;
+        for (credentialed, name, head, get, body, logs) in seen {
             assert!(
                 !logs.contains(&secret) && !logs.contains("svc-4518"),
                 "{name}: {logs}"
             );
+            if credentialed {
+                assert_eq!(head, StatusCode::BAD_GATEWAY, "{name} HEAD");
+                assert_eq!(get, StatusCode::BAD_GATEWAY, "{name} GET: {body}");
+                assert!(body.contains("DENIED"), "{name}: {body}");
+                assert!(!body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
+                let warns = security_warns(&logs);
+                if warns > 0 {
+                    assert!(
+                        logs.contains("credentials_sent=true")
+                            && logs.contains(&format!("/v2/{name}/manifests/v1")),
+                        "{name}: {logs}"
+                    );
+                }
+                credentialed_warns += warns;
+            } else {
+                assert_eq!(head, StatusCode::NOT_FOUND, "{name} HEAD (anonymous)");
+                assert_eq!(get, StatusCode::NOT_FOUND, "{name} GET (anonymous): {body}");
+                assert!(body.contains("MANIFEST_UNKNOWN"), "{name}: {body}");
+                assert_eq!(security_warns(&logs), 0, "{name}: {logs}");
+                assert!(
+                    logs.contains("refused an anonymous manifest request"),
+                    "{name}: {logs}"
+                );
+            }
         }
+        // Six refusals on one Remote within the interval: one security WARN.
+        assert_eq!(credentialed_warns, 1);
     }
 }
 

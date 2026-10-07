@@ -938,9 +938,10 @@ pub async fn proxy_fetch_capped_with_accept(
         Err(error) => error,
     };
     // #4518: an OCI registry that refuses the request itself (after a
-    // successful token exchange, or on plain Basic auth) is an upstream
-    // authentication failure like a refusing token service (#4453), not an
-    // indeterminate miss.
+    // successful token exchange, or on plain Basic auth) while the Remote
+    // sends credentials is an upstream authentication failure like a
+    // refusing token service (#4453), not an indeterminate miss. Without
+    // credentials it stays a miss (see `oci_registry_auth_error`).
     let error = if repo.format == RepositoryFormat::Docker
         && crate::services::proxy_service::upstream_request_auth_refusal(&error).is_some()
     {
@@ -950,7 +951,12 @@ pub async fn proxy_fetch_capped_with_accept(
             path.trim_start_matches('/')
         );
         let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
-        crate::services::proxy_service::oci_registry_auth_error(error, &url, credentials_sent)
+        crate::services::proxy_service::oci_registry_auth_error(
+            error,
+            repo_id,
+            &url,
+            credentials_sent,
+        )
     } else {
         error
     };

@@ -922,18 +922,68 @@ pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode
         .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
 }
 
+/// At most one `security` WARN per Remote per this interval for an OCI
+/// registry refusing its credentials (#4518); the rest are counted and the
+/// count is reported on the next WARN. A client pulling a missing or private
+/// image in a loop must not flood the security log.
+const REGISTRY_AUTH_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on the Remotes [`registry_auth_warn_state`] tracks; past it the
+/// state is reset (each Remote then warns once more).
+const REGISTRY_AUTH_WARN_KEYS: usize = 4096;
+
+fn registry_auth_warn_state() -> &'static std::sync::Mutex<HashMap<Uuid, (Instant, u64)>> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, (Instant, u64)>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Sampling decision for a rate-limited WARN keyed by `key`: `Some(n)` to
+/// log now, `n` being how many were suppressed since the last one, or `None`
+/// to stay quiet (counted) because one was logged less than `interval` ago.
+fn admit_sampled_warn(
+    state: &mut HashMap<Uuid, (Instant, u64)>,
+    key: Uuid,
+    now: Instant,
+    interval: Duration,
+    max_keys: usize,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = state.get_mut(&key) {
+        if now.duration_since(*last) < interval {
+            *suppressed += 1;
+            return None;
+        }
+        let missed = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(missed);
+    }
+    if state.len() >= max_keys {
+        state.clear();
+    }
+    state.insert(key, (now, 0));
+    Some(0)
+}
+
 /// Reclassify an OCI registry's `401`/`403` on the manifest request itself
-/// (see [`upstream_request_auth_refusal`]) as [`AppError::UpstreamAuth`],
-/// the error [`token_endpoint_status_error`] gives a refusal by the token
-/// service (#4453), with the same kind of `security`-target line naming the
-/// redacted URL and whether credentials were sent (#4518). Docker Hub, for
-/// one, hands out an anonymous token for a private image and then refuses
-/// the manifest. Any other error is returned unchanged.
+/// (see [`upstream_request_auth_refusal`]) for Remote `repo_id` (#4518).
 ///
-/// OCI only: generic formats keep a 403 as `BadGateway`, which some of them
-/// read as "not here" ([`is_upstream_forbidden`], #3886).
+/// * Credentials were sent: [`AppError::UpstreamAuth`], the error
+///   [`token_endpoint_status_error`] gives a refusing token service (#4453),
+///   so the client gets 502 `DENIED`, plus a `security`-target WARN naming
+///   the redacted URL, sampled per Remote ([`REGISTRY_AUTH_WARN_INTERVAL`]).
+/// * No credentials configured: the error is returned unchanged, so the
+///   client keeps 404 `MANIFEST_UNKNOWN`, and the refusal is logged at INFO.
+///   There is nothing for the operator to fix, and an anonymous refusal
+///   usually means the image does not exist or is private (Docker Hub
+///   answers 401 for a repository that does not exist).
+///
+/// Any other error is returned unchanged. OCI only: generic formats keep a
+/// 403 as `BadGateway`, which some read as "not here"
+/// ([`is_upstream_forbidden`], #3886).
 pub(crate) fn oci_registry_auth_error(
     err: AppError,
+    repo_id: Uuid,
     url: &str,
     credentials_sent: bool,
 ) -> AppError {
@@ -941,14 +991,38 @@ pub(crate) fn oci_registry_auth_error(
         return err;
     };
     let url = redact_url_for_diagnostics(url);
-    tracing::warn!(
-        target: "security",
-        upstream = %url,
-        status = %status,
-        credentials_sent,
-        "upstream OCI registry rejected the proxy's authentication on a manifest request; \
-         check the Remote's upstream credentials"
-    );
+    if !credentials_sent {
+        tracing::info!(
+            upstream = %url,
+            status = %status,
+            "upstream OCI registry refused an anonymous manifest request; reporting the \
+             manifest as unknown (no upstream credentials are configured)"
+        );
+        return err;
+    }
+    let admitted = registry_auth_warn_state()
+        .lock()
+        .map(|mut state| {
+            admit_sampled_warn(
+                &mut state,
+                repo_id,
+                Instant::now(),
+                REGISTRY_AUTH_WARN_INTERVAL,
+                REGISTRY_AUTH_WARN_KEYS,
+            )
+        })
+        .unwrap_or(Some(0));
+    if let Some(suppressed) = admitted {
+        tracing::warn!(
+            target: "security",
+            upstream = %url,
+            status = %status,
+            credentials_sent,
+            suppressed,
+            "upstream OCI registry rejected the proxy's authentication on a manifest request; \
+             check the Remote's upstream credentials"
+        );
+    }
     AppError::UpstreamAuth(format!(
         "upstream registry {url} returned {status}; check the repository's upstream credentials"
     ))
@@ -17147,21 +17221,26 @@ mod tests {
     }
 
     /// #4518: only an upstream 401/403 on the request itself becomes an
-    /// upstream auth failure, and the error names the redacted URL only.
+    /// upstream auth failure, only when credentials were sent, and the error
+    /// names the redacted URL only.
     #[test]
     fn test_oci_registry_auth_error_classifies_request_refusals_4518() {
         let url = "https://bob:pw@reg.example.test/v2/img/manifests/v1";
-        let refused = [
-            validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
-            validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
-            AppError::Storage(format!(
-                "Upstream returned error status {}: {url}",
-                StatusCode::UNAUTHORIZED
-            )),
-        ];
-        for err in refused {
+        let refused = || {
+            [
+                validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
+                validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
+                AppError::Storage(format!(
+                    "Upstream returned error status {}: {url}",
+                    StatusCode::UNAUTHORIZED
+                )),
+            ]
+        };
+        for err in refused() {
             assert!(upstream_request_auth_refusal(&err).is_some(), "{err:?}");
-            let AppError::UpstreamAuth(msg) = oci_registry_auth_error(err, url, true) else {
+            let AppError::UpstreamAuth(msg) =
+                oci_registry_auth_error(err, Uuid::new_v4(), url, true)
+            else {
                 panic!("expected UpstreamAuth");
             };
             assert!(
@@ -17169,6 +17248,12 @@ mod tests {
                 "{msg}"
             );
             assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        }
+        // Anonymous: unchanged, so the manifest handlers keep the miss.
+        for err in refused() {
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, false);
+            assert_eq!(format!("{after:?}"), before);
         }
         let unchanged = [
             validate_upstream_status(StatusCode::NOT_FOUND, url).unwrap_err(),
@@ -17180,11 +17265,33 @@ mod tests {
         for err in unchanged {
             assert!(upstream_request_auth_refusal(&err).is_none(), "{err:?}");
             let before = format!("{err:?}");
-            assert_eq!(
-                format!("{:?}", oci_registry_auth_error(err, url, false)),
-                before
-            );
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, true);
+            assert_eq!(format!("{after:?}"), before);
         }
+    }
+
+    /// #4518: the registry-auth WARN is sampled per Remote: one per
+    /// interval, the rest counted and reported on the next one.
+    #[test]
+    fn test_admit_sampled_warn_4518() {
+        let mut state = HashMap::new();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), Some(0));
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), None);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(admit_sampled_warn(&mut state, a, later, every, 8), None);
+        // Another Remote is not throttled by the first.
+        assert_eq!(admit_sampled_warn(&mut state, b, later, every, 8), Some(0));
+        let next = t0 + every;
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), Some(2));
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), None);
+        // Bounded: a full table is reset rather than grown.
+        let mut full = HashMap::new();
+        assert_eq!(admit_sampled_warn(&mut full, a, t0, every, 1), Some(0));
+        assert_eq!(admit_sampled_warn(&mut full, b, t0, every, 1), Some(0));
+        assert_eq!(full.len(), 1);
     }
 
     // -- #3606: the token cache is scoped to the credential ------------------
