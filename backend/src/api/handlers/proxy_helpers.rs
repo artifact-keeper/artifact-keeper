@@ -2962,8 +2962,9 @@ pub(crate) fn classify_streaming_upstream(
 /// `ctx` is the caller's download context (#3844). `Some` records a REMOTE
 /// member's winning serve into `proxy_download_statistics` exactly once, at
 /// winner-determination, so a losing member's probe is never counted. A hosted
-/// winner is left to the caller, which counts it off
-/// [`StreamingFetchResult::artifact_id`] (#2260). `None` records nothing.
+/// winner is left to the caller, which may or may not count it today (Maven
+/// and the generic route do, off [`StreamingFetchResult::artifact_id`],
+/// #2260). `None` records nothing.
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -3253,11 +3254,14 @@ impl VirtualServeOrigin {
 
 /// Record a virtual download's WINNING member exactly once (#2260, #3844).
 ///
-/// `record_hosted` is false for the buffered resolvers, whose callers already
-/// count a hosted winner off `StreamingFetchResult::artifact_id`; recording it
-/// here too would double count. A Remote winner needs the proxy it was
-/// resolved through (always present: only the proxy strategy yields one). Both
-/// recorders are HEAD-guarded and best-effort.
+/// `record_hosted` is false for the buffered resolvers: a hosted winner there
+/// is left to the caller, which may or may not count it today (Maven and the
+/// generic route do, off `StreamingFetchResult::artifact_id`); recording it
+/// here too would double count those. A Remote winner needs the proxy it was
+/// resolved through (always present: only the proxy strategy yields one) and
+/// is recorded off the response path under the #3778 limiter, like Maven's
+/// direct Remote arm, so a virtual serve pays no extra time to first byte.
+/// Both recorders are HEAD-guarded and best-effort.
 async fn record_virtual_serve(
     db: &PgPool,
     proxy: Option<&ProxyService>,
@@ -3272,7 +3276,7 @@ async fn record_virtual_serve(
         }
         VirtualServeOrigin::Remote { repo_id, repo_key } => {
             if let Some(proxy) = proxy {
-                record_proxy_download_via(db, proxy, *repo_id, repo_key, path, ctx).await;
+                record_proxy_download_via_deferred(db, proxy, *repo_id, repo_key, path, ctx).await;
             }
         }
         VirtualServeOrigin::Hosted(_) | VirtualServeOrigin::Unrecorded => {}
@@ -3446,8 +3450,8 @@ where
 
     match outcome {
         Some(MemberResolveOutcome::Hit((response, origin))) => {
-            // Record the winning member exactly once (#2260, #3844), inline so
-            // the row is committed before the response is returned.
+            // Record the winning member exactly once (#2260, #3844). Both
+            // recorders write off the response path (#2522, #3778).
             record_virtual_serve(&state.db, proxy_service, &origin, path, ctx, true).await;
             Ok(response)
         }
@@ -6231,21 +6235,11 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// that prompted the streaming migration.
 /// The proxy-cache `(storage_key, metadata_key)` pair under which a recorded
 /// serve ensures its transient catalog placeholder — the keys the streaming
-/// tee later refines in place. `None` when no proxy service is wired (the
-/// scope must come from the live `ProxyService`, #3454) or when the path is
-/// too long to cache at all (it could never have a catalog row).
-fn proxy_record_target(
-    state: &crate::api::SharedState,
-    repo_key: &str,
-    path: &str,
-) -> Option<(String, String)> {
-    proxy_record_keys(state.proxy_service.as_ref()?, repo_key, path)
-}
-
-/// [`proxy_record_target`] for an explicit [`ProxyService`]: the virtual
-/// resolvers are handed the proxy they fetched through (which may be the
-/// caller's `proxy_for_virtual`, not `state.proxy_service`), and the catalog
-/// placeholder must be keyed under THAT proxy's cache scope (#3454).
+/// tee later refines in place. The scope comes from the `ProxyService` the
+/// serve went through (#3454): `state.proxy_service` for a direct Remote, the
+/// resolver's proxy (possibly the caller's `proxy_for_virtual`) for a virtual
+/// member. `None` when the path is too long to cache at all (it could never
+/// have a catalog row).
 fn proxy_record_keys(proxy: &ProxyService, repo_key: &str, path: &str) -> Option<(String, String)> {
     let scope = proxy.cache_scope();
     match (
@@ -6360,13 +6354,31 @@ pub(crate) async fn record_proxy_download_deferred(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) {
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return;
+    };
+    record_proxy_download_via_deferred(&state.db, proxy, repo_id, repo_key, path, ctx).await;
+}
+
+/// [`record_proxy_download_deferred`] against an explicit [`ProxyService`]
+/// (#3844): the virtual resolvers record a Remote member's winning serve under
+/// the proxy they resolved it through, off the response path like Maven's
+/// direct Remote arm (#3778).
+pub(crate) async fn record_proxy_download_via_deferred(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
     if ctx.is_head {
         return;
     }
-    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+    let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
         return;
     };
-    let db = state.db.clone();
+    let db = db.clone();
     let path_owned = path.to_string();
     let user_id = ctx.user_id;
     let ip = ctx.client_ip.map(|i| i.to_string());
@@ -22653,8 +22665,24 @@ mod virtual_winner_recording_tests_3844 {
             assert!(result.is_ok(), "a member must serve the tarball");
         }
 
-        /// `proxy_download_statistics` rows recorded under member `index`.
-        async fn recorded(&self, index: usize) -> i64 {
+        /// `proxy_download_statistics` rows recorded under member `index` for
+        /// exactly `path`, the canonical coordinate the member's cache uses.
+        async fn recorded_at(&self, index: usize, path: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(self.members[index].0)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count member statistics")
+        }
+
+        /// Every `proxy_download_statistics` row under member `index`, at any
+        /// path.
+        async fn recorded_any(&self, index: usize) -> i64 {
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM proxy_download_statistics d \
                  JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
@@ -22666,10 +22694,22 @@ mod virtual_winner_recording_tests_3844 {
             .expect("count member statistics")
         }
 
-        async fn recorded_all(&self) -> Vec<i64> {
+        /// Per-member counts at `path`, once their sum reaches `expected`
+        /// (bounded ~2s). The Remote winner is recorded off the response path
+        /// (#3778), so its row lands shortly after the serve; nothing else is
+        /// ever spawned (losers are never recorded), so once the winner's row
+        /// is in, the counts are final.
+        async fn recorded_all(&self, path: &str, expected: i64) -> Vec<i64> {
             let mut out = Vec::new();
-            for i in 0..self.members.len() {
-                out.push(self.recorded(i).await);
+            for _ in 0..100 {
+                out.clear();
+                for i in 0..self.members.len() {
+                    out.push(self.recorded_at(i, path).await);
+                }
+                if out.iter().sum::<i64>() >= expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
             out
         }
@@ -22718,7 +22758,7 @@ mod virtual_winner_recording_tests_3844 {
         let rig = Rig::new(pool, &[true, true]).await;
         let path = tarball_path();
         rig.serve_streaming(&path, &ctx(false)).await;
-        let counts = rig.recorded_all().await;
+        let counts = rig.recorded_all(&path, 1).await;
         rig.teardown().await;
         assert_eq!(counts, vec![1, 0], "only the winning member is counted");
     }
@@ -22734,7 +22774,7 @@ mod virtual_winner_recording_tests_3844 {
         let rig = Rig::new(pool, &[false, true, true]).await;
         let path = tarball_path();
         rig.serve_streaming(&path, &ctx(false)).await;
-        let counts = rig.recorded_all().await;
+        let counts = rig.recorded_all(&path, 1).await;
         rig.teardown().await;
         assert_eq!(
             counts,
@@ -22783,7 +22823,7 @@ mod virtual_winner_recording_tests_3844 {
         );
 
         rig.serve_streaming(&path, &ctx(false)).await;
-        let counts = rig.recorded_all().await;
+        let counts = rig.recorded_all(&path, 1).await;
         rig.teardown().await;
         assert_eq!(
             counts,
@@ -22801,10 +22841,10 @@ mod virtual_winner_recording_tests_3844 {
         let rig = Rig::new(pool, &[true]).await;
         let path = tarball_path();
         rig.serve_streaming(&path, &ctx(true)).await;
-        let after_head = rig.recorded(0).await;
+        let after_head = rig.recorded_at(0, &path).await;
         rig.serve_streaming(&path, &ctx(false)).await;
         rig.serve_streaming(&path, &ctx(false)).await;
-        let after_gets = rig.recorded(0).await;
+        let after_gets = rig.recorded_all(&path, 2).await[0];
         rig.teardown().await;
         assert_eq!(after_head, 0, "a HEAD serves no bytes and is never counted");
         assert_eq!(after_gets, 2, "each served GET is counted exactly once");
@@ -22821,10 +22861,12 @@ mod virtual_winner_recording_tests_3844 {
         let rig = Rig::new(pool, &[false, true, true]).await;
         let path = tarball_path();
         rig.serve_buffered(&path, Some(&ctx(false))).await;
-        let with_ctx = rig.recorded_all().await;
+        let with_ctx = rig.recorded_all(&path, 1).await;
         rig.serve_buffered(&path, Some(&ctx(true))).await;
         rig.serve_buffered(&path, None).await;
-        let after_uncounted = rig.recorded_all().await;
+        // Neither call spawns a recorder; give a stray one time to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_uncounted = rig.recorded_all(&path, 1).await;
         rig.teardown().await;
         assert_eq!(with_ctx, vec![0, 1, 0], "only the winner is counted");
         assert_eq!(
@@ -22832,5 +22874,129 @@ mod virtual_winner_recording_tests_3844 {
             vec![0, 1, 0],
             "a HEAD and a context-less call record nothing"
         );
+    }
+
+    /// npm / cargo (`_with_fetch_urls`): the winning member fetched its bytes
+    /// from an absolute URL that differs from the canonical path, but the serve
+    /// is recorded under the canonical `path`, the key its cache uses — never
+    /// under the fetch URL.
+    #[tokio::test]
+    async fn fetch_url_override_records_under_canonical_path_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true]).await;
+        let path = tarball_path();
+        let (member_id, upstream) = &rig.members[0];
+        let fetch_url = format!("{}/download/elsewhere/pkg.tgz", upstream.uri());
+        let members = fetch_virtual_members(&rig.pool, rig.virtual_id)
+            .await
+            .expect("members");
+        let urls = std::collections::HashMap::from([(*member_id, fetch_url)]);
+        let served = resolve_virtual_download_from_members_with_fetch_urls(
+            members,
+            Some(&rig.proxy),
+            &path,
+            &urls,
+            Some(&ctx(false)),
+            |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+        )
+        .await;
+        assert!(served.is_ok(), "the member must serve via its fetch URL");
+        let at_canonical = rig.recorded_all(&path, 1).await;
+        let anywhere = rig.recorded_any(0).await;
+        rig.teardown().await;
+        assert_eq!(at_canonical, vec![1], "recorded under the canonical path");
+        assert_eq!(anywhere, 1, "and nowhere else");
+    }
+
+    /// The buffered resolver leaves a HOSTED winner to its caller
+    /// (`record_hosted == false`): it must write no `download_statistics` row
+    /// itself, or callers that count `artifact_id` (Maven, the generic route)
+    /// would count every hosted virtual download twice. The Remote member
+    /// behind it lost, so it records nothing either.
+    #[tokio::test]
+    async fn buffered_hosted_winner_is_not_recorded_by_the_resolver_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool.clone(), &[true]).await;
+        let path = tarball_path();
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query("UPDATE virtual_repo_members SET priority = 1 WHERE virtual_repo_id = $1")
+            .bind(rig.virtual_id)
+            .execute(&pool)
+            .await
+            .expect("move the remote member behind");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(rig.virtual_id)
+        .bind(local_id)
+        .execute(&pool)
+        .await
+        .expect("link hosted member first");
+        let local_state = tdh::build_state(pool.clone(), local_dir.to_str().unwrap());
+        let local_info = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let storage_key = format!("{local_key}/{path}");
+        put_artifact_bytes(
+            &local_state,
+            &local_info,
+            &storage_key,
+            Bytes::from_static(b"hosted"),
+        )
+        .await
+        .expect("seed hosted bytes");
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'pkg', '1.0.0', 6, $3, 'application/gzip', $4) RETURNING id",
+        )
+        .bind(local_id)
+        .bind(&path)
+        .bind(format!("{:0>64}", "3844"))
+        .bind(&storage_key)
+        .fetch_one(&pool)
+        .await
+        .expect("seed hosted row");
+
+        let db = pool.clone();
+        let st = local_state.clone();
+        let p = path.clone();
+        let result = resolve_virtual_download(
+            &pool,
+            tdh::admin_auth_ext().as_ref(),
+            Some(&rig.proxy),
+            rig.virtual_id,
+            &path,
+            Some(&ctx(false)),
+            move |mid, loc| {
+                let db = db.clone();
+                let st = st.clone();
+                let p = p.clone();
+                async move { local_fetch_by_path(&db, &st, mid, &loc, &p).await }
+            },
+        )
+        .await;
+        let winner = result.as_ref().ok().and_then(|r| r.artifact_id);
+        drop(result);
+        // A recorder the resolver spawned would land within this window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let hosted_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count hosted rows");
+        let remote_rows = rig.recorded_any(0).await;
+        tdh::cleanup(&pool, local_id, Uuid::nil()).await;
+        rig.teardown().await;
+        assert_eq!(winner, Some(artifact_id), "the hosted member wins");
+        assert_eq!(
+            hosted_rows, 0,
+            "the resolver leaves the hosted winner to its caller"
+        );
+        assert_eq!(remote_rows, 0, "the losing Remote member is not counted");
     }
 }
