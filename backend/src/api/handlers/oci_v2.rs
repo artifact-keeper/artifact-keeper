@@ -4097,6 +4097,7 @@ async fn cache_manifest_reference_locally(
 
         // NO-SCAN-ON-UPLOAD: a pull-side listing row for a proxied manifest,
         // not an upload; proxied content is gated by the digest-keyed proxy scan.
+        // NO-QUOTA-ADMISSION: a proxy-cache fill, not a publish (#4422).
         if let Err(e) = sqlx::query(
             r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -6345,16 +6346,34 @@ async fn try_mount_blob(
         return None;
     }
 
+    // A mount charges the target repository the blob's bytes, so it is
+    // admitted against the target's storage quotas like an upload (#4422).
+    let mut tx = state.db.begin().await.ok()?;
+    if let Some(refusal) = oci_blob_quota_refusal(
+        &mut tx,
+        &state.db,
+        target_repo_id,
+        &canonical,
+        blob.size_bytes,
+    )
+    .await
+    {
+        return Some(refusal);
+    }
     if let Err(e) = sqlx::query!(
         "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
         target_repo_id, canonical, blob.size_bytes, blob.storage_key
     )
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     {
         // Registering the mount failed; fall back to a real upload rather than
         // reporting a success the registry cannot back.
         tracing::warn!(digest = %canonical, "OCI blob mount row insert failed: {}", e);
+        return None;
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(digest = %canonical, "OCI blob mount commit failed: {}", e);
         return None;
     }
 
@@ -6622,6 +6641,24 @@ async fn handle_start_upload(
                     &e.to_string(),
                 );
             }
+        }
+
+        // #4422: storage-quota admission in the transaction that commits the
+        // row. A refusal rolls back like a failed insert below: the temp
+        // object is deleted and the pending reaper reclaims the blob object.
+        if let Some(refusal) = oci_blob_quota_refusal(
+            &mut blob_tx,
+            &state.db,
+            repo_id,
+            canonical_digest.as_str(),
+            put_result.bytes_written as i64,
+        )
+        .await
+        {
+            let _ = blob_tx.rollback().await;
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob refused by quota")
+                .await;
+            return refusal;
         }
 
         if let Err(e) = sqlx::query!(
@@ -8190,6 +8227,34 @@ async fn handle_complete_upload(
                 &e.to_string(),
             );
         }
+    }
+    // #4422: storage-quota admission in the transaction that commits the row;
+    // a refusal unwinds exactly like a failed insert below.
+    if let Some(refusal) = oci_blob_quota_refusal(
+        &mut tx,
+        &state.db,
+        session.repository_id,
+        &digest,
+        size_bytes,
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        if final_part.is_some() {
+            delete_storage_key_best_effort(&storage, &final_part_key, "blob refused by quota")
+                .await;
+        }
+        if let Err(reset_resp) = reset_oci_upload_session_state(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await
+        {
+            return reset_resp;
+        }
+        return refusal;
     }
     // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
     // chunked upload of a blob GC had marked resurrects it, mirroring the
@@ -9830,6 +9895,8 @@ async fn stage_proxy_image_blobs(
                 blob.digest, e
             ))
         })?;
+        // NO-QUOTA-ADMISSION: a blob staged for the proxy's inline scan, a
+        // pull-side cache fill rather than a push (#4422).
         sqlx::query(
             "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
              VALUES ($1, $2, $3, $4) \
@@ -10532,6 +10599,42 @@ pub(crate) async fn index_child_artifact_size_sum(
     })
 }
 
+/// #4422: a storage-quota decision as the error an OCI push answers: `None`
+/// when the push fits, `507 DENIED` naming the repository or project quota that
+/// refuses it, or a 500 when the check itself failed.
+fn oci_quota_refusal(
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+) -> Option<Response> {
+    match decision {
+        Ok(None) => None,
+        Ok(Some(scope)) => Some(oci_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "DENIED",
+            scope.exceeded_message(),
+        )),
+        Err(e) => Some(oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// #4422: the authoritative storage-quota admission of an `oci_blobs` row
+/// inside `tx`, the transaction that INSERTs it; `Some(response)` when the
+/// push must be refused (see [`oci_quota_refusal`]).
+async fn oci_blob_quota_refusal(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db: &PgPool,
+    repo_id: Uuid,
+    digest: &str,
+    size_bytes: i64,
+) -> Option<Response> {
+    oci_quota_refusal(
+        super::publish_quota::locked_oci_blob_denial(tx, db, repo_id, digest, size_bytes).await,
+    )
+}
+
 /// Upsert the `artifacts` row that makes a Docker/OCI manifest visible to the
 /// subsystems that enumerate the `artifacts` table (UI/download, GC, quota,
 /// scanning).
@@ -10706,6 +10809,16 @@ async fn handle_put_manifest(
     // stays correct because it reads this canonicalized value.
     let content_type = stored_media_type_for(&class, &content_type);
 
+    // Calculate total image size from manifest (config + layers): the size
+    // the manifest's `artifacts` row is charged.
+    let total_size: i64 = manifest_total_size(&body);
+    // #4422: refuse an over-quota push before the manifest is stored.
+    if let Some(refusal) = oci_quota_refusal(
+        super::publish_quota::preflight_quota_denial(&state.db, repo_id, total_size).await,
+    ) {
+        return refusal;
+    }
+
     // Store manifest
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -10741,6 +10854,33 @@ async fn handle_put_manifest(
     // with 400 above. The startup backfill in main.rs remains a safety net for
     // rows that pre-date this code, but is no longer needed to repair a push
     // that returned 201.
+    //
+    // #4422: the manifest's `artifacts` row is admitted against the storage
+    // quotas BEFORE the tag goes live, in the transaction that upserts the row
+    // below, so a refused push never leaves a pullable tag behind.
+    let artifact_path = format!("v2/{}/manifests/{}", image, reference);
+    let mut manifest_tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    if let Some(refusal) = oci_quota_refusal(
+        super::publish_quota::locked_quota_denial(
+            &mut manifest_tx,
+            &state.db,
+            repo_id,
+            &artifact_path,
+            total_size,
+        )
+        .await,
+    ) {
+        return refusal;
+    }
     if let Err(e) = persist_tag_and_refs(
         &state.db,
         repo_id,
@@ -10760,19 +10900,15 @@ async fn handle_put_manifest(
         );
     }
 
-    // Calculate total image size from manifest (config + layers)
-    let total_size: i64 = manifest_total_size(&body);
-
     // Also create an artifact record so it appears in the UI (and so GC /
     // quota / scanning, which enumerate the `artifacts` table, see this
     // manifest). Shared with the migration import path via
     // `upsert_manifest_artifact` so a pushed and a migrated manifest are
     // recorded identically.
-    let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
 
-    match upsert_manifest_artifact(
-        &state.db,
+    let upserted = upsert_manifest_artifact(
+        &mut *manifest_tx,
         repo_id,
         &image,
         reference,
@@ -10784,8 +10920,12 @@ async fn handle_put_manifest(
         // A live push takes the trigger-derived hosted origin (#4050).
         None,
     )
-    .await
-    {
+    .await;
+    let upserted = match upserted {
+        Ok(artifact_id) => manifest_tx.commit().await.map(|()| artifact_id),
+        Err(e) => Err(e),
+    };
+    match upserted {
         Ok(artifact_id) => {
             crate::services::quarantine_service::apply_upload_hold_hosted(
                 &state.db,
@@ -27250,6 +27390,123 @@ mod cross_repo_session_regression_tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "a failed mount must not register any blob");
+
+        cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #4422: a failed quota check answers the registry's 500, not a refusal.
+    #[test]
+    fn oci_quota_refusal_maps_a_failed_check_to_500_4422() {
+        assert!(oci_quota_refusal(Ok(None)).is_none());
+        let resp = oci_quota_refusal(Err(AppError::Database("x".into()))).expect("refused");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// #4422: a `docker push` is admitted against the repository's storage
+    /// quota on every write it makes. A blob that would exceed the quota (a
+    /// monolithic upload or a cross-repository mount) and a manifest whose
+    /// image would exceed it are refused with the registry's `507 DENIED`, and
+    /// nothing is recorded; a re-push of a blob the repository holds costs
+    /// nothing.
+    #[tokio::test]
+    async fn docker_push_is_refused_by_repository_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (src_id, src_key, storage_dir) = create_docker_repo(&pool, "quotasrc").await;
+        let (dst_id, dst_key) =
+            create_docker_repo_sharing_storage(&pool, "quotadst", &storage_dir).await;
+        for (id, quota) in [(src_id, 30_i64), (dst_id, 10)] {
+            sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                .bind(id)
+                .bind(quota)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let send = |req: Request<Body>| {
+            let app = router(None).with_state(state.clone());
+            async move {
+                let (status, body) = tdh::send(app, req).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let refused = |(status, body): (StatusCode, String), what: &str| {
+            assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{what}: {body}");
+            assert!(body.contains("DENIED"), "{what}: {body}");
+            assert!(
+                body.contains("Repository storage quota exceeded"),
+                "{what}: {body}"
+            );
+        };
+
+        let first = b"twenty-bytes-blob-01".to_vec();
+        let digest = push_blob(&state, &src_key, &auth, &first).await;
+        // A re-push of the held blob is charged nothing.
+        push_blob(&state, &src_key, &auth, &first).await;
+
+        let second = b"twenty-bytes-blob-02".to_vec();
+        let second_digest = format!("sha256:{}", sha256_hex(&second));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                src_key, second_digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(second))
+            .unwrap();
+        refused(send(req).await, "a blob past the quota");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?mount={}&from={}",
+                dst_key, digest, src_key
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        refused(send(req).await, "a mount past the target's quota");
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest,
+                "size": 20
+            },
+            "layers": []
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/myimage/manifests/v1", src_key))
+            .header("Authorization", &auth)
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(manifest.to_string()))
+            .unwrap();
+        refused(send(req).await, "a manifest whose image is past the quota");
+
+        for (table, id, expected) in [
+            ("oci_blobs", src_id, 1_i64),
+            ("oci_blobs", dst_id, 0),
+            ("oci_tags", src_id, 0),
+            ("artifacts", src_id, 0),
+        ] {
+            let sql = format!("SELECT count(*) FROM {table} WHERE repository_id = $1");
+            let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, expected, "{table} rows in {id}");
+        }
 
         cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
     }
