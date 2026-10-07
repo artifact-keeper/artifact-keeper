@@ -2622,6 +2622,7 @@ async fn resolve_unscanned_crate_members(
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
+        Some(coordinate.ctx),
         |member_id, location| async move {
             proxy_helpers::local_fetch_by_name_version(
                 &state.db, state, member_id, &location, name, version,

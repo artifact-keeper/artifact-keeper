@@ -3045,6 +3045,7 @@ async fn pool_download(
                     allowed_members,
                     state.proxy_service.as_deref(),
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();

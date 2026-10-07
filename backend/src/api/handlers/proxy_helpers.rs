@@ -2958,12 +2958,19 @@ pub(crate) fn classify_streaming_upstream(
 /// parent — including, when that parent was public, an anonymous `curl`. The
 /// member set is narrowed by [`authorize_virtual_members`] before any member is
 /// probed, so a member the caller could not read directly can never serve.
+///
+/// `ctx` is the caller's download context (#3844). `Some` records a REMOTE
+/// member's winning serve into `proxy_download_statistics` exactly once, at
+/// winner-determination, so a losing member's probe is never counted. A hosted
+/// winner is left to the caller, which counts it off
+/// [`StreamingFetchResult::artifact_id`] (#2260). `None` records nothing.
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -2983,7 +2990,7 @@ where
         // has no members", so the two stayed distinguishable (#3452).
         return Err(no_accessible_members_response());
     }
-    resolve_virtual_download_from_members(members, proxy_service, path, local_fetch).await
+    resolve_virtual_download_from_members(members, proxy_service, path, ctx, local_fetch).await
 }
 
 /// Body of [`resolve_virtual_download`] operating over an already-fetched (and,
@@ -3000,10 +3007,13 @@ where
 /// round-trips in Pass 1 and defeating the concurrent fan-out. Mutable indexes
 /// must instead go through [`resolve_virtual_metadata`] / the metadata-merge
 /// helpers.
+///
+/// `ctx`: see [`resolve_virtual_download`] (#3844).
 pub async fn resolve_virtual_download_from_members<F, Fut>(
     members: Vec<Repository>,
     proxy_service: Option<&ProxyService>,
     path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -3015,6 +3025,7 @@ where
         proxy_service,
         path,
         &std::collections::HashMap::new(),
+        ctx,
         local_fetch,
     )
     .await
@@ -3034,12 +3045,14 @@ where
 /// `config.json` `dl` template names the download host, and on a split-host
 /// registry (index.crates.io vs static.crates.io) the canonical path against
 /// the index host 404s. The caller resolves and SSRF-validates the URLs; this
-/// function only threads them through the two-phase walk.
+/// function only threads them through the two-phase walk. A Remote winner is
+/// recorded (`ctx`, #3844) under the canonical `path`, the key its cache uses.
 pub async fn resolve_virtual_download_from_members_with_fetch_urls<F, Fut>(
     members: Vec<Repository>,
     proxy_service: Option<&ProxyService>,
     path: &str,
     member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -3068,7 +3081,16 @@ where
     // Borrow `local_fetch` so the per-member `probe` closure copies the
     // reference instead of moving the `Fn` into each `async move` future.
     let local_fetch = &local_fetch;
-    let outcome = resolve_members_two_phase::<StreamingFetchResult, Response, _, _, _, _>(
+    // Each hit carries its `VirtualServeOrigin` to winner-determination (#3844);
+    // see `resolve_virtual_download_streaming` for why it is not recorded here.
+    let outcome = resolve_members_two_phase::<
+        (StreamingFetchResult, VirtualServeOrigin),
+        Response,
+        _,
+        _,
+        _,
+        _,
+    >(
         &members,
         |member| async move {
             match virtual_member_fetch_strategy(
@@ -3078,10 +3100,13 @@ where
             ) {
                 VirtualMemberFetchStrategy::Local => {
                     match local_fetch(member.id, member.storage_location()).await {
-                        Ok(result) => (
-                            MemberCacheClass::DefiniteHit,
-                            Some(MemberResolveOutcome::Hit(result)),
-                        ),
+                        Ok(result) => {
+                            let origin = VirtualServeOrigin::hosted(result.artifact_id);
+                            (
+                                MemberCacheClass::DefiniteHit,
+                                Some(MemberResolveOutcome::Hit((result, origin))),
+                            )
+                        }
                         // #3220: the member's own download gate (quarantine /
                         // scan policy) refused an artifact it HOLDS. Terminal,
                         // not a miss — otherwise the block silently falls
@@ -3098,9 +3123,17 @@ where
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
                     // The cache-only probe contacts no upstream; its result is
                     // classified by the pure `classify_cache_probe`.
-                    Some(proxy) => classify_cache_probe(
-                        proxy.streaming_cached_artifact_by_path(member, path).await,
-                    ),
+                    Some(proxy) => {
+                        let (class, outcome) = classify_cache_probe(
+                            proxy.streaming_cached_artifact_by_path(member, path).await,
+                        );
+                        (
+                            class,
+                            outcome.map(|o| {
+                                o.map_hit(|result| (result, VirtualServeOrigin::remote(member)))
+                            }),
+                        )
+                    }
                     None => (MemberCacheClass::DefiniteMiss, None),
                 },
                 VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
@@ -3127,6 +3160,7 @@ where
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
                     classify_stream_upstream(fetch, &member.key, path)
+                        .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
                 None => MemberResolveOutcome::Miss,
             }
@@ -3135,7 +3169,14 @@ where
     .await;
 
     match outcome {
-        Some(MemberResolveOutcome::Hit(result)) => Ok(result),
+        Some(MemberResolveOutcome::Hit((result, origin))) => {
+            // A Remote winner implies `proxy_service` is present; the caller
+            // records a hosted winner itself (`record_hosted == false`).
+            if let (Some(ctx), Some(proxy)) = (ctx, proxy_service) {
+                record_virtual_serve(proxy.db(), Some(proxy), &origin, path, ctx, false).await;
+            }
+            Ok(result)
+        }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
         _ => Err(member_miss_response()),
     }
@@ -3171,6 +3212,71 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
 /// `helm::download_chart_via_index` and `pypi::serve_file`.
 pub(crate) fn is_member_policy_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
+}
+
+/// Which member served a virtual download, and so which statistics table (if
+/// any) the serve belongs in (#3844).
+///
+/// The two-phase resolvers carry this from the per-member closures to
+/// winner-determination and record ONLY there. Recording inside a closure would
+/// count every member that is probed in Pass 1 or fanned out to in Pass 2 and
+/// then loses to a higher-priority member; recording at the winner counts the
+/// one member whose bytes the client actually receives, exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VirtualServeOrigin {
+    /// A hosted (Local / Staging) member's `artifacts` row:
+    /// `download_statistics` (#2260).
+    Hosted(Uuid),
+    /// A Remote member (presigned redirect, proxy-cache hit or upstream fetch):
+    /// `proxy_download_statistics`, keyed on the MEMBER's `(id, path)`, the
+    /// same coordinate a direct download from that Remote records (#3844).
+    Remote { repo_id: Uuid, repo_key: String },
+    /// A hosted serve with no `artifacts` row (row-less legacy bytes): there is
+    /// nothing to key a row on (#1278).
+    Unrecorded,
+}
+
+impl VirtualServeOrigin {
+    /// Origin of a hosted member's serve, from the resolved row id (if any).
+    pub(crate) fn hosted(artifact_id: Option<Uuid>) -> Self {
+        artifact_id.map_or(Self::Unrecorded, Self::Hosted)
+    }
+
+    /// Origin of a Remote member's serve.
+    pub(crate) fn remote(member: &Repository) -> Self {
+        Self::Remote {
+            repo_id: member.id,
+            repo_key: member.key.clone(),
+        }
+    }
+}
+
+/// Record a virtual download's WINNING member exactly once (#2260, #3844).
+///
+/// `record_hosted` is false for the buffered resolvers, whose callers already
+/// count a hosted winner off `StreamingFetchResult::artifact_id`; recording it
+/// here too would double count. A Remote winner needs the proxy it was
+/// resolved through (always present: only the proxy strategy yields one). Both
+/// recorders are HEAD-guarded and best-effort.
+async fn record_virtual_serve(
+    db: &PgPool,
+    proxy: Option<&ProxyService>,
+    origin: &VirtualServeOrigin,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    record_hosted: bool,
+) {
+    match origin {
+        VirtualServeOrigin::Hosted(artifact_id) if record_hosted => {
+            crate::services::artifact_service::record_download(db, *artifact_id, ctx).await;
+        }
+        VirtualServeOrigin::Remote { repo_id, repo_key } => {
+            if let Some(proxy) = proxy {
+                record_proxy_download_via(db, proxy, *repo_id, repo_key, path, ctx).await;
+            }
+        }
+        VirtualServeOrigin::Hosted(_) | VirtualServeOrigin::Unrecorded => {}
+    }
 }
 
 /// Streaming sibling of [`resolve_virtual_download`] that avoids
@@ -3252,100 +3358,97 @@ where
     // Borrow `local_fetch` so the per-member `probe` closure copies the
     // reference instead of moving the `Fn` into each `async move` future.
     let local_fetch = &local_fetch;
-    // The winning hit carries the resolved LOCAL artifact id (`Some`) so a
-    // local-member serve can be recorded exactly once at winner-determination
-    // (#2260). Remote pass-through / proxy-cache hits carry `None` and stay
-    // unrecorded (#1278). Recording in the probe would over-count members that
-    // are probed but lose to a higher-priority upstream candidate in Pass 2, so
-    // the id is threaded to the outcome instead.
-    let outcome = resolve_members_two_phase::<(Response, Option<Uuid>), Response, _, _, _, _>(
-        &members,
-        |member| async move {
-            match virtual_member_fetch_strategy(
-                &member.repo_type,
-                proxy_service.is_some(),
-                member.upstream_url.is_some(),
-            ) {
-                VirtualMemberFetchStrategy::Local => {
-                    let fetched = local_fetch(member.id, member.storage_location()).await;
-                    // Capture the local artifact id before `fetched` is consumed
-                    // into a Response by `classify_streaming_local`.
-                    let artifact_id = fetched.as_ref().ok().and_then(|r| r.artifact_id);
-                    let (class, outcome) = classify_streaming_local(
-                        fetched,
-                        default_content_type,
-                        content_disposition_filename,
-                    );
-                    // #3220: `classify_streaming_local` may return a terminal
-                    // Quarantine here (the member's download gate refusing an
-                    // artifact it holds); `map_hit` threads the artifact id onto
-                    // the success arm only, leaving that rejection intact.
-                    (
-                        class,
-                        outcome.map(|o| o.map_hit(|resp| (resp, artifact_id))),
-                    )
-                }
-                VirtualMemberFetchStrategy::Proxy => match proxy_service {
-                    Some(proxy) => {
-                        // #1555: a fresh proxy-cache hit on a redirect-capable
-                        // backend is served as a presigned redirect, never
-                        // streamed through the backend.
-                        if let Some(redirect) =
-                            try_member_cache_redirect(state, proxy, member, path, ctx).await
-                        {
-                            // Remote proxy-cache serve: not our artifact (#1278).
-                            (
-                                MemberCacheClass::DefiniteHit,
-                                Some(MemberResolveOutcome::Hit((redirect, None))),
-                            )
-                        } else {
-                            let (class, outcome) = classify_streaming_cache_probe(
-                                proxy.streaming_cached_artifact_by_path(member, path).await,
-                                default_content_type,
-                                content_disposition_filename,
-                            );
-                            (class, outcome.map(|o| o.map_hit(|resp| (resp, None))))
-                        }
-                    }
-                    None => (MemberCacheClass::DefiniteMiss, None),
-                },
-                VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
-            }
-        },
-        |member| async move {
-            match proxy_service {
-                // Remote upstream serve: not our artifact (#1278), so `None`.
-                Some(proxy) => match classify_streaming_upstream(
-                    proxy_fetch_streaming_member(
-                        proxy,
-                        member,
-                        path,
-                        default_content_type,
-                        content_disposition_filename,
-                    )
-                    .await,
+    // The winning hit carries its `VirtualServeOrigin` so the serve is recorded
+    // exactly once at winner-determination: a hosted member into
+    // `download_statistics` (#2260), a Remote member into
+    // `proxy_download_statistics` (#3844). Recording in the closures would
+    // over-count members that are probed but lose to a higher-priority
+    // candidate in Pass 2, so the origin is threaded to the outcome instead.
+    let outcome =
+        resolve_members_two_phase::<(Response, VirtualServeOrigin), Response, _, _, _, _>(
+            &members,
+            |member| async move {
+                match virtual_member_fetch_strategy(
+                    &member.repo_type,
+                    proxy_service.is_some(),
+                    member.upstream_url.is_some(),
                 ) {
-                    MemberResolveOutcome::Hit(resp) => MemberResolveOutcome::Hit((resp, None)),
-                    MemberResolveOutcome::Quarantine(resp) => {
-                        MemberResolveOutcome::Quarantine(resp)
+                    VirtualMemberFetchStrategy::Local => {
+                        let fetched = local_fetch(member.id, member.storage_location()).await;
+                        // Capture the local artifact id before `fetched` is consumed
+                        // into a Response by `classify_streaming_local`.
+                        let origin = VirtualServeOrigin::hosted(
+                            fetched.as_ref().ok().and_then(|r| r.artifact_id),
+                        );
+                        let (class, outcome) = classify_streaming_local(
+                            fetched,
+                            default_content_type,
+                            content_disposition_filename,
+                        );
+                        // #3220: `classify_streaming_local` may return a terminal
+                        // Quarantine here (the member's download gate refusing an
+                        // artifact it holds); `map_hit` threads the origin onto the
+                        // success arm only, leaving that rejection intact.
+                        (class, outcome.map(|o| o.map_hit(|resp| (resp, origin))))
                     }
-                    MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
-                },
-                None => MemberResolveOutcome::Miss,
-            }
-        },
-    )
-    .await;
+                    VirtualMemberFetchStrategy::Proxy => match proxy_service {
+                        Some(proxy) => {
+                            // #1555: a fresh proxy-cache hit on a redirect-capable
+                            // backend is served as a presigned redirect, never
+                            // streamed through the backend.
+                            if let Some(redirect) =
+                                try_member_cache_redirect(state, proxy, member, path, ctx).await
+                            {
+                                (
+                                    MemberCacheClass::DefiniteHit,
+                                    Some(MemberResolveOutcome::Hit((
+                                        redirect,
+                                        VirtualServeOrigin::remote(member),
+                                    ))),
+                                )
+                            } else {
+                                let (class, outcome) = classify_streaming_cache_probe(
+                                    proxy.streaming_cached_artifact_by_path(member, path).await,
+                                    default_content_type,
+                                    content_disposition_filename,
+                                );
+                                (
+                                    class,
+                                    outcome.map(|o| {
+                                        o.map_hit(|resp| (resp, VirtualServeOrigin::remote(member)))
+                                    }),
+                                )
+                            }
+                        }
+                        None => (MemberCacheClass::DefiniteMiss, None),
+                    },
+                    VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
+                }
+            },
+            |member| async move {
+                match proxy_service {
+                    Some(proxy) => classify_streaming_upstream(
+                        proxy_fetch_streaming_member(
+                            proxy,
+                            member,
+                            path,
+                            default_content_type,
+                            content_disposition_filename,
+                        )
+                        .await,
+                    )
+                    .map_hit(|resp| (resp, VirtualServeOrigin::remote(member))),
+                    None => MemberResolveOutcome::Miss,
+                }
+            },
+        )
+        .await;
 
     match outcome {
-        Some(MemberResolveOutcome::Hit((response, artifact_id))) => {
-            // Record the local-member winner exactly once (#2260). Inline-awaited
-            // so the row is committed before the response is returned; a Remote
-            // pass-through winner has `artifact_id == None` and stays unrecorded.
-            if let Some(artifact_id) = artifact_id {
-                crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
-                    .await;
-            }
+        Some(MemberResolveOutcome::Hit((response, origin))) => {
+            // Record the winning member exactly once (#2260, #3844), inline so
+            // the row is committed before the response is returned.
+            record_virtual_serve(&state.db, proxy_service, &origin, path, ctx, true).await;
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
@@ -6136,7 +6239,15 @@ fn proxy_record_target(
     repo_key: &str,
     path: &str,
 ) -> Option<(String, String)> {
-    let scope = state.proxy_service.as_ref()?.cache_scope();
+    proxy_record_keys(state.proxy_service.as_ref()?, repo_key, path)
+}
+
+/// [`proxy_record_target`] for an explicit [`ProxyService`]: the virtual
+/// resolvers are handed the proxy they fetched through (which may be the
+/// caller's `proxy_for_virtual`, not `state.proxy_service`), and the catalog
+/// placeholder must be keyed under THAT proxy's cache scope (#3454).
+fn proxy_record_keys(proxy: &ProxyService, repo_key: &str, path: &str) -> Option<(String, String)> {
+    let scope = proxy.cache_scope();
     match (
         crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
         crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
@@ -6169,6 +6280,26 @@ pub(crate) async fn record_proxy_download(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) {
+    // The scope must come from the live `ProxyService` (#3454): a placeholder
+    // row keyed under a different scope than the tee writes would never be
+    // refined in place, leaving a permanently orphaned catalog row.
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return;
+    };
+    record_proxy_download_via(&state.db, proxy, repo_id, repo_key, path, ctx).await;
+}
+
+/// Body of [`record_proxy_download`] against an explicit [`ProxyService`]
+/// (#3844): the virtual resolvers record a Remote member's winning serve under
+/// the proxy they resolved it through. Same HEAD guard and best-effort posture.
+pub(crate) async fn record_proxy_download_via(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
     if ctx.is_head {
         return;
     }
@@ -6177,15 +6308,12 @@ pub(crate) async fn record_proxy_download(
     // later authoritative upsert refines the same `(repo, path)` row in place.
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
-    // The scope must come from the live `ProxyService` (#3454): a placeholder
-    // row keyed under a different scope than the tee writes would never be
-    // refined in place, leaving a permanently orphaned catalog row.
-    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+    let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
         return;
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
     if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
-        &state.db,
+        db,
         repo_id,
         path,
         &storage_key,
@@ -9418,6 +9546,11 @@ where
 /// the winning artifact row's id only for hosted members (proxy-member and
 /// row-less legacy serves carry `None`, #1278), exactly as the format's
 /// fallback resolver path records it.
+///
+/// `ctx` counts a REMOTE member's winning serve inside the resolver (#3844),
+/// independently of `record`, so a format that does not (yet) count hosted
+/// virtual serves still counts its proxy serves like the direct Remote path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
     run: Vec<Repository>,
     proxy: Option<&ProxyService>,
@@ -9428,12 +9561,13 @@ pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
         &PgPool,
         &crate::api::middleware::download_telemetry::DownloadContext,
     )>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Option<Result<Response, Response>>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
-    match resolve_virtual_download_from_members(run, proxy, path, local_fetch).await {
+    match resolve_virtual_download_from_members(run, proxy, path, ctx, local_fetch).await {
         Ok(result) => {
             if let (Some(artifact_id), Some((db, ctx))) = (result.artifact_id, record) {
                 crate::services::artifact_service::record_download(db, artifact_id, ctx).await;
@@ -12139,6 +12273,7 @@ mod tests {
             Vec::new(),
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Ok(empty_stream_result()) },
         )
         .await;
@@ -12152,6 +12287,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Ok(empty_stream_result()) },
         )
         .await;
@@ -12173,6 +12309,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Err((StatusCode::NOT_FOUND, "missing").into_response()) },
         )
         .await;
@@ -12195,6 +12332,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             move |_id, _loc| {
                 let n = calls2.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -18058,6 +18196,7 @@ mod tests {
             None,
             virtual_id,
             path,
+            None,
             move |mid, loc| {
                 let db = db.clone();
                 let st = st.clone();
@@ -18420,8 +18559,16 @@ mod tests {
         }
 
         let genuinely_empty = describe(
-            resolve_virtual_download(&pool, None, None, empty_virtual_id, "a/b/c", never_serves)
-                .await,
+            resolve_virtual_download(
+                &pool,
+                None,
+                None,
+                empty_virtual_id,
+                "a/b/c",
+                None,
+                never_serves,
+            )
+            .await,
         )
         .await;
         let filtered_parent_grant = describe(
@@ -18431,6 +18578,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -18443,6 +18591,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -18491,6 +18640,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -22380,6 +22530,307 @@ mod scan_policy_read_tests {
         assert_eq!(
             combined_member_policy(&rec, virt, member),
             Some((ProxyScanAction::RecordOnly, ProxySeverityGate::RecordOnly))
+        );
+    }
+}
+
+/// #3844: a Remote member that WINS a virtual download is counted exactly once
+/// in `proxy_download_statistics` (under the member's own id), and a member
+/// that was probed in Pass 1 or fanned out to in Pass 2 but lost is counted
+/// zero times. DB-backed with one wiremock upstream per Remote member.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod virtual_winner_recording_tests_3844 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::download_telemetry::DownloadContext;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ctx(is_head: bool) -> DownloadContext {
+        DownloadContext {
+            is_head,
+            ..Default::default()
+        }
+    }
+
+    /// An immutable npm tarball coordinate, unique per test so the
+    /// process-global cache-metadata LRU cannot leak between tests (#2758).
+    fn tarball_path() -> String {
+        let name = format!("p{}", Uuid::new_v4().simple());
+        format!("{name}/-/{name}-1.0.0.tgz")
+    }
+
+    /// A virtual npm repo whose Remote members (in priority order) each sit in
+    /// front of their own wiremock upstream: `true` serves the tarball, `false`
+    /// answers 404.
+    struct Rig {
+        pool: PgPool,
+        virtual_id: Uuid,
+        members: Vec<(Uuid, MockServer)>,
+        proxy: Arc<ProxyService>,
+        state: crate::api::SharedState,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        async fn new(pool: PgPool, serves: &[bool]) -> Self {
+            let (virtual_id, _, _) = tdh::create_repo(&pool, "virtual", "npm").await;
+            let mut members = Vec::new();
+            for (priority, serves) in serves.iter().enumerate() {
+                let upstream = MockServer::start().await;
+                let template = if *serves {
+                    ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".as_ref())
+                } else {
+                    ResponseTemplate::new(404)
+                };
+                Mock::given(method("GET"))
+                    .respond_with(template)
+                    .mount(&upstream)
+                    .await;
+                let (member_id, _, _) = tdh::create_repo(&pool, "remote", "npm").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(upstream.uri())
+                    .bind(member_id)
+                    .execute(&pool)
+                    .await
+                    .expect("point member at its upstream");
+                sqlx::query(
+                    "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                     VALUES ($1, $2, $3)",
+                )
+                .bind(virtual_id)
+                .bind(member_id)
+                .bind(priority as i32)
+                .execute(&pool)
+                .await
+                .expect("link member");
+                members.push((member_id, upstream));
+            }
+            let cache_dir = tempfile::tempdir().expect("cache dir");
+            let cache_path = cache_dir.path().to_str().unwrap();
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), cache_path);
+            let state = tdh::build_state_with_proxy(pool.clone(), cache_path, proxy.clone());
+            Self {
+                pool,
+                virtual_id,
+                members,
+                proxy,
+                state,
+                _cache_dir: cache_dir,
+            }
+        }
+
+        async fn serve_streaming(&self, path: &str, ctx: &DownloadContext) -> Response {
+            let resp = resolve_virtual_download_streaming(
+                &self.state,
+                tdh::admin_auth_ext().as_ref(),
+                Some(&self.proxy),
+                self.virtual_id,
+                path,
+                "application/octet-stream",
+                None,
+                ctx,
+                |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+            )
+            .await
+            .expect("a member must serve the tarball");
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp
+        }
+
+        async fn serve_buffered(&self, path: &str, ctx: Option<&DownloadContext>) {
+            let result = resolve_virtual_download(
+                &self.pool,
+                tdh::admin_auth_ext().as_ref(),
+                Some(&self.proxy),
+                self.virtual_id,
+                path,
+                ctx,
+                |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+            )
+            .await;
+            assert!(result.is_ok(), "a member must serve the tarball");
+        }
+
+        /// `proxy_download_statistics` rows recorded under member `index`.
+        async fn recorded(&self, index: usize) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1",
+            )
+            .bind(self.members[index].0)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count member statistics")
+        }
+
+        async fn recorded_all(&self) -> Vec<i64> {
+            let mut out = Vec::new();
+            for i in 0..self.members.len() {
+                out.push(self.recorded(i).await);
+            }
+            out
+        }
+
+        async fn teardown(self) {
+            for (member_id, _) in &self.members {
+                let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                    .bind(member_id)
+                    .execute(&self.pool)
+                    .await;
+                tdh::cleanup(&self.pool, *member_id, Uuid::nil()).await;
+            }
+            tdh::cleanup(&self.pool, self.virtual_id, Uuid::nil()).await;
+        }
+    }
+
+    #[test]
+    fn virtual_serve_origin_maps_member_and_row() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            VirtualServeOrigin::hosted(Some(id)),
+            VirtualServeOrigin::Hosted(id)
+        );
+        assert_eq!(
+            VirtualServeOrigin::hosted(None),
+            VirtualServeOrigin::Unrecorded
+        );
+        let member = build_remote_repo(id, "npm-remote", "http://upstream.invalid");
+        assert_eq!(
+            VirtualServeOrigin::remote(&member),
+            VirtualServeOrigin::Remote {
+                repo_id: id,
+                repo_key: "npm-remote".to_string(),
+            }
+        );
+    }
+
+    /// Cold positive on the TOP member: confirm-top-first serves it without
+    /// contacting the member behind it. One row for the winner, none for the
+    /// other member.
+    #[tokio::test]
+    async fn streaming_top_remote_winner_records_once_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true, true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all().await;
+        rig.teardown().await;
+        assert_eq!(counts, vec![1, 0], "only the winning member is counted");
+    }
+
+    /// The top member misses upstream, so Pass 2 fans out to BOTH remaining
+    /// members concurrently. The higher-priority of the two wins; the losing
+    /// member's upstream probe (and the top member's miss) must count zero.
+    #[tokio::test]
+    async fn streaming_fanout_loser_and_miss_record_nothing_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[false, true, true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all().await;
+        rig.teardown().await;
+        assert_eq!(
+            counts,
+            vec![0, 1, 0],
+            "the fan-out winner counts once; the miss and the losing probe count zero"
+        );
+    }
+
+    /// A lower-priority member that is a Pass-1 CACHE HIT loses to a
+    /// higher-priority member resolved upstream in Pass 2. The cache hit was
+    /// probed but never served, so it must count zero.
+    #[tokio::test]
+    async fn streaming_pass1_cache_hit_that_loses_records_nothing_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true, true]).await;
+        let path = tarball_path();
+        // Warm member 1's cache directly (no statistics are recorded here).
+        let members = fetch_virtual_members(&rig.pool, rig.virtual_id)
+            .await
+            .expect("members");
+        let warm = rig
+            .proxy
+            .fetch_artifact_streaming(&members[1], &path)
+            .await
+            .expect("warm member 1");
+        let mut body = warm.body;
+        while body.next().await.is_some() {}
+        let mut cached = false;
+        for _ in 0..100 {
+            if matches!(
+                rig.proxy
+                    .streaming_cached_artifact_by_path(&members[1], &path)
+                    .await,
+                Ok(Some(_))
+            ) {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cached,
+            "member 1's cache must be warm before the virtual serve"
+        );
+
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all().await;
+        rig.teardown().await;
+        assert_eq!(
+            counts,
+            vec![1, 0],
+            "the upstream winner counts; the losing cache-hit probe does not"
+        );
+    }
+
+    /// Each served GET counts once; a HEAD never counts.
+    #[tokio::test]
+    async fn streaming_repeat_get_counts_each_and_head_counts_zero_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(true)).await;
+        let after_head = rig.recorded(0).await;
+        rig.serve_streaming(&path, &ctx(false)).await;
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let after_gets = rig.recorded(0).await;
+        rig.teardown().await;
+        assert_eq!(after_head, 0, "a HEAD serves no bytes and is never counted");
+        assert_eq!(after_gets, 2, "each served GET is counted exactly once");
+    }
+
+    /// The buffered resolver (cocoapods, composer, npm, maven, ...) counts the
+    /// Remote winner once when the caller passes its context, and records
+    /// nothing when it does not.
+    #[tokio::test]
+    async fn buffered_remote_winner_records_once_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[false, true, true]).await;
+        let path = tarball_path();
+        rig.serve_buffered(&path, Some(&ctx(false))).await;
+        let with_ctx = rig.recorded_all().await;
+        rig.serve_buffered(&path, Some(&ctx(true))).await;
+        rig.serve_buffered(&path, None).await;
+        let after_uncounted = rig.recorded_all().await;
+        rig.teardown().await;
+        assert_eq!(with_ctx, vec![0, 1, 0], "only the winner is counted");
+        assert_eq!(
+            after_uncounted,
+            vec![0, 1, 0],
+            "a HEAD and a context-less call record nothing"
         );
     }
 }

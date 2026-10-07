@@ -3628,6 +3628,7 @@ where
             members[run_start..idx].to_vec(),
             None,
             walk.upstream_path,
+            None,
             local_fetch,
         )
         .await
