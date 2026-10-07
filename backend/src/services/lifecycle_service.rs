@@ -1350,8 +1350,10 @@ impl LifecycleService {
             // of tag_pattern_keep) that PostgreSQL reads differently from how
             // it was validated fails open and deletes what it should keep.
             // Refuse the live run; the stored config is left as it is.
-            // A `match.version_pattern` with `\b` is refused too (#4459,
-            // #4502); parse_match would refuse it per repository anyway.
+            // So is a policy that cannot run as stored: a `\b` in
+            // `match.version_pattern` (#4459, #4502), or a pattern PostgreSQL
+            // cannot compile, which would otherwise fail mid-run as a 500
+            // (#4504).
             if let Some(refusal) = live_run_refusal(&policy.name, &policy.policy_type, &problems) {
                 return Err(refusal);
             }

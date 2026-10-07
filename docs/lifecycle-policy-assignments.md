@@ -54,8 +54,10 @@ entry, or the `pattern` of `tag_pattern_keep` -- has such a problem, because it
 would delete what it was written to keep. It also refuses (400) a policy whose
 `match.version_pattern` uses `\b` / `\B`: "matches nothing" does not make a
 scope safe, since inside a negative lookahead such as `^(?!.*\bstable)` it
-makes the scope match every version. A `tag_pattern_delete` pattern with `\b`
-still runs; the preview and the startup WARN report it. Fix the policy with
+makes the scope match every version. A live run of a policy with any pattern
+PostgreSQL cannot compile is refused (400, naming the field) before it starts,
+rather than failing part-way. A `tag_pattern_delete` pattern with `\b` still
+runs; the preview and the startup WARN report it. Fix the policy with
 `PATCH /api/v1/admin/lifecycle/{id}`.
 
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept

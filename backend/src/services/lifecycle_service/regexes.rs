@@ -240,9 +240,12 @@ impl StoredRegexProblem {
         self.issue == StoredRegexIssue::WordBoundary && self.field == "match.version_pattern"
     }
 
-    /// A live run of a policy of `policy_type` must refuse this problem.
+    /// A live run of a policy of `policy_type` must refuse this problem:
+    /// it fails open, or the policy cannot run as stored. A pattern that does
+    /// not compile is refused up front with a 400 naming the field, instead
+    /// of reaching PostgreSQL mid-run as a 500 `DATABASE_ERROR` (#4504).
     pub(crate) fn refuses_live_run(&self, policy_type: &str) -> bool {
-        self.fails_open(policy_type) || self.is_match_word_boundary()
+        self.fails_open(policy_type) || self.blocks_run()
     }
 
     /// The pattern PROTECTS artifacts in a policy of `policy_type` (an

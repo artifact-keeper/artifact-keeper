@@ -443,7 +443,7 @@ async fn stored_match_word_boundary_is_previewed_and_refused_4502() {
 
 /// Which stored-regex problems refuse a live run, and with what message.
 #[test]
-fn live_run_refusal_covers_protective_and_match_patterns_4502() {
+fn live_run_refusal_covers_protective_and_unrunnable_patterns_4502() {
     let problem = |field: &str, issue| StoredRegexProblem {
         field: field.to_string(),
         message: format!("{field}: bad"),
@@ -467,8 +467,79 @@ fn live_run_refusal_covers_protective_and_match_patterns_4502() {
         m.contains("match.version_pattern") && m.contains("cannot run this pattern"),
         "{m}"
     );
+    // #4504: a pattern that does not compile refuses every policy type.
+    let broken = problem("pattern", StoredRegexIssue::DoesNotCompile);
+    let m = refusal("tag_pattern_delete", &[broken]).expect("does not compile");
+    assert!(m.contains("cannot run this pattern"), "{m}");
     assert!(refusal("tag_pattern_keep", std::slice::from_ref(&delete)).is_some());
     assert!(!delete.blocks_run());
     assert!(refusal("tag_pattern_delete", &[delete]).is_none());
     assert!(refusal("max_age_days", &[]).is_none());
+}
+
+/// #4504: a live run of a stored policy whose `match.version_pattern`
+/// PostgreSQL cannot compile is a 400 naming the field, not a 500
+/// `DATABASE_ERROR` from the delete query; the preview reports the same
+/// problem. Nothing is deleted.
+#[tokio::test]
+async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    let repository_id = super::tests::insert_max_age_test_repository(&mut conn).await;
+    let storage_key = format!("generic/{}", Uuid::new_v4());
+    let artifact = super::tests::insert_max_age_test_artifact(
+        &mut conn,
+        repository_id,
+        "builds/foo",
+        "foo",
+        &storage_key,
+        30,
+    )
+    .await;
+    let mut ids = Vec::new();
+    for (policy_type, config) in [
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": r"foo\z"}}),
+        ),
+        ("tag_pattern_delete", json!({"pattern": r"foo\z"})),
+    ] {
+        let id = insert_unvalidated(&pool, policy_type, config).await;
+        sqlx::query(
+            "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
+        )
+        .bind(id)
+        .bind(repository_id)
+        .execute(&mut *conn)
+        .await
+        .expect("assign repository");
+        ids.push(id);
+    }
+
+    let service = LifecycleService::new(pool.clone());
+    for (id, field) in ids.iter().zip(["match.version_pattern", "pattern"]) {
+        let preview = service.execute_policy(*id, true).await.expect("preview");
+        assert!(
+            preview.errors.iter().any(|e| e.contains(field)),
+            "{preview:?}"
+        );
+        match service.execute_policy(*id, false).await {
+            Err(AppError::Validation(m)) => assert!(
+                m.contains(field) && m.contains("not a valid PostgreSQL regular expression"),
+                "{m}"
+            ),
+            other => panic!("{field}: expected a 400 validation error, got {other:?}"),
+        }
+    }
+    assert!(!super::tests::is_deleted(&mut conn, artifact).await);
+
+    for id in ids {
+        service.delete_policy(id).await.expect("cleanup");
+    }
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .execute(&mut *conn)
+        .await;
 }
