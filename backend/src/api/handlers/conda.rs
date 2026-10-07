@@ -2713,6 +2713,102 @@ fn merge_package_maps(
     }
 }
 
+/// The package name a conda filename carries: `<name>-<version>-<build>` plus
+/// `.conda` or `.tar.bz2`. Version and build strings never contain `-`
+/// (CEP-26), so the name is everything before the second-to-last hyphen.
+fn conda_name_from_filename(filename: &str) -> Option<&str> {
+    let stem = filename
+        .strip_suffix(".conda")
+        .or_else(|| filename.strip_suffix(".tar.bz2"))?;
+    let mut parts = stem.rsplitn(3, '-');
+    parts.next()?;
+    parts.next()?;
+    parts.next().filter(|name| !name.is_empty())
+}
+
+/// Package names (lower-cased) that the hosted members of a virtual conda
+/// channel own.
+///
+/// This is the conda form of the cross-format name-shadowing guard
+/// ([`proxy_helpers::virtual_non_remote_owns_name`]): once a local or staging
+/// member of the virtual has published a name, no remote member may
+/// contribute ANY record under that name to the merged index, whatever its
+/// version, build or subdir. Without it a public upstream that publishes
+/// `acme-core 99.0` outbids the internal `acme-core 1.0` in the solver, which
+/// is the textbook dependency-confusion attack.
+///
+/// Like the other shadowing guards this is an ENFORCEMENT walk, so it reads
+/// the unfiltered member list rather than the caller-authorized one: a caller
+/// who cannot read the hosted member must still not be offered the upstream
+/// impostor. Every non-deleted row counts, including withdrawn ones, because a
+/// withdrawn internal package must not hand its name to the upstream either.
+/// Fails closed: a database error is a 500, never an unguarded merge.
+async fn virtual_hosted_owned_names(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<std::collections::HashSet<String>, Response> {
+    // UNFILTERED-ENFORCEMENT (#3323): this walk decides name ownership (a
+    // shadowing guard), not a response body; narrowing it by caller visibility
+    // would let a caller who cannot read the hosted member be offered the
+    // upstream impostor.
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    let hosted_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if hosted_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT LOWER(COALESCE(am.metadata->>'name', a.name)) \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = ANY($1) AND a.is_deleted = false",
+    )
+    .bind(&hosted_ids)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            virtual_repo_id = %virtual_repo_id,
+            error = %e,
+            "conda virtual name-ownership guard query failed; refusing to merge unguarded"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+    Ok(names.into_iter().collect())
+}
+
+/// Whether a repodata record from a remote member names a package a hosted
+/// member owns. The record's own `name` is authoritative; the filename is the
+/// fallback for a record that omits it.
+fn record_is_hosted_owned(
+    filename: &str,
+    record: &serde_json::Value,
+    owned: &std::collections::HashSet<String>,
+) -> bool {
+    let name = record
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| conda_name_from_filename(filename));
+    name.is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
+}
+
+/// Remove every record a hosted member owns from a remote member's package
+/// map, returning how many were dropped (logged by the caller).
+fn drop_hosted_owned_records(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    owned: &std::collections::HashSet<String>,
+) -> usize {
+    if owned.is_empty() {
+        return 0;
+    }
+    let before = map.len();
+    map.retain(|filename, record| !record_is_hosted_owned(filename, record, owned));
+    before - map.len()
+}
+
 /// Parse upstream repodata JSON and extract `packages` and `packages.conda` maps.
 ///
 /// Returns `(packages, packages_conda)`. Missing keys are returned as empty maps.
@@ -2817,9 +2913,23 @@ async fn build_virtual_repodata(
     )
     .await?;
 
-    for (_member_key, (pkgs, pkgs_conda)) in &remote_data {
-        merge_package_maps(&mut merged_packages, pkgs);
-        merge_package_maps(&mut merged_packages_conda, pkgs_conda);
+    // Hosted members own their names (dependency-confusion guard): a remote
+    // member contributes nothing under a name a hosted member has published.
+    let owned = virtual_hosted_owned_names(db, virtual_repo_id).await?;
+    for (member_key, (mut pkgs, mut pkgs_conda)) in remote_data {
+        let dropped = drop_hosted_owned_records(&mut pkgs, &owned)
+            + drop_hosted_owned_records(&mut pkgs_conda, &owned);
+        if dropped > 0 {
+            tracing::info!(
+                virtual_repo = %virtual_repo_key,
+                member = %member_key,
+                subdir,
+                dropped,
+                "excluded remote conda records whose names a hosted member owns"
+            );
+        }
+        merge_package_maps(&mut merged_packages, &pkgs);
+        merge_package_maps(&mut merged_packages_conda, &pkgs_conda);
     }
 
     // Handle hosted/local members
@@ -2887,8 +2997,12 @@ async fn build_virtual_channeldata(
     )
     .await?;
 
-    for (_member_key, pkgs) in &remote_data {
-        merge_package_maps(&mut merged_packages, pkgs);
+    // Hosted members own their names here too, so channeldata cannot describe
+    // an upstream package the merged repodata refuses to list.
+    let owned = virtual_hosted_owned_names(db, virtual_repo_id).await?;
+    for (_member_key, mut pkgs) in remote_data {
+        pkgs.retain(|name, _| !owned.contains(&name.to_ascii_lowercase()));
+        merge_package_maps(&mut merged_packages, &pkgs);
     }
 
     // Handle hosted/local members
@@ -3048,13 +3162,31 @@ async fn download_package(
 
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                // Name-shadowing guard: when a hosted member owns this
+                // package name, no remote member may satisfy the download,
+                // matching the merged repodata, which never lists the
+                // upstream's records for an owned name.
+                let hosted_owns_name = match conda_name_from_filename(&filename) {
+                    Some(name) => {
+                        proxy_helpers::virtual_non_remote_owns_name(
+                            &state.db, repo.id, name, "conda",
+                        )
+                        .await?
+                    }
+                    None => false,
+                };
+                let proxy_service = if hosted_owns_name {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
                 let db = state.db.clone();
                 let upstream_path = format!("{}/{}", subdir, filename);
                 let artifact_path_clone = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     auth.as_ref(),
-                    state.proxy_service.as_deref(),
+                    proxy_service,
                     repo.id,
                     &upstream_path,
                     Some(&ctx),
@@ -13923,7 +14055,7 @@ mod withdrawal_tests {
 // trusted root) and the bare Statement an attacker can author at will.
 // ---------------------------------------------------------------------------
 
-#[cfg(ak_test_shard = "router")]
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod attestation_verification_tests {
     use super::*;
@@ -14713,6 +14845,282 @@ mod scan_on_upload_tests {
         assert_eq!(
             count, 0,
             "scan_on_upload is disabled, so the upload must not enqueue a scan"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod virtual_channel_tests {
+    //! Virtual conda channel merge semantics: hosted members own their names
+    //! (dependency-confusion guard), member fetch shape and failure policy.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Insert a hosted conda package row (no storage bytes: repodata is built
+    /// from the catalog alone) with the metadata document an upload writes.
+    pub(super) async fn seed_hosted_record(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        subdir: &str,
+        filename: &str,
+    ) -> uuid::Uuid {
+        let (name, version, build) =
+            crate::formats::conda_native::CondaNativeHandler::parse_package_filename(filename)
+                .expect("fixture filename parses");
+        let path = format!("{subdir}/{filename}");
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 10, repeat('a', 64), 'application/octet-stream', $5) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(&name)
+        .bind(&version)
+        .bind(format!("conda-test/{repo_id}/{path}"))
+        .fetch_one(pool)
+        .await
+        .expect("insert hosted conda row");
+        let metadata = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "subdir": subdir,
+            "depends": [],
+            "constrains": [],
+            "license": "MIT",
+            "md5": "0".repeat(32),
+        });
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'conda', $2)",
+        )
+        .bind(id)
+        .bind(metadata)
+        .execute(pool)
+        .await
+        .expect("insert hosted conda metadata");
+        id
+    }
+
+    /// A minimal upstream repodata record for `filename`.
+    pub(super) fn upstream_record(subdir: &str, filename: &str) -> serde_json::Value {
+        let (name, version, build) =
+            crate::formats::conda_native::CondaNativeHandler::parse_package_filename(filename)
+                .expect("fixture filename parses");
+        serde_json::json!({
+            "build": build,
+            "build_number": 0,
+            "depends": [],
+            "md5": "1".repeat(32),
+            "name": name,
+            "sha256": "2".repeat(64),
+            "size": 20,
+            "subdir": subdir,
+            "version": version,
+        })
+    }
+
+    /// An upstream `repodata.json` listing `filenames` (all `.conda`).
+    pub(super) fn upstream_repodata(subdir: &str, filenames: &[&str]) -> serde_json::Value {
+        let mut conda = serde_json::Map::new();
+        for f in filenames {
+            conda.insert(f.to_string(), upstream_record(subdir, f));
+        }
+        serde_json::json!({
+            "info": {"subdir": subdir},
+            "packages": {},
+            "packages.conda": conda,
+            "repodata_version": 1,
+        })
+    }
+
+    /// Hosted member (priority 1) + remote member (priority 2) behind a
+    /// public virtual, everything anonymous-readable.
+    pub(super) struct VirtualRig {
+        pub pool: sqlx::PgPool,
+        pub hosted_id: uuid::Uuid,
+        pub remote_id: uuid::Uuid,
+        pub virtual_id: uuid::Uuid,
+        pub virtual_key: String,
+        pub state: crate::api::SharedState,
+        _cache: tempfile::TempDir,
+    }
+
+    impl VirtualRig {
+        pub(super) async fn new(pool: sqlx::PgPool, upstream_url: &str) -> Self {
+            let (hosted_id, _hk, _hd) = tdh::create_repo(&pool, "local", "conda").await;
+            let (remote_id, _rk, _rd) = tdh::create_repo(&pool, "remote", "conda").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(upstream_url)
+                .bind(remote_id)
+                .execute(&pool)
+                .await
+                .expect("point remote at mock upstream");
+            let (virtual_id, virtual_key, _vd) = tdh::create_repo(&pool, "virtual", "conda").await;
+            for id in [hosted_id, remote_id, virtual_id] {
+                tdh::publish_repo(&pool, id).await;
+            }
+            tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+            tdh::link_virtual_member(&pool, virtual_id, remote_id, 2).await;
+            let cache = tempfile::tempdir().expect("proxy cache tempdir");
+            let root = cache.path().to_str().expect("utf8 tempdir").to_string();
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &root);
+            let state = tdh::build_state_with_proxy(pool.clone(), &root, proxy);
+            Self {
+                pool,
+                hosted_id,
+                remote_id,
+                virtual_id,
+                virtual_key,
+                state,
+                _cache: cache,
+            }
+        }
+
+        pub(super) async fn get(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            let app = tdh::router_anon(router(), self.state.clone());
+            tdh::send_with_headers(app, tdh::get(uri)).await
+        }
+
+        pub(super) async fn repodata(&self, subdir: &str) -> (StatusCode, serde_json::Value) {
+            let (status, body, _) = self
+                .get(format!("/{}/{subdir}/repodata.json", self.virtual_key))
+                .await;
+            let doc = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            (status, doc)
+        }
+
+        pub(super) async fn cleanup(self) {
+            for id in [self.virtual_id, self.hosted_id, self.remote_id] {
+                let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+    }
+
+    pub(super) fn listed(doc: &serde_json::Value) -> Vec<String> {
+        let mut out: Vec<String> = ["packages", "packages.conda"]
+            .iter()
+            .filter_map(|k| doc.get(*k).and_then(|v| v.as_object()))
+            .flat_map(|m| m.keys().cloned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn conda_name_from_filename_splits_on_the_last_two_hyphens() {
+        assert_eq!(
+            conda_name_from_filename("acme-core-1.0-py_0.conda"),
+            Some("acme-core")
+        );
+        assert_eq!(
+            conda_name_from_filename("zlib-1.2.13-hd590300_5.tar.bz2"),
+            Some("zlib")
+        );
+        assert_eq!(conda_name_from_filename("acme-1.0.conda"), None);
+        assert_eq!(conda_name_from_filename("acme-core-1.0-0.whl"), None);
+    }
+
+    #[test]
+    fn drop_hosted_owned_records_matches_record_name_case_insensitively() {
+        let owned: std::collections::HashSet<String> = ["acme-core".to_string()].into();
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "acme-core-99.0-0.conda".into(),
+            upstream_record("noarch", "acme-core-99.0-0.conda"),
+        );
+        map.insert(
+            "rich-13.0-0.conda".into(),
+            upstream_record("noarch", "rich-13.0-0.conda"),
+        );
+        // A record whose own `name` differs in case from the owned name.
+        let mut shouty = upstream_record("noarch", "acme-core-98.0-0.conda");
+        shouty["name"] = "ACME-Core".into();
+        map.insert("acme-core-98.0-0.conda".into(), shouty);
+        assert_eq!(drop_hosted_owned_records(&mut map, &owned), 2);
+        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["rich-13.0-0.conda"]);
+    }
+
+    /// F1: a hosted `acme-core 1.0` and an upstream `acme-core 99.0` behind one
+    /// virtual: the merged repodata lists only the hosted version (in every
+    /// subdir, not only the one the hosted package lives in), keeps the
+    /// upstream's unrelated packages, and the upstream impostor cannot be
+    /// downloaded through the virtual either.
+    #[tokio::test]
+    async fn hosted_member_owns_its_package_names_in_virtual_repodata() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_repodata(
+                "noarch",
+                &["acme-core-99.0-0.conda", "rich-13.0-0.conda"],
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/linux-64/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_repodata(
+                "linux-64",
+                &["acme-core-99.0-h1_0.conda", "numpy-2.0-h1_0.conda"],
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/acme-core-99.0-0.conda"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"impostor".to_vec()))
+            .mount(&server)
+            .await;
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+
+        let (noarch_status, noarch) = rig.repodata("noarch").await;
+        let (linux_status, linux) = rig.repodata("linux-64").await;
+        let (dl_status, dl_body, _) = rig
+            .get(format!(
+                "/{}/noarch/acme-core-99.0-0.conda",
+                rig.virtual_key
+            ))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(noarch_status, StatusCode::OK);
+        assert_eq!(
+            listed(&noarch),
+            vec!["acme-core-1.0-0.conda", "rich-13.0-0.conda"],
+            "the upstream acme-core 99.0 must not be offered next to the hosted 1.0"
+        );
+        assert_eq!(linux_status, StatusCode::OK);
+        assert_eq!(
+            listed(&linux),
+            vec!["numpy-2.0-h1_0.conda"],
+            "ownership is per name, across subdirs"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::NOT_FOUND,
+            "the impostor must not download through the virtual, got {:?}",
+            String::from_utf8_lossy(&dl_body)
         );
     }
 }
