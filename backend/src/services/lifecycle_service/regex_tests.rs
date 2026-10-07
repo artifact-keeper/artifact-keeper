@@ -46,7 +46,7 @@ async fn insert_unvalidated(pool: &PgPool, policy_type: &str, config: serde_json
 #[tokio::test]
 async fn postgres_only_syntax_passes_static_validation_4461() {
     let service = make_service_for_validation();
-    for pattern in [r"\ystable\y", r"^(a)\1$", r"\mrc\M"] {
+    for pattern in [r"\ystable\y", r"\mrc\M"] {
         assert!(regex::Regex::new(pattern).is_err(), "{pattern}");
         for (policy_type, config) in [
             ("tag_pattern_keep", json!({"pattern": pattern})),
@@ -195,6 +195,7 @@ async fn stored_policy_regex_problems_are_reported_4461() {
     let boundary = insert_unvalidated(&pool, "max_age_days", boundary_config.clone()).await;
     let broken = insert_unvalidated(&pool, "tag_pattern_delete", json!({"pattern": r"\pL"})).await;
     let clean = insert_unvalidated(&pool, "tag_pattern_delete", json!({"pattern": "^tmp-"})).await;
+    let both = insert_unvalidated(&pool, "tag_pattern_delete", json!({"pattern": r"\bfoo("})).await;
 
     let mut conn = pool.acquire().await.expect("acquire");
     let offending = invalid_regex_policies(&mut conn).await.expect("scan");
@@ -206,14 +207,24 @@ async fn stored_policy_regex_problems_are_reported_4461() {
             .map(|(_, _, problems)| problems.clone())
     };
     let found = problems_of(boundary).expect("the \\b exclusion is reported");
-    assert!(
-        found[0].runnable && found[0].message.contains(r"\y"),
-        "{found:?}"
-    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].issue, StoredRegexIssue::WordBoundary);
+    assert!(found[0].message.contains(r"\y"), "{found:?}");
+    assert!(found[0].fails_open("max_age_days") && !found[0].blocks_run());
     let found = problems_of(broken).expect("the uncompilable pattern is reported");
-    assert!(
-        !found[0].runnable && found[0].message.contains("PostgreSQL"),
-        "{found:?}"
+    assert_eq!(found[0].issue, StoredRegexIssue::DoesNotCompile);
+    assert!(found[0].message.contains("PostgreSQL"), "{found:?}");
+    assert!(found[0].blocks_run() && !found[0].fails_open("tag_pattern_delete"));
+    // `\b` AND a syntax error: compiled first, so it is classed as
+    // not compiling (the preview stops rather than erroring out later).
+    let found = problems_of(both).expect("the \\b + syntax error pattern is reported");
+    let issues: Vec<_> = found.iter().map(|p| p.issue).collect();
+    assert_eq!(
+        issues,
+        vec![
+            StoredRegexIssue::DoesNotCompile,
+            StoredRegexIssue::WordBoundary
+        ]
     );
     assert!(problems_of(clean).is_none());
     warn_invalid_lifecycle_regexes(&pool).await;
@@ -229,13 +240,144 @@ async fn stored_policy_regex_problems_are_reported_4461() {
     assert!(preview.errors[0].contains("PostgreSQL"), "{preview:?}");
     let preview = service.execute_policy(clean, true).await.expect("preview");
     assert!(preview.errors.is_empty(), "{preview:?}");
+    let preview = service.execute_policy(both, true).await.expect("preview");
+    assert_eq!(preview.errors.len(), 2, "{preview:?}");
+    assert_eq!(preview.artifacts_matched, 0);
 
     let stored = service.get_policy(boundary).await.expect("stored");
     assert_eq!(
         stored.config, boundary_config,
         "the stored config is not rewritten"
     );
-    for id in [boundary, broken, clean] {
+    for id in [boundary, broken, clean, both] {
+        service.delete_policy(id).await.expect("cleanup");
+    }
+}
+
+#[tokio::test]
+async fn static_rules_refuse_backrefs_long_patterns_and_long_lists_4461() {
+    let service = make_service_for_validation();
+    let long = "a".repeat(MAX_REGEX_BYTES + 1);
+    let cases = [
+        (
+            "tag_pattern_keep",
+            json!({"pattern": r"^(v)\1"}),
+            "back-references",
+        ),
+        (
+            "max_age_days",
+            json!({"days": 1, "exclude": {"version_patterns": [r"(a)\2"]}}),
+            "back-references",
+        ),
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": r"(a)\9"}}),
+            "back-references",
+        ),
+        ("tag_pattern_delete", json!({"pattern": long}), "bytes long"),
+        (
+            "max_age_days",
+            json!({"days": 1, "exclude": {"version_patterns": vec!["^v"; MAX_VERSION_PATTERNS + 1]}}),
+            "at most 64",
+        ),
+    ];
+    for (policy_type, config, needle) in cases {
+        let err = service
+            .validate_policy_config(policy_type, &config)
+            .expect_err(needle);
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains(needle)),
+            "{err:?}"
+        );
+    }
+    // The limits themselves are accepted, and `\\1` is an escaped backslash.
+    service
+        .validate_policy_config(
+            "max_age_days",
+            &json!({"days": 1, "exclude": {"version_patterns": vec!["^v"; MAX_VERSION_PATTERNS]}}),
+        )
+        .expect("64 patterns");
+    service
+        .validate_policy_config(
+            "tag_pattern_keep",
+            &json!({"pattern": format!(r"\\1{}", "a".repeat(MAX_REGEX_BYTES - 3))}),
+        )
+        .expect("an escaped backslash and a pattern at the length limit");
+    assert!(matches!(
+        postgres_regex_error("pattern", Some("57014"), "canceling statement due to statement timeout"),
+        AppError::Validation(m) if m.contains("too expensive")
+    ));
+}
+
+/// A pattern that takes longer than the statement timeout to compile is a
+/// validation error, not a hung connection.
+#[tokio::test]
+async fn slow_regex_compile_is_bounded_by_the_timeout_4461() {
+    let Some(pool) = crate::testing::try_pool_with(1).await else {
+        return;
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    // ~0.5 s to compile on PostgreSQL 16; the timeout here is 1 ms.
+    let expensive = "(a?)".repeat(1000);
+    match compile_in_postgres(&mut conn, "pattern", &expensive, 1).await {
+        Err(AppError::Validation(m)) => assert!(m.contains("too expensive"), "{m}"),
+        other => panic!("expected a timeout validation error, got {other:?}"),
+    }
+    // The session is unaffected: no lingering timeout, no aborted transaction.
+    compile_in_postgres(&mut conn, "pattern", "^v[0-9]+", 1_000)
+        .await
+        .expect("the connection still works");
+    let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_ne!(timeout, "1ms");
+}
+
+/// A live run refuses a stored policy whose PROTECTIVE pattern (an
+/// exclusion, or the keep pattern of tag_pattern_keep) fails open; a
+/// selecting pattern (`match.version_pattern`, tag_pattern_delete) with the
+/// same `\b` matches nothing and still runs. Nothing stored is changed.
+#[tokio::test]
+async fn live_run_refuses_fail_open_stored_patterns_4461() {
+    let Some(pool) = crate::testing::try_pool_with(2).await else {
+        return;
+    };
+    let service = LifecycleService::new(pool.clone());
+    let refused = [
+        (
+            "max_age_days",
+            json!({"days": 1, "exclude": {"version_patterns": [r"\bstable\b"]}}),
+        ),
+        (
+            "max_age_days",
+            json!({"days": 1, "exclude": {"version_patterns": [r"\pL"]}}),
+        ),
+        ("tag_pattern_keep", json!({"pattern": r"\bstable\b"})),
+        ("tag_pattern_keep", json!({"pattern": r"(?P<n>x)"})),
+    ];
+    for (policy_type, config) in refused {
+        let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
+        match service.execute_policy(id, false).await {
+            Err(AppError::Validation(m)) => assert!(m.contains("Refusing to run"), "{m}"),
+            other => panic!("{config}: expected a refusal, got {other:?}"),
+        }
+        assert_eq!(service.get_policy(id).await.unwrap().config, config);
+        service.delete_policy(id).await.expect("cleanup");
+    }
+    let report_only = [
+        (
+            "max_age_days",
+            json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
+        ),
+        ("tag_pattern_delete", json!({"pattern": r"\btmp"})),
+    ];
+    for (policy_type, config) in report_only {
+        let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
+        service
+            .execute_policy(id, false)
+            .await
+            .unwrap_or_else(|e| panic!("{config}: a selecting pattern still runs: {e}"));
         service.delete_policy(id).await.expect("cleanup");
     }
 }

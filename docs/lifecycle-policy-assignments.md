@@ -32,18 +32,28 @@ Every policy type accepts these optional `config` keys:
 Every lifecycle regex -- `match.version_pattern`, each
 `exclude.version_patterns` entry, and the `pattern` of `tag_pattern_keep` /
 `tag_pattern_delete` -- is a **PostgreSQL** (ARE) regular expression, because
-PostgreSQL runs it. Each is compiled by PostgreSQL when the policy is created
-or updated, and a pattern PostgreSQL rejects (for example `\z`, `\pL`,
-`(?P<name>...)` or a mid-pattern `(?i)`) returns 400. `\b` and `\B` are
-refused: in PostgreSQL they mean backspace and backslash, so `\bstable\b`
-would protect nothing. Write `\ystable\y` instead. Patterns are unanchored
-unless they use `^` / `$`.
+PostgreSQL runs it. Patterns are unanchored unless they use `^` / `$`. When a
+policy is created or updated, each pattern is compiled by PostgreSQL (with a
+2-second limit, on its own connection) and the request returns 400 if:
 
-Policies stored before this check are not changed. On every start the backend
-logs one WARN per stored policy with such a pattern, and a preview
-(`POST /api/v1/admin/lifecycle/{id}/preview`) lists the problems in `errors`;
-a preview of a policy whose pattern PostgreSQL cannot compile stops there with
-zero matches. Fix the policy with `PATCH /api/v1/admin/lifecycle/{id}`.
+- PostgreSQL rejects it, for example `\z`, `\pL`, `(?P<name>...)` or a
+  mid-pattern `(?i)`, or it takes too long to compile;
+- it uses `\b` or `\B`. In PostgreSQL these mean backspace and backslash, so
+  `\bstable\b` would protect nothing. Write `\ystable\y` instead;
+- it uses a back-reference (`\1` to `\9`);
+- it is longer than 512 bytes, or `exclude.version_patterns` has more than 64
+  entries.
+
+Policies stored before these checks are not changed. On every start the backend
+logs one WARN per stored policy with a pattern PostgreSQL cannot compile or
+that uses `\b` / `\B`. A preview (`POST /api/v1/admin/lifecycle/{id}/preview`)
+lists the problems in `errors`, and stops with zero matches when a pattern
+cannot compile. A live run refuses (400) a policy whose protective pattern --
+an `exclude.version_patterns` entry, or the `pattern` of `tag_pattern_keep` --
+has such a problem, because it would delete what it was written to keep. A
+`match.version_pattern` or `tag_pattern_delete` pattern with `\b` matches
+nothing, so it still runs and deletes nothing. Fix the policy with
+`PATCH /api/v1/admin/lifecycle/{id}`.
 
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept
 versions, so out-of-scope and excluded versions never take a kept slot.

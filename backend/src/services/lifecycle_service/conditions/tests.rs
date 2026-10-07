@@ -592,7 +592,11 @@ async fn version_pattern_rejects_rust_only_word_boundaries_2024() {
         AppError::Validation(m) if m.contains("PostgreSQL regular expression: bad")
     ));
     assert!(matches!(
-        postgres_regex_error("match.version_pattern", Some("57014"), "cancelled"),
+        postgres_regex_error(
+            "match.version_pattern",
+            Some("40001"),
+            "serialization failure"
+        ),
         AppError::Database(_)
     ));
 }

@@ -1079,204 +1079,6 @@ pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>,
     Ok((path_prefix, version_pattern))
 }
 
-/// Every regex a policy `config` carries, paired with the config path it came
-/// from: `pattern` (the `tag_pattern_*` types), each `exclude.version_patterns`
-/// entry and `match.version_pattern`. All of them are executed by PostgreSQL
-/// (`~` / `!~` / `~ ANY`), never by the Rust `regex` crate.
-///
-/// Deliberately lenient (non-string entries are skipped, not rejected): it
-/// also reads stored configs for the startup and preview reports (#4461),
-/// where the shape was validated when the policy was written.
-pub(crate) fn policy_regexes(
-    policy_type: &str,
-    config: &serde_json::Value,
-) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    if matches!(policy_type, "tag_pattern_keep" | "tag_pattern_delete") {
-        if let Some(pattern) = config.get("pattern").and_then(|v| v.as_str()) {
-            found.push(("pattern".to_string(), pattern.to_string()));
-        }
-    }
-    let excluded = config
-        .get(EXCLUDE_CONFIG_KEY)
-        .and_then(|e| e.get("version_patterns"))
-        .and_then(|v| v.as_array());
-    for (i, pattern) in excluded.into_iter().flatten().enumerate() {
-        if let Some(pattern) = pattern.as_str() {
-            found.push((
-                format!("exclude.version_patterns[{i}]"),
-                pattern.to_string(),
-            ));
-        }
-    }
-    if let Some(pattern) = config
-        .get(MATCH_CONFIG_KEY)
-        .and_then(|m| m.get("version_pattern"))
-        .and_then(|v| v.as_str())
-    {
-        found.push(("match.version_pattern".to_string(), pattern.to_string()));
-    }
-    found
-}
-
-/// True when `pattern` contains an unescaped `\b` or `\B`.
-fn has_backspace_escape(pattern: &str) -> bool {
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' && matches!(chars.next(), Some('b' | 'B')) {
-            return true;
-        }
-    }
-    false
-}
-
-/// `\b` and `\B` validate as word-boundary escapes in the Rust `regex` crate
-/// but mean "backspace" and "backslash" in a PostgreSQL regex, so a pattern
-/// written with them silently matches nothing: a `match` scope selects
-/// nothing and an exclusion protects nothing (#4461). PostgreSQL spells word
-/// boundaries `\y` / `\Y`.
-fn reject_backspace_escape(field: &str, pattern: &str) -> Result<()> {
-    if has_backspace_escape(pattern) {
-        return Err(AppError::Validation(format!(
-            "{field}: \\b and \\B are not word boundaries in a PostgreSQL regex; use \\y / \\Y"
-        )));
-    }
-    Ok(())
-}
-
-/// SQLSTATE `invalid_regular_expression`.
-const INVALID_REGULAR_EXPRESSION: &str = "2201B";
-
-/// Map a failed PostgreSQL regex compile to a validation error; anything else
-/// stays a database error.
-fn postgres_regex_error(field: &str, code: Option<&str>, message: &str) -> AppError {
-    if code == Some(INVALID_REGULAR_EXPRESSION) {
-        AppError::Validation(format!(
-            "{field} is not a valid PostgreSQL regular expression: {message}"
-        ))
-    } else {
-        AppError::Database(message.to_string())
-    }
-}
-
-/// Check one lifecycle regex the way PostgreSQL will run it: refuse `\b`/`\B`,
-/// then compile it with `SELECT '' ~ $1`. A dialect mismatch (`\z`, `\pL`,
-/// `(?P<name>...)`, a mid-pattern `(?i)`) is a [`AppError::Validation`].
-async fn check_regex_in_postgres(
-    conn: &mut sqlx::PgConnection,
-    field: &str,
-    pattern: &str,
-) -> Result<()> {
-    reject_backspace_escape(field, pattern)?;
-    sqlx::query("SELECT '' ~ $1")
-        .bind(pattern)
-        .execute(conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| match e.as_database_error() {
-            Some(db) => postgres_regex_error(field, db.code().as_deref(), db.message()),
-            None => AppError::Database(e.to_string()),
-        })
-}
-
-/// Compile every regex of a policy config with the engine that runs it
-/// (#4459 for `match.version_pattern`, #4461 for `pattern` and
-/// `exclude.version_patterns`). The Rust-crate check in
-/// `validate_policy_config` accepts patterns PostgreSQL rejects, and an
-/// exclusion PostgreSQL reads differently fails open. Called at create/update
-/// time, inside the write transaction.
-pub(crate) async fn validate_regexes_in_postgres(
-    conn: &mut sqlx::PgConnection,
-    policy_type: &str,
-    config: &serde_json::Value,
-) -> Result<()> {
-    for (field, pattern) in policy_regexes(policy_type, config) {
-        check_regex_in_postgres(conn, &field, &pattern).await?;
-    }
-    Ok(())
-}
-
-/// One problem with a regex stored in an existing policy (#4461).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredRegexProblem {
-    pub(crate) message: String,
-    /// False when PostgreSQL cannot compile the pattern, so every run of the
-    /// policy fails; true for `\b`/`\B`, which runs but matches nothing.
-    pub(crate) runnable: bool,
-}
-
-/// Re-check the regexes of a policy that is already stored. Validation only
-/// runs on create/update, so policies written before #4461 can still carry a
-/// Rust-only pattern; they are reported (preview errors, startup WARN), never
-/// silently rewritten.
-pub(crate) async fn stored_regex_problems(
-    conn: &mut sqlx::PgConnection,
-    policy_type: &str,
-    config: &serde_json::Value,
-) -> Result<Vec<StoredRegexProblem>> {
-    let mut problems = Vec::new();
-    for (field, pattern) in policy_regexes(policy_type, config) {
-        let runnable = has_backspace_escape(&pattern);
-        match check_regex_in_postgres(conn, &field, &pattern).await {
-            Ok(()) => {}
-            Err(AppError::Validation(message)) => {
-                problems.push(StoredRegexProblem { message, runnable })
-            }
-            Err(other) => return Err(other),
-        }
-    }
-    Ok(problems)
-}
-
-/// Every stored lifecycle policy whose regexes PostgreSQL reads differently
-/// from how they were validated, with its problems.
-pub(crate) async fn invalid_regex_policies(
-    conn: &mut sqlx::PgConnection,
-) -> Result<Vec<(Uuid, String, Vec<StoredRegexProblem>)>> {
-    let policies: Vec<(Uuid, String, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, name, policy_type, config FROM lifecycle_policies ORDER BY created_at",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    let mut offending = Vec::new();
-    for (id, name, policy_type, config) in policies {
-        let problems = stored_regex_problems(conn, &policy_type, &config).await?;
-        if !problems.is_empty() {
-            offending.push((id, name, problems));
-        }
-    }
-    Ok(offending)
-}
-
-/// Log one WARN per stored lifecycle policy whose regexes are not valid
-/// PostgreSQL regexes or use `\b`/`\B` (#4461). Runs once per boot; the
-/// stored configs are left untouched. Never fails startup.
-pub async fn warn_invalid_lifecycle_regexes(db: &PgPool) {
-    let report = async {
-        let mut conn = db
-            .acquire()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        invalid_regex_policies(&mut conn).await
-    };
-    match report.await {
-        Ok(offending) => {
-            for (id, name, problems) in offending {
-                let messages: Vec<&str> = problems.iter().map(|p| p.message.as_str()).collect();
-                tracing::warn!(
-                    policy_id = %id,
-                    policy_name = %name,
-                    "lifecycle policy has a regex PostgreSQL does not run as written \
-                     (fix it with PATCH /api/v1/admin/lifecycle/{{id}}): {}",
-                    messages.join("; ")
-                );
-            }
-        }
-        Err(e) => tracing::warn!("lifecycle regex startup check failed: {e}"),
-    }
-}
-
 /// Parse a policy's [`PolicyFilters`] from its `config`.
 pub(crate) fn parse_policy_filters(config: &serde_json::Value) -> Result<PolicyFilters> {
     let (path_prefix, version_pattern) = parse_match(config)?;
@@ -1542,14 +1344,33 @@ impl LifecycleService {
             ));
         }
 
+        let problems = self.stored_regex_problems_of(&policy).await?;
+        if !dry_run {
+            // #4461: a protective pattern (an exclusion, or the keep pattern
+            // of tag_pattern_keep) that PostgreSQL reads differently from how
+            // it was validated fails open and deletes what it should keep.
+            // Refuse the live run; the stored config is left as it is.
+            if let Some(problem) = problems.iter().find(|p| p.fails_open(&policy.policy_type)) {
+                return Err(AppError::Validation(format!(
+                    "Refusing to run lifecycle policy '{}': {}. This pattern protects \
+                     artifacts and would protect nothing as written; fix the policy",
+                    policy.name, problem.message
+                )));
+            }
+        }
+
         let repositories = self.resolve_repositories(&policy).await?;
         let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
-        if dry_run
-            && self
-                .report_stored_regex_problems(&policy, &mut result)
-                .await?
-        {
-            return Ok(result);
+        if dry_run {
+            // Report every stored-regex problem in the preview, and stop when
+            // a pattern cannot compile at all (the run would only error out).
+            let blocked = problems.iter().any(|p| p.blocks_run());
+            result
+                .errors
+                .extend(problems.into_iter().map(|p| p.message));
+            if blocked {
+                return Ok(result);
+            }
         }
         if repositories.is_empty() {
             return Ok(result);
@@ -1587,26 +1408,21 @@ impl LifecycleService {
         Ok(result)
     }
 
-    /// Add a preview error for each stored regex PostgreSQL reads differently
-    /// from how it was validated (#4461). Returns true when one cannot compile
-    /// at all, i.e. the preview cannot run.
-    async fn report_stored_regex_problems(
+    /// The stored-regex problems of `policy` (#4461), checked on one pooled
+    /// connection under the compile timeout.
+    async fn stored_regex_problems_of(
         &self,
         policy: &LifecyclePolicy,
-        result: &mut PolicyExecutionResult,
-    ) -> Result<bool> {
+    ) -> Result<Vec<regexes::StoredRegexProblem>> {
+        if policy_regexes(&policy.policy_type, &policy.config).is_empty() {
+            return Ok(Vec::new());
+        }
         let mut conn = self
             .db
             .acquire()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        let problems =
-            stored_regex_problems(&mut conn, &policy.policy_type, &policy.config).await?;
-        let blocked = problems.iter().any(|p| !p.runnable);
-        result
-            .errors
-            .extend(problems.into_iter().map(|p| p.message));
-        Ok(blocked)
+        stored_regex_problems(&mut conn, &policy.policy_type, &policy.config).await
     }
 
     async fn execute_in_repository(
@@ -2294,8 +2110,15 @@ impl LifecycleService {
         // bad `exclude`/`match` block is a 422 at create/update time rather
         // than a surprise at sweep time.
         parse_policy_filters(config)?;
+        let version_patterns = parse_exclusions(config)?.version_patterns.len();
+        if version_patterns > MAX_VERSION_PATTERNS {
+            return Err(AppError::Validation(format!(
+                "exclude.version_patterns has {version_patterns} entries; at most \
+                 {MAX_VERSION_PATTERNS} are allowed"
+            )));
+        }
         for (field, pattern) in policy_regexes(policy_type, config) {
-            reject_backspace_escape(&field, &pattern)?;
+            reject_static_regex_problems(&field, &pattern)?;
         }
         if matches!(policy_type, "max_age_days" | "composite") {
             parse_min_keep(config)?;
@@ -2380,7 +2203,19 @@ mod regex_tests;
 mod proxy_cache;
 // After the SQL macros: it expands the `retention_*` family.
 mod conditions;
+// Lifecycle regexes are PostgreSQL regexes (#4461).
+mod regexes;
 pub use proxy_cache::ProxyCacheExecutionResult;
+pub use regexes::warn_invalid_lifecycle_regexes;
+#[cfg(test)]
+pub(crate) use regexes::{
+    compile_in_postgres, has_backspace_escape, invalid_regex_policies, postgres_regex_error,
+    StoredRegexIssue, MAX_REGEX_BYTES,
+};
+pub(crate) use regexes::{
+    policy_regexes, reject_backspace_escape, reject_static_regex_problems, stored_regex_problems,
+    validate_regexes_in_postgres, MAX_VERSION_PATTERNS,
+};
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]

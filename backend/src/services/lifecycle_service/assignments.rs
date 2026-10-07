@@ -191,6 +191,9 @@ impl LifecycleService {
         let ids = req.assigned_repositories()?;
         self.validate_policy_config(&req.policy_type, &req.config)?;
         validate_schedule(req.cron_schedule.as_deref())?;
+        // Compiled on its own connection before the write transaction takes
+        // any lock (#4461).
+        validate_regexes_in_postgres(&self.db, &req.policy_type, &req.config).await?;
 
         let mut tx = self
             .db
@@ -199,7 +202,6 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         let found = Self::lock_repositories(&mut tx, &ids).await?;
         Self::require_repositories(&ids, &found)?;
-        validate_regexes_in_postgres(&mut tx, &req.policy_type, &req.config).await?;
         Self::reject_inert_remote_assignments(&mut tx, &req.policy_type, &req.config, &ids).await?;
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO lifecycle_policies \
@@ -254,6 +256,16 @@ impl LifecycleService {
         id: Uuid,
         req: UpdateLifecyclePolicyRequest,
     ) -> Result<LifecyclePolicy> {
+        // A changed config's regexes are compiled on their own connection
+        // before the write transaction takes any lock (#4461). `policy_type`
+        // is immutable, so this unlocked read is safe; a client re-sending
+        // the stored config is not changing it and is not re-checked.
+        if let Some(config) = &req.config {
+            let current = self.get_policy(id).await?;
+            if *config != current.config {
+                validate_regexes_in_postgres(&self.db, &current.policy_type, config).await?;
+            }
+        }
         let (mut tx, existing) = self
             .assignment_transaction(id, req.repository_ids.as_deref().unwrap_or_default())
             .await?;
@@ -271,9 +283,6 @@ impl LifecycleService {
         // A new config is checked against every assignment; otherwise only
         // newly added repositories are, so a policy assigned before #3734 can
         // still be renamed or disabled.
-        if config_changed {
-            validate_regexes_in_postgres(&mut tx, &existing.policy_type, &config).await?;
-        }
         let checked = inert_check_scope(config_changed, &ids, &existing.repository_ids);
         Self::reject_inert_remote_assignments(&mut tx, &existing.policy_type, &config, &checked)
             .await?;
