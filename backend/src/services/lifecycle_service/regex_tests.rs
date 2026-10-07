@@ -374,6 +374,43 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
     }
 }
 
+/// A repository holding one 30-day-old artifact with `version`, for the
+/// stored-policy run tests below. Returns `(repository, artifact)`.
+async fn repository_with_artifact(conn: &mut sqlx::PgConnection, version: &str) -> (Uuid, Uuid) {
+    let repository_id = super::tests::insert_max_age_test_repository(conn).await;
+    let storage_key = format!("generic/{}", Uuid::new_v4());
+    let path = format!("builds/{version}");
+    let artifact = super::tests::insert_max_age_test_artifact(
+        conn,
+        repository_id,
+        &path,
+        version,
+        &storage_key,
+        30,
+    )
+    .await;
+    (repository_id, artifact)
+}
+
+/// Assign stored policy `policy_id` to `repository_id`.
+async fn assign_repository(conn: &mut sqlx::PgConnection, policy_id: Uuid, repository_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
+    )
+    .bind(policy_id)
+    .bind(repository_id)
+    .execute(conn)
+    .await
+    .expect("assign repository");
+}
+
+async fn drop_repository(conn: &mut sqlx::PgConnection, repository_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .execute(conn)
+        .await;
+}
+
 /// #4502: a stored `match.version_pattern` with `\b`, on a policy that has a
 /// repository with a matching-looking artifact. The preview reports it in
 /// `errors` and matches nothing (it used to be a 400 from `parse_match`), and
@@ -384,27 +421,10 @@ async fn stored_match_word_boundary_is_previewed_and_refused_4502() {
         return;
     };
     let mut conn = pool.acquire().await.expect("acquire");
-    let repository_id = super::tests::insert_max_age_test_repository(&mut conn).await;
-    let storage_key = format!("generic/{}", Uuid::new_v4());
-    let artifact = super::tests::insert_max_age_test_artifact(
-        &mut conn,
-        repository_id,
-        "builds/foo-1",
-        "foo-1",
-        &storage_key,
-        30,
-    )
-    .await;
+    let (repository_id, artifact) = repository_with_artifact(&mut conn, "foo-1").await;
     let config = json!({"days": 1, "match": {"version_pattern": r"\bfoo"}});
     let id = insert_unvalidated(&pool, "max_age_days", config.clone()).await;
-    sqlx::query(
-        "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
-    )
-    .bind(id)
-    .bind(repository_id)
-    .execute(&mut *conn)
-    .await
-    .expect("assign repository");
+    assign_repository(&mut conn, id, repository_id).await;
 
     let service = LifecycleService::new(pool.clone());
     let preview = service
@@ -428,10 +448,7 @@ async fn stored_match_word_boundary_is_previewed_and_refused_4502() {
     assert_eq!(service.get_policy(id).await.unwrap().config, config);
 
     service.delete_policy(id).await.expect("cleanup");
-    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-        .bind(repository_id)
-        .execute(&mut *conn)
-        .await;
+    drop_repository(&mut conn, repository_id).await;
 }
 
 /// Which stored-regex problems refuse a live run, and with what message.
@@ -486,17 +503,7 @@ async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
         return;
     };
     let mut conn = pool.acquire().await.expect("acquire");
-    let repository_id = super::tests::insert_max_age_test_repository(&mut conn).await;
-    let storage_key = format!("generic/{}", Uuid::new_v4());
-    let artifact = super::tests::insert_max_age_test_artifact(
-        &mut conn,
-        repository_id,
-        "builds/foo",
-        "foo",
-        &storage_key,
-        30,
-    )
-    .await;
+    let (repository_id, artifact) = repository_with_artifact(&mut conn, "foo").await;
     let mut ids = Vec::new();
     for (policy_type, config) in [
         (
@@ -506,14 +513,7 @@ async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
         ("tag_pattern_delete", json!({"pattern": r"foo\z"})),
     ] {
         let id = insert_unvalidated(&pool, policy_type, config).await;
-        sqlx::query(
-            "INSERT INTO lifecycle_policy_repositories (policy_id, repository_id) VALUES ($1, $2)",
-        )
-        .bind(id)
-        .bind(repository_id)
-        .execute(&mut *conn)
-        .await
-        .expect("assign repository");
+        assign_repository(&mut conn, id, repository_id).await;
         ids.push(id);
     }
 
@@ -537,8 +537,5 @@ async fn uncompilable_stored_match_pattern_is_a_400_on_a_live_run_4504() {
     for id in ids {
         service.delete_policy(id).await.expect("cleanup");
     }
-    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-        .bind(repository_id)
-        .execute(&mut *conn)
-        .await;
+    drop_repository(&mut conn, repository_id).await;
 }
