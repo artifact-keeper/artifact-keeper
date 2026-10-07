@@ -1707,8 +1707,13 @@ async fn store_crate_artifact(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, crate_bytes.len() as i64)
-        .await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        crate_bytes.len() as i64,
+    )
+    .await?;
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state

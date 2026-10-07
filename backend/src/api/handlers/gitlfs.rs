@@ -521,7 +521,15 @@ async fn upload_object(
             .unwrap());
     }
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
+    let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
+
     // Store the object
     let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
     let storage = state
@@ -535,7 +543,6 @@ async fn upload_object(
     })?;
 
     let size_bytes = body.len() as i64;
-    let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 

@@ -1177,8 +1177,15 @@ async fn upload(
         let size_bytes = bundle_bytes.len() as i64;
 
         // Refuse an over-quota commit before its bundle is stored (#4422).
+        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
         connect_quota_decision(
-            super::publish_quota::preflight_quota_denial(&state.db, repo.id, size_bytes).await,
+            super::publish_quota::preflight_quota_denial(
+                &state.db,
+                repo.id,
+                super::publish_quota::PublishAt::Path(&artifact_path),
+                size_bytes,
+            )
+            .await,
         )?;
 
         // Store via StorageBackend
@@ -1195,8 +1202,6 @@ async fn upload(
                 crate::api::handlers::storage_err_message(&e),
             )
         })?;
-
-        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
 
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 

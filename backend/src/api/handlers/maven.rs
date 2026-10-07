@@ -3736,7 +3736,13 @@ async fn upload(
 
     // Refuse an over-quota upload before claiming the key or writing its
     // bytes (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&path),
+        size_bytes,
+    )
+    .await?;
 
     // Atomically claim the flat key BEFORE writing its bytes so that of two
     // concurrent first-publishers of the same key exactly one proceeds and the

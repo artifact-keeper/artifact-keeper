@@ -1127,7 +1127,13 @@ async fn upload_image(
     // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`.
     // Refuse an over-quota image synchronously, while the staged body is
     // still guarded and before the 202 (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_storage_key(&repo.id, &artifact_path);
     let session_id = Uuid::new_v4();
     // Fresh session, but it still carries a finalize lease so the background
@@ -2346,10 +2352,14 @@ async fn run_finalize(
 ) -> Result<Uuid, String> {
     // Refuse an over-quota image before pushing its bytes to the backend
     // (#4422); the authoritative admission runs with the row INSERT.
-    if let Some(scope) =
-        super::publish_quota::preflight_quota_denial(&state.db, p.repo_id, p.size_bytes)
-            .await
-            .map_err(|e| format!("database error: {e}"))?
+    if let Some(scope) = super::publish_quota::preflight_quota_denial(
+        &state.db,
+        p.repo_id,
+        super::publish_quota::PublishAt::Path(&p.artifact_path),
+        p.size_bytes,
+    )
+    .await
+    .map_err(|e| format!("database error: {e}"))?
     {
         return Err(scope.exceeded_message().to_string());
     }

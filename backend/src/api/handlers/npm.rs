@@ -5491,7 +5491,13 @@ async fn store_npm_version(
     // before any bytes are written; the authoritative admission happens
     // under lock in the same transaction as the artifact INSERT below.
     let size_bytes = ver.tarball_bytes.len() as i64;
-    super::publish_quota::preflight_publish_quota(&state.db, repo_id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo_id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
 
     // Store the tarball
     let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);

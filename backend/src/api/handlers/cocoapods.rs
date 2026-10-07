@@ -605,7 +605,13 @@ async fn push_pod(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
     // Store the pod archive
     let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)

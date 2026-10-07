@@ -4871,7 +4871,13 @@ async fn store_conda_package(
     .await
     .map_err(|e| e.into_response())?;
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, content.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        content.len() as i64,
+    )
+    .await?;
     // Store the file
     let storage_key = build_conda_storage_key(&repo.id, subdir, filename);
     let storage = state

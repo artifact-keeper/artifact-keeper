@@ -24,7 +24,7 @@
 //! repositories and projects (no quota, or a non-positive sentinel) take no
 //! lock and pay one extra primary-key read per publish.
 //!
-//! The `publish_quota_admission_gate` test in `proxy_helpers.rs` reads every
+//! The `every_format_publish_runs_quota_admission_4422` gate in `proxy_helpers.rs` reads every
 //! handler source and fails when a production `artifacts` insert neither runs
 //! through these helpers nor carries a `NO-QUOTA-ADMISSION:` comment saying
 //! why the row is not a publish.
@@ -48,30 +48,80 @@ fn admit(denied_by: Option<QuotaScope>) -> Result<(), Response> {
     denied_by.map_or(Ok(()), |scope| Err(quota_denied(scope)))
 }
 
+/// Where a publish lands, so the preflight can net out the bytes already
+/// stored there: an overwrite is charged only its size delta, as the
+/// authoritative locked admission charges it.
+#[derive(Debug, Clone, Copy)]
+pub enum PublishAt<'a> {
+    /// The artifact's `(repository_id, path)`.
+    Path(&'a str),
+    /// The storage key the bytes are written under (the shared put
+    /// primitives know the key, not the artifact path).
+    StorageKey(&'a str),
+}
+
+/// Bytes of the live, hosted rows of `repo_id` at `at`.
+async fn live_bytes_at(db: &PgPool, repo_id: Uuid, at: PublishAt<'_>) -> sqlx::Result<i64> {
+    let (sql, key) = match at {
+        PublishAt::Path(path) => (
+            "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts \
+              WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+                AND storage_key NOT LIKE 'proxy-cache/%'",
+            path,
+        ),
+        PublishAt::StorageKey(storage_key) => (
+            "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts \
+              WHERE repository_id = $1 AND storage_key = $2 AND is_deleted = false \
+                AND storage_key NOT LIKE 'proxy-cache/%'",
+            storage_key,
+        ),
+    };
+    sqlx::query_scalar(sql)
+        .bind(repo_id)
+        .bind(key)
+        .fetch_one(db)
+        .await
+}
+
 /// The scope that refuses an unlocked, best-effort preflight of a
-/// `size_bytes` publish into `repo_id` (repository quota and, if any, its
-/// project's aggregate quota), or `None` when it fits. For callers that report
-/// errors as text (a background finalizer); handlers use
-/// [`preflight_publish_quota`].
+/// `size_bytes` publish into `repo_id` at `at` (repository quota and, if any,
+/// its project's aggregate quota), or `None` when it fits. Bytes already
+/// stored at `at` are netted out, so an overwrite is charged its delta and one
+/// that adds nothing always passes. For callers that report errors as text (a
+/// background finalizer); handlers use [`preflight_publish_quota`].
 pub async fn preflight_quota_denial(
     db: &PgPool,
     repo_id: Uuid,
+    at: PublishAt<'_>,
     size_bytes: i64,
 ) -> crate::error::Result<Option<QuotaScope>> {
-    RepositoryService::new(db.clone())
+    let service = RepositoryService::new(db.clone());
+    // The common case (fits, or no quota) costs no extra query; only a
+    // would-be refusal looks up what the publish replaces.
+    if service
         .quota_preflight(repo_id, size_bytes)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let replaced = live_bytes_at(db, repo_id, at).await?;
+    service
+        .quota_preflight(repo_id, size_bytes - replaced)
         .await
 }
 
 /// Unlocked best-effort quota preflight for a publish of `size_bytes` into
-/// `repo_id`. Call it once the size is known and before the bytes are written.
+/// `repo_id` at `at`. Call it once the size is known and before the bytes are
+/// written (and before any soft-deleted row at the path is purged).
 #[allow(clippy::result_large_err)]
 pub async fn preflight_publish_quota(
     db: &PgPool,
     repo_id: Uuid,
+    at: PublishAt<'_>,
     size_bytes: i64,
 ) -> Result<(), Response> {
-    let denied_by = preflight_quota_denial(db, repo_id, size_bytes)
+    let denied_by = preflight_quota_denial(db, repo_id, at, size_bytes)
         .await
         .map_err(IntoResponse::into_response)?;
     admit(denied_by)
@@ -142,6 +192,11 @@ pub(crate) fn oci_blob_charge(already_held: bool, size_bytes: i64) -> i64 {
 /// (`oci_blobs`) inside `tx`, or `None` when it fits. A blob lives in
 /// `oci_blobs`, not `artifacts`, so nothing is netted by path; a re-push of a
 /// blob the repository already holds is charged nothing.
+///
+/// The "already held" probe runs AFTER the quota locks are taken (a zero
+/// charge still takes them), so two concurrent pushes of one new digest
+/// serialize and the second sees the first's committed row instead of being
+/// charged the blob a second time.
 pub async fn locked_oci_blob_denial(
     tx: &mut Transaction<'_, Postgres>,
     db: &PgPool,
@@ -149,15 +204,16 @@ pub async fn locked_oci_blob_denial(
     digest: &str,
     size_bytes: i64,
 ) -> crate::error::Result<Option<QuotaScope>> {
+    // An `oci_blobs` row has no `artifacts` path; this key matches none, so
+    // check_quota_locked nets nothing out.
+    let path = format!("oci-blob:{digest}");
+    locked_quota_denial(tx, db, repo_id, &path, 0).await?;
     let held: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM oci_blobs WHERE repository_id = $1 AND digest = $2")
             .bind(repo_id)
             .bind(digest)
             .fetch_optional(&mut **tx)
             .await?;
-    // An `oci_blobs` row has no `artifacts` path; this key matches none, so
-    // check_quota_locked nets nothing out.
-    let path = format!("oci-blob:{digest}");
     let charge = oci_blob_charge(held.is_some(), size_bytes);
     locked_quota_denial(tx, db, repo_id, &path, charge).await
 }
@@ -223,11 +279,11 @@ mod tests {
             .await
             .unwrap();
 
-        preflight_publish_quota(&pool, repo_id, 100)
+        preflight_publish_quota(&pool, repo_id, PublishAt::Path("new.bin"), 100)
             .await
             .expect("fits exactly");
         let (status, body) = body_text(
-            preflight_publish_quota(&pool, repo_id, 101)
+            preflight_publish_quota(&pool, repo_id, PublishAt::Path("new.bin"), 101)
                 .await
                 .unwrap_err(),
         )
@@ -245,12 +301,88 @@ mod tests {
             .await
             .expect_err("60 + 50 exceeds 100");
         assert_eq!(err.status(), StatusCode::INSUFFICIENT_STORAGE);
-        assert!(preflight_publish_quota(&pool, repo_id, 50).await.is_err());
+        assert!(
+            preflight_publish_quota(&pool, repo_id, PublishAt::Path("b.bin"), 50)
+                .await
+                .is_err()
+        );
         // Overwriting a.bin with 90 bytes is a +30 delta: admitted.
         begin_admitted_publish(&pool, repo_id, "a.bin", 90)
             .await
             .expect("overwrite charged its delta only");
 
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+    }
+
+    /// #4422 review: a publish that adds no bytes is always admitted, by the
+    /// preflight (netted by path or by storage key) and by the locked check,
+    /// even once the repository is over a quota that was lowered; one that
+    /// adds bytes is refused.
+    #[tokio::test]
+    async fn publishes_that_add_no_bytes_pass_an_exceeded_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let mut tx = begin_admitted_publish(&pool, repo_id, "a.bin", 60)
+            .await
+            .expect("unlimited");
+        insert_row(&mut tx, repo_id, "a.bin", 60).await;
+        tx.commit().await.unwrap();
+        let digest = format!("sha256:{}", "de".repeat(32));
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, 10, $3)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(format!("quota-4422/{repo_id}/blob"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The quota is lowered below what the repository already holds.
+        sqlx::query("UPDATE repositories SET quota_bytes = 50 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let key = format!("quota-4422/{repo_id}/a.bin");
+        for (at, size, admitted) in [
+            (PublishAt::Path("a.bin"), 60, true),
+            (PublishAt::Path("a.bin"), 40, true),
+            (PublishAt::StorageKey(&key), 60, true),
+            (PublishAt::Path("a.bin"), 61, false),
+            (PublishAt::Path("b.bin"), 1, false),
+            (PublishAt::StorageKey("elsewhere"), 1, false),
+        ] {
+            let result = preflight_publish_quota(&pool, repo_id, at, size).await;
+            assert_eq!(result.is_ok(), admitted, "preflight {at:?} {size}");
+        }
+        for (path, size, admitted) in [
+            ("a.bin", 60, true),
+            ("a.bin", 40, true),
+            ("b.bin", 1, false),
+        ] {
+            let result = begin_admitted_publish(&pool, repo_id, path, size).await;
+            assert_eq!(result.is_ok(), admitted, "locked {path} {size}");
+        }
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            locked_oci_blob_denial(&mut tx, &pool, repo_id, &digest, 10)
+                .await
+                .unwrap(),
+            None,
+            "a re-push of a held blob is admitted over the cap"
+        );
+        drop(tx);
+
+        sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
     }
 
@@ -285,8 +417,12 @@ mod tests {
         insert_row(&mut tx, a, "x.bin", 80).await;
         tx.commit().await.unwrap();
 
-        let (status, body) =
-            body_text(preflight_publish_quota(&pool, b, 30).await.unwrap_err()).await;
+        let (status, body) = body_text(
+            preflight_publish_quota(&pool, b, PublishAt::Path("y.bin"), 30)
+                .await
+                .unwrap_err(),
+        )
+        .await;
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
 

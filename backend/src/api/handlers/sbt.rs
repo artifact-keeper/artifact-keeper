@@ -548,7 +548,13 @@ async fn upload_artifact(
         "application/java-archive"
     };
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
 
     // Store the file. #2624: on shared cloud namespaces new objects embed the
     // repository id (`sbt/{repository_id}/{path}`) so keys can never collide

@@ -1723,7 +1723,13 @@ async fn upload(
     .await
     .map_err(|e| e.into_response())?;
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
     // Store the archive
     let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)

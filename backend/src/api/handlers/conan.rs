@@ -2025,7 +2025,13 @@ async fn recipe_file_upload(
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
 
     // Check for duplicate — allow overwrite for the same revision
     let existing = sqlx::query_scalar!(
@@ -2953,7 +2959,13 @@ async fn package_file_upload(
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
 
     // Check for duplicate — allow overwrite within same revision
     let existing = sqlx::query_scalar!(

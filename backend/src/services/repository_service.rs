@@ -2813,7 +2813,12 @@ impl RepositoryService {
         project: QuotaUsage,
         additional_bytes: i64,
     ) -> Option<QuotaScope> {
-        if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
+        // An upload that adds no bytes (a re-push of identical content, a
+        // shrinking overwrite) is always admitted, even when usage is already
+        // over a quota that was lowered or never enforced (#4422).
+        if additional_bytes <= 0 {
+            None
+        } else if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
             Some(QuotaScope::Repository)
         } else if !Self::quota_allows(project.quota_bytes, project.used_bytes, additional_bytes) {
             Some(QuotaScope::Project)
@@ -2995,13 +3000,16 @@ impl RepositoryService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let base_usage = repo_total.map(|total| total - existing_at_path);
+        // Charged the NET delta against the full usage (the same sum as the
+        // base usage plus the new size), so an upload that adds no bytes is
+        // admitted even over the cap (#4422).
         let denied_by = Self::quota_denial(
-            QuotaUsage::new(repo_quota, base_usage.unwrap_or(0)),
+            QuotaUsage::new(repo_quota, repo_total.unwrap_or(0)),
             QuotaUsage::new(
                 project_quota.map(|(_, quota)| quota),
-                project_total.map_or(0, |total| total - existing_at_path),
+                project_total.unwrap_or(0),
             ),
-            new_size,
+            new_size - existing_at_path,
         );
         // No manual charge here: the caller's artifact INSERT (same
         // transaction, made while the row locks taken above are still held)
@@ -4488,6 +4496,21 @@ mod tests {
                 u(Some(10), 10),
                 u(Some(10), 10),
                 0,
+                None,
+            ),
+            (
+                // #4422: a zero-delta upload is admitted even over the cap.
+                "zero_byte_already_over_both",
+                u(Some(10), 50),
+                u(Some(10), 50),
+                0,
+                None,
+            ),
+            (
+                "shrinking_overwrite_already_over",
+                u(Some(10), 50),
+                u(None, 0),
+                -20,
                 None,
             ),
         ];

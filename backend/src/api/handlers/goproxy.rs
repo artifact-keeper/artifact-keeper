@@ -1574,7 +1574,13 @@ async fn upload_zip(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_go_zip_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
@@ -1723,7 +1729,13 @@ async fn upload_mod(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_go_mod_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;

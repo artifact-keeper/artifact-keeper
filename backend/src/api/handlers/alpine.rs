@@ -1539,7 +1539,13 @@ async fn store_apk(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, content.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        content.len() as i64,
+    )
+    .await?;
 
     // Store the file
     let storage_key = build_alpine_storage_key(repo.id, &artifact_path);

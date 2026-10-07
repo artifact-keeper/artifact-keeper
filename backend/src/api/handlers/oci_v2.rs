@@ -6348,17 +6348,20 @@ async fn try_mount_blob(
 
     // A mount charges the target repository the blob's bytes, so it is
     // admitted against the target's storage quotas like an upload (#4422).
+    // A denial answers 507; a failed check falls back to a normal upload, as
+    // every other unsatisfiable mount does.
     let mut tx = state.db.begin().await.ok()?;
-    if let Some(refusal) = oci_blob_quota_refusal(
-        &mut tx,
-        &state.db,
-        target_repo_id,
-        &canonical,
-        blob.size_bytes,
-    )
-    .await
-    {
-        return Some(refusal);
+    if let Err(outcome) = mount_quota_refusal(
+        super::publish_quota::locked_oci_blob_denial(
+            &mut tx,
+            &state.db,
+            target_repo_id,
+            &canonical,
+            blob.size_bytes,
+        )
+        .await,
+    ) {
+        return outcome;
     }
     if let Err(e) = sqlx::query!(
         "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
@@ -10705,11 +10708,30 @@ fn oci_quota_refusal(
             "DENIED",
             scope.exceeded_message(),
         )),
-        Err(e) => Some(oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )),
+        Err(e) => {
+            tracing::error!("storage quota check failed: {e}");
+            Some(oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "storage quota check failed",
+            ))
+        }
+    }
+}
+
+/// #4422: a blob mount's quota decision. `Err(Some(507))` refuses the mount;
+/// `Err(None)` (the check itself failed) falls back to a normal upload
+/// session, per [`try_mount_blob`]'s contract that a mount never errors.
+fn mount_quota_refusal(
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+) -> Result<(), Option<Response>> {
+    match decision {
+        Ok(None) => Ok(()),
+        Ok(Some(scope)) => Err(oci_quota_refusal(Ok(Some(scope)))),
+        Err(e) => {
+            tracing::warn!("blob mount quota check failed; falling back to an upload: {e}");
+            Err(None)
+        }
     }
 }
 
@@ -27523,6 +27545,17 @@ mod cross_repo_session_regression_tests {
         assert!(oci_quota_refusal(Ok(None)).is_none());
         let resp = oci_quota_refusal(Err(AppError::Database("x".into()))).expect("refused");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // A mount: a denial refuses, a failed check falls back to an upload.
+        use crate::services::repository_service::QuotaScope;
+        assert!(mount_quota_refusal(Ok(None)).is_ok());
+        let refused = mount_quota_refusal(Ok(Some(QuotaScope::Project))).unwrap_err();
+        assert_eq!(
+            refused.expect("a denial refuses").status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert!(mount_quota_refusal(Err(AppError::Database("x".into())))
+            .unwrap_err()
+            .is_none());
     }
 
     /// #4422: a `docker push` is admitted against the repository's storage

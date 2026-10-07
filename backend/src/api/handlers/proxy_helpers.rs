@@ -6717,7 +6717,13 @@ pub async fn put_artifact_bytes(
 ) -> Result<(), Response> {
     // Every caller is a hosted publish: refuse an over-quota upload before
     // its bytes are written (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, body.len() as i64).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        body.len() as i64,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -6874,7 +6880,13 @@ pub async fn put_artifact_stream(
 ) -> Result<crate::storage::PutStreamResult, Response> {
     // Every caller is a hosted publish: refuse an over-quota upload before
     // its bytes are written (#4422).
-    super::publish_quota::preflight_publish_quota(&state.db, repo.id, staged.size_bytes).await?;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        staged.size_bytes,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -21569,7 +21581,7 @@ mod scan_on_upload_coverage_tests {
     const OCI_BLOB_QUOTA_GATE: InsertGate = InsertGate {
         insert_sql: r"(?i)INSERT\s+INTO\s+(public\.)?oci_blobs\b",
         insert_calls: &[],
-        triggers: &["oci_blob_quota_refusal("],
+        triggers: &["oci_blob_quota_refusal(", "mount_quota_refusal("],
         marker: QUOTA_MARKER,
         self_covering: &[],
     };
