@@ -4471,6 +4471,11 @@ enum UpstreamFetchOutcome {
     /// of those say anything about whether the object exists, so a walk that
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
+    /// The upstream (its OCI token service) refused the Remote's credentials
+    /// (#4453). As indeterminate as [`Self::Indeterminate`], but the direct
+    /// Remote manifest GET/HEAD reports it as a gateway error instead of
+    /// `MANIFEST_UNKNOWN`.
+    UpstreamAuthFailed,
 }
 
 impl UpstreamFetchOutcome {
@@ -4484,7 +4489,26 @@ impl UpstreamFetchOutcome {
 
     /// `true` when this outcome leaves the object's existence unresolved.
     fn is_indeterminate(&self) -> bool {
-        matches!(self, UpstreamFetchOutcome::Indeterminate)
+        matches!(
+            self,
+            UpstreamFetchOutcome::Indeterminate | UpstreamFetchOutcome::UpstreamAuthFailed
+        )
+    }
+
+    /// The OCI error a direct Remote manifest request returns for an upstream
+    /// authentication failure (#4453): 502 with code `DENIED`, never a 404
+    /// `MANIFEST_UNKNOWN` (a client must not read a credentials problem as
+    /// "this image does not exist"), and never a 401, which would make the
+    /// client retry with ITS credentials against this registry.
+    fn upstream_auth_error(&self) -> Option<Response> {
+        matches!(self, UpstreamFetchOutcome::UpstreamAuthFailed).then(|| {
+            oci_error(
+                StatusCode::BAD_GATEWAY,
+                "DENIED",
+                "upstream registry authentication failed: the upstream token service \
+                 rejected this repository's upstream credentials",
+            )
+        })
     }
 }
 
@@ -4541,6 +4565,9 @@ async fn try_upstream_fetch_with_accept(
     {
         Ok((content, content_type)) => UpstreamFetchOutcome::Fetched(content, content_type),
         Err(error) if upstream_error_is_definitive_miss(&error) => UpstreamFetchOutcome::Missing,
+        Err(error) if proxy_helpers::is_upstream_auth_failure(&error) => {
+            UpstreamFetchOutcome::UpstreamAuthFailed
+        }
         Err(_) => UpstreamFetchOutcome::Indeterminate,
     }
 }
@@ -8869,15 +8896,19 @@ async fn handle_head_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    if let Some((content, ct)) = try_upstream_fetch_with_accept(
+    let outcome = try_upstream_fetch_with_accept(
         &repo,
         state,
         &format!("manifests/{}", reference),
         Some(&accept),
     )
-    .await
-    .into_fetched()
-    {
+    .await;
+    // #4453: an upstream that refused the Remote's credentials is a gateway
+    // error the operator must fix, not a missing manifest.
+    if let Some(resp) = outcome.upstream_auth_error() {
+        return resp;
+    }
+    if let Some((content, ct)) = outcome.into_fetched() {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -10327,15 +10358,19 @@ async fn handle_get_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    if let Some((content, ct)) = try_upstream_fetch_with_accept(
+    let outcome = try_upstream_fetch_with_accept(
         &repo,
         state,
         &format!("manifests/{}", reference),
         Some(&accept),
     )
-    .await
-    .into_fetched()
-    {
+    .await;
+    // #4453: an upstream that refused the Remote's credentials is a gateway
+    // error the operator must fix, not a missing manifest.
+    if let Some(resp) = outcome.upstream_auth_error() {
+        return resp;
+    }
+    if let Some((content, ct)) = outcome.into_fetched() {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -17343,6 +17378,68 @@ mod remote_blob_streaming_fallback_tests {
             "an over-cap manifest must be rejected by the buffered/capped fallback, \
              proving manifests are NOT streamed"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4453: an upstream whose token service refuses the Remote's
+    /// credentials (401) is an upstream authentication failure, reported to
+    /// the client as 502 `DENIED`, not as an indeterminate miss that the
+    /// manifest handlers turned into 404 `MANIFEST_UNKNOWN`. Never a negative.
+    #[tokio::test]
+    async fn remote_manifest_token_401_is_an_upstream_auth_failure_4453() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/v1"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="reg.test",scope="repository:myorg/app:pull""#,
+                    server.uri()
+                )
+                .as_str(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-token-401-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        let outcome =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/v1", None).await;
+        assert!(matches!(outcome, UpstreamFetchOutcome::UpstreamAuthFailed));
+        assert!(outcome.is_indeterminate(), "never negative-cacheable");
+        let resp = outcome.upstream_auth_error().expect("an error response");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("DENIED"), "{body}");
+        assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
+
+        // Other outcomes carry no auth error.
+        assert!(UpstreamFetchOutcome::Indeterminate
+            .upstream_auth_error()
+            .is_none());
+        assert!(UpstreamFetchOutcome::Missing
+            .upstream_auth_error()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

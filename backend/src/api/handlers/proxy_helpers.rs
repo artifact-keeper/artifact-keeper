@@ -724,6 +724,25 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             );
             (StatusCode::FORBIDDEN, msg.clone()).into_response()
         }
+        // #4453: the upstream refused the Remote's credentials. Still a 502,
+        // but named as an authentication failure (the `security` line with
+        // the realm was logged where it happened), and marked so a format
+        // handler can report it instead of a not-found.
+        crate::error::AppError::UpstreamAuth(_) => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %diagnostic_path,
+                "Upstream authentication failed: {}",
+                e
+            );
+            let mut response = (
+                StatusCode::BAD_GATEWAY,
+                "Upstream authentication failed; check the repository's upstream credentials",
+            )
+                .into_response();
+            response.extensions_mut().insert(UpstreamAuthFailure);
+            response
+        }
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
@@ -734,6 +753,17 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
+}
+
+/// Response extension [`map_proxy_error`] attaches to the 502 it returns for
+/// [`AppError::UpstreamAuth`] (#4453), so a handler that only sees the
+/// `Response` can tell an upstream credentials failure from any other 502.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamAuthFailure;
+
+/// Whether a proxy error `Response` is an upstream authentication failure.
+pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAuthFailure>().is_some()
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
@@ -12171,6 +12201,19 @@ mod tests {
             crate::error::AppError::Storage("connection reset".into()),
         );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_member_policy_block_response(&resp));
+        assert!(!is_upstream_auth_failure(&resp));
+    }
+
+    #[test]
+    fn test_map_proxy_error_marks_upstream_auth_failure_4453() {
+        let resp = map_proxy_error(
+            "docker-remote",
+            "v2/library/alpine/manifests/3.20",
+            crate::error::AppError::UpstreamAuth("token service returned 401".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(is_upstream_auth_failure(&resp));
         assert!(!is_member_policy_block_response(&resp));
     }
 

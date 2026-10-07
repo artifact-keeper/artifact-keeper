@@ -185,6 +185,14 @@ pub enum AppError {
     #[error("Bad gateway: {0}")]
     BadGateway(String),
 
+    /// An upstream refused to authenticate the proxy: an OCI token service
+    /// answered 401/403 for the Remote's credentials (#4453). A gateway error
+    /// (502) like any other upstream refusal, but with its own code so a
+    /// credentials problem is not reported as a storage fault or as "not
+    /// found". The message names the (redacted) service, never credentials.
+    #[error("Upstream authentication failed: {0}")]
+    UpstreamAuth(String),
+
     /// A required dependency or feature is not configured / not enabled on
     /// this deployment. Distinct from `Internal` (which is "the server
     /// failed unexpectedly") because operators alert on 500s but not on
@@ -290,6 +298,7 @@ impl AppError {
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            Self::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -369,6 +378,7 @@ impl AppError {
             | Self::UnprocessableEntity(msg)
             | Self::QuotaExceeded(msg)
             | Self::BadGateway(msg)
+            | Self::UpstreamAuth(msg)
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
@@ -661,6 +671,16 @@ mod tests {
             AppError::ServiceUnavailable("x".into()).status_and_code().1,
             "SERVICE_UNAVAILABLE"
         );
+    }
+
+    #[test]
+    fn test_upstream_auth_maps_to_502_with_its_own_code_4453() {
+        let err = AppError::UpstreamAuth("token service rejected".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED")
+        );
+        assert_eq!(err.user_message(), "token service rejected");
     }
 
     #[test]
