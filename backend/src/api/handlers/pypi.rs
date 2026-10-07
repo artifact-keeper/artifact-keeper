@@ -2364,20 +2364,25 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
 /// spellings of one request could address two different cache entries -- or,
 /// worse, one spelling could address the entry another package's bytes were
 /// written under. The newtype makes that unrepresentable.
+///
+/// The key of [`pypi_file_serve_key`], so every PyPI proxy-cache key goes
+/// through the shared helper (#4365 item 1).
 fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) -> String {
-    format!("simple/{}/{}", project.as_str(), filename)
+    pypi_file_serve_key(project, filename).cache_key
 }
 
-/// The canonical `(cache_key, scannable)` decision for a proxied PyPI
-/// distribution (#4365 item 1): every file on the download route is a
-/// package, cached under [`build_pypi_proxy_cache_path`].
+/// The canonical `(cache_key, scannable)` decision for a proxied PyPI file
+/// (#4365 item 1), cached under `simple/{project}/{filename}`. Every
+/// distribution is a package; a PEP 658 `.metadata` sidecar (the core
+/// metadata the resolver reads, served by its own route) is not.
 fn pypi_file_serve_key(
     project: &NormalizedProjectName,
     filename: &str,
 ) -> crate::services::proxy_service::ProxyServeKey {
-    crate::services::proxy_service::route_package_serve_key(&build_pypi_proxy_cache_path(
-        project, filename,
-    ))
+    crate::services::proxy_service::proxy_serve_key(
+        &format!("simple/{}/{}", project.as_str(), filename),
+        |file| !file.to_ascii_lowercase().ends_with(".metadata"),
+    )
 }
 
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
@@ -3731,7 +3736,7 @@ async fn resolve_pypi_remote_fetch_target(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let cache_path = pypi_file_serve_key(project, filename).cache_key;
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
@@ -22648,11 +22653,24 @@ mod serve_key_4365_tests {
     #[test]
     fn pypi_file_serve_key_table() {
         let project = NormalizedProjectName::parse("requests").expect("valid name");
-        for file in ["requests-2.31.0.tar.gz", "requests-2.31.0-py3-none-any.whl"] {
+        for (file, scannable) in [
+            ("requests-2.31.0.tar.gz", true),
+            ("requests-2.31.0-py3-none-any.whl", true),
+            ("requests-2.31.0-py3-none-any.whl.metadata", false),
+        ] {
             let got = pypi_file_serve_key(&project, file);
             assert_eq!(got.cache_key, format!("simple/requests/{file}"));
             assert_eq!(got.cache_key, build_pypi_proxy_cache_path(&project, file));
-            assert!(got.scannable);
+            assert_eq!(got.scannable, scannable, "{file}");
+        }
+        // PEP 503: every spelling of a project name reaches one key.
+        for raw in ["Foo_Bar.baz", "foo-bar-baz", "FOO__bar--BAZ", "foo.bar_baz"] {
+            let project = NormalizedProjectName::parse(raw).expect("valid name");
+            assert_eq!(
+                pypi_file_serve_key(&project, "foo_bar_baz-1.0.tar.gz").cache_key,
+                "simple/foo-bar-baz/foo_bar_baz-1.0.tar.gz",
+                "{raw}"
+            );
         }
     }
 }

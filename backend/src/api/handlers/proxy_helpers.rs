@@ -3705,15 +3705,8 @@ pub(crate) async fn remote_scan_policy(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<Option<MemberScanPolicy>, Response> {
-    let row: std::result::Result<Option<ScanConfigRow>, sqlx::Error> = sqlx::query_as(
-        r#"SELECT scan_on_proxy, proxy_scan_action,
-                  block_on_policy_violation, severity_threshold
-           FROM scan_configs WHERE repository_id = $1"#,
-    )
-    .bind(repo_id)
-    .fetch_optional(db)
-    .await;
-    remote_policy_from_read(repo_id, row)
+    let rows = read_scan_config_rows(db, repo_id, &[repo_id]).await?;
+    Ok(direct_policy_from_rows(&rows, repo_id))
 }
 
 /// One `scan_configs` row as the proxy scan policy reads it:
@@ -3721,25 +3714,16 @@ pub(crate) async fn remote_scan_policy(
 /// severity_threshold)`.
 type ScanConfigRow = (bool, String, bool, String);
 
-/// The DB-free half of [`remote_scan_policy`]: a read error is the 503, a
-/// missing row or a disabled flag is `None`.
-fn remote_policy_from_read(
+/// The DB-free half of [`remote_scan_policy`]: `repo_id`'s own row, if any,
+/// mapped by [`scan_policy_from_row`]; a missing row or a disabled flag is
+/// `None`.
+fn direct_policy_from_rows(
+    rows: &[(Uuid, ScanConfigRow)],
     repo_id: Uuid,
-    row: std::result::Result<Option<ScanConfigRow>, sqlx::Error>,
-) -> Result<Option<MemberScanPolicy>, Response> {
-    match row {
-        Ok(row) => {
-            let (enabled, action, gate) = scan_policy_from_row(row.as_ref());
-            Ok(enabled.then_some((action, gate)))
-        }
-        Err(e) => {
-            tracing::warn!(
-                repo_id = %repo_id, error = %e,
-                "could not read the scan-on-proxy config; failing the pull closed (#4365)"
-            );
-            Err(scan_config_unreadable())
-        }
-    }
+) -> Option<MemberScanPolicy> {
+    let (enabled, action, gate) =
+        scan_policy_from_row(rows.iter().find(|r| r.0 == repo_id).map(|r| &r.1));
+    enabled.then_some((action, gate))
 }
 
 /// [`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)
@@ -9240,13 +9224,15 @@ pub(crate) async fn virtual_member_scan_policies(
         .collect())
 }
 
-/// `scan_configs` rows for `ids`, keyed by repository id, in ONE read. An
-/// unreadable config is the retryable 503 of [`scan_config_unreadable`]:
-/// whether any side is fail-closed is exactly what cannot be read, so the
-/// caller must not serve unscanned.
+/// `scan_configs` rows for `ids`, keyed by repository id, in ONE read: the
+/// only query the proxy scan policy runs, for a direct pull (one id) and a
+/// Virtual walk alike. An unreadable config is the retryable 503 of
+/// [`scan_config_unreadable`]: whether any side is fail-closed is exactly
+/// what cannot be read, so the caller must not serve unscanned.
+/// `context_id` (the pulled repository) only labels the log line.
 async fn read_scan_config_rows(
     db: &PgPool,
-    virtual_id: Uuid,
+    context_id: Uuid,
     ids: &[Uuid],
 ) -> Result<Vec<(Uuid, ScanConfigRow)>, Response> {
     let rows: Vec<(Uuid, bool, String, bool, String)> = sqlx::query_as(
@@ -9259,8 +9245,8 @@ async fn read_scan_config_rows(
     .await
     .map_err(|e| {
         tracing::warn!(
-            virtual_id = %virtual_id, error = %e,
-            "could not read member scan-on-proxy configs; failing the walk closed"
+            repo_id = %context_id, error = %e,
+            "could not read the scan-on-proxy config; failing the pull closed (#4365)"
         );
         scan_config_unreadable()
     })?;
@@ -22317,30 +22303,29 @@ mod scan_policy_read_tests {
         assert!(!enabled);
         assert_eq!(action, ProxyScanAction::FailOpen);
         assert_eq!(gate, ProxySeverityGate::BlockOnAny);
-        assert_eq!(
-            remote_policy_from_read(Uuid::nil(), Ok(None)).ok(),
-            Some(None)
-        );
+        assert_eq!(direct_policy_from_rows(&[], Uuid::nil()), None);
     }
 
     #[test]
     fn enabled_row_yields_its_policy_and_disabled_row_none() {
-        let on = remote_policy_from_read(Uuid::nil(), Ok(Some(row(true, "fail_closed"))))
-            .unwrap_or_else(|_| panic!("readable"));
+        let (repo, other) = (Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(
-            on,
+            direct_policy_from_rows(&[(repo, row(true, "fail_closed"))], repo),
             Some((ProxyScanAction::FailClosed, ProxySeverityGate::BlockOnAny))
         );
-        let off = remote_policy_from_read(Uuid::nil(), Ok(Some(row(false, "fail_closed"))))
-            .unwrap_or_else(|_| panic!("readable"));
-        assert_eq!(off, None);
+        assert_eq!(
+            direct_policy_from_rows(&[(repo, row(false, "fail_closed"))], repo),
+            None
+        );
+        // Another repository's row says nothing about this one.
+        assert_eq!(
+            direct_policy_from_rows(&[(other, row(true, "fail_closed"))], repo),
+            None
+        );
     }
 
     #[test]
-    fn unreadable_config_fails_closed_with_503() {
-        let err = remote_policy_from_read(Uuid::nil(), Err(sqlx::Error::PoolClosed))
-            .expect_err("unreadable");
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    fn unreadable_config_is_a_503() {
         assert_eq!(
             scan_config_unreadable().status(),
             StatusCode::SERVICE_UNAVAILABLE

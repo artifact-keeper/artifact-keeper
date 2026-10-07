@@ -441,6 +441,10 @@ struct GalleryAssetSource<'a> {
     /// metadata the client renders, and an unknown type is refused while the
     /// repository scans on proxy.
     kind: GalleryAssetKind,
+    /// The shared helper's scan decision for this asset's cache key (#4365
+    /// item 1): what the gate is chosen on. `kind` only separates display
+    /// metadata (no policy read) from an unknown type (404 while scanning).
+    scannable: bool,
 }
 
 /// Parsed gallery metadata plus the reservation that covers the simultaneous
@@ -2665,12 +2669,11 @@ async fn gallery_vspackage(
         urlencoding::encode(&version),
         urlencoding::encode(target_platform.as_ref()),
     );
-    let cache_path = gallery_asset_serve_key(
+    let key = gallery_asset_serve_key(
         (&publisher, &name, &version, target_platform.as_ref()),
         "vspackage",
         GalleryAssetKind::Package,
-    )
-    .cache_key;
+    );
     let upstream_asset_url = format!(
         "{}/{}",
         upstream_url.trim_end_matches('/'),
@@ -2685,10 +2688,11 @@ async fn gallery_vspackage(
     };
     let source = GalleryAssetSource {
         upstream_url: &upstream_asset_url,
-        cache_path: &cache_path,
+        cache_path: &key.cache_key,
         default_content_type: "application/vsix",
         gallery_url: upstream_url,
         kind: GalleryAssetKind::Package,
+        scannable: key.scannable,
     };
     // The `vspackage` route is the extension package itself, so it always
     // counts (#3649).
@@ -2738,12 +2742,11 @@ async fn gallery_asset(
         asset_type,
         target_platform.as_ref(),
     )?;
-    let cache_path = gallery_asset_serve_key(
+    let key = gallery_asset_serve_key(
         (&publisher, &name, &version, target_platform.as_ref()),
         &format!("asset-{:x}", Sha256::digest(asset_type.as_bytes())),
         kind,
-    )
-    .cache_key;
+    );
     let coordinate = GalleryAssetCoordinate {
         repo_key: &repo_key,
         publisher: &publisher,
@@ -2753,10 +2756,11 @@ async fn gallery_asset(
     };
     let source = GalleryAssetSource {
         upstream_url: &asset_url,
-        cache_path: &cache_path,
+        cache_path: &key.cache_key,
         default_content_type: "application/octet-stream",
         gallery_url: upstream_url,
         kind,
+        scannable: key.scannable,
     };
     // #3649: this route serves BOTH the extension package and the gallery
     // metadata assets VS Code fetches while rendering a listing (manifest,
@@ -2850,7 +2854,7 @@ async fn proxy_gallery_asset(
         proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
     };
     if let Some((action, severity_gate)) = scan {
-        if source.kind == GalleryAssetKind::Other {
+        if !source.scannable {
             return Err((StatusCode::NOT_FOUND, "Asset not found").into_response());
         }
         return serve_scanned_gallery_package(
@@ -3889,12 +3893,17 @@ fn legacy_download_upstream_path(
     for segment in [publisher, name, version] {
         validate_gallery_request_segment(segment)?;
     }
-    Ok(format!(
-        "extensions/{}/{}/{}/download",
-        urlencoding::encode(publisher),
-        urlencoding::encode(name),
-        urlencoding::encode(version),
-    ))
+    // #4365 item 1: also the legacy route's proxy-cache key, so it goes
+    // through the shared helper (the route serves only the package).
+    Ok(
+        crate::services::proxy_service::route_package_serve_key(&format!(
+            "extensions/{}/{}/{}/download",
+            urlencoding::encode(publisher),
+            urlencoding::encode(name),
+            urlencoding::encode(version),
+        ))
+        .cache_key,
+    )
 }
 
 /// The coordinate of one legacy `/extensions/.../download` VSIX request.

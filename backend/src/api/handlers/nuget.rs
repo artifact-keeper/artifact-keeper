@@ -1940,7 +1940,7 @@ async fn flatcontainer_fetch_target(
                     urlencoding::encode(id),
                     urlencoding::encode(version)
                 ),
-                format!("v2/package/{}/{}/package.nupkg", id, version),
+                v2_package_cache_path(id, version),
             ))
         }
     }
@@ -1990,8 +1990,28 @@ fn flatcontainer_v2_unsupported(sub_path: &str) -> Response {
 /// Proxy-cache path for a flat-container object — the key both the primary
 /// Remote arm and the repair arms cache under. Factored out so the #2921
 /// cache-to-storage copy cannot drift from the key the fetches write.
+///
+/// Goes through [`nuget_proxy_serve_key`], the shared `(cache_key, scannable)`
+/// helper (#4365 item 1), like every NuGet package cache key.
 fn flatcontainer_cache_path(sub_path: &str) -> String {
-    format!("v3/flatcontainer/{}", sub_path)
+    nuget_proxy_serve_key(&format!("v3/flatcontainer/{}", sub_path)).cache_key
+}
+
+/// The `{id}/{version}/{file}` flat-container sub-path of one package file,
+/// with the id lowercased as the flat container requires (and as every
+/// NuGet cache key is spelled), whatever case the client asked in.
+fn flatcontainer_package_sub_path(id: &str, version: &str, filename: &str) -> String {
+    format!("{}/{}/{}", id.to_lowercase(), version, filename)
+}
+
+/// Proxy-cache path for a package fetched from a V2 feed's
+/// `package/{id}/{version}` route (#4122), through the shared helper.
+fn v2_package_cache_path(id_lower: &str, version: &str) -> String {
+    nuget_proxy_serve_key(&format!(
+        "v2/package/{}/{}/package.nupkg",
+        id_lower, version
+    ))
+    .cache_key
 }
 
 /// Best-effort re-materialization of a Remote row's missing storage object
@@ -2346,7 +2366,9 @@ async fn proxy_v2_download(
                 let (url, _) = v3_flatcontainer_target(&resources, upstream_url, &encoded)?;
                 (
                     url,
-                    flatcontainer_cache_path(&format!("{}/{}/{}", id_lower, version, filename)),
+                    flatcontainer_cache_path(&flatcontainer_package_sub_path(
+                        &id_lower, version, &filename,
+                    )),
                 )
             }
             Ok(UpstreamProtocol::V2 { .. }) | Err(_) => (
@@ -2356,7 +2378,7 @@ async fn proxy_v2_download(
                     urlencoding::encode(id),
                     urlencoding::encode(version)
                 ),
-                format!("v2/package/{}/{}/package.nupkg", id_lower, version),
+                v2_package_cache_path(&id_lower, version),
             ),
         };
     if let Some(policy) = scan {
@@ -3458,11 +3480,8 @@ async fn virtual_member_download(
         return Err(proxy_helpers::no_accessible_members_response());
     }
     let db = state.db.clone();
-    let upstream_path = format!(
-        "v3/flatcontainer/{}/{}/{}",
-        package_id_lower, version, filename
-    );
-    let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+    let sub_path = flatcontainer_package_sub_path(package_id_lower, version, filename);
+    let upstream_path = flatcontainer_cache_path(&sub_path);
     let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| {
         let db = db.clone();
         let state = state.clone();
@@ -3679,7 +3698,8 @@ async fn flatcontainer_download(
                     // Resolve the upstream `PackageBaseAddress` from the service
                     // index and stream the .nupkg from there (#2775), through
                     // the scan gate when this repository scans on proxy (#4102).
-                    let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+                    let sub_path =
+                        flatcontainer_package_sub_path(&package_id_lower, &version, &filename);
                     return proxy_v3_flatcontainer(
                         &state,
                         proxy,
@@ -3839,7 +3859,8 @@ async fn flatcontainer_download(
                         .into_response());
                 };
 
-                let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+                let sub_path =
+                    flatcontainer_package_sub_path(&package_id_lower, &version, &filename);
                 // #4102: the scan-on-proxy policy both repair arms honour.
                 let repair_scan = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
 
@@ -12434,8 +12455,24 @@ mod serve_key_4365_tests {
             assert_eq!(got.scannable, scannable, "{path}");
         }
         assert_eq!(
-            nuget_proxy_serve_key(&flatcontainer_cache_path("a/1.0.0/a.1.0.0.nupkg")).cache_key,
+            flatcontainer_cache_path("a/1.0.0/a.1.0.0.nupkg"),
             "v3/flatcontainer/a/1.0.0/a.1.0.0.nupkg"
+        );
+        // A mixed-case id reaches the same lowercase key as every spelling of it.
+        for id in ["Newtonsoft.Json", "NEWTONSOFT.JSON", "newtonsoft.json"] {
+            assert_eq!(
+                flatcontainer_cache_path(&flatcontainer_package_sub_path(
+                    id,
+                    "13.0.1",
+                    "newtonsoft.json.13.0.1.nupkg"
+                )),
+                "v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+                "{id}"
+            );
+        }
+        assert_eq!(
+            v2_package_cache_path("chocolatey", "2.2.2"),
+            "v2/package/chocolatey/2.2.2/package.nupkg"
         );
     }
 }
