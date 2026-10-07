@@ -6,6 +6,7 @@
 //! supplied metadata or content, while Local members remain ungated.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +20,9 @@ use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::event_bus::EventBus;
 use crate::services::metrics_service;
 use crate::services::upstream_metadata::UpstreamMetadataCache;
+use crate::services::version_order::{
+    compare_natural_segment, compare_semver_prerelease_identifier,
+};
 
 pub const AUTO_APPROVE_REASON: &str = "auto-approved: crossed age threshold";
 
@@ -2004,7 +2008,15 @@ pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
 }
 
 /// Drop any `dist-tags` entry whose target version is no longer present in the
-/// filtered packument, then re-point `latest` to the newest surviving version.
+/// filtered packument, then re-point `latest` if the gate removed its target.
+///
+/// `latest` is the publisher's choice, so a surviving `latest` is kept even when
+/// a higher prerelease also survived: re-pointing it to the newest version would
+/// hand `npm install pkg` a nightly. When the gate removed it, the replacement is
+/// the newest allowed release at or below the old `latest`, then the newest
+/// allowed release, then the newest allowed version of any kind. A blocked
+/// prerelease `latest` is therefore replaced by a release whenever one
+/// survives.
 ///
 /// `allowed` is the set of versions that survived age-gate filtering and must be
 /// sorted newest-first. When `allowed` is empty every tag is removed, leaving an
@@ -2017,8 +2029,27 @@ fn reconcile_dist_tags(packument: &mut serde_json::Value, allowed: &[String]) {
     else {
         return;
     };
+    let previous_latest = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     dist_tags.retain(|_tag, target| target.as_str().is_some_and(|v| allowed_set.contains(v)));
-    if let Some(latest) = allowed.first() {
+    if dist_tags.contains_key("latest") {
+        return;
+    }
+
+    let is_release = |v: &&String| split_version_prerelease(v).1.is_none();
+    let replacement = allowed
+        .iter()
+        .filter(is_release)
+        .find(|v| {
+            previous_latest
+                .as_deref()
+                .is_none_or(|latest| version_compare(v, latest) <= 0)
+        })
+        .or_else(|| allowed.iter().find(is_release))
+        .or_else(|| allowed.first());
+    if let Some(latest) = replacement {
         dist_tags.insert(
             "latest".to_string(),
             serde_json::Value::String(latest.clone()),
@@ -2038,7 +2069,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
     let (main_a, pre_a) = split_version_prerelease(a);
     let (main_b, pre_b) = split_version_prerelease(b);
 
-    let main_cmp = compare_dot_segments(main_a, main_b);
+    let main_cmp = compare_dot_segments(main_a, main_b, compare_natural_segment);
     if main_cmp != 0 {
         return main_cmp;
     }
@@ -2047,7 +2078,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
         (None, None) => 0,
         (None, Some(_)) => 1,
         (Some(_), None) => -1,
-        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb),
+        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb, compare_semver_prerelease_identifier),
     }
 }
 
@@ -2058,10 +2089,13 @@ fn split_version_prerelease(version: &str) -> (&str, Option<&str>) {
 }
 
 /// Compare two dot-separated version segment lists (the numeric core such as
-/// `1.2.3`, or a prerelease tail such as `alpha.1`). Each segment is compared
-/// numerically when both sides parse as integers, otherwise lexically. Missing
-/// trailing segments default to `0`. Returns -1, 0, or 1.
-fn compare_dot_segments(a: &str, b: &str) -> i32 {
+/// `1.2.3`, or a prerelease tail such as `alpha.1`), one segment at a time with
+/// `compare_segment`. Missing trailing segments default to `0`. Returns -1, 0,
+/// or 1.
+///
+/// `compare_segment` must be a total order, or so is not the result: `sort_by`
+/// panics on a comparator with a cycle once the slice is long enough.
+fn compare_dot_segments(a: &str, b: &str, compare_segment: fn(&str, &str) -> Ordering) -> i32 {
     let seg_a: Vec<&str> = a.split('.').collect();
     let seg_b: Vec<&str> = b.split('.').collect();
 
@@ -2069,20 +2103,10 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
         let sa = seg_a.get(i).unwrap_or(&"0");
         let sb = seg_b.get(i).unwrap_or(&"0");
 
-        match (sa.parse::<u64>(), sb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                if na < nb {
-                    return -1;
-                }
-                if na > nb {
-                    return 1;
-                }
-            }
-            _ => match sa.cmp(sb) {
-                std::cmp::Ordering::Less => return -1,
-                std::cmp::Ordering::Greater => return 1,
-                std::cmp::Ordering::Equal => {}
-            },
+        match compare_segment(sa, sb) {
+            Ordering::Less => return -1,
+            Ordering::Greater => return 1,
+            Ordering::Equal => {}
         }
     }
     0
@@ -2720,6 +2744,96 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_dist_tags_keeps_surviving_latest_over_newer_prerelease() {
+        // typescript: `latest` is a release, nightlies above it are allowed too.
+        // `npm install typescript` must keep resolving to the release.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2", "next": "7.1.0-dev.20260926.1" },
+            "versions": { "7.0.2": {}, "7.1.0-dev.20260926.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["7.1.0-dev.20260926.1".to_string(), "7.0.2".to_string()],
+        );
+        let tags = packument["dist-tags"].as_object().unwrap();
+        assert_eq!(tags.get("latest"), Some(&serde_json::json!("7.0.2")));
+        assert_eq!(
+            tags.get("next"),
+            Some(&serde_json::json!("7.1.0-dev.20260926.1"))
+        );
+    }
+
+    #[test]
+    fn reconcile_dist_tags_repoints_blocked_latest_to_a_release_not_a_prerelease() {
+        // `latest` was blocked; the newest survivor is a prerelease and a release
+        // line above the old `latest` survives as well. Neither is a fit for
+        // `latest`: the replacement is the newest release at or below it.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2" },
+            "versions": { "8.0.0": {}, "7.1.0-dev.1": {}, "7.0.1": {}, "7.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "8.0.0".to_string(),
+                "7.1.0-dev.1".to_string(),
+                "7.0.1".to_string(),
+                "7.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("7.0.1"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_takes_a_newer_release_when_none_at_or_below_latest_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "3.0.0-rc.1": {}, "3.0.0": {}, "2.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "3.0.0".to_string(),
+                "3.0.0-rc.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("3.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_replaces_a_blocked_prerelease_latest_with_a_release() {
+        // A publisher may tag a prerelease as `latest`. When the gate blocks
+        // it, the replacement is the newest release below it, not an older
+        // prerelease of the same line.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0-beta.5" },
+            "versions": { "3.0.0-beta.4": {}, "2.9.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["3.0.0-beta.4".to_string(), "2.9.0".to_string()],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.9.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_falls_back_to_a_prerelease_when_no_release_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0-rc.2": {}, "1.0.0-rc.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["1.0.0-rc.2".to_string(), "1.0.0-rc.1".to_string()],
+        );
+        assert_eq!(
+            packument["dist-tags"]["latest"],
+            serde_json::json!("1.0.0-rc.2")
+        );
+    }
+
+    #[test]
     fn reconcile_dist_tags_removes_dangling_non_latest_tag() {
         // A prerelease `beta` tag points at a blocked version; it must be dropped so
         // `npm install pkg@beta` does not resolve to a missing manifest.
@@ -3214,6 +3328,81 @@ mod tests {
         assert!(version_compare("2.0.0-beta", "2.0.0-alpha") > 0);
         // Identical prerelease tails are equal.
         assert_eq!(version_compare("1.0.0-alpha.1", "1.0.0-alpha.1"), 0);
+    }
+
+    #[test]
+    fn version_compare_numeric_prerelease_sorts_below_alphanumeric() {
+        // SemVer 2.0.0 §11.4.3: numeric identifiers have lower precedence
+        // than alphanumeric ones, whatever their lexical order.
+        assert!(version_compare("2.0.0-next.103", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.2150693d", "2.0.0-next.74") > 0);
+        assert!(version_compare("1.0.0-1", "1.0.0-alpha") < 0);
+    }
+
+    #[test]
+    fn version_compare_ranks_digit_led_core_segments_by_their_digits() {
+        // The core uses natural order, not the SemVer prerelease rule, so a
+        // PyPI pre-release or a build suffix stays below the next release.
+        assert!(version_compare("2.0.0rc1", "2.0.1") < 0);
+        assert!(version_compare("1.1rc1", "1.2") < 0);
+        assert!(version_compare("2.0.0+cu118", "2.0.1") < 0);
+    }
+
+    #[test]
+    fn version_compare_is_transitive_across_numeric_and_hash_prereleases() {
+        // The three versions that formed a cycle under the old comparator.
+        let cycle = ["2.0.0-next.74", "2.0.0-next.103", "2.0.0-next.2150693d"];
+        for a in cycle {
+            for b in cycle {
+                for c in cycle {
+                    if version_compare(a, b) <= 0 && version_compare(b, c) <= 0 {
+                        assert!(version_compare(a, c) <= 0, "{a} <= {b} <= {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_npm_packument_blocks_sorts_mixed_prereleases_without_panicking() {
+        // The version keys of confusing-browser-globals, whose packument made
+        // `sort_by` panic with "user-provided comparison function does not
+        // correctly implement a total order". Insertion sort on a short slice
+        // never notices, so the test needs the full, long list.
+        let keys: Vec<&str> = concat!(
+            "0.0.0 1.0.1 1.0.2 1.0.3 1.0.4 1.0.5 1.0.5-next.9b4009d7 1.0.5-next.c662dfb0 ",
+            "1.0.6 1.0.6-next.6a95aae9 1.0.7 1.0.8 1.0.9 1.0.10 1.0.11 1.1.0-next.14 ",
+            "1.1.0-next.61 1.1.0-next.62 1.1.0-next.85 1.1.0-next.103 2.0.0-next.03604a46 ",
+            "2.0.0-next.096703ab 2.0.0-next.101 2.0.0-next.102 2.0.0-next.103 ",
+            "2.0.0-next.104 2.0.0-next.2150693d 2.0.0-next.247 2.0.0-next.260 ",
+            "2.0.0-next.279 2.0.0-next.281 2.0.0-next.299 2.0.0-next.300 ",
+            "2.0.0-next.3e165448 2.0.0-next.47d2d941 2.0.0-next.66cc7a90 2.0.0-next.74 ",
+            "2.0.0-next.75 2.0.0-next.81 2.0.0-next.91 2.0.0-next.9754a231 ",
+            "2.0.0-next.a671462c 2.0.0-next.b0cbf2ca 2.0.0-next.b2fd8db8 ",
+            "2.0.0-next.fb6e6f70 ",
+        )
+        .split_whitespace()
+        .collect();
+        let versions: serde_json::Map<String, serde_json::Value> = keys
+            .iter()
+            .map(|k| (k.to_string(), serde_json::json!({})))
+            .collect();
+        let mut packument = serde_json::json!({
+            "dist-tags": {"latest": "1.0.11"},
+            "versions": versions,
+        });
+
+        let allowed = apply_npm_packument_blocks(&mut packument, &std::collections::HashSet::new());
+
+        assert_eq!(allowed.len(), keys.len());
+        for pair in allowed.windows(2) {
+            assert!(version_compare(&pair[0], &pair[1]) >= 0, "{pair:?}");
+        }
+        // Numeric prereleases rank below hash prereleases of the same core.
+        let pos = |v: &str| allowed.iter().position(|a| a == v).unwrap();
+        assert!(pos("2.0.0-next.2150693d") < pos("2.0.0-next.300"));
+        assert!(pos("2.0.0-next.300") < pos("2.0.0-next.74"));
     }
 
     #[test]

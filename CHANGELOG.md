@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **WASM plugin runtime updated to wasmtime 36.0.17** (#4361; RUSTSEC-2026-0321, RUSTSEC-2026-0322, RUSTSEC-2026-0323). A WASM plugin guest could get around its fuel limit through WASI preview 0 `poll_oneoff`, make the host allocate excessive memory when it had no stdio, or read uninitialized host memory through `fd_readdir`. All three are fixed upstream in 36.0.17; no configuration change is needed.
 
+### Fixed
+
+- **An npm package that mixes numeric and hash prerelease versions no longer panics its packument request through an age-gated repository** (#4524, #4454, #4431). `confusing-browser-globals` publishes `2.0.0-next.74`, `-next.103` and `-next.2150693d`, and the version comparator ordered them `74 < 103 < 2150693d < 74`: numeric between two numbers, lexical otherwise. `sort_by` panicked on that cycle, the connection dropped, and every request for the package failed; invalidating the cache did not help. Version segments are now compared in natural order: leading digits by value, then the rest lexically. npm prerelease identifiers follow SemVer 2.0.0 §11.4.3, where a numeric identifier ranks below an alphanumeric one. The curation comparator behind the Hex, NuGet and package version listings had the same cycle and uses the same natural order. That comparator also evaluates curation version rules (`< X`, `>= X`), so those rules change in the same edge shapes: `1.9a1` now counts as below `1.10`, and a Debian/RPM version with an epoch against a multi-digit major flips (`1:2.0-1` now compares below `10.0-1`, where it compared above by accident). Epochs are still not parsed (#4507).
+
+- **The age gate keeps an npm package's own `latest` tag instead of re-pointing it to the newest allowed version** (#4524, #4454, #4432). Every gated packument had `latest` set to the newest version that passed the gate, prereleases included, so `npm install typescript` resolved to a nightly build and `next` to a canary. A `latest` the gate allows is now kept. When the gate blocks it, `latest` moves to the newest allowed release at or below it, then the newest allowed release, then the newest allowed version of any kind.
+
 ## [1.10.2] - 2026-10-01
 
 ### Security
