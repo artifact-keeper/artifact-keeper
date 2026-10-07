@@ -66,13 +66,22 @@ only the base of the redirect URL changes. The value may carry a path
 strings, fragments and userinfo are rejected at startup. SAS tokens are issued
 with `spr=https`, so real Azure Storage requires an `https` public endpoint.
 
+The proxy rule is the **opposite of S3's**: Azure Storage identifies the
+storage account from the `Host` header, so a reverse proxy in front of
+`<account>.blob.core.windows.net` must rewrite `Host` to the account host.
+Alternatively, the public host must be registered as the account's custom
+domain. (Azurite and other path-style endpoints take the account from the
+path instead.)
+
 ## Checking it
 
-With the backend running, request a download without following the redirect and look
-at the `Location` header:
+With the backend running, send a GET that does not follow the redirect and
+look at the `Location` header. Do not use `curl -I`: `HEAD` is never
+redirected, so it shows no `Location`.
 
 ```bash
-curl -sI -u user:token https://ak.example.com/v2/<name>/blobs/<digest> | grep -i location
+curl -s -o /dev/null -D - -u user:token \
+  https://ak.example.com/v2/<name>/blobs/<digest> | grep -i '^location'
 ```
 
 The host must be the public endpoint, and fetching that URL from outside the

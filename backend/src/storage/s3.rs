@@ -1661,14 +1661,22 @@ impl S3Backend {
     /// same, so the URL is signed exactly as the backend would sign it for
     /// itself, just for the host the client will send (SigV4 signs the
     /// `host` header, so it cannot be rewritten after signing).
+    ///
+    /// CloudFront, when configured, signs every client URL itself, so the
+    /// public endpoint is ignored there (it would never be used).
     fn signing_config(config: &S3Config) -> Option<S3Config> {
         let dedicated_creds =
             config.presign_access_key.is_some() && config.presign_secret_key.is_some();
-        if !dedicated_creds && config.public_endpoint.is_none() {
+        let public_endpoint = config
+            .public_endpoint
+            .as_ref()
+            .filter(|_| config.cloudfront.is_none());
+        if !dedicated_creds && public_endpoint.is_none() {
             return None;
         }
         let mut signing = config.clone();
-        if let Some(public) = &config.public_endpoint {
+        signing.public_endpoint = public_endpoint.cloned();
+        if let Some(public) = public_endpoint {
             signing.endpoint = Some(public.clone());
         }
         Some(signing)
@@ -1677,7 +1685,18 @@ impl S3Backend {
     /// Build the presign-only store (see [`Self::signing_store`]): dedicated
     /// `S3_PRESIGN_*` credentials when set, otherwise the normal credential
     /// chain, and `S3_PUBLIC_ENDPOINT` as the endpoint when set.
+    ///
+    /// Without dedicated keys the store resolves its own copy of the
+    /// credential chain, so under IRSA / ECS / web identity it fetches and
+    /// caches credentials separately from [`Self::store`] (harmless, one extra
+    /// STS or container-credential call per refresh).
     fn build_signing_store(config: &S3Config) -> Result<Option<AmazonS3>> {
+        if config.public_endpoint.is_some() && config.cloudfront.is_some() {
+            tracing::info!(
+                "S3_PUBLIC_ENDPOINT is ignored: CloudFront is configured and signs the \
+                 presigned download URLs"
+            );
+        }
         let Some(signing) = Self::signing_config(config) else {
             return Ok(None);
         };
@@ -4411,6 +4430,52 @@ mod tests {
         let mut half = S3Config::new("b".into(), "us-east-1".into(), None, None);
         half.presign_access_key = Some("ak".into());
         assert!(S3Backend::signing_config(&half).is_none());
+    }
+
+    fn test_cloudfront_config() -> CloudFrontConfig {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        CloudFrontConfig {
+            distribution_url: "https://d1234.cloudfront.net".to_string(),
+            key_pair_id: "KTEST4417".to_string(),
+            private_key: key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cloudfront_takes_precedence_over_public_endpoint_4417() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        )
+        .with_public_endpoint("https://dl.example.com")
+        .with_cloudfront(test_cloudfront_config())
+        .with_redirect_downloads(true);
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "CloudFront signs client URLs; the public endpoint must not build a signer"
+        );
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, "a.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(presigned.source, PresignedUrlSource::CloudFront);
+        assert!(
+            presigned
+                .url
+                .starts_with("https://d1234.cloudfront.net/a.bin?"),
+            "{}",
+            presigned.url
+        );
     }
 
     #[tokio::test]

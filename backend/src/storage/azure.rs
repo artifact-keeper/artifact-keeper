@@ -1000,6 +1000,18 @@ impl AzureBackend {
         expires_in: Duration,
         signed_permissions: &str,
     ) -> Result<String> {
+        self.generate_sas_token_at(key, expires_in, signed_permissions, Utc::now())
+    }
+
+    /// [`Self::generate_sas_token_with_permissions`] for an explicit issue
+    /// time, so tests can pin the otherwise clock-derived `st`/`se`.
+    fn generate_sas_token_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        signed_permissions: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
         let decoded_key = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => decoded_key,
             AzureAuthMode::TokenCredential { .. } => {
@@ -1010,7 +1022,6 @@ impl AzureBackend {
             }
         };
 
-        let now = Utc::now();
         let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
         // Backdate the start time to tolerate clock skew between this host
         // and the Azure storage service (Azure's documented guidance is a
@@ -1078,7 +1089,16 @@ impl AzureBackend {
     /// on [`Self::presented_base_url`]. Backend-internal reads keep
     /// `generate_sas_url` so they never leave the internal endpoint.
     fn generate_client_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
-        let sas_token = self.generate_sas_token(key, expires_in)?;
+        self.client_sas_url_at(key, expires_in, Utc::now())
+    }
+
+    fn client_sas_url_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
+        let sas_token = self.generate_sas_token_at(key, expires_in, "r", now)?;
         let url = Self::blob_url_on(&self.presented_base_url(), &self.config.container_name, key);
         Ok(format!("{}?{}", url, sas_token))
     }
@@ -2178,11 +2198,6 @@ mod tests {
 
     // ── AZURE_STORAGE_PUBLIC_ENDPOINT (#4417) ───────────────────────────
 
-    /// The SAS query string of `url` (everything after `?`).
-    fn sas_query(url: &str) -> &str {
-        url.split_once('?').map(|(_, q)| q).unwrap_or_default()
-    }
-
     #[tokio::test]
     async fn test_presigned_url_without_public_endpoint_is_unchanged_4417() {
         let mut config = create_test_config();
@@ -2228,23 +2243,22 @@ mod tests {
                 "{public}: {}",
                 presigned.url
             );
-            // The SAS token signs account/container/blob, not the host: the
-            // client URL carries exactly the token the internal URL would.
-            let internal = backend
-                .generate_sas_url("a/b.bin", Duration::from_secs(60))
+            // The SAS token signs account/container/blob, not the host: for a
+            // pinned issue time the client URL carries exactly the token the
+            // internal URL would, on the public base.
+            let now = Utc::now();
+            let token = backend
+                .generate_sas_token_at("a/b.bin", Duration::from_secs(60), "r", now)
                 .unwrap();
-            assert!(internal.starts_with("http://azurite.internal:10000/"));
-            let (pub_q, int_q) = (sas_query(&presigned.url), sas_query(&internal));
-            let sig = |q: &str| {
-                q.split('&')
-                    .find(|p| p.starts_with("sig="))
-                    .map(str::to_string)
-            };
-            assert!(sig(pub_q).is_some());
-            // Same second => same st/se => identical signature.
-            if pub_q.split("&sig=").next() == int_q.split("&sig=").next() {
-                assert_eq!(sig(pub_q), sig(int_q));
-            }
+            let client = backend
+                .client_sas_url_at("a/b.bin", Duration::from_secs(60), now)
+                .unwrap();
+            assert_eq!(client, format!("{want_prefix}{token}"));
+            assert_eq!(
+                backend.blob_url("a/b.bin"),
+                "http://azurite.internal:10000/testaccount/testcontainer/a/b.bin",
+                "backend-internal URLs keep the internal endpoint"
+            );
         }
     }
 

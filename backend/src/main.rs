@@ -512,20 +512,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // Try to register additional backends if credentials are available and
         // they are not already the primary backend.
         if config.storage_backend != "s3" {
-            if let Ok(s3) = artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
-                tracing::info!("Additional S3 storage backend registered");
-                backends.insert("s3".to_string(), Arc::new(s3));
+            match artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
+                Ok(s3) => {
+                    tracing::info!("Additional S3 storage backend registered");
+                    backends.insert("s3".to_string(), Arc::new(s3));
+                }
+                // Not configured (no S3_BUCKET, no credentials) is the normal
+                // case and stays silent; a malformed public endpoint is an
+                // operator mistake worth surfacing (#4417).
+                Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional S3 storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "azure" {
-            if let Ok(azure_cfg) = artifact_keeper_backend::storage::azure::AzureConfig::from_env()
-            {
-                if let Ok(azure) =
-                    artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
-                {
-                    tracing::info!("Additional Azure storage backend registered");
-                    backends.insert("azure".to_string(), Arc::new(azure));
+            match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
+                Ok(azure_cfg) => {
+                    if let Ok(azure) =
+                        artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
+                    {
+                        tracing::info!("Additional Azure storage backend registered");
+                        backends.insert("azure".to_string(), Arc::new(azure));
+                    }
                 }
+                Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional Azure storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
