@@ -284,6 +284,8 @@ FAILED=0
 echo "--- A1: exactly one upstream fetch ---"
 A1=$(assert_fetch_counter_one "$POST_COUNT"); A1_RC=$?
 if [ "$A1_RC" -eq 0 ]; then echo -e "  ${GREEN}$A1${NC}"; else echo -e "  ${RED}$A1${NC}"; FAILED=$((FAILED+1)); fi
+A1_WARN=$(fetch_count_warning "$POST_COUNT" "$((END_TIME - START_TIME))" "${PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS:-65}")
+if [ -n "$A1_WARN" ]; then echo -e "  ${YELLOW}$A1_WARN${NC}"; fi
 
 echo "--- A2: every response 200 + correct sha256 ---"
 A2=$(assert_all_responses_ok "$RESULTS_DIR/results.csv" "$EXPECTED_SHA"); A2_RC=$?

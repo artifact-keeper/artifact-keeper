@@ -2300,15 +2300,20 @@ mod tests {
             Duration::from_millis(60),
         ));
         let opens = Arc::new(AtomicUsize::new(0));
+        // The leader's open (after its wait times out) is held until every
+        // other request has joined as a follower, so none can arrive late.
+        let (gate_tx, gate_rx) = watch::channel(false);
         let mut tasks = Vec::new();
         for _ in 0..5 {
             let coord = Arc::clone(&coord);
             let key = key.clone();
             let opens = Arc::clone(&opens);
+            let mut gate_rx = gate_rx.clone();
             tasks.push(tokio::spawn(async move {
                 let handle = coord
                     .coordinate_stream(&key, || async move {
                         opens.fetch_add(1, Ordering::SeqCst);
+                        let _ = gate_rx.wait_for(|open| *open).await;
                         Ok(StreamHandle {
                             body: body_of(&[b"hello ", b"world"]),
                             headers: test_headers(),
@@ -2323,15 +2328,75 @@ mod tests {
                 }
             }));
         }
+        await_subscribers(&key, 4).await;
+        gate_tx.send_replace(true);
         let mut served = 0;
         for task in tasks {
-            if let Some(bytes) = task.await.expect("join").expect("no error") {
-                assert_eq!(bytes, b"hello world");
-                served += 1;
-            }
+            let bytes = task
+                .await
+                .expect("join")
+                .expect("no error")
+                .expect("every request is served by the per-process leader");
+            assert_eq!(bytes, b"hello world");
+            served += 1;
         }
         assert_eq!(opens.load(Ordering::SeqCst), 1, "one fetch per process");
-        assert!(served >= 1, "the per-process leader serves its client");
+        assert_eq!(served, 5, "the leader and its 4 followers are all served");
+    }
+
+    /// #4013 review: an in-process leader cancelled WHILE blocked on the
+    /// cluster lock releases the followers parked on it (they re-enter with
+    /// `Ok(None)`), and the next request re-elects and fetches once the
+    /// remote leader is gone.
+    #[tokio::test]
+    async fn advisory_streaming_cancelled_waiting_leader_releases_parked_followers() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let key = format!("proxy-stream:cancel-wait-{}", uuid::Uuid::new_v4());
+        let remote = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
+            .await
+            .expect("no error")
+            .expect("held");
+        let coord = Arc::new(advisory_over(&lock));
+        let spawn_request = |coord: Arc<AdvisoryLockCoordinator>, key: String| {
+            tokio::spawn(async move {
+                coord
+                    .coordinate_stream(&key, never_opens)
+                    .await
+                    .map(|h| h.is_none())
+            })
+        };
+        let leader = spawn_request(Arc::clone(&coord), key.clone());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let followers: Vec<_> = (0..2)
+            .map(|_| spawn_request(Arc::clone(&coord), key.clone()))
+            .collect();
+        await_subscribers(&key, 2).await;
+        leader.abort();
+        for follower in followers {
+            let reentered = tokio::time::timeout(Duration::from_secs(2), follower)
+                .await
+                .expect("released when the leader is cancelled")
+                .expect("join")
+                .expect("no error");
+            assert!(reentered, "a parked follower re-enters, never opens");
+        }
+        remote.release().await;
+        let opens = AtomicUsize::new(0);
+        let handle = coord
+            .coordinate_stream(&key, || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(StreamHandle {
+                    body: body_of(&[b"ok"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            })
+            .await
+            .expect("ok")
+            .expect("re-elected leader");
+        assert_eq!(drain(handle.body).await.expect("bytes"), b"ok");
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 
     /// #4013: N concurrent in-process requests touch the cluster lock ONCE

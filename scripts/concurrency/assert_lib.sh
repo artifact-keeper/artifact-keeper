@@ -58,6 +58,22 @@ assert_fetch_counter_one() {
     return 0
 }
 
+# fetch_count_warning <count> <storm_secs> <wait_timeout_secs> -> prints a WARN
+# line, or nothing. A1 may PASS with more than one fetch under the LARGE
+# tolerance (#4013), which would also hide a regression that adds one fetch
+# per replica. Keep such a result visible: more than one fetch in a storm that
+# ended before PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS cannot be the timeout
+# floor and is almost certainly a coordination bug.
+fetch_count_warning() {
+    local count="$1" storm="$2" wait="$3"
+    [ "$count" -gt 1 ] || return 0
+    if [ "$storm" -lt "$wait" ]; then
+        echo "WARN $count upstream fetches although the storm (${storm}s) ended before the lock wait timeout (${wait}s): not the per-replica floor, likely a single-flight regression"
+    else
+        echo "WARN $count upstream fetches: within tolerance; the storm (${storm}s) outlived the lock wait timeout (${wait}s), so the per-replica floor applies"
+    fi
+}
+
 # assert_all_responses_ok <results_csv> <expected_sha256>
 # A2: EVERY response is HTTP 200 and its sha256 == the published digest.
 # CSV columns: idx,status,sha256,bytes

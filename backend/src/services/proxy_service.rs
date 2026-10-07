@@ -16770,6 +16770,152 @@ mod tests {
     }
 
     /// Drain a streaming proxy body into a single `Vec<u8>`.
+    /// #4013 review: the streaming leader's handle carries the tee writer's
+    /// publish signal, which flips only once the cache entry is committed.
+    /// (The cross-replica lock is released on it; without it the lock would
+    /// be released at the client's EOF, before the sidecar exists.)
+    #[tokio::test]
+    async fn test_streaming_leader_handle_carries_the_cache_publish_signal() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"publish-signal-body".to_vec();
+        let artifact = "org/acme/sig/1.0/sig-1.0.jar";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{artifact}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("ak-4013-sig-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for(
+            &format!("sig-{}", Uuid::new_v4()),
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        );
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+        let handle = proxy
+            .open_streaming_leader(&repo, artifact, artifact, cache_key, metadata_key, None)
+            .await
+            .expect("leader opens");
+        let mut published = handle
+            .cache_published
+            .clone()
+            .expect("a tee'd leader body must carry its publish signal");
+        assert!(
+            !*published.borrow(),
+            "nothing is published before the body is read"
+        );
+        assert_eq!(drain_stream(handle.body).await, body);
+        tokio::time::timeout(Duration::from_secs(10), published.wait_for(|done| *done))
+            .await
+            .expect("publish finishes")
+            .expect("signal observed");
+        assert!(
+            proxy.is_cache_fresh(&repo.key, artifact).await,
+            "when the signal flips, the entry is committed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4013 review: a streaming re-enter must forget the miss its own cache
+    /// check memoised. Another replica may have filled the shared cache in
+    /// the meantime, and its publish only invalidated ITS process's LRU.
+    #[tokio::test]
+    async fn test_streaming_reenter_forgets_the_memoised_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_hydration::coordinate_stream_fanout;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("ak-4013-reenter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        // No upstream is ever contacted: the attempt below falls back.
+        let repo = remote_repo_for(
+            &format!("reenter-{}", Uuid::new_v4()),
+            "http://upstream.invalid",
+            tmp.to_str().unwrap(),
+        );
+        let artifact = "org/acme/re/1.0/re-1.0.jar";
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+
+        // An in-process leader for the same object that has already started
+        // emitting, so the attempt is a late arrival: it waits for the
+        // leader and then asks the caller to re-enter (`Ok(None)`).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        let leader_body: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|i| (i, rx))
+            }));
+        let leader = coordinate_stream_fanout(&format!("proxy-stream:{cache_key}"), || async {
+            Ok(StreamHandle {
+                body: leader_body,
+                headers: Default::default(),
+                cache_published: None,
+            })
+        })
+        .await
+        .expect("ok")
+        .expect("leader");
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::spawn(async move {
+            let mut body = leader.body;
+            let _ = body.next().await;
+            let _ = first_tx.send(());
+            while body.next().await.is_some() {}
+        });
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("send");
+        first_rx.await.expect("leader started emitting");
+
+        let attempt = {
+            let proxy = Arc::clone(&proxy);
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                proxy
+                    .try_fetch_artifact_streaming_once(&repo, artifact, artifact, None)
+                    .await
+                    .map(|r| r.is_none())
+            })
+        };
+        let lru = proxy_metadata_lru().await;
+        let mut memoised = false;
+        for _ in 0..100 {
+            if matches!(lru.get(&metadata_key).await, Some(None)) {
+                memoised = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(memoised, "the attempt's cache check memoised the miss");
+        drop(tx);
+        let reentered = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("attempt finishes with the leader")
+            .expect("join")
+            .expect("no error");
+        drain.await.expect("drain");
+        assert!(reentered, "a late arrival asks the caller to re-enter");
+        assert!(
+            lru.get(&metadata_key).await.is_none(),
+            "the re-enter must re-read the sidecar, not the memoised miss"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
