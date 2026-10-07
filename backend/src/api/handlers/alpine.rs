@@ -1539,6 +1539,8 @@ async fn store_apk(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, content.len() as i64).await?;
+
     // Store the file
     let storage_key = build_alpine_storage_key(repo.id, &artifact_path);
     let storage = state
@@ -1558,6 +1560,13 @@ async fn store_apk(
     let size_bytes = content.len() as i64;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1577,9 +1586,10 @@ async fn store_apk(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
