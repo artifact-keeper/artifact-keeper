@@ -640,11 +640,19 @@ fn rotation_audit_details(
     overlap_seconds: u64,
     overlap_ends_at: DateTime<Utc>,
     co_sign_problem: Option<&str>,
+    repointed_repository_ids: &[Uuid],
 ) -> serde_json::Value {
     let ends_at = (overlap_seconds > 0).then(|| overlap_ends_at.to_rfc3339());
+    let repointed: Vec<String> = repointed_repository_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect();
     let mut details = serde_json::json!({
         "new_key_id": new_key_id.to_string(),
         "overlap_ends_at": ends_at,
+        // Every repository whose signing config moved to the successor
+        // (#4416); a key can be bound to repositories other than its own.
+        "repointed_repository_ids": repointed,
     });
     if let Some(reason) = co_sign_problem {
         details["overlap_skipped"] = serde_json::Value::from(reason);
@@ -1983,12 +1991,13 @@ impl SigningService {
         //     leave those configs on a retired key, and every InRelease /
         //     Release.gpg / repomd.xml.asc request 404s (#4416). Guarded on
         //     the old id so a concurrent winner's repoint is never clobbered.
-        sqlx::query!(
-            "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE signing_key_id = $2",
+        //     The repointed repositories are recorded in the `rotated` audit.
+        let repointed = sqlx::query_scalar!(
+            "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE signing_key_id = $2 RETURNING repository_id",
             new_id,
             old_key_id,
         )
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
         // (3) Deactivate the old key LAST, recording when its rotation overlap
@@ -2019,6 +2028,7 @@ impl SigningService {
                 overlap_seconds,
                 overlap_ends_at,
                 co_sign_problem,
+                &repointed,
             )),
         )
         .await?;
@@ -4499,15 +4509,20 @@ mod tests {
     fn rotation_audit_records_the_window_end_or_why_there_is_none() {
         let id = Uuid::new_v4();
         let end = Utc::now() + Duration::days(14);
-        let d = rotation_audit_details(id, 60, end, None);
+        let repo = Uuid::new_v4();
+        let d = rotation_audit_details(id, 60, end, None, &[repo]);
         assert_eq!(d["new_key_id"], id.to_string());
+        assert_eq!(
+            d["repointed_repository_ids"],
+            serde_json::json!([repo.to_string()])
+        );
         assert_eq!(d["overlap_ends_at"], end.to_rfc3339());
         assert!(d.get("overlap_skipped").is_none());
 
-        let d = rotation_audit_details(id, 0, end, None);
+        let d = rotation_audit_details(id, 0, end, None, &[]);
         assert!(d["overlap_ends_at"].is_null(), "overlap disabled");
 
-        let d = rotation_audit_details(id, 0, end, Some("public key is not OpenPGP"));
+        let d = rotation_audit_details(id, 0, end, Some("public key is not OpenPGP"), &[]);
         assert!(d["overlap_ends_at"].is_null());
         assert_eq!(d["overlap_skipped"], "public key is not OpenPGP");
     }
@@ -4867,6 +4882,16 @@ mod tests {
         }
         let other = service.get_active_key_for_repo(other_repo).await.unwrap();
         assert_eq!(other.map(|k| k.id), Some(other_key));
+        let audit = audit_details(&pool, unscoped.id, "rotated").await;
+        let mut recorded: Vec<String> =
+            serde_json::from_value(audit[0]["repointed_repository_ids"].clone()).unwrap();
+        recorded.sort();
+        let mut expected: Vec<String> = repos.iter().map(Uuid::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            recorded, expected,
+            "the rotation audit names every repointed repository"
+        );
     }
 
     #[tokio::test]
