@@ -950,6 +950,8 @@ pub async fn proxy_fetch_capped_with_accept(
             upstream_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
+        // A refusal of an anonymous bearer token never gets here (#4527), so
+        // for what does, configured credentials were sent to the upstream.
         let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
         crate::services::proxy_service::oci_registry_auth_error(
             error,
