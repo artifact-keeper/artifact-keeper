@@ -1,0 +1,14 @@
+-- #4426: rebuild the cross-artifact scan dedup index with
+-- `origin = 'local_scan'` in its predicate, online, in three steps:
+--   273 (this file)  clear any leftover of the new index
+--   274              CREATE INDEX CONCURRENTLY the new index
+--   275              DROP INDEX CONCURRENTLY the old idx_scan_results_dedup
+-- (docs/operations/online-migrations.md, "Index build"). scan_results is a
+-- hot table, so neither index is ever built or dropped under a write lock.
+--
+-- The next migration is `-- no-transaction`: if it fails part-way it is NOT
+-- rolled back and NOT recorded, so it re-runs on the next boot, and
+-- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would skip a leftover INVALID
+-- index and leave it invalid forever. Drop first, unconditionally. On a
+-- normal upgrade the index does not exist and this is a catalogue no-op.
+DROP INDEX IF EXISTS idx_scan_results_dedup_local;

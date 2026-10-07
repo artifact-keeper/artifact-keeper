@@ -4001,6 +4001,67 @@ mod tests {
             cleanup_repo(&pool, repo_id).await;
         }
 
+        /// #4426: the dedup partial index carries `origin = 'local_scan'`
+        /// (migrations 273-275) and the old index without it is gone.
+        #[tokio::test]
+        async fn dedup_index_predicate_requires_local_scan_origin() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let defs: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT c.relname::text, pg_get_indexdef(i.indexrelid), i.indisvalid \
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                  WHERE i.indrelid = 'scan_results'::regclass \
+                    AND c.relname IN ('idx_scan_results_dedup', 'idx_scan_results_dedup_local')",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("index catalog");
+            assert_eq!(defs.len(), 1, "exactly one dedup index: {defs:?}");
+            let (name, def, valid) = &defs[0];
+            assert_eq!(name, "idx_scan_results_dedup_local");
+            assert!(valid, "the concurrent build must leave a valid index");
+            assert!(
+                def.contains("origin = 'local_scan'"),
+                "dedup index predicate must require local_scan: {def}"
+            );
+            assert!(def.contains("= 'completed'"), "{def}");
+        }
+
+        /// #4426: the planner can still serve `find_reusable_scan` from the
+        /// rebuilt index. The query's predicate must imply the index
+        /// predicate, so this fails if either side drifts. Sequential scan is
+        /// disabled so the assertion is about the index being usable, not
+        /// about row estimates on a test-sized table.
+        #[tokio::test]
+        async fn find_reusable_scan_can_use_the_dedup_index() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut tx = pool.begin().await.expect("tx");
+            sqlx::query("SET LOCAL enable_seqscan = off")
+                .execute(&mut *tx)
+                .await
+                .expect("seqscan off");
+            let plans: Vec<String> = sqlx::query_scalar(
+                "EXPLAIN SELECT id FROM scan_results \
+                  WHERE checksum_sha256 = 'abc' AND scan_type = 'grype' \
+                    AND status = 'completed' AND scan_completeness <> 'not_cataloged' \
+                    AND origin = 'local_scan' AND source_scan_id IS NULL \
+                    AND pin_identity IS NOT DISTINCT FROM NULL \
+                  ORDER BY completed_at DESC LIMIT 1",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .expect("explain");
+            tx.rollback().await.expect("rollback");
+            let plan = plans.join("\n");
+            assert!(
+                plan.contains("idx_scan_results_dedup_local"),
+                "find_reusable_scan must be able to use the dedup index, got:\n{plan}"
+            );
+        }
+
         /// #1059 coverage: recalculate_score runs end-to-end inside the
         /// transaction wrap. Exercises tx.begin, the three queries that
         /// each take `&mut *tx`, and tx.commit.
