@@ -10743,9 +10743,9 @@ struct PushedManifest<'a> {
     uploaded_by: Uuid,
 }
 
-/// Commit a pushed manifest's tag, references, storage-quota admission and
-/// `artifacts` row on ONE transaction (#4422), returning the artifact id or
-/// the OCI error the push answers. Nothing commits unless everything does.
+/// Commit a pushed manifest's tag, references and `artifacts` row on ONE
+/// transaction (#4422), returning the artifact id or the OCI error the push
+/// answers. Nothing commits unless everything does.
 async fn commit_pushed_manifest(
     state: &SharedState,
     m: PushedManifest<'_>,
@@ -10771,18 +10771,11 @@ async fn commit_pushed_manifest(
     )
     .await
     .map_err(|e| internal(&e))?;
-    if let Some(refusal) = oci_quota_refusal(
-        super::publish_quota::locked_quota_denial(
-            &mut tx,
-            &state.db,
-            m.repo_id,
-            m.artifact_path,
-            m.total_size,
-        )
-        .await,
-    ) {
-        return Err(refusal);
-    }
+    // No storage-quota admission for the manifest row (#4422): it records the
+    // IMAGE size (#3601), whose config and layer bytes were already admitted
+    // blob by blob, so charging it again would fill a capped repository at
+    // half its real bytes. It is charged 0 until the ledger stops counting it
+    // (#4545); see the marker on `upsert_manifest_artifact`.
     let artifact_id = upsert_manifest_artifact(
         &mut *tx,
         m.repo_id,
@@ -10847,6 +10840,9 @@ where
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    // NO-QUOTA-ADMISSION: a manifest row records the image size, whose bytes
+    // are admitted blob by blob; it is charged 0 until #4545 re-stamps the
+    // ledger (a push, a migration import and a reindex all land here).
     sqlx::query_scalar(
         r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by, origin)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -10994,13 +10990,6 @@ async fn handle_put_manifest(
             );
         }
     };
-    // #4422: refuse an over-quota push before the manifest is stored.
-    if let Some(refusal) = oci_quota_refusal(
-        super::publish_quota::preflight_quota_denial(&state.db, repo_id, total_size).await,
-    ) {
-        return refusal;
-    }
-
     // Store manifest
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -11037,16 +11026,15 @@ async fn handle_put_manifest(
     // rows that pre-date this code, but is no longer needed to repair a push
     // that returned 201.
     //
-    // #4422: the tag, its references, the quota admission and the manifest's
-    // `artifacts` row all commit on ONE transaction (one pooled connection).
-    // Holding a quota-locked transaction open while a second connection
-    // committed the tag starved the pool under concurrent pushes, and formed
-    // a lock cycle with the blob-GC sweep that Postgres could not see
-    // (connection A: ledger row; B: `oci_blobs` rows; GC: `oci_blobs` then
-    // ledger). On one connection the referenced `oci_blobs` rows are locked
-    // first (inside `persist_tag_and_refs_in_tx`), then the ledger, which is
-    // the sweep's own order; and a refused or failed push commits nothing,
-    // so it never leaves a pullable tag behind.
+    // #4422: the tag, its references and the manifest's `artifacts` row
+    // commit on ONE transaction (one pooled connection), so a failed push
+    // never leaves a pullable tag without its row. (An earlier revision held
+    // a quota-locked transaction open while a second connection committed the
+    // tag, which could starve the pool and deadlock against the blob-GC
+    // sweep invisibly to Postgres.) The referenced `oci_blobs` rows are locked
+    // inside `persist_tag_and_refs_in_tx` before the row INSERT's ledger
+    // trigger touches the ledger, the sweep's own order. The manifest row is
+    // charged 0 by quota admission; see `commit_pushed_manifest`.
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
     let committed = commit_pushed_manifest(
@@ -27539,10 +27527,10 @@ mod cross_repo_session_regression_tests {
 
     /// #4422: a `docker push` is admitted against the repository's storage
     /// quota on every write it makes. A blob that would exceed the quota (a
-    /// monolithic upload or a cross-repository mount) and a manifest whose
-    /// image would exceed it are refused with the registry's `507 DENIED`, and
-    /// nothing is recorded; a re-push of a blob the repository holds costs
-    /// nothing.
+    /// monolithic upload or a cross-repository mount) is refused with the
+    /// registry's `507 DENIED` and nothing is recorded; a re-push of a blob the
+    /// repository holds costs nothing, and the manifest (charged 0, #4545) is
+    /// accepted.
     #[tokio::test]
     async fn docker_push_is_refused_by_repository_quota_4422() {
         let _serial = tdh::usage_ledger_serial_lock().await;
@@ -27609,30 +27597,22 @@ mod cross_repo_session_regression_tests {
             .unwrap();
         refused(send(req).await, "a mount past the target's quota");
 
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": digest,
-                "size": 20
-            },
-            "layers": []
-        });
-        let req = Request::builder()
-            .method("PUT")
-            .uri(format!("/{}/myimage/manifests/v1", src_key))
-            .header("Authorization", &auth)
-            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
-            .body(Body::from(manifest.to_string()))
-            .unwrap();
-        refused(send(req).await, "a manifest whose image is past the quota");
+        // The manifest row is charged 0 (#4545): the image's bytes were
+        // admitted blob by blob, so tagging them is never refused.
+        let (status, body) = send(put_manifest_request(
+            &src_key,
+            "v1",
+            &auth,
+            image_manifest(&digest, 20, &[]),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
 
         for (table, id, expected) in [
             ("oci_blobs", src_id, 1_i64),
             ("oci_blobs", dst_id, 0),
-            ("oci_tags", src_id, 0),
-            ("artifacts", src_id, 0),
+            ("oci_tags", src_id, 1),
+            ("artifacts", src_id, 1),
         ] {
             let sql = format!("SELECT count(*) FROM {table} WHERE repository_id = $1");
             let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
@@ -27643,6 +27623,13 @@ mod cross_repo_session_regression_tests {
             assert_eq!(rows, expected, "{table} rows in {id}");
         }
 
+        for table in ["manifest_blob_refs", "oci_tags", "artifacts"] {
+            let sql = format!("DELETE FROM {table} WHERE repository_id = $1");
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(src_id)
+                .execute(&pool)
+                .await;
+        }
         cleanup_all(&pool, &[src_id, dst_id], user_id, &[storage_dir]).await;
     }
 

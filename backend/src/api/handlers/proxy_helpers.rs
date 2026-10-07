@@ -21600,7 +21600,6 @@ mod scan_on_upload_coverage_tests {
         ("jetbrains.rs", "upload_plugin"),
         ("maven.rs", "upload"),
         ("npm.rs", "store_npm_version"),
-        ("oci_v2.rs", "upsert_manifest_artifact"),
         ("pacman.rs", "insert_package_rows"),
         ("protobuf.rs", "upload"),
         ("pub_registry.rs", "upload_package"),
