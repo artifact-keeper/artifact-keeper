@@ -592,6 +592,8 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
     (266, "idx_artifacts_download_holds_quarantine"),
     (272, "idx_proxy_cache_download_holds"),
     (274, "idx_scan_results_dedup_local"),
+    (281, "idx_proxy_dl_stats_repo_path"),
+    (283, "idx_proxy_dl_stats_ip"),
 ];
 
 /// The index names from `table` whose migration version is not in
@@ -1649,6 +1651,36 @@ mod tests {
                     .as_str()
                     .contains(&format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name}")),
                 "migration {version} must build {name} concurrently"
+            );
+        }
+    }
+
+    /// The reverse direction (#4539): every `-- no-transaction`
+    /// `CREATE INDEX CONCURRENTLY` migration from 260 on is registered in
+    /// [`CONCURRENT_INDEX_MIGRATIONS`] under the index it builds, so a new
+    /// concurrent index cannot land without the interrupted-build repair.
+    #[test]
+    fn every_concurrent_index_migration_is_registered() {
+        let migrator = sqlx::migrate!("./migrations");
+        const OPENER: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS ";
+        for m in migrator.iter().filter(|m| m.version >= 260) {
+            let sql = m.sql.as_str();
+            if !sql.starts_with("-- no-transaction") || !sql.contains("CREATE INDEX CONCURRENTLY") {
+                continue;
+            }
+            let name: String = sql
+                .split(OPENER)
+                .nth(1)
+                .unwrap_or_else(|| panic!("migration {} must use `{OPENER}<name>`", m.version))
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                CONCURRENT_INDEX_MIGRATIONS.contains(&(m.version, name.as_str())),
+                "migration {} builds {name} concurrently but ({}, \"{name}\") is missing \
+                 from CONCURRENT_INDEX_MIGRATIONS",
+                m.version,
+                m.version
             );
         }
     }

@@ -449,6 +449,77 @@ async fn max_age_evicts_by_cached_at_within_path_prefix_3734() {
         .await;
 }
 
+/// #4539: a real lifecycle eviction keeps the evicted entry's download
+/// history. The rows lose their catalog id (ON DELETE SET NULL) but stay keyed
+/// on `(repository_id, path)`, so the per-repository analytics proxy count does
+/// not drop when the cache entry goes.
+#[tokio::test]
+async fn eviction_keeps_proxy_download_history_4539() {
+    let Some(cache) = RemoteCache::setup("npm", ProxyCacheScope::unscoped()).await else {
+        return;
+    };
+    let path = "packages/h/-/h-1.tgz";
+    let old = cache.entry(path, 90, Some(1)).await;
+    for _ in 0..2 {
+        crate::services::proxy_catalog::record_proxy_download(
+            &cache.fx.pool,
+            cache.fx.repo_id,
+            path,
+            &old.content,
+            &old.metadata,
+            None,
+            Some("198.51.100.9"),
+            None,
+        )
+        .await
+        .expect("record serve");
+    }
+    let analytics =
+        crate::services::analytics_service::AnalyticsService::new(cache.fx.pool.clone());
+    let proxy_downloads = || async {
+        analytics
+            .get_storage_breakdown()
+            .await
+            .expect("breakdown")
+            .into_iter()
+            .find(|r| r.repository_id == cache.fx.repo_id)
+            .map(|r| r.proxy_download_count)
+    };
+    let before = proxy_downloads().await;
+
+    let policy = cache.policy("max_age_days", json!({"days": 30})).await;
+    let run = cache
+        .service()
+        .execute_policy(policy.id, false)
+        .await
+        .expect("run");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert_eq!(run.proxy_cache.entries_removed, 1);
+    cache.assert_entry(&old, false, "evicted").await;
+
+    let detached: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE proxy_cache_id IS NULL) \
+         FROM proxy_download_statistics WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(cache.fx.repo_id)
+    .bind(path)
+    .fetch_one(&cache.fx.pool)
+    .await
+    .expect("history rows");
+    let after = proxy_downloads().await;
+    assert_eq!(before, Some(2));
+    assert_eq!(
+        detached,
+        (2, 2),
+        "both rows survive, detached from the catalog"
+    );
+    assert_eq!(
+        after,
+        Some(2),
+        "the analytics proxy count survives eviction"
+    );
+}
+
 /// An entry cached before #3454 records unscoped keys; the sweep reaches
 /// them. A row recording keys outside this repository's cache keeps its row
 /// and is reported, and the foreign objects it points at are not touched.

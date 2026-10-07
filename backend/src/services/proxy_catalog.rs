@@ -592,6 +592,12 @@ pub async fn find_cached_entry(
 /// serve, with no double count and the proxy sibling kept fully separate from
 /// the hot `download_statistics` table.
 ///
+/// The row also carries the serve's `(repository_id, path)` (#4539). That, not
+/// `proxy_cache_id`, is the history key: evicting or purging the catalog row
+/// sets `proxy_cache_id` to NULL (migration 279) and leaves the download in
+/// place, and a later re-cache of the same path gets a new catalog id. Hot-path
+/// cost: two more columns on the one INSERT the serve already does.
+///
 /// The caller applies the HEAD guard, mirroring
 /// `artifact_service::record_download`'s `is_head` short circuit so a metadata
 /// probe never inflates the count. Best-effort: a failure is logged by the
@@ -619,8 +625,8 @@ pub async fn record_proxy_download(
             RETURNING id
         )
         INSERT INTO proxy_download_statistics
-            (proxy_cache_id, user_id, ip_address, user_agent)
-        SELECT id, $5, $6, $7 FROM ensured
+            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent)
+        SELECT id, $1, $2, $5, $6, $7 FROM ensured
         "#,
         repository_id,
         path,
@@ -638,7 +644,8 @@ pub async fn record_proxy_download(
 
 /// Recorded proxy-download counts for the given cached `paths`, keyed by path
 /// (#3265). Paths with no recorded serve are absent from the map; the caller
-/// substitutes zero.
+/// substitutes zero. Keyed on `(repository_id, path)` (#4539), so the count
+/// includes serves recorded before the entry was last evicted and re-cached.
 ///
 /// Batched (`= ANY`) so a listing page costs one query rather than one per
 /// row, mirroring `ArtifactService::get_download_stats_batch` on the hosted
@@ -655,7 +662,8 @@ pub async fn download_counts_by_paths(
         r#"
         SELECT a.path, COUNT(d.id)::BIGINT
         FROM proxy_cache_artifacts a
-        LEFT JOIN proxy_download_statistics d ON d.proxy_cache_id = a.id
+        LEFT JOIN proxy_download_statistics d
+               ON d.repository_id = a.repository_id AND d.path = a.path
         WHERE a.repository_id = $1
           AND a.path = ANY($2)
         GROUP BY a.path
@@ -670,7 +678,8 @@ pub async fn download_counts_by_paths(
     Ok(rows.into_iter().collect())
 }
 
-/// Count of proxy downloads recorded for one repository's cached objects.
+/// Count of proxy downloads recorded for one repository, including serves of
+/// objects since evicted from its cache (#4539).
 /// Backs analytics that `UNION ALL` the hosted `download_statistics` count with
 /// the proxy sibling; exposed here so the union math lives beside the table.
 pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<i64> {
@@ -678,8 +687,7 @@ pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<
         r#"
         SELECT COUNT(*)::BIGINT AS "count!"
         FROM proxy_download_statistics pds
-        JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id
-        WHERE pca.repository_id = $1
+        WHERE pds.repository_id = $1
         "#,
         repository_id
     )
@@ -1682,6 +1690,138 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `(proxy_cache_id IS NULL, repository_id, path)` of every proxy
+    /// download row recorded for `repo`.
+    async fn history_rows(pool: &PgPool, repo: Uuid) -> Vec<(bool, Uuid, String)> {
+        sqlx::query_as(
+            "SELECT proxy_cache_id IS NULL, repository_id, path \
+             FROM proxy_download_statistics WHERE repository_id = $1 ORDER BY downloaded_at",
+        )
+        .bind(repo)
+        .fetch_all(pool)
+        .await
+        .expect("read history rows")
+    }
+
+    /// #4539: evicting a cache entry (the lifecycle sweep deletes the catalog
+    /// row) keeps its download history, keyed on `(repository_id, path)`; a
+    /// re-cache of the same path continues the same count; deleting the
+    /// repository still removes the history.
+    #[tokio::test]
+    async fn test_download_history_survives_eviction_and_recache_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/pkg/pkg-2.0.whl";
+        for _ in 0..2 {
+            record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string()); 2],
+            "each serve is keyed on the coordinate it was served from"
+        );
+
+        // Lifecycle eviction / cache purge deletes the catalog row.
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("evict");
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(true, repo, path.to_string()); 2],
+            "eviction detaches the history from the catalog row, never deletes it"
+        );
+        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 2);
+
+        // Re-cached and served again: a new catalog row, one continuous count.
+        record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+            .await
+            .unwrap();
+        let counts = download_counts_by_paths(&pool, repo, &[path.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(counts.get(path).copied(), Some(3));
+        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 3);
+
+        cleanup_repo(&pool, repo).await;
+        assert!(
+            history_rows(&pool, repo).await.is_empty(),
+            "deleting the repository still deletes its proxy download history"
+        );
+    }
+
+    /// #4539 rolling deploy: a pod still on the previous release inserts
+    /// `proxy_cache_id` only; migration 277's trigger keys the row from the
+    /// catalog so it is not left unkeyed once eviction stops deleting it.
+    #[tokio::test]
+    async fn test_legacy_insert_is_keyed_by_trigger_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/legacy/legacy-1.0.whl";
+        upsert(&pool, repo, path, "k", "m", 7, None, None, None, None)
+            .await
+            .expect("cache row");
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id) \
+             SELECT id FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("legacy insert");
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string())]
+        );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #4539: migration 278's batched backfill keys a row that predates the
+    /// key columns, and is safe to run again (it is `-- no-transaction` and
+    /// re-runs in full after an interruption).
+    #[tokio::test]
+    async fn test_history_backfill_migration_keys_old_rows_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/old/old-1.0.whl";
+        record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+            .await
+            .unwrap();
+        // Shape of a row written before migration 277.
+        sqlx::query(
+            "UPDATE proxy_download_statistics SET repository_id = NULL, path = NULL \
+             WHERE proxy_cache_id IN (SELECT id FROM proxy_cache_artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("strip key");
+        assert!(history_rows(&pool, repo).await.is_empty());
+
+        let backfill =
+            include_str!("../../migrations/278_proxy_download_statistics_history_backfill.sql");
+        for _ in 0..2 {
+            sqlx::raw_sql(backfill)
+                .execute(&pool)
+                .await
+                .expect("run backfill");
+        }
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string())]
+        );
         cleanup_repo(&pool, repo).await;
     }
 }

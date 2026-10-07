@@ -337,8 +337,7 @@ impl AnalyticsService {
                 pc.artifact_count as proxy_artifact_count,
                 pc.storage_bytes as proxy_storage_bytes,
                 (SELECT COUNT(*) FROM proxy_download_statistics pds
-                 JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id
-                 WHERE pca.repository_id = r.id)::BIGINT as proxy_download_count,
+                 WHERE pds.repository_id = r.id)::BIGINT as proxy_download_count,
                 MAX(a.created_at) as last_upload_at
             FROM repositories r
             -- One indexed pass over the proxy catalog per repository, feeding

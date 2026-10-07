@@ -1400,7 +1400,15 @@ pub struct SystemStats {
     /// (`oci_blobs`) and proxy-cached bytes; `proxy_storage_bytes` below is
     /// a *breakdown* of this total, not a disjoint bucket.
     pub total_storage_bytes: i64,
+    /// Every recorded download: hosted artifact downloads
+    /// (`download_statistics`) plus proxy pull-through serves
+    /// (`proxy_download_statistics`). Before #4539 this counted hosted
+    /// downloads only, so an all-proxy deployment reported zero.
     pub total_downloads: i64,
+    /// Proxy pull-through serves. A **breakdown of** `total_downloads`, not a
+    /// disjoint bucket (the same relation `proxy_storage_bytes` has to
+    /// `total_storage_bytes`): hosted downloads are the difference (#4539).
+    pub proxy_download_count: i64,
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
@@ -1491,8 +1499,13 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let download_count =
+    let hosted_download_count =
         sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM download_statistics")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let proxy_download_count =
+        sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM proxy_download_statistics")
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1520,7 +1533,8 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
         total_repositories: repo_count,
         total_artifacts: artifact_count,
         total_storage_bytes: storage_totals.total,
-        total_downloads: download_count,
+        total_downloads: hosted_download_count + proxy_download_count,
+        proxy_download_count,
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
@@ -1689,14 +1703,64 @@ pub struct ListDownloadsQuery {
     pub from: Option<String>,
     /// Inclusive upper bound on `downloaded_at` (RFC 3339).
     pub to: Option<String>,
+    /// Filter to one source: `hosted` (a hosted artifact) or `proxy` (a
+    /// pull-through serve from a Remote repository). Omitted: both (#4539).
+    pub source: Option<DownloadSource>,
+    /// Filter to downloads served from one repository: the artifact's
+    /// repository for a hosted download, the Remote repository for a proxy
+    /// serve (#4539).
+    pub repository_id: Option<Uuid>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
 
-/// One attributed download event.
+/// Where a download event was recorded (#4539). Hosted artifacts and proxy
+/// pull-through serves live in two tables (`download_statistics`, keyed on the
+/// `artifacts` row, and `proxy_download_statistics`, keyed on the Remote
+/// repository and path, since proxied content has no `artifacts` row); the
+/// listing returns both, and this says which one a row came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadSource {
+    Hosted,
+    Proxy,
+}
+
+impl DownloadSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hosted => "hosted",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+impl TryFrom<String> for DownloadSource {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        match value.as_str() {
+            "hosted" => Ok(Self::Hosted),
+            "proxy" => Ok(Self::Proxy),
+            other => Err(format!("unknown download source `{other}`")),
+        }
+    }
+}
+
+/// One attributed download event: a hosted artifact download or a proxy
+/// pull-through serve (#4539).
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
 pub struct DownloadRecord {
-    pub artifact_id: Uuid,
+    #[sqlx(try_from = "String")]
+    pub source: DownloadSource,
+    /// The hosted artifact downloaded. `null` for a proxy serve: proxied
+    /// content has no `artifacts` row.
+    pub artifact_id: Option<Uuid>,
+    /// The repository that served the download: the artifact's repository,
+    /// or the Remote repository a proxy serve was recorded under.
+    pub repository_id: Option<Uuid>,
+    /// The artifact's path in that repository, or the proxied path.
+    pub path: Option<String>,
     pub user_id: Option<Uuid>,
     /// Username of the downloader, when the download was authenticated and
     /// the user still exists.
@@ -1738,8 +1802,16 @@ fn push_download_filters(
     to: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     builder.push(" WHERE TRUE");
+    if let Some(source) = query.source {
+        builder.push(" AND d.source = ").push_bind(source.as_str());
+    }
     if let Some(artifact_id) = query.artifact_id {
         builder.push(" AND d.artifact_id = ").push_bind(artifact_id);
+    }
+    if let Some(repository_id) = query.repository_id {
+        builder
+            .push(" AND COALESCE(d.repository_id, a.repository_id) = ")
+            .push_bind(repository_id);
     }
     if let Some(user_id) = query.user_id {
         builder.push(" AND d.user_id = ").push_bind(user_id);
@@ -1755,6 +1827,23 @@ fn push_download_filters(
     }
 }
 
+/// Every recorded download event, hosted and proxy, as one relation `d`
+/// (#4539), with the hosted artifact row joined as `a` so a hosted event
+/// reports its repository and path too. Read-time `UNION ALL` of the two
+/// tables: neither hot-path INSERT changes, and a filter on `d` is pushed down
+/// into both branches (a `source` filter prunes the other branch outright).
+/// The `artifacts` join is a primary-key lookup the planner drops when no
+/// `a` column is referenced.
+const DOWNLOAD_EVENTS_FROM: &str = " FROM ( \
+     SELECT 'hosted'::TEXT AS source, artifact_id, NULL::UUID AS repository_id, \
+            NULL::TEXT AS path, user_id, ip_address, user_agent, downloaded_at \
+       FROM download_statistics \
+     UNION ALL \
+     SELECT 'proxy'::TEXT, NULL::UUID, repository_id, path, \
+            user_id, ip_address, user_agent, downloaded_at \
+       FROM proxy_download_statistics \
+     ) d LEFT JOIN artifacts a ON a.id = d.artifact_id";
+
 /// Shared listing core for the three download-telemetry endpoints.
 async fn query_downloads(
     db: &sqlx::PgPool,
@@ -1766,7 +1855,8 @@ async fn query_downloads(
     let from = parse_rfc3339_bound(query.from.as_deref(), "from")?;
     let to = parse_rfc3339_bound(query.to.as_deref(), "to")?;
 
-    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM download_statistics d");
+    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*)");
+    count_builder.push(DOWNLOAD_EVENTS_FROM);
     push_download_filters(&mut count_builder, query, from, to);
     let total: i64 = count_builder
         .build_query_scalar()
@@ -1775,10 +1865,13 @@ async fn query_downloads(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut builder = sqlx::QueryBuilder::new(
-        "SELECT d.artifact_id, d.user_id, u.username, d.ip_address, d.user_agent, \
-         d.downloaded_at \
-         FROM download_statistics d LEFT JOIN users u ON u.id = d.user_id",
+        "SELECT d.source, d.artifact_id, \
+         COALESCE(d.repository_id, a.repository_id) AS repository_id, \
+         COALESCE(d.path, a.path) AS path, \
+         d.user_id, u.username, d.ip_address, d.user_agent, d.downloaded_at",
     );
+    builder.push(DOWNLOAD_EVENTS_FROM);
+    builder.push(" LEFT JOIN users u ON u.id = d.user_id");
     push_download_filters(&mut builder, query, from, to);
     builder
         .push(" ORDER BY d.downloaded_at DESC LIMIT ")
@@ -1800,8 +1893,9 @@ async fn query_downloads(
 }
 
 /// List attributed downloads (client IP + user), filterable by artifact,
-/// user, IP, and time range (#2365). Admin-only: download attribution is
-/// sensitive.
+/// user, IP, and time range (#2365). Covers hosted artifact downloads and
+/// proxy pull-through serves alike, each row marked with its `source`
+/// (#4539). Admin-only: download attribution is sensitive.
 #[utoipa::path(
     get,
     path = "/downloads",
@@ -1839,6 +1933,8 @@ pub async fn list_downloads(
     params(
         ("ip" = String, Path, description = "Client IP address"),
         ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
+        ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("user_id" = Option<Uuid>, Query, description = "Filter to downloads by one user"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
@@ -1880,6 +1976,8 @@ pub async fn list_downloads_by_ip(
     params(
         ("user_id" = Uuid, Path, description = "User id"),
         ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
+        ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("ip" = Option<String>, Query, description = "Filter to downloads from one client IP (exact match)"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
@@ -2535,6 +2633,7 @@ pub async fn delete_proxy_scan_verdicts(
         GuestAccessSource,
         SystemStats,
         ListDownloadsQuery,
+        DownloadSource,
         DownloadRecord,
         DownloadListResponse,
         CleanupRequest,
@@ -3297,6 +3396,7 @@ mod tests {
             total_artifacts: 500,
             total_storage_bytes: 1_000_000_000,
             total_downloads: 5000,
+            proxy_download_count: 1200,
             total_users: 25,
             active_peers: 3,
             pending_sync_tasks: 0,
@@ -3308,6 +3408,7 @@ mod tests {
         assert_eq!(json["total_artifacts"], 500);
         assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);
         assert_eq!(json["total_downloads"], 5000);
+        assert_eq!(json["proxy_download_count"], 1200);
         assert_eq!(json["total_users"], 25);
         assert_eq!(json["proxy_artifact_count"], 12);
         assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
@@ -3393,6 +3494,16 @@ mod tests {
             bytes,
             "proxy bytes are a breakdown of total_storage_bytes"
         );
+        assert_eq!(
+            after.proxy_download_count - before.proxy_download_count,
+            rows,
+            "get_system_stats.proxy_download_count must count proxy serves (#4539)"
+        );
+        assert_eq!(
+            after.total_downloads - before.total_downloads,
+            rows,
+            "proxy serves are a breakdown of total_downloads (#4539)"
+        );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -3453,6 +3564,14 @@ mod tests {
             .execute(&mut *tx)
             .await?;
         }
+        // One proxy serve per seeded entry (#4539).
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id, repository_id, path) \
+             SELECT id, repository_id, path FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
 
         let after = collect_system_stats(&mut tx)
             .await
@@ -4344,6 +4463,33 @@ mod tests {
         .expect("query by artifact");
         assert_eq!(by_artifact.total, 2);
         assert_eq!(by_artifact.downloads.len(), 2);
+        // #4539: a hosted row names its source and the artifact's repository.
+        assert!(by_artifact.downloads.iter().all(|d| {
+            d.source == DownloadSource::Hosted
+                && d.repository_id == Some(repo_id)
+                && d.path
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("dl-telemetry/"))
+        }));
+
+        // #4539: the repository filter reaches hosted rows through their
+        // artifact, and the source filter excludes them.
+        let in_repo = |source| ListDownloadsQuery {
+            repository_id: Some(repo_id),
+            source,
+            ..Default::default()
+        };
+        let repo_all = query_downloads(&pool, &in_repo(None))
+            .await
+            .expect("query by repository");
+        assert_eq!(
+            repo_all.total, 2,
+            "hosted rows match their artifact's repository"
+        );
+        let repo_proxy = query_downloads(&pool, &in_repo(Some(DownloadSource::Proxy)))
+            .await
+            .expect("query proxy in repository");
+        assert_eq!(repo_proxy.total, 0);
 
         // Filter by IP: only the authenticated row, with the username joined.
         let by_ip = query_downloads(
@@ -4407,6 +4553,162 @@ mod tests {
         assert_eq!(paged.page, 2);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #4539: the download listing returns proxy pull-through serves alongside
+    /// hosted downloads, keyed on the Remote repository and path, and the
+    /// `source` / `repository_id` filters select between them.
+    #[tokio::test]
+    async fn test_query_downloads_includes_proxy_serves_4539() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let path = format!("simple/p/p-{}.whl", Uuid::new_v4().simple());
+        crate::services::proxy_catalog::record_proxy_download(
+            &pool,
+            repo_id,
+            &path,
+            "k",
+            "m",
+            Some(user_id),
+            Some("198.51.100.7"),
+            Some("pip/24"),
+        )
+        .await
+        .expect("record proxy serve");
+
+        let in_repo = |source| ListDownloadsQuery {
+            repository_id: Some(repo_id),
+            source,
+            ..Default::default()
+        };
+        let all = query_downloads(&pool, &in_repo(None))
+            .await
+            .expect("query repo");
+        let proxy_only = query_downloads(&pool, &in_repo(Some(DownloadSource::Proxy)))
+            .await
+            .expect("query proxy");
+        let hosted_only = query_downloads(&pool, &in_repo(Some(DownloadSource::Hosted)))
+            .await
+            .expect("query hosted");
+        let by_ip = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                ip: Some("198.51.100.7".to_string()),
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by ip");
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(all.total, 1, "the proxy serve is listed");
+        let row = &all.downloads[0];
+        assert_eq!(row.source, DownloadSource::Proxy);
+        assert_eq!(row.artifact_id, None, "proxied content has no artifact row");
+        assert_eq!(row.repository_id, Some(repo_id));
+        assert_eq!(row.path.as_deref(), Some(path.as_str()));
+        assert_eq!(row.username.as_deref(), Some(username.as_str()));
+        assert_eq!(row.user_agent.as_deref(), Some("pip/24"));
+        assert_eq!(proxy_only.total, 1);
+        assert_eq!(hosted_only.total, 0);
+        assert_eq!(by_ip.total, 1, "the IP / user filters see proxy serves");
+    }
+
+    /// #4539: one page mixing hosted and proxy events is ordered newest
+    /// first across both tables, and pagination walks the union.
+    #[tokio::test]
+    async fn test_query_downloads_orders_and_pages_across_sources_4539() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (remote_id, _, _) = tdh::create_repo(&pool, "remote", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'mix/a.bin', 'mix', '1.0.0', 1, $2, 'application/octet-stream', \
+             'mix/a.bin') RETURNING id",
+        )
+        .bind(local_id)
+        .bind(format!("{:0>64}", "4539"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+        // hosted 1 min ago, proxy 2 min ago, hosted 3 min ago.
+        for minutes in [1, 3] {
+            sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, user_id, downloaded_at) \
+                 VALUES ($1, $2, NOW() - make_interval(mins => $3))",
+            )
+            .bind(artifact_id)
+            .bind(user_id)
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .expect("hosted row");
+        }
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (repository_id, path, user_id, downloaded_at) \
+             VALUES ($1, 'mix/b.bin', $2, NOW() - make_interval(mins => 2))",
+        )
+        .bind(remote_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("proxy row");
+
+        let page = |page| ListDownloadsQuery {
+            user_id: Some(user_id),
+            page: Some(page),
+            per_page: Some(2),
+            ..Default::default()
+        };
+        let first = query_downloads(&pool, &page(1)).await.expect("page 1");
+        let second = query_downloads(&pool, &page(2)).await.expect("page 2");
+        tdh::cleanup(&pool, remote_id, Uuid::nil()).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        let sources = |r: &DownloadListResponse| -> Vec<(DownloadSource, Option<Uuid>)> {
+            r.downloads
+                .iter()
+                .map(|d| (d.source, d.repository_id))
+                .collect()
+        };
+        assert_eq!((first.total, second.total), (3, 3));
+        assert_eq!(
+            sources(&first),
+            vec![
+                (DownloadSource::Hosted, Some(local_id)),
+                (DownloadSource::Proxy, Some(remote_id)),
+            ],
+            "newest first across both tables"
+        );
+        assert_eq!(
+            sources(&second),
+            vec![(DownloadSource::Hosted, Some(local_id))]
+        );
+    }
+
+    #[test]
+    fn test_download_source_round_trips() {
+        for source in [DownloadSource::Hosted, DownloadSource::Proxy] {
+            assert_eq!(
+                DownloadSource::try_from(source.as_str().to_string()),
+                Ok(source)
+            );
+            assert_eq!(
+                serde_json::to_value(source).unwrap(),
+                serde_json::Value::String(source.as_str().to_string())
+            );
+        }
+        assert!(DownloadSource::try_from("mirror".to_string()).is_err());
     }
 
     #[tokio::test]
