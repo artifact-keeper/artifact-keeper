@@ -17018,8 +17018,13 @@ mod tests {
             password: secret.clone(),
         });
 
-        for (realm_path, creds) in [("/token", &creds), ("/forbidden/token", &None)] {
-            let realm = format!("{}{realm_path}", server.uri());
+        for (realm_path, creds, sent) in [
+            ("/token", &creds, "credentials_sent=true"),
+            ("/forbidden/token", &None, "credentials_sent=false"),
+        ] {
+            let realm = format!("{}{realm_path}?account=svc-4453", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
             let err = client
                 .obtain_bearer_token(
                     &realm,
@@ -17030,13 +17035,27 @@ mod tests {
                 )
                 .await
                 .expect_err("a rejected token request must fail");
+            drop(guard);
+            let redacted = format!("{}{realm_path}", server.uri());
             match err {
                 AppError::UpstreamAuth(msg) => {
-                    assert!(msg.contains(&realm), "names the token service: {msg}");
+                    assert!(msg.contains(&redacted), "names the token service: {msg}");
                     assert!(!msg.contains(&secret) && !msg.contains("svc-4453"), "{msg}");
                 }
                 other => panic!("{realm_path}: expected UpstreamAuth, got {other:?}"),
             }
+            // The operator-facing line: WARN on the `security` target, the
+            // redacted realm, whether credentials were sent, and no secret.
+            let logs = capture.text();
+            assert!(
+                logs.contains("WARN") && logs.contains("security") && logs.contains(sent),
+                "{logs}"
+            );
+            assert!(logs.contains(&redacted), "{logs}");
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4453"),
+                "{logs}"
+            );
         }
 
         let realm = format!("{}/broken/token", server.uri());

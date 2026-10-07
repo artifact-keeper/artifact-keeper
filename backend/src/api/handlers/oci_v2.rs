@@ -4572,6 +4572,33 @@ async fn try_upstream_fetch_with_accept(
     }
 }
 
+/// The direct Remote manifest fetch shared by GET and HEAD: the bytes, or
+/// `Ok(None)` for a miss the caller reports as `MANIFEST_UNKNOWN`, or the
+/// response to return as-is when the upstream refused the Remote's
+/// credentials (#4453): a gateway error the operator must fix, not a missing
+/// manifest.
+async fn fetch_remote_manifest(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    reference: &str,
+    accept: &str,
+) -> Result<Option<(Bytes, Option<String>)>, Response> {
+    // UNRECORDED-PROXY-SERVE: this only fetches; nothing is served here. The
+    // GET caller records the pull through `record_oci_manifest_pull` after its
+    // scan gate, and HEAD serves no body, so it is exempt (#3446).
+    let outcome = try_upstream_fetch_with_accept(
+        repo,
+        state,
+        &format!("manifests/{reference}"),
+        Some(accept),
+    )
+    .await;
+    match outcome.upstream_auth_error() {
+        Some(resp) => Err(resp),
+        None => Ok(outcome.into_fetched()),
+    }
+}
+
 /// Canonical set of manifest media types we always advertise to an OCI
 /// upstream when proxying a manifest fetch.
 ///
@@ -8896,19 +8923,11 @@ async fn handle_head_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    let outcome = try_upstream_fetch_with_accept(
-        &repo,
-        state,
-        &format!("manifests/{}", reference),
-        Some(&accept),
-    )
-    .await;
-    // #4453: an upstream that refused the Remote's credentials is a gateway
-    // error the operator must fix, not a missing manifest.
-    if let Some(resp) = outcome.upstream_auth_error() {
-        return resp;
-    }
-    if let Some((content, ct)) = outcome.into_fetched() {
+    let fetched = match fetch_remote_manifest(&repo, state, reference, &accept).await {
+        Ok(fetched) => fetched,
+        Err(resp) => return resp,
+    };
+    if let Some((content, ct)) = fetched {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -10358,19 +10377,11 @@ async fn handle_get_manifest(
     // #3836: the direct Remote path keeps no negative cache of its own (the
     // proxy cache's status-gated one already covers it), so only the bytes
     // matter here.
-    let outcome = try_upstream_fetch_with_accept(
-        &repo,
-        state,
-        &format!("manifests/{}", reference),
-        Some(&accept),
-    )
-    .await;
-    // #4453: an upstream that refused the Remote's credentials is a gateway
-    // error the operator must fix, not a missing manifest.
-    if let Some(resp) = outcome.upstream_auth_error() {
-        return resp;
-    }
-    if let Some((content, ct)) = outcome.into_fetched() {
+    let fetched = match fetch_remote_manifest(&repo, state, reference, &accept).await {
+        Ok(fetched) => fetched,
+        Err(resp) => return resp,
+    };
+    if let Some((content, ct)) = fetched {
         let digest = cache_manifest_or_compute_digest(
             state,
             &repo,
@@ -36174,6 +36185,71 @@ mod remote_pull_through_cache_tests {
              {tag_manifest_ttl}s — this negative control keeps the immutable \
              assertions honest"
         );
+    }
+
+    /// #4453 through the real handlers: a Remote whose upstream token service
+    /// rejects the request answers GET and HEAD with 502 `DENIED`, not 404
+    /// `MANIFEST_UNKNOWN`.
+    #[tokio::test]
+    async fn get_and_head_manifest_report_upstream_auth_failure_as_502_4453() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/myimage/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="reg.test""#,
+                        server.uri()
+                    )
+                    .as_str(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let tmp = std::env::temp_dir().join(format!("oci-4453-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let image = format!("{repo_key}/myimage");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let head =
+            super::handle_head_manifest(&state, &anon_headers(), "http://ak.test", &image, "v1")
+                .await;
+        let get = super::handle_get_manifest(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &image,
+            "v1",
+            &ctx,
+        )
+        .await;
+        let (get_status, get_body, _h) = tdh::collect_response(get).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(head.status(), StatusCode::BAD_GATEWAY, "HEAD");
+        assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET");
+        let body = String::from_utf8_lossy(&get_body);
+        assert!(body.contains("DENIED"), "{body}");
+        assert!(!body.contains("MANIFEST_UNKNOWN"), "{body}");
     }
 }
 

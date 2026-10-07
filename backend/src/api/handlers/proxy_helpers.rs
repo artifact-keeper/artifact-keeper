@@ -732,7 +732,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             tracing::warn!(
                 repo_key = %repo_key,
                 path = %diagnostic_path,
-                "Upstream authentication failed: {}",
+                "{}",
                 e
             );
             let mut response = (
