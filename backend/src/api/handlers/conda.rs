@@ -2369,7 +2369,7 @@ async fn sharded_repodata_index(
     let mut shards_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (pkg_name, artifacts) in &by_name {
         let shard = build_shard(&subdir, artifacts);
-        let shard_compressed = serialize_msgpack_zst(&shard)?;
+        let shard_compressed = encode_shard(&shard)?;
 
         let mut hasher = Sha256::new();
         hasher.update(&shard_compressed);
@@ -2386,8 +2386,11 @@ async fn sharded_repodata_index(
 
     Ok(Response::builder()
         .status(StatusCode::OK)
+        // The `.msgpack.zst` file IS the resource: the zstd frame is part of
+        // the document, not a transfer coding. Declaring `Content-Encoding:
+        // zstd` invites an HTTP client to strip the frame before the CEP-16
+        // reader, which expects it, ever sees the bytes.
         .header(CONTENT_TYPE, "application/x-msgpack")
-        .header("Content-Encoding", "zstd")
         .header(CONTENT_LENGTH, compressed.len().to_string())
         .header("Cache-Control", "public, max-age=60")
         .body(Body::from(compressed))
@@ -2420,7 +2423,7 @@ async fn sharded_repodata_shard(
     // Find the shard matching the requested hash
     for artifacts in by_name.values() {
         let shard = build_shard(&subdir, artifacts);
-        let shard_compressed = serialize_msgpack_zst(&shard)?;
+        let shard_compressed = encode_shard(&shard)?;
 
         let mut hasher = Sha256::new();
         hasher.update(&shard_compressed);
@@ -2430,7 +2433,6 @@ async fn sharded_repodata_shard(
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/x-msgpack")
-                .header("Content-Encoding", "zstd")
                 .header(CONTENT_LENGTH, shard_compressed.len().to_string())
                 .header("Cache-Control", "public, max-age=31536000, immutable")
                 .body(Body::from(shard_compressed))
@@ -2534,29 +2536,129 @@ fn build_shard(subdir: &str, artifacts: &[&CondaArtifact]) -> serde_json::Value 
     })
 }
 
-/// Build the CEP-16 shard index.
-fn build_sharded_index(
-    subdir: &str,
-    base_url: &str,
-    shards: &BTreeMap<String, Vec<u8>>,
-) -> serde_json::Value {
-    // Convert binary hashes to hex strings for JSON representation
-    // (the msgpack wire format uses raw bytes, but we use serde_json as
-    // the intermediate representation, so hex strings are fine here since
-    // rmp_serde will serialize them as msgpack strings)
-    let shards_hex: BTreeMap<String, String> = shards
-        .iter()
-        .map(|(k, v)| (k.clone(), hex::encode(v)))
-        .collect();
+/// A digest in CEP-16 wire form: msgpack `bin`, not a hex string. CEP-16
+/// carries every hash as raw bytes — the index's shard hashes and the
+/// `sha256`/`md5` of each record inside a shard — and rattler's readers decode
+/// them as such.
+struct WireDigest<'a>(&'a [u8]);
 
-    serde_json::json!({
-        "info": {
-            "subdir": subdir,
-            "base_url": base_url,
-            "shards_base_url": "./shards/",
+impl serde::Serialize for WireDigest<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.0)
+    }
+}
+
+/// The CEP-16 shard index (`repodata_shards.msgpack.zst`): package name to the
+/// SHA-256 of that package's `.msgpack.zst` shard, as raw bytes.
+#[derive(serde::Serialize)]
+struct ShardedIndex<'a> {
+    info: ShardedIndexInfo<'a>,
+    shards: BTreeMap<&'a str, WireDigest<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct ShardedIndexInfo<'a> {
+    base_url: &'a str,
+    shards_base_url: &'static str,
+    subdir: &'a str,
+}
+
+/// Build the CEP-16 shard index.
+fn build_sharded_index<'a>(
+    subdir: &'a str,
+    base_url: &'a str,
+    shards: &'a BTreeMap<String, Vec<u8>>,
+) -> ShardedIndex<'a> {
+    ShardedIndex {
+        info: ShardedIndexInfo {
+            base_url,
+            shards_base_url: "./shards/",
+            subdir,
         },
-        "shards": shards_hex,
-    })
+        shards: shards
+            .iter()
+            .map(|(name, hash)| (name.as_str(), WireDigest(hash)))
+            .collect(),
+    }
+}
+
+/// Record keys CEP-16 carries as raw digest bytes, with their digest length.
+const SHARD_DIGEST_KEYS: [(&str, usize); 3] = [("sha256", 32), ("md5", 16), ("legacy_bz2_md5", 16)];
+
+/// One field of a shard record on the wire.
+enum ShardField<'a> {
+    Json(&'a serde_json::Value),
+    Digest(Vec<u8>),
+}
+
+/// A repodata record in CEP-16 shard form: every field as in `repodata.json`
+/// except the digests, which become `bin`. A digest field that is not valid
+/// hex of the right length (an empty `md5` on a row with no extracted
+/// metadata) is omitted rather than sent as a string a reader would reject.
+struct ShardRecord<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl serde::Serialize for ShardRecord<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let fields: Vec<(&String, ShardField<'_>)> = self
+            .0
+            .iter()
+            .filter_map(|(key, value)| {
+                match SHARD_DIGEST_KEYS.iter().find(|(k, _)| *k == key.as_str()) {
+                    Some((_, len)) => value
+                        .as_str()
+                        .and_then(|h| hex::decode(h).ok())
+                        .filter(|bytes| bytes.len() == *len)
+                        .map(|bytes| (key, ShardField::Digest(bytes))),
+                    None => Some((key, ShardField::Json(value))),
+                }
+            })
+            .collect();
+        let mut map = s.serialize_map(Some(fields.len()))?;
+        for (key, field) in &fields {
+            match field {
+                ShardField::Json(v) => map.serialize_entry(key, v)?,
+                ShardField::Digest(bytes) => map.serialize_entry(key, &WireDigest(bytes))?,
+            }
+        }
+        map.end()
+    }
+}
+
+/// A shard document on the wire.
+#[derive(serde::Serialize)]
+struct ShardWire<'a> {
+    packages: BTreeMap<&'a str, ShardRecord<'a>>,
+    #[serde(rename = "packages.conda")]
+    packages_conda: BTreeMap<&'a str, ShardRecord<'a>>,
+    removed: Vec<&'a serde_json::Value>,
+}
+
+/// Encode a shard built by [`build_shard`] to its CEP-16 `.msgpack.zst` bytes,
+/// whose SHA-256 is the shard's address.
+#[allow(clippy::result_large_err)]
+fn encode_shard(shard: &serde_json::Value) -> Result<Vec<u8>, Response> {
+    let records = |key: &str| -> BTreeMap<&str, ShardRecord<'_>> {
+        shard
+            .get(key)
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(f, r)| r.as_object().map(|r| (f.as_str(), ShardRecord(r))))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let wire = ShardWire {
+        packages: records("packages"),
+        packages_conda: records("packages.conda"),
+        removed: shard
+            .get("removed")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default(),
+    };
+    serialize_msgpack_zst(&wire)
 }
 
 // ---------------------------------------------------------------------------
@@ -5278,7 +5380,9 @@ fn build_conda_metadata(
 /// Shared by shard index and individual shard handlers.
 #[allow(clippy::result_large_err)]
 fn serialize_msgpack_zst<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Response> {
-    let msgpack = rmp_serde::to_vec(value).map_err(|e| {
+    // `to_vec_named`: structs become msgpack maps keyed by field name, which
+    // is what CEP-16 readers expect (plain `to_vec` writes positional arrays).
+    let msgpack = rmp_serde::to_vec_named(value).map_err(|e| {
         tracing::error!("msgpack serialization error: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
@@ -8785,6 +8889,11 @@ mod tests {
         assert!(entry.get("size").is_some());
     }
 
+    /// Decode an encoded shard index with rattler's own CEP-16 type.
+    fn decode_index_with_rattler(bytes: &[u8]) -> rattler_conda_types::ShardedRepodata {
+        rmp_serde::from_slice(&zstd::decode_all(bytes).unwrap()).expect("rattler decodes the index")
+    }
+
     #[test]
     fn test_build_sharded_index_structure() {
         let mut shards = BTreeMap::new();
@@ -8793,29 +8902,24 @@ mod tests {
         shards.insert("scipy".to_string(), vec![0xCD; 32]);
 
         let index = build_sharded_index("linux-64", "/conda/my-repo/linux-64/", &shards);
+        let decoded = decode_index_with_rattler(&serialize_msgpack_zst(&index).unwrap());
 
-        assert_eq!(index["info"]["subdir"], "linux-64");
-        assert_eq!(index["info"]["base_url"], "/conda/my-repo/linux-64/");
-        assert_eq!(index["info"]["shards_base_url"], "./shards/");
-
-        let shards_obj = index["shards"].as_object().unwrap();
-        assert_eq!(shards_obj.len(), 2);
-        assert!(shards_obj.contains_key("numpy"));
-        assert!(shards_obj.contains_key("scipy"));
-
-        // Hashes should be hex-encoded strings
-        let numpy_hash = shards_obj["numpy"].as_str().unwrap();
-        assert_eq!(numpy_hash.len(), 64);
-        assert_eq!(numpy_hash, "ab".repeat(32));
+        assert_eq!(decoded.info.subdir, "linux-64");
+        assert_eq!(decoded.info.base_url, "/conda/my-repo/linux-64/");
+        assert_eq!(decoded.info.shards_base_url, "./shards/");
+        assert_eq!(decoded.shards.len(), 2);
+        assert_eq!(decoded.shards["numpy"].as_slice(), &[0xAB; 32]);
+        assert_eq!(decoded.shards["scipy"].as_slice(), &[0xCD; 32]);
     }
 
     #[test]
     fn test_sharded_index_empty_repo() {
         let shards = BTreeMap::new();
         let index = build_sharded_index("noarch", "/conda/empty/noarch/", &shards);
+        let decoded = decode_index_with_rattler(&serialize_msgpack_zst(&index).unwrap());
 
-        assert_eq!(index["info"]["subdir"], "noarch");
-        assert!(index["shards"].as_object().unwrap().is_empty());
+        assert_eq!(decoded.info.subdir, "noarch");
+        assert!(decoded.shards.is_empty());
     }
 
     #[test]
@@ -8900,20 +9004,55 @@ mod tests {
         );
     }
 
+    /// F4 (#4173): the shard hashes are msgpack `bin` (CEP-16), not `str`.
     #[test]
     fn test_sharded_index_msgpack_roundtrip() {
         let mut shards = BTreeMap::new();
         shards.insert("numpy".to_string(), vec![0xAB; 32]);
 
         let index = build_sharded_index("linux-64", "/conda/test/linux-64/", &shards);
+        let msgpack = rmp_serde::to_vec_named(&index).unwrap();
+        // bin8 marker (0xc4), length 32, then the raw digest.
+        let mut bin = vec![0xc4, 32];
+        bin.extend_from_slice(&[0xAB; 32]);
+        assert!(
+            msgpack.windows(bin.len()).any(|w| w == bin.as_slice()),
+            "the hash must be encoded as msgpack bin"
+        );
+        assert!(
+            !msgpack.windows(64).any(|w| w == "ab".repeat(32).as_bytes()),
+            "the hash must not be a hex string"
+        );
+    }
 
-        let msgpack_bytes = rmp_serde::to_vec(&index).unwrap();
-        let compressed = zstd_compress(&msgpack_bytes).unwrap();
-        let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap();
-        let decoded: serde_json::Value = rmp_serde::from_slice(&decompressed).unwrap();
-
-        assert_eq!(decoded["info"]["subdir"], "linux-64");
-        assert!(decoded["shards"]["numpy"].is_string());
+    /// F4 (#4173): a shard decodes with rattler's `Shard` type, digests and
+    /// all, and the record digests are raw bytes equal to the hex in
+    /// `repodata.json`.
+    #[test]
+    fn test_shard_decodes_with_rattler() {
+        let mut artifact =
+            make_full_conda_artifact("numpy", "1.26.4", "py312_0", "linux-64", "conda", 8192);
+        artifact.checksum_sha256 = "ab".repeat(32);
+        artifact.metadata.as_mut().unwrap()["md5"] = "cd".repeat(16).into();
+        let shard = build_shard("linux-64", &[&artifact]);
+        let bytes = encode_shard(&shard).unwrap();
+        let decoded: rattler_conda_types::Shard =
+            rmp_serde::from_slice(&zstd::decode_all(&bytes[..]).unwrap())
+                .expect("rattler decodes the shard");
+        let (_, record) = decoded
+            .conda_packages
+            .iter()
+            .next()
+            .expect("one .conda record");
+        assert_eq!(record.name.as_normalized(), "numpy");
+        assert_eq!(
+            hex::encode(record.sha256.expect("sha256 present")),
+            artifact.checksum_sha256
+        );
+        assert_eq!(
+            hex::encode(record.md5.expect("md5 present")),
+            "cd".repeat(16)
+        );
     }
 
     #[test]
@@ -8925,14 +9064,14 @@ mod tests {
             shards_small.insert(format!("pkg{}", i), vec![0xAA; 32]);
         }
         let index_small = build_sharded_index("linux-64", "/test/", &shards_small);
-        let bytes_small = rmp_serde::to_vec(&index_small).unwrap();
+        let bytes_small = rmp_serde::to_vec_named(&index_small).unwrap();
 
         let mut shards_large = BTreeMap::new();
         for i in 0..100 {
             shards_large.insert(format!("pkg{}", i), vec![0xBB; 32]);
         }
         let index_large = build_sharded_index("linux-64", "/test/", &shards_large);
-        let bytes_large = rmp_serde::to_vec(&index_large).unwrap();
+        let bytes_large = rmp_serde::to_vec_named(&index_large).unwrap();
 
         // 10x more packages should result in roughly 10x larger index (within 2x margin)
         let ratio = bytes_large.len() as f64 / bytes_small.len() as f64;
@@ -11104,7 +11243,7 @@ mod tests {
             let by_name = group_artifacts_by_name(&subdir_artifacts);
             let artifacts = by_name.get("zlib").expect("seeded package must shard");
             let shard = build_shard("linux-64", artifacts);
-            let shard_compressed = serialize_msgpack_zst(&shard).expect("serialize shard");
+            let shard_compressed = encode_shard(&shard).expect("serialize shard");
             let mut hasher = Sha256::new();
             hasher.update(&shard_compressed);
             let hash = format!("{:x}", hasher.finalize());
@@ -13146,12 +13285,15 @@ mod withdrawal_tests {
         .await;
         assert_eq!(idx_status, StatusCode::OK);
         let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
-        let pre_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
-        let bad_shard_hash = pre_index["shards"]["bad"]
-            .as_str()
-            .expect("pre-withdrawal shard index must list bad")
-            .to_string();
-        assert!(pre_index["shards"]["good"].is_string());
+        let pre_index: rattler_conda_types::ShardedRepodata =
+            rmp_serde::from_slice(&idx_msgpack).unwrap();
+        let bad_shard_hash = hex::encode(
+            pre_index
+                .shards
+                .get("bad")
+                .expect("pre-withdrawal shard index must list bad"),
+        );
+        assert!(pre_index.shards.contains_key("good"));
 
         // Withdraw ONE package, with the reason an admin would give.
         let (status, body) = tdh::send(
@@ -13296,13 +13438,9 @@ mod withdrawal_tests {
         .await;
         assert_eq!(idx_status, StatusCode::OK);
         let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
-        let post_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
-        let shard_names: Vec<&str> = post_index["shards"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, _)| k.as_str())
-            .collect();
+        let post_index: rattler_conda_types::ShardedRepodata =
+            rmp_serde::from_slice(&idx_msgpack).unwrap();
+        let shard_names: Vec<&str> = post_index.shards.keys().map(String::as_str).collect();
         assert_eq!(
             shard_names,
             vec!["good"],
