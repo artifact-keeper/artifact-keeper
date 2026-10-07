@@ -1028,6 +1028,10 @@ struct CondaArtifact {
     checksum_sha256: String,
     storage_key: String,
     metadata: Option<serde_json::Value>,
+    /// When the package entered this channel's index: the row's `created_at`,
+    /// written once at upload and never rewritten, so every rebuild of the
+    /// repodata reports the same value (CEP-47 `indexed_timestamp`).
+    indexed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Row shape for [`list_conda_artifacts`]. Runtime-checked (not the `query!`
@@ -1045,6 +1049,7 @@ struct CondaArtifactRow {
     metadata: Option<serde_json::Value>,
     quarantine_status: Option<String>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Whether an artifact is withdrawn from the channel: the exact predicate the
@@ -1073,7 +1078,8 @@ async fn list_conda_artifacts(
     let rows = sqlx::query_as::<_, CondaArtifactRow>(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until
+               a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until,
+               a.created_at
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1 AND a.is_deleted = false
@@ -1105,6 +1111,7 @@ async fn list_conda_artifacts(
             checksum_sha256: r.checksum_sha256,
             storage_key: r.storage_key,
             metadata: r.metadata,
+            indexed_at: Some(r.created_at),
         })
         .collect())
 }
@@ -2501,6 +2508,13 @@ fn build_artifact_entry(
     }
     if let Some(ts) = meta.and_then(|m| m.get("timestamp").and_then(|v| v.as_u64())) {
         entry["timestamp"] = serde_json::json!(ts);
+    }
+    // CEP-47: when the record entered this channel, set by the server (never
+    // by the uploader), in Unix milliseconds. It is what a client's
+    // `exclude-newer` cooldown can trust: the package's own `timestamp` is
+    // whatever the build machine's clock said.
+    if let Some(indexed_at) = artifact.indexed_at {
+        entry["indexed_timestamp"] = serde_json::json!(indexed_at.timestamp_millis());
     }
 
     entry
@@ -6228,6 +6242,7 @@ mod tests {
             checksum_sha256: "hash".to_string(),
             storage_key: "key".to_string(),
             metadata,
+            indexed_at: None,
         }
     }
 
@@ -7498,6 +7513,7 @@ mod tests {
                 "license": "MIT",
                 "package_format": if format_ext == "conda" { "v2" } else { "v1" },
             })),
+            indexed_at: None,
         }
     }
 
@@ -8719,6 +8735,20 @@ mod tests {
         assert!(!entry["depends"].as_array().unwrap().is_empty());
     }
 
+    /// CEP-47: the server-set `indexed_timestamp` is the row's creation time
+    /// in milliseconds, and absent when the row carries none.
+    #[test]
+    fn test_build_artifact_entry_indexed_timestamp() {
+        let mut a = make_conda_artifact("pkg", "noarch/pkg-1.0-0.conda", None);
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
+        assert!(entry.get("indexed_timestamp").is_none());
+
+        let at = chrono::DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+        a.indexed_at = Some(at);
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
+        assert_eq!(entry["indexed_timestamp"], 1_700_000_000_123_i64);
+    }
+
     #[test]
     fn test_build_artifact_entry_no_metadata() {
         let artifact = CondaArtifact {
@@ -8730,6 +8760,7 @@ mod tests {
             checksum_sha256: "abc123".to_string(),
             storage_key: "key".to_string(),
             metadata: None,
+            indexed_at: None,
         };
         let entry = build_artifact_entry(&artifact, "mypkg-1.0-0.conda", "linux-64");
 
@@ -8757,6 +8788,7 @@ mod tests {
             checksum_sha256: "sha".to_string(),
             storage_key: "key".to_string(),
             metadata: None,
+            indexed_at: None,
         };
         let entry = build_artifact_entry(&artifact, "pkg-0-0.conda", "noarch");
         assert_eq!(entry["version"], "0"); // fallback
@@ -8778,6 +8810,7 @@ mod tests {
                 "build": "custom_1",
                 "build_number": 5,
             })),
+            indexed_at: None,
         };
         let entry = build_artifact_entry(&artifact, "pkg-2.0-custom_1.conda", "linux-64");
 
@@ -8807,6 +8840,7 @@ mod tests {
                 "track_features": "mkl",
                 "timestamp": 1700000000000_u64,
             })),
+            indexed_at: None,
         };
         let entry = build_artifact_entry(&artifact, "pkg-1.0-0.conda", "noarch");
 
@@ -14516,6 +14550,7 @@ mod repodata_byte_stability_tests {
         "python >=3.10"
       ],
       "fn": "zlib-1.2.13-hd590300_5.tar.bz2",
+      "indexed_timestamp": {ts},
       "license": "MIT",
       "md5": "171767ec5672ea594e1ef29d1211f3d7",
       "name": "zlib",
@@ -14548,6 +14583,7 @@ mod repodata_byte_stability_tests {
         "zlib >=1.2.13,<1.3.0a0"
       ],
       "fn": "rattlerpy-0.4.1-py312h02b7e37_1.conda",
+      "indexed_timestamp": {ts},
       "license": "BSD-3-Clause",
       "md5": "9f2993fb3eeeebbb9128a5c6b6b537d4",
       "name": "rattlerpy",
@@ -14561,8 +14597,26 @@ mod repodata_byte_stability_tests {
   "repodata_version": 1
 }"#;
 
-    fn golden(template: &str, key: &str) -> Vec<u8> {
-        template.replace("{key}", key).into_bytes()
+    /// `{ts}` is the record's CEP-47 `indexed_timestamp`: the artifact row's
+    /// `created_at` in milliseconds, which differs per run but is fixed for a
+    /// stored package.
+    fn golden(template: &str, key: &str, ts: i64) -> Vec<u8> {
+        template
+            .replace("{key}", key)
+            .replace("{ts}", &ts.to_string())
+            .into_bytes()
+    }
+
+    async fn indexed_ms(pool: &sqlx::PgPool, repo_id: uuid::Uuid, path: &str) -> i64 {
+        let created: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .expect("uploaded row");
+        created.timestamp_millis()
     }
 
     #[tokio::test]
@@ -14589,23 +14643,42 @@ mod repodata_byte_stability_tests {
         let noarch = get_bytes(&fx, "noarch/repodata.json").await;
         let linux64 = get_bytes(&fx, "linux-64/repodata.json").await;
         let current = get_bytes(&fx, "linux-64/current_repodata.json").await;
+        // A rebuild must report the same indexed_timestamp (CEP-47).
+        let noarch_again = get_bytes(&fx, "noarch/repodata.json").await;
         let key = fx.repo_key.clone();
+        let zlib_ts = indexed_ms(
+            &fx.pool,
+            fx.repo_id,
+            "noarch/zlib-1.2.13-hd590300_5.tar.bz2",
+        )
+        .await;
+        let rattler_ts = indexed_ms(
+            &fx.pool,
+            fx.repo_id,
+            "linux-64/rattlerpy-0.4.1-py312h02b7e37_1.conda",
+        )
+        .await;
         fx.teardown().await;
 
         assert_eq!(
+            noarch, noarch_again,
+            "repodata must be stable across rebuilds"
+        );
+
+        assert_eq!(
             noarch,
-            golden(GOLDEN_NOARCH, &key),
+            golden(GOLDEN_NOARCH, &key, zlib_ts),
             "noarch/repodata.json bytes changed"
         );
         assert_eq!(
             linux64,
-            golden(GOLDEN_LINUX64, &key),
+            golden(GOLDEN_LINUX64, &key, rattler_ts),
             "linux-64/repodata.json bytes changed"
         );
         // One version per name here, so current_repodata is the same document.
         assert_eq!(
             current,
-            golden(GOLDEN_LINUX64, &key),
+            golden(GOLDEN_LINUX64, &key, rattler_ts),
             "linux-64/current_repodata.json bytes changed"
         );
     }
