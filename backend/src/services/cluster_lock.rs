@@ -13,6 +13,8 @@
 //! without leaking a lock back into the pool. An in-memory implementation backs
 //! the unit tests so the coordinator is exercisable without a live database.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 
@@ -84,6 +86,58 @@ pub trait ClusterLock: Send + Sync {
     /// * `Err(_)` — lock infrastructure failure; the caller degrades to
     ///   per-process coordination (no worse than the pre-#1609 behavior).
     async fn try_acquire(&self, class: i32, obj: i32) -> Result<Option<ClusterLease>>;
+
+    /// Acquire `(class, obj)`, BLOCKING for at most `timeout` while another
+    /// replica holds it (#4013).
+    ///
+    /// * `Ok(Some(_))` — acquired. For a waiter this is the wake-up signal: the
+    ///   previous holder released, which the streaming leader does only after
+    ///   its cache publish, so the object is now readable from the cache.
+    /// * `Ok(None)` — `timeout` elapsed with the lock still held elsewhere.
+    /// * `Err(_)` — lock infrastructure failure.
+    ///
+    /// The provided body polls [`Self::try_acquire`] every
+    /// [`BLOCKING_ACQUIRE_POLL`]; it backs the in-memory test locks. The
+    /// Postgres implementation overrides it with a server-side wait that wakes
+    /// at the holder's release.
+    async fn acquire_blocking(
+        &self,
+        class: i32,
+        obj: i32,
+        timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(lease) = self.try_acquire(class, obj).await? {
+                return Ok(Some(lease));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(BLOCKING_ACQUIRE_POLL.min(deadline - now)).await;
+        }
+    }
+}
+
+/// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
+pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
+
+/// Postgres `lock_timeout` value for a blocking advisory wait of `timeout`.
+///
+/// `lock_timeout = 0` means "wait forever" in Postgres, so a zero (or sub-ms)
+/// timeout is rounded UP to 1 ms rather than silently becoming unbounded.
+fn lock_timeout_setting(timeout: Duration) -> String {
+    let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
+    format!("{ms}ms")
+}
+
+/// `true` when `err` is Postgres `lock_not_available` (SQLSTATE 55P03), which
+/// is what a lock wait that outlives `lock_timeout` raises.
+fn is_lock_timeout(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == "55P03")
 }
 
 /// Real PostgreSQL advisory-lock implementation (#1609).
@@ -126,6 +180,42 @@ impl ClusterLock for PgAdvisoryLock {
             class,
             obj,
         })))
+    }
+
+    async fn acquire_blocking(
+        &self,
+        class: i32,
+        obj: i32,
+        timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        // DETACH before the blocking statement, not after it: if this future
+        // is cancelled mid-wait (client gone) a pooled connection would go back
+        // to the pool while Postgres may still grant it the session lock, which
+        // would then poison the key for every replica. A detached connection
+        // simply closes on drop, and the server drops the wait (or the lock)
+        // with it. It also means the session-level `lock_timeout` below never
+        // leaks into a pooled connection.
+        let mut conn = self.pool.acquire().await?.detach();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(lock_timeout_setting(timeout))
+            .execute(&mut conn)
+            .await?;
+        match sqlx::query("SELECT pg_advisory_lock($1, $2)")
+            .bind(class)
+            .bind(obj)
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
+                conn: Some(conn),
+                class,
+                obj,
+            }))),
+            // The holder is still working after `timeout`: not an error, the
+            // caller falls back to fetching on its own. `conn` closes here.
+            Err(e) if is_lock_timeout(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -192,9 +282,36 @@ pub struct ErroringClusterLock;
 #[async_trait]
 impl ClusterLock for ErroringClusterLock {
     async fn try_acquire(&self, _class: i32, _obj: i32) -> Result<Option<ClusterLease>> {
-        Err(crate::error::AppError::Database(
-            "simulated cluster-lock backend failure".to_string(),
-        ))
+        Err(simulated_lock_failure())
+    }
+}
+
+#[cfg(test)]
+fn simulated_lock_failure() -> crate::error::AppError {
+    crate::error::AppError::Database("simulated cluster-lock backend failure".to_string())
+}
+
+/// A [`ClusterLock`] whose `try_acquire` always LOSES (another replica holds the
+/// key) but whose blocking wait fails, for exercising the coordinator's
+/// "lock lost, then the wait itself errors" path in unit tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct LosingThenErroringClusterLock;
+
+#[cfg(test)]
+#[async_trait]
+impl ClusterLock for LosingThenErroringClusterLock {
+    async fn try_acquire(&self, _class: i32, _obj: i32) -> Result<Option<ClusterLease>> {
+        Ok(None)
+    }
+
+    async fn acquire_blocking(
+        &self,
+        _class: i32,
+        _obj: i32,
+        _timeout: Duration,
+    ) -> Result<Option<ClusterLease>> {
+        Err(simulated_lock_failure())
     }
 }
 
@@ -353,5 +470,144 @@ mod tests {
             freed,
             "dropping the guard must release the advisory lock (connection close)"
         );
+    }
+    #[test]
+    fn lock_timeout_setting_never_becomes_unbounded() {
+        // `lock_timeout = 0` is "wait forever" in Postgres: a zero timeout
+        // must round UP, never down.
+        assert_eq!(lock_timeout_setting(Duration::ZERO), "1ms");
+        assert_eq!(lock_timeout_setting(Duration::from_micros(300)), "1ms");
+        assert_eq!(lock_timeout_setting(Duration::from_secs(65)), "65000ms");
+        assert_eq!(
+            lock_timeout_setting(Duration::from_secs(u64::MAX / 4)),
+            format!("{}ms", i32::MAX)
+        );
+    }
+
+    #[test]
+    fn non_database_errors_are_not_lock_timeouts() {
+        assert!(!is_lock_timeout(&sqlx::Error::RowNotFound));
+        assert!(!is_lock_timeout(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[tokio::test]
+    async fn provided_blocking_acquire_waits_for_release_then_wins() {
+        let lock = InMemoryClusterLock::default();
+        let obj = lease_object_id("blocking");
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("no error")
+            .expect("acquired");
+        let waiter = {
+            let lock = lock.clone();
+            tokio::spawn(async move {
+                lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "waiter blocks while the key is held");
+        held.release().await;
+        let won = waiter.await.expect("join").expect("no error");
+        assert!(won.is_some(), "waiter acquires once the holder releases");
+    }
+
+    #[tokio::test]
+    async fn provided_blocking_acquire_times_out_while_held() {
+        let lock = InMemoryClusterLock::default();
+        let obj = lease_object_id("blocking-timeout");
+        let _held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("no error")
+            .expect("acquired");
+        let got = lock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_millis(20))
+            .await
+            .expect("no error");
+        assert!(
+            got.is_none(),
+            "timeout while held is Ok(None), not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_acquire_surfaces_backend_errors() {
+        let err = ErroringClusterLock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, 1, Duration::from_millis(5))
+            .await;
+        assert!(err.is_err());
+        let err = LosingThenErroringClusterLock
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, 1, Duration::from_millis(5))
+            .await;
+        assert!(err.is_err());
+    }
+
+    /// Tier-2 (#4013): the REAL blocking advisory wait wakes when the holder
+    /// releases, times out with `Ok(None)` (SQLSTATE 55P03 under
+    /// `lock_timeout`) while it is held, and a cancelled wait never leaves a
+    /// lock behind. Two separate pools stand in for two replicas.
+    #[tokio::test]
+    async fn pg_blocking_acquire_wakes_on_release_and_times_out() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b = PgAdvisoryLock::new(pool_b);
+        let key = format!("proxy-cache:pgblock-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+
+        let held = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+
+        // Timeout while held: Ok(None), not an error.
+        let started = std::time::Instant::now();
+        let timed_out = replica_b
+            .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_millis(150))
+            .await
+            .expect("lock_timeout maps to Ok(None)");
+        assert!(timed_out.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(140));
+
+        // A cancelled wait must not leave a lock behind once the holder goes.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            replica_b.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "wait was still blocked when cancelled");
+
+        // Wake on release.
+        let waiter = tokio::spawn(async move {
+            replica_b
+                .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "waiter blocks while held");
+        held.release().await;
+        let woke = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter woke promptly after release")
+            .expect("join")
+            .expect("query ok")
+            .expect("acquired after release");
+        woke.release().await;
+
+        // Nothing leaked: the key is free again.
+        let free = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("free after the waiter released");
+        free.release().await;
     }
 }

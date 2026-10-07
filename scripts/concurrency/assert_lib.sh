@@ -18,6 +18,27 @@ sha256_of_file() {
     fi
 }
 
+# LARGE profile threshold: objects bigger than the backend's in-process
+# streaming fan-out window (FANOUT_CAPTURE_MAX_BYTES, 16 MiB) are not fanned
+# out live; their followers wait for the leader and read the cache.
+LARGE_OBJECT_BYTES=16777216
+
+# default_fetch_tolerance <artifact_size_bytes> <replicas> -> prints a number
+# A1's default allowance (#4013). The target stays "exactly one upstream fetch".
+# For a LARGE object the cross-replica coordinator's waiters block on the
+# leader for at most PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS and then fetch
+# once per replica, so the documented floor is <= replicas fetches:
+# tolerance = replicas - 1. A small object is fanned out in-process and must
+# stay strictly at 1.
+default_fetch_tolerance() {
+    local size="${1:-0}" replicas="${2:-1}"
+    if [ "$size" -gt "$LARGE_OBJECT_BYTES" ] && [ "$replicas" -gt 1 ]; then
+        echo $((replicas - 1))
+    else
+        echo 0
+    fi
+}
+
 # assert_fetch_counter_one <count> -> "PASS"/"FAIL <reason>"
 # A1: exactly one upstream fetch (strict ==1 unless a documented passthrough
 # tolerance is configured via FETCH_TOLERANCE).

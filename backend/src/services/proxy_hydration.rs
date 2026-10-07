@@ -365,6 +365,13 @@ pub struct StreamHandle {
     /// Response headers observed once when the leader opened upstream, shared
     /// verbatim with every follower so all clients see identical metadata.
     pub headers: StreamHeaders,
+    /// Flips to `true` when the leader's cache writer has FINISHED (published,
+    /// or rejected the body), i.e. when a cache read will no longer race a
+    /// half-finalised sidecar (#4013). `None` when this handle feeds no cache
+    /// write (a follower replay, the over-quota bypass). The cross-replica
+    /// coordinator releases its lock on this signal rather than on the
+    /// client's EOF, so a remote waiter it wakes finds the object committed.
+    pub cache_published: Option<watch::Receiver<bool>>,
 }
 
 /// Response metadata shared from the leader to all streaming followers. Cloned
@@ -530,6 +537,33 @@ where
     Open: FnOnce() -> OpenFut,
     OpenFut: Future<Output = crate::error::Result<StreamHandle>>,
 {
+    coordinate_stream_fanout_with(lease_key, move || {
+        let opened = open_leader();
+        async move { opened.await.map(LeaderOpen::Body) }
+    })
+    .await
+}
+
+/// What an in-process streaming leader's open step produced (#4013).
+enum LeaderOpen {
+    /// Upstream is open: fan this body out.
+    Body(StreamHandle),
+    /// No body: another replica's leader just finished this object, so the
+    /// leader and every follower parked on it re-enter (`Ok(None)`) and read
+    /// the warm cache instead of opening upstream.
+    ReElect,
+}
+
+/// [`coordinate_stream_fanout`] with an open step that may decline to open
+/// upstream ([`LeaderOpen::ReElect`]); the cross-replica coordinator's seam.
+async fn coordinate_stream_fanout_with<Open, OpenFut>(
+    lease_key: &str,
+    open_leader: Open,
+) -> crate::error::Result<Option<StreamHandle>>
+where
+    Open: FnOnce() -> OpenFut,
+    OpenFut: Future<Output = crate::error::Result<LeaderOpen>>,
+{
     match acquire_stream_slot(lease_key) {
         StreamRole::FallBack(rx) => {
             // A late arrival already missed leading bytes, so it cannot be
@@ -575,7 +609,14 @@ where
             // no items — must be released. We send a terminal failure so any
             // already-subscribed follower errors out instead of hanging.
             let handle = match open_leader().await {
-                Ok(handle) => handle,
+                Ok(LeaderOpen::Body(handle)) => handle,
+                Ok(LeaderOpen::ReElect) => {
+                    // Dropping the lease frees the slot and drops the header
+                    // watch sender, so every follower parked on this leader
+                    // sees `changed()` fail and also returns `Ok(None)`.
+                    drop(lease);
+                    return Ok(None);
+                }
                 Err(e) => {
                     // No body to fan out. Wake any followers waiting on headers
                     // (the watch sender drops with `lease`, so their
@@ -610,7 +651,11 @@ where
 /// receives every chunk and every error exactly as the underlying tee produced
 /// it — broadcasting is a side-effect that never alters the leader's bytes.
 fn leader_handle(lease: StreamLeaderLease, handle: StreamHandle) -> StreamHandle {
-    let StreamHandle { body, headers } = handle;
+    let StreamHandle {
+        body,
+        headers,
+        cache_published,
+    } = handle;
     let wrapped = async_stream::stream! {
         // Flip `started` under the registry lock so a concurrent follower
         // either subscribed before this point (and will see the first chunk)
@@ -661,6 +706,7 @@ fn leader_handle(lease: StreamLeaderLease, handle: StreamHandle) -> StreamHandle
     StreamHandle {
         body: Box::pin(wrapped),
         headers,
+        cache_published,
     }
 }
 
@@ -779,6 +825,7 @@ fn replay_handle(chunks: Vec<Bytes>, headers: StreamHeaders) -> StreamHandle {
     StreamHandle {
         body: Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))),
         headers,
+        cache_published: None,
     }
 }
 
@@ -797,9 +844,11 @@ fn replay_handle(chunks: Vec<Bytes>, headers: StreamHeaders) -> StreamHandle {
 /// gating the leader-election step behind the shared lock.
 ///
 /// The lock is held on a DETACHED connection ([`crate::services::cluster_lock`]),
-/// never across a transaction and never across a multi-GB streaming fetch, and
-/// auto-releases on connection death — so a crashed/cancelled leader cannot
-/// poison the key.
+/// never across a transaction, and auto-releases on connection death — so a
+/// crashed/cancelled leader cannot poison the key. On the streaming path it is
+/// taken only by a process's in-process leader and is held until that
+/// leader's cache publish; a losing in-process leader blocks on it (see
+/// [`open_as_cluster_leader`]).
 pub struct AdvisoryLockCoordinator {
     /// The in-process buffered coordinator the cluster leader delegates to
     /// (unchanged local election + produce + sidecar commit).
@@ -807,10 +856,12 @@ pub struct AdvisoryLockCoordinator {
     /// Shared cross-replica lock (`Arc<dyn ClusterLock>` keeps this type concrete
     /// so [`HydrationCoordinator`] stays non-generic).
     lock: Arc<dyn ClusterLock>,
-    /// How often a follower re-checks the cache while the leader produces.
+    /// How often a buffered follower re-checks the cache while the leader
+    /// produces. (The streaming path does not poll: it blocks on the lock.)
     poll_interval: Duration,
     /// Upper bound a follower waits for the leader's commit before falling back
-    /// to its own (bounded, content-addressed-safe) produce.
+    /// to its own (bounded, content-addressed-safe) produce. On the streaming
+    /// path this is the `lock_timeout` of the losing leader's blocking wait.
     wait_timeout: Duration,
 }
 
@@ -936,70 +987,164 @@ impl Coordinator for AdvisoryLockCoordinator {
         Open: FnOnce() -> OpenFut,
         OpenFut: Future<Output = crate::error::Result<StreamHandle>>,
     {
-        let obj = lease_object_id(lease_key);
-        match self.lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
-            Ok(Some(lease)) => {
-                // Cluster leader: delegate to the unchanged in-process tee/fan-out
-                // and HOLD the lease for the lifetime of the streamed body so no
-                // other replica cold-fetches the same object while we tee it to
-                // cache. The lock is never held across a transaction.
-                match self.inner.coordinate_stream(lease_key, open_leader).await {
-                    Ok(Some(handle)) => Ok(Some(hold_lease_until_stream_end(lease, handle))),
-                    // Fall-back (`Ok(None)`) or open failure (`Err`): no body to
-                    // fan out, so release the lock immediately.
-                    other => {
-                        lease.release().await;
-                        other
-                    }
+        // In-process single-flight FIRST (#4013): only this process's elected
+        // leader touches the cluster lock, so siblings of a leader never
+        // contend for it (they follow the local fan-out), and a lock loser
+        // costs one blocked connection per cold key per replica, not one per
+        // request.
+        let lock = self.lock.as_ref();
+        let wait_timeout = self.wait_timeout;
+        coordinate_stream_fanout_with(lease_key, move || {
+            open_as_cluster_leader(lock, lease_key, wait_timeout, open_leader)
+        })
+        .await
+    }
+}
+
+/// The in-process streaming leader's open step under the cross-replica lock
+/// (#4013, corrected option A of the 1.11.0 design review).
+///
+/// * Lock won: open upstream and hold the lock until the cache publish
+///   ([`hold_lease_until_published`]).
+/// * Lock lost: BLOCK on the lock for at most `wait_timeout`. The remote
+///   leader releases only after its cache publish, so the wake-up is the
+///   commit signal (no NOTIFY, no polling, no size estimate): release at once
+///   and [`LeaderOpen::ReElect`], so this leader and its followers re-enter
+///   onto the warm cache. One upstream fetch cluster-wide.
+/// * Wait timed out (multi-GB or throttled remote leader): open upstream as a
+///   per-process leader WITHOUT the lock, which is the flag-off behaviour: at
+///   most one fetch per replica, never one per request.
+/// * Lock infrastructure error: per-process leader, as before.
+async fn open_as_cluster_leader<Open, OpenFut>(
+    lock: &dyn ClusterLock,
+    lease_key: &str,
+    wait_timeout: Duration,
+    open_leader: Open,
+) -> crate::error::Result<LeaderOpen>
+where
+    Open: FnOnce() -> OpenFut,
+    OpenFut: Future<Output = crate::error::Result<StreamHandle>>,
+{
+    let obj = lease_object_id(lease_key);
+    match lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
+        Ok(Some(lease)) => match open_leader().await {
+            Ok(handle) => Ok(LeaderOpen::Body(hold_lease_until_published(lease, handle))),
+            Err(e) => {
+                // No body, no cache write: release now so a waiter re-elects.
+                lease.release().await;
+                Err(e)
+            }
+        },
+        Ok(None) => {
+            match lock
+                .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, wait_timeout)
+                .await
+            {
+                Ok(Some(lease)) => {
+                    lease.release().await;
+                    Ok(LeaderOpen::ReElect)
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        lease_key,
+                        wait_secs = wait_timeout.as_secs_f64(),
+                        "cross-replica proxy leader still filling after the wait timeout; \
+                         fetching as a per-process leader"
+                    );
+                    open_leader().await.map(LeaderOpen::Body)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        lease_key,
+                        "cross-replica hydration lock wait failed; fetching as a per-process leader"
+                    );
+                    open_leader().await.map(LeaderOpen::Body)
                 }
             }
-            Ok(None) => {
-                // Remote follower. Give the leader a brief window to commit a
-                // SMALL object (so the caller's re-enter lands on the warm cache),
-                // then return `Ok(None)`. A LARGE object never commits under the
-                // lock, so the caller's bounded re-enter budget drains into
-                // `fetch_artifact_streaming_uncoordinated` — proxy-without-cache,
-                // streaming straight through with NO lock held here and no OOM.
-                let nap = self.poll_interval.min(self.wait_timeout);
-                if !nap.is_zero() {
-                    tokio::time::sleep(nap).await;
-                }
-                Ok(None)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    lease_key,
-                    "cross-replica hydration lock unavailable; falling back to per-process streaming single-flight"
-                );
-                self.inner.coordinate_stream(lease_key, open_leader).await
-            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                lease_key,
+                "cross-replica hydration lock unavailable; falling back to per-process streaming single-flight"
+            );
+            open_leader().await.map(LeaderOpen::Body)
         }
     }
 }
 
-/// Wrap a leader [`StreamHandle`] so the cross-replica [`ClusterLease`] is held
-/// for the lifetime of the streamed body and released when the body completes
-/// (eager unlock) or is dropped (cancel/pod-kill → connection close). This is
-/// what prevents another replica from cold-fetching the same object while THIS
-/// leader is still teeing it to cache — without ever holding the lock inside a
-/// transaction or across the whole fetch synchronously.
-fn hold_lease_until_stream_end(lease: ClusterLease, handle: StreamHandle) -> StreamHandle {
-    let StreamHandle { body, headers } = handle;
+/// Upper bound on how long a cluster leader keeps the lock after its client
+/// body ended while waiting for the cache writer to finish. The writer's
+/// guard fires on every exit path, so this only matters if a storage call
+/// hangs; then the lock is released anyway and a waiter re-elects.
+const LEASE_PUBLISH_WAIT_MAX: Duration = Duration::from_secs(60);
+
+/// Wrap a cluster leader's [`StreamHandle`] so the [`ClusterLease`] is held
+/// until the leader's cache publish has FINISHED, not merely until the
+/// client's body ended (#4013). Remote waiters treat the release as "the
+/// object is in the cache", so releasing at client EOF would wake them a few
+/// milliseconds before the sidecar exists and they would re-elect a second
+/// upstream fetch.
+///
+/// The release runs from a [`PublishOrderedRelease`] guard, so it happens on
+/// every path: clean EOF, a client that stops polling at `Content-Length`, a
+/// dropped/cancelled body. It never delays the client's own stream.
+fn hold_lease_until_published(lease: ClusterLease, handle: StreamHandle) -> StreamHandle {
+    let StreamHandle {
+        body,
+        headers,
+        cache_published,
+    } = handle;
+    let guard = PublishOrderedRelease {
+        lease: Some(lease),
+        published: cache_published.clone(),
+    };
     let wrapped = async_stream::stream! {
-        // `lease` lives until this stream is fully consumed or dropped; on early
-        // drop the guard auto-releases, on clean EOF we release eagerly below.
-        let lease = lease;
+        let _guard = guard;
         let mut body = body;
         while let Some(item) = body.next().await {
             yield item;
         }
-        lease.release().await;
     };
     StreamHandle {
         body: Box::pin(wrapped),
         headers,
+        cache_published,
     }
+}
+
+/// Releases a cluster lease once the cache publish it guards has finished.
+struct PublishOrderedRelease {
+    lease: Option<ClusterLease>,
+    published: Option<watch::Receiver<bool>>,
+}
+
+impl Drop for PublishOrderedRelease {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let published = self.published.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(release_after_publish(lease, published));
+            }
+            // No runtime (process teardown): dropping the lease closes its
+            // connection, which releases the lock server-side.
+            Err(_) => drop(lease),
+        }
+    }
+}
+
+/// Wait (bounded by [`LEASE_PUBLISH_WAIT_MAX`]) for `published` to flip, then
+/// release `lease`. A closed channel counts as finished.
+async fn release_after_publish(lease: ClusterLease, published: Option<watch::Receiver<bool>>) {
+    if let Some(mut published) = published {
+        let _ =
+            tokio::time::timeout(LEASE_PUBLISH_WAIT_MAX, published.wait_for(|done| *done)).await;
+    }
+    lease.release().await;
 }
 
 /// Holds either the per-process buffered coordinator or the cross-replica
@@ -1369,6 +1514,7 @@ mod tests {
         Ok(StreamHandle {
             body: body_of(&[]),
             headers: StreamHeaders::default(),
+            cache_published: None,
         })
     }
 
@@ -1389,6 +1535,7 @@ mod tests {
                 Ok(StreamHandle {
                     body: body_of(&[b"hello ", b"world"]),
                     headers: test_headers(),
+                    cache_published: None,
                 })
             })
             .await
@@ -1454,6 +1601,7 @@ mod tests {
             Ok(StreamHandle {
                 body: Box::pin(body),
                 headers: test_headers(),
+                cache_published: None,
             })
         })
         .await
@@ -1550,6 +1698,7 @@ mod tests {
             Ok(StreamHandle {
                 body: Box::pin(body),
                 headers: test_headers(),
+                cache_published: None,
             })
         })
         .await
@@ -1592,6 +1741,7 @@ mod tests {
             Ok(StreamHandle {
                 body: body_of(&[b"x"]),
                 headers: test_headers(),
+                cache_published: None,
             })
         })
         .await
@@ -1626,6 +1776,7 @@ mod tests {
             Ok(StreamHandle {
                 body: body_of(&[b"ok"]),
                 headers: test_headers(),
+                cache_published: None,
             })
         })
         .await
@@ -1654,6 +1805,7 @@ mod tests {
                     content_length: Some(0),
                     etag: None,
                 },
+                cache_published: None,
             })
         })
         .await
@@ -1912,75 +2064,384 @@ mod tests {
         drop(held);
     }
 
-    /// Streaming leader holds the cluster lock for the lifetime of the streamed
-    /// body (so no peer replica cold-fetches concurrently) and releases it on
-    /// clean EOF; exactly one upstream open.
+    /// `true` once `key`'s cluster lock can be taken again (polls briefly: the
+    /// publish-ordered release runs on a spawned task).
+    async fn lock_frees_within(lock: &Arc<dyn ClusterLock>, key: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(lease) = lock
+                .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(key))
+                .await
+                .expect("no error")
+            {
+                lease.release().await;
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// A body plus a publish signal the test flips by hand.
+    fn handle_with_publish(chunks: &[&'static [u8]]) -> (StreamHandle, watch::Sender<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (
+            StreamHandle {
+                body: body_of(chunks),
+                headers: test_headers(),
+                cache_published: Some(rx),
+            },
+            tx,
+        )
+    }
+
+    /// #4013: the streaming cluster leader holds the lock across its body AND
+    /// past the client's EOF, until its cache publish finishes; only then is
+    /// the lock released (that release is what wakes remote waiters).
     #[tokio::test]
-    async fn advisory_streaming_leader_holds_lock_until_body_completes() {
+    async fn advisory_streaming_leader_holds_lock_until_cache_publish() {
         let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
         let key = format!("proxy-stream:leader-{}", uuid::Uuid::new_v4());
         let coord = advisory_over(&lock);
         let opens = Arc::new(AtomicUsize::new(0));
+        let (inner, publish) = handle_with_publish(&[b"abc", b"def"]);
         let handle = {
             let opens = Arc::clone(&opens);
             coord
                 .coordinate_stream(&key, || async move {
                     opens.fetch_add(1, Ordering::SeqCst);
-                    Ok(StreamHandle {
-                        body: body_of(&[b"abc", b"def"]),
-                        headers: test_headers(),
-                    })
+                    Ok(inner)
                 })
                 .await
                 .expect("leader open ok")
                 .expect("leader handle")
         };
-        // Held while the body is unconsumed.
         assert!(
-            lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
-                .await
-                .expect("no error")
-                .is_none(),
+            !lock_frees_within(&lock, &key, Duration::ZERO).await,
             "leader holds the cluster lock across the streamed body"
         );
         assert_eq!(drain(handle.body).await.expect("bytes"), b"abcdef");
         assert_eq!(opens.load(Ordering::SeqCst), 1, "exactly one upstream open");
-        // Released after the body completes.
         assert!(
-            lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
-                .await
-                .expect("no error")
-                .is_some(),
-            "cluster lock released after the leader body completes"
+            !lock_frees_within(&lock, &key, Duration::from_millis(30)).await,
+            "client EOF alone must not release: the sidecar is not published yet"
+        );
+        publish.send_replace(true);
+        assert!(
+            lock_frees_within(&lock, &key, Duration::from_secs(2)).await,
+            "cluster lock released once the cache publish finished"
         );
     }
 
-    /// Streaming remote follower returns `Ok(None)` so the caller re-enters
-    /// (warm cache) or drains its budget into proxy-without-cache; it must NOT
-    /// open upstream and must NOT hold the lock.
+    /// A leader body dropped mid-stream (client gone) still releases once its
+    /// publish signal resolves; a writer that went away counts as finished.
     #[tokio::test]
-    async fn advisory_streaming_loser_returns_none_without_opening() {
+    async fn advisory_streaming_leader_releases_when_body_dropped() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let key = format!("proxy-stream:dropped-{}", uuid::Uuid::new_v4());
+        let coord = advisory_over(&lock);
+        let (inner, publish) = handle_with_publish(&[b"abc"]);
+        let handle = coord
+            .coordinate_stream(&key, || async move { Ok(inner) })
+            .await
+            .expect("ok")
+            .expect("leader");
+        drop(handle);
+        drop(publish);
+        assert!(lock_frees_within(&lock, &key, Duration::from_secs(2)).await);
+    }
+
+    /// #4013 core: an in-process leader that LOSES the cluster lock blocks
+    /// until the remote leader releases (= published), then re-enters with
+    /// `Ok(None)` without opening upstream, and so do the local followers
+    /// parked on it. Zero upstream opens on this replica.
+    #[tokio::test]
+    async fn advisory_streaming_loser_waits_for_remote_publish_then_reenters() {
         let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
         let key = format!("proxy-stream:loser-{}", uuid::Uuid::new_v4());
-        let held = lock
+        let remote = lock
             .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
             .await
             .expect("no error")
             .expect("held");
-        let coord = AdvisoryLockCoordinator::new(
-            Arc::clone(&lock),
-            Duration::from_millis(1),
-            Duration::from_secs(5),
-        );
-        let handle = coord
-            .coordinate_stream(&key, never_opens)
-            .await
-            .expect("no error");
+        let coord = Arc::new(advisory_over(&lock));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let coord = Arc::clone(&coord);
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                coord
+                    .coordinate_stream(&key, never_opens)
+                    .await
+                    .map(|h| h.is_none())
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            handle.is_none(),
-            "streaming loser must return Ok(None) (re-enter / proxy-without-cache)"
+            tasks.iter().all(|t| !t.is_finished()),
+            "every local request waits while the remote leader is filling"
         );
-        drop(held);
+        remote.release().await;
+        for task in tasks {
+            let reentered = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("woken by the release")
+                .expect("join")
+                .expect("no error");
+            assert!(
+                reentered,
+                "re-enter onto the warm cache, never open upstream"
+            );
+        }
+    }
+
+    /// #4013 floor: when the remote leader is still filling at `wait_timeout`,
+    /// the local leader fetches ONCE as a per-process leader (no lock) and its
+    /// in-process followers are served from that one fetch, never N fetches.
+    #[tokio::test]
+    async fn advisory_streaming_wait_timeout_fetches_once_per_process() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let key = format!("proxy-stream:timeout-{}", uuid::Uuid::new_v4());
+        let _remote = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
+            .await
+            .expect("no error")
+            .expect("held for the whole test");
+        let coord = Arc::new(AdvisoryLockCoordinator::new(
+            Arc::clone(&lock),
+            Duration::from_millis(5),
+            Duration::from_millis(60),
+        ));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let coord = Arc::clone(&coord);
+            let key = key.clone();
+            let opens = Arc::clone(&opens);
+            tasks.push(tokio::spawn(async move {
+                let handle = coord
+                    .coordinate_stream(&key, || async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(StreamHandle {
+                            body: body_of(&[b"hello ", b"world"]),
+                            headers: test_headers(),
+                            cache_published: None,
+                        })
+                    })
+                    .await
+                    .expect("no error");
+                match handle {
+                    Some(h) => drain(h.body).await.map(Some),
+                    None => Ok(None),
+                }
+            }));
+        }
+        let mut served = 0;
+        for task in tasks {
+            if let Some(bytes) = task.await.expect("join").expect("no error") {
+                assert_eq!(bytes, b"hello world");
+                served += 1;
+            }
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "one fetch per process");
+        assert!(served >= 1, "the per-process leader serves its client");
+    }
+
+    /// #4013: N concurrent in-process requests touch the cluster lock ONCE
+    /// (only the in-process leader elects cluster-wide) and open upstream once.
+    #[tokio::test]
+    async fn advisory_streaming_in_process_election_runs_before_the_lock() {
+        #[derive(Default)]
+        struct CountingLock {
+            inner: InMemoryClusterLock,
+            tries: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ClusterLock for CountingLock {
+            async fn try_acquire(
+                &self,
+                class: i32,
+                obj: i32,
+            ) -> crate::error::Result<Option<ClusterLease>> {
+                self.tries.fetch_add(1, Ordering::SeqCst);
+                self.inner.try_acquire(class, obj).await
+            }
+        }
+        let counting = Arc::new(CountingLock::default());
+        let lock: Arc<dyn ClusterLock> = counting.clone();
+        let coord = Arc::new(advisory_over(&lock));
+        let key = format!("proxy-stream:inproc-{}", uuid::Uuid::new_v4());
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let coord = Arc::clone(&coord);
+            let key = key.clone();
+            let opens = Arc::clone(&opens);
+            let mut gate_rx = gate_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                coord
+                    .coordinate_stream(&key, || async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        // Hold the open until every request has arrived.
+                        let _ = gate_rx.wait_for(|open| *open).await;
+                        Ok(StreamHandle {
+                            body: body_of(&[b"hello ", b"world"]),
+                            headers: test_headers(),
+                            cache_published: None,
+                        })
+                    })
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate_tx.send_replace(true);
+        for task in tasks {
+            if let Some(h) = task.await.expect("join").expect("no error") {
+                assert_eq!(drain(h.body).await.expect("bytes"), b"hello world");
+            }
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "one upstream open");
+        assert_eq!(
+            counting.tries.load(Ordering::SeqCst),
+            1,
+            "only the in-process leader contends for the cluster lock"
+        );
+    }
+
+    /// A lock lost and then a failing wait degrades to a per-process fetch.
+    #[tokio::test]
+    async fn advisory_streaming_wait_error_fetches_per_process() {
+        use crate::services::cluster_lock::LosingThenErroringClusterLock;
+        let lock: Arc<dyn ClusterLock> = Arc::new(LosingThenErroringClusterLock);
+        let coord = advisory_over(&lock);
+        let key = format!("proxy-stream:waiterr-{}", uuid::Uuid::new_v4());
+        let handle = coord
+            .coordinate_stream(&key, || async {
+                Ok(StreamHandle {
+                    body: body_of(&[b"xy"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            })
+            .await
+            .expect("ok")
+            .expect("per-process leader handle");
+        assert_eq!(drain(handle.body).await.expect("bytes"), b"xy");
+    }
+
+    /// Tier-2 (#4013): two "replicas" on two separate pools, the real Postgres
+    /// advisory lock. The waiter is NOT woken by the leader's client EOF, only
+    /// by its cache publish, and by then the object is in the (shared) cache,
+    /// so its re-enter serves from cache with zero upstream opens.
+    #[tokio::test]
+    async fn pg_cross_replica_waiter_serves_from_cache_after_leader_publish() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cluster_lock::PgAdvisoryLock;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let replica_a: Arc<dyn ClusterLock> = Arc::new(PgAdvisoryLock::new(pool_a));
+        let replica_b: Arc<dyn ClusterLock> = Arc::new(PgAdvisoryLock::new(pool_b));
+        let key = format!("proxy-stream:pg-xreplica-{}", uuid::Uuid::new_v4());
+        let cache: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let opens = Arc::new(AtomicUsize::new(0));
+
+        // Replica A wins and streams.
+        let (inner, publish) = handle_with_publish(&[b"hello ", b"world"]);
+        let leader = match open_as_cluster_leader(
+            replica_a.as_ref(),
+            &key,
+            Duration::from_secs(30),
+            || async move { Ok(inner) },
+        )
+        .await
+        .expect("leader open")
+        {
+            LeaderOpen::Body(h) => h,
+            LeaderOpen::ReElect => panic!("first replica must lead"),
+        };
+
+        // Replica B's in-process leader loses and blocks.
+        let waiter = {
+            let opens = Arc::clone(&opens);
+            let key = key.clone();
+            tokio::spawn(async move {
+                let outcome = open_as_cluster_leader(
+                    replica_b.as_ref(),
+                    &key,
+                    Duration::from_secs(30),
+                    || async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Err(crate::error::AppError::BadGateway("must not open".into()))
+                    },
+                )
+                .await;
+                matches!(outcome, Ok(LeaderOpen::ReElect))
+            })
+        };
+        let body = drain(leader.body).await.expect("leader bytes");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter.is_finished(),
+            "client EOF must not wake the waiter before the publish"
+        );
+        // The writer commits, then signals.
+        *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(body);
+        publish.send_replace(true);
+        let reelected = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("waiter woke after the publish")
+            .expect("join");
+        assert!(reelected, "waiter re-enters instead of opening upstream");
+        assert_eq!(opens.load(Ordering::SeqCst), 0, "zero opens on replica B");
+        assert_eq!(
+            cache.lock().unwrap_or_else(|p| p.into_inner()).as_deref(),
+            Some(&b"hello world"[..]),
+            "the re-enter finds the committed object"
+        );
+    }
+
+    /// Tier-2 (#4013) timeout path on the real lock: a waiter whose remote
+    /// leader outlives `wait_timeout` opens upstream itself, once.
+    #[tokio::test]
+    async fn pg_cross_replica_waiter_fetches_itself_after_lock_timeout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cluster_lock::PgAdvisoryLock;
+        let Some(pool_a) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(pool_b) = tdh::try_pool().await else {
+            return;
+        };
+        let replica_a = PgAdvisoryLock::new(pool_a);
+        let replica_b = PgAdvisoryLock::new(pool_b);
+        let key = format!("proxy-stream:pg-timeout-{}", uuid::Uuid::new_v4());
+        let held = replica_a
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
+            .await
+            .expect("query ok")
+            .expect("held");
+        let opens = AtomicUsize::new(0);
+        let outcome =
+            open_as_cluster_leader(&replica_b, &key, Duration::from_millis(200), || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(StreamHandle {
+                    body: body_of(&[b"xy"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            })
+            .await
+            .expect("open ok");
+        assert!(matches!(outcome, LeaderOpen::Body(_)));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        held.release().await;
     }
 
     /// Lock-infrastructure failure must NOT fail the request: the buffered
@@ -2022,6 +2483,7 @@ mod tests {
                 Ok(StreamHandle {
                     body: body_of(&[b"xy"]),
                     headers: test_headers(),
+                    cache_published: None,
                 })
             })
             .await

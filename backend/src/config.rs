@@ -1087,13 +1087,23 @@ pub struct Config {
     /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
     pub proxy_singleflight_advisory_locks_enabled: bool,
 
-    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
-    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    /// Follower poll cadence (milliseconds) for the BUFFERED proxy path while
+    /// the cluster leader fetches, when `proxy_singleflight_advisory_locks_enabled`
+    /// is true. The streaming path does not poll (it blocks on the lock, see
+    /// below). Default: 200.
     pub proxy_singleflight_lock_poll_interval_ms: u64,
 
     /// Upper bound (seconds) a follower waits for the leader's commit before
     /// falling back to its own bounded fetch, when advisory locks are enabled.
-    /// Default: 65.
+    /// On the streaming path (#4013) only one request per replica waits: that
+    /// replica's in-process leader blocks on the advisory lock with this as its
+    /// `lock_timeout`, and the cluster leader releases the lock after its cache
+    /// publish, so the waiter wakes exactly when the object is readable and
+    /// serves it (and its local followers) from cache. If the leader is still
+    /// filling at the deadline the waiter fetches once for its replica, so a
+    /// cold object costs 1 upstream fetch, or at most one per replica when the
+    /// fill outlives this. Each waiting replica holds one database connection
+    /// per cold key while it waits. Default: 65.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
     // -- OCI virtual-resolution negative cache (#1424) --

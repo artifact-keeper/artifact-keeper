@@ -193,6 +193,16 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     true
 }
 
+/// Completion signal of the streaming publish registered for `metadata_key`
+/// (#4013): flips to `true` when its writer task ends (commit, reject or
+/// error). Read right after [`CachePersister::tee_stream`] registered it, so
+/// it is this leader's own publish. `None` when nothing is registered.
+fn tee_publish_done(metadata_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lock_tee_publish_registry()
+        .get(metadata_key)
+        .map(|entry| entry.done_rx.clone())
+}
+
 /// Response from an upstream registry fetch.
 pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
@@ -5133,6 +5143,12 @@ impl ProxyService {
         // A Deferred digest survives the re-enters as a cheap
         // [`DeferredCommitDigest`] clone — every clone shares the ONE
         // underlying resolution, so a re-enter never re-fetches the sidecar.
+        //
+        // Under the cross-replica coordinator (#4013) a re-enter is not a
+        // timed poll: a losing leader blocks on the cluster lock until the
+        // remote leader has PUBLISHED, so each re-enter corresponds to a
+        // finished remote fill and normally lands on the warm cache. The
+        // budget is therefore never drained by waiting on a large object.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
@@ -5587,10 +5603,14 @@ impl ProxyService {
                 return Ok(StreamHandle {
                     body: upstream.body,
                     headers,
+                    cache_published: None,
                 });
             }
         }
 
+        // #4013: the cross-replica coordinator releases its lock on the tee
+        // writer's completion, so capture that signal before the key moves.
+        let publish_key = metadata_key.clone();
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
@@ -5647,7 +5667,11 @@ impl ProxyService {
             ));
         }
 
-        Ok(StreamHandle { body, headers })
+        Ok(StreamHandle {
+            body,
+            headers,
+            cache_published: tee_publish_done(&publish_key),
+        })
     }
 
     /// Apply the buffered path's upstream-error correctness to the streaming
@@ -5749,7 +5773,11 @@ impl ProxyService {
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
             };
-            return Ok(StreamHandle { body, headers });
+            return Ok(StreamHandle {
+                body,
+                headers,
+                cache_published: None,
+            });
         }
 
         Err(upstream_err)

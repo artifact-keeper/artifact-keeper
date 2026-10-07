@@ -158,6 +158,12 @@ services:
       # a configuration in which cross-replica coordination is switched off and
       # cannot hold. The feature under test must be enabled in the stack under
       # test. Overridable from the shell so an A/B run can compare the two.
+      # With it on, a replica that loses the lock blocks until the leader has
+      # published and then reads the cache (#4013); only a leader that outlives
+      # PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS (default 65) makes the others
+      # fetch, once per replica. A1 therefore targets 1 and, for an object over
+      # the 16 MiB fan-out window (the default 256 MiB one), allows
+      # <= replicas (FETCH_TOLERANCE defaults to REPLICAS-1 in the driver).
       PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED: "${PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED:-true}"
       ENVIRONMENT: development
       RUST_LOG: info
