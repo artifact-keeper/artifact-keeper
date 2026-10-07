@@ -408,7 +408,19 @@ async fn select_unregistered_manifests(db: &PgPool) -> sqlx::Result<Vec<RepairCa
 /// Shared with the OCI by-digest delete, which tombstones only the rows of the
 /// image it names (#4466).
 pub(crate) fn manifest_row_image(path: &str, repo_key: &str) -> Option<String> {
-    match classify_oci_source_artifact(strip_repo_prefix(path, repo_key)) {
+    let path = strip_repo_prefix(path, repo_key);
+    // The canonical push shape first: a tag may literally be `manifest.json`,
+    // which the source-layout classifier would read as an Artifactory folder.
+    if let Some((image, reference)) = path
+        .strip_prefix("v2/")
+        .and_then(|rest| rest.rsplit_once("/manifests/"))
+    {
+        let image = image.strip_prefix("-/").unwrap_or(image);
+        if !image.is_empty() && !reference.is_empty() && !reference.contains('/') {
+            return Some(image.to_string());
+        }
+    }
+    match classify_oci_source_artifact(path) {
         OciRole::Manifest { image, .. } => Some(image),
         _ => None,
     }
@@ -1281,6 +1293,8 @@ mod tests {
             ("xa/sha256__abc/list.manifest.json", Some("xa")),
             ("rk/v2/xa/manifests/v1", Some("xa")),
             ("rk/xa/v1/manifest.json", Some("xa")),
+            ("v2/xa/manifests/manifest.json", Some("xa")),
+            ("v2/xa/manifests/list.manifest.json", Some("xa")),
             ("v2/xa/blobs/sha256:abc", None),
             ("readme.txt", None),
         ];
@@ -1971,6 +1985,58 @@ mod tests {
         rig.restart().await;
         assert_eq!(rig.tag("xb", "v1").await.as_deref(), Some(&*digest));
         assert_eq!(rig.tag("xa", "v1").await, None, "xa:v1 must not come back");
+
+        rig.teardown().await;
+    }
+
+    async fn live_v1_row(rig: &Rig4450, image: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 \
+             AND path = $2 AND is_deleted = false)",
+        )
+        .bind(rig.repo_id)
+        .bind(format!("v2/{image}/manifests/v1"))
+        .fetch_one(&rig.pool)
+        .await
+        .expect("row state")
+    }
+
+    /// #4466, the exact W4C repro: `xa:v1` and `xb:v1` are the same manifest
+    /// pushed BY TAG ONLY (no by-digest row, so no reindex marker is ever
+    /// written). `DELETE xa@digest` removes `xa:v1` and its row only; `xb:v1`
+    /// and its row, the `oci_manifests` record and the blob refs stay, and a
+    /// restart neither drops `xb:v1` nor brings `xa:v1` back.
+    #[tokio::test]
+    async fn digest_delete_of_tag_only_images_is_scoped_to_the_image_name_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool.clone(), "reidx4466t").await;
+
+        let body = image_manifest_4450("tag-only-4466");
+        let digest = rig.push("xa", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push("xb", "v1", &body, OCI_MANIFEST_CT).await;
+        let blob_refs = "SELECT COUNT(*) FROM manifest_blob_refs \
+                         WHERE repository_id = $1 AND manifest_digest = $2";
+        let refs_before = rig.count(blob_refs, &digest).await;
+        rig.delete("xa", &digest, &digest).await;
+        for label in ["after delete", "after restart"] {
+            if label == "after restart" {
+                rig.restart().await;
+            }
+            assert_eq!(rig.tag("xa", "v1").await, None, "{label}: xa:v1 goes");
+            assert!(!live_v1_row(&rig, "xa").await, "{label}: xa's row goes");
+            assert_eq!(
+                rig.tag("xb", "v1").await.as_deref(),
+                Some(&*digest),
+                "{label}: xb:v1 stays"
+            );
+            assert!(live_v1_row(&rig, "xb").await, "{label}: xb's row stays");
+            assert_eq!(rig.manifest_record(&digest).await, 1, "{label}");
+            assert_eq!(rig.count(blob_refs, &digest).await, refs_before, "{label}");
+        }
 
         rig.teardown().await;
     }

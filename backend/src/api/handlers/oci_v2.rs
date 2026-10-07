@@ -12093,9 +12093,9 @@ async fn handle_delete_manifest(
 
     // Preserve the OCI contract exactly: a digest reference is a
     // content-addressed delete (every tag of this image name pointing at the
-    // digest goes, #4466), a tag reference removes only that tag. The digest here was resolved FROM this
-    // repository's index, which is what makes the content-addressed scope
-    // correct on this route.
+    // digest goes, #4466), a tag reference removes only that tag. The digest
+    // here was resolved FROM this repository's index, which is what makes the
+    // content-addressed scope correct on this route.
     let scope = if is_digest_reference(reference) {
         OciIndexDeleteScope::ContentAddressed
     } else {
@@ -12152,7 +12152,8 @@ async fn handle_delete_manifest(
 ///   belong to a different image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OciIndexDeleteScope {
-    /// Remove every tag row in the repository pointing at `digest`.
+    /// Remove every tag row OF THE NAMED IMAGE pointing at `digest` (#4466);
+    /// the same digest under another image name in the repository stays.
     ContentAddressed,
     /// Remove only the `(name = image, tag = reference)` tag row.
     NamedReference,
