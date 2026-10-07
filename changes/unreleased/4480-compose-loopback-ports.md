@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#4480]
+---
+- **The stock `docker-compose.yml` no longer publishes Postgres, OpenSearch, Trivy or OpenSCAP on every host interface** (#4480). A `ports:` entry without an address binds `0.0.0.0` (and bypasses firewalld/ufw on Docker), so a default `docker compose up -d` on a host with a routable address exposed Postgres with its fixed `registry`/`registry` login on 30432 and OpenSearch, which runs with its security plugin disabled, on 9200. The backend reaches all four on the compose network and needs none of these ports. Postgres and OpenSearch are now published on `127.0.0.1` only, which keeps the documented host-side development flow (`docker compose up -d postgres opensearch`, then `cargo run`) working, and Trivy and OpenSCAP are no longer published, with a commented loopback opt-in for debugging. Only Caddy (30080/30443) is reachable from other machines by default. Anyone who relied on reaching these services from another host must now publish them explicitly.

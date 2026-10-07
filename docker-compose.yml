@@ -93,8 +93,14 @@ services:
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
       - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro,z
       - pg_certs:/var/lib/postgresql/certs:ro
+    # Loopback only (#4480). The backend reaches Postgres as postgres:5432 on
+    # the compose network and needs no published port; this one exists for
+    # running the backend from a host checkout (CONTRIBUTING.md: `docker
+    # compose up -d postgres opensearch` then `cargo run`). The credentials
+    # above are fixed, so never publish it on all interfaces. To reach it
+    # from another machine, replace the line with "30432:5432" knowingly.
     ports:
-      - "30432:5432"
+      - "127.0.0.1:30432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
       interval: 10s
@@ -357,8 +363,12 @@ services:
       DISABLE_INSTALL_DEMO_CONFIG: "true"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
+    # Loopback only (#4480): the security plugin is disabled, so anyone who
+    # can reach this port can read and change the index. The backend uses
+    # opensearch:9200 on the compose network; the published port is only for
+    # host-side development (see the postgres service above).
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
@@ -377,8 +387,10 @@ services:
     image: ghcr.io/aquasecurity/trivy:0.74.0
     container_name: artifact-keeper-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
-    ports:
-      - "8090:8090"
+    # Not published (#4480): the backend calls trivy:8090 on the compose
+    # network. For host-side debugging, opt in on loopback only:
+    # ports:
+    #   - "127.0.0.1:8090:8090"
     volumes:
       - trivy_cache:/root/.cache/trivy
       - scan_workspace:/scan-workspace:ro
@@ -420,8 +432,10 @@ services:
   openscap:
     image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest  # or artifactkeeper/openscap:latest
     container_name: artifact-keeper-openscap
-    ports:
-      - "8091:8091"
+    # Not published (#4480): the backend calls openscap:8091 on the compose
+    # network. For host-side debugging, opt in on loopback only:
+    # ports:
+    #   - "127.0.0.1:8091:8091"
     volumes:
       - scan_workspace:/scan-workspace:ro
     healthcheck:
@@ -594,8 +608,9 @@ volumes:
 # Network
 # =============================================================================
 # A single bridge network for all services. All inter-container communication
-# stays on this network; only Caddy (and optionally Postgres/OpenSearch for
-# debugging) expose ports to the host.
+# stays on this network. Only Caddy is published on all host interfaces;
+# Postgres and OpenSearch are published on 127.0.0.1 for host-side
+# development, and Trivy/OpenSCAP are not published at all (#4480).
 #
 # The subnet is PINNED so it is deterministic: the backend's
 # RATE_LIMIT_TRUSTED_PROXY_CIDRS (see the backend service) must match the
