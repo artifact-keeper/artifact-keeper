@@ -14,8 +14,8 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::download_holds_service::{
-    classify_hold, normalize_pagination, parse_hold_kinds, remaining_seconds, total_pages,
-    DownloadHoldsService, HoldKind, QuarantineHoldRow,
+    classify_hold, parse_hold_kinds, remaining_seconds, DownloadHoldsService, HoldKind,
+    QuarantineHoldRow,
 };
 
 pub fn admin_router() -> Router<SharedState> {
@@ -43,6 +43,8 @@ pub struct HoldsSummaryResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuarantineHoldResponse {
     /// `hosted` (an `artifacts` row) or `proxy-cache` (`proxy_cache_artifacts`).
+    /// Proxy-cache rows mirror the hold in the cache sidecar, which is what the
+    /// download path enforces; the listing is a best-effort view of it.
     pub source: String,
     /// Present for hosted rows; proxy-cache holds have no `artifacts` identity.
     pub artifact_id: Option<Uuid>,
@@ -152,7 +154,7 @@ pub async fn list_quarantine(
 ) -> Result<Json<QuarantineHoldListResponse>> {
     require_queue_admin(&auth)?;
     let kinds = parse_hold_kinds(query.kind.as_deref())?;
-    let (page, per_page, offset) = normalize_pagination(query.page, query.per_page);
+    let (page, per_page, offset) = Pagination::clamp_offset(query.page, query.per_page);
     let (rows, total) = svc(&state)
         .list_quarantine(
             query.repository_key.as_deref(),
@@ -163,12 +165,7 @@ pub async fn list_quarantine(
         .await?;
     Ok(Json(QuarantineHoldListResponse {
         items: rows.into_iter().map(to_quarantine_response).collect(),
-        pagination: Pagination {
-            page,
-            per_page,
-            total,
-            total_pages: total_pages(total, per_page),
-        },
+        pagination: Pagination::for_page(page, per_page, total),
     }))
 }
 
@@ -186,6 +183,7 @@ pub async fn list_quarantine(
 )]
 pub struct DownloadHoldsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

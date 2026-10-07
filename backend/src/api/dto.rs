@@ -67,6 +67,33 @@ impl Pagination {
     }
 }
 
+impl Pagination {
+    /// Clamp raw `page` / `per_page` query values for an OFFSET listing:
+    /// `page >= 1`, `per_page` defaults to 20 and is clamped to `1..=100`.
+    /// Returns `(page, per_page, offset)`; the offset is computed in `i64`, so
+    /// it cannot overflow.
+    pub fn clamp_offset(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
+        let page = page.unwrap_or(1).max(1);
+        let per_page = per_page.unwrap_or(20).clamp(1, 100);
+        let offset = i64::from(page - 1) * i64::from(per_page);
+        (page, per_page, offset)
+    }
+
+    /// The response block for one page of an OFFSET listing. `total_pages`
+    /// is an integer ceiling (#1571) and is 0 for an empty result.
+    pub fn for_page(page: u32, per_page: u32, total: i64) -> Self {
+        let total_pages = u64::try_from(total)
+            .unwrap_or(0)
+            .div_ceil(u64::from(per_page.max(1)));
+        Self {
+            page,
+            per_page,
+            total,
+            total_pages: u32::try_from(total_pages).unwrap_or(u32::MAX),
+        }
+    }
+}
+
 /// Query parameters for paginated list requests.
 ///
 /// Provides optional page and per_page parameters with sensible defaults.
@@ -95,6 +122,24 @@ impl PaginationQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_offset_defaults_and_clamps() {
+        assert_eq!(Pagination::clamp_offset(None, None), (1, 20, 0));
+        assert_eq!(Pagination::clamp_offset(Some(0), Some(500)), (1, 100, 0));
+        assert_eq!(Pagination::clamp_offset(Some(3), Some(25)), (3, 25, 50));
+        assert_eq!(Pagination::clamp_offset(Some(2), Some(0)), (2, 1, 1));
+    }
+
+    #[test]
+    fn for_page_uses_an_integer_ceiling() {
+        assert_eq!(Pagination::for_page(1, 20, 0).total_pages, 0);
+        assert_eq!(Pagination::for_page(1, 20, 45).total_pages, 3);
+        assert_eq!(Pagination::for_page(1, 20, 40).total_pages, 2);
+        assert_eq!(Pagination::for_page(1, 20, -1).total_pages, 0);
+        let p = Pagination::for_page(2, 10, 11);
+        assert_eq!((p.page, p.per_page, p.total, p.total_pages), (2, 10, 11, 2));
+    }
 
     // -----------------------------------------------------------------------
     // PaginationQuery

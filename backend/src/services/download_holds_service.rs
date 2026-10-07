@@ -6,9 +6,16 @@
 //! * **Quarantine** — timed upload/age holds and admin blocks (`artifacts`
 //!   status, plus proxy-cache `quarantine_until` / `quarantine_released_at`).
 //!
-//! Scan-policy 403s are a separate gate and are **not** listed here; they
-//! belong on a dedicated surface once that gate has a real identity other
-//! than a quarantine stamp.
+//! Scan-policy blocks are currently stored as a quarantine stamp
+//! (`quarantine_status = 'quarantined'` with a `Policy '...'` reason), so they
+//! DO appear in the quarantine queue, as `source: hosted, kind: active`. They
+//! cannot be told apart from other holds until the hold records its origin
+//! (a `quarantine_source` column, #4510).
+//!
+//! Proxy-cache rows mirror the hold recorded in the cache sidecar, which is
+//! the read path's authority; the catalog columns are a best-effort mirror of
+//! it (an entry cached before migration 236 is not listed until it is
+//! re-fetched).
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -97,21 +104,6 @@ pub fn parse_hold_kinds(raw: Option<&str>) -> Result<Vec<HoldKind>> {
         return Ok(vec![HoldKind::Active, HoldKind::Rejected]);
     }
     Ok(kinds)
-}
-
-pub fn normalize_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
-    let page = page.unwrap_or(1).max(1);
-    let per_page = per_page.unwrap_or(20).clamp(1, 100);
-    let offset = i64::from(page - 1) * i64::from(per_page);
-    (page, per_page, offset)
-}
-
-pub fn total_pages(total: i64, per_page: u32) -> u32 {
-    if total <= 0 {
-        0
-    } else {
-        ((total as f64) / (per_page as f64)).ceil() as u32
-    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -297,6 +289,7 @@ impl DownloadHoldsService {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,15 +357,6 @@ mod tests {
     fn parse_hold_kinds_rejects_unknown() {
         let err = parse_hold_kinds(Some("pending")).unwrap_err();
         assert!(err.to_string().contains("Unknown hold kind"));
-    }
-
-    #[test]
-    fn pagination_clamps() {
-        assert_eq!(normalize_pagination(None, None), (1, 20, 0));
-        assert_eq!(normalize_pagination(Some(0), Some(500)), (1, 100, 0));
-        assert_eq!(normalize_pagination(Some(3), Some(10)), (3, 10, 20));
-        assert_eq!(total_pages(0, 20), 0);
-        assert_eq!(total_pages(45, 20), 3);
     }
 
     #[test]
