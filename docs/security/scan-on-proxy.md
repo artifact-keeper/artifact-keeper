@@ -78,8 +78,9 @@ different file than the one classified and cached, each a `400` before any
 upstream request:
 
 - *What the client sent.* On the npm tarball, PyPI file and Cargo download
-  routes, the generic download route's Remote arm, and (already before) the
-  Maven, sbt, NuGet and VS Code routes, a client path containing any `?`,
+  routes, the VS Code gallery routes (asset, `vspackage`, legacy download),
+  the generic download route's Remote arm, and (already before) the Maven,
+  sbt and NuGet routes, a client path containing any `?`,
   `#`, `;`, `\`, a control character or a `%` that is not a valid `%XX`
   escape is refused. The format routes also refuse raw spaces; the generic
   route allows them, since stored file names may contain them.

@@ -681,9 +681,24 @@ fn is_safe_gallery_segment(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+/// A gallery coordinate a CLIENT sent (#4365 item 3): [`is_safe_gallery_segment`]
+/// plus the shared client-path rule
+/// ([`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)),
+/// so a `;`, a `%` that is not a valid `%XX` escape or a raw space is refused
+/// like a `?` or `#`. Each of these used to be percent-encoded into the
+/// upstream URL and cache key, giving one more spelling of a coordinate. No
+/// publisher id, extension name, version, platform or asset type contains
+/// them. Values read from upstream metadata keep the narrower
+/// [`is_safe_gallery_segment`] rule, so an odd upstream listing is not
+/// refused wholesale.
+fn is_safe_gallery_request_segment(value: &str) -> bool {
+    is_safe_gallery_segment(value)
+        && crate::services::proxy_service::reject_ambiguous_client_path(value, false).is_ok()
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_gallery_request_segment(value: &str) -> Result<(), Response> {
-    if is_safe_gallery_segment(value) {
+    if is_safe_gallery_request_segment(value) {
         Ok(())
     } else {
         Err((StatusCode::BAD_REQUEST, "Invalid VS Code gallery path").into_response())
@@ -5642,10 +5657,21 @@ mod tests {
     #[test]
     fn legacy_download_upstream_path_validates_then_percent_encodes() {
         assert_eq!(
-            legacy_download_upstream_path("Publisher Name", "My Extension", "1.0.0+build").unwrap(),
-            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download"
+            legacy_download_upstream_path("Publisher", "my-extension", "1.0.0+build").unwrap(),
+            "extensions/Publisher/my-extension/1.0.0%2Bbuild/download"
         );
-        assert!(legacy_download_upstream_path("bad?publisher", "extension", "1.0.0").is_err());
+        // #4365 item 3: none of these is a gallery coordinate character.
+        for (publisher, name, version) in [
+            ("bad?publisher", "extension", "1.0.0"),
+            ("Publisher Name", "extension", "1.0.0"),
+            ("publisher", "extension;jsessionid=1", "1.0.0"),
+            ("publisher", "extension", "1.0.0%zz"),
+        ] {
+            assert!(
+                legacy_download_upstream_path(publisher, name, version).is_err(),
+                "{publisher}/{name}/{version}"
+            );
+        }
     }
 
     #[test]
@@ -5783,6 +5809,18 @@ mod tests {
             "Microsoft.VisualStudio.Services.VSIXPackage"
         ));
         assert!(is_safe_gallery_segment("linux-x64"));
+        // #4365 item 3: a client-sent coordinate also refuses what the shared
+        // client-path rule refuses; a valid escape is still a coordinate.
+        for value in ["a;b", "a%", "a%zz", "a b", "a\tb", "a?b"] {
+            assert!(!is_safe_gallery_request_segment(value), "{value:?}");
+        }
+        for value in [
+            "Microsoft.VisualStudio.Services.VSIXPackage",
+            "1.0.0+build",
+            "a%2Bb",
+        ] {
+            assert!(is_safe_gallery_request_segment(value), "{value:?}");
+        }
         // A coordinate is also a cache-path component, and a component past the
         // filesystem name limit is a storage error waiting to happen.
         assert!(is_safe_gallery_segment(&"x".repeat(255)));
@@ -8225,6 +8263,70 @@ mod tests {
     /// type goes through the gate (and is fetched under the canonical
     /// spelling), and an asset type outside the allowlist is 404 without an
     /// upstream request.
+    /// #4365 item 3: a `;`, a stray `%` or a raw space in a client-sent
+    /// coordinate is a 400 on every gallery route (asset, vspackage, legacy
+    /// download), before any upstream request. Before, each was
+    /// percent-encoded into the upstream URL. The display-asset fetch at the
+    /// end is the positive control that the upstream is reachable.
+    #[tokio::test]
+    async fn gallery_routes_refuse_ambiguous_coordinates_before_the_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"icon".to_vec()))
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let key = &fx.repo_key;
+        let mut refused = Vec::new();
+        for bad in ["yaml%3Bjsessionid=1", "yaml%25zz", "yaml%20x"] {
+            for uri in [
+                format!(
+                    "/{key}/asset/RedHat/{bad}/1.0.0/universal/Microsoft.VisualStudio.Services.VSIXPackage"
+                ),
+                format!(
+                    "/{key}/asset/RedHat/yaml/1.0.0/universal/Microsoft.VisualStudio.Services.VSIXPackage{}",
+                    &bad[4..]
+                ),
+                format!("/{key}/gallery/publishers/RedHat/vsextensions/{bad}/1.0.0/vspackage"),
+                format!("/{key}/extensions/RedHat/{bad}/1.0.0/download"),
+            ] {
+                let (status, _) =
+                    tdh::send(tdh::router_anon(super::router(), state.clone()), tdh::get(uri.clone()))
+                        .await;
+                refused.push((uri, status));
+            }
+        }
+        let hits_after_refusals = server.received_requests().await.unwrap().len();
+        let (control, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/asset/RedHat/yaml/1.0.0/universal/Microsoft.VisualStudio.Services.Icons.Default"
+            )),
+        )
+        .await;
+        let hits_after_control = server.received_requests().await.unwrap().len();
+        drop(server);
+        fx.teardown().await;
+
+        for (uri, status) in refused {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(
+            hits_after_refusals, 0,
+            "refused before any upstream request"
+        );
+        assert_eq!(control, StatusCode::OK, "positive control");
+        assert!(hits_after_control > 0, "the control reaches the upstream");
+    }
+
     #[tokio::test]
     async fn gallery_asset_scans_recapitalised_package_and_refuses_unknown_types() {
         use crate::api::handlers::test_db_helpers as tdh;
