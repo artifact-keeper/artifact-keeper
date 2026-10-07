@@ -837,6 +837,8 @@ async fn insert_promoted_artifact_row(
 ) -> std::result::Result<(), sqlx::Error> {
     // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
     // gated the promotion; it is not an upload (#4166 scope).
+    // NO-QUOTA-ADMISSION: a promotion copy, not a client publish; whether a
+    // promotion is bounded by the target's storage quota is open (#4422).
     sqlx::query!(
         r#"
         INSERT INTO artifacts (
