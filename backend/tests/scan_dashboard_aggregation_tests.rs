@@ -118,6 +118,8 @@ async fn create_scans_with_findings(
                     fixed_version: Some("1.0.1".to_string()),
                     source: Some("test".to_string()),
                     source_url: None,
+                    finding_class:
+                        artifact_keeper_backend::models::security::FindingClass::Vulnerability,
                 }
             })
             .collect();
@@ -151,6 +153,7 @@ async fn create_scans_with_findings(
             Some("test-scanner-1.0"),
             chrono::Utc::now(),
             "complete",
+            None,
             None,
             None,
         )

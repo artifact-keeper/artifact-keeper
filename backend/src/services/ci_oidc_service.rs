@@ -4361,9 +4361,9 @@ mod tests {
         // fall-back to the first key would verify it.
         let jwt = sign(&k1, Some("k2"), &k8s_token_claims(ONPREM_ISSUER));
 
-        let capture = crate::testing::LogCapture::default();
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
         let err = {
-            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            let _guard = capture.install(tracing::Level::INFO);
             test_service()
                 .validate_ci_jwt(&provider, &jwt)
                 .await
@@ -4374,7 +4374,7 @@ mod tests {
             axum::response::IntoResponse::into_response(err).status(),
             axum::http::StatusCode::UNAUTHORIZED
         );
-        let logs = capture.contents();
+        let logs = capture.text();
         assert!(
             logs.contains(&format!("provider_id={}", provider.id)) && logs.contains("kid=\"k2\""),
             "the security line names provider and kid: {logs}"

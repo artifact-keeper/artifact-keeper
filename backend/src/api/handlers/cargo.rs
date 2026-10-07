@@ -2171,6 +2171,7 @@ async fn download(
                         repo.id,
                         &name_lower,
                         &version,
+                        "cargo",
                     )
                     .await?
                 } else {
@@ -2484,6 +2485,7 @@ impl proxy_helpers::ScannedProxyFile for CargoScannedCrate<'_> {
         &self,
         _state: &SharedState,
         req: &proxy_helpers::ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
         digest: &str,
     ) -> Result<(), Response> {
         let Some(expected) = self

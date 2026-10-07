@@ -14,13 +14,34 @@ log()  { echo "==> $1"; }
 pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; exit 1; }
 
+# Throwaway e2e admin credential: compose injects ADMIN_PASS into the
+# mesh-test container from the repository-root .env.test (#3490).
+: "${ADMIN_PASS:?ADMIN_PASS is not set (the mesh-test service reads it from .env.test)}"
+LOGIN_BODY=$(jq -cn --arg p "$ADMIN_PASS" '{username: "admin", password: $p}')
+: "${PEER_B_API_KEY:?PEER_B_API_KEY is not set (run-all-mesh-tests.sh mints it)}"
+
+# Poll GET <url> with <token> until it returns 200 or MESH_SYNC_TIMEOUT_SECS
+# (default 120) elapses. Prints the last HTTP status. The sync worker ticks
+# every 10s, but a fresh peer and the retry backoff can delay the first
+# transfer, so a single fixed sleep both under- and over-waits (#1936).
+wait_for_http_200() {
+  _url="$1"; _token="$2"; _deadline=$(( $(date +%s) + ${MESH_SYNC_TIMEOUT_SECS:-120} ))
+  while :; do
+    _code=$(curl -s -o /dev/null -w "%{http_code}" "$_url" -H "Authorization: Bearer $_token")
+    if [ "$_code" = "200" ] || [ "$(date +%s)" -ge "$_deadline" ]; then
+      echo "$_code"; return 0
+    fi
+    sleep 5
+  done
+}
+
 # ---------------------------------------------------------------------------
 # 1. Login to both peers
 # ---------------------------------------------------------------------------
 log "Logging in to peer-a..."
 PEER_A_TOKEN=$(curl -sf -X POST "$PEER_A_URL/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin123"}' | jq -r '.access_token')
+  -d "$LOGIN_BODY" | jq -r '.access_token')
 
 [ -n "$PEER_A_TOKEN" ] && [ "$PEER_A_TOKEN" != "null" ] \
   && pass "peer-a login succeeded" \
@@ -29,7 +50,7 @@ PEER_A_TOKEN=$(curl -sf -X POST "$PEER_A_URL/api/v1/auth/login" \
 log "Logging in to peer-b..."
 PEER_B_TOKEN=$(curl -sf -X POST "$PEER_B_URL/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin123"}' | jq -r '.access_token')
+  -d "$LOGIN_BODY" | jq -r '.access_token')
 
 [ -n "$PEER_B_TOKEN" ] && [ "$PEER_B_TOKEN" != "null" ] \
   && pass "peer-b login succeeded" \
@@ -90,7 +111,7 @@ curl -s -X POST "$PEER_A_URL/api/v1/peers" \
     "name": "peer-b",
     "endpoint_url": "http://backend-peer-b:8080",
     "region": "us-west-2",
-    "api_key": "peer-b-key"
+    "api_key": "'"$PEER_B_API_KEY"'"
   }' >/dev/null 2>&1 || true
 pass "peer-b registration ensured"
 
@@ -182,25 +203,18 @@ TASK_COUNT=$(echo "$TASKS_RESP" | jq -r '
   || fail "no retroactive sync tasks created for pre-existing artifact"
 
 # ---------------------------------------------------------------------------
-# 10. Wait for sync worker and verify artifact on peer-b
+# 10. Wait for the sync worker to deliver the artifact to peer-b
 # ---------------------------------------------------------------------------
-log "Waiting 15 seconds for sync worker to process..."
-sleep 15
+log "Waiting up to ${MESH_SYNC_TIMEOUT_SECS:-120}s for the artifact to arrive on peer-b..."
+DOWNLOAD_STATUS=$(wait_for_http_200 \
+  "$PEER_B_URL/api/v1/repositories/$REPO_KEY/artifacts/retro/test-file.bin" "$PEER_B_TOKEN")
 
-log "Checking if artifact arrived on peer-b..."
-DOWNLOAD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-  "$PEER_B_URL/api/v1/repositories/$REPO_KEY/artifacts/retro/test-file.bin" \
-  -H "Authorization: Bearer $PEER_B_TOKEN")
-
-if [ "$DOWNLOAD_STATUS" = "200" ]; then
-    pass "retroactive artifact synced to peer-b (HTTP 200)"
-else
-    if [ "$TASK_COUNT" -gt 0 ] 2>/dev/null; then
-        pass "sync tasks created (artifact may still be transferring, HTTP $DOWNLOAD_STATUS)"
-    else
-        fail "artifact not available on peer-b (HTTP $DOWNLOAD_STATUS)"
-    fi
-fi
+# Queued tasks are not replication: until #1936 this step passed on
+# "tasks were created" alone, so it could never catch a sync worker that
+# queues and then never delivers.
+[ "$DOWNLOAD_STATUS" = "200" ] \
+  && pass "retroactive artifact synced to peer-b (HTTP 200)" \
+  || fail "retroactive artifact not on peer-b after ${MESH_SYNC_TIMEOUT_SECS:-120}s (HTTP $DOWNLOAD_STATUS, $TASK_COUNT task(s) queued)"
 
 echo ""
 echo "Retroactive sync test completed successfully."

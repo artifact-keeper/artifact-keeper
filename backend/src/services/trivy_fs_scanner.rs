@@ -315,16 +315,17 @@ impl TrivyFsScanner {
         // `ScannerEngineUnavailable` variant so an absent engine degrades to
         // `not_applicable` (#2324) instead of flooring the grade to F.
         let scan_result = match self.engine.backend() {
-            TrivyFsBackend::Cli { trivy_url } => {
-                self.run_cli(&workspace, trivy_url, &artifact.name).await
-            }
-            TrivyFsBackend::Adapter(client) => {
-                self.engine
-                    .scan_dir_via_adapter(client, &workspace, fs_upload_cap_bytes())
-                    .await
-            }
+            TrivyFsBackend::Cli { trivy_url } => self
+                .run_cli(&workspace, trivy_url, &artifact.name)
+                .await
+                .map(|(report, stderr)| (report, stderr, None)),
+            TrivyFsBackend::Adapter(client) => self
+                .engine
+                .scan_dir_via_adapter(client, &workspace, fs_upload_cap_bytes())
+                .await
+                .map(|scan| (scan.report, scan.stderr, scan.vuln_db)),
         };
-        let (report, stderr) = match scan_result {
+        let (report, stderr, vuln_db) = match scan_result {
             Ok(out) => out,
             Err(e) => {
                 return Err(
@@ -339,12 +340,14 @@ impl TrivyFsScanner {
         // and cannot perturb scanner behaviour.
         let known_targets = workspace_known_targets(&workspace);
         let known_target_refs: Vec<&str> = known_targets.iter().map(|s| *s as &str).collect();
-        let output = ScanOutput::from_trivy_report_with_context(
+        let mut output = ScanOutput::from_trivy_report_with_context(
             &report,
             "trivy-filesystem",
             &stderr,
             &known_target_refs,
         );
+        // #3014: the adapter's DB for this scan (None in CLI mode).
+        output.vuln_db = vuln_db;
 
         info!(
             "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages, completeness={}",
@@ -611,7 +614,11 @@ mod tests {
                     ]
                 }]},
                 "stderr": "",
-                "scanner_version": "0.71.2"
+                "scanner_version": "0.71.2",
+                "vulnerability_db": {
+                    "version": 2,
+                    "updated_at": "2026-10-04T19:39:34.715623444Z"
+                }
             }),
         )
         .await;
@@ -651,6 +658,13 @@ mod tests {
         );
         // Provenance: version comes from the adapter, not a CLI probe.
         assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+        // #3014: the adapter's DB rides on THIS scan's output.
+        let db = output.vuln_db.expect("adapter-reported DB provenance");
+        assert_eq!(db.version, "trivy-db-v2");
+        assert_eq!(
+            db.published_at.map(|t| t.to_rfc3339()),
+            Some("2026-10-04T19:39:34.715623444+00:00".to_string())
+        );
     }
 
     /// Adapter mode with the sidecar down must degrade gracefully: the

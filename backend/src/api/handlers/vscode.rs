@@ -110,29 +110,37 @@ async fn resolve_vscode_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 const GALLERY_METADATA_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// One gallery query can simultaneously retain wire bytes, a parsed JSON tree,
 /// and serialized output, so it charges a multiple of the wire cap against the
-/// shared metadata budget rather than the cap alone.
+/// metadata budget rather than the cap alone.
 ///
-/// The multiple is 1 (wire buffer) + 4 (parsed `serde_json::Value`) + 1
-/// (serialized response). The middle term is the only estimated one: a `Value`
-/// tree costs several times its wire bytes, and 4× is the same allowance the
-/// skeleton path already charges for serde's full materialization — see
-/// [`GALLERY_SKELETON_BUDGET_MULTIPLE`], whose 4× was derived from a measured
-/// document.
+/// The multiple is MEASURED (#3914), not estimated. Real Open VSX
+/// `extensionquery` responses (2026-10, open-vsx.org), parsed into a
+/// `serde_json::Value` and re-serialized under a counting allocator with this
+/// crate's serde_json features, peak at this many times their wire size,
+/// counting the wire buffer itself:
 ///
-/// It was 32×, which is the DOM cost of a document made almost entirely of
-/// one-byte values. The gallery protocol cannot produce that shape: every key
-/// is a fixed protocol name and every value a version string, URL, timestamp
-/// or statistic, and a real Open VSX detail query measures ~400 KiB — a fifth
-/// of the cap above, which is itself the bound this reservation multiplies. A
-/// worst case assumed two levels deep cost 64 MiB per in-flight query and
-/// admitted only 16 concurrent gallery queries against the shared 1 GiB budget,
-/// which is what let anonymous gallery reads park npm packument, PyPI index,
-/// Debian `Packages` and RPM `repomd` fetches behind them (#3255). At 6× the
-/// default budget admits ~85.
-const GALLERY_METADATA_BUDGET_MULTIPLE: usize = 6;
+/// | query                                   | wire     | peak / wire |
+/// |-----------------------------------------|----------|-------------|
+/// | detail, one extension, flags 914        | 25.7 KiB | 8.63×       |
+/// | search page of 50, flags 950            | 201 KiB  | 8.58×       |
+/// | search page of 100, flags 950           | 569 KiB  | 9.11×       |
+/// | full version history, flags 511         | 8.6 MiB  | 9.24×       |
+///
+/// The parsed tree alone is a steady ~6.3× of the wire bytes across shapes,
+/// and the serialized output plus its growth slack adds ~1.3-1.9×. 10× covers
+/// the largest measured peak with headroom for the URL rewrite lengthening
+/// the output. The previous 6× (1 + an assumed 4× tree + 1) undercounted the
+/// tree by half; the 32× before that assumed a document of one-byte values the
+/// protocol cannot produce (#3255).
+const GALLERY_METADATA_BUDGET_MULTIPLE: usize = 10;
 const GALLERY_METADATA_BUDGET_RESERVATION_BYTES: usize =
     GALLERY_METADATA_MAX_BYTES * GALLERY_METADATA_BUDGET_MULTIPLE;
-/// Longest a gallery request queues for its share of the shared
+/// Every gallery reservation is charged against this family's sub-budget as
+/// well as the shared budget (#3914), so a burst of anonymous gallery reads
+/// queues against the gallery's own share and can never hold more of the
+/// shared budget than that share.
+const GALLERY_METADATA_BUDGET_FAMILY: proxy_helpers::MetadataBudgetFamily =
+    proxy_helpers::MetadataBudgetFamily::VscodeGallery;
+/// Longest a gallery request queues for its share of the
 /// buffered-metadata budget before shedding.
 ///
 /// [`proxy_helpers::ProxyMetadataBudget::reserve`] otherwise waits without a
@@ -150,7 +158,7 @@ const GALLERY_QUERY_BODY_MAX_BYTES: usize = 1024 * 1024;
 /// headroom while still refusing an unbounded document.
 const GALLERY_SKELETON_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Skeleton bytes are deserialized into [`GallerySkeletonVersion`] rather than
-/// into a `serde_json::Value` tree, so the 32× DOM allowance behind
+/// into a `serde_json::Value` tree, so the parsed-tree allowance behind
 /// [`GALLERY_METADATA_BUDGET_RESERVATION_BYTES`] does not apply. The honest
 /// peak is still three things resident at once: the wire buffer (up to the
 /// cap), serde's full materialization of every version's `properties` into
@@ -224,6 +232,12 @@ const GALLERY_VERSIONS_PER_CHANNEL: usize = 30;
 /// many extensions are in flight so a client query cannot fan out into
 /// simultaneous upstream requests and budget reservations without limit.
 const GALLERY_COMPOSITION_CONCURRENCY: usize = 4;
+/// Peak gallery-family reservation held at once by ONE request: a full-width
+/// composition's concurrent skeleton fetches. The gallery sub-budget's default
+/// is floored here so a lone composed response never sheds against itself on
+/// a small shared budget (#3914).
+pub(crate) const GALLERY_PEAK_REQUEST_RESERVATION_BYTES: usize =
+    GALLERY_COMPOSITION_CONCURRENCY * GALLERY_SKELETON_BUDGET_RESERVATION_BYTES;
 /// Composed responses admitted at once.
 ///
 /// A composed page accumulates during the fan-out, before it can be charged
@@ -335,7 +349,7 @@ struct GalleryAssetSource<'a> {
 /// upstream read completes.
 struct BufferedGalleryQuery {
     value: serde_json::Value,
-    _budget_permit: tokio::sync::OwnedSemaphorePermit,
+    _budget_permit: proxy_helpers::MetadataBudgetPermit,
 }
 
 fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
@@ -823,7 +837,7 @@ async fn post_gallery_query(
     upstream_url: &str,
     body: Bytes,
     limits: proxy_helpers::MetadataWorkingSetLimits,
-) -> Result<Option<(Bytes, tokio::sync::OwnedSemaphorePermit)>, Response> {
+) -> Result<Option<(Bytes, proxy_helpers::MetadataBudgetPermit)>, Response> {
     // Validate client input before it is eligible to reach an upstream. This
     // also makes the contract explicit: the gateway forwards JSON semantics,
     // not arbitrary POST bytes.
@@ -881,6 +895,7 @@ async fn fetch_gallery_query_bounded(
             max_bytes: GALLERY_METADATA_MAX_BYTES,
             reservation_bytes: GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
             reservation_wait: Some(GALLERY_BUDGET_RESERVATION_WAIT),
+            family: Some(GALLERY_METADATA_BUDGET_FAMILY),
         },
     )
     .await?
@@ -1351,6 +1366,7 @@ async fn fetch_gallery_skeleton(
             max_bytes: GALLERY_SKELETON_MAX_BYTES,
             reservation_bytes: GALLERY_SKELETON_BUDGET_RESERVATION_BYTES,
             reservation_wait: Some(GALLERY_BUDGET_RESERVATION_WAIT),
+            family: Some(GALLERY_METADATA_BUDGET_FAMILY),
         },
     )
     .await?
@@ -1742,6 +1758,7 @@ async fn serve_composed_gallery_response(
     let _budget_permit = proxy_helpers::reserve_metadata_budget_bounded(
         GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES,
         Some(GALLERY_BUDGET_RESERVATION_WAIT),
+        Some(GALLERY_METADATA_BUDGET_FAMILY),
     )
     .await?;
     render_gallery_response(&mut composed, base_url, repo_key)
@@ -5300,6 +5317,82 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3914: gallery queries draw from their own sub-budget. Saturating it
+    /// sheds the next gallery read with the budget's 503 while the shared
+    /// budget is still free, and a full-size npm packument reservation
+    /// against the shared budget is still admitted at the same moment.
+    #[tokio::test]
+    async fn gallery_query_sheds_on_its_own_sub_budget_without_starving_npm() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (state, _cache) =
+            rewire_remote_gallery(&fx, "https://open-vsx.example/vscode/gallery").await;
+        let gallery = proxy_helpers::metadata_sub_budget(GALLERY_METADATA_BUDGET_FAMILY);
+        let held = gallery
+            .budget()
+            .try_reserve(gallery.budget().total_bytes())
+            .expect("the gallery sub-budget is unreserved at the start of this test process");
+        assert_eq!(gallery.saturation(), 1.0);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from_static(b"{\"filters\":[],\"flags\":0}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            String::from_utf8_lossy(&body).contains("Buffered metadata budget"),
+            "the shed must be the budget's own 503: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let shared = proxy_helpers::proxy_metadata_budget();
+        assert_eq!(
+            shared.available_bytes(),
+            shared.total_bytes(),
+            "a gallery read queued on its own share holds none of the shared budget"
+        );
+        let npm = shared
+            .try_reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+            .expect("an npm packument is admitted while the gallery sub-budget is saturated");
+        drop((npm, held));
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn gallery_sub_budget_fits_one_full_width_composition_and_spares_other_formats() {
+        let total = proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+        let share =
+            proxy_helpers::metadata_sub_budget_bytes(GALLERY_METADATA_BUDGET_FAMILY, None, total);
+        assert_eq!(share, 384 * 1024 * 1024);
+        assert!(
+            GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share,
+            "one composed response's concurrent skeleton fetches fit the gallery share, \
+             so a lone composition never sheds against itself"
+        );
+        assert!(GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES <= share);
+        assert!(
+            (total - share) / proxy_helpers::LARGE_METADATA_MAX_BYTES >= 5,
+            "at least five worst-case buffers stay available to every other format"
+        );
+        // A shrunken shared budget still fits one full-width composition.
+        for small in [300 * 1024 * 1024, 512 * 1024 * 1024, 682 * 1024 * 1024] {
+            let share = proxy_helpers::metadata_sub_budget_bytes(
+                GALLERY_METADATA_BUDGET_FAMILY,
+                None,
+                small,
+            );
+            assert!(GALLERY_PEAK_REQUEST_RESERVATION_BYTES <= share, "{small}");
+        }
+    }
+
     #[tokio::test]
     async fn gallery_age_gate_without_service_fails_closed_for_metadata_and_delivery() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -5606,21 +5699,24 @@ mod tests {
             "gallery responses use the conservative gallery-specific wire cap"
         );
         assert_eq!(
-            GALLERY_METADATA_BUDGET_MULTIPLE, 6,
-            "wire buffer + parsed serde_json tree + serialized response, not a one-byte-value worst case"
+            GALLERY_METADATA_BUDGET_MULTIPLE, 10,
+            "wire buffer + parsed serde_json tree + serialized response, measured \
+             at up to 9.24x on real Open VSX responses (#3914)"
         );
         assert_eq!(
             GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
             GALLERY_METADATA_MAX_BYTES * GALLERY_METADATA_BUDGET_MULTIPLE
         );
-        assert_eq!(GALLERY_METADATA_BUDGET_RESERVATION_BYTES, 12 * 1024 * 1024);
+        assert_eq!(GALLERY_METADATA_BUDGET_RESERVATION_BYTES, 20 * 1024 * 1024);
+        let gallery_share = proxy_helpers::metadata_sub_budget_bytes(
+            GALLERY_METADATA_BUDGET_FAMILY,
+            None,
+            proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+        );
         assert_eq!(
-            proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES
-                / GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
-            85,
-            "the default shared budget admits 85 cap-sized gallery queries; at the \
-             assumed 32x it admitted 16, which is what let gallery reads park \
-             every other format's buffered metadata fetch behind them (#3255)"
+            gallery_share / GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
+            19,
+            "the default gallery sub-budget admits 19 cap-sized gallery queries at once (#3914)"
         );
 
         let budget =

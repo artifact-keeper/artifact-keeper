@@ -1673,9 +1673,20 @@ impl SbomService {
     /// (free-form names, SPDX expressions, "UNKNOWN"), so emit `id` only for
     /// recognized identifiers and fall back to the free-form `name` field —
     /// which DT accepts unconditionally — for everything else.
+    ///
+    /// A compound SPDX expression (`MIT AND PSF-2.0`, `Apache-2.0 WITH
+    /// LLVM-exception`, `(MIT OR ISC) AND BSD-3-Clause`) is emitted as the
+    /// CycloneDX `expression` choice instead (#3866): written as a `name`,
+    /// Dependency-Track stores it as an unresolved free-text license and
+    /// every license policy fails on it, even when each operand is approved.
+    /// CycloneDX 1.5 requires an `expression` entry to be the only element
+    /// of its `licenses` array; every caller wraps this single entry in a
+    /// one-element array, so that holds.
     fn cyclonedx_license_entry(license: &str) -> serde_json::Value {
         if Self::SPDX_COMMON_IDS.contains(&license) {
             serde_json::json!({"license": {"id": license}})
+        } else if crate::services::spdx_licenses::is_compound_spdx_expression(license) {
+            serde_json::json!({"expression": license})
         } else {
             serde_json::json!({"license": {"name": license}})
         }
@@ -2107,13 +2118,80 @@ mod tests {
         assert!(entry["license"].get("id").is_none());
     }
 
+    /// #3866: a compound SPDX expression must reach Dependency-Track as the
+    /// CycloneDX `expression` choice, never as `license.name` (unresolved
+    /// free text that fails license policy) nor `license.id` (#1474: an
+    /// out-of-enum id rejects the whole BOM).
     #[test]
-    fn test_cyclonedx_license_entry_spdx_expression_uses_name() {
-        // SPDX expressions are not bare ids and fail `license.id` enum
-        // validation; they must fall back to `name`.
-        let entry = SbomService::cyclonedx_license_entry("MIT OR Apache-2.0");
-        assert_eq!(entry["license"]["name"], "MIT OR Apache-2.0");
-        assert!(entry["license"].get("id").is_none());
+    fn test_cyclonedx_license_entry_spdx_expression_uses_expression() {
+        for expr in [
+            "MIT AND PSF-2.0",
+            "MIT OR Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "(MIT OR Apache-2.0) AND BSD-3-Clause",
+        ] {
+            let entry = SbomService::cyclonedx_license_entry(expr);
+            assert_eq!(entry, serde_json::json!({"expression": expr}), "{expr}");
+        }
+    }
+
+    /// #3866 end to end for scanner-derived licenses: a package Trivy (or
+    /// Grype, through the same sanitizer) reports with two licenses must
+    /// export as their CONJUNCTION. Exported as `OR`, Dependency-Track would
+    /// pass the package on its approved arm alone, so GPL or a proprietary
+    /// `LicenseRef-` riding along with MIT would fail open.
+    #[test]
+    fn test_scanner_multi_license_package_exports_as_and_expression() {
+        use crate::services::scanner_service::sanitize_trivy_licenses;
+        for (raw, expected) in [
+            (vec!["MIT", "GPL-3.0-only"], "MIT AND GPL-3.0-only"),
+            (
+                vec!["mit", "Custom Commercial"],
+                "MIT AND LicenseRef-Custom-Commercial",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            let license = sanitize_trivy_licenses(&raw).expect("non-empty list");
+            assert_eq!(license, expected);
+            let dep = DependencyInfo {
+                name: "pkg".to_string(),
+                version: Some("1.0.0".to_string()),
+                purl: None,
+                license: Some(license),
+                sha256: None,
+                cpe: None,
+            };
+            assert_eq!(
+                build_cyclonedx_component(&dep)["licenses"],
+                serde_json::json!([{"expression": expected}])
+            );
+        }
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_prose_with_operator_words_uses_name() {
+        for text in ["GPL v2 or later", "MIT/Apache-2.0", "BSD License"] {
+            let entry = SbomService::cyclonedx_license_entry(text);
+            assert_eq!(entry["license"]["name"], text);
+            assert!(entry.get("expression").is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_compound_license_is_sole_expression() {
+        let dep = DependencyInfo {
+            name: "greenlet".to_string(),
+            version: Some("3.5.5".to_string()),
+            purl: None,
+            license: Some("MIT AND PSF-2.0".to_string()),
+            sha256: None,
+            cpe: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT AND PSF-2.0"}])
+        );
     }
 
     #[test]
@@ -2686,23 +2764,11 @@ mod tests {
     /// Helper to create a mock SbomService for testing SBOM generation
     /// without a database connection.
     fn generate_test_cyclonedx(deps: &[DependencyInfo]) -> serde_json::Value {
-        let mut components = Vec::new();
-        for dep in deps {
-            let mut comp = serde_json::json!({
-                "type": "library",
-                "name": dep.name,
-            });
-            if let Some(v) = &dep.version {
-                comp["version"] = serde_json::json!(v);
-            }
-            if let Some(p) = &dep.purl {
-                comp["purl"] = serde_json::json!(p);
-            }
-            if let Some(l) = &dep.license {
-                comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
-            }
-            components.push(comp);
-        }
+        // Components go through the real builder, so these document-level
+        // tests cannot drift from what the exporter actually emits (the
+        // hand-built copy this replaced pinned `license.id` for an SPDX
+        // expression, the output #1474 and #3866 both forbid).
+        let components: Vec<_> = deps.iter().map(build_cyclonedx_component).collect();
 
         serde_json::json!({
             "bomFormat": "CycloneDX",
@@ -3156,7 +3222,10 @@ mod tests {
         assert_eq!(comp["name"], "serde");
         assert_eq!(comp["version"], "1.0.195");
         assert_eq!(comp["purl"], "pkg:cargo/serde@1.0.195");
-        assert_eq!(comp["licenses"][0]["license"]["id"], "MIT OR Apache-2.0");
+        assert_eq!(
+            comp["licenses"],
+            serde_json::json!([{"expression": "MIT OR Apache-2.0"}])
+        );
     }
 
     #[test]

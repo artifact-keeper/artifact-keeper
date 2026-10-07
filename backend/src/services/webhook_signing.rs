@@ -1,4 +1,5 @@
-//! HMAC-SHA256 signing for the v2 webhook wire contract.
+//! HMAC-SHA256 (`v1=`) and Ed25519 (`v2=`, #921) signing for the v2
+//! webhook wire contract.
 //!
 //! The signed payload is `"<unix_seconds>.<raw_body>"` so receivers can
 //! detect replay independent of body inspection. The header form is
@@ -12,9 +13,21 @@
 //! secret first) so a receiver that has not yet rotated keys can still
 //! validate. Receivers MUST accept any `v1=` token whose constant-time
 //! comparison succeeds.
+//!
+//! Webhooks whose `signing_mode` is `asymmetric` or `both` also carry
+//! `v2=<kid>:<base64url Ed25519 signature>` over
+//! `"<unix_seconds>.<webhook_id>.<raw_body>"` plus an
+//! `X-ArtifactKeeper-Webhook-Id` header, verified against
+//! `GET /api/v1/webhooks/jwks` (see [`crate::services::webhook_signing_keys`],
+//! which also explains why the webhook id is signed). Receivers that only
+//! know `v1=` ignore the `v2=` token.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::services::webhook_signing_keys::InstanceSigningKey;
 
 /// One-shot compute helper. `body` is the exact bytes that will be sent
 /// on the wire; do not re-serialize after calling this. `unix_secs` is
@@ -46,6 +59,117 @@ pub fn render_header(unix_secs: i64, body: &[u8], secrets: &[&str]) -> String {
         ));
     }
     parts.join(",")
+}
+
+/// Which signature tokens a webhook's deliveries carry (#921). Stored in
+/// `webhooks.signing_mode`.
+///
+/// * `hmac` (default): `v1=` HMAC tokens only, byte-identical to the wire
+///   format that predates asymmetric signing.
+/// * `asymmetric`: a `v2=<kid>:<sig>` Ed25519 token only, verified against
+///   the instance JWKS; no shared secret is used.
+/// * `both`: `v1=` tokens followed by the `v2=` token, so receivers can
+///   migrate from HMAC to asymmetric verification without a cut-over.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SigningMode {
+    #[default]
+    Hmac,
+    Asymmetric,
+    Both,
+}
+
+impl SigningMode {
+    /// The value stored in `webhooks.signing_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SigningMode::Hmac => "hmac",
+            SigningMode::Asymmetric => "asymmetric",
+            SigningMode::Both => "both",
+        }
+    }
+
+    /// Parse a stored value. The column's CHECK keeps unknown values out
+    /// today, but a later release may add a mode that an older replica reads
+    /// during a rolling upgrade. Such a value fails closed to `asymmetric`:
+    /// the webhook asked for something stronger than HMAC, so it must never
+    /// silently fall back to HMAC-only signing.
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "hmac" => SigningMode::Hmac,
+            "both" => SigningMode::Both,
+            _ => SigningMode::Asymmetric,
+        }
+    }
+
+    /// Whether deliveries carry `v1=` HMAC tokens.
+    pub fn uses_hmac(self) -> bool {
+        matches!(self, SigningMode::Hmac | SigningMode::Both)
+    }
+
+    /// Whether deliveries carry the `v2=` Ed25519 token.
+    pub fn uses_asymmetric(self) -> bool {
+        matches!(self, SigningMode::Asymmetric | SigningMode::Both)
+    }
+}
+
+/// Render the `X-ArtifactKeeper-Signature` value for any signing mode:
+/// `t=<ts>`, then one `v1=<hex>` per HMAC secret (current first), then one
+/// `v2=<kid>:<base64url sig>` per Ed25519 key, each signing
+/// `"<t>.<webhook_id>.<body>"`. With no keys this returns
+/// exactly [`render_header`]'s output, which is what keeps `hmac` mode
+/// byte-identical. Returns an empty string when there is nothing to sign
+/// with; callers omit the header then.
+pub fn render_signature_header(
+    unix_secs: i64,
+    webhook_id: Uuid,
+    body: &[u8],
+    secrets: &[&str],
+    v2_keys: &[InstanceSigningKey],
+) -> String {
+    let mut header = render_header(unix_secs, body, secrets);
+    if v2_keys.is_empty() {
+        return header;
+    }
+    if header.is_empty() {
+        header = format!("t={}", unix_secs);
+    }
+    for key in v2_keys {
+        header.push_str(&format!(
+            ",v2={}:{}",
+            key.kid(),
+            key.sign_v2(unix_secs, webhook_id, body)
+        ));
+    }
+    header
+}
+
+/// Parse the `v2=` tokens of a signature header into
+/// `(timestamp, vec_of_(kid, base64url_sig))`. Returns None when the
+/// timestamp is missing or no well-formed `v2=` token is present; `v1=`
+/// tokens are ignored, exactly as [`parse_header`] ignores `v2=`.
+pub fn parse_v2_tokens(header: &str) -> Option<(i64, Vec<(String, String)>)> {
+    let mut ts: Option<i64> = None;
+    let mut sigs: Vec<(String, String)> = Vec::new();
+    for part in header.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("t=") {
+            ts = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("v2=") {
+            if let Some((kid, sig)) = v.split_once(':') {
+                if !kid.is_empty() && !sig.is_empty() {
+                    sigs.push((kid.to_string(), sig.to_string()));
+                }
+            }
+        }
+    }
+    let ts = ts?;
+    if sigs.is_empty() {
+        return None;
+    }
+    Some((ts, sigs))
 }
 
 /// Parse a v2 signature header into (timestamp, vec_of_v1_hex). Returns
@@ -163,5 +287,116 @@ mod tests {
     #[test]
     fn replay_window_rejects_future_clock_skew() {
         assert!(!within_replay_window(1_000, 2_000, 300));
+    }
+
+    // ---------------- v2 (Ed25519) tokens, #921 ----------------
+
+    const WH: Uuid = Uuid::from_u128(0xA);
+
+    fn test_key() -> InstanceSigningKey {
+        InstanceSigningKey::from_seed(&[9u8; 32])
+    }
+
+    #[test]
+    fn signature_header_without_keys_is_render_header() {
+        for secrets in [&[][..], &["whsec_a"][..], &["whsec_new", "whsec_old"][..]] {
+            assert_eq!(
+                render_signature_header(1_700_000_000, WH, b"hi", secrets, &[]),
+                render_header(1_700_000_000, b"hi", secrets)
+            );
+        }
+    }
+
+    #[test]
+    fn signature_header_both_appends_v2_after_v1() {
+        let key = test_key();
+        let h = render_signature_header(
+            1_700_000_000,
+            WH,
+            b"hi",
+            &["whsec_a"],
+            std::slice::from_ref(&key),
+        );
+        let v1 = compute_v1_signature("whsec_a", 1_700_000_000, b"hi");
+        let v2 = key.sign_v2(1_700_000_000, WH, b"hi");
+        assert_eq!(h, format!("t=1700000000,v1={},v2={}:{}", v1, key.kid(), v2));
+        // An HMAC-only receiver still parses the header and sees one v1.
+        let (ts, v1s) = parse_header(&h).unwrap();
+        assert_eq!(ts, 1_700_000_000);
+        assert_eq!(v1s, vec![v1]);
+    }
+
+    #[test]
+    fn signature_header_asymmetric_only_has_no_v1() {
+        let key = test_key();
+        let h = render_signature_header(1_700_000_000, WH, b"hi", &[], std::slice::from_ref(&key));
+        assert!(h.starts_with("t=1700000000,v2="));
+        assert!(!h.contains("v1="));
+        assert!(parse_header(&h).is_none());
+        let (ts, v2s) = parse_v2_tokens(&h).unwrap();
+        assert_eq!(ts, 1_700_000_000);
+        assert_eq!(v2s.len(), 1);
+        assert_eq!(v2s[0].0, key.kid());
+    }
+
+    #[test]
+    fn v2_token_verifies_against_jwks() {
+        let key = test_key();
+        let body = br#"{"event":"artifact.uploaded"}"#;
+        let h = render_signature_header(
+            1_700_000_000,
+            WH,
+            body,
+            &["whsec_a"],
+            std::slice::from_ref(&key),
+        );
+        let jwks = crate::services::webhook_signing_keys::jwks_from_public_keys(&[key
+            .public_key_bytes()
+            .to_vec()]);
+        let (ts, tokens) = parse_v2_tokens(&h).unwrap();
+        for (kid, sig) in tokens {
+            let jwk = jwks.keys.iter().find(|j| j.kid == kid).unwrap();
+            assert!(jwk.verify_v2(ts, WH, body, &sig));
+            assert!(!jwk.verify_v2(ts, WH, b"tampered", &sig));
+            assert!(!jwk.verify_v2(ts, Uuid::from_u128(0xB), body, &sig));
+        }
+    }
+
+    #[test]
+    fn parse_v2_rejects_missing_parts() {
+        assert!(parse_v2_tokens("v2=kid:sig").is_none());
+        assert!(parse_v2_tokens("t=1,v1=abc").is_none());
+        assert!(parse_v2_tokens("t=1,v2=nocolon").is_none());
+        assert!(parse_v2_tokens("t=1,v2=:sig,v2=kid:").is_none());
+        assert_eq!(
+            parse_v2_tokens("t=1, v2=k:s").unwrap(),
+            (1, vec![("k".to_string(), "s".to_string())])
+        );
+    }
+
+    #[test]
+    fn signing_mode_round_trips_and_defaults_to_hmac() {
+        for m in [
+            SigningMode::Hmac,
+            SigningMode::Asymmetric,
+            SigningMode::Both,
+        ] {
+            assert_eq!(SigningMode::from_stored(m.as_str()), m);
+            let json = serde_json::to_string(&m).unwrap();
+            assert_eq!(json, format!("\"{}\"", m.as_str()));
+            assert_eq!(serde_json::from_str::<SigningMode>(&json).unwrap(), m);
+        }
+        assert_eq!(SigningMode::default(), SigningMode::Hmac);
+        // Fail closed: an unknown stored mode never degrades to HMAC-only.
+        assert_eq!(SigningMode::from_stored("rsa"), SigningMode::Asymmetric);
+        assert_eq!(SigningMode::from_stored(""), SigningMode::Asymmetric);
+        assert!(serde_json::from_str::<SigningMode>("\"rsa\"").is_err());
+    }
+
+    #[test]
+    fn signing_mode_token_families() {
+        assert!(SigningMode::Hmac.uses_hmac() && !SigningMode::Hmac.uses_asymmetric());
+        assert!(!SigningMode::Asymmetric.uses_hmac() && SigningMode::Asymmetric.uses_asymmetric());
+        assert!(SigningMode::Both.uses_hmac() && SigningMode::Both.uses_asymmetric());
     }
 }

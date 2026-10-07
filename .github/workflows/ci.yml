@@ -121,6 +121,11 @@ jobs:
   # and smoke jobs on a PR that changes nothing under docker/. Labels are
   # read live from the API, so "add the label, then re-run all jobs" works;
   # if that read fails they fall back to the labels in the event payload.
+  #
+  # `scanner_adapter` gates the Go job for docker/scanner-adapter (#4437): it
+  # is "true" when the change touches the adapter's sources (not its
+  # Markdown), its Dockerfile, or this workflow, and on every push, dispatch
+  # and failed listing. Independent of the arms below, like `tests`.
   changes:
     name: 🔍 Docs-Only Gate
     runs-on: ubuntu-24.04
@@ -139,6 +144,7 @@ jobs:
       tests: ${{ steps.filter.outputs.tests }}
       ci_full: ${{ steps.filter.outputs.ci_full }}
       ci_image: ${{ steps.filter.outputs.ci_image }}
+      scanner_adapter: ${{ steps.filter.outputs.scanner_adapter }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
       # the protected branch's own commit. Pull requests are classified from
@@ -182,6 +188,7 @@ jobs:
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
             rust=true
             if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
               # Fails open: a non-zero exit or anything but an explicit
@@ -204,6 +211,7 @@ jobs:
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
             exit 0
           }
           if [ "$EVENT_NAME" = "merge_group" ]; then
@@ -228,6 +236,7 @@ jobs:
           manifest=false
           rust=false
           tests=false
+          scanner_adapter=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # What the integration job reads that the unit shards do not:
@@ -238,6 +247,14 @@ jobs:
               *.md) ;;
               backend/tests/*|backend/migrations/*|.github/workflows/ci.yml)
                 tests=true
+                ;;
+            esac
+            # The Go job's inputs (#4437): the adapter module, the image
+            # that builds it, and this workflow. Docs are never Go inputs.
+            case "$f" in
+              *.md) ;;
+              docker/scanner-adapter/*|docker/Dockerfile.scanner-adapter|.github/workflows/ci.yml)
+                scanner_adapter=true
                 ;;
             esac
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -308,11 +325,13 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "scanner_adapter=$scanner_adapter" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
           echo "rust-job inputs changed: $rust"
           echo "integration-job inputs changed: $tests"
+          echo "scanner-adapter Go inputs changed: $scanner_adapter"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -1522,6 +1541,8 @@ jobs:
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check
         run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the candidate certifies the scanner-adapter digest that ships
+        run: bash scripts/ci/test-pin-adapter-digest.sh
       - name: Check the dispatched-run follower selects the right run
         run: bash scripts/ci/test-follow-dispatched-run.sh
       - name: Check the CHANGELOG-documents-version gate
@@ -1871,6 +1892,14 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The weekly whole-repo duplication scan (scheduled-tests.yml,
+      # duplication-report, #1619) is only worth its red run if it reports a
+      # regression exactly when there is one, and treats a source jscpd
+      # silently skipped as "not a measurement" rather than a clean 0%.
+      # Pure python on throwaway files, ~1s.
+      - name: Check the whole-repo duplication report
+        run: bash scripts/ci/test-jscpd-repo-report.sh
+
       # The unit-test matrix runs one shard of the inline tests per leg and
       # the coverage gates read the legs' merged lcov. Both scripts fail
       # silently if wrong: an ungated test module runs in every leg, a
@@ -1986,6 +2015,56 @@ jobs:
             echo "::error title=Version-pin gate could not be measured::The registry or the component table could not be read (exit 2). This is NOT a verdict about this PR and NOT a pass; re-run the job. See the INFRA line above."
           fi
           exit "$rc"
+
+  # The scanner adapter (docker/scanner-adapter, #2091) is a stdlib-only Go
+  # module with its own test suite, and nothing else ever runs it:
+  # Dockerfile.scanner-adapter only runs `go build`, so before #4437 the
+  # adapter's tests executed only on authors' machines (found reviewing #4352
+  # and #4395). This runs gofmt, go vet and the race-enabled tests whenever
+  # the `changes` gate sees an adapter input, on the Go version go.mod
+  # declares (the language floor; the image builds with a newer toolchain).
+  #
+  # Reported through ✅ CI Complete rather than as a new required context,
+  # like Version Pin Bump: a failure blocks, a skip passes only when the gate
+  # found no adapter input.
+  scanner-adapter-go:
+    name: 🐹 Scanner Adapter (Go)
+    needs: changes
+    if: ${{ needs.changes.outputs.scanner_adapter != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: docker/scanner-adapter
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: docker/scanner-adapter
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: docker/scanner-adapter/go.mod
+          # Stdlib-only module with no go.sum: nothing to cache.
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error title=gofmt::These files need gofmt -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
 
   # The coverage GATES, evaluated from the reports the unit-test legs
   # (`test-backend-unit-shard`) wrote, merged into one report here first.
@@ -2880,7 +2959,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, scanner-adapter-go, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -2909,6 +2988,7 @@ jobs:
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
+          RESULT_SCANNER_ADAPTER: ${{ needs.scanner-adapter-go.result }}
           RESULT_COVERAGE: ${{ needs.coverage-gates.result }}
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
@@ -2916,6 +2996,7 @@ jobs:
           RUST_CHANGED: ${{ needs.changes.outputs.rust }}
           RUST_SKIP_REASON: ${{ needs.changes.outputs.rust_skip_reason }}
           MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
+          SCANNER_ADAPTER_CHANGED: ${{ needs.changes.outputs.scanner_adapter }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
           COVERAGE_FLOOR: ${{ needs.coverage-gates.outputs.floor }}
           COVERAGE_FLOOR_PCT: ${{ needs.coverage-gates.outputs.floor_pct }}
@@ -3065,6 +3146,16 @@ jobs:
             require_success "version-pin-bump" "$RESULT_VERSION_PIN"
           else
             allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
+          fi
+
+          # The scanner adapter's Go job (#4437) runs only when the `changes`
+          # gate saw an adapter input. Only an explicit "false" lets its skip
+          # pass -- an empty output (the gate died) makes a skip fatal,
+          # matching the job's own fail-open `!= 'false'` condition.
+          if [[ "${SCANNER_ADAPTER_CHANGED:-}" == "false" ]]; then
+            allow_skip "scanner-adapter-go" "$RESULT_SCANNER_ADAPTER"
+          else
+            require_success "scanner-adapter-go" "$RESULT_SCANNER_ADAPTER"
           fi
 
           # Container chain (build-backend-image -> smoke-e2e, plus the

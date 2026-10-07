@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE signing_keys\n            SET is_active = false,\n                expires_at = CASE WHEN expires_at IS NULL OR expires_at > NOW()\n                                  THEN NOW() ELSE expires_at END\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a02fa9a4a9679ca2ff761df2c07584a9c8e82d2f6161ea21f0e17977dcc05e26"
+}

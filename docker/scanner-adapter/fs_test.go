@@ -214,6 +214,33 @@ func TestFsScanSucceedsWithNativeReport(t *testing.T) {
 	if len(report.Results[0].Packages) != 1 || report.Results[0].Packages[0].Name != "acme/lib" {
 		t.Fatalf("Packages block (SBOM inventory, #903) lost: %s", res.Report)
 	}
+	if res.VulnerabilityDB != nil {
+		t.Errorf("vulnerability_db = %+v, want omitted with no metadata.json", res.VulnerabilityDB)
+	}
+}
+
+// TestFsScanResultCarriesVulnDB: the filesystem result names the trivy DB the
+// scan ran against (#3014).
+func TestFsScanResultCarriesVulnDB(t *testing.T) {
+	ts := newTestServerWithCache(t, fsSucceedStub(t), cacheWithDBMetadata(t))
+	defer ts.Close()
+
+	id := submitFsScan(t, ts.URL, tarOf(t, map[string]string{"composer.lock": "{}"}))
+	status, body := pollFsReport(t, ts.URL, id)
+	if status != http.StatusOK {
+		t.Fatalf("fs report status = %d, want 200; body=%s", status, body)
+	}
+	var res FsScanResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("unmarshal fs result: %v", err)
+	}
+	if res.VulnerabilityDB == nil || res.VulnerabilityDB.Version != 2 {
+		t.Fatalf("vulnerability_db = %+v, want version 2; body=%s", res.VulnerabilityDB, body)
+	}
+	want := time.Date(2026, 10, 4, 19, 39, 34, 715623444, time.UTC)
+	if res.VulnerabilityDB.UpdatedAt == nil || !res.VulnerabilityDB.UpdatedAt.Equal(want) {
+		t.Errorf("updated_at = %v, want %v", res.VulnerabilityDB.UpdatedAt, want)
+	}
 }
 
 // TestFsScanTrivyErrorFailsClosed: a non-zero trivy exit must surface as a 500

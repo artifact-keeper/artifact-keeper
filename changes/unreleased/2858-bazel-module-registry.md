@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#2858]
+---
+- **Bazel repositories now speak the Bazel module registry (Bzlmod / BCR) protocol at `/bazel/{repo}`** (#2858). Point Bazel at `--registry=https://<host>/bazel/<repo>` and it resolves modules through Artifact Keeper instead of a generic repository behind a rewrite. Hosted repositories accept `PUT /bazel/{repo}/modules/{name}/{version}/{file}` (MODULE.bazel, source.json, patches, overlays and source archives) and generate each module's `metadata.json` from the published versions; published files cannot be overwritten. Remote repositories proxy an upstream registry such as `https://bcr.bazel.build`, caching versioned files permanently and revalidating `bazel_registry.json` and `metadata.json` on the mutable TTL. Virtual repositories merge `metadata.json` across their members and resolve files by member priority; a module that a hosted member publishes shadows the same module name on remote members. Source archives referenced by a proxied `source.json` are still downloaded by Bazel from their original URLs.

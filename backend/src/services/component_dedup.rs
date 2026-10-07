@@ -443,6 +443,12 @@ pub fn merge_artifact_self_findings(
             fixed_version,
             source: (!sources.is_empty()).then(|| sources.join(" + ")),
             source_url,
+            // #3013: a merge must never launder a malicious finding into an
+            // ordinary one, whichever member happened to rank first.
+            finding_class: members
+                .iter()
+                .map(|&i| findings[i].finding_class)
+                .fold(base.finding_class, |acc, c| acc.most_severe(c)),
         };
 
         merged_at.insert(members[0], merged);
@@ -536,6 +542,7 @@ mod tests {
             fixed_version: Some("9.9.9".to_string()),
             source: Some(source.to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 
@@ -892,6 +899,33 @@ mod tests {
         // Different vulnerability identities and different versions never
         // merge; only exact (vuln, component, version) identity does.
         assert_eq!(merged.len(), 3);
+    }
+
+    /// #3013: the merged finding takes the most severe CLASS of its members,
+    /// even when the malicious member is not the one that ranks first.
+    #[test]
+    fn merge_keeps_the_malicious_class_of_any_member() {
+        let scope = numpy_scope();
+        let ranked_first = finding(Severity::High, "CVE-2024-4242", "numpy", "1.26.4", "grype");
+        let mut malicious = finding(
+            Severity::Low,
+            "CVE-2024-4242",
+            "numpy",
+            "1.26.4",
+            "osv (conda alias)",
+        );
+        malicious.finding_class = crate::models::security::FindingClass::Malicious;
+        for order in [
+            vec![ranked_first.clone(), malicious.clone()],
+            vec![malicious.clone(), ranked_first.clone()],
+        ] {
+            let merged = merge_artifact_self_findings(order, &scope);
+            assert_eq!(merged.len(), 1);
+            assert_eq!(
+                merged[0].finding_class,
+                crate::models::security::FindingClass::Malicious
+            );
+        }
     }
 
     #[test]

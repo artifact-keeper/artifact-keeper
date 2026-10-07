@@ -1,7 +1,8 @@
 //! SPDX license identifier validation (#1152).
 //!
 //! Trivy returns license arrays per package; the scan_packages persistence
-//! path joins multi-license entries with " OR " (a valid SPDX operator)
+//! path joins multi-license entries into one SPDX expression (with " AND "
+//! since #3866; it was " OR ", which inferred a choice the scanner never saw)
 //! without verifying each element is a valid SPDX identifier. A package
 //! shipping `Licenses: ["MIT", "Custom Commercial - see LICENSE"]` would
 //! produce `"MIT OR Custom Commercial - see LICENSE"`, which a lenient
@@ -354,6 +355,194 @@ pub fn sanitize_license_term(term: &str) -> Option<String> {
     Some(format!("LicenseRef-{}", truncated))
 }
 
+/// Deepest parenthesis nesting [`is_compound_spdx_expression`] accepts.
+/// Real expressions nest two or three levels; the bound keeps a hostile
+/// `((((...` license field from driving the recursive-descent parser into
+/// a stack overflow.
+const SPDX_EXPRESSION_MAX_DEPTH: usize = 32;
+
+/// One lexical token of an SPDX license expression (SPDX 2.3 Annex D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpdxToken<'a> {
+    Open,
+    Close,
+    And,
+    Or,
+    With,
+    Term(&'a str),
+}
+
+/// Split `input` into SPDX expression tokens, or `None` when it holds a
+/// character no SPDX expression can contain (`/`, `,`, quotes, ...).
+///
+/// Operators are matched case-sensitively in upper case, as Annex D
+/// specifies: `MIT and Apache-2.0` is prose, not an expression, and stays
+/// a free-form name.
+fn tokenize_spdx_expression(input: &str) -> Option<Vec<SpdxToken<'_>>> {
+    let mut tokens = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        let Some(first) = rest.chars().next() else {
+            return Some(tokens);
+        };
+        match first {
+            '(' => {
+                tokens.push(SpdxToken::Open);
+                rest = &rest[1..];
+            }
+            ')' => {
+                tokens.push(SpdxToken::Close);
+                rest = &rest[1..];
+            }
+            _ => {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                    .unwrap_or(rest.len());
+                let word = &rest[..end];
+                if !word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '+' | ':'))
+                {
+                    return None;
+                }
+                tokens.push(match word {
+                    "AND" => SpdxToken::And,
+                    "OR" => SpdxToken::Or,
+                    "WITH" => SpdxToken::With,
+                    _ => SpdxToken::Term(word),
+                });
+                rest = &rest[end..];
+            }
+        }
+    }
+}
+
+/// SPDX `idstring`: `1*(ALPHA / DIGIT / "-" / ".")`.
+fn is_spdx_idstring(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+}
+
+/// A `simple-expression` operand: `license-id ["+"]`, `LicenseRef-<id>` or
+/// `DocumentRef-<id>:LicenseRef-<id>`.
+fn is_spdx_simple_expression(term: &str) -> bool {
+    if let Some((doc, lic)) = term.split_once(':') {
+        return doc
+            .strip_prefix("DocumentRef-")
+            .is_some_and(is_spdx_idstring)
+            && lic
+                .strip_prefix("LicenseRef-")
+                .is_some_and(is_spdx_idstring);
+    }
+    is_spdx_idstring(term.strip_suffix('+').unwrap_or(term))
+}
+
+/// Recursive-descent parser over [`SpdxToken`]s for the Annex D grammar,
+/// with the usual precedence `WITH` > `AND` > `OR`.
+struct SpdxExpressionParser<'t, 'a> {
+    tokens: &'t [SpdxToken<'a>],
+    pos: usize,
+}
+
+impl SpdxExpressionParser<'_, '_> {
+    fn peek(&self) -> Option<SpdxToken<'_>> {
+        self.tokens.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, want: SpdxToken<'_>) -> bool {
+        let hit = self.peek() == Some(want);
+        if hit {
+            self.pos += 1;
+        }
+        hit
+    }
+
+    /// `or-expr := and-expr *("OR" and-expr)`
+    fn or_expr(&mut self, depth: usize) -> bool {
+        if !self.and_expr(depth) {
+            return false;
+        }
+        while self.eat(SpdxToken::Or) {
+            if !self.and_expr(depth) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `and-expr := with-expr *("AND" with-expr)`
+    fn and_expr(&mut self, depth: usize) -> bool {
+        if !self.with_expr(depth) {
+            return false;
+        }
+        while self.eat(SpdxToken::And) {
+            if !self.with_expr(depth) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `with-expr := "(" or-expr ")" / simple-expression ["WITH" exception-id]`
+    fn with_expr(&mut self, depth: usize) -> bool {
+        match self.peek() {
+            Some(SpdxToken::Open) => {
+                self.pos += 1;
+                depth < SPDX_EXPRESSION_MAX_DEPTH
+                    && self.or_expr(depth + 1)
+                    && self.eat(SpdxToken::Close)
+            }
+            Some(SpdxToken::Term(term)) if is_spdx_simple_expression(term) => {
+                self.pos += 1;
+                if !self.eat(SpdxToken::With) {
+                    return true;
+                }
+                match self.peek() {
+                    Some(SpdxToken::Term(exception)) if is_spdx_idstring(exception) => {
+                        self.pos += 1;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// True when `input` is a syntactically valid SPDX license expression
+/// (SPDX 2.3 Annex D) that is *compound*: it combines licenses with `AND`
+/// / `OR` or attaches an exception with `WITH`.
+///
+/// A lone identifier returns `false`, parenthesised or not — `(MIT)` is
+/// valid SPDX, but a `(c)` license field is free text, not an expression
+/// for a license named `c`: whether it belongs in a CycloneDX
+/// `license.id` or `license.name` is a separate question (#1474), and
+/// this function only answers "is this a structured expression that must
+/// not be flattened into free text?" (#3866). Operands are checked for
+/// SPDX `idstring` syntax, not membership of the license list, so
+/// `MIT AND PSF-2.0` qualifies even though `PSF-2.0` is outside
+/// [`SPDX_IDENTIFIERS`]; prose such as `BSD License`, `GPL v2 or later`
+/// or `MIT/Apache-2.0` does not parse and therefore never qualifies.
+pub fn is_compound_spdx_expression(input: &str) -> bool {
+    let Some(tokens) = tokenize_spdx_expression(input) else {
+        return false;
+    };
+    if !tokens
+        .iter()
+        .any(|t| matches!(t, SpdxToken::And | SpdxToken::Or | SpdxToken::With))
+    {
+        return false;
+    }
+    let mut parser = SpdxExpressionParser {
+        tokens: &tokens,
+        pos: 0,
+    };
+    parser.or_expr(0) && parser.pos == tokens.len()
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -455,5 +644,100 @@ mod tests {
 
         // is_valid_spdx_identifier must also fast-fail oversized input.
         assert!(!is_valid_spdx_identifier(&prefixed_garbage));
+    }
+
+    // ---------------------------------------------------------------
+    // is_compound_spdx_expression (#3866)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compound_expressions_are_recognised() {
+        for expr in [
+            "MIT AND PSF-2.0",
+            "Apache-2.0 AND BSD-3-Clause",
+            "MIT OR Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "GPL-2.0-only WITH Classpath-exception-2.0 OR MIT",
+            "(MIT OR Apache-2.0) AND BSD-3-Clause",
+            "LGPL-2.1+ AND LicenseRef-custom-1",
+            "DocumentRef-spdx-tool-1.2:LicenseRef-MIT-Style-2 OR MIT",
+            "(MIT AND(Apache-2.0 OR ISC))",
+        ] {
+            assert!(is_compound_spdx_expression(expr), "{expr}");
+        }
+    }
+
+    #[test]
+    fn single_identifiers_are_not_compound() {
+        for term in [
+            "MIT",
+            "PSF-2.0",
+            "GPL-2.0+",
+            "LicenseRef-foo",
+            "UNKNOWN",
+            "(MIT)",
+            "((MIT))",
+            "(c)",
+            "",
+        ] {
+            assert!(!is_compound_spdx_expression(term), "{term}");
+        }
+    }
+
+    #[test]
+    fn prose_and_malformed_expressions_are_not_compound() {
+        for text in [
+            "Public Domain",
+            "BSD License",
+            "GPL v2 or later",
+            "MIT and Apache-2.0",
+            "MIT/Apache-2.0",
+            "MIT, Apache-2.0",
+            "MIT AND",
+            "AND MIT",
+            "MIT OR OR ISC",
+            "(MIT OR ISC",
+            "MIT OR ISC)",
+            "()",
+            "(MIT) WITH LLVM-exception",
+            "MIT WITH",
+            "MIT WITH (LLVM-exception)",
+            "MIT WITH LLVM-exception+x:y",
+            "Foo:LicenseRef-x AND MIT",
+            "DocumentRef-a:b AND MIT",
+            "Custom Commercial - see LICENSE",
+        ] {
+            assert!(!is_compound_spdx_expression(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_expression_is_rejected_not_overflowed() {
+        let deep = format!(
+            "{}MIT OR ISC{}",
+            "(".repeat(SPDX_EXPRESSION_MAX_DEPTH + 1),
+            ")".repeat(SPDX_EXPRESSION_MAX_DEPTH + 1)
+        );
+        assert!(!is_compound_spdx_expression(&deep));
+        let deep_ok = format!(
+            "{}MIT OR ISC{}",
+            "(".repeat(SPDX_EXPRESSION_MAX_DEPTH),
+            ")".repeat(SPDX_EXPRESSION_MAX_DEPTH)
+        );
+        assert!(is_compound_spdx_expression(&deep_ok));
+        let hostile = format!("{}MIT", "(".repeat(100_000));
+        assert!(!is_compound_spdx_expression(&hostile));
+    }
+
+    #[test]
+    fn long_expression_is_preserved_as_compound() {
+        // DT abbreviates free-text names at 255 chars; expressions longer
+        // than that must still be recognised so they go to `expression`.
+        let long = (0..40)
+            .map(|i| format!("LicenseRef-component-{i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert!(long.len() > 255);
+        assert!(is_compound_spdx_expression(&long));
     }
 }

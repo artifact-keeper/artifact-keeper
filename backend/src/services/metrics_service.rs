@@ -5,12 +5,43 @@
 //! artifact uploads/downloads, security scans, backups, and storage gauges.
 
 use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+
+/// Name of the HTTP request latency histogram recorded by
+/// `crate::api::middleware::metrics`.
+pub const HTTP_REQUEST_DURATION_METRIC: &str = "ak_http_request_duration_seconds";
+
+/// Bucket upper bounds (seconds) for [`HTTP_REQUEST_DURATION_METRIC`] (#3954).
+///
+/// Without explicit buckets `metrics-exporter-prometheus` renders a histogram
+/// as a Prometheus *summary*: per-series quantiles pre-computed over the
+/// exporter's own window, which cannot be aggregated across replicas, paths or
+/// a chosen time range, so `histogram_quantile()` is unusable. Exporting
+/// `_bucket{le=...}` series instead makes fleet-wide percentiles computable.
+///
+/// The range is sized for a registry: 5 ms covers a cached metadata hit, the
+/// sub-second buckets cover database- and storage-bound requests, and the tail
+/// out to 60 s covers upstream proxy fetches and large blob transfers.
+pub const HTTP_REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// The configured (not yet installed) Prometheus builder: bucketed export of
+/// the HTTP latency histogram, defaults for everything else. Split out of
+/// [`init_metrics`] so tests can build a local recorder from the exact
+/// production configuration without installing a process-global one.
+pub fn prometheus_builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(HTTP_REQUEST_DURATION_METRIC.to_string()),
+            HTTP_REQUEST_DURATION_BUCKETS,
+        )
+        .expect("HTTP_REQUEST_DURATION_BUCKETS is a non-empty constant")
+}
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
 pub fn init_metrics() -> PrometheusHandle {
-    let builder = PrometheusBuilder::new();
-    builder
+    prometheus_builder()
         .install_recorder()
         .expect("failed to install Prometheus recorder")
 }
@@ -48,7 +79,10 @@ pub fn record_artifact_download(repo_key: &str, format: &str) {
 /// which branch is responsible for slow repeat requests. The repository
 /// label keeps cardinality bounded by the operator's repo count, which
 /// matches the existing `ak_artifact_downloads_total` shape.
-pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
+pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
+    // The same outcome tags the request's trace (#4455), as a span attribute
+    // only: the repository label above is the metric's only per-repo series.
+    crate::api::middleware::request_span::record_cache_outcome(result);
     counter!(
         "ak_proxy_cache_lookups_total",
         "repository" => repo_key.to_string(),
@@ -373,12 +407,68 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
 mod tests {
     use super::*;
 
+    /// Render what a local recorder built from the production configuration
+    /// exports after `record` runs against it. A local recorder, because only
+    /// one global recorder may be installed per process.
+    fn render_with_production_recorder(record: impl FnOnce()) -> String {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, record);
+        handle.render()
+    }
+
     #[test]
-    fn test_prometheus_builder_can_be_created() {
-        // Verify that PrometheusBuilder::new() compiles and runs. We cannot
-        // call install_recorder() in tests because only one global recorder
-        // is allowed per process.
-        let _builder = PrometheusBuilder::new();
+    fn test_http_request_duration_exports_as_bucketed_histogram() {
+        // #3954: without buckets the latency histogram rendered as a summary
+        // (`quantile=` series, no `_bucket`), so no aggregate percentile
+        // could be computed across replicas or paths.
+        let rendered = render_with_production_recorder(|| {
+            histogram!(HTTP_REQUEST_DURATION_METRIC, "method" => "GET", "path" => "/x", "status" => "200")
+                .record(0.042);
+        });
+
+        assert!(
+            rendered.contains("# TYPE ak_http_request_duration_seconds histogram"),
+            "expected histogram type line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("quantile="),
+            "summary quantile series must be gone, got:\n{rendered}"
+        );
+        for le in ["0.005", "0.05", "1", "60", "+Inf"] {
+            assert!(
+                rendered.contains(&format!("le=\"{le}\"")),
+                "missing le={le} bucket, got:\n{rendered}"
+            );
+        }
+        // 0.042 s lands in the 0.05 bucket but not the 0.025 one.
+        assert!(rendered.contains(
+            "ak_http_request_duration_seconds_bucket{method=\"GET\",path=\"/x\",status=\"200\",le=\"0.05\"} 1"
+        ));
+        assert!(rendered.contains(
+            "ak_http_request_duration_seconds_bucket{method=\"GET\",path=\"/x\",status=\"200\",le=\"0.025\"} 0"
+        ));
+    }
+
+    #[test]
+    fn test_unbucketed_histograms_keep_summary_export() {
+        // Buckets are scoped to the HTTP latency metric only; every other
+        // histogram keeps its existing exposition shape.
+        let rendered = render_with_production_recorder(|| {
+            record_artifact_upload("my-repo", "maven", 1024);
+        });
+        assert!(
+            rendered.contains("# TYPE ak_artifact_upload_size_bytes summary"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_http_request_duration_buckets_span_5ms_to_60s_ascending() {
+        let b = HTTP_REQUEST_DURATION_BUCKETS;
+        assert_eq!(b.first(), Some(&0.005));
+        assert_eq!(b.last(), Some(&60.0));
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

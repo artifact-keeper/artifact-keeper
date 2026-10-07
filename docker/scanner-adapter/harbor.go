@@ -48,6 +48,9 @@ type ScanResponse struct {
 type HarborScanReport struct {
 	Scanner         HarborScanner         `json:"scanner"`
 	Vulnerabilities []HarborVulnerability `json:"vulnerabilities"`
+	// VulnerabilityDB is the trivy DB the scan ran against (#3014). An AK
+	// extension; omitted when the metadata could not be read.
+	VulnerabilityDB *VulnDBInfo `json:"vulnerability_db,omitempty"`
 }
 
 // HarborScanner identifies the scanner that produced the report.

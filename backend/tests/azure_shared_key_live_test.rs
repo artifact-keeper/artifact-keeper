@@ -24,6 +24,7 @@ async fn test_azure_shared_key_put_get_exists_delete() {
         container_name: container,
         access_key: Some(access_key),
         endpoint: None,
+        public_endpoint: None,
         redirect_downloads: true,
         sas_expiry: std::time::Duration::from_secs(3600),
         path_format: artifact_keeper_backend::storage::StoragePathFormat::Native,

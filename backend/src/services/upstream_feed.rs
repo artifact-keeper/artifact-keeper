@@ -35,7 +35,8 @@
 //! in-process backend it clears the consumer's replica only and the other
 //! replicas fall back to the TTL floor.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -48,7 +49,9 @@ use url::Url;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
+use crate::services::upstream_tracing::send_upstream;
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
 /// `PROXY_HYDRATION_LOCK_CLASS` (0x1609) and the scheduler locks
@@ -324,20 +327,31 @@ fn feed_root_url(feed_url: &Url) -> Result<Url> {
     root.set_query(None);
     root.set_fragment(None);
     {
-        let mut segs = root.path_segments_mut().map_err(|()| {
-            AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base"))
-        })?;
+        let mut segs = root
+            .path_segments_mut()
+            .map_err(|()| not_a_base_error(feed_url))?;
         // Drop the empty segment a trailing slash leaves behind first.
         segs.pop_if_empty();
     }
     let ends_in_changes = root.path_segments().and_then(|mut s| s.next_back()) == Some("_changes");
     if ends_in_changes {
         root.path_segments_mut()
-            .map_err(|()| AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base")))?
+            .map_err(|()| not_a_base_error(feed_url))?
             .pop()
             .push("");
     }
     Ok(root)
+}
+
+/// The error for a feed URL that cannot be a base. It names only the scheme:
+/// a non-hierarchical "URL" such as `user:pw@host` parses with the secret in
+/// its path, where [`without_userinfo`] cannot strip it, and this message can
+/// reach `last_error` in the admin status response (#3069).
+fn not_a_base_error(feed_url: &Url) -> AppError {
+    AppError::Config(format!(
+        "npm feed URL (scheme '{}') cannot be a base",
+        feed_url.scheme()
+    ))
 }
 
 /// Adapter for npm's public replication feed. Polls `_changes?since&limit`
@@ -378,17 +392,29 @@ impl NpmReplicationFeedAdapter {
             .user_agent(concat!("artifact-keeper/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| AppError::Config(format!("building npm feed HTTP client: {e}")))?;
-        // Strip userinfo so credentials in the configured URL never reach
-        // the DB key or log lines that carry `feed = feed_key`.
-        let mut display = parsed.clone();
-        let _ = display.set_username("");
-        let _ = display.set_password(None);
         Ok(Self {
             http,
-            feed_key: format!("npm-changes:{display}"),
+            feed_key: npm_feed_key(&parsed),
             url: parsed,
         })
     }
+}
+
+/// `url` with any userinfo stripped, so credentials in a configured feed URL
+/// never reach the DB key, log lines that carry `feed = feed_key`, or the
+/// admin status response (#3069).
+fn without_userinfo(url: &Url) -> Url {
+    let mut display = url.clone();
+    let _ = display.set_username("");
+    let _ = display.set_password(None);
+    display
+}
+
+/// The `upstream_feed_state.feed_key` (and advisory-lock lease key) the npm
+/// adapter uses for `url`. Shared with the status endpoint (#3069) so it reads
+/// exactly the row and lock the consumer writes and holds.
+fn npm_feed_key(url: &Url) -> String {
+    format!("npm-changes:{}", without_userinfo(url))
 }
 
 #[async_trait]
@@ -409,7 +435,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
     /// genesis (replaying the registry's entire change history).
     async fn bootstrap_cursor(&self) -> Result<Option<String>> {
         let root = feed_root_url(&self.url)?;
-        let response = self.http.get(root).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(root)).await.map_err(|e| {
             AppError::Internal(format!(
                 "npm feed bootstrap request failed: {}",
                 e.without_url()
@@ -443,7 +469,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
                 query.append_pair("since", since);
             }
         }
-        let response = self.http.get(url).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(url)).await.map_err(|e| {
             AppError::Internal(format!("npm feed request failed: {}", e.without_url()))
         })?;
         if !response.status().is_success() {
@@ -592,6 +618,211 @@ impl FeedStateStore for PgFeedStateStore {
 }
 
 // ---------------------------------------------------------------------------
+// Live status (#3069)
+// ---------------------------------------------------------------------------
+
+/// Process-local live state of this replica's feed consumer, shared between
+/// the [`FeedConsumer`] that writes it and `AppState` (the admin status
+/// endpoint reads it). Per replica by nature: behind a load balancer the
+/// replica answering the status call may not be the leader, which is why the
+/// status response also carries the cluster-wide lock check.
+#[derive(Debug, Default)]
+pub struct FeedStatus {
+    running: AtomicBool,
+    is_leader: AtomicBool,
+    last_error: Mutex<Option<String>>,
+}
+
+impl FeedStatus {
+    /// Whether a consumer task is running on this replica.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Whether this replica currently holds the feed's advisory lock.
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::Relaxed)
+    }
+
+    /// The most recent feed failure this replica observed, cleared once the
+    /// feed answers again.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn set_running(&self, running: bool) {
+        self.running.store(running, Ordering::Relaxed);
+    }
+
+    fn set_leader(&self, leader: bool) {
+        self.is_leader.store(leader, Ordering::Relaxed);
+    }
+
+    fn record_error(&self, message: String) {
+        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
+    }
+
+    fn clear_error(&self) {
+        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// Clears [`FeedStatus::is_running`] when the consumer task ends, however it
+/// ends (cancellation, or a panic unwinding the task).
+struct RunningGuard(Arc<FeedStatus>);
+
+impl RunningGuard {
+    fn new(status: Arc<FeedStatus>) -> Self {
+        status.set_running(true);
+        Self(status)
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.set_leader(false);
+        self.0.set_running(false);
+    }
+}
+
+/// Admin view of the npm upstream change-feed (#3069), served by
+/// `GET /api/v1/admin/npm/upstream-feed/status`.
+///
+/// Mixed scope: `consumer_running`, `is_leader` and `last_error` describe
+/// only the replica named by `replica_id` (the one that answered this call);
+/// `enabled`/`feed_url` are that replica's effective configuration; `cursor`,
+/// `last_poll_at` and `cluster_leader_active` are cluster-wide (read from the
+/// shared database). Behind a load balancer, repeated calls may be answered
+/// by different replicas.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct NpmUpstreamFeedStatus {
+    /// Which replica answered, as `<host>:<pid>:<boot-uuid>` (`<host>` is
+    /// `POD_NAME`, else `HOSTNAME`). The per-replica fields below
+    /// (`consumer_running`, `is_leader`, `last_error`) describe this replica
+    /// only.
+    pub replica_id: String,
+    /// Effective `NPM_UPSTREAM_FEED_ENABLED`.
+    pub enabled: bool,
+    /// Effective `NPM_UPSTREAM_FEED_URL`, with userinfo and query string
+    /// removed (a placeholder when the value does not parse).
+    pub feed_url: String,
+    /// Last persisted feed sequence (`upstream_feed_state.last_seq`); `null`
+    /// before the consumer has ever bootstrapped.
+    pub cursor: Option<String>,
+    /// When the cursor was last persisted (`upstream_feed_state.updated_at`).
+    /// The consumer only writes when the cursor moves, so on a quiet feed
+    /// this trails the most recent poll.
+    pub last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether a consumer task runs on THE REPLICA THAT ANSWERED. `false` when
+    /// the feed is disabled, the packument cache is off, or the URL was
+    /// rejected (`last_error` then says why).
+    pub consumer_running: bool,
+    /// Whether THE REPLICA THAT ANSWERED holds the feed's advisory lock. Behind
+    /// a load balancer this is usually `false` on a healthy cluster; read
+    /// `cluster_leader_active` for "is anyone consuming".
+    pub is_leader: bool,
+    /// Whether ANY replica currently holds the feed's advisory lock (read from
+    /// `pg_locks`), i.e. whether the feed is being consumed cluster-wide.
+    pub cluster_leader_active: bool,
+    /// Leadership term length: a leader steps down and re-contends at most
+    /// this often, which bounds failover after a silently lost lock.
+    pub leader_term_secs: u64,
+    /// Most recent feed failure seen by the replica that answered (poll,
+    /// bootstrap, cursor read, or invalidation actions) during its current
+    /// leadership term, cleared once a poll and its actions succeed and when
+    /// the replica steps down. Only the leader polls, so a non-leader replica
+    /// reports `null` here unless it failed to start the consumer.
+    pub last_error: Option<String>,
+}
+
+/// Shown as `feed_url` when the configured value is not a usable URL: it may
+/// still carry credentials, so it is never echoed.
+const UNPARSEABLE_FEED_URL: &str = "(unparseable NPM_UPSTREAM_FEED_URL)";
+
+/// The feed URL as reported to admins (userinfo and query string removed, so
+/// neither a password nor an `?access_token=` reaches the response), and the
+/// state key it maps to (`None` for a URL that does not parse, which can never
+/// have a state row). The key is derived exactly as the adapter derives it.
+fn npm_feed_identity(configured_url: &str) -> (String, Option<String>) {
+    match Url::parse(configured_url) {
+        // A non-hierarchical "URL" (`user:pw@host` parses with scheme `user`)
+        // has no userinfo to strip, so it is never echoed either.
+        Ok(url) if !url.cannot_be_a_base() => {
+            let mut shown = without_userinfo(&url);
+            shown.set_query(None);
+            shown.set_fragment(None);
+            (shown.to_string(), Some(npm_feed_key(&url)))
+        }
+        _ => (UNPARSEABLE_FEED_URL.to_string(), None),
+    }
+}
+
+/// Read the persisted cursor row for `feed_key`.
+async fn load_feed_state_row(
+    pool: &PgPool,
+    feed_key: &str,
+) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+    Ok(
+        sqlx::query_as("SELECT last_seq, updated_at FROM upstream_feed_state WHERE feed_key = $1")
+            .bind(feed_key)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// Whether any session in this database holds the feed's advisory lock. The
+/// two-key `pg_try_advisory_lock(int4, int4)` form shows in `pg_locks` as
+/// `classid`/`objid` (as `oid`, i.e. the int4 bit pattern) with
+/// `objsubid = 2`.
+async fn feed_lock_held_cluster_wide(pool: &PgPool, feed_key: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_locks \
+             WHERE locktype = 'advisory' AND granted AND objsubid = 2 \
+               AND classid = ($1::int4)::oid AND objid = ($2::int4)::oid \
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
+    )
+    .bind(UPSTREAM_FEED_LOCK_CLASS)
+    .bind(lease_object_id(feed_key))
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Assemble the admin status of the npm change-feed (#3069) from the
+/// effective configuration, the persisted cursor row, the cluster-wide lock
+/// table and this replica's live [`FeedStatus`].
+pub async fn npm_feed_status(
+    config: &Config,
+    pool: &PgPool,
+    live: &FeedStatus,
+) -> Result<NpmUpstreamFeedStatus> {
+    let (feed_url, feed_key) = npm_feed_identity(&config.npm_upstream_feed_url);
+    let (cursor, last_poll_at, cluster_leader_active) = match feed_key {
+        Some(ref key) => {
+            let row = load_feed_state_row(pool, key).await?;
+            let held = feed_lock_held_cluster_wide(pool, key).await?;
+            (row.as_ref().map(|r| r.0.clone()), row.map(|r| r.1), held)
+        }
+        None => (None, None, false),
+    };
+    Ok(NpmUpstreamFeedStatus {
+        replica_id: WorkerIdentity::for_process().as_str().to_string(),
+        enabled: config.npm_upstream_feed_enabled,
+        feed_url,
+        cursor,
+        last_poll_at,
+        consumer_running: live.is_running(),
+        is_leader: live.is_leader(),
+        cluster_leader_active,
+        leader_term_secs: LEADER_TERM.as_secs(),
+        last_error: live.last_error(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Consumer
 // ---------------------------------------------------------------------------
 
@@ -608,6 +839,7 @@ pub struct FeedConsumer {
     leader_term: Duration,
     backoff_initial: Duration,
     backoff_max: Duration,
+    status: Arc<FeedStatus>,
 }
 
 impl FeedConsumer {
@@ -628,7 +860,15 @@ impl FeedConsumer {
             leader_term: LEADER_TERM,
             backoff_initial: FEED_BACKOFF_INITIAL,
             backoff_max: FEED_BACKOFF_MAX,
+            status: Arc::new(FeedStatus::default()),
         }
+    }
+
+    /// Publish this consumer's live state into `status` (#3069), the handle
+    /// `AppState` shares with the admin status endpoint.
+    pub fn with_status(mut self, status: Arc<FeedStatus>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Test seam: shrink the loop intervals so tests converge in
@@ -655,6 +895,7 @@ impl FeedConsumer {
     pub async fn run(self) {
         let feed_key = self.adapter.feed_key().to_string();
         let lock_object = lease_object_id(&feed_key);
+        let _running = RunningGuard::new(self.status.clone());
         // Consecutive feed-connectivity failures (poll + bootstrap), tracked
         // across leadership terms so a permanently-broken feed escalates to
         // warn even though each bootstrap failure ends its term.
@@ -695,11 +936,17 @@ impl FeedConsumer {
                 feed = feed_key,
                 "upstream feed consumer: leadership acquired"
             );
+            self.status.set_leader(true);
             self.consume_for_one_term(&feed_key, &mut failures).await;
             // Step down at term end (or cancellation) and re-contend, so a
             // lock silently lost to a dead connection converges back to a
             // single consumer within one term instead of persisting until
             // process restart.
+            // A former leader no longer polls, so its last error would go
+            // stale forever if another replica wins the next term; the
+            // current leader reports the live one.
+            self.status.set_leader(false);
+            self.status.clear_error();
             lease.release().await;
             if self.cancel.is_cancelled() {
                 return;
@@ -716,7 +963,8 @@ impl FeedConsumer {
             // First enablement: bootstrap the head cursor from the adapter.
             Ok(None) => match self.adapter.bootstrap_cursor().await {
                 Ok(cursor) => {
-                    Self::note_recovery(feed_key, failures);
+                    self.note_recovery(feed_key, failures);
+                    self.status.clear_error();
                     // Persist the bootstrapped head before the first poll: at
                     // head the first poll echoes the same seq, so the
                     // `advanced`-gated save below never fires and the stored
@@ -742,6 +990,8 @@ impl FeedConsumer {
                     // replay the upstream's entire history from genesis, so
                     // sit the term out exactly as for an unreadable cursor;
                     // the next leader retries the bootstrap.
+                    self.status
+                        .record_error(format!("feed head bootstrap failed: {e}"));
                     *failures += 1;
                     log_feed_failure(
                         feed_key,
@@ -758,6 +1008,8 @@ impl FeedConsumer {
                 // everything between the stored cursor and now, and the next
                 // save would overwrite the stored cursor. Sit the term out;
                 // the next leader retries the load.
+                self.status
+                    .record_error(format!("feed cursor unreadable: {e}"));
                 tracing::warn!(
                     feed = feed_key,
                     error = %e,
@@ -783,11 +1035,14 @@ impl FeedConsumer {
                 Ok(batch) => {
                     // A successful poll means the feed is reachable and speaking
                     // the expected dialect; clear any failure streak.
-                    Self::note_recovery(feed_key, failures);
+                    self.note_recovery(feed_key, failures);
                     if !batch.events.is_empty() && !self.action.apply(&batch.events).await {
                         // Advancing the cursor past an unapplied batch would
                         // lose those invalidations for good; hold position
                         // and replay the batch after a backoff.
+                        self.status.record_error(
+                            "feed invalidation actions failed; replaying the batch".to_string(),
+                        );
                         tracing::warn!(
                             feed = feed_key,
                             backoff_secs = backoff.as_secs_f32(),
@@ -799,6 +1054,9 @@ impl FeedConsumer {
                         backoff = next_backoff(backoff, self.backoff_max);
                         continue;
                     }
+                    // Cleared only once the poll AND its actions succeeded,
+                    // so a replaying batch keeps its error visible.
+                    self.status.clear_error();
                     let advanced =
                         batch.last_seq.is_some() && batch.last_seq.as_deref() != since.as_deref();
                     if let Some(last_seq) = batch.last_seq {
@@ -860,6 +1118,7 @@ impl FeedConsumer {
                     }
                 }
                 Err(e) => {
+                    self.status.record_error(format!("feed poll failed: {e}"));
                     *failures += 1;
                     log_feed_failure(
                         feed_key,
@@ -877,7 +1136,7 @@ impl FeedConsumer {
     }
 
     /// Clear the failure streak, logging recovery at info when a streak ended.
-    fn note_recovery(feed_key: &str, failures: &mut u32) {
+    fn note_recovery(&self, feed_key: &str, failures: &mut u32) {
         if *failures > 0 {
             tracing::info!(
                 feed = feed_key,
@@ -892,11 +1151,15 @@ impl FeedConsumer {
 /// Start the npm replication-feed consumer described by the configuration.
 /// Returns `None` (with a log, never a startup failure) when disabled or
 /// misconfigured.
+///
+/// `status` is the live handle `AppState` shares with the admin status
+/// endpoint (#3069); a consumer that is not started records why in it.
 pub fn spawn_npm_feed_consumer(
     config: &Config,
     db: PgPool,
     cache: Option<Arc<NpmPackumentCache>>,
     cancel: CancellationToken,
+    status: Arc<FeedStatus>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.npm_upstream_feed_enabled {
         return None;
@@ -906,12 +1169,17 @@ pub fn spawn_npm_feed_consumer(
             "NPM_UPSTREAM_FEED_ENABLED is set but the packument cache is disabled; \
              there is nothing to invalidate, feed consumer not started"
         );
+        status
+            .record_error("consumer not started: the npm packument cache is disabled".to_string());
         return None;
     };
     let adapter = match NpmReplicationFeedAdapter::new(&config.npm_upstream_feed_url) {
         Ok(adapter) => Arc::new(adapter),
         Err(e) => {
             tracing::warn!(error = %e, "NPM_UPSTREAM_FEED_URL rejected; feed consumer not started");
+            status.record_error(format!(
+                "consumer not started: NPM_UPSTREAM_FEED_URL rejected: {e}"
+            ));
             return None;
         }
     };
@@ -921,7 +1189,8 @@ pub fn spawn_npm_feed_consumer(
         Arc::new(PgFeedStateStore::new(db.clone())),
         Arc::new(PgAdvisoryLock::new(db)),
         cancel,
-    );
+    )
+    .with_status(status);
     Some(tokio::spawn(consumer.run()))
 }
 
@@ -1005,6 +1274,14 @@ mod tests {
     }
 
     #[test]
+    fn feed_root_url_error_never_echoes_the_configured_url() {
+        let url = Url::parse("user:s3cret@registry.example").unwrap();
+        let err = feed_root_url(&url).expect_err("non-base URL").to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+        assert!(err.contains("scheme 'user'"), "{err}");
+    }
+
+    #[test]
     fn feed_root_url_strips_trailing_changes_segment() {
         let root = |u: &str| feed_root_url(&Url::parse(u).unwrap()).unwrap().to_string();
         assert_eq!(
@@ -1041,12 +1318,15 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_polls_with_since_and_limit_only() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{header_exists, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The poll goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/_changes"))
+            .and(header_exists("traceparent"))
             .and(query_param("since", "41"))
             .and(query_param("limit", NPM_FEED_BATCH_LIMIT.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(changes_body(
@@ -1273,13 +1553,16 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_bootstraps_head_from_root_update_seq() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The bootstrap goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         // The real root shape, update_seq as a number.
         let numeric = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/"))
+            .and(header_exists("traceparent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "db_name": "registry",
                 "engine": "npm-replicate",
@@ -1772,6 +2055,211 @@ mod tests {
         );
         cancel.cancel();
         handle.await.expect("join");
+    }
+
+    /// #3069: the live status the admin endpoint reads. While the feed fails,
+    /// the leader reports itself running, leading and the last error; when
+    /// the task ends, both flags drop.
+    #[tokio::test]
+    async fn consumer_publishes_leadership_and_last_error_to_status() {
+        let failures = (0..200)
+            .map(|_| Err(AppError::Internal("feed down".to_string())))
+            .collect();
+        let adapter = ScriptedAdapter::new(failures);
+        let status = Arc::new(FeedStatus::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter,
+            Arc::new(RecordingAction::default()),
+            Arc::new(MemoryStateStore::default()),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        )
+        .with_status(status.clone());
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| status.is_leader() && status.last_error().is_some()).await,
+            "a failing leader must publish leadership and its error"
+        );
+        assert!(status.is_running());
+        let error = status.last_error().unwrap_or_default();
+        assert!(
+            error.contains("feed poll failed") && error.contains("feed down"),
+            "{error}"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+        assert!(!status.is_running() && !status.is_leader());
+        // Stepping down drops the error: a non-leader no longer polls, so it
+        // would otherwise report a stale failure indefinitely.
+        assert_eq!(status.last_error(), None);
+    }
+
+    /// #3069: a successful poll clears a previously published error.
+    #[tokio::test]
+    async fn consumer_clears_last_error_on_recovery() {
+        let mut script: Vec<Result<FeedBatch>> = (0..20)
+            .map(|_| Err(AppError::Internal("feed down".to_string())))
+            .collect();
+        script.push(batch(&["recovered-pkg"], "9"));
+        let adapter = ScriptedAdapter::new(script);
+        let action = Arc::new(RecordingAction::default());
+        let status = Arc::new(FeedStatus::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter,
+            action.clone(),
+            Arc::new(MemoryStateStore::default()),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        )
+        .with_status(status.clone());
+        let handle = tokio::spawn(consumer.run());
+        // The error is published while the feed fails...
+        assert!(wait_until(|| status.last_error().is_some()).await);
+        assert!(action.applied().is_empty());
+        // ...and cleared once a poll and its actions succeed.
+        assert!(wait_until(|| action.applied() == vec!["recovered-pkg"]).await);
+        assert!(wait_until(|| status.last_error().is_none()).await);
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    /// #3069: an enabled feed whose consumer cannot start says why.
+    #[tokio::test]
+    async fn spawn_records_why_the_consumer_did_not_start() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let mut config = Config::test_config();
+        config.npm_upstream_feed_enabled = true;
+
+        let status = Arc::new(FeedStatus::default());
+        let handle = spawn_npm_feed_consumer(
+            &config,
+            pool.clone(),
+            None,
+            CancellationToken::new(),
+            status.clone(),
+        );
+        assert!(handle.is_none());
+        assert!(!status.is_running());
+        assert!(status
+            .last_error()
+            .unwrap_or_default()
+            .contains("packument cache is disabled"));
+
+        config.npm_upstream_feed_url = "http://169.254.169.254/_changes".to_string();
+        let cache = NpmPackumentCache::from_config(&Config::test_config());
+        assert!(cache.is_some(), "test config enables the packument cache");
+        let status = Arc::new(FeedStatus::default());
+        let handle = spawn_npm_feed_consumer(
+            &config,
+            pool.clone(),
+            cache,
+            CancellationToken::new(),
+            status.clone(),
+        );
+        assert!(handle.is_none());
+        assert!(status
+            .last_error()
+            .unwrap_or_default()
+            .contains("NPM_UPSTREAM_FEED_URL rejected"));
+
+        // Disabled: nothing to report.
+        config.npm_upstream_feed_enabled = false;
+        let status = Arc::new(FeedStatus::default());
+        assert!(spawn_npm_feed_consumer(
+            &config,
+            pool,
+            None,
+            CancellationToken::new(),
+            status.clone()
+        )
+        .is_none());
+        assert_eq!(status.last_error(), None);
+    }
+
+    /// #3069: the reported URL drops userinfo, and the status reads the same
+    /// state row the adapter writes.
+    #[test]
+    fn npm_feed_identity_strips_userinfo_and_matches_the_adapter_key() {
+        let configured = "https://user:secret@replicate.example.test/_changes?access_token=tok";
+        let (url, key) = npm_feed_identity(configured);
+        assert_eq!(url, "https://replicate.example.test/_changes");
+        let adapter = NpmReplicationFeedAdapter::from_url_unchecked(configured).expect("adapter");
+        assert_eq!(key.as_deref(), Some(adapter.feed_key()));
+        assert!(!key.unwrap_or_default().contains("secret"));
+
+        assert_eq!(
+            npm_feed_identity("not a url"),
+            (UNPARSEABLE_FEED_URL.to_string(), None)
+        );
+        assert_eq!(
+            npm_feed_identity("user:pw@feed.example.test"),
+            (UNPARSEABLE_FEED_URL.to_string(), None)
+        );
+    }
+
+    /// #3069 (DB-backed): the status reflects the persisted cursor row and a
+    /// lock held by ANY session (`pg_locks`), not just this process.
+    #[tokio::test]
+    async fn npm_feed_status_reads_cursor_row_and_cluster_lock_db() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let mut config = Config::test_config();
+        config.npm_upstream_feed_enabled = true;
+        config.npm_upstream_feed_url = format!(
+            "https://u:p@feed-{}.example.test/_changes",
+            uuid::Uuid::new_v4().simple()
+        );
+        let (_, key) = npm_feed_identity(&config.npm_upstream_feed_url);
+        let feed_key = key.expect("parseable feed url");
+        let live = FeedStatus::default();
+
+        let empty = npm_feed_status(&config, &pool, &live)
+            .await
+            .expect("status");
+        assert!(empty.enabled);
+        assert_eq!(empty.replica_id, WorkerIdentity::for_process().as_str());
+        assert!(!empty.feed_url.contains("u:p@"), "{}", empty.feed_url);
+        assert_eq!(empty.cursor, None);
+        assert_eq!(empty.last_poll_at, None);
+        assert!(!empty.cluster_leader_active);
+        assert!(!empty.is_leader && !empty.consumer_running);
+        assert_eq!(empty.leader_term_secs, LEADER_TERM.as_secs());
+
+        PgFeedStateStore::new(pool.clone())
+            .save(&feed_key, "4242")
+            .await
+            .expect("seed cursor");
+        let lease = PgAdvisoryLock::new(pool.clone())
+            .try_acquire(UPSTREAM_FEED_LOCK_CLASS, lease_object_id(&feed_key))
+            .await
+            .expect("lock query")
+            .expect("lock free");
+        live.record_error("feed poll failed: boom".to_string());
+
+        let seeded = npm_feed_status(&config, &pool, &live).await;
+        lease.release().await;
+        let released = npm_feed_status(&config, &pool, &live).await;
+        sqlx::query("DELETE FROM upstream_feed_state WHERE feed_key = $1")
+            .bind(&feed_key)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+
+        let seeded = seeded.expect("status");
+        assert_eq!(seeded.cursor.as_deref(), Some("4242"));
+        assert!(seeded.last_poll_at.is_some());
+        assert!(
+            seeded.cluster_leader_active,
+            "a held lock must be visible cluster-wide"
+        );
+        assert_eq!(seeded.last_error.as_deref(), Some("feed poll failed: boom"));
+        assert!(!released.expect("status").cluster_leader_active);
     }
 
     #[tokio::test]

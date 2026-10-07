@@ -82,8 +82,8 @@ pub struct TrivyPackage {
     #[serde(rename = "Version", default)]
     pub version: String,
     /// Trivy emits `Licenses` as an array of strings. Multi-license packages
-    /// produce multiple entries; persistence joins them with `" OR "` per
-    /// CycloneDX convention.
+    /// produce multiple entries; persistence joins them with `" AND "`
+    /// because every detected license applies (#3866).
     #[serde(rename = "Licenses", default)]
     pub licenses: Option<Vec<String>>,
     #[serde(rename = "Identifier", default)]
@@ -120,6 +120,12 @@ pub struct HarborScanReport {
     pub scanner: Option<HarborScanner>,
     #[serde(default)]
     pub vulnerabilities: Vec<HarborVulnerability>,
+    /// Trivy vulnerability-DB metadata (#3014). An Artifact Keeper adapter
+    /// extension to the Harbor report, absent from older adapters and from
+    /// third-party Harbor scanners (then `None`, stored as NULL). Raw JSON,
+    /// parsed leniently, so a foreign shape can never fail the scan.
+    #[serde(default)]
+    pub vulnerability_db: Option<serde_json::Value>,
 }
 
 /// Identifies the scanner that produced the report. Feeds
@@ -867,7 +873,12 @@ impl ImageScanner {
         // preserve back-compat with dashboards / filters that group findings
         // by `source = 'trivy'`.
         let trivy_report = harbor_report_to_trivy(&report, &reference_label);
-        let output = ScanOutput::from_trivy_report(&trivy_report, "trivy");
+        let mut output = ScanOutput::from_trivy_report(&trivy_report, "trivy");
+        // #3014: the DB this very report was graded against, carried with the
+        // findings rather than through a shared last-scan slot.
+        output.vuln_db = crate::services::scanner_service::AdapterVulnDb::lenient(
+            report.vulnerability_db.as_ref(),
+        );
 
         info!(
             "Adapter image scan complete for {}: {} vulnerabilities",
@@ -1177,6 +1188,7 @@ mod tests {
                     links: None,
                 },
             ],
+            vulnerability_db: None,
         };
 
         let findings = ImageScanner::convert_findings(&harbor_report_to_trivy(&report, "img:tag"));
@@ -1439,6 +1451,45 @@ mod tests {
         assert_eq!(out.findings[0].severity, Severity::High);
         assert_eq!(out.findings[0].source, Some("trivy".to_string()));
         assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+        // An adapter that reports no DB metadata yields no provenance.
+        assert_eq!(out.vuln_db, None);
+    }
+
+    /// #3014: the Harbor report's `vulnerability_db` extension reaches the
+    /// scan output, and a malformed one is ignored rather than failing the
+    /// scan.
+    #[tokio::test]
+    async fn test_adapter_scan_carries_vulnerability_db() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (db, want) in [
+            (
+                serde_json::json!({"version": 2, "updated_at": "2026-10-04T19:39:34Z"}),
+                Some("trivy-db-v2"),
+            ),
+            (serde_json::json!({"version": "2"}), None),
+            (serde_json::json!("not an object"), None),
+        ] {
+            let server = MockServer::start().await;
+            mount_ready_and_submit(&server, "scan-db").await;
+            let report = serde_json::json!({
+                "scanner": {"name": "Trivy", "version": "0.71.2"},
+                "vulnerabilities": [],
+                "vulnerability_db": db,
+            });
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/v1/scan/.+/report$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(report))
+                .mount(&server)
+                .await;
+
+            let out = ImageScanner::new(server.uri())
+                .scan(&oci_image_artifact(), None, &Bytes::new())
+                .await
+                .expect("a malformed vulnerability_db must not fail the scan");
+            assert_eq!(out.vuln_db.map(|p| p.version).as_deref(), want);
+        }
     }
 
     /// Mirror of #888 `test_scan_fails_when_trivy_unreachable`: an unreachable

@@ -82,6 +82,8 @@ pub enum RepositoryFormat {
     // Container images
     Incus,
     Lxc,
+    // Linux distribution packages (#3343)
+    Pacman,
 }
 
 impl RepositoryFormat {
@@ -159,6 +161,7 @@ impl RepositoryFormat {
         RepositoryFormat::Protobuf,
         RepositoryFormat::Incus,
         RepositoryFormat::Lxc,
+        RepositoryFormat::Pacman,
     ];
 
     /// The canonical snake_case key for this format.
@@ -225,6 +228,7 @@ impl RepositoryFormat {
             Self::Protobuf => "protobuf",
             Self::Incus => "incus",
             Self::Lxc => "lxc",
+            Self::Pacman => "pacman",
         }
     }
 

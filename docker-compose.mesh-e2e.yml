@@ -2,6 +2,7 @@
 #
 # Usage:
 #   docker compose -f docker-compose.mesh-e2e.yml up --abort-on-container-exit --exit-code-from mesh-test
+#   (scheduled-tests.yml runs exactly this nightly, job `mesh-e2e`, #1936)
 #   docker compose -f docker-compose.mesh-e2e.yml down -v
 #
 # Spins up two independent backend peers (each with its own Postgres) and runs
@@ -14,7 +15,7 @@ services:
   # ==========================================================================
 
   postgres-peer-a:
-    image: docker.io/postgres:18-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: mesh-e2e-db-peer-a
     environment:
       POSTGRES_USER: registry
@@ -35,7 +36,7 @@ services:
   # ==========================================================================
 
   postgres-peer-b:
-    image: docker.io/postgres:18-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: mesh-e2e-db-peer-b
     environment:
       POSTGRES_USER: registry
@@ -56,6 +57,9 @@ services:
   # ==========================================================================
 
   backend-peer-a:
+    # Same tag as docker-compose.test.yml: `up --no-build` runs an image that
+    # was built (or `docker load`ed) beforehand, as scheduled-tests.yml does.
+    image: artifact-keeper-backend:test
     build:
       context: .
       dockerfile: docker/Dockerfile.backend
@@ -77,6 +81,18 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       GRPC_PORT: 9090
+      # E2E-ONLY SSRF relaxation, scoped to this stack's pinned subnet (see
+      # `mesh-e2e-network` below). Peer registration validates the peer's
+      # endpoint URL with the outbound-URL guard (#1832), and the other peer
+      # resolves to an address on this bridge, so without the allowlist every
+      # POST /api/v1/peers returns 400 and no replication test gets past
+      # setup (#1936). Never set this outside a throwaway test stack.
+      AK_SSRF_ALLOW_PRIVATE_CIDRS: 10.213.77.0/24
+      # Probe peers every sync-worker tick instead of every 60s. The worker
+      # only delivers to a peer whose liveness probe has marked it `online`,
+      # so this is what lets a freshly registered peer receive artifacts
+      # within the test's wait window rather than a minute later.
+      PEER_HEARTBEAT_INTERVAL_SECS: "10"
       PEER_INSTANCE_NAME: peer-a
       PEER_INSTANCE_ENDPOINT: http://backend-peer-a:8080
       PEER_INSTANCE_REGION: us-east-1
@@ -96,6 +112,9 @@ services:
   # ==========================================================================
 
   backend-peer-b:
+    # Same tag as docker-compose.test.yml: `up --no-build` runs an image that
+    # was built (or `docker load`ed) beforehand, as scheduled-tests.yml does.
+    image: artifact-keeper-backend:test
     build:
       context: .
       dockerfile: docker/Dockerfile.backend
@@ -117,6 +136,18 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       GRPC_PORT: 9090
+      # E2E-ONLY SSRF relaxation, scoped to this stack's pinned subnet (see
+      # `mesh-e2e-network` below). Peer registration validates the peer's
+      # endpoint URL with the outbound-URL guard (#1832), and the other peer
+      # resolves to an address on this bridge, so without the allowlist every
+      # POST /api/v1/peers returns 400 and no replication test gets past
+      # setup (#1936). Never set this outside a throwaway test stack.
+      AK_SSRF_ALLOW_PRIVATE_CIDRS: 10.213.77.0/24
+      # Probe peers every sync-worker tick instead of every 60s. The worker
+      # only delivers to a peer whose liveness probe has marked it `online`,
+      # so this is what lets a freshly registered peer receive artifacts
+      # within the test's wait window rather than a minute later.
+      PEER_HEARTBEAT_INTERVAL_SECS: "10"
       PEER_INSTANCE_NAME: peer-b
       PEER_INSTANCE_ENDPOINT: http://backend-peer-b:8080
       PEER_INSTANCE_REGION: us-west-2
@@ -136,13 +167,17 @@ services:
   # ==========================================================================
 
   mesh-test:
-    image: docker.io/alpine:3.24
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: mesh-e2e-test
     depends_on:
       backend-peer-a:
         condition: service_healthy
       backend-peer-b:
         condition: service_healthy
+    # The scripts log in as admin with ADMIN_PASS, the throwaway e2e
+    # credential defined ONCE in .env.test (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     volumes:
       - ./scripts/mesh-e2e:/scripts:ro
     command: sh /scripts/run-all-mesh-tests.sh
@@ -153,6 +188,11 @@ networks:
   mesh-e2e-network:
     name: mesh-e2e-network
     driver: bridge
+    # Pinned so AK_SSRF_ALLOW_PRIVATE_CIDRS on the peers can name exactly this
+    # network instead of relaxing the guard for every private address.
+    ipam:
+      config:
+        - subnet: 10.213.77.0/24
 
 volumes:
   mesh-peer-a-storage:

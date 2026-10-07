@@ -1003,8 +1003,8 @@ mod tests {
             }
         };
 
-        let capture = crate::testing::LogCapture::default();
-        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+        let _guard = capture.install(tracing::Level::INFO);
 
         let provider = create_provider(
             State(state.clone()),
@@ -1022,7 +1022,7 @@ mod tests {
         .await
         .expect("create static provider")
         .0;
-        let created_line = capture.contents();
+        let created_line = capture.text();
         assert!(
             created_line.contains("key_source=static") && created_line.contains("kids=k1"),
             "{created_line}"
@@ -1041,7 +1041,7 @@ mod tests {
         .expect("replace the JWKS")
         .0;
         assert_eq!(replaced.key_source, "static");
-        let logs = capture.contents();
+        let logs = capture.text();
         let line = logs
             .lines()
             .rfind(|l| l.contains("CI OIDC: provider key source set"))
@@ -1071,7 +1071,7 @@ mod tests {
         .expect("change the provider type")
         .0;
         assert_eq!(widened.provider_type, "generic");
-        let logs = capture.contents();
+        let logs = capture.text();
         let line = logs
             .lines()
             .rfind(|l| l.contains("CI OIDC: provider type changed"))
@@ -1095,10 +1095,7 @@ mod tests {
         .await;
         assert!(refused.is_err(), "k8s must be refused");
 
-        let before = capture
-            .contents()
-            .matches("provider key source set")
-            .count();
+        let before = capture.text().matches("provider key source set").count();
         let renamed = update_provider(
             State(state.clone()),
             Extension(auth.clone()),
@@ -1113,10 +1110,7 @@ mod tests {
         .0;
         assert!(renamed.name.starts_with("k8s-renamed-"));
         assert_eq!(
-            capture
-                .contents()
-                .matches("provider key source set")
-                .count(),
+            capture.text().matches("provider key source set").count(),
             before,
             "an update that leaves key material alone logs no key-source line"
         );

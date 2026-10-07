@@ -1670,7 +1670,11 @@ mod guest_access_oci_3854 {
             ..Default::default()
         };
         GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(
+                artifact_keeper_backend::services::guest_access_policy::GuestAccessPolicy::fixed(
+                    guest_access_enabled,
+                ),
+            ),
             auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
         }
     }
@@ -1834,6 +1838,9 @@ mod guest_access_oci_3854 {
             jwt_secret: JWT_SECRET.into(),
             setup_password_hint: None,
             guest_access_enabled,
+            // As if AK_GUEST_ACCESS_ENABLED were set: the value is pinned and
+            // never depends on a stored row in the shared test DB (#867).
+            guest_access_env_pinned: true,
             ..Default::default()
         };
         let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
@@ -1848,9 +1855,11 @@ mod guest_access_oci_3854 {
 
     /// The production shape: the OCI routes nested under `/v2`, with the
     /// guest-access guard as the global outer layer in front of them.
-    fn real_app(shared: SharedState, guest_access_enabled: bool) -> Router {
+    /// The guard shares `shared.guest_access_policy`, exactly as
+    /// `create_router` wires it (#867).
+    fn real_app(shared: SharedState) -> Router {
         let guard_state = GuestAccessState {
-            guest_access_enabled,
+            policy: shared.guest_access_policy.clone(),
             auth_service: Arc::new(AuthService::new(
                 shared.db.clone(),
                 Arc::new(shared.config.clone()),
@@ -1899,7 +1908,7 @@ mod guest_access_oci_3854 {
         std::fs::create_dir_all(&dir).expect("create storage dir");
         let path = dir.to_string_lossy().to_string();
 
-        let refused = real_app(real_state(pool.clone(), &path, false), false)
+        let refused = real_app(real_state(pool.clone(), &path, false))
             .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
             .await
             .expect("router is infallible");
@@ -1917,7 +1926,7 @@ mod guest_access_oci_3854 {
 
         // With the flag on, the very same request mints the anonymous token —
         // the default configuration is untouched by this change.
-        let minted = real_app(real_state(pool, &path, true), true)
+        let minted = real_app(real_state(pool, &path, true))
             .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
             .await
             .expect("router is infallible");
@@ -2012,7 +2021,7 @@ mod guest_access_oci_3854 {
         let shared = real_state(pool.clone(), &path, false);
 
         // 1. `docker login` — the password grant asking for an offline token.
-        let login = real_app(shared.clone(), false)
+        let login = real_app(shared.clone())
             .oneshot(form_post(
                 "/v2/token",
                 format!(
@@ -2031,7 +2040,7 @@ mod guest_access_oci_3854 {
         let exchanged = match refresh.as_deref() {
             Some(rt) => Some(
                 status_and_body(
-                    real_app(shared.clone(), false)
+                    real_app(shared.clone())
                         .oneshot(form_post(
                             "/v2/token",
                             format!("grant_type=refresh_token&refresh_token={rt}"),
@@ -2053,7 +2062,7 @@ mod guest_access_oci_3854 {
         let pulled = match access.as_deref() {
             Some(token) => Some(
                 status_and_body(
-                    real_app(shared, false)
+                    real_app(shared)
                         .oneshot(
                             Request::builder()
                                 .uri(format!("/v2/{key}/manifests/latest"))

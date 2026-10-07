@@ -126,7 +126,32 @@ const _: () = assert!(prefix_matches("oci-manifests/"));
 /// upload-then-manifest gap and short enough that abandoned uploads do
 /// not waste storage indefinitely. The bound is pinned by compile-time
 /// `assert!`s in the test module to keep accidental drift out of band.
-pub(crate) const MIN_BLOB_AGE_SECS: u64 = 24 * 60 * 60;
+///
+/// This is the DEFAULT. Operators can override it with
+/// `BLOB_GC_MIN_AGE_SECS` (#2906, `Config::blob_gc_min_age_secs`), clamped by
+/// [`clamp_min_blob_age_secs`]; a service built without
+/// [`StorageGcService::with_min_blob_age_secs`] uses this value.
+pub const MIN_BLOB_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Lowest configurable minimum blob age (#2906). Short enough that a test
+/// deployment can observe a pushed blob being reclaimed, long enough that a
+/// push's own blob-then-manifest gap is never zero.
+pub const MIN_BLOB_AGE_FLOOR_SECS: u64 = 60;
+
+/// Highest configurable minimum blob age (#2906): the same seven-day ceiling
+/// the default is pinned under, so a fat-fingered value cannot switch blob GC
+/// off in practice.
+pub const MIN_BLOB_AGE_CEILING_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Below this the minimum blob age is shorter than a slow real-world push can
+/// take, so `Config` logs a warning when an operator configures less (#2906).
+pub const MIN_BLOB_AGE_RECOMMENDED_SECS: u64 = 60 * 60;
+
+/// Clamp an operator-supplied minimum blob age into
+/// [`MIN_BLOB_AGE_FLOOR_SECS`, `MIN_BLOB_AGE_CEILING_SECS`] (#2906).
+pub fn clamp_min_blob_age_secs(secs: u64) -> u64 {
+    secs.clamp(MIN_BLOB_AGE_FLOOR_SECS, MIN_BLOB_AGE_CEILING_SECS)
+}
 
 /// SQL fragment: `EXISTS (...)` — true when some `manifest_blob_refs` row
 /// still protects the outer blob row aliased `ob` (joined to its
@@ -163,6 +188,226 @@ const BLOB_PROTECTED_BY_REFS_SQL: &str = r#"
     )
 "#;
 
+/// Page size for every keyset-paged GC candidate scan (#2524): the orphan
+/// storage-key scan behind [`StorageGcService::run_gc`] and both blob-GC
+/// phases. A pass holds at most one page of candidates in memory and walks
+/// the whole candidate set page by page, so a deletion wave of any size is
+/// bounded in memory and each page's query is bounded in rows returned.
+pub(crate) const GC_CANDIDATE_PAGE_SIZE: i64 = 1000;
+
+/// Ceiling for `GC_TRASH_RETENTION_DAYS` (#2072): ten years. Anything larger is
+/// a typo, and an unbounded value would overflow `make_interval`.
+pub const MAX_TRASH_RETENTION_DAYS: u32 = 3650;
+
+/// Clamp an operator-supplied trash retention window into
+/// `[0, MAX_TRASH_RETENTION_DAYS]` (#2072). `0` keeps today's behaviour:
+/// soft-deleted artifacts are reclaimable by the next GC pass.
+pub fn clamp_trash_retention_days(days: u32) -> u32 {
+    days.min(MAX_TRASH_RETENTION_DAYS)
+}
+
+/// Extra `AND` clause appended to [`ORPHAN_PREDICATE_SQL`] for a trash
+/// retention window of `days` (#2072): a soft-deleted row keeps its storage
+/// key alive until it has been in the trash for `days` days.
+///
+/// `0` (the default) yields an empty clause, so the predicate is byte-for-byte
+/// what it was before retention existed. `deleted_at IS NULL` counts as
+/// expired: those rows were soft-deleted before migration 261 added the
+/// column, i.e. at least as long ago as the upgrade, and must not become
+/// unreclaimable just because retention was switched on afterwards.
+///
+/// The `NOT EXISTS` arm drops a row whose key is still named by a trashed row
+/// inside the window in the same scope (same backend; same `storage_path` on
+/// filesystem, matching [`is_still_orphan`]'s lock). Without it the scan
+/// would admit such a key through its expired row and the locked re-check
+/// would then skip it: a dry run would over-report what is reclaimable, and
+/// every pass would lock and skip the same keys.
+///
+/// The value is a clamped `u32` rendered as an integer literal, never caller
+/// text, so formatting it into the SQL is injection-safe.
+pub(crate) fn trash_retention_clause(days: u32) -> String {
+    if days == 0 {
+        return String::new();
+    }
+    let days = clamp_trash_retention_days(days);
+    format!(
+        r#"
+AND (a.deleted_at IS NULL OR a.deleted_at < NOW() - make_interval(days => {days}))
+AND NOT EXISTS (
+    SELECT 1
+    FROM artifacts kept
+    JOIN repositories keptr ON keptr.id = kept.repository_id
+    WHERE kept.storage_key = a.storage_key
+      AND kept.is_deleted = true
+      AND kept.deleted_at >= NOW() - make_interval(days => {days})
+      AND keptr.storage_backend = r.storage_backend
+      AND (
+        r.storage_backend <> 'filesystem'
+        OR keptr.storage_path = r.storage_path
+      )
+)
+"#
+    )
+}
+
+/// [`ORPHAN_PREDICATE_SQL`] plus the trash-retention clause for `days`. Both
+/// the candidate scan and the locked re-check ([`is_still_orphan`]) build
+/// their predicate here, so the two cannot drift (the #1180 rule). Because the
+/// re-check is a `bool_and` over every row sharing the key, an object shared
+/// by one expired and one still-retained trashed row is kept until both have
+/// expired.
+fn orphan_predicate_sql(days: u32) -> String {
+    format!("{ORPHAN_PREDICATE_SQL}{}", trash_retention_clause(days))
+}
+
+/// Keyset cursor over the orphan storage-key scan (#2524): the full GROUP BY
+/// key of the last group on the previous page. The default (all empty
+/// strings) sorts before every real group, so it starts the first page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OrphanKeyCursor {
+    storage_key: String,
+    storage_backend: String,
+    storage_path: String,
+}
+
+impl OrphanKeyCursor {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Option<Self> {
+        Some(Self {
+            storage_key: row.try_get("storage_key").ok()?,
+            storage_backend: row.try_get("storage_backend").ok()?,
+            storage_path: row.try_get("storage_path").ok()?,
+        })
+    }
+}
+
+/// Keyset cursor over a blob-GC candidate scan (#2524): the
+/// `(repository_id, digest)` primary key of the last row on the previous
+/// page. The default (nil UUID, empty digest) sorts before every real row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BlobCursor {
+    repository_id: Uuid,
+    digest: String,
+}
+
+impl BlobCursor {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Option<Self> {
+        Some(Self {
+            repository_id: row.try_get("repository_id").ok()?,
+            digest: row.try_get("digest").ok()?,
+        })
+    }
+}
+
+/// Which blob-GC phase a paged pass is running (#1660, paged in #2524).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobGcPhase {
+    /// Phase A: stamp `pending_delete_at` on aged orphan blobs.
+    Mark,
+    /// Phase B: delete blobs marked at least `grace_secs` ago.
+    Sweep { grace_secs: i64 },
+}
+
+impl BlobGcPhase {
+    /// Operation label used when a later page's candidate query fails.
+    fn select_label(self) -> &'static str {
+        match self {
+            Self::Mark => "select orphan blobs",
+            Self::Sweep { .. } => "select pending-delete blobs",
+        }
+    }
+
+    /// Dry-run log line for one candidate of this phase.
+    fn dry_run_message(self) -> &'static str {
+        match self {
+            Self::Mark => "Blob GC (dry-run): would mark orphan blob for deletion",
+            Self::Sweep { .. } => "Blob GC (dry-run): would sweep marked orphan blob",
+        }
+    }
+}
+
+/// SQL for one keyset page of `oci_blobs` candidates whose phase filter is
+/// `filter` (#2524). Binds: `$1` the filter's seconds, `$2`/`$3` the
+/// [`BlobCursor`], `$4` the page size. Both phases share the projection, the
+/// [`BLOB_PROTECTED_BY_REFS_SQL`] orphan test and the ordering, so only the
+/// age filter differs between them.
+fn blob_candidate_page_sql(filter: &str) -> String {
+    format!(
+        r#"
+        SELECT ob.repository_id,
+               ob.digest,
+               ob.size_bytes,
+               ob.storage_key,
+               r.storage_backend,
+               r.storage_path
+        FROM oci_blobs ob
+        JOIN repositories r ON r.id = ob.repository_id
+        WHERE {filter}
+          AND NOT {protected}
+          AND (ob.repository_id, ob.digest) > ($2, $3)
+        ORDER BY ob.repository_id, ob.digest
+        LIMIT $4
+        "#,
+        protected = BLOB_PROTECTED_BY_REFS_SQL,
+    )
+}
+
+/// The cursor for the page after `page`, or `None` when paging is done
+/// (#2524). A short page is the last one: the scan already returned every
+/// remaining candidate. A full page continues from its last row. A last row
+/// that cannot be decoded also stops paging, rather than restarting from a
+/// default cursor and looping.
+fn next_page_cursor<T, C>(
+    page: &[T],
+    page_size: i64,
+    decode: impl Fn(&T) -> Option<C>,
+) -> Option<C> {
+    if (page.len() as i64) < page_size {
+        return None;
+    }
+    page.last().and_then(decode)
+}
+
+/// [`next_page_cursor`] for a production pass: a full page whose last row
+/// cannot be decoded still ends the pass, but is recorded in `result.errors`
+/// so a truncated pass is visible instead of silently looking complete.
+fn continue_paging<T, C>(
+    page: &[T],
+    page_size: i64,
+    decode: impl Fn(&T) -> Option<C>,
+    result: &mut StorageGcResult,
+) -> Option<C> {
+    let next = next_page_cursor(page, page_size, decode);
+    if next.is_none() && page.len() as i64 >= page_size {
+        let msg = format_gc_error(
+            "decode page cursor",
+            "<page>",
+            "last row of a full page could not be decoded; remaining candidates wait for the next pass",
+        );
+        tracing::warn!("{}", msg);
+        result.errors.push(msg);
+    }
+    next
+}
+
+/// Handle a failed candidate-page query (#2524). The FIRST page failing means
+/// the pass never started, so the error propagates exactly as the unpaged
+/// scan's did. A later page failing must not discard the work earlier pages
+/// already committed: it is recorded in `result.errors` and the pass stops.
+fn record_page_error(
+    result: &mut StorageGcResult,
+    first_page: bool,
+    operation: &str,
+    error: AppError,
+) -> Result<()> {
+    if first_page {
+        return Err(error);
+    }
+    let msg = format_gc_error(operation, "<page>", &error.to_string());
+    tracing::warn!("{}", msg);
+    result.errors.push(msg);
+    Ok(())
+}
+
 /// Storage-key prefix under which committed OCI blobs are stored. The SQL
 /// embedding of the key shape `oci_v2.rs` writes; paired with
 /// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
@@ -181,8 +426,12 @@ const OCI_GC_CANDIDATE_SCAN_LIMIT: i64 = 1000;
 /// `oci_blobs` row after, so a sweep firing in that window would delete an
 /// object the pusher is about to reference. That is the same hazard
 /// [`MIN_BLOB_AGE_SECS`] exists for, so it takes the same answer and the same
-/// value; `oci_gc_candidate_grace_matches_blob_grace` pins the two together.
-const OCI_GC_CANDIDATE_MIN_AGE_SQL: &str = "INTERVAL '24 hours'";
+/// value: the interval is bound from the service's configured minimum blob age,
+/// the very field the blob-GC scan binds, so a configured
+/// `BLOB_GC_MIN_AGE_SECS` (#2906) moves both windows together. The placeholder
+/// is `$2` in [`StorageGcService::select_oci_gc_candidates`].
+/// `configured_min_blob_age_governs_both_grace_windows` pins the two together.
+const OCI_GC_CANDIDATE_MIN_AGE_SQL: &str = "make_interval(secs => $2::BIGINT)";
 
 /// One `EXISTS (...)` arm of [`OCI_GC_CANDIDATE_REFERENCED_SQL`]: some row of
 /// `table` (aliased `t`) still references the candidate object when
@@ -521,6 +770,16 @@ pub struct OciBlobFootprintReport {
 pub struct StorageGcService {
     db: PgPool,
     storage_registry: Arc<StorageRegistry>,
+    /// Days a soft-deleted artifact stays restorable before GC may reclaim it
+    /// (#2072). `0`, the default from [`StorageGcService::new`], keeps the
+    /// historical behaviour: reclaimable on the next pass. Set from
+    /// `Config::gc_trash_retention_days` via
+    /// [`StorageGcService::with_trash_retention_days`].
+    trash_retention_days: u32,
+    /// Rows per keyset page of every candidate scan (#2524). Always
+    /// [`GC_CANDIDATE_PAGE_SIZE`] in production; tests shrink it to exercise
+    /// multi-page passes without seeding thousands of rows.
+    candidate_page_size: i64,
     /// Opt-in gate for [`StorageGcService::cleanup_orphan_maven_flat_objects`]
     /// (#3431). `false` — the default from [`StorageGcService::new`] — makes
     /// that sweep report-only. Set from `Config::maven_flat_gc_enabled` via
@@ -528,6 +787,11 @@ pub struct StorageGcService {
     /// entry point (scheduler + admin handlers), so an entry point that
     /// forgets to wire the flag fails SAFE.
     maven_flat_gc_enabled: bool,
+    /// Grace window (seconds) shielding both an unreferenced `oci_blobs` row
+    /// and a recorded OCI GC candidate from deletion (#1408, #3733). Defaults
+    /// to [`MIN_BLOB_AGE_SECS`]; set from `Config::blob_gc_min_age_secs` via
+    /// [`StorageGcService::with_min_blob_age_secs`] (#2906).
+    min_blob_age_secs: u64,
 }
 
 #[derive(Debug)]
@@ -656,10 +920,29 @@ impl StorageGcService {
         Self {
             db,
             storage_registry,
+            trash_retention_days: 0,
+            candidate_page_size: GC_CANDIDATE_PAGE_SIZE,
             // Fail safe: the orphan Maven flat-object sweep never deletes
             // until a caller explicitly opts in (#3431).
             maven_flat_gc_enabled: false,
+            min_blob_age_secs: MIN_BLOB_AGE_SECS,
         }
+    }
+
+    /// Override the minimum blob age (#2906, `BLOB_GC_MIN_AGE_SECS`). The
+    /// value is clamped by [`clamp_min_blob_age_secs`] and governs both the
+    /// unreferenced-blob scan and the OCI GC candidate sweep, which guard the
+    /// same push-time hazard and must not drift apart.
+    #[must_use]
+    pub fn with_min_blob_age_secs(mut self, secs: u64) -> Self {
+        self.min_blob_age_secs = clamp_min_blob_age_secs(secs);
+        self
+    }
+
+    /// The minimum blob age this service enforces, as the `BIGINT` both grace
+    /// windows bind. The clamp keeps it far below `i64::MAX`.
+    fn min_blob_age_bind(&self) -> i64 {
+        self.min_blob_age_secs as i64
     }
 
     /// Opt the orphaned row-less Maven flat-object sweep into live deletion
@@ -668,6 +951,24 @@ impl StorageGcService {
     #[must_use]
     pub fn with_maven_flat_gc_enabled(mut self, enabled: bool) -> Self {
         self.maven_flat_gc_enabled = enabled;
+        self
+    }
+
+    /// Keep soft-deleted artifacts restorable for `days` days before GC may
+    /// reclaim them (#2072, `GC_TRASH_RETENTION_DAYS`). Clamped by
+    /// [`clamp_trash_retention_days`]; `0` is the historical behaviour.
+    #[must_use]
+    pub fn with_trash_retention_days(mut self, days: u32) -> Self {
+        self.trash_retention_days = clamp_trash_retention_days(days);
+        self
+    }
+
+    /// Test seam: shrink the keyset page size so a handful of seeded rows
+    /// spans several pages (#2524).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_candidate_page_size(mut self, page_size: i64) -> Self {
+        self.candidate_page_size = page_size.max(1);
         self
     }
 
@@ -862,243 +1163,41 @@ impl StorageGcService {
         repo_scope: Option<Uuid>,
         dry_run: bool,
     ) -> Result<StorageGcResult> {
-        let orphans = self.select_orphans(repo_scope).await?;
-
         let mut result = empty_gc_result(dry_run);
 
-        if dry_run {
-            for row in &orphans {
-                let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
-                let count: i64 = row.try_get("artifact_count").unwrap_or(0);
-                accumulate_dry_run(&mut result, bytes, count);
-            }
-        } else {
-            for row in &orphans {
-                let storage_key: String = row.try_get("storage_key").unwrap_or_default();
-                let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
-                let storage_path: String = row.try_get("storage_path").unwrap_or_default();
-                let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
-                let count: i64 = row.try_get("artifact_count").unwrap_or(0);
-
-                // Resolve the correct storage backend for this repo
-                let location = StorageLocation {
-                    backend: storage_backend.clone(),
-                    path: storage_path.clone(),
-                };
-                let storage = match self.storage_for_location(&location) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        continue;
-                    }
-                };
-
-                // Begin a per-key transaction. The transaction holds row locks
-                // on the matching `artifacts` rows from `is_still_orphan`'s
-                // FOR UPDATE clause through the storage delete and the DB row
-                // deletes. Any writer trying to flip `is_deleted = false` or
-                // insert a new reference is blocked behind the lock.
-                let mut tx = match self.db.begin().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let msg = format_gc_error("begin gc tx", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        continue;
-                    }
-                };
-
-                // Re-verify the orphan predicate inside the tx, taking a row
-                // lock on the matching artifact rows. If a concurrent push has
-                // landed a live reference (`oci_tags`, `oci_blobs`,
-                // `oci_manifest_refs` parent re-tag, or a new live artifact
-                // sharing the key), this returns `false` and the GC pass
-                // skips the key to revisit on the next run.
-                match is_still_orphan(&mut tx, &storage_key, &storage_backend, &storage_path).await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = tx.rollback().await;
-                        tracing::debug!(
-                            storage_key = storage_key.as_str(),
-                            "GC skipped key: no longer orphan after row-lock re-check"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        let msg = format_gc_error("re-check orphan", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        continue;
-                    }
+        // Keyset-paged candidate selection (#2524): at most one page of
+        // orphan keys is held in memory at a time, and the cursor (the last
+        // key of the page) strictly advances, so a key that is skipped (no
+        // longer orphan, storage error) is not re-read in the same pass.
+        let mut cursor = OrphanKeyCursor::default();
+        let mut first_page = true;
+        loop {
+            let page = match self.select_orphans_page(repo_scope, &cursor).await {
+                Ok(page) => page,
+                Err(e) => {
+                    record_page_error(&mut result, first_page, "select orphan keys", e)?;
+                    break;
                 }
-
-                // Storage delete is not transactional, but it happens while
-                // the row lock is still held by `tx`. A racing pusher cannot
-                // begin re-using this storage key until we commit/rollback.
-                // An already-absent object is treated as success (#1660) so a
-                // retry after a crash mid-delete still reclaims the soft-deleted
-                // row instead of erroring every pass — matching the cloud
-                // backends' NotFound→Ok mapping.
-                //
-                // ...except for proxy-cache content, whose object is NOT this
-                // sweep's to reclaim (#3368). A soft-deleted `artifacts` row
-                // can carry a `proxy-cache/` key — legacy rows from before the
-                // proxy catalog was split out (#1278). The key is derived
-                // purely from `(repo_key, path)`, so the object such a row
-                // names is the SAME object a live `proxy_cache_artifacts` row
-                // points at, and this predicate never consults that catalog:
-                // deleting it would destroy a live cache entry and leave a
-                // dangling catalog row whose `size_bytes` only clears on the
-                // next fetch. Proxy-cache objects are reclaimed by
-                // `purge_repo_cache` and by TTL/lifecycle expiry.
-                //
-                // The stale `artifacts` ROW is still reclaimed below, which is
-                // the point of skipping only the delete rather than excluding
-                // the key from the candidate scan: the row is a redundant
-                // second reference to an object the proxy catalog owns, and
-                // leaving it behind would make these rows unreclaimable — the
-                // hard-delete here is the only reaper of soft-deleted
-                // `artifacts` rows in the codebase.
-                //
-                // It never mattered before because the delete was issued
-                // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
-                // or the per-repository filesystem root) and silently hit
-                // nothing. Anchoring the layout makes it land, which is why
-                // the guard has to be explicit now.
-                let is_cache_object =
-                    crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
-                if is_cache_object {
-                    tracing::debug!(
-                        storage_key = storage_key.as_str(),
-                        "GC reclaiming the stale artifacts row only; the object belongs to the \
-                         proxy cache catalog and is left for purge_repo_cache / lifecycle expiry"
-                    );
+            };
+            for row in &page {
+                if dry_run {
+                    let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
+                    let count: i64 = row.try_get("artifact_count").unwrap_or(0);
+                    accumulate_dry_run(&mut result, bytes, count);
                 } else {
-                    match storage.delete(&storage_key).await {
-                        Ok(()) | Err(AppError::NotFound(_)) => {}
-                        Err(e) => {
-                            let _ = tx.rollback().await;
-                            let msg =
-                                format_gc_error("delete storage key", &storage_key, &e.to_string());
-                            tracing::warn!("{}", msg);
-                            result.errors.push(msg);
-                            // Skip DB cleanup if storage delete fails
-                            continue;
-                        }
-                    }
-                }
-
-                // Delete promotion_approvals (no CASCADE on this FK)
-                if let Err(e) = sqlx::query(
-                    r#"
-                    DELETE FROM promotion_approvals
-                    WHERE artifact_id IN (
-                        SELECT id FROM artifacts
-                        WHERE storage_key = $1 AND is_deleted = true
-                    )
-                    "#,
-                )
-                .bind(&storage_key)
-                .execute(&mut *tx)
-                .await
-                {
-                    let _ = tx.rollback().await;
-                    let msg =
-                        format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-
-                // Hard-delete artifact records (cascades to child tables).
-                // `RETURNING` feeds the catalog prune below: this is the only
-                // reaper of soft-deleted `artifacts` rows, so it is the only
-                // place a `packages` / `package_versions` row may be removed
-                // (#3660) — a soft delete must stay restorable.
-                let purged: Vec<(uuid::Uuid, String)> = match sqlx::query_as(
-                    "DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true \
-                     RETURNING repository_id, checksum_sha256",
-                )
-                .bind(&storage_key)
-                .fetch_all(&mut *tx)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        let msg =
-                            format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        continue;
-                    }
-                };
-
-                // Drop the catalog rows the purged artifacts backed, so the
-                // Packages page's `total` stops counting rows whose bytes are
-                // gone for good. Best-effort: a prune failure must not strand
-                // the reclaim, and the read-path filter hides the row anyway.
-                for (repository_id, checksum) in &purged {
-                    if let Err(e) =
-                        crate::services::package_service::prune_catalog_for_purged_artifact(
-                            &mut tx,
-                            *repository_id,
-                            checksum,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            "GC could not prune catalog rows for {}: {}",
-                            storage_key,
-                            e
-                        );
-                    }
-                }
-
-                // Row-less Maven checksum sidecars (`.md5`, `.sha1`, ...) are
-                // written with no `artifacts` row of their own, so this sweep
-                // never enumerates them; reclaim them together with their base
-                // object or they leak on storage forever (#2668). A failure
-                // here rolls the key back: the base storage delete is already
-                // idempotent (NotFound => Ok), so the next pass retries the
-                // whole key and the invariant stays "a reclaimed Maven key
-                // takes its sidecars with it".
-                if let Err(e) = reclaim_maven_sidecars(
-                    &mut tx,
-                    storage.as_ref(),
-                    &storage_key,
-                    &storage_backend,
-                )
-                .await
-                {
-                    let _ = tx.rollback().await;
-                    let msg =
-                        format_gc_error("delete maven sidecars", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-
-                if let Err(e) = tx.commit().await {
-                    let msg = format_gc_error("commit gc tx", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-
-                if is_cache_object {
-                    // No object was deleted and no bytes were freed: only the
-                    // stale row went away. Counting it as a reclaimed storage
-                    // key would overstate what GC actually recovered.
-                    result.artifacts_removed += count;
-                } else {
-                    record_gc_success(&mut result, bytes, count);
+                    self.reclaim_orphan_key(row, &mut result).await;
                 }
             }
+            match continue_paging(
+                &page,
+                self.candidate_page_size,
+                OrphanKeyCursor::from_row,
+                &mut result,
+            ) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+            first_page = false;
         }
 
         // Run each OCI cleanup sweep independently so a failure in one does
@@ -1179,6 +1278,252 @@ impl StorageGcService {
         Ok(result)
     }
 
+    /// Reclaim one orphan-candidate storage key (#1180 locked re-check,
+    /// storage delete, row hard-delete), recording the outcome in `result`.
+    ///
+    /// Extracted from [`Self::run_gc_inner`] when candidate selection became
+    /// keyset-paged (#2524); the body is unchanged. The storage delete still
+    /// runs inside the per-key row-lock transaction: moving it out (the
+    /// tombstone/claim pattern the OCI cleanup-key sweep uses) is the separate
+    /// follow-up slice of #2524.
+    async fn reclaim_orphan_key(&self, row: &sqlx::postgres::PgRow, result: &mut StorageGcResult) {
+        let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+        let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
+        let storage_path: String = row.try_get("storage_path").unwrap_or_default();
+        let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
+        let count: i64 = row.try_get("artifact_count").unwrap_or(0);
+
+        // Resolve the correct storage backend for this repo
+        let location = StorageLocation {
+            backend: storage_backend.clone(),
+            path: storage_path.clone(),
+        };
+        let storage = match self.storage_for_location(&location) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        // Begin a per-key transaction. The transaction holds row locks
+        // on the matching `artifacts` rows from `is_still_orphan`'s
+        // FOR UPDATE clause through the storage delete and the DB row
+        // deletes. Any writer trying to flip `is_deleted = false` or
+        // insert a new reference is blocked behind the lock.
+        let mut tx = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format_gc_error("begin gc tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        // Re-verify the orphan predicate inside the tx, taking a row
+        // lock on the matching artifact rows. If a concurrent push has
+        // landed a live reference (`oci_tags`, `oci_blobs`,
+        // `oci_manifest_refs` parent re-tag, or a new live artifact
+        // sharing the key), this returns `false` and the GC pass
+        // skips the key to revisit on the next run.
+        match is_still_orphan(
+            &mut tx,
+            &storage_key,
+            &storage_backend,
+            &storage_path,
+            self.trash_retention_days,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                tracing::debug!(
+                    storage_key = storage_key.as_str(),
+                    "GC skipped key: no longer orphan after row-lock re-check"
+                );
+                return;
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("re-check orphan", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        }
+
+        // Storage delete is not transactional, but it happens while
+        // the row lock is still held by `tx`. A racing pusher cannot
+        // begin re-using this storage key until we commit/rollback.
+        // An already-absent object is treated as success (#1660) so a
+        // retry after a crash mid-delete still reclaims the soft-deleted
+        // row instead of erroring every pass — matching the cloud
+        // backends' NotFound→Ok mapping.
+        //
+        // ...except for proxy-cache content, whose object is NOT this
+        // sweep's to reclaim (#3368). A soft-deleted `artifacts` row
+        // can carry a `proxy-cache/` key — legacy rows from before the
+        // proxy catalog was split out (#1278). The key is derived
+        // purely from `(repo_key, path)`, so the object such a row
+        // names is the SAME object a live `proxy_cache_artifacts` row
+        // points at, and this predicate never consults that catalog:
+        // deleting it would destroy a live cache entry and leave a
+        // dangling catalog row whose `size_bytes` only clears on the
+        // next fetch. Proxy-cache objects are reclaimed by
+        // `purge_repo_cache` and by TTL/lifecycle expiry.
+        //
+        // The stale `artifacts` ROW is still reclaimed below, which is
+        // the point of skipping only the delete rather than excluding
+        // the key from the candidate scan: the row is a redundant
+        // second reference to an object the proxy catalog owns, and
+        // leaving it behind would make these rows unreclaimable — the
+        // hard-delete here is the only reaper of soft-deleted
+        // `artifacts` rows in the codebase.
+        //
+        // It never mattered before because the delete was issued
+        // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
+        // or the per-repository filesystem root) and silently hit
+        // nothing. Anchoring the layout makes it land, which is why
+        // the guard has to be explicit now.
+        let is_cache_object =
+            crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
+        if is_cache_object {
+            tracing::debug!(
+                storage_key = storage_key.as_str(),
+                "GC reclaiming the stale artifacts row only; the object belongs to the \
+                 proxy cache catalog and is left for purge_repo_cache / lifecycle expiry"
+            );
+        } else {
+            match storage.delete(&storage_key).await {
+                Ok(()) | Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error("delete storage key", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    // Skip DB cleanup if storage delete fails
+                    return;
+                }
+            }
+        }
+
+        // Delete promotion_approvals (no CASCADE on this FK)
+        if let Err(e) = sqlx::query(
+            r#"
+            DELETE FROM promotion_approvals
+            WHERE artifact_id IN (
+                SELECT a.id FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.storage_key = $1 AND a.is_deleted = true
+                  AND r.storage_backend = $2
+                  AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3)
+            )
+            "#,
+        )
+        .bind(&storage_key)
+        .bind(&storage_backend)
+        .bind(&storage_path)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let msg = format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        // Hard-delete artifact records (cascades to child tables).
+        // `RETURNING` feeds the catalog prune below: this is the only
+        // reaper of soft-deleted `artifacts` rows, so it is the only
+        // place a `packages` / `package_versions` row may be removed
+        // (#3660) — a soft delete must stay restorable.
+        //
+        // Both deletes are scoped exactly like `is_still_orphan`'s lock and
+        // re-check (same backend; same `storage_path` on filesystem). Keys are
+        // content-addressed, so another scope can hold a row with this key
+        // that was never locked or re-checked here: a trashed row still
+        // inside its retention window, or one whose own object lives under a
+        // different filesystem root. Deleting it would empty that scope's
+        // trash entry and strand its object with no row (#2072).
+        let purged: Vec<(uuid::Uuid, String)> = match sqlx::query_as(
+            "DELETE FROM artifacts a USING repositories r \
+             WHERE r.id = a.repository_id AND a.storage_key = $1 AND a.is_deleted = true \
+               AND r.storage_backend = $2 \
+               AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3) \
+             RETURNING a.repository_id, a.checksum_sha256",
+        )
+        .bind(&storage_key)
+        .bind(&storage_backend)
+        .bind(&storage_path)
+        .fetch_all(&mut *tx)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        // Drop the catalog rows the purged artifacts backed, so the
+        // Packages page's `total` stops counting rows whose bytes are
+        // gone for good. Best-effort: a prune failure must not strand
+        // the reclaim, and the read-path filter hides the row anyway.
+        for (repository_id, checksum) in &purged {
+            if let Err(e) = crate::services::package_service::prune_catalog_for_purged_artifact(
+                &mut tx,
+                *repository_id,
+                checksum,
+            )
+            .await
+            {
+                tracing::warn!("GC could not prune catalog rows for {}: {}", storage_key, e);
+            }
+        }
+
+        // Row-less Maven checksum sidecars (`.md5`, `.sha1`, ...) are
+        // written with no `artifacts` row of their own, so this sweep
+        // never enumerates them; reclaim them together with their base
+        // object or they leak on storage forever (#2668). A failure
+        // here rolls the key back: the base storage delete is already
+        // idempotent (NotFound => Ok), so the next pass retries the
+        // whole key and the invariant stays "a reclaimed Maven key
+        // takes its sidecars with it".
+        if let Err(e) =
+            reclaim_maven_sidecars(&mut tx, storage.as_ref(), &storage_key, &storage_backend).await
+        {
+            let _ = tx.rollback().await;
+            let msg = format_gc_error("delete maven sidecars", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        if let Err(e) = tx.commit().await {
+            let msg = format_gc_error("commit gc tx", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        if is_cache_object {
+            // No object was deleted and no bytes were freed: only the
+            // stale row went away. Counting it as a reclaimed storage
+            // key would overstate what GC actually recovered.
+            result.artifacts_removed += count;
+        } else {
+            record_gc_success(result, bytes, count);
+        }
+    }
+
     /// Reclaim OCI blob layers that no live manifest references (#1408).
     ///
     /// Deletion design originated in #1409; this rebuilds it on top of the
@@ -1199,7 +1544,8 @@ impl StorageGcService {
     /// file per repo and orphan-ness is scoped to the same `storage_path`.
     /// This mirrors the cloud/filesystem branch of `ORPHAN_PREDICATE_SQL`.
     ///
-    /// Grace period (`MIN_BLOB_AGE_SECS`) shields in-flight pushes: a
+    /// Grace period (`MIN_BLOB_AGE_SECS` by default, `BLOB_GC_MIN_AGE_SECS`
+    /// when configured, #2906) shields in-flight pushes: a
     /// client first uploads blobs, then PUTs the manifest, which writes the
     /// matching `manifest_blob_refs` rows. Between those two steps the blob
     /// is "orphan" in the strict sense; skipping rows younger than the
@@ -1290,119 +1636,7 @@ impl StorageGcService {
             }
         }
 
-        let orphans = self.select_orphan_blobs().await?;
-
-        let mut result = empty_gc_result(dry_run);
-
-        if dry_run {
-            for row in &orphans {
-                let digest: String = row.try_get("digest").unwrap_or_default();
-                let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
-                tracing::info!(
-                    digest = digest.as_str(),
-                    size_bytes = bytes,
-                    "Blob GC (dry-run): would mark orphan blob for deletion"
-                );
-                accumulate_dry_run(&mut result, bytes, 1);
-            }
-            return Ok(result);
-        }
-
-        for row in &orphans {
-            let digest: String = row.try_get("digest").unwrap_or_default();
-            let storage_key: String = row.try_get("storage_key").unwrap_or_default();
-            let repository_id: Uuid = match row.try_get("repository_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format_gc_error("read repo id", &digest, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-            let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
-
-            let mut tx = match self.db.begin().await {
-                Ok(t) => t,
-                Err(e) => {
-                    let msg =
-                        format_gc_error("begin blob gc mark tx", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            // Re-check orphan-ness under the per-row `FOR UPDATE` lock so a
-            // concurrent push that just referenced this blob is observed and
-            // the blob is not marked (mark phase ignores the marker itself).
-            match is_blob_still_orphan(&mut tx, repository_id, &digest, false).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = tx.rollback().await;
-                    tracing::debug!(
-                        digest = digest.as_str(),
-                        "Blob GC mark skipped digest: no longer orphan after row-lock re-check"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    let msg = format_gc_error("re-check blob orphan", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            }
-
-            // Stamp the marker while still holding the lock. No storage I/O.
-            // `pending_delete_at IS NULL` keeps an existing (earlier) mark's
-            // timestamp untouched, so the sweep grace is always measured from
-            // the FIRST mark and a re-mark affects zero rows — we only count /
-            // log a blob that was NEWLY marked this pass.
-            let newly_marked = match sqlx::query(
-                r#"
-                UPDATE oci_blobs
-                SET pending_delete_at = NOW()
-                WHERE repository_id = $1
-                  AND digest = $2
-                  AND pending_delete_at IS NULL
-                "#,
-            )
-            .bind(repository_id)
-            .bind(&digest)
-            .execute(&mut *tx)
-            .await
-            {
-                Ok(res) => res.rows_affected() > 0,
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    let msg =
-                        format_gc_error("mark blob pending delete", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            if let Err(e) = tx.commit().await {
-                let msg = format_gc_error("commit blob gc mark tx", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
-
-            if newly_marked {
-                tracing::debug!(
-                    digest = digest.as_str(),
-                    size_bytes = bytes,
-                    "Blob GC: marked orphan blob pending deletion"
-                );
-                record_gc_success(&mut result, bytes, 1);
-            }
-        }
-
-        Ok(result)
+        self.run_blob_gc_phase(BlobGcPhase::Mark, dry_run).await
     }
 
     /// Phase B of two-phase blob GC — **sweep**. Deletes blobs marked
@@ -1432,146 +1666,18 @@ impl StorageGcService {
         dry_run: bool,
         sweep_grace_secs: i64,
     ) -> Result<StorageGcResult> {
-        let pending = self.select_pending_delete_blobs(sweep_grace_secs).await?;
-
-        let mut result = empty_gc_result(dry_run);
-
-        if dry_run {
-            for row in &pending {
-                let digest: String = row.try_get("digest").unwrap_or_default();
-                let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
-                tracing::info!(
-                    digest = digest.as_str(),
-                    size_bytes = bytes,
-                    "Blob GC (dry-run): would sweep marked orphan blob"
-                );
-                accumulate_dry_run(&mut result, bytes, 1);
-            }
-            return Ok(result);
-        }
-
-        for row in &pending {
-            let digest: String = row.try_get("digest").unwrap_or_default();
-            let storage_key: String = row.try_get("storage_key").unwrap_or_default();
-            let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
-            let storage_path: String = row.try_get("storage_path").unwrap_or_default();
-            let repository_id: Uuid = match row.try_get("repository_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format_gc_error("read repo id", &digest, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-            let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
-
-            let location = StorageLocation {
-                backend: storage_backend.clone(),
-                path: storage_path.clone(),
-            };
-            let storage = match self.storage_for_location(&location) {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            let mut tx = match self.db.begin().await {
-                Ok(t) => t,
-                Err(e) => {
-                    let msg =
-                        format_gc_error("begin blob gc sweep tx", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            // Re-check UNDER the lock that the blob is still marked AND still
-            // orphan. `require_pending = true` makes a blob whose marker a
-            // concurrent push cleared (resurrection) fail the check, so the
-            // sweep skips it and the now-live blob survives.
-            match is_blob_still_orphan(&mut tx, repository_id, &digest, true).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = tx.rollback().await;
-                    tracing::debug!(
-                        digest = digest.as_str(),
-                        "Blob GC sweep skipped digest: resurrected or no longer orphan after \
-                         row-lock re-check"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    let msg = format_gc_error("re-check blob sweep", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            }
-
-            // Storage delete first, still under the row lock. Deleting an
-            // already-absent object is success (#1660): a retry after a crash
-            // between this delete and the row delete must reclaim the marked
-            // orphan, not roll back forever and leak it. The cloud backends
-            // already map NotFound to Ok (s3.rs, gcs.rs, azure.rs); the
-            // filesystem backend returns NotFound, so tolerate it here too.
-            match storage.delete(&storage_key).await {
-                Ok(()) | Err(AppError::NotFound(_)) => {}
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    let msg = format_gc_error("delete blob storage", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            }
-
-            // Delete only while still marked: belt-and-suspenders against ever
-            // removing a resurrected (un-marked) row. We hold the lock and the
-            // re-check already proved the marker is set, so this always
-            // matches here; it also makes the DELETE self-documenting.
-            if let Err(e) = sqlx::query(
-                "DELETE FROM oci_blobs \
-                 WHERE repository_id = $1 AND digest = $2 AND pending_delete_at IS NOT NULL",
+        let result = self
+            .run_blob_gc_phase(
+                BlobGcPhase::Sweep {
+                    grace_secs: sweep_grace_secs,
+                },
+                dry_run,
             )
-            .bind(repository_id)
-            .bind(&digest)
-            .execute(&mut *tx)
-            .await
-            {
-                let _ = tx.rollback().await;
-                let msg = format_gc_error("delete oci_blobs row", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
+            .await?;
 
-            if let Err(e) = tx.commit().await {
-                let msg = format_gc_error("commit blob gc sweep tx", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
-
-            // Audit log: every committed blob deletion is recorded with its
-            // digest and freed bytes. Blob deletion is irreversible, so this
-            // trail is the operator's record of exactly what GC reclaimed.
-            tracing::info!(
-                digest = digest.as_str(),
-                size_bytes = bytes,
-                storage_key = storage_key.as_str(),
-                "Blob GC: swept marked orphan blob"
-            );
-            record_gc_success(&mut result, bytes, 1);
-        }
-
-        if result.storage_keys_deleted > 0 {
+        // Live passes only: a dry run's counters are "would sweep", which the
+        // scheduler already reports as such.
+        if !result.dry_run && result.storage_keys_deleted > 0 {
             tracing::info!(
                 "Blob GC: swept {} blob objects, freed {} bytes",
                 result.storage_keys_deleted,
@@ -1580,6 +1686,291 @@ impl StorageGcService {
         }
 
         Ok(result)
+    }
+
+    /// Shared keyset-paged driver for both blob-GC phases (#2524): walks the
+    /// phase's candidate set one page at a time (at most
+    /// `candidate_page_size` rows in memory), reporting each candidate on a
+    /// dry run and otherwise handing it to the phase's per-row step, which
+    /// keeps its own row-lock re-check exactly as before.
+    async fn run_blob_gc_phase(
+        &self,
+        phase: BlobGcPhase,
+        dry_run: bool,
+    ) -> Result<StorageGcResult> {
+        let mut result = empty_gc_result(dry_run);
+        let mut cursor = BlobCursor::default();
+        let mut first_page = true;
+        loop {
+            let page = match self.select_blob_phase_page(phase, &cursor).await {
+                Ok(page) => page,
+                Err(e) => {
+                    record_page_error(&mut result, first_page, phase.select_label(), e)?;
+                    break;
+                }
+            };
+            for row in &page {
+                if dry_run {
+                    let digest: String = row.try_get("digest").unwrap_or_default();
+                    let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+                    tracing::info!(
+                        digest = digest.as_str(),
+                        size_bytes = bytes,
+                        "{}",
+                        phase.dry_run_message()
+                    );
+                    accumulate_dry_run(&mut result, bytes, 1);
+                    continue;
+                }
+                match phase {
+                    BlobGcPhase::Mark => self.mark_orphan_blob(row, &mut result).await,
+                    BlobGcPhase::Sweep { .. } => self.sweep_marked_blob(row, &mut result).await,
+                }
+            }
+            match continue_paging(
+                &page,
+                self.candidate_page_size,
+                BlobCursor::from_row,
+                &mut result,
+            ) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+            first_page = false;
+        }
+        Ok(result)
+    }
+
+    /// One keyset page of the candidate set for `phase` (#2524).
+    async fn select_blob_phase_page(
+        &self,
+        phase: BlobGcPhase,
+        after: &BlobCursor,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        match phase {
+            BlobGcPhase::Mark => self.select_orphan_blobs(after).await,
+            BlobGcPhase::Sweep { grace_secs } => {
+                self.select_pending_delete_blobs(grace_secs, after).await
+            }
+        }
+    }
+
+    /// Phase A per-row step: re-check one candidate under its `FOR UPDATE`
+    /// row lock and stamp `pending_delete_at` (see [`Self::run_blob_gc_mark`]).
+    async fn mark_orphan_blob(&self, row: &sqlx::postgres::PgRow, result: &mut StorageGcResult) {
+        let digest: String = row.try_get("digest").unwrap_or_default();
+        let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+        let repository_id: Uuid = match row.try_get("repository_id") {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format_gc_error("read repo id", &digest, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+        let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+
+        let mut tx = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format_gc_error("begin blob gc mark tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        // Re-check orphan-ness under the per-row `FOR UPDATE` lock so a
+        // concurrent push that just referenced this blob is observed and
+        // the blob is not marked (mark phase ignores the marker itself).
+        match is_blob_still_orphan(&mut tx, repository_id, &digest, false).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                tracing::debug!(
+                    digest = digest.as_str(),
+                    "Blob GC mark skipped digest: no longer orphan after row-lock re-check"
+                );
+                return;
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("re-check blob orphan", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        }
+
+        // Stamp the marker while still holding the lock. No storage I/O.
+        // `pending_delete_at IS NULL` keeps an existing (earlier) mark's
+        // timestamp untouched, so the sweep grace is always measured from
+        // the FIRST mark and a re-mark affects zero rows — we only count /
+        // log a blob that was NEWLY marked this pass.
+        let newly_marked = match sqlx::query(
+            r#"
+            UPDATE oci_blobs
+            SET pending_delete_at = NOW()
+            WHERE repository_id = $1
+              AND digest = $2
+              AND pending_delete_at IS NULL
+            "#,
+        )
+        .bind(repository_id)
+        .bind(&digest)
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(res) => res.rows_affected() > 0,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("mark blob pending delete", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        if let Err(e) = tx.commit().await {
+            let msg = format_gc_error("commit blob gc mark tx", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        if newly_marked {
+            tracing::debug!(
+                digest = digest.as_str(),
+                size_bytes = bytes,
+                "Blob GC: marked orphan blob pending deletion"
+            );
+            record_gc_success(result, bytes, 1);
+        }
+    }
+
+    /// Phase B per-row step: re-check one marked candidate under its
+    /// `FOR UPDATE` row lock, delete its object, then its row (see
+    /// [`Self::run_blob_gc_sweep`]). The storage delete still runs under the
+    /// row lock; moving it out is the separate follow-up slice of #2524.
+    async fn sweep_marked_blob(&self, row: &sqlx::postgres::PgRow, result: &mut StorageGcResult) {
+        let digest: String = row.try_get("digest").unwrap_or_default();
+        let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+        let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
+        let storage_path: String = row.try_get("storage_path").unwrap_or_default();
+        let repository_id: Uuid = match row.try_get("repository_id") {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format_gc_error("read repo id", &digest, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+        let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+
+        let location = StorageLocation {
+            backend: storage_backend.clone(),
+            path: storage_path.clone(),
+        };
+        let storage = match self.storage_for_location(&location) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        let mut tx = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format_gc_error("begin blob gc sweep tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        };
+
+        // Re-check UNDER the lock that the blob is still marked AND still
+        // orphan. `require_pending = true` makes a blob whose marker a
+        // concurrent push cleared (resurrection) fail the check, so the
+        // sweep skips it and the now-live blob survives.
+        match is_blob_still_orphan(&mut tx, repository_id, &digest, true).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                tracing::debug!(
+                    digest = digest.as_str(),
+                    "Blob GC sweep skipped digest: resurrected or no longer orphan after \
+                     row-lock re-check"
+                );
+                return;
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("re-check blob sweep", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        }
+
+        // Storage delete first, still under the row lock. Deleting an
+        // already-absent object is success (#1660): a retry after a crash
+        // between this delete and the row delete must reclaim the marked
+        // orphan, not roll back forever and leak it. The cloud backends
+        // already map NotFound to Ok (s3.rs, gcs.rs, azure.rs); the
+        // filesystem backend returns NotFound, so tolerate it here too.
+        match storage.delete(&storage_key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("delete blob storage", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                return;
+            }
+        }
+
+        // Delete only while still marked: belt-and-suspenders against ever
+        // removing a resurrected (un-marked) row. We hold the lock and the
+        // re-check already proved the marker is set, so this always
+        // matches here; it also makes the DELETE self-documenting.
+        if let Err(e) = sqlx::query(
+            "DELETE FROM oci_blobs \
+             WHERE repository_id = $1 AND digest = $2 AND pending_delete_at IS NOT NULL",
+        )
+        .bind(repository_id)
+        .bind(&digest)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let msg = format_gc_error("delete oci_blobs row", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        if let Err(e) = tx.commit().await {
+            let msg = format_gc_error("commit blob gc sweep tx", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        // Audit log: every committed blob deletion is recorded with its
+        // digest and freed bytes. Blob deletion is irreversible, so this
+        // trail is the operator's record of exactly what GC reclaimed.
+        tracing::info!(
+            digest = digest.as_str(),
+            size_bytes = bytes,
+            storage_key = storage_key.as_str(),
+            "Blob GC: swept marked orphan blob"
+        );
+        record_gc_success(result, bytes, 1);
     }
 
     /// Delete `manifest_blob_refs` rows whose manifest is no longer live, so
@@ -1624,27 +2015,11 @@ impl StorageGcService {
     /// the shared bucket; filesystem protects only within the same
     /// `storage_path`). The grace period is the only safeguard against the
     /// push-time race described on [`Self::run_blob_gc`].
-    async fn select_orphan_blobs(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
-        let sql = format!(
-            r#"
-            SELECT ob.repository_id,
-                   ob.digest,
-                   ob.size_bytes,
-                   ob.storage_key,
-                   r.storage_backend,
-                   r.storage_path
-            FROM oci_blobs ob
-            JOIN repositories r ON r.id = ob.repository_id
-            WHERE ob.created_at < NOW() - make_interval(secs => $1::BIGINT)
-              AND NOT {protected}
-            "#,
-            protected = BLOB_PROTECTED_BY_REFS_SQL,
-        );
-        sqlx::query(sqlx::AssertSqlSafe(&*sql))
-            .bind(MIN_BLOB_AGE_SECS as i64)
-            .fetch_all(&self.db)
+    async fn select_orphan_blobs(&self, after: &BlobCursor) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let sql =
+            blob_candidate_page_sql("ob.created_at < NOW() - make_interval(secs => $1::BIGINT)");
+        self.fetch_blob_candidate_page(&sql, self.min_blob_age_bind(), after)
             .await
-            .map_err(|e| crate::error::AppError::Database(e.to_string()))
     }
 
     /// Phase B selection: `oci_blobs` rows marked `pending_delete_at` at least
@@ -1660,40 +2035,48 @@ impl StorageGcService {
     async fn select_pending_delete_blobs(
         &self,
         sweep_grace_secs: i64,
+        after: &BlobCursor,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        let sql = format!(
-            r#"
-            SELECT ob.repository_id,
-                   ob.digest,
-                   ob.size_bytes,
-                   ob.storage_key,
-                   r.storage_backend,
-                   r.storage_path
-            FROM oci_blobs ob
-            JOIN repositories r ON r.id = ob.repository_id
-            WHERE ob.pending_delete_at IS NOT NULL
-              AND ob.pending_delete_at < NOW() - make_interval(secs => $1::BIGINT)
-              AND NOT {protected}
-            "#,
-            protected = BLOB_PROTECTED_BY_REFS_SQL,
+        let sql = blob_candidate_page_sql(
+            "ob.pending_delete_at IS NOT NULL \
+             AND ob.pending_delete_at < NOW() - make_interval(secs => $1::BIGINT)",
         );
-        sqlx::query(sqlx::AssertSqlSafe(&*sql))
-            .bind(sweep_grace_secs)
+        self.fetch_blob_candidate_page(&sql, sweep_grace_secs, after)
+            .await
+    }
+
+    /// Run one blob-candidate keyset page built by [`blob_candidate_page_sql`]:
+    /// `$1` is the phase's age/grace seconds, `$2`/`$3` the cursor, `$4` the
+    /// page size (#2524).
+    async fn fetch_blob_candidate_page(
+        &self,
+        sql: &str,
+        age_secs: i64,
+        after: &BlobCursor,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(age_secs)
+            .bind(after.repository_id)
+            .bind(&after.digest)
+            .bind(self.candidate_page_size)
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
     }
 
-    /// Initial scan that lists candidate orphan storage keys.
+    /// One keyset page (at most `candidate_page_size` groups, #2524) of the
+    /// initial scan that lists candidate orphan storage keys, resuming
+    /// strictly after `after` ([`OrphanKeyCursor::default`] for the first page).
     ///
-    /// This is a snapshot of the orphan set at one point in time. Each
+    /// Each page is a snapshot of the orphan set at one point in time. Each
     /// candidate is re-checked under a row-level lock by
     /// [`is_still_orphan`] before deletion so that pushes landing between
     /// this scan and the per-key delete cannot get their references
     /// silently dropped (#1180).
     ///
     /// Visibility is `pub(crate)` so that unit tests in the same crate can
-    /// inspect the candidate set per-storage-key. The dry-run regression
+    /// inspect the candidate set per-storage-key (through the test-only
+    /// [`Self::select_orphans`], which walks every page). The dry-run regression
     /// tests (#1490 / #1493) cannot assert on the global
     /// `storage_keys_deleted` counter because concurrent integration tests
     /// share the same Postgres database, and a peer test's in-flight
@@ -1703,10 +2086,20 @@ impl StorageGcService {
     /// owned by that repository (web #708); the orphan predicate itself stays
     /// instance-wide, so a scoped scan can only ever *narrow* the candidate
     /// set, never admit a key the instance-wide scan would protect.
-    pub(crate) async fn select_orphans(
+    pub(crate) async fn select_orphans_page(
         &self,
         repo_scope: Option<Uuid>,
+        after: &OrphanKeyCursor,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        // Keyset page (#2524): groups are ordered by their full group key and
+        // the page resumes strictly after `after`, so memory is bounded by the
+        // page size however large the orphan set is. The row-value comparison
+        // and the ORDER BY use the same collation, so no group is skipped or
+        // repeated between pages. The redundant `a.storage_key >= $1` is
+        // implied by the row comparison but, unlike it, is a single-column
+        // condition the planner can push into `idx_artifacts_storage_key`
+        // (migration 157), so each page range-scans from the cursor instead
+        // of re-filtering every soft-deleted row.
         let sql = format!(
             r#"
             SELECT a.storage_key, r.storage_backend, r.storage_path,
@@ -1715,13 +2108,21 @@ impl StorageGcService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE {predicate}
+              AND a.storage_key >= $1
+              AND (a.storage_key, r.storage_backend, r.storage_path) > ($1, $2, $3)
               {scope}
             GROUP BY a.storage_key, r.storage_backend, r.storage_path
+            ORDER BY a.storage_key, r.storage_backend, r.storage_path
+            LIMIT $4
             "#,
-            predicate = ORPHAN_PREDICATE_SQL,
-            scope = repo_scope_clause("a.repository_id", 1, repo_scope),
+            predicate = orphan_predicate_sql(self.trash_retention_days),
+            scope = repo_scope_clause("a.repository_id", 5, repo_scope),
         );
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql));
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(&after.storage_key)
+            .bind(&after.storage_backend)
+            .bind(&after.storage_path)
+            .bind(self.candidate_page_size);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -1729,6 +2130,27 @@ impl StorageGcService {
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
+    }
+
+    /// Every orphan candidate, walking all keyset pages. Test-only: the
+    /// production sweep consumes one page at a time (#2524), but the dry-run
+    /// regression tests assert on the whole candidate set per storage key.
+    #[cfg(test)]
+    pub(crate) async fn select_orphans(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let mut all = Vec::new();
+        let mut cursor = OrphanKeyCursor::default();
+        loop {
+            let page = self.select_orphans_page(repo_scope, &cursor).await?;
+            let next = next_page_cursor(&page, self.candidate_page_size, OrphanKeyCursor::from_row);
+            all.extend(page);
+            match next {
+                Some(c) => cursor = c,
+                None => return Ok(all),
+            }
+        }
     }
 
     /// Build the read-only OCI blob footprint report (issue #1408).
@@ -3148,6 +3570,7 @@ impl StorageGcService {
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_GC_CANDIDATE_SCAN_LIMIT)
+            .bind(self.min_blob_age_bind())
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -3624,6 +4047,7 @@ async fn is_still_orphan(
     storage_key: &str,
     storage_backend: &str,
     storage_path: &str,
+    trash_retention_days: u32,
 ) -> sqlx::Result<bool> {
     // Step 1: acquire row locks. We do not care about the returned
     // rows; we just need them locked for the rest of the transaction.
@@ -3668,7 +4092,7 @@ async fn is_still_orphan(
             OR r.storage_path = $3
           )
         "#,
-        predicate = ORPHAN_PREDICATE_SQL,
+        predicate = orphan_predicate_sql(trash_retention_days),
     );
 
     let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
@@ -4202,13 +4626,131 @@ mod tests {
     /// The candidate sweep's grace window and the blob GC's must stay the same
     /// value: they exist for the same hazard (an object written before the row
     /// that references it), so a change to one that skips the other would
-    /// silently make this sweep the riskier of the two.
+    /// silently make this sweep the riskier of the two. Since #2906 both bind
+    /// one configurable value; this pins the default and the SQL spelling, and
+    /// `configured_min_blob_age_governs_both_grace_windows` pins the behaviour.
     #[test]
     fn oci_gc_candidate_grace_matches_blob_grace() {
         assert_eq!(MIN_BLOB_AGE_SECS, 24 * 60 * 60);
         assert_eq!(
-            OCI_GC_CANDIDATE_MIN_AGE_SQL, "INTERVAL '24 hours'",
-            "the SQL interval must spell MIN_BLOB_AGE_SECS; Postgres cannot read the Rust constant"
+            OCI_GC_CANDIDATE_MIN_AGE_SQL, "make_interval(secs => $2::BIGINT)",
+            "the candidate interval must be bound from the configured minimum blob age, \
+             not spelled as a literal that a BLOB_GC_MIN_AGE_SECS override would miss"
+        );
+    }
+
+    /// #2906: the operator knob is clamped into a sane corridor, and the
+    /// default sits inside it unchanged.
+    #[test]
+    fn min_blob_age_clamp_bounds() {
+        assert_eq!(clamp_min_blob_age_secs(0), MIN_BLOB_AGE_FLOOR_SECS);
+        assert_eq!(clamp_min_blob_age_secs(59), 60);
+        assert_eq!(clamp_min_blob_age_secs(60), 60);
+        assert_eq!(clamp_min_blob_age_secs(3600), 3600);
+        assert_eq!(
+            clamp_min_blob_age_secs(MIN_BLOB_AGE_SECS),
+            MIN_BLOB_AGE_SECS
+        );
+        assert_eq!(clamp_min_blob_age_secs(u64::MAX), MIN_BLOB_AGE_CEILING_SECS);
+        // A recommended floor above the hard floor, both under the default.
+        const _: () = assert!(MIN_BLOB_AGE_FLOOR_SECS < MIN_BLOB_AGE_RECOMMENDED_SECS);
+        const _: () = assert!(MIN_BLOB_AGE_RECOMMENDED_SECS <= MIN_BLOB_AGE_SECS);
+    }
+
+    /// #2906: a configured minimum blob age moves BOTH grace windows: the
+    /// unreferenced-`oci_blobs` scan (mark phase input) and the recorded OCI GC
+    /// candidate scan. A two-hour-old orphan blob and a two-hour-old candidate
+    /// are shielded by the 24h default and eligible under a 1h override.
+    #[tokio::test]
+    async fn configured_min_blob_age_governs_both_grace_windows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!("sha256:{}", Uuid::new_v4().simple().to_string().repeat(2));
+        let blob_key = format!("{OCI_BLOB_STORAGE_PREFIX}{digest}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, created_at) \
+             VALUES ($1, $2, 1, $3, NOW() - INTERVAL '2 hours')",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert two-hour-old orphan blob");
+        let candidate_key = format!(
+            "{OCI_BLOB_STORAGE_PREFIX}sha256:{}",
+            Uuid::new_v4().simple()
+        );
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path, recorded_at) \
+             VALUES ($1, 'filesystem', $2, NOW() - INTERVAL '2 hours')",
+        )
+        .bind(&candidate_key)
+        .bind(fx.storage_dir.to_string_lossy().to_string())
+        .execute(&fx.pool)
+        .await
+        .expect("insert two-hour-old OCI GC candidate");
+
+        let sees = |service: StorageGcService| {
+            let digest = digest.clone();
+            let candidate_key = candidate_key.clone();
+            async move {
+                // select_orphan_blobs is keyset-paged (#2524): walk every page
+                // so the answer does not depend on how many other orphans the
+                // shared test DB holds.
+                let mut blob = false;
+                let mut cursor = BlobCursor::default();
+                loop {
+                    let page = service
+                        .select_orphan_blobs(&cursor)
+                        .await
+                        .expect("orphan blob scan");
+                    if page
+                        .iter()
+                        .any(|r| r.try_get::<String, _>("digest").ok().as_deref() == Some(&digest))
+                    {
+                        blob = true;
+                        break;
+                    }
+                    match next_page_cursor(&page, service.candidate_page_size, BlobCursor::from_row)
+                    {
+                        Some(next) => cursor = next,
+                        None => break,
+                    }
+                }
+                let candidate = service
+                    .select_oci_gc_candidates()
+                    .await
+                    .expect("candidate scan")
+                    .iter()
+                    .any(|c| c.storage_key() == candidate_key);
+                (blob, candidate)
+            }
+        };
+        let registry = fx.state.storage_registry.clone();
+        let default_view = sees(StorageGcService::new(fx.pool.clone(), registry.clone())).await;
+        let configured_view =
+            sees(StorageGcService::new(fx.pool.clone(), registry).with_min_blob_age_secs(3600))
+                .await;
+
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&candidate_key)
+            .execute(&fx.pool)
+            .await
+            .expect("remove test candidate");
+        fx.teardown().await;
+
+        assert_eq!(
+            default_view,
+            (false, false),
+            "the 24h default must shield a two-hour-old blob and candidate"
+        );
+        assert_eq!(
+            configured_view,
+            (true, true),
+            "a 1h BLOB_GC_MIN_AGE_SECS must expose both to GC, together"
         );
     }
 
@@ -11182,5 +11724,492 @@ mod tests {
             .await;
         repo_b.teardown().await;
         repo_a.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2524: keyset-paged GC candidate selection
+    // #2072: trash retention (GC_TRASH_RETENTION_DAYS + artifacts.deleted_at)
+    // -----------------------------------------------------------------------
+
+    /// #2072: retention 0 (the default) must leave the orphan predicate
+    /// byte-for-byte as it was, so an upgrade reclaims exactly what it did.
+    #[tokio::test]
+    async fn trash_retention_zero_leaves_orphan_predicate_unchanged_2072() {
+        assert_eq!(trash_retention_clause(0), "");
+        assert_eq!(orphan_predicate_sql(0), ORPHAN_PREDICATE_SQL);
+        assert_eq!(make_service("filesystem").trash_retention_days, 0);
+    }
+
+    #[test]
+    fn trash_retention_clause_treats_unknown_deletion_time_as_expired_2072() {
+        let clause = trash_retention_clause(30);
+        assert!(clause.contains("make_interval(days => 30)"), "{clause}");
+        assert!(
+            clause.contains("a.deleted_at IS NULL OR"),
+            "rows trashed before migration 261 must stay reclaimable: {clause}"
+        );
+        assert!(orphan_predicate_sql(30).starts_with(ORPHAN_PREDICATE_SQL));
+    }
+
+    #[tokio::test]
+    async fn trash_retention_days_are_clamped_2072() {
+        assert_eq!(clamp_trash_retention_days(0), 0);
+        assert_eq!(clamp_trash_retention_days(60), 60);
+        assert_eq!(
+            clamp_trash_retention_days(u32::MAX),
+            MAX_TRASH_RETENTION_DAYS
+        );
+        assert!(trash_retention_clause(u32::MAX).contains("days => 3650)"));
+        let service = make_service("filesystem").with_trash_retention_days(u32::MAX);
+        assert_eq!(service.trash_retention_days, MAX_TRASH_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn next_page_cursor_continues_only_after_a_full_decodable_page_2524() {
+        let decode = |v: &i32| (*v >= 0).then_some(*v);
+        assert_eq!(next_page_cursor::<i32, i32>(&[], 2, decode), None);
+        assert_eq!(
+            next_page_cursor(&[1], 2, decode),
+            None,
+            "short page is last"
+        );
+        assert_eq!(next_page_cursor(&[1, 2], 2, decode), Some(2));
+        assert_eq!(
+            next_page_cursor(&[1, -1], 2, decode),
+            None,
+            "an undecodable last row must stop paging, not restart it"
+        );
+    }
+
+    #[test]
+    fn continue_paging_reports_an_undecodable_full_page_2524() {
+        let decode = |v: &i32| (*v >= 0).then_some(*v);
+        let mut result = empty_gc_result(false);
+        assert_eq!(continue_paging(&[1], 2, decode, &mut result), None);
+        assert_eq!(continue_paging(&[1, 2], 2, decode, &mut result), Some(2));
+        assert!(result.errors.is_empty(), "normal paging records nothing");
+        assert_eq!(continue_paging(&[1, -1], 2, decode, &mut result), None);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("decode page cursor"));
+    }
+
+    #[test]
+    fn record_page_error_propagates_first_page_and_keeps_later_work_2524() {
+        let mut result = empty_gc_result(false);
+        let err = record_page_error(
+            &mut result,
+            true,
+            "select orphan keys",
+            AppError::Database("boom".into()),
+        );
+        assert!(err.is_err(), "a failed first page is a failed pass");
+        assert!(result.errors.is_empty());
+
+        record_gc_success(&mut result, 10, 1);
+        record_page_error(
+            &mut result,
+            false,
+            "select orphan keys",
+            AppError::Database("boom".into()),
+        )
+        .expect("a later page failing must not discard committed work");
+        assert_eq!(result.storage_keys_deleted, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("select orphan keys"));
+    }
+
+    #[tokio::test]
+    async fn blob_candidate_pages_are_keyset_ordered_and_limited_2524() {
+        let sql = blob_candidate_page_sql("ob.created_at < NOW()");
+        assert!(
+            sql.contains("(ob.repository_id, ob.digest) > ($2, $3)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY ob.repository_id, ob.digest"),
+            "{sql}"
+        );
+        assert!(sql.contains("LIMIT $4"), "{sql}");
+        assert!(sql.contains(BLOB_PROTECTED_BY_REFS_SQL));
+        assert_eq!(BlobGcPhase::Mark.select_label(), "select orphan blobs");
+        let sweep = BlobGcPhase::Sweep { grace_secs: 0 };
+        assert_eq!(sweep.select_label(), "select pending-delete blobs");
+        assert_ne!(BlobGcPhase::Mark.dry_run_message(), sweep.dry_run_message());
+        assert_eq!(
+            make_service("filesystem").candidate_page_size,
+            GC_CANDIDATE_PAGE_SIZE
+        );
+    }
+
+    /// Seed a soft-deleted `artifacts` row (and, when `with_object`, its
+    /// stored object) in the fixture repository. `deleted_days_ago` backdates
+    /// `deleted_at`; `None` leaves it NULL, as for rows trashed before
+    /// migration 261.
+    async fn seed_trashed_row(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+        path: &str,
+        storage_key: &str,
+        deleted_days_ago: Option<i32>,
+        with_object: bool,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        if with_object {
+            let storage = fixture
+                .state
+                .storage_for_repo(
+                    &tdh::make_repo_info(
+                        fixture.repo_id,
+                        &fixture.repo_key,
+                        &fixture.storage_dir,
+                        "local",
+                        None,
+                    )
+                    .storage_location(),
+                )
+                .expect("resolve storage");
+            storage
+                .put(storage_key, Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+        }
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted, deleted_at) \
+             VALUES ($1, $2, 'trashed', '1.0', 7, 'cafe', 'application/octet-stream', $3, $4, true, \
+                     NOW() - make_interval(days => $5))",
+        )
+        .bind(fixture.repo_id)
+        .bind(path)
+        .bind(storage_key)
+        .bind(fixture.user_id)
+        .bind(deleted_days_ago.unwrap_or(0))
+        .execute(&fixture.pool)
+        .await
+        .expect("insert trashed row");
+        if deleted_days_ago.is_none() {
+            // Only `deleted_at` changes, so the stamp trigger does not fire.
+            sqlx::query(
+                "UPDATE artifacts SET deleted_at = NULL WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fixture.repo_id)
+            .bind(path)
+            .execute(&fixture.pool)
+            .await
+            .expect("clear deleted_at");
+        }
+    }
+
+    async fn fixture_object_exists(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+        storage_key: &str,
+    ) -> bool {
+        use crate::api::handlers::test_db_helpers as tdh;
+        fixture
+            .state
+            .storage_for_repo(
+                &tdh::make_repo_info(
+                    fixture.repo_id,
+                    &fixture.repo_key,
+                    &fixture.storage_dir,
+                    "local",
+                    None,
+                )
+                .storage_location(),
+            )
+            .expect("resolve storage")
+            .exists(storage_key)
+            .await
+            .expect("probe object")
+    }
+
+    async fn surviving_rows(pool: &PgPool, repo_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar("SELECT path FROM artifacts WHERE repository_id = $1 ORDER BY path")
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .expect("list surviving rows")
+    }
+
+    /// #2524 regression: candidate selection is keyset-paged and the sweep
+    /// walks every page. Seeds more orphan keys than one page holds (page
+    /// size shrunk to 2, five keys) and requires that a single pass reports
+    /// and then reclaims all of them, while no page exceeds the page size.
+    #[tokio::test]
+    async fn paged_orphan_scan_reclaims_more_candidates_than_one_page_2524() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let keys: Vec<String> = (0..5).map(|i| format!("generic/paged-{uid}-{i}")).collect();
+        for key in &keys {
+            seed_trashed_row(&fixture, key, key, Some(0), true).await;
+        }
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_candidate_page_size(2);
+
+        let first = service
+            .select_orphans_page(Some(fixture.repo_id), &OrphanKeyCursor::default())
+            .await
+            .expect("first page");
+        let dry = service
+            .run_gc_for_repository(fixture.repo_id, true)
+            .await
+            .expect("dry run");
+        let live = service
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("live run");
+        let rows_left = surviving_rows(&fixture.pool, fixture.repo_id).await;
+        let mut objects_left = 0;
+        for key in &keys {
+            objects_left += i32::from(fixture_object_exists(&fixture, key).await);
+        }
+        fixture.teardown().await;
+
+        assert_eq!(first.len(), 2, "a page must never exceed the page size");
+        assert_eq!(dry.storage_keys_deleted, 5, "dry run must count every page");
+        assert!(live.errors.is_empty(), "{:?}", live.errors);
+        assert_eq!(
+            live.storage_keys_deleted, 5,
+            "live run must reclaim every page"
+        );
+        assert!(rows_left.is_empty(), "rows left behind: {rows_left:?}");
+        assert_eq!(objects_left, 0, "objects left behind");
+    }
+
+    /// #2524 regression for both blob-GC phases: five aged orphan blobs with a
+    /// page size of 2 must all be marked and then swept in one call.
+    #[tokio::test]
+    async fn paged_blob_gc_marks_and_sweeps_more_blobs_than_one_page_2524() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digests: Vec<String> = (0..5)
+            .map(|_| format!("sha256:{}", Uuid::new_v4().simple().to_string().repeat(2)))
+            .collect();
+        for digest in &digests {
+            insert_old_blob(
+                &fixture.pool,
+                fixture.repo_id,
+                digest,
+                &format!("{OCI_BLOB_STORAGE_PREFIX}{digest}"),
+                11,
+            )
+            .await;
+        }
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_candidate_page_size(2);
+
+        let dry = service.run_blob_gc(true).await.expect("dry run");
+        let live = service.run_blob_gc(false).await.expect("live run");
+        let left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = ANY($2)",
+        )
+        .bind(fixture.repo_id)
+        .bind(&digests)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count blobs");
+        fixture.teardown().await;
+
+        assert!(dry.storage_keys_deleted >= 5, "dry run saw {dry:?}");
+        assert!(live.errors.is_empty(), "{:?}", live.errors);
+        assert!(live.storage_keys_deleted >= 5, "live run swept {live:?}");
+        assert_eq!(left, 0, "every page of orphan blobs must be swept");
+    }
+
+    /// #2072: with a retention window, a row trashed inside the window
+    /// survives GC (row and object) while one trashed before it, and one
+    /// whose deletion time predates migration 261, are reclaimed. An object
+    /// shared by an expired and a retained row is kept for the retained one.
+    /// With the default (0) the retained row is reclaimed too: today's
+    /// behaviour.
+    #[tokio::test]
+    async fn trash_retention_spares_rows_inside_the_window_2072() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let young = format!("generic/young-{uid}");
+        let old = format!("generic/old-{uid}");
+        let legacy = format!("generic/legacy-{uid}");
+        let shared = format!("generic/shared-{uid}");
+        seed_trashed_row(&fixture, &young, &young, Some(2), true).await;
+        seed_trashed_row(&fixture, &old, &old, Some(10), true).await;
+        seed_trashed_row(&fixture, &legacy, &legacy, None, true).await;
+        seed_trashed_row(&fixture, &format!("{shared}-a"), &shared, Some(10), true).await;
+        seed_trashed_row(&fixture, &format!("{shared}-b"), &shared, Some(2), false).await;
+
+        let retained =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_trash_retention_days(7);
+        let dry = retained
+            .run_gc_for_repository(fixture.repo_id, true)
+            .await
+            .expect("dry run");
+        let live = retained
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("live run");
+        let after_retained = surviving_rows(&fixture.pool, fixture.repo_id).await;
+        let young_object = fixture_object_exists(&fixture, &young).await;
+        let old_object = fixture_object_exists(&fixture, &old).await;
+        let shared_object = fixture_object_exists(&fixture, &shared).await;
+
+        let default =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        default
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("default run");
+        let after_default = surviving_rows(&fixture.pool, fixture.repo_id).await;
+        let young_object_after_default = fixture_object_exists(&fixture, &young).await;
+        fixture.teardown().await;
+
+        assert!(live.errors.is_empty(), "{:?}", live.errors);
+        // The shared key still has a retained row in the same scope, so the
+        // scan itself excludes it: the dry run reports exactly what the live
+        // run reclaims.
+        assert_eq!(dry.storage_keys_deleted, 2, "old and legacy: {dry:?}");
+        assert_eq!(live.storage_keys_deleted, 2, "old and legacy: {live:?}");
+        assert_eq!(
+            after_retained,
+            vec![format!("{shared}-a"), format!("{shared}-b"), young.clone()],
+            "rows inside the window, and rows sharing their object, must survive"
+        );
+        assert!(young_object, "a retained row's object must survive");
+        assert!(
+            shared_object,
+            "an object a retained row still names must survive"
+        );
+        assert!(!old_object, "an expired row's object must be reclaimed");
+        assert!(
+            after_default.is_empty(),
+            "retention 0 must reclaim everything, as before #2072: {after_default:?}"
+        );
+        assert!(!young_object_after_default);
+    }
+
+    /// #2072 review: content-addressed keys are shared across scopes. Two
+    /// filesystem repositories (distinct roots) trash the same key; A's row
+    /// is past the retention window, B's is inside it. Reclaiming A's scope
+    /// must delete only A's row and object: B's row was never locked or
+    /// re-checked by A's pass, so it and its object must survive.
+    ///
+    /// FAILS before the scoped hard-delete: the unscoped
+    /// `DELETE ... WHERE storage_key = $1` removed B's retained row too,
+    /// emptying B's trash entry and stranding B's object with no row.
+    #[tokio::test]
+    async fn reclaim_never_deletes_another_scopes_retained_row_2072() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(repo_a) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let Some(repo_b) = tdh::Fixture::setup("local", "generic").await else {
+            repo_a.teardown().await;
+            return;
+        };
+        let key = format!("generic/shared-scope-{}", Uuid::new_v4().simple());
+        seed_trashed_row(&repo_a, &key, &key, Some(10), true).await;
+        seed_trashed_row(&repo_b, &key, &key, Some(2), true).await;
+
+        let service =
+            StorageGcService::new(repo_a.pool.clone(), repo_a.state.storage_registry.clone())
+                .with_trash_retention_days(7);
+        let result = service
+            .run_gc_for_repository(repo_a.repo_id, false)
+            .await
+            .expect("gc run");
+        let a_rows = surviving_rows(&repo_a.pool, repo_a.repo_id).await;
+        let b_rows = surviving_rows(&repo_b.pool, repo_b.repo_id).await;
+        let a_object = fixture_object_exists(&repo_a, &key).await;
+        let b_object = fixture_object_exists(&repo_b, &key).await;
+        repo_b.teardown().await;
+        repo_a.teardown().await;
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(a_rows.is_empty(), "A's expired row must be reclaimed");
+        assert!(!a_object, "A's object must be reclaimed");
+        assert_eq!(b_rows, vec![key.clone()], "B's retained row must survive");
+        assert!(b_object, "B's object must survive with its row");
+    }
+
+    /// #2072: the migration-261 trigger stamps `deleted_at` only when
+    /// `is_deleted` actually flips, clears it on revival, and leaves it alone
+    /// on unrelated updates (including re-asserting the same flag value).
+    #[tokio::test]
+    async fn deleted_at_trigger_fires_only_on_is_deleted_flips_2072() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/trigger-{}", Uuid::new_v4().simple());
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+                 content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 't', 1, 'cafe', 'application/octet-stream', $2, $3) RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&path)
+        .bind(fixture.user_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("insert live row");
+        let deleted_at = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                "SELECT deleted_at FROM artifacts WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read deleted_at")
+        };
+        let exec = |pool: PgPool, sql: &'static str| async move {
+            sqlx::query(sql).bind(id).execute(&pool).await.expect(sql);
+        };
+
+        let live = deleted_at(fixture.pool.clone()).await;
+        exec(
+            fixture.pool.clone(),
+            "UPDATE artifacts SET is_deleted = true WHERE id = $1",
+        )
+        .await;
+        let trashed = deleted_at(fixture.pool.clone()).await;
+        exec(
+            fixture.pool.clone(),
+            "UPDATE artifacts SET deleted_at = NOW() - INTERVAL '3 days' WHERE id = $1",
+        )
+        .await;
+        exec(
+            fixture.pool.clone(),
+            "UPDATE artifacts SET is_deleted = true, size_bytes = 2, updated_at = NOW() WHERE id = $1",
+        )
+        .await;
+        let after_unrelated = deleted_at(fixture.pool.clone()).await;
+        exec(
+            fixture.pool.clone(),
+            "UPDATE artifacts SET is_deleted = false WHERE id = $1",
+        )
+        .await;
+        let revived = deleted_at(fixture.pool.clone()).await;
+        fixture.teardown().await;
+
+        assert_eq!(live, None, "a live insert has no deletion time");
+        assert!(trashed.is_some(), "a soft delete must stamp deleted_at");
+        let backdated = after_unrelated.expect("an unrelated update must not clear deleted_at");
+        assert!(
+            backdated < chrono::Utc::now() - chrono::Duration::days(2),
+            "an update that does not flip is_deleted must not restamp deleted_at"
+        );
+        assert_eq!(revived, None, "reviving a row must clear deleted_at");
     }
 }

@@ -2500,11 +2500,11 @@ mod tests {
             let exchange_line = |claims: serde_json::Value| {
                 let fx = &fx;
                 async move {
-                    let capture = crate::testing::LogCapture::default();
-                    let _guard = tracing::subscriber::set_default(capture.subscriber());
+                    let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+                    let _guard = capture.install(tracing::Level::INFO);
                     fx.exchange(claims).await.expect("exchange succeeds");
                     capture
-                        .contents()
+                        .text()
                         .lines()
                         .find(|l| l.contains("CI OIDC token exchange"))
                         .expect("an exchange security line")

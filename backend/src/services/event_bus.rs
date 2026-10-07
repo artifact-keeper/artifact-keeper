@@ -115,6 +115,30 @@ impl EventBus {
         ));
     }
 
+    /// Publish `artifact.uploaded` for an `artifacts` row the caller has just
+    /// written and whose id it already holds (#3939).
+    ///
+    /// For the write paths that copy or create an artifact row WITHOUT a
+    /// catalog registration to hang the event off: promotion, approval
+    /// execution, Git LFS and the chunked-upload completion. Hosted format
+    /// publishes go through `package_service::register_published_package`
+    /// instead, which emits the same event; calling both would double-deliver.
+    /// The payload matches what `ArtifactService::finalize_upload` emits: the
+    /// artifact id as the entity and the uploader as the actor.
+    pub fn emit_artifact_uploaded(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        uploaded_by: Option<Uuid>,
+    ) {
+        self.emit_for_repo(
+            "artifact.uploaded",
+            artifact_id,
+            repository_id,
+            uploaded_by.map(|id| id.to_string()),
+        );
+    }
+
     /// Convenience for `repository.*` events where the affected entity IS
     /// the repository. Sets both `entity_id` and `repository_id` to
     /// `repo_id`, avoiding the visually-duplicated argument at the call
@@ -146,6 +170,26 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.event_type, "user.created");
         assert_eq!(event.entity_id, "abc-123");
+    }
+
+    /// #3939: the row-holding producer carries the artifact id, the owning
+    /// repository and the uploader, exactly as `finalize_upload`'s event does.
+    #[tokio::test]
+    async fn emit_artifact_uploaded_carries_row_repo_and_uploader() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let (artifact, repo, user) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+        bus.emit_artifact_uploaded(artifact, repo, Some(user));
+        bus.emit_artifact_uploaded(artifact, repo, None);
+
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.event_type, "artifact.uploaded");
+        assert_eq!(first.entity_id, artifact.to_string());
+        assert_eq!(first.repository_id, Some(repo));
+        assert_eq!(first.actor, Some(user.to_string()));
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.actor, None);
     }
 
     #[tokio::test]

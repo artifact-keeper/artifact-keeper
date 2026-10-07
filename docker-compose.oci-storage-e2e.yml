@@ -1,0 +1,108 @@
+# OCI push/pull E2E against an object-storage backend (#1529).
+#
+# Postgres, MinIO and one backend whose storage backend is chosen at `up` time:
+#   STORAGE_BACKEND=s3          (default) every repository is stored in MinIO
+#   STORAGE_BACKEND=filesystem  the same suite on local disk, for comparison
+#
+# The docker client runs on the HOST, not in a container: the daemon only
+# talks plain HTTP to a registry it treats as insecure, and loopback
+# (127.0.0.0/8) is the one address every daemon treats that way without
+# configuration. So the backend is published on 127.0.0.1 and the suite is
+# pointed at it:
+#
+#   docker compose -f docker-compose.oci-storage-e2e.yml up -d --wait
+#   REGISTRY_URL=localhost:18091 STORAGE_BACKEND=s3 \
+#     bash scripts/native-tests/test-docker.sh
+#   docker compose -f docker-compose.oci-storage-e2e.yml down -v
+#
+# scheduled-tests.yml runs exactly this nightly (job `oci-storage-e2e`).
+# Every credential below is a throwaway for a stack torn down with `down -v`;
+# NOT for deployment.
+
+services:
+  postgres:
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  minio:
+    # ci-mirror copy: Docker Hub no longer hosts minio/minio (#3949).
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb local/artifact-keeper --ignore-existing &&
+      mc anonymous set none local/artifact-keeper
+      "
+    restart: "no"
+
+  backend:
+    image: artifact-keeper-backend:test
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # ADMIN_PASSWORD, the throwaway e2e admin credential defined ONCE in
+    # .env.test (#3490).
+    env_file:
+      - .env.test
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      # MinIO over plain HTTP. object_store addresses a custom endpoint
+      # path-style, which is what MinIO serves without DNS wildcards.
+      S3_BUCKET: artifact-keeper
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      JWT_SECRET: oci-storage-e2e-nonprod-cobalt-fern-lantern-7391
+      RUST_LOG: info,artifact_keeper_backend::storage=debug
+      # test-docker.sh authenticates as admin a dozen-plus times (token
+      # endpoint, docker login, each pull/push), all from one address, which
+      # trips the default 10-per-15-minutes per-user login budget halfway
+      # through the suite with HTTP 429.
+      RATE_LIMIT_LOGIN_PER_WINDOW: "1000"
+      HOST: 0.0.0.0
+      PORT: 8080
+    ports:
+      - "127.0.0.1:18091:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s

@@ -19,6 +19,8 @@
 //!   - `pretty` (default) -- the human-readable multi-line `fmt` output
 //!   - `json` -- one JSON object per line, for structured stdout collection by a SIEM / log shipper (#2413 item 1)
 
+mod db_spans;
+
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
@@ -168,9 +170,10 @@ fn build_span_exporter(protocol: OtlpProtocol, endpoint: &str) -> SpanExporter {
 /// `AlwaysOn`, so a caller can only suppress its own trace. **Under
 /// `parentbased_traceidratio` or `parentbased_always_off` that changes** — an
 /// untrusted `sampled=01` then forces export of a trace the sampler would have
-/// dropped. An operator choosing those values on a publicly reachable
-/// deployment should gate trace-context extraction on their trusted-proxy
-/// range; that gate does not exist yet and is the obvious follow-up.
+/// dropped. Setting `RATE_LIMIT_TRUSTED_PROXY_CIDRS` gates extraction on the
+/// trusted-proxy range (#4195); with that list empty, extraction stays
+/// accept-all for compatibility and startup logs a warning under those two
+/// samplers (see [`sampler_obeys_remote_sampled_upgrade`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SamplerChoice {
     AlwaysOn,
@@ -216,10 +219,29 @@ impl SamplerChoice {
         }
     }
 
+    /// Whether a remote parent's `sampled=01` can make this sampler export a
+    /// trace it would have dropped as a root (#4195). `parentbased_always_on`
+    /// samples every root already, and the non-parent-based forms ignore the
+    /// parent's flag entirely.
+    fn obeys_remote_sampled_upgrade(self) -> bool {
+        matches!(
+            self,
+            Self::ParentBasedAlwaysOff | Self::ParentBasedTraceIdRatio
+        )
+    }
+
     /// Whether this choice consults `OTEL_TRACES_SAMPLER_ARG`.
     fn uses_ratio(self) -> bool {
         matches!(self, Self::TraceIdRatio | Self::ParentBasedTraceIdRatio)
     }
+}
+
+/// Whether the sampler configured by `OTEL_TRACES_SAMPLER` lets an inbound
+/// `sampled=01` force export of a trace it would have dropped (#4195). Used by
+/// the startup warning in
+/// [`crate::api::middleware::tracing::warn_if_trace_context_untrusted`].
+pub fn sampler_obeys_remote_sampled_upgrade() -> bool {
+    SamplerChoice::from_env().obeys_remote_sampled_upgrade()
 }
 
 /// Default sampling ratio per the OTel specification when
@@ -333,7 +355,13 @@ fn init_with_otel(
         .build();
 
     let tracer = provider.tracer("artifact-keeper");
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    // sqlx's per-statement events carry SQL text and stay out of the OTel
+    // export; stdout and the DB span layer below still see them (#4455).
+    let otel_layer = db_spans::otel_export_layer(tracer);
+    // Per-query DB `CLIENT` spans from sqlx's `sqlx::query` events (#4455).
+    // It sees what the filter above lets through: slow statements by default,
+    // every statement with `sqlx::query=debug`.
+    let db_span_layer = db_spans::DbQuerySpanLayer::new(provider.tracer("artifact-keeper"));
 
     // Install the W3C Trace Context propagator globally.
     //
@@ -352,6 +380,7 @@ fn init_with_otel(
         .with(env_filter)
         .with(build_fmt_layer(log_format))
         .with(otel_layer)
+        .with(db_span_layer)
         .init();
 
     OtelGuard { provider }
@@ -745,6 +774,34 @@ mod sampler_tests {
         ] {
             assert!(!choice.uses_ratio(), "{}", choice.name());
         }
+    }
+
+    /// #4195: only the two samplers for which a remote `sampled=01` overrides
+    /// a root decision of "drop" trigger the accept-all startup warning.
+    #[test]
+    fn only_drop_capable_parentbased_samplers_obey_a_remote_upgrade() {
+        for choice in [
+            SamplerChoice::ParentBasedAlwaysOff,
+            SamplerChoice::ParentBasedTraceIdRatio,
+        ] {
+            assert!(choice.obeys_remote_sampled_upgrade(), "{}", choice.name());
+        }
+        for choice in [
+            SamplerChoice::AlwaysOn,
+            SamplerChoice::AlwaysOff,
+            SamplerChoice::TraceIdRatio,
+            SamplerChoice::ParentBasedAlwaysOn,
+        ] {
+            assert!(!choice.obeys_remote_sampled_upgrade(), "{}", choice.name());
+        }
+        clear();
+        assert!(
+            !sampler_obeys_remote_sampled_upgrade(),
+            "the default sampler must not trigger the warning"
+        );
+        std::env::set_var("OTEL_TRACES_SAMPLER", "parentbased_always_off");
+        assert!(sampler_obeys_remote_sampled_upgrade());
+        clear();
     }
 
     /// Every choice builds, and the names round-trip — a name that does not

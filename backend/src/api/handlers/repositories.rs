@@ -23,6 +23,10 @@ use crate::api::dto::Pagination;
 // is a drop-in replacement on response types too.
 use crate::api::extractors::Json;
 use crate::api::handlers::is_replication_request;
+use crate::api::handlers::last_promotion::{
+    fetch_last_promotions, latest_promotion, LastPromotion,
+};
+use crate::api::handlers::projects;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -37,17 +41,18 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::cache_classifier;
-use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
-use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
-    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
-    RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
+    derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
+    MemberVisibility, RepoVisibility, RepositoryService,
+    UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
+use crate::services::upstream_filter::{self, UpstreamFilter};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -57,7 +62,8 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 /// Refuse a request that asks for a public repository while guest access is
 /// disabled server-wide (#3855).
 ///
-/// `AK_GUEST_ACCESS_ENABLED=false` is a deliberate operator decision, and a
+/// Disabling guest access (the admin setting or `AK_GUEST_ACCESS_ENABLED=false`,
+/// #867) is a deliberate operator decision, and a
 /// create/update asking for `is_public = true` contradicts it — a
 /// configuration mistake on one side or the other. Historically the request
 /// was silently rewritten to private (issue #850): the caller got a `201`/
@@ -74,7 +80,8 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 fn require_public_visibility_allowed(requested: bool, guest_access_enabled: bool) -> Result<()> {
     if requested && !guest_access_enabled {
         return Err(AppError::Validation(
-            "guest access is disabled on this instance (AK_GUEST_ACCESS_ENABLED=false); \
+            "guest access is disabled on this instance (admin setting \
+             PATCH /api/v1/admin/settings/system, or AK_GUEST_ACCESS_ENABLED=false); \
              repositories cannot be public. Enable guest access, or choose a non-public \
              visibility."
                 .to_string(),
@@ -806,6 +813,13 @@ pub fn router() -> Router<SharedState> {
                 .post(set_routing_rules)
                 .delete(delete_routing_rules),
         )
+        // Per-remote upstream include/exclude filter (#840)
+        .route(
+            "/:key/upstream-filter",
+            get(get_upstream_filter)
+                .put(set_upstream_filter)
+                .delete(delete_upstream_filter),
+        )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
         // Per-repository outbound egress proxy (#2469, #2811)
@@ -978,6 +992,23 @@ pub struct CreateRepositoryRequest {
     /// `npm_allowed_name_patterns`. A name is allowed if its scope is allowed
     /// OR any glob matches (e.g. `@acme/*`, `internal-*`).
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// npm Virtual isolate mode (#3767). When `true`, a package name owned by
+    /// any hosted member is served exclusively from the members: upstream
+    /// versions of that name are dropped from the merged packument and
+    /// refused on the tarball route. Only valid for npm *Virtual*
+    /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
+    /// `false` for the default union semantics.
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591). Each entry is an exact
+    /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
+    /// and canonicalized. By default the credentials only follow a realm on
+    /// the upstream's own origin (GHSA-78h6-3wp8-2542); list the token
+    /// service here when the registry serves it from another host, e.g.
+    /// `https://auth.docker.io` for a credentialed `https://registry-1.docker.io`
+    /// remote, or `https://gitlab.example.com` for a GitLab registry on
+    /// `https://registry.example.com`. Only valid for Remote repositories.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote (proxy) distribution/component/architecture filter
     /// (#2460, epic #2458). Only valid for Debian *Remote* repositories.
     /// Passthrough-only: allowed paths are proxied byte-for-byte; denied
@@ -1189,6 +1220,14 @@ pub struct UpdateRepositoryRequest {
     /// repository (#2424). When provided, replaces the stored
     /// `npm_allowed_name_patterns` list.
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
+    /// Virtual repositories; omit to leave it unchanged.
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Replace the trusted cross-origin OCI Bearer token realms for this
+    /// Remote repository (#3591); same rules as on create. Omit to leave the
+    /// list unchanged; send `[]` to clear it and restore the strict
+    /// same-origin default.
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Update the Debian remote proxy filter (#2460). Three-way semantics:
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
@@ -1256,6 +1295,12 @@ pub struct RepositoryResponse {
     pub name: String,
     pub description: Option<String>,
     pub format: String,
+    /// Plugin format key for a WASM-plugin-backed repository (#3070). Such a
+    /// repository is stored as `format = "generic"` plus this key, so it is the
+    /// only way to tell it apart from a plain generic one. Omitted when the
+    /// repository uses the built-in handler for `format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_key: Option<String>,
     pub repo_type: String,
     /// Baseline read audience: `public`, `internal`, or `private`. This is the
     /// authoritative field; read it rather than `is_public`, which cannot
@@ -1285,7 +1330,17 @@ pub struct RepositoryResponse {
     /// (`NOT NULL DEFAULT 'filesystem'`), so like `curation_enabled` this
     /// needs no separate lookup and is always concrete.
     pub storage_backend: String,
+    /// Bytes stored in this repository itself. Always 0 for a virtual
+    /// repository, which stores nothing of its own, so summing this field
+    /// over repositories (for example per project) counts each byte once
+    /// (#4423).
     pub storage_used_bytes: i64,
+    /// Virtual repositories only: the combined bytes of the member
+    /// repositories the caller can see, each member counted once (#2785,
+    /// #3081). These bytes are already in the members' own
+    /// `storage_used_bytes`; do not add them to a total. `null` for every
+    /// other repository type (#4423).
+    pub member_storage_used_bytes: Option<i64>,
     pub quota_bytes: Option<i64>,
     /// Project this repository is assigned to (#2472), if any.
     pub project_id: Option<Uuid>,
@@ -1296,7 +1351,17 @@ pub struct RepositoryResponse {
     /// update) and the listing; `repo_to_response` alone defaults it to `false`
     /// (it is db-less and cannot read the column).
     pub has_trusted_gpg_key: bool,
+    /// The Remote repository's upstream URL with any embedded userinfo
+    /// (`user:password@` or `token@`) removed (#4452). Credentials embedded in
+    /// the URL at create time are still stored and still sent upstream as
+    /// HTTP Basic auth, but are never returned; `upstream_url_has_credentials`
+    /// says whether any are configured.
     pub upstream_url: Option<String>,
+    /// Whether the stored `upstream_url` carries embedded userinfo
+    /// credentials that were stripped from `upstream_url` above (#4452).
+    /// Independent of `upstream_auth_configured`, which covers the dedicated
+    /// (encrypted) upstream credential fields.
+    pub upstream_url_has_credentials: bool,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
     /// Whether the Package Age / quarantine policy is enabled for this
@@ -1338,6 +1403,15 @@ pub struct RepositoryResponse {
     /// `repository_config`. Omitted for non-npm repositories or when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// npm Virtual isolate mode (#3767): the effective value for npm Virtual
+    /// repositories; omitted for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// Cross-origin OCI Bearer token realms trusted to receive this Remote
+    /// repository's upstream credentials (#3591), canonical origins. Omitted
+    /// when none are configured (the strict same-origin default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oci_trusted_bearer_realms: Option<Vec<String>>,
     /// Debian remote proxy filter (#2460), read back from `repository_config`.
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1404,11 +1478,45 @@ async fn with_repodata_depth(
     Ok(response)
 }
 
+/// Render a stored `upstream_url` for an API response (#4452): the URL with
+/// its userinfo stripped, plus whether any userinfo was present. Every
+/// response that carries a repository's upstream URL goes through here so the
+/// embedded password can never be echoed.
+fn upstream_url_for_response(stored: Option<&str>) -> (Option<String>, bool) {
+    match stored.map(crate::services::proxy_service::strip_url_userinfo) {
+        Some((url, has_credentials)) => (Some(url), has_credentials),
+        None => (None, false),
+    }
+}
+
+/// [`repo_to_response`] with both display storage figures (#4423): the
+/// repository's own bytes, and for a virtual repository its members' bytes.
+fn repo_to_display_response(
+    repo: crate::models::repository::Repository,
+    usage: DisplayStorageUsage,
+) -> RepositoryResponse {
+    let mut response = repo_to_response(repo, usage.own_bytes);
+    response.member_storage_used_bytes = usage.member_bytes;
+    response
+}
+
+/// Display storage figures of a repository that was just created: nothing
+/// stored, and for a virtual repository a member figure of 0 (#4423).
+fn new_repository_storage(repo_type: &RepositoryType) -> DisplayStorageUsage {
+    if *repo_type == RepositoryType::Virtual {
+        DisplayStorageUsage::virtual_repo(0)
+    } else {
+        DisplayStorageUsage::own(0)
+    }
+}
+
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.
 fn repo_to_response(
     repo: crate::models::repository::Repository,
     storage_used_bytes: i64,
 ) -> RepositoryResponse {
+    let (upstream_url, upstream_url_has_credentials) =
+        upstream_url_for_response(repo.upstream_url.as_deref());
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
@@ -1417,6 +1525,10 @@ fn repo_to_response(
         name: repo.name,
         description: repo.description,
         format: repo.format.as_key().to_string(),
+        // db-less: `repositories.format_key` is not on the model; the
+        // single-repo handlers fill it via `with_row_presence_fields` and the
+        // listing from its batch query (#3070).
+        format_key: None,
         repo_type: repo.repo_type.as_str().to_string(),
         visibility: repo.visibility,
         allow_anonymous_access: repo.is_public,
@@ -1425,12 +1537,14 @@ fn repo_to_response(
         versioning_enabled: repo.versioning_enabled,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
+        member_storage_used_bytes: None,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
-        // db-less: single-repo handlers overwrite this via `with_trusted_gpg_key`
+        // db-less: single-repo handlers overwrite this via `with_row_presence_fields`
         // and the listing sets it from a batch presence query (#2568).
         has_trusted_gpg_key: false,
-        upstream_url: repo.upstream_url,
+        upstream_url,
+        upstream_url_has_credentials,
         upstream_auth_type: None,
         upstream_auth_configured: false,
         // Populated by the handlers that have a DB handle (see
@@ -1446,6 +1560,8 @@ fn repo_to_response(
         npm_allowed_scopes: None,
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
+        npm_virtual_isolate_hosted_names: None,
+        oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
@@ -1660,7 +1776,7 @@ async fn with_debian_config(
 }
 
 /// Validate that a repository key is safe and well-formed.
-fn validate_repository_key(key: &str) -> Result<()> {
+pub(crate) fn validate_repository_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > 128 {
         return Err(AppError::Validation(
             "Repository key must be between 1 and 128 characters".to_string(),
@@ -1782,21 +1898,36 @@ fn validate_trusted_gpg_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Populate `RepositoryResponse.has_trusted_gpg_key` from the repositories row
-/// (#2568). Split out like `with_custom_user_agent` so only handlers with a DB
-/// handle read the column back; the key material is never returned.
-async fn with_trusted_gpg_key(
+/// The `format_key` to expose for a repository whose built-in format key is
+/// `builtin_key` (#3070): the stored key only when it names a different
+/// handler, i.e. a WASM plugin. A NULL, blank, or redundant (equal to the
+/// built-in) stored key yields `None` so plain repositories omit the field.
+fn custom_format_key(builtin_key: &str, stored: Option<String>) -> Option<String> {
+    stored.filter(|k| {
+        let k = k.trim();
+        !k.is_empty() && !k.eq_ignore_ascii_case(builtin_key)
+    })
+}
+
+/// Populate the `RepositoryResponse` fields read straight off the repositories
+/// row but absent from the model: `has_trusted_gpg_key` (#2568; only the
+/// presence, the key material is never returned) and `format_key` (#3070).
+/// Split out like `with_custom_user_agent` so only handlers with a DB handle
+/// read the columns back.
+async fn with_row_presence_fields(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
-    let present: std::result::Result<Option<bool>, _> =
-        sqlx::query_scalar("SELECT trusted_gpg_key IS NOT NULL FROM repositories WHERE id = $1")
-            .bind(repo_id)
-            .fetch_optional(db)
-            .await;
-    if let Ok(Some(has_key)) = present {
+    let row: std::result::Result<Option<(bool, Option<String>)>, _> = sqlx::query_as(
+        "SELECT trusted_gpg_key IS NOT NULL, format_key FROM repositories WHERE id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await;
+    if let Ok(Some((has_key, format_key))) = row {
         response.has_trusted_gpg_key = has_key;
+        response.format_key = custom_format_key(&response.format, format_key);
     }
     response
 }
@@ -1819,9 +1950,21 @@ fn ensure_single_line(value: &str, field_name: &str) -> Result<()> {
 }
 
 /// Validate that a cache TTL value (in seconds) is within the acceptable range.
-/// Minimum is 1 second, maximum is 30 days (2,592,000 seconds).
+/// Minimum is 1 second; maximum is [`MAX_CACHE_TTL_SECS`] (~10 years), the
+/// lifetime immutable artifacts are cached for (#2667). The override only
+/// applies to mutable paths (indexes, tag manifests), so the maximum is how an
+/// operator stops a remote's mutable paths from revalidating at all. It was
+/// 30 days before #2667.
 fn validate_cache_ttl(secs: i64) -> bool {
-    (1..=2_592_000).contains(&secs)
+    (1..=MAX_CACHE_TTL_SECS).contains(&secs)
+}
+
+/// The 400 message for an out-of-range `cache_ttl_seconds`.
+fn cache_ttl_range_error() -> String {
+    format!(
+        "cache_ttl_seconds must be between 1 and {MAX_CACHE_TTL_SECS} (~10 years; the maximum \
+         means mutable paths are never revalidated)"
+    )
 }
 
 /// Clamp a caller-supplied `per_page` into the valid `[1, 100]` range.
@@ -1940,6 +2083,13 @@ fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCacheTtlRequest {
+    /// Freshness lifetime, in seconds, for this remote's mutable paths
+    /// (indexes, packuments, tag manifests, GitHub release lookups); immutable
+    /// artifacts are cached forever regardless. 1 to 315360000 (~10 years);
+    /// the maximum means mutable paths are never revalidated. Lowering it also
+    /// applies to entries already cached, measured from when each was cached
+    /// or last revalidated; raising it applies from each entry's next
+    /// revalidation.
     pub cache_ttl_seconds: i64,
 }
 
@@ -2004,9 +2154,7 @@ pub async fn set_cache_ttl(
     is_cache_ttl_configurable(&repo.repo_type)?;
 
     if !validate_cache_ttl(payload.cache_ttl_seconds) {
-        return Err(AppError::Validation(
-            "cache_ttl_seconds must be between 1 and 2592000 (30 days)".to_string(),
-        ));
+        return Err(AppError::Validation(cache_ttl_range_error()));
     }
 
     // Upsert into repository_config table
@@ -2023,6 +2171,13 @@ pub async fn set_cache_ttl(
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // The proxy clamps already-cached mutable entries to the current TTL on
+    // read (#3832), so make this process see the new value at once rather
+    // than after its policy-cache TTL. Other replicas follow within that TTL.
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service.invalidate_cache_ttl_override(repo.id).await;
+    }
 
     Ok(Json(CacheTtlResponse {
         repository_key: key,
@@ -2315,8 +2470,11 @@ async fn with_npm_scope_policy(
     repo_id: Uuid,
     repo_type: &RepositoryType,
     format: &RepositoryFormat,
-    mut response: RepositoryResponse,
+    response: RepositoryResponse,
 ) -> Result<RepositoryResponse> {
+    // The npm Virtual isolate toggle (#3767) rides the same echo, so every
+    // handler that round-trips the scope policy round-trips it too.
+    let mut response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -2329,6 +2487,97 @@ async fn with_npm_scope_policy(
     }
     if !policy.allowed_name_patterns.is_empty() {
         response.npm_allowed_name_patterns = Some(policy.allowed_name_patterns);
+    }
+    Ok(response)
+}
+
+/// Whether npm Virtual isolate mode (#3767) can be configured on a repository.
+fn is_npm_virtual_repo(repo_type: &RepositoryType, format: &RepositoryFormat) -> bool {
+    repo_type == &RepositoryType::Virtual && format == &RepositoryFormat::Npm
+}
+
+/// Decide whether a supplied `npm_virtual_isolate_hosted_names` is persisted
+/// (#3767). `Ok(None)` for an absent field, and for an explicit `false` on a
+/// repository the mode does not apply to — that payload configures nothing, so
+/// it is accepted as a no-op rather than failing the whole request (the #3299
+/// rule for untouched settings forms). `true` on anything but an npm Virtual
+/// is a 400: it would store a toggle no code path reads.
+fn npm_virtual_isolate_to_store(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    requested: Option<bool>,
+) -> Result<Option<bool>> {
+    match requested {
+        None => Ok(None),
+        Some(value) if is_npm_virtual_repo(repo_type, format) => Ok(Some(value)),
+        Some(false) => Ok(None),
+        Some(true) => Err(AppError::Validation(
+            "npm_virtual_isolate_hosted_names is only configurable on npm virtual repositories"
+                .to_string(),
+        )),
+    }
+}
+
+/// Validate a supplied `oci_trusted_bearer_realms` list (#3591) and return
+/// the canonical list to persist. `Ok(None)` for an absent field and for an
+/// empty list on a repository the setting does not apply to (an untouched
+/// settings form configures nothing, the #3299 rule). A non-empty list on a
+/// non-Remote repository is a 400: no other type fetches from an upstream.
+fn oci_trusted_realms_to_store(
+    repo_type: &RepositoryType,
+    requested: Option<&[String]>,
+) -> Result<Option<Vec<String>>> {
+    match requested {
+        None => Ok(None),
+        Some(list) if *repo_type == RepositoryType::Remote => {
+            crate::services::oci_trusted_realms::normalize_trusted_realms(list).map(Some)
+        }
+        Some([]) => Ok(None),
+        Some(_) => Err(AppError::Validation(
+            "oci_trusted_bearer_realms is only valid for remote repositories".to_string(),
+        )),
+    }
+}
+
+/// Echo the trusted OCI bearer realms (#3591) on Remote repositories.
+async fn with_oci_trusted_realms(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if *repo_type == RepositoryType::Remote {
+        let list = crate::services::oci_trusted_realms::load_trusted_realms(db, repo_id).await?;
+        response.oci_trusted_bearer_realms = (!list.is_empty()).then_some(list);
+    }
+    Ok(response)
+}
+
+/// Persist a validated isolate-mode toggle (#3767). No cache invalidation is
+/// needed: the toggle is part of every npm virtual packument cache key, so the
+/// next read on every replica (and the shared Redis tier) misses and
+/// recomputes under the new mode.
+async fn apply_npm_virtual_isolate(state: &SharedState, repo_id: Uuid, value: bool) -> Result<()> {
+    upsert_repo_config(
+        &state.db,
+        repo_id,
+        crate::api::handlers::npm::NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY,
+        if value { "true" } else { "false" },
+    )
+    .await
+}
+
+/// Echo the npm Virtual isolate toggle (#3767) on npm Virtual repositories.
+async fn with_npm_virtual_isolate(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if is_npm_virtual_repo(repo_type, format) {
+        response.npm_virtual_isolate_hosted_names =
+            Some(crate::api::handlers::npm::fetch_npm_virtual_isolate(db, repo_id).await?);
     }
     Ok(response)
 }
@@ -2841,6 +3090,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "cran" => Ok(RepositoryFormat::Cran),
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
+        "pacman" => Ok(RepositoryFormat::Pacman),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
@@ -2961,61 +3211,64 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    // #2785: the batched per-repo figure above keys off `repository_id`, which
-    // is (near) empty for a virtual repo — it owns no artifact rows, only
-    // member links. Overwrite each virtual repo's figure with the union of its
-    // resolvable members so the listing total matches the child repos.
+    // #2785: a virtual repo owns no artifact rows, only member links, so its
+    // own figure is 0 (#4423: it must not repeat its members' bytes, or any
+    // sum over the listing counts them twice). The union of its resolvable
+    // members is reported separately as `member_storage_used_bytes`.
     //
     // #3078: resolve every virtual on the page in ONE query (the old shape
     // called `get_virtual_storage_usage` once per virtual — an N+1 that
-    // re-scanned every reachable member's artifact rows per call). Seeding 0
-    // first preserves the old always-overwrite semantics: a virtual with no
-    // resolvable members has no row in the batch result and must render 0.
-    let mut storage_map = storage_map;
+    // re-scanned every reachable member's artifact rows per call). A virtual
+    // with no resolvable members has no row in the batch result and renders
+    // a member figure of 0.
     let virtual_ids: Vec<Uuid> = repos
         .iter()
         .filter(|r| r.repo_type == RepositoryType::Virtual)
         .map(|r| r.id)
         .collect();
-    if !virtual_ids.is_empty() {
-        for id in &virtual_ids {
-            storage_map.insert(*id, 0);
+    // #3081: aggregate only over the members THIS caller may see — a member
+    // the caller cannot read must not disclose its byte size through the
+    // virtual's total. An empty `virtual_ids` returns without a query.
+    let member_map = service
+        .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
+        .await?;
+    let display_usage = |id: Uuid| {
+        if virtual_ids.contains(&id) {
+            DisplayStorageUsage::virtual_repo(member_map.get(&id).copied().unwrap_or(0))
+        } else {
+            DisplayStorageUsage::own(storage_map.get(&id).copied().unwrap_or(0))
         }
-        // #3081: aggregate only over the members THIS caller may see — a
-        // member the caller cannot read must not disclose its byte size
-        // through the virtual's total.
-        storage_map.extend(
-            service
-                .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
-                .await?,
-        );
-    }
-
-    // Batch fetch which repos have a trusted GPG key configured (#2568) so the
-    // listing reports `has_trusted_gpg_key` accurately without an N+1. The key
-    // material is never selected — only its presence.
-    let gpg_key_ids: std::collections::HashSet<Uuid> = if !repo_ids.is_empty() {
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM repositories WHERE id = ANY($1) AND trusted_gpg_key IS NOT NULL",
-        )
-        .bind(&repo_ids)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .into_iter()
-        .collect()
-    } else {
-        std::collections::HashSet::new()
     };
+
+    // Batch fetch which repos have a trusted GPG key configured (#2568) and
+    // any plugin `format_key` (#3070) so the listing reports both without an
+    // N+1. The key material is never selected — only its presence.
+    let row_fields: std::collections::HashMap<Uuid, (bool, Option<String>)> =
+        if !repo_ids.is_empty() {
+            sqlx::query_as::<_, (Uuid, bool, Option<String>)>(
+                "SELECT id, trusted_gpg_key IS NOT NULL, format_key FROM repositories \
+                 WHERE id = ANY($1) AND (trusted_gpg_key IS NOT NULL OR format_key IS NOT NULL)",
+            )
+            .bind(&repo_ids)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|(id, has_gpg, format_key)| (id, (has_gpg, format_key)))
+            .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
-            let storage = storage_map.get(&r.id).copied().unwrap_or(0);
-            let has_gpg = gpg_key_ids.contains(&r.id);
-            let mut resp = repo_to_response(r, storage);
+            let storage = display_usage(r.id);
+            let (has_gpg, format_key) = row_fields.get(&r.id).cloned().unwrap_or_default();
+            let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
+            resp.format_key = custom_format_key(&resp.format, format_key);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
@@ -3045,9 +3298,9 @@ pub async fn list_repositories(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
@@ -3067,19 +3320,19 @@ pub async fn create_repository(
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
-    // Fine-grained permission check: non-admins need "admin" on the system sentinel.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(
-                auth.user_id,
-                SYSTEM_TARGET_TYPE,
-                SYSTEM_SENTINEL_ID,
-                "admin",
-                false,
-            )
-            .await?;
-        if !has_perm {
+    // Fine-grained permission check: non-admins need "admin" on the system
+    // sentinel or (#2473) project-admin on the project the request assigns
+    // the new repository to, so a project admin creates only inside their
+    // own project. `provisioner` (global or system-sentinel admin) also
+    // decides the creator's owner auto-grant below: a creator authorised only
+    // through a revocable project grant must not receive a durable owner role.
+    let provisioner = projects::has_system_repo_admin(&state, &auth).await?;
+    if !provisioner {
+        let allowed = match payload.project_id {
+            Some(project_id) => projects::is_project_admin(&state, &auth, project_id).await?,
+            None => false,
+        };
+        if !allowed {
             return Err(AppError::Authorization(
                 "Insufficient permissions to create repositories".to_string(),
             ));
@@ -3171,6 +3424,16 @@ pub async fn create_repository(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
+    // npm Virtual isolate mode (#3767): validated up-front for the same reason.
+    let npm_virtual_isolate = npm_virtual_isolate_to_store(
+        &repo_type,
+        &format,
+        payload.npm_virtual_isolate_hosted_names,
+    )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
+    // the same reason; persisted once `repo.id` exists.
+    let oci_trusted_realms =
+        oci_trusted_realms_to_store(&repo_type, payload.oci_trusted_bearer_realms.as_deref())?;
 
     // Debian remote proxy filter (#2460): validate up-front — before the
     // repository row is created — so a rejected config (wrong repo type or an
@@ -3258,6 +3521,10 @@ pub async fn create_repository(
                 project_id
             )));
         }
+        // Opt-in key-prefix convention (#2473): a key using a project's
+        // `<project.key>-` prefix must be created in that project.
+        projects::validate_repo_key_project_prefix(&state, &payload.key, project_id, auth.is_admin)
+            .await?;
     }
 
     // #3855: a public repository contradicts a server-wide guest-access
@@ -3267,11 +3534,11 @@ pub async fn create_repository(
     let visibility = payload.effective_visibility()?;
     require_public_visibility_allowed(
         visibility.allows_anonymous_read(),
-        state.config.guest_access_enabled,
+        state.guest_access_policy.is_enabled().await,
     )?;
 
     let repo = service
-        .create_with_repodata_depth(
+        .create_with_options(
             ServiceCreateRepoReq {
                 key: payload.key,
                 name: payload.name,
@@ -3296,11 +3563,12 @@ pub async fn create_repository(
                 // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
                 // default; only an explicit `true` opts into unverified ingest.
                 curation_allow_unverified: payload.curation_allow_unverified,
-                // Owner auto-grant: record the creator and grant them per-repo
-                // access so they retain access under per-repo authorization.
+                // Always record the creator. The owner role auto-grant is
+                // applied only for provisioners (see `provisioner` above).
                 created_by: Some(auth.user_id),
             },
             payload.repodata_depth.unwrap_or(0),
+            provisioner,
         )
         .await?;
 
@@ -3367,6 +3635,13 @@ pub async fn create_repository(
             payload.npm_allowed_name_patterns.as_deref(),
         )
         .await?;
+    }
+    if let Some(isolate) = npm_virtual_isolate {
+        apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
     }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
@@ -3521,7 +3796,9 @@ pub async fn create_repository(
     let repo_id = repo.id;
     let repo_type_out = repo.repo_type.clone();
     let repo_format_out = repo.format.clone();
-    let mut response = repo_to_response(repo, 0);
+    // A new repository stores nothing yet; a new virtual reports a member
+    // figure of 0 like every other virtual response (#4423).
+    let mut response = repo_to_display_response(repo, new_repository_storage(&repo_type_out));
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -3555,9 +3832,10 @@ pub async fn create_repository(
         response,
     )
     .await?;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type_out, response).await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -3602,7 +3880,7 @@ pub async fn get_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let mut response = repo_to_response(repo, storage_used);
+    let mut response = repo_to_display_response(repo, storage_used);
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
@@ -3621,7 +3899,8 @@ pub async fn get_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -4086,9 +4365,9 @@ pub async fn get_repository_storage_tree(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
@@ -4164,6 +4443,37 @@ pub async fn update_repository(
         }
     }
 
+    // Projects (#2473): (re)assigning a repository to a different project
+    // needs a global admin, a system repo-admin, or project-admin on the
+    // DESTINATION project (global admins short-circuit without DB work).
+    // Repository admin alone (which a project admin holds on its repositories
+    // by inheritance) must not push a repository into a project the caller
+    // does not administer. When the key or the assignment changes, the
+    // opt-in key-prefix convention is re-validated for the result.
+    let reassigned_to = payload
+        .project_id
+        .filter(|p| existing.project_id != Some(*p));
+    if let Some(project_id) = reassigned_to {
+        if !projects::can_assign_to_project(&state, &auth, project_id).await? {
+            return Err(AppError::Authorization(
+                "Project admin access to the destination project required".to_string(),
+            ));
+        }
+    }
+    let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
+    if key_changed || reassigned_to.is_some() {
+        if let Some(project_id) = payload.project_id.or(existing.project_id) {
+            let effective_key = payload.key.as_deref().unwrap_or(&existing.key);
+            projects::validate_repo_key_project_prefix(
+                &state,
+                effective_key,
+                project_id,
+                auth.is_admin,
+            )
+            .await?;
+        }
+    }
+
     // #3855: flipping a repository to public contradicts a server-wide
     // guest-access disable; refuse it explicitly rather than silently keeping
     // the repository non-public while answering 200. An absent field, a
@@ -4172,9 +4482,25 @@ pub async fn update_repository(
     let visibility_update = payload.visibility_update()?;
     require_public_visibility_allowed(
         matches!(visibility_update, VisibilityUpdate::Set(v) if v.allows_anonymous_read()),
-        state.config.guest_access_enabled,
+        state.guest_access_policy.is_enabled().await,
     )?;
     let (effective_visibility, effective_is_public) = visibility_update.binds();
+
+    // npm Virtual isolate mode (#3767): validated before the update so a
+    // rejected toggle cannot leave the other fields half-applied. Repository
+    // type and format are immutable here, so `existing` decides.
+    let npm_virtual_isolate = npm_virtual_isolate_to_store(
+        &existing.repo_type,
+        &existing.format,
+        payload.npm_virtual_isolate_hosted_names,
+    )?;
+    // Trusted cross-origin OCI bearer realms (#3591): validated before the
+    // update for the same reason. Writing them is gated by the repository
+    // `admin` check above, like every other credential-routing setting.
+    let oci_trusted_realms = oci_trusted_realms_to_store(
+        &existing.repo_type,
+        payload.oci_trusted_bearer_realms.as_deref(),
+    )?;
 
     let repo = service
         .update_with_repodata_depth(
@@ -4206,6 +4532,15 @@ pub async fn update_repository(
         )
         .await?;
 
+    // #2473: project-inherited grants on this repository just changed, so
+    // drop cached resolutions now instead of serving the source project's
+    // members their old actions for up to the cache TTL. (Other replicas
+    // are not notified: the `repositories` change trigger does not watch
+    // `project_id` yet, a tracked follow-up.)
+    if reassigned_to.is_some() {
+        state.permission_service.invalidate_cache();
+    }
+
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
@@ -4235,6 +4570,13 @@ pub async fn update_repository(
             payload.npm_allowed_name_patterns.as_deref(),
         )
         .await?;
+    }
+    if let Some(isolate) = npm_virtual_isolate {
+        apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    if let Some(ref realms) = oci_trusted_realms {
+        crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
+            .await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -4504,7 +4846,7 @@ pub async fn update_repository(
     let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
-    let response = repo_to_response(repo, storage_used);
+    let response = repo_to_display_response(repo, storage_used);
     let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
@@ -4527,7 +4869,8 @@ pub async fn update_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
-    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
+    let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
+    let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -5381,6 +5724,11 @@ pub struct ArtifactResponse {
     /// (listings, historical revisions). The per-artifact metadata endpoint
     /// populates it.
     pub origin: Option<crate::services::artifact_origin::ArtifactOrigin>,
+    /// The most recent successful promotion of this artifact out of its
+    /// repository (#1758), derived from `promotion_history` rows with status
+    /// `promoted` (rejected and pending attempts never count). Always
+    /// serialized; `null` when the artifact was never promoted.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -5456,6 +5804,9 @@ pub struct DockerTagResponse {
     ///   `completed` label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_status: Option<String>,
+    /// The most recent successful promotion of this tag's manifest artifact
+    /// (#1758); same contract as `ArtifactResponse.last_promotion`.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 /// A Maven component grouped by GAV (groupId, artifactId, version).
@@ -5484,6 +5835,10 @@ pub struct MavenComponentResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Individual filenames belonging to this component.
     pub artifact_files: Vec<String>,
+    /// The most recent successful promotion of any file in this component
+    /// (#1758); same contract as `ArtifactResponse.last_promotion`. `null`
+    /// when no file of the component was ever promoted.
+    pub last_promotion: Option<LastPromotion>,
 }
 
 /// List artifacts in repository
@@ -5763,6 +6118,14 @@ pub async fn list_artifacts(
     // names in one batched lookup, so the UI can render "uploaded by <name>"
     // without an admin-only per-artifact user fetch.
     resolve_uploader_usernames(&state.db, &mut items).await;
+    // #1758: stamp each row's latest promotion in one batched lookup.
+    let promotions = fetch_last_promotions(&state.db, &artifact_ids, auth.as_ref()).await;
+    apply_last_promotions(
+        &mut items,
+        &promotions,
+        |i| i.id,
+        |i, p| i.last_promotion = p,
+    );
 
     Ok(Json(ArtifactListResponse {
         items,
@@ -6085,6 +6448,7 @@ fn build_catalog_artifact_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6210,6 +6574,7 @@ fn build_cached_artifact_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6422,6 +6787,7 @@ fn build_artifact_response(
         quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
         quarantine_until: artifact.quarantine_until,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -6487,6 +6853,21 @@ async fn resolve_uploader_usernames(db: &sqlx::PgPool, items: &mut [ArtifactResp
     apply_uploader_usernames(items, &usernames);
 }
 
+/// Stamp each listing row with its artifact's latest promotion (#1758), keyed
+/// by `id_of`. Generic over the row type so the flat listing and the Docker
+/// tag grouping share one implementation.
+fn apply_last_promotions<T>(
+    items: &mut [T],
+    promotions: &std::collections::HashMap<Uuid, LastPromotion>,
+    id_of: impl Fn(&T) -> Uuid,
+    set: impl Fn(&mut T, Option<LastPromotion>),
+) {
+    for item in items.iter_mut() {
+        let promotion = promotions.get(&id_of(item)).cloned();
+        set(item, promotion);
+    }
+}
+
 /// Build `ArtifactResponse` rows for each Maven secondary file recorded
 /// under a single primary artifact (#1092).
 ///
@@ -6545,6 +6926,7 @@ fn expand_maven_secondary_files(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin: None,
+            last_promotion: None,
         });
     }
     out
@@ -6807,6 +7189,8 @@ async fn list_artifacts_grouped_by_maven_component(
 
     let components = build_maven_components_for_keys(
         artifact_service,
+        &state.db,
+        auth,
         &repo_ids,
         repo_key,
         repo.format.as_key(),
@@ -6978,6 +7362,8 @@ fn maven_component_path_prefix(name: &str, version: &str) -> Option<String> {
 /// the key filter, so the page contents stay exactly the catalog page.
 async fn build_maven_components_for_keys(
     artifact_service: &ArtifactService,
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
     repo_ids: &[Uuid],
     repo_key: &str,
     format: &str,
@@ -7000,7 +7386,11 @@ async fn build_maven_components_for_keys(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
-    let grouped = group_maven_artifacts(&artifacts, &download_counts, repo_key, format);
+    // #1758: a component reports the latest promotion of any of its files.
+    let promotions = fetch_last_promotions(db, &artifact_ids, auth).await;
+
+    let grouped =
+        group_maven_artifacts(&artifacts, &download_counts, &promotions, repo_key, format);
     Ok(order_components_by_keys(grouped, keys))
 }
 
@@ -7290,6 +7680,7 @@ async fn maven_components_from_catalog(
             // this in from the proxy cache catalog for just the page it keeps
             // (`populate_remote_component_files`, #3270).
             artifact_files: Vec::new(),
+            last_promotion: None,
         });
     }
 
@@ -7350,6 +7741,7 @@ struct GavKey {
 fn group_maven_artifacts(
     artifacts: &[crate::models::artifact::Artifact],
     download_counts: &std::collections::HashMap<Uuid, i64>,
+    promotions: &std::collections::HashMap<Uuid, LastPromotion>,
     repo_key: &str,
     format: &str,
 ) -> Vec<MavenComponentResponse> {
@@ -7375,6 +7767,7 @@ fn group_maven_artifacts(
             .to_string();
 
         let downloads = *download_counts.get(&artifact.id).unwrap_or(&0);
+        let promotion = promotions.get(&artifact.id);
 
         groups
             .entry(key)
@@ -7385,6 +7778,7 @@ fn group_maven_artifacts(
                     comp.created_at = artifact.created_at;
                 }
                 comp.artifact_files.push(filename.clone());
+                comp.last_promotion = latest_promotion(comp.last_promotion.take(), promotion);
             })
             .or_insert_with(|| MavenComponentResponse {
                 id: artifact.id,
@@ -7397,6 +7791,7 @@ fn group_maven_artifacts(
                 download_count: downloads,
                 created_at: artifact.created_at,
                 artifact_files: vec![filename],
+                last_promotion: promotion.cloned(),
             });
     }
 
@@ -7544,10 +7939,19 @@ async fn list_artifacts_grouped_by_docker_tag(
 
     // Rows arrive in (image, tag) order straight from the keyset index; no
     // in-memory re-sort or slicing is needed.
-    let docker_tags: Vec<DockerTagResponse> = rows
+    let mut docker_tags: Vec<DockerTagResponse> = rows
         .into_iter()
         .map(|row| build_docker_tag_response(row, repo_key, &child_sizes))
         .collect();
+    // #1758: a tag reports its manifest artifact's latest promotion.
+    let manifest_ids: Vec<Uuid> = docker_tags.iter().map(|t| t.id).collect();
+    let promotions = fetch_last_promotions(&state.db, &manifest_ids, auth).await;
+    apply_last_promotions(
+        &mut docker_tags,
+        &promotions,
+        |t| t.id,
+        |t, p| t.last_promotion = p,
+    );
 
     let exact_total = if count_exact {
         Some(count_docker_tag_rows(&state.db, &repo_ids, search_query).await?)
@@ -7949,6 +8353,7 @@ fn build_docker_tag_response(
         is_index,
         last_pushed_at: row.last_pushed_at,
         scan_status: row.scan_status,
+        last_promotion: None,
     }
 }
 
@@ -8091,11 +8496,17 @@ pub async fn get_artifact_metadata(
         let cache_lookup_path = cache_metadata_lookup_path(&artifact.path, &repo.format);
         let cache_meta = if repo.repo_type == RepositoryType::Remote {
             if let Some(proxy) = state.proxy_service.as_ref() {
-                proxy
-                    .get_cache_metadata(&key, &cache_lookup_path)
-                    .await
-                    .ok()
-                    .flatten()
+                match proxy.get_cache_metadata(&key, &cache_lookup_path).await {
+                    // #3832: report the expiry the proxy actually enforces
+                    // under the current TTL, not the stamp from write time.
+                    Ok(Some(mut m)) => {
+                        m.expires_at = proxy
+                            .effective_cache_expires_at(&key, &cache_lookup_path, &m)
+                            .await;
+                        Some(m)
+                    }
+                    _ => None,
+                }
             } else {
                 None
             }
@@ -8113,7 +8524,10 @@ pub async fn get_artifact_metadata(
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
                 .flatten()
-                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v));
+                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::for_response(&v));
+        let last_promotion = fetch_last_promotions(&state.db, &[artifact.id], auth.as_ref())
+            .await
+            .remove(&artifact.id);
 
         return Ok(Json(ArtifactResponse {
             id: artifact.id,
@@ -8141,6 +8555,7 @@ pub async fn get_artifact_metadata(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin,
+            last_promotion,
         })
         .into_response());
     }
@@ -8277,6 +8692,7 @@ fn artifact_version_to_response(
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
         origin: None,
+        last_promotion: None,
     }
 }
 
@@ -8349,8 +8765,11 @@ pub async fn list_artifact_versions(
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
         (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
+        (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -8384,9 +8803,8 @@ pub async fn upload_artifact(
     // instead of relying on a request-body-limit layer. An object-storage
     // repository stages on its own backend rather than local disk (#3916),
     // unless something downstream needs the body as a local file.
-    let stage_on_backend = repo.storage_backend != "filesystem"
-        && !generic_upload_needs_local_body(&state, &repo_service, &repo, &path).await?;
-    let (staged, digests) = if stage_on_backend {
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
+    let (staged, digests) = if staging.on_backend(Some(&path)) {
         let (staged, digests) = proxy_helpers::stage_stream_on_backend(
             &state,
             &repo.storage_location(),
@@ -8430,9 +8848,9 @@ impl GenericStagedBody {
     }
 
     /// The staged body as a local file, for the consumers that read one (RPM
-    /// header parse, WASM plugins). [`generic_upload_needs_local_body`] keeps
-    /// those uploads on local scratch, so a backend-staged body never gets
-    /// here; it reads as an I/O error rather than a panic if it ever does.
+    /// header parse, WASM plugins). [`GenericStagingPlan`] keeps those uploads
+    /// on local scratch, so a backend-staged body never gets here; it reads as
+    /// an I/O error rather than a panic if it ever does.
     fn local_path(&self) -> std::io::Result<&std::path::Path> {
         match self {
             Self::Local(staged) => Ok(staged.path()),
@@ -8464,19 +8882,59 @@ impl GenericStagedBody {
     }
 }
 
-/// Whether a generic upload's body must be staged as a local file because a
-/// downstream consumer reads it from disk: the RPM header parse (#3801) or a
-/// WASM format plugin (#2517 plugin-input decision).
+/// Where a generic upload's body is staged (#3916): on the repository's own
+/// object-storage backend, unless the repository is filesystem-backed or a
+/// downstream consumer reads the body as a local file -- the RPM header parse
+/// (#3801) or a WASM format plugin (#2517 plugin-input decision).
+struct GenericStagingPlan {
+    format: crate::models::repository::RepositoryFormat,
+    location: Option<crate::storage::StorageLocation>,
+}
+
+impl GenericStagingPlan {
+    /// Resolve the plan for `repo`. `location` is `None` (always local) for a
+    /// filesystem repository or one with a WASM format plugin.
+    #[allow(clippy::result_large_err)]
+    async fn resolve(
+        state: &SharedState,
+        repo_service: &RepositoryService,
+        repo: &crate::models::repository::Repository,
+    ) -> std::result::Result<Self, Response> {
+        let object_storage = repo.storage_backend != "filesystem";
+        let plugin = object_storage && repo_has_wasm_format(state, repo_service, repo).await?;
+        Ok(Self {
+            format: repo.format.clone(),
+            location: (object_storage && !plugin).then(|| repo.storage_location()),
+        })
+    }
+
+    /// The backend to stage a body bound for `path` on, or `None` for local
+    /// scratch. A `path` not yet known (a multipart form can name it after the
+    /// file) is treated as possibly an `.rpm`, so an RPM repository spools.
+    fn backend_for(&self, path: Option<&str>) -> Option<&crate::storage::StorageLocation> {
+        let rpm_parse = match path {
+            Some(path) => super::upload::rpm_header_metadata_eligible(&self.format, path),
+            None => matches!(
+                self.format,
+                crate::models::repository::RepositoryFormat::Rpm
+            ),
+        };
+        self.location.as_ref().filter(|_| !rpm_parse)
+    }
+
+    fn on_backend(&self, path: Option<&str>) -> bool {
+        self.backend_for(path).is_some()
+    }
+}
+
+/// Whether `repo` has a registered WASM format plugin, which receives the
+/// whole upload body by value and so needs it as a local file.
 #[allow(clippy::result_large_err)]
-async fn generic_upload_needs_local_body(
+async fn repo_has_wasm_format(
     state: &SharedState,
     repo_service: &RepositoryService,
     repo: &crate::models::repository::Repository,
-    path: &str,
 ) -> std::result::Result<bool, Response> {
-    if super::upload::rpm_header_metadata_eligible(&repo.format, path) {
-        return Ok(true);
-    }
     let Some(registry) = &state.plugin_registry else {
         return Ok(false);
     };
@@ -8488,6 +8946,46 @@ async fn generic_upload_needs_local_body(
         Some(fk) => registry.has_format(&fk).await,
         None => false,
     })
+}
+
+/// Stage one multipart file field (#3916): on `backend` when given -- the
+/// field streams into a staging object through a bounded channel, since the
+/// backend's `put_stream` needs a `'static` stream and a field borrows its
+/// form -- else to a local scratch file. Digests are computed in the same
+/// pass either way.
+#[allow(clippy::result_large_err)]
+async fn stage_multipart_field(
+    state: &SharedState,
+    backend: Option<&crate::storage::StorageLocation>,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> std::result::Result<
+    (
+        GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    use futures::{SinkExt, StreamExt};
+    let Some(location) = backend else {
+        let (staged, digests) =
+            proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+        return Ok((GenericStagedBody::Local(staged), digests));
+    };
+    let (mut tx, rx) = futures::channel::mpsc::channel(2);
+    let forward = async move {
+        while let Some(chunk) = field.next().await {
+            let failed = chunk.is_err();
+            if tx.send(chunk).await.is_err() || failed {
+                break;
+            }
+        }
+    };
+    let ((), staged) = tokio::join!(
+        forward,
+        proxy_helpers::stage_stream_on_backend(state, location, rx)
+    );
+    let (staged, digests) = staged?;
+    Ok((GenericStagedBody::Backend(staged), digests))
 }
 
 /// Authorize a generic artifact write: resolve the repository and enforce the
@@ -8514,6 +9012,11 @@ async fn authorize_generic_upload(
     require_repo_action(auth, repo.id, "write", &state.permission_service)
         .await
         .map_err(|e| e.into_response())?;
+
+    // Hosted-only gate (#4420): the generic PUT and both multipart entry
+    // points refuse remote and virtual repositories with the same response the
+    // native publish routes give, before any byte is staged.
+    proxy_helpers::reject_write_if_not_hosted(repo.repo_type.as_str())?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
@@ -8609,11 +9112,13 @@ async fn persist_generic_staged_upload(
             auth.is_admin,
             auth.is_service_account,
         ) {
-        let prefix = match staged.local_path() {
-            Ok(local) => super::upload::read_rpm_header_prefix(local).await,
-            Err(e) => Err(e),
-        };
-        match prefix {
+        // The #3801 gate must not fail open: a `.rpm` that reached here staged
+        // on the backend means `GenericStagingPlan` disagreed with this check,
+        // which is a server bug, not a reason to skip the parse.
+        let local = staged
+            .local_path()
+            .map_err(|e| proxy_helpers::internal_error("RPM header parse needs a local body", e))?;
+        match super::upload::read_rpm_header_prefix(local).await {
             Ok(prefix) => {
                 let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
                 tokio::task::spawn_blocking(move || {
@@ -8816,6 +9321,7 @@ async fn persist_generic_staged_upload(
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
             origin: None,
+            last_promotion: None,
         }),
     )
         .into_response())
@@ -8862,12 +9368,15 @@ async fn upload_artifact_multipart_with_path(
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
-    let (staged, digests, filename) = stage_multipart_file(&state, multipart).await?;
-    let artifact_path = if path.is_empty() || path == "/" {
-        filename
-    } else {
-        path
-    };
+    // The URL path is the artifact path unless empty, when the uploaded file
+    // name is; either is known by the time the file field streams (#3916).
+    let url_path = (!path.is_empty() && path != "/").then_some(path);
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
+    let (staged, digests, filename) = stage_multipart_file(&state, multipart, |filename| {
+        staging.backend_for(Some(url_path.as_deref().unwrap_or(filename)))
+    })
+    .await?;
+    let artifact_path = url_path.unwrap_or(filename);
     upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
@@ -8879,7 +9388,7 @@ async fn upload_artifact_multipart_with_path(
         key,
         artifact_path,
         &headers,
-        GenericStagedBody::Local(staged),
+        staged,
         digests,
     )
     .await
@@ -8908,8 +9417,11 @@ async fn upload_artifact_multipart(
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
+    // The artifact path may arrive in a `path` field after the file, so the
+    // file stages before its path is known (#3916).
+    let staging = GenericStagingPlan::resolve(&state, &repo_service, &repo).await?;
     let (staged, digests, filename, custom_path) =
-        stage_multipart_file_and_path(&state, multipart).await?;
+        stage_multipart_file_and_path(&state, multipart, staging.backend_for(None)).await?;
     let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
@@ -8922,7 +9434,7 @@ async fn upload_artifact_multipart(
         key,
         artifact_path,
         &headers,
-        GenericStagedBody::Local(staged),
+        staged,
         digests,
     )
     .await
@@ -8953,16 +9465,18 @@ fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
     }
 }
 
-/// Stream the first file field of a multipart form to a bounded scratch file,
-/// computing SHA-256/SHA-1/MD5 in one pass (#2517). Never buffers the field in
-/// memory. Returns the staged scratch handle, its content digests, and the
-/// original filename.
-async fn stage_multipart_file(
+/// Stream the first file field of a multipart form to staging, computing
+/// SHA-256/SHA-1/MD5 in one pass (#2517). Never buffers the field in memory.
+/// `backend_for(filename)` picks the object-storage backend to stage on, or
+/// `None` for a bounded local scratch file (#3916). Returns the staged body,
+/// its content digests, and the original filename.
+async fn stage_multipart_file<'a>(
     state: &SharedState,
     mut multipart: Multipart,
+    backend_for: impl Fn(&str) -> Option<&'a crate::storage::StorageLocation>,
 ) -> std::result::Result<
     (
-        proxy_helpers::StagedUpload,
+        GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
         String,
     ),
@@ -8976,16 +9490,16 @@ async fn stage_multipart_file(
         // Accept any field that has a filename (i.e. a file upload)
         if let Some(filename) = field.file_name().map(|s| s.to_string()) {
             let (staged, digests) =
-                proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+                stage_multipart_field(state, backend_for(&filename), field).await?;
             return Ok((staged, digests, filename));
         }
     }
     Err(AppError::Validation("No file field found in multipart form".to_string()).into_response())
 }
 
-/// Streaming variant of the file+path extractor (#2517): spool the file field
-/// to a bounded scratch file (digests in one pass) and read the small optional
-/// `path` text field.
+/// Streaming variant of the file+path extractor (#2517): stage the file field
+/// on `backend` (or a bounded local scratch file when `None`, #3916), digests
+/// in one pass, and read the small optional `path` text field.
 ///
 /// Iterates the full form: a file field (one with a `filename`) is staged; a
 /// `path` field (any non-file field named `path`) yields the requested artifact
@@ -8993,9 +9507,10 @@ async fn stage_multipart_file(
 async fn stage_multipart_file_and_path(
     state: &SharedState,
     mut multipart: Multipart,
+    backend: Option<&crate::storage::StorageLocation>,
 ) -> std::result::Result<
     (
-        proxy_helpers::StagedUpload,
+        GenericStagedBody,
         crate::services::artifact_service::ContentDigests,
         String,
         Option<String>,
@@ -9015,8 +9530,7 @@ async fn stage_multipart_file_and_path(
         if let Some(filename) = filename {
             // File upload field
             if file.is_none() {
-                let (staged, digests) =
-                    proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+                let (staged, digests) = stage_multipart_field(state, backend, field).await?;
                 file = Some((staged, digests, filename));
             }
         } else if name.as_deref() == Some("path") {
@@ -10977,10 +11491,13 @@ pub async fn test_upstream(
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
     if response.status().is_success() || status == 404 {
+        let (upstream_url, upstream_url_has_credentials) =
+            upstream_url_for_response(Some(upstream_url));
         Ok(Json(serde_json::json!({
             "status": "ok",
             "upstream_status": status,
             "upstream_url": upstream_url,
+            "upstream_url_has_credentials": upstream_url_has_credentials,
         })))
     } else {
         Err(AppError::BadGateway(format!(
@@ -11167,6 +11684,198 @@ pub async fn delete_routing_rules(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Upstream filter CRUD (#840)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpstreamFilterResponse {
+    pub repository_key: String,
+    /// When non-empty, only paths matching at least one of these regexes are
+    /// fetched from upstream.
+    pub include_patterns: Vec<String>,
+    /// Paths matching any of these regexes are never fetched from upstream.
+    pub exclude_patterns: Vec<String>,
+    /// Whether a filter is enforced (`false` when none is configured). A
+    /// stored filter that can no longer be read is enforced as refuse-all, so
+    /// it reports `true` with `error` set and both lists empty.
+    pub active: bool,
+    /// Set when the stored filter is unusable (only possible after a direct
+    /// database edit): every upstream fetch for this repository is refused
+    /// until a valid filter is saved or the filter is deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl UpstreamFilterResponse {
+    fn new(repository_key: String, stored: upstream_filter::StoredUpstreamFilter) -> Self {
+        use upstream_filter::StoredUpstreamFilter as Stored;
+        let (filter, error) = match stored {
+            Stored::None => (UpstreamFilter::default(), None),
+            Stored::Valid(filter) => (filter, None),
+            Stored::Unusable(err) => (UpstreamFilter::default(), Some(err)),
+        };
+        Self {
+            repository_key,
+            active: !filter.is_empty() || error.is_some(),
+            include_patterns: filter.include_patterns,
+            exclude_patterns: filter.exclude_patterns,
+            error,
+        }
+    }
+}
+
+/// Resolve `key` to a Remote repository the caller administers. The upstream
+/// filter is a supply-chain control on the same tier as routing rules and the
+/// egress proxy (#2603), so reading and changing it both require the
+/// repository `admin` action.
+async fn upstream_filter_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+    write: bool,
+) -> Result<crate::models::repository::Repository> {
+    let auth = require_auth(auth)?;
+    auth.require_scope(if write {
+        "write:repositories"
+    } else {
+        "read:repositories"
+    })?;
+    let repo = load_remote_repo(state, &auth, key).await?;
+    if write {
+        let repo_service = RepositoryService::new(state.db.clone());
+        require_repo_write_access(&auth, &repo, &repo_service).await?;
+    }
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    Ok(repo)
+}
+
+/// Get the upstream filter of a remote repository
+#[utoipa::path(
+    get,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current upstream filter", body = UpstreamFilterResponse),
+        (status = 400, description = "Repository is not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    let repo = upstream_filter_repo(&state, auth, &key, false).await?;
+    let filter = upstream_filter::load_upstream_filter(&state.db, repo.id).await?;
+    Ok(Json(UpstreamFilterResponse::new(key, filter)))
+}
+
+/// Set the upstream filter of a remote repository
+///
+/// Restricts which paths this remote repository requests from its upstream.
+/// Patterns are regular expressions (Rust `regex` syntax) matched anywhere in
+/// the subject; anchor them with `^`/`$`. If `include_patterns` is non-empty a
+/// path must match one of them; a path matching any `exclude_patterns` entry
+/// is refused. A refused path answers 404 without contacting the upstream, and
+/// a virtual repository skips this member for it.
+///
+/// The subject is the path as it is sent upstream, relative to the upstream
+/// URL and without a leading `/`, query string included:
+/// - Maven, Debian, OCI (`v2/<name>/manifests/<ref>`), Go and similar: the
+///   repository layout path, e.g. `com/acme/lib/1.0/lib-1.0.jar`.
+/// - npm: package metadata uses the wire form `@scope%2Fname`, tarballs
+///   `@scope/name/-/name-1.0.0.tgz`, so a scope rule should match both
+///   (`^@acme(/|%2F)`).
+/// - Formats that download from another host (PyPI files on
+///   `files.pythonhosted.org`, cargo `dl` hosts, NuGet service URLs): the full
+///   absolute URL, unless it lies under the upstream URL.
+///
+/// Not filtered in this version: npm `/-/` passthroughs (search, attestations,
+/// ping) and npm audit, curation upstream sync, change feeds, and the admin
+/// `test-upstream` probe.
+///
+/// A proxy-cache entry for a refused path is served only while it is fresh:
+/// once it expires it is neither revalidated nor served stale, and answers 404
+/// like a miss (purge it with `cache/invalidate` to hide it immediately).
+/// Limits: 64 patterns per list, 512 bytes each, each list compiled to at most
+/// 64 KiB; subjects longer than 4 KiB are refused. Submitting two empty lists
+/// removes the filter. Changes apply at once on every replica (a missed
+/// notification converges within 30 s).
+#[utoipa::path(
+    put,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpstreamFilter,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream filter saved", body = UpstreamFilterResponse),
+        (status = 400, description = "Invalid pattern, too many patterns, or not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<UpstreamFilter>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    // Authorize first; `save_upstream_filter` then validates (naming the list
+    // and index of a bad pattern) and persists, compiling the filter once.
+    let repo = upstream_filter_repo(&state, auth, &key, true).await?;
+    upstream_filter::save_upstream_filter(&state.db, repo.id, &payload).await?;
+    let stored = if payload.is_empty() {
+        upstream_filter::StoredUpstreamFilter::None
+    } else {
+        upstream_filter::StoredUpstreamFilter::Valid(payload)
+    };
+    Ok(Json(UpstreamFilterResponse::new(key, stored)))
+}
+
+/// Remove the upstream filter of a remote repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/upstream-filter",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream filter removed", body = UpstreamFilterResponse),
+        (status = 400, description = "Repository is not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_upstream_filter(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<UpstreamFilterResponse>> {
+    let repo = upstream_filter_repo(&state, auth, &key, true).await?;
+    upstream_filter::delete_upstream_filter(&state.db, repo.id).await?;
+    Ok(Json(UpstreamFilterResponse::new(
+        key,
+        upstream_filter::StoredUpstreamFilter::None,
+    )))
+}
+
 /// Load routing rules from repository_config for a given repository ID.
 /// Returns an empty Vec if no rules are configured.
 async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
@@ -11219,6 +11928,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_routing_rules,
         set_routing_rules,
         delete_routing_rules,
+        get_upstream_filter,
+        set_upstream_filter,
+        delete_upstream_filter,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
@@ -11250,6 +11962,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ArtifactVersionListResponse,
         MavenComponentResponse,
         DockerTagResponse,
+        LastPromotion,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -11263,6 +11976,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         SetRoutingRulesRequest,
         RoutingRulesResponse,
         RoutingRule,
+        UpstreamFilter,
+        UpstreamFilterResponse,
         DebianRepositoryConfig,
         DebianConfigPatch,
         crate::formats::debian::DebianMetadataStrategy,
@@ -11371,6 +12086,7 @@ mod tests {
 
     use super::*;
     use crate::error::AppError;
+    use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 
     // -----------------------------------------------------------------------
     // Storage stats: the whole-instance aggregate `instance_unique_bytes` is
@@ -12366,6 +13082,7 @@ mod tests {
             download_count: 0,
             created_at: chrono::Utc::now(),
             artifact_files: Vec::new(),
+            last_promotion: None,
         }
     }
 
@@ -12626,6 +13343,7 @@ mod tests {
             quarantine_status: NOT_QUARANTINED.to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         }
     }
 
@@ -13837,6 +14555,31 @@ mod tests {
     /// Asserts the real stored value survives, not just that a field exists:
     /// a hardcoded `"filesystem"` would pass a presence-only check while
     /// still lying about every object-storage repository.
+    /// #3070: only a stored key naming a different handler is exposed.
+    #[test]
+    fn custom_format_key_only_surfaces_plugin_keys() {
+        assert_eq!(
+            custom_format_key("generic", Some("rpm-custom".into())),
+            Some("rpm-custom".to_string())
+        );
+        assert_eq!(custom_format_key("generic", None), None);
+        assert_eq!(custom_format_key("maven", Some("maven".into())), None);
+        assert_eq!(custom_format_key("maven", Some("MAVEN".into())), None);
+        assert_eq!(custom_format_key("generic", Some("  ".into())), None);
+    }
+
+    /// #3070: `repo_to_response` is db-less, so the field starts absent and
+    /// is skipped on the wire until a handler fills it.
+    #[test]
+    fn repository_response_omits_absent_format_key() {
+        let mut resp = repo_to_response(sample_repo(), 0);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("format_key").is_none());
+        resp.format_key = Some("pypi-custom".into());
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["format_key"], "pypi-custom");
+    }
+
     #[test]
     fn repository_response_echoes_the_stored_storage_backend() {
         for backend in ["filesystem", "s3", "azure", "gcs"] {
@@ -13894,6 +14637,31 @@ mod tests {
         }
     }
 
+    /// #4423: the member figure is present as an explicit `null` for a
+    /// non-virtual repository and is a number for a virtual one, including
+    /// the response to creating it.
+    #[test]
+    fn member_storage_field_is_null_or_number_4423() {
+        let hosted = serde_json::to_value(repo_to_display_response(
+            sample_repo(),
+            new_repository_storage(&RepositoryType::Local),
+        ))
+        .unwrap();
+        assert_eq!(
+            hosted.get("member_storage_used_bytes"),
+            Some(&serde_json::Value::Null)
+        );
+        let mut virt = sample_repo();
+        virt.repo_type = RepositoryType::Virtual;
+        let created = serde_json::to_value(repo_to_display_response(
+            virt,
+            new_repository_storage(&RepositoryType::Virtual),
+        ))
+        .unwrap();
+        assert_eq!(created["storage_used_bytes"], 0);
+        assert_eq!(created["member_storage_used_bytes"], 0);
+    }
+
     #[test]
     fn test_repository_response_redacts_key_exposes_only_boolean() {
         // #2568: the response serializes a `has_trusted_gpg_key` boolean and
@@ -13914,6 +14682,37 @@ mod tests {
         resp2.has_trusted_gpg_key = false;
         let json2 = serde_json::to_string(&resp2).unwrap();
         assert!(json2.contains("\"has_trusted_gpg_key\":false"), "{json2}");
+    }
+
+    #[test]
+    fn test_repository_response_never_echoes_upstream_url_password() {
+        // #4452: a Remote created with `https://user:pass@host/...` must not
+        // hand the password back on create / get / list / update, which all
+        // render through `repo_to_response`.
+        let mut repo = sample_repo();
+        repo.repo_type = RepositoryType::Remote;
+        repo.upstream_url =
+            Some("https://alice:s3cret-4452@registry.example.com/anything/base".to_string());
+        let json = serde_json::to_value(repo_to_response(repo, 0)).unwrap();
+        let text = json.to_string();
+        assert!(!text.contains("s3cret-4452"), "password leaked: {text}");
+        assert!(!text.contains("alice"), "username leaked: {text}");
+        assert_eq!(
+            json["upstream_url"],
+            "https://registry.example.com/anything/base"
+        );
+        assert_eq!(json["upstream_url_has_credentials"], true);
+
+        // A credential-free URL is echoed verbatim with the flag false, and a
+        // repository without an upstream keeps `null`.
+        let mut plain = sample_repo();
+        plain.upstream_url = Some("https://registry.npmjs.org".to_string());
+        let json = serde_json::to_value(repo_to_response(plain, 0)).unwrap();
+        assert_eq!(json["upstream_url"], "https://registry.npmjs.org");
+        assert_eq!(json["upstream_url_has_credentials"], false);
+        let json = serde_json::to_value(repo_to_response(sample_repo(), 0)).unwrap();
+        assert!(json["upstream_url"].is_null());
+        assert_eq!(json["upstream_url_has_credentials"], false);
     }
 
     #[test]
@@ -14089,6 +14888,7 @@ mod tests {
             "p2",
             "bazel",
             "protobuf",
+            "pacman",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
@@ -14261,6 +15061,7 @@ mod tests {
             name: "My Repo".to_string(),
             description: Some("desc".to_string()),
             format: "maven".to_string(),
+            format_key: None,
             repo_type: "local".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
@@ -14268,8 +15069,10 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 1024,
+            member_storage_used_bytes: None,
             quota_bytes: Some(1048576),
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -14283,6 +15086,8 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -14429,7 +15234,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "maven-central",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         let comp = &result[0];
@@ -14477,7 +15288,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "maven-central",
+            "maven",
+        );
 
         assert_eq!(result.len(), 2);
         // BTreeMap ordering: "com.google.guava" < "org.junit.jupiter"
@@ -14508,7 +15325,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, "1.0.0");
@@ -14527,7 +15350,13 @@ mod tests {
         ];
 
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &artifacts,
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].artifact_id, "lib");
@@ -14546,17 +15375,87 @@ mod tests {
         downloads.insert(a1.id, 100);
         downloads.insert(a2.id, 25);
 
-        let result = group_maven_artifacts(&[a1, a2], &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &[a1, a2],
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].download_count, 125);
         assert_eq!(result[0].size_bytes, 10_500);
     }
 
+    /// #1758: a component reports the newest promotion among its files, and a
+    /// component with no promoted file reports none.
+    #[test]
+    fn test_group_maven_artifacts_folds_latest_promotion() {
+        let jar = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.jar", "lib-1.0.0.jar", 10);
+        let pom = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.pom", "lib-1.0.0.pom", 5);
+        let other = maven_artifact("org/example/other/2.0/other-2.0.jar", "other-2.0.jar", 1);
+        let promo = |at: i64, key: &str| LastPromotion {
+            target_repo_key: Some(key.to_string()),
+            promoted_at: chrono::DateTime::from_timestamp(at, 0).unwrap(),
+            status: "promoted".to_string(),
+        };
+        let mut promotions = std::collections::HashMap::new();
+        promotions.insert(jar.id, promo(100, "old-release"));
+        promotions.insert(pom.id, promo(200, "release"));
+
+        let result = group_maven_artifacts(
+            &[jar, pom, other],
+            &std::collections::HashMap::new(),
+            &promotions,
+            "staging",
+            "maven",
+        );
+        let lib = result.iter().find(|c| c.artifact_id == "lib").unwrap();
+        let other = result.iter().find(|c| c.artifact_id == "other").unwrap();
+        assert_eq!(lib.last_promotion, Some(promo(200, "release")));
+        assert_eq!(other.last_promotion, None);
+    }
+
+    /// #1758: rows are stamped by id; an unpromoted row is cleared to `None`.
+    #[test]
+    fn test_apply_last_promotions_by_id() {
+        let mut items = vec![
+            sample_artifact_response("a.txt", "a"),
+            sample_artifact_response("b.txt", "b"),
+        ];
+        items[1].last_promotion = Some(LastPromotion {
+            target_repo_key: None,
+            promoted_at: chrono::Utc::now(),
+            status: "promoted".to_string(),
+        });
+        let promoted = LastPromotion {
+            target_repo_key: Some("release".to_string()),
+            promoted_at: chrono::Utc::now(),
+            status: "promoted".to_string(),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(items[0].id, promoted.clone());
+        apply_last_promotions(&mut items, &map, |i| i.id, |i, p| i.last_promotion = p);
+        assert_eq!(items[0].last_promotion, Some(promoted));
+        assert_eq!(items[1].last_promotion, None);
+        let json = serde_json::to_value(&items[1]).unwrap();
+        assert!(
+            json["last_promotion"].is_null(),
+            "never-promoted serializes as null"
+        );
+    }
+
     #[test]
     fn test_group_maven_artifacts_empty_input() {
         let downloads = std::collections::HashMap::new();
-        let result = group_maven_artifacts(&[], &downloads, "repo", "maven");
+        let result = group_maven_artifacts(
+            &[],
+            &downloads,
+            &std::collections::HashMap::new(),
+            "repo",
+            "maven",
+        );
         assert!(result.is_empty());
     }
 
@@ -14576,6 +15475,7 @@ mod tests {
                 "junit-jupiter-api-5.11.0.jar".to_string(),
                 "junit-jupiter-api-5.11.0.pom".to_string(),
             ],
+            last_promotion: None,
         };
         let json = serde_json::to_string(&comp).unwrap();
         assert!(json.contains("\"group_id\":\"org.junit.jupiter\""));
@@ -14619,6 +15519,7 @@ mod tests {
             download_count: 0,
             created_at: chrono::Utc::now(),
             artifact_files: vec!["mylib-1.0.0.jar".to_string()],
+            last_promotion: None,
         };
         let resp = ArtifactListResponse {
             items: vec![],
@@ -14651,6 +15552,7 @@ mod tests {
             is_index: false,
             last_pushed_at: chrono::Utc::now(),
             scan_status: Some("completed".to_string()),
+            last_promotion: None,
         };
         let resp = ArtifactListResponse {
             items: vec![],
@@ -14973,6 +15875,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
@@ -15066,6 +15969,7 @@ mod tests {
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
             origin: None,
+            last_promotion: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
@@ -15570,6 +16474,7 @@ mod tests {
             name: "npm-age".to_string(),
             description: None,
             format: "npm".to_string(),
+            format_key: None,
             repo_type: "remote".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
@@ -15577,8 +16482,10 @@ mod tests {
             promotion_only: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: Some(true),
@@ -15592,6 +16499,8 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -17424,6 +18333,234 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #3916: both multipart upload routes into an object-storage repository
+    /// stage the file field on the repository's backend, like the raw `PUT`,
+    /// instead of a local scratch file. Proven the same way: local scratch is
+    /// unusable (STORAGE_PATH sits under a regular file), so before the fix
+    /// both routes failed with 500 on the scratch spool.
+    #[tokio::test]
+    async fn multipart_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-mp-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+
+        // The file field precedes the `path` field, so the no-path route
+        // stages before it knows the artifact path.
+        let form = |content: &str, path_field: &str| {
+            Bytes::from(format!(
+                "--XB\r\n\
+                 Content-Disposition: form-data; name=\"file\"; filename=\"tool.bin\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\
+                 {content}\r\n\
+                 --XB\r\n\
+                 Content-Disposition: form-data; name=\"path\"\r\n\r\n\
+                 {path_field}\r\n\
+                 --XB--\r\n"
+            ))
+        };
+        let cases = [
+            (
+                format!("/{repo_key}/artifacts"),
+                "multipart body without a URL path",
+                "tool/2.0/tool.bin",
+            ),
+            (
+                format!("/{repo_key}/artifacts/tool/3.0/tool.bin"),
+                "multipart body with a URL path",
+                "ignored",
+            ),
+        ];
+        for (uri, content, path_field) in cases {
+            let router = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::admin_auth(user_id, &username),
+            );
+            let (status, resp) = tdh::send(
+                router,
+                tdh::post(
+                    uri.clone(),
+                    "multipart/form-data; boundary=XB",
+                    form(content, path_field),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{uri}: a multipart upload into an S3-backed repository must not need \
+                 local scratch: {}",
+                String::from_utf8_lossy(&resp)
+            );
+            let (storage_key, sha256): (String, String) = sqlx::query_as(
+                "SELECT storage_key, checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(format!("{:x}", Sha256::digest(content.as_bytes())))
+            .fetch_one(&pool)
+            .await
+            .expect("artifact row");
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(
+                objects.get(&storage_key).map(|b| b.to_vec()),
+                Some(content.as_bytes().to_vec()),
+                "{uri}: the bytes ({sha256}) must land at the content-addressed key"
+            );
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "{uri}: the staging object must be deleted once promoted"
+            );
+        }
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM artifacts WHERE repository_id = $1 ORDER BY path")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(paths, vec!["tool/2.0/tool.bin", "tool/3.0/tool.bin"]);
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(tracked, 0, "the staging tracking rows go with the objects");
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: a multipart body over `max_upload_size_bytes` on the new
+    /// backend-staging path is refused with 413, and its partial staging
+    /// object and tracking row are cleaned up, not left for the sweep.
+    #[tokio::test]
+    async fn multipart_over_size_limit_on_backend_staging_leaves_nothing_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .max_upload_size_bytes = 1024;
+        let content = "x".repeat(4096);
+        let form = Bytes::from(format!(
+            "--XB\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n\
+             {content}\r\n\
+             --XB--\r\n"
+        ));
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::admin_auth(user_id, &username));
+        let (status, resp) = tdh::send(
+            router,
+            tdh::post(
+                format!("/{repo_key}/artifacts/big/1.0/big.bin"),
+                "multipart/form-data; boundary=XB",
+                form,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        // The discard is synchronous on this path; allow the armed-drop
+        // fallback a moment in case it ever is not.
+        for _ in 0..50 {
+            if mem.objects.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            mem.objects.lock().unwrap().is_empty(),
+            "no staging (or any) object may remain"
+        );
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+        )
+        .bind(&repo_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count staging rows");
+        assert_eq!(tracked, 0, "no staging tracking row may remain");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: which generic upload bodies stage on the repository's backend.
+    /// Filesystem repositories never do; an object-storage RPM repository
+    /// keeps `.rpm` packages (header parse) local, and a body whose path is
+    /// not yet known (a multipart form naming it after the file) local too.
+    #[test]
+    fn generic_staging_plan_backend_choice_3916() {
+        use crate::models::repository::RepositoryFormat;
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: "repo".to_string(),
+        };
+        let plan = |format: RepositoryFormat, location: Option<crate::storage::StorageLocation>| {
+            GenericStagingPlan { format, location }
+        };
+        let generic = plan(RepositoryFormat::Generic, Some(location.clone()));
+        assert!(generic.on_backend(Some("a/b.bin")));
+        assert!(generic.on_backend(None));
+        let rpm = plan(RepositoryFormat::Rpm, Some(location));
+        assert!(!rpm.on_backend(Some("x-1.0-1.noarch.rpm")));
+        assert!(rpm.on_backend(Some("repodata/repomd.xml")));
+        assert!(!rpm.on_backend(None));
+        let filesystem = plan(RepositoryFormat::Generic, None);
+        assert!(!filesystem.on_backend(Some("a/b.bin")));
+        assert!(!filesystem.on_backend(None));
+    }
+
     /// #3916: a generic staging object whose upload died before promoting or
     /// deleting it (crash, eviction, shutdown) is reclaimed by the hourly
     /// sweep once older than the threshold; a young one (possibly a live
@@ -17793,6 +18930,132 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #3767: which `npm_virtual_isolate_hosted_names` values are stored.
+    #[test]
+    fn npm_virtual_isolate_to_store_matrix() {
+        let (virt, local) = (RepositoryType::Virtual, RepositoryType::Local);
+        let (npm, pypi) = (RepositoryFormat::Npm, RepositoryFormat::Pypi);
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, Some(true)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            npm_virtual_isolate_to_store(&virt, &npm, Some(false)).unwrap(),
+            Some(false)
+        );
+        // An untouched (false) toggle elsewhere configures nothing: no-op.
+        assert_eq!(
+            npm_virtual_isolate_to_store(&local, &npm, Some(false)).unwrap(),
+            None
+        );
+        // Turning it ON where nothing reads it is rejected.
+        for (repo_type, format) in [(&local, &npm), (&virt, &pypi)] {
+            assert!(matches!(
+                npm_virtual_isolate_to_store(repo_type, format, Some(true)),
+                Err(AppError::Validation(_))
+            ));
+        }
+    }
+
+    /// #3767: the isolate toggle round-trips through create, update and the
+    /// response echo of an npm Virtual, and is refused up-front (no orphaned
+    /// row) on a repository that cannot use it.
+    #[tokio::test]
+    async fn npm_virtual_isolate_toggle_create_update_round_trip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("npm-isolate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+        let stored = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'npm_virtual_isolate_hosted_names'",
+                )
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query isolate toggle")
+            }
+        };
+
+        let virt_key = format!("npm-isolate-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &virt_key,
+                "npm isolate",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "virtual",
+                    "npm_virtual_isolate_hosted_names": true
+                }),
+            ),
+        )
+        .await
+        .expect("isolate toggle on an npm virtual create must succeed");
+        assert_eq!(created.npm_virtual_isolate_hosted_names, Some(true));
+        assert_eq!(stored(created.id).await.as_deref(), Some("true"));
+
+        let upd: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"npm_virtual_isolate_hosted_names": false}"#)
+                .expect("deserialize update payload");
+        let Json(updated) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(virt_key.clone()),
+            Json(upd),
+        )
+        .await
+        .expect("isolate toggle update must succeed");
+        assert_eq!(updated.npm_virtual_isolate_hosted_names, Some(false));
+        assert_eq!(stored(created.id).await.as_deref(), Some("false"));
+
+        // Refused up-front on an npm Local: no repository row is created.
+        let local_key = format!("npm-isolate-local-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "npm isolate local",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "npm_virtual_isolate_hosted_names": true
+                }),
+            ),
+        )
+        .await
+        .expect_err("isolate toggle on an npm local must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&local_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphan, 0,
+            "rejected create must not leave a repository behind"
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     /// The Debian counterpart of the npm gate above (#2460): the create dialog
     /// attaches `debian: {distribution_paths: [], components: [],
     /// architectures: []}` to EVERY Debian-format create — local, staging and
@@ -17942,6 +19205,95 @@ mod tests {
         tdh::cleanup(&pool, local.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4420: the generic PUT and both multipart upload entry points refuse a
+    /// remote repository with 405 and a virtual one with 400 (the native
+    /// publish-route responses), even for an admin, and store nothing; a
+    /// hosted repository still accepts the same request.
+    #[tokio::test]
+    async fn generic_uploads_reject_remote_and_virtual_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(user_id, &username);
+        let form = "--XB\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\
+                    \r\n\
+                    x\r\n\
+                    --XB--\r\n";
+        for (repo_type, want) in [
+            (
+                "remote",
+                Some((
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Cannot publish to a remote (proxy) repository",
+                )),
+            ),
+            (
+                "virtual",
+                Some((
+                    StatusCode::BAD_REQUEST,
+                    "Cannot publish to a virtual repository",
+                )),
+            ),
+            ("local", None),
+        ] {
+            let (repo_id, key, dir) = tdh::create_repo(&pool, repo_type, "generic").await;
+            let state = tdh::build_state(pool.clone(), &dir.to_string_lossy());
+            let put = upload_artifact(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/put.bin".to_string())),
+                HeaderMap::new(),
+                Body::from(Bytes::from_static(b"BYTES")),
+            )
+            .await;
+            let multipart = upload_artifact_multipart(
+                State(state.clone()),
+                Extension(Some(admin.clone())),
+                Path(key.clone()),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let with_path = upload_artifact_multipart_with_path(
+                State(state),
+                Extension(Some(admin.clone())),
+                Path((key.clone(), "pkg/1.0.0/mp.bin".to_string())),
+                HeaderMap::new(),
+                multipart_from_body("XB", form).await,
+            )
+            .await;
+            let stored: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or(-1);
+            tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut refusals = Vec::new();
+            for result in [put, multipart, with_path] {
+                refusals.push(match result {
+                    Ok(_) => None,
+                    Err(resp) => {
+                        let status = resp.status();
+                        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                            .await
+                            .expect("refusal body");
+                        Some((status, String::from_utf8_lossy(&body).into_owned()))
+                    }
+                });
+            }
+            let want_owned = want.map(|(status, text)| (status, text.to_string()));
+            assert_eq!(refusals, vec![want_owned; 3], "{repo_type}");
+            let expected_rows = if want.is_some() { 0 } else { 3 };
+            assert_eq!(stored, expected_rows, "{repo_type}");
+        }
+        tdh::cleanup(&pool, Uuid::nil(), user_id).await;
     }
 
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
@@ -19470,6 +20822,14 @@ mod tests {
     #[test]
     fn test_validate_cache_ttl_valid_maximum() {
         assert!(validate_cache_ttl(2_592_000));
+        // #2667: the ceiling is the immutable lifetime, not 30 days.
+        assert!(validate_cache_ttl(2_592_001));
+        assert!(validate_cache_ttl(MAX_CACHE_TTL_SECS));
+        assert_eq!(
+            MAX_CACHE_TTL_SECS,
+            crate::services::cache_classifier::Mutability::Immutable.write_ttl_secs()
+        );
+        assert!(cache_ttl_range_error().contains(&MAX_CACHE_TTL_SECS.to_string()));
     }
 
     #[test]
@@ -19484,7 +20844,8 @@ mod tests {
 
     #[test]
     fn test_validate_cache_ttl_invalid_too_large() {
-        assert!(!validate_cache_ttl(2_592_001));
+        assert!(!validate_cache_ttl(MAX_CACHE_TTL_SECS + 1));
+        assert!(!validate_cache_ttl(i64::MAX));
     }
 
     #[test]
@@ -19820,6 +21181,9 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("store cache_ttl_secs override");
+        // Written behind the API's back: drop the proxy's memoised "no
+        // override" the way `set_cache_ttl` does (#3832).
+        proxy.invalidate_cache_ttl_override(fx.repo_id).await;
         let override_reported = reported(&fx).await;
         let override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
 
@@ -21051,8 +22415,9 @@ mod tests {
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("AK_GUEST_ACCESS_ENABLED=false"),
-                    "message must name the operator switch: {msg}"
+                    msg.contains("AK_GUEST_ACCESS_ENABLED=false")
+                        && msg.contains("/api/v1/admin/settings/system"),
+                    "message must name both operator switches: {msg}"
                 );
                 assert!(
                     msg.contains("cannot be public"),
@@ -24023,7 +25388,7 @@ mod tests {
         );
         let mp = multipart_from_body("XB", body).await;
 
-        let (staged, digests, filename) = stage_multipart_file(&state, mp)
+        let (staged, digests, filename) = stage_multipart_file(&state, mp, |_| None)
             .await
             .expect("staging should succeed");
         assert_eq!(filename, "abc.bin");
@@ -24037,7 +25402,7 @@ mod tests {
         assert_eq!(digests.sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(digests.md5, "900150983cd24fb0d6963f7d28e17f72");
         // The bytes live in the scratch file, ready to be re-streamed.
-        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        let on_disk = tokio::fs::read(staged.local_path().unwrap()).await.unwrap();
         assert_eq!(on_disk, b"abc");
     }
 
@@ -24052,7 +25417,7 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let resp = match stage_multipart_file(&state, mp).await {
+        let resp = match stage_multipart_file(&state, mp, |_| None).await {
             Ok(_) => panic!("form without a file field must be rejected"),
             Err(resp) => resp,
         };
@@ -24075,14 +25440,15 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let (staged, digests, filename, custom_path) = stage_multipart_file_and_path(&state, mp)
-            .await
-            .expect("staging should succeed");
+        let (staged, digests, filename, custom_path) =
+            stage_multipart_file_and_path(&state, mp, None)
+                .await
+                .expect("staging should succeed");
         assert_eq!(filename, "guide.pdf");
         assert_eq!(custom_path.as_deref(), Some("docs/dir/"));
         assert_eq!(staged.size_bytes(), 8);
         assert_eq!(digests.sha256.len(), 64);
-        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        let on_disk = tokio::fs::read(staged.local_path().unwrap()).await.unwrap();
         assert_eq!(on_disk, b"pdfbytes");
     }
 
@@ -24097,7 +25463,7 @@ mod tests {
             "--XB--\r\n"
         );
         let mp = multipart_from_body("XB", body).await;
-        let resp = match stage_multipart_file_and_path(&state, mp).await {
+        let resp = match stage_multipart_file_and_path(&state, mp, None).await {
             Ok(_) => panic!("path-only form must be rejected"),
             Err(resp) => resp,
         };
@@ -24768,6 +26134,7 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
             cfg.guest_access_enabled = false;
+            cfg.guest_access_env_pinned = true;
         });
         let admin = admin_auth(user_id, &username);
 
@@ -24834,6 +26201,7 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
             cfg.guest_access_enabled = false;
+            cfg.guest_access_env_pinned = true;
         });
         let admin = admin_auth(user_id, &username);
 
@@ -25028,8 +26396,58 @@ mod tests {
             "plugin-backed repo must be stored as Generic format"
         );
 
-        // Verify the format_key was persisted to the DB (RepositoryResponse does
-        // not expose format_key directly).
+        // A plain generic repository alongside it, to pin that the field is
+        // omitted when no plugin key is in play (#3070).
+        let plain_key = format!("plain-generic-{}", Uuid::new_v4().simple());
+        let Json(plain_resp) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            make_create_request(&plain_key, "plain", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("create plain generic repo");
+
+        // #3070: the plugin key is echoed on create, GET and the listing.
+        let auth = Extension(Some(admin_auth(user_id, &username)));
+        let Json(got) = get_repository(State(state.clone()), auth.clone(), Path(repo_key.clone()))
+            .await
+            .expect("get plugin repo");
+        let Json(got_plain) =
+            get_repository(State(state.clone()), auth.clone(), Path(plain_key.clone()))
+                .await
+                .expect("get plain repo");
+        let list_query = |q: &str| ListRepositoriesQuery {
+            page: Some(1),
+            per_page: Some(100),
+            format: None,
+            repo_type: None,
+            q: Some(q.to_string()),
+            project: None,
+        };
+        let Json(listed) = list_repositories(
+            State(state.clone()),
+            auth.clone(),
+            Query(list_query(&repo_key)),
+        )
+        .await
+        .expect("list plugin repo");
+        let Json(listed_plain) =
+            list_repositories(State(state.clone()), auth, Query(list_query(&plain_key)))
+                .await
+                .expect("list plain repo");
+        let listed_fk = listed
+            .items
+            .iter()
+            .find(|r| r.key == repo_key)
+            .map(|r| r.format_key.clone());
+        let listed_plain_fk = listed_plain
+            .items
+            .iter()
+            .find(|r| r.key == plain_key)
+            .map(|r| r.format_key.clone());
+        let plain_json = serde_json::to_value(&got_plain).expect("serialize");
+
+        // Verify the format_key was persisted to the DB.
         let stored: Option<String> =
             sqlx::query_scalar("SELECT format_key FROM repositories WHERE key = $1")
                 .bind(&repo_key)
@@ -25038,8 +26456,8 @@ mod tests {
                 .expect("query format_key");
 
         // Cleanup after reading so we don't delete the row before asserting.
-        sqlx::query("DELETE FROM repositories WHERE key = $1")
-            .bind(&repo_key)
+        sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![repo_key.clone(), plain_key.clone()])
             .execute(&pool)
             .await
             .ok();
@@ -25055,6 +26473,16 @@ mod tests {
             stored.as_deref(),
             Some(format_key.as_str()),
             "plugin format key must be persisted to the repositories.format_key column"
+        );
+        assert_eq!(resp.format_key.as_deref(), Some(format_key.as_str()));
+        assert_eq!(got.format_key.as_deref(), Some(format_key.as_str()));
+        assert_eq!(listed_fk, Some(Some(format_key.clone())));
+        assert_eq!(plain_resp.format_key, None);
+        assert_eq!(got_plain.format_key, None);
+        assert_eq!(listed_plain_fk, Some(None));
+        assert!(
+            plain_json.get("format_key").is_none(),
+            "a plain generic repository must omit format_key entirely"
         );
     }
 
@@ -25160,6 +26588,181 @@ mod tests {
             matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
             "expected a Validation error mentioning 'disabled', got {err:?}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // oci_trusted_bearer_realms (#3591): validation + create/update/get plumbing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oci_trusted_realms_to_store_gates_on_remote() {
+        let list = vec!["https://Auth.Docker.io/".to_string()];
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&list)).unwrap(),
+            Some(vec!["https://auth.docker.io".to_string()])
+        );
+        // `[]` on a remote is an explicit clear.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[])).unwrap(),
+            Some(vec![])
+        );
+        // An untouched form (`[]`) on a non-remote is a no-op; a real list is a 400.
+        assert_eq!(
+            oci_trusted_realms_to_store(&RepositoryType::Local, Some(&[])).unwrap(),
+            None
+        );
+        let err = oci_trusted_realms_to_store(&RepositoryType::Virtual, Some(&list)).unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        // Invalid entries are rejected on a remote.
+        for bad in [
+            "http://auth.docker.io",
+            "https://*.docker.io",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                oci_trusted_realms_to_store(&RepositoryType::Remote, Some(&[bad.to_string()]))
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oci_trusted_realms_create_update_get_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::load_trusted_realms;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("realm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+
+        // A non-remote create carrying a list is rejected before any row is written.
+        let local_key = format!("realm-local-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &local_key,
+                "local",
+                "docker",
+                serde_json::json!({ "oci_trusted_bearer_realms": ["https://auth.docker.io"] }),
+            ),
+        )
+        .await
+        .expect_err("non-remote must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("remote")));
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&local_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            written, 0,
+            "a rejected create must not write the repository row"
+        );
+
+        let repo_key = format!("realm-remote-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &repo_key,
+                "Docker Hub",
+                "docker",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://registry-1.docker.io",
+                    "oci_trusted_bearer_realms": ["https://AUTH.docker.io/", "https://auth.docker.io"]
+                }),
+            ),
+        )
+        .await
+        .expect("remote create with trusted realms must succeed");
+        let docker = vec!["https://auth.docker.io".to_string()];
+        assert_eq!(created.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            docker
+        );
+
+        let Json(fetched) = get_repository(State(state.clone()), auth(), Path(repo_key.clone()))
+            .await
+            .expect("GET must succeed");
+        assert_eq!(fetched.oci_trusted_bearer_realms.as_ref(), Some(&docker));
+
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+
+        // Replace.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({
+                "oci_trusted_bearer_realms": ["https://gitlab.example.com:8443"]
+            })),
+        )
+        .await
+        .expect("update must succeed");
+        let gitlab = vec!["https://gitlab.example.com:8443".to_string()];
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // An invalid entry is rejected and leaves the stored list unchanged.
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(
+                serde_json::json!({ "oci_trusted_bearer_realms": ["http://gitlab.example.com"] }),
+            ),
+        )
+        .await
+        .expect_err("http realm must be rejected");
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("https")));
+        assert_eq!(
+            load_trusted_realms(&pool, created.id).await.unwrap(),
+            gitlab
+        );
+
+        // Omitting the field leaves it unchanged.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "description": "x" })),
+        )
+        .await
+        .expect("unrelated update must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms.as_ref(), Some(&gitlab));
+
+        // `[]` clears and the response omits the field.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "oci_trusted_bearer_realms": [] })),
+        )
+        .await
+        .expect("clear must succeed");
+        assert_eq!(resp.oci_trusted_bearer_realms, None);
+        assert!(load_trusted_realms(&pool, created.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     // -----------------------------------------------------------------------
@@ -25840,6 +27443,7 @@ mod tests {
             name: "ua-serde".to_string(),
             description: None,
             format: "maven".to_string(),
+            format_key: None,
             repo_type: "remote".to_string(),
             visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
@@ -25848,8 +27452,10 @@ mod tests {
             versioning_enabled: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
+            member_storage_used_bytes: None,
             quota_bytes: None,
             upstream_url: None,
+            upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
             quarantine_enabled: None,
@@ -25863,6 +27469,8 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
+            oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
@@ -27393,14 +29001,21 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
-        let listed: std::collections::HashMap<String, i64> = json["items"]
+        let listed: std::collections::HashMap<String, (i64, Option<i64>)> = json["items"]
             .as_array()
             .expect("items array")
             .iter()
             .map(|item| {
                 (
                     item["key"].as_str().expect("key").to_string(),
-                    item["storage_used_bytes"].as_i64().expect("storage figure"),
+                    (
+                        item["storage_used_bytes"].as_i64().expect("storage figure"),
+                        match item.get("member_storage_used_bytes") {
+                            Some(serde_json::Value::Null) => None,
+                            Some(figure) => Some(figure.as_i64().expect("member figure")),
+                            None => panic!("member_storage_used_bytes must always be present"),
+                        },
+                    ),
                 )
             })
             .collect();
@@ -27416,7 +29031,8 @@ mod apt_validation_tests {
             (hollow, "hollow", 0),
         ];
         for (id, tag, expected) in matrix {
-            let oracle = if tag == "virt" || tag == "hollow" {
+            let is_virtual = tag == "virt" || tag == "hollow";
+            let oracle = if is_virtual {
                 service
                     .get_virtual_storage_usage(id, &MemberVisibility::Unfiltered)
                     .await
@@ -27431,9 +29047,16 @@ mod apt_validation_tests {
                 oracle, expected,
                 "live-SUM oracle drifted from the seeded expectation for {tag}"
             );
+            // #4423: a virtual's own figure is 0; its members' union is the
+            // separate `member_storage_used_bytes`.
+            let figures = if is_virtual {
+                (0, Some(expected))
+            } else {
+                (expected, None)
+            };
             assert_eq!(
                 listed.get(&format!("{prefix}-{tag}")).copied(),
-                Some(expected),
+                Some(figures),
                 "ledger-backed listing figure must equal the live-SUM oracle for {tag}"
             );
         }
@@ -27953,9 +29576,16 @@ mod apt_validation_tests {
             String::from_utf8_lossy(&body)
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
-        detail["storage_used_bytes"]
+        virtual_member_figure_4423(&detail)
+    }
+
+    /// A virtual repository's member total from a response item, after
+    /// checking its own `storage_used_bytes` is 0 (#4423).
+    fn virtual_member_figure_4423(item: &serde_json::Value) -> i64 {
+        assert_eq!(item["storage_used_bytes"].as_i64(), Some(0), "{item}");
+        item["member_storage_used_bytes"]
             .as_i64()
-            .expect("detail storage figure")
+            .expect("virtual member storage figure")
     }
 
     /// Read `storage_used_bytes` for `key` from `GET /?q={prefix}` — the
@@ -27984,7 +29614,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(key))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("virtual repo present in listing")
     }
 
@@ -28390,8 +30020,8 @@ mod apt_validation_tests {
         );
         let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
         assert_eq!(
-            detail["storage_used_bytes"].as_i64(),
-            Some(3_000),
+            virtual_member_figure_4423(&detail),
+            3_000,
             "anonymous total must count the public member only, not the private one"
         );
 
@@ -28405,7 +30035,7 @@ mod apt_validation_tests {
             .expect("items array")
             .iter()
             .find(|item| item["key"].as_str() == Some(virt_key.as_str()))
-            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .map(virtual_member_figure_4423)
             .expect("public virtual present in anonymous listing");
         assert_eq!(
             listed, 3_000,
@@ -28571,9 +30201,7 @@ mod apt_validation_tests {
                     String::from_utf8_lossy(&body)
                 );
                 let resp: serde_json::Value = serde_json::from_slice(&body).expect("patch json");
-                resp["storage_used_bytes"]
-                    .as_i64()
-                    .expect("patch storage figure")
+                virtual_member_figure_4423(&resp)
             }
         };
 
@@ -28870,20 +30498,27 @@ mod content_encoding_forwarding_tests {
         assert_eq!(&body[..], &coded[..]);
     }
 
-    /// #4050: the artifact detail response exposes the immutable origin
-    /// record — for a proxied artifact, the fetch-through repository AND the
-    /// upstream that supplied the bytes.
-    #[tokio::test]
-    async fn test_get_artifact_metadata_exposes_origin_4050() {
+    /// Seed one proxied artifact into a fresh Remote whose stored
+    /// `upstream_url` is `stored_upstream`, then read it back through BOTH
+    /// artifact detail routes (`GET /repositories/{key}/artifacts/{path}` and
+    /// `GET /artifacts/{id}`). Returns the two JSON bodies and the repo key.
+    async fn origin_detail_bodies(
+        stored_upstream: &str,
+    ) -> Option<(serde_json::Value, serde_json::Value, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
-            return;
-        };
+        let fx = tdh::Fixture::setup("remote", "generic").await?;
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
-        tdh::seed_artifact(
+        // The origin fill trigger copies the repositories row's upstream_url.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(stored_upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+        let artifact_id = tdh::seed_artifact(
             &fx.state,
             &fx.pool,
-            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            &fx.repo_info("remote", Some(stored_upstream)),
             "org/origin/1.0/origin-1.0.bin",
             "org/origin/1.0/origin-1.0.bin",
             "origin",
@@ -28905,22 +30540,112 @@ mod content_encoding_forwarding_tests {
             Default::default(),
         )
         .await;
+        let by_id = crate::api::handlers::artifacts::get_artifact(
+            axum::extract::State(fx.state.clone()),
+            Extension(None),
+            axum::extract::Path(artifact_id),
+        )
+        .await;
+        let repo_key = fx.repo_key.clone();
         fx.teardown().await;
 
         let resp = result.unwrap_or_else(|e| panic!("metadata serve failed: {e:?}"));
         let (status, body, _headers) = tdh::collect_response(resp).await;
         assert_eq!(status, StatusCode::OK);
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_path: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        let by_id = serde_json::to_value(
+            by_id
+                .unwrap_or_else(|e| panic!("get_artifact failed: {e:?}"))
+                .0,
+        )
+        .expect("artifact json");
+        Some((by_path, by_id, repo_key))
+    }
+
+    /// #4050: the artifact detail response exposes the immutable origin
+    /// record — for a proxied artifact, the fetch-through repository AND the
+    /// upstream that supplied the bytes.
+    #[tokio::test]
+    async fn test_get_artifact_metadata_exposes_origin_4050() {
+        let Some((json, by_id, repo_key)) =
+            origin_detail_bodies("https://upstream.example.test").await
+        else {
+            return;
+        };
         assert_eq!(
             json["origin"]["v"], 1,
             "origin must be on the detail response: {json}"
         );
         assert_eq!(json["origin"]["kind"], "proxy");
-        assert_eq!(json["origin"]["repository_key"], fx.repo_key);
+        assert_eq!(json["origin"]["repository_key"], repo_key);
         assert_eq!(
             json["origin"]["upstream_url"], "https://upstream.example.test",
             "the detail response must name the upstream that supplied the bytes: {json}"
         );
+        assert_eq!(by_id["origin"], json["origin"], "{by_id}");
+    }
+
+    /// #4452: a Remote whose upstream_url embeds credentials stamps them into
+    /// the stored origin; neither artifact detail route may return them.
+    #[tokio::test]
+    async fn test_artifact_detail_origin_redacts_upstream_userinfo_4452() {
+        // Assembled at runtime so secret scanners do not flag a fixture.
+        let stored = format!("https://{}@upstream.example.test", "alice:s3cret");
+        let Some((by_path, by_id, _)) = origin_detail_bodies(&stored).await else {
+            return;
+        };
+        for json in [&by_path, &by_id] {
+            let text = json.to_string();
+            assert!(
+                !text.contains("s3cret") && !text.contains("alice"),
+                "leaked: {text}"
+            );
+            assert_eq!(
+                json["origin"]["upstream_url"],
+                "https://upstream.example.test"
+            );
+        }
+    }
+
+    /// #4452: the `test-upstream` probe reaches an upstream that requires the
+    /// URL's embedded Basic credentials, and its 200 body reports the URL
+    /// without them plus `upstream_url_has_credentials`.
+    #[tokio::test]
+    async fn test_test_upstream_redacts_upstream_userinfo_4452() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/base"))
+            .and(wiremock::matchers::basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let plain = format!("{}/base", server.uri());
+        let stored = plain.replacen("://", "://alice:s3cret@", 1);
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&stored)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let result = super::test_upstream(
+            axum::extract::State(fx.state.clone()),
+            Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+            axum::extract::Path(fx.repo_key.clone()),
+        )
+        .await;
+        fx.teardown().await;
+
+        let json = result
+            .unwrap_or_else(|e| panic!("test-upstream must reach the authed mock: {e:?}"))
+            .0;
+        assert_eq!(json["upstream_status"], 200, "{json}");
+        assert_eq!(json["upstream_url"], plain.as_str(), "{json}");
+        assert_eq!(json["upstream_url_has_credentials"], true, "{json}");
+        assert!(!json.to_string().contains("s3cret"), "leaked: {json}");
     }
 }
 
@@ -30131,5 +31856,159 @@ mod virtual_member_authz_tests {
             String::from_utf8_lossy(&granted_body)
         );
         assert!(granted_row);
+    }
+}
+
+/// `GET/PUT/DELETE /:key/upstream-filter` (#840).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod upstream_filter_endpoint_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+
+    fn uri(key: &str) -> String {
+        format!("/{key}/upstream-filter")
+    }
+
+    fn put(key: &str, body: serde_json::Value) -> Request<Body> {
+        tdh::put_json(uri(key), Bytes::from(body.to_string()))
+    }
+
+    fn delete(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri(key))
+            .body(Body::empty())
+            .expect("build DELETE request")
+    }
+
+    fn json(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).expect("JSON body")
+    }
+
+    #[tokio::test]
+    async fn upstream_filter_crud_is_admin_gated_and_validated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let filter = serde_json::json!({
+            "include_patterns": ["^com/fringe/"],
+            "exclude_patterns": ["-SNAPSHOT/"],
+        });
+
+        // A plain repository member may neither read nor change the filter.
+        let (member_id, member_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, member_id).await;
+        let member_app = || {
+            tdh::router_with_auth(
+                super::router(),
+                fx.state.clone(),
+                tdh::make_auth(member_id, &member_name),
+            )
+        };
+        let (member_get, _) = tdh::send(member_app(), tdh::get(uri(&key))).await;
+        let (member_put, _) = tdh::send(member_app(), put(&key, filter.clone())).await;
+        let (member_delete, _) = tdh::send(member_app(), delete(&key)).await;
+        let (anon_get, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri(&key))).await;
+        // Authorization precedes validation: an anonymous caller never reaches
+        // the regex compiler, so a bad pattern still answers 401, not 400.
+        let bad_filter = serde_json::json!({"exclude_patterns": ["ok", "(unclosed"]});
+        let (anon_bad_put, _) = tdh::send(
+            fx.router_anon(super::router()),
+            put(&key, bad_filter.clone()),
+        )
+        .await;
+
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+
+        let (empty_status, empty_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (bad_status, bad_body) = tdh::send(app(), put(&key, bad_filter)).await;
+        let (put_status, put_body) = tdh::send(app(), put(&key, filter.clone())).await;
+        let (get_status, get_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+
+        // A read-only API token of the same repository admin may read but not
+        // change or remove the filter.
+        let read_only = || {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_api_token = true;
+            auth.scopes = Some(vec!["read:repositories".to_string()]);
+            tdh::router_with_auth(super::router(), fx.state.clone(), auth)
+        };
+        let (ro_get, _) = tdh::send(read_only(), tdh::get(uri(&key))).await;
+        let (ro_put, _) = tdh::send(read_only(), put(&key, filter.clone())).await;
+        let (ro_delete, _) = tdh::send(read_only(), delete(&key)).await;
+
+        // A stored value that no longer parses (direct DB edit) is enforced as
+        // refuse-all, so GET must report it as active with an error.
+        sqlx::query(
+            "UPDATE repository_config SET value = 'not json' \
+             WHERE repository_id = $1 AND key = 'upstream_filter'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("corrupt stored filter");
+        let (corrupt_status, corrupt_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (del_status, del_body) = tdh::send(app(), delete(&key)).await;
+        let (after_status, after_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+
+        // The filter only makes sense on a Remote repository.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "maven").await;
+        tdh::grant_repo_access(&fx.pool, local_id, fx.user_id).await;
+        tdh::grant_repo_admin(&fx.pool, local_id, fx.user_id).await;
+        let (local_status, _) = tdh::send(app(), put(&local_key, filter.clone())).await;
+
+        tdh::cleanup_member_repo(&fx.pool, local_id, &local_dir).await;
+        tdh::cleanup_user(&fx.pool, member_id).await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_get, StatusCode::FORBIDDEN);
+        assert_eq!(member_put, StatusCode::FORBIDDEN);
+        assert_eq!(member_delete, StatusCode::FORBIDDEN);
+        assert_eq!(anon_get, StatusCode::UNAUTHORIZED);
+        assert_eq!(anon_bad_put, StatusCode::UNAUTHORIZED);
+        assert_eq!(ro_get, StatusCode::OK);
+        assert_eq!(ro_put, StatusCode::FORBIDDEN);
+        assert_eq!(ro_delete, StatusCode::FORBIDDEN);
+        assert_eq!(corrupt_status, StatusCode::OK);
+        let corrupt = json(&corrupt_body);
+        assert_eq!(corrupt["active"], true, "{corrupt}");
+        assert!(
+            corrupt["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{corrupt}"
+        );
+
+        assert_eq!(empty_status, StatusCode::OK);
+        assert_eq!(json(&empty_body)["active"], false);
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        let bad = String::from_utf8_lossy(&bad_body);
+        assert!(bad.contains("exclude_patterns[1]"), "{bad}");
+
+        assert_eq!(put_status, StatusCode::OK);
+        let put_json = json(&put_body);
+        assert_eq!(put_json["active"], true);
+        assert_eq!(put_json["repository_key"], key.as_str());
+        assert_eq!(get_status, StatusCode::OK);
+        let got = json(&get_body);
+        assert_eq!(got["include_patterns"], filter["include_patterns"]);
+        assert_eq!(got["exclude_patterns"], filter["exclude_patterns"]);
+        assert_eq!(got["active"], true);
+        assert!(got.get("error").is_none(), "{got}");
+
+        assert_eq!(del_status, StatusCode::OK);
+        assert_eq!(json(&del_body)["active"], false);
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(json(&after_body)["active"], false);
+        assert_eq!(json(&after_body)["include_patterns"], serde_json::json!([]));
+
+        assert_eq!(local_status, StatusCode::BAD_REQUEST);
     }
 }

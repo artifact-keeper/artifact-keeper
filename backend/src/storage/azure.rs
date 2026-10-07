@@ -30,6 +30,9 @@
 //! # SAS redirect downloads (Shared Key only)
 //! AZURE_REDIRECT_DOWNLOADS=true
 //! AZURE_SAS_EXPIRY=3600  # seconds, default 1 hour
+//! # Client-facing base URL for SAS redirects when AZURE_STORAGE_ENDPOINT is
+//! # not reachable by clients (#4417). Backend calls keep the internal endpoint.
+//! AZURE_STORAGE_PUBLIC_ENDPOINT=https://blobs.example.com
 //!
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
@@ -49,6 +52,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::storage::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use crate::storage::{
     PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
 };
@@ -80,6 +84,13 @@ pub struct AzureConfig {
     pub access_key: Option<String>,
     /// Optional custom endpoint (for Azure Government, China, etc.)
     pub endpoint: Option<String>,
+    /// Client-facing base URL for SAS redirect URLs
+    /// (`AZURE_STORAGE_PUBLIC_ENDPOINT`, #4417). Replaces the account base URL
+    /// in the URLs handed to clients only; the SAS signature covers the
+    /// account, container and blob names, not the host, so the same token
+    /// validates through it. May carry a path (path-style endpoints such as
+    /// Azurite put the account name there).
+    pub public_endpoint: Option<String>,
     /// Enable redirect downloads via SAS URLs (requires access key)
     pub redirect_downloads: bool,
     /// SAS URL expiry duration
@@ -103,6 +114,8 @@ impl AzureConfig {
         let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY").ok();
 
         let endpoint = std::env::var("AZURE_STORAGE_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("AZURE_STORAGE_PUBLIC_ENDPOINT", EndpointPath::Allowed)?;
 
         let redirect_downloads = std::env::var("AZURE_REDIRECT_DOWNLOADS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -121,6 +134,7 @@ impl AzureConfig {
             container_name,
             access_key,
             endpoint,
+            public_endpoint,
             redirect_downloads,
             sas_expiry,
             path_format,
@@ -514,7 +528,20 @@ impl AzureBackend {
 
     /// Get the full URL for a blob
     fn blob_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.base_url(), self.config.container_name, key)
+        Self::blob_url_on(&self.base_url(), &self.config.container_name, key)
+    }
+
+    fn blob_url_on(base: &str, container: &str, key: &str) -> String {
+        format!("{}/{}/{}", base, container, key)
+    }
+
+    /// Base URL for the SAS URLs handed to clients: the public endpoint when
+    /// one is configured (#4417), otherwise the same base the backend uses.
+    fn presented_base_url(&self) -> String {
+        self.config
+            .public_endpoint
+            .clone()
+            .unwrap_or_else(|| self.base_url())
     }
 
     fn append_query(mut url: String, query: &str) -> String {
@@ -973,6 +1000,18 @@ impl AzureBackend {
         expires_in: Duration,
         signed_permissions: &str,
     ) -> Result<String> {
+        self.generate_sas_token_at(key, expires_in, signed_permissions, Utc::now())
+    }
+
+    /// [`Self::generate_sas_token_with_permissions`] for an explicit issue
+    /// time, so tests can pin the otherwise clock-derived `st`/`se`.
+    fn generate_sas_token_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        signed_permissions: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
         let decoded_key = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => decoded_key,
             AzureAuthMode::TokenCredential { .. } => {
@@ -983,7 +1022,6 @@ impl AzureBackend {
             }
         };
 
-        let now = Utc::now();
         let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
         // Backdate the start time to tolerate clock skew between this host
         // and the Azure storage service (Azure's documented guidance is a
@@ -1045,6 +1083,24 @@ impl AzureBackend {
     pub fn generate_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
         let sas_token = self.generate_sas_token(key, expires_in)?;
         Ok(format!("{}?{}", self.blob_url(key), sas_token))
+    }
+
+    /// SAS URL for a client redirect: same token as [`Self::generate_sas_url`],
+    /// on [`Self::presented_base_url`]. Backend-internal reads keep
+    /// `generate_sas_url` so they never leave the internal endpoint.
+    fn generate_client_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        self.client_sas_url_at(key, expires_in, Utc::now())
+    }
+
+    fn client_sas_url_at(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
+        let sas_token = self.generate_sas_token_at(key, expires_in, "r", now)?;
+        let url = Self::blob_url_on(&self.presented_base_url(), &self.config.container_name, key);
+        Ok(format!("{}?{}", url, sas_token))
     }
 
     fn generate_sas_url_with_permissions(
@@ -1259,7 +1315,7 @@ impl StorageBackend for AzureBackend {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_put(&url, key, &content).await?;
@@ -1276,7 +1332,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let response = self.authorized_get(&url).await?;
@@ -1330,7 +1386,7 @@ impl StorageBackend for AzureBackend {
         Ok(bytes)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1366,7 +1422,7 @@ impl StorageBackend for AzureBackend {
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let mut response = self.authorized_get(&url).await?;
@@ -1410,7 +1466,7 @@ impl StorageBackend for AzureBackend {
         Ok(Box::pin(stream))
     }
 
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1504,7 +1560,7 @@ impl StorageBackend for AzureBackend {
         })
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let size = match self.size(source).await {
             Ok(size) => size,
@@ -1550,7 +1606,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1600,7 +1656,7 @@ impl StorageBackend for AzureBackend {
         Ok(false)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_delete(&url, key).await?;
@@ -1623,7 +1679,7 @@ impl StorageBackend for AzureBackend {
     /// revalidation. Returns `Ok(None)` for a missing blob or for a
     /// response without an `ETag` header so the freshness probe can fall
     /// through to the slow path without surfacing a backend error.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1650,7 +1706,7 @@ impl StorageBackend for AzureBackend {
         self.config.redirect_downloads && !self.is_rbac()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1660,7 +1716,7 @@ impl StorageBackend for AzureBackend {
             return Ok(None);
         }
 
-        let url = self.generate_sas_url(key, expires_in)?;
+        let url = self.generate_client_sas_url(key, expires_in)?;
 
         tracing::debug!(
             key = %key,
@@ -1686,7 +1742,7 @@ impl StorageBackend for AzureBackend {
     /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
     /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
     /// not O(file_size).
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::BufReader;
@@ -1755,7 +1811,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
@@ -1801,6 +1857,7 @@ mod tests {
                     .to_string(),
             ),
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: true,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
@@ -1813,6 +1870,7 @@ mod tests {
             container_name: "testcontainer".to_string(),
             access_key: None,
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: false,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
@@ -2136,6 +2194,113 @@ mod tests {
             header,
             "SharedKey devstoreaccount1:b0RVKgjLFrvt4fqAuLLg3E+hGrJPhIU4Qr31NgdGlC8="
         );
+    }
+
+    // ── AZURE_STORAGE_PUBLIC_ENDPOINT (#4417) ───────────────────────────
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_is_unchanged_4417() {
+        let mut config = create_test_config();
+        config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+        let backend = AzureBackend::new(config).await.unwrap();
+        let presigned = backend
+            .get_presigned_url("a/b.bin", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            presigned
+                .url
+                .starts_with("http://azurite.internal:10000/testaccount/testcontainer/a/b.bin?"),
+            "{}",
+            presigned.url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_uses_public_endpoint_4417() {
+        for (public, want_prefix) in [
+            (
+                "https://blobs.example.com",
+                "https://blobs.example.com/testcontainer/a/b.bin?",
+            ),
+            (
+                "http://dl.example.com:10000/testaccount",
+                "http://dl.example.com:10000/testaccount/testcontainer/a/b.bin?",
+            ),
+        ] {
+            let mut config = create_test_config();
+            config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+            config.public_endpoint = Some(public.to_string());
+            let backend = AzureBackend::new(config).await.unwrap();
+            let presigned = backend
+                .get_presigned_url("a/b.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                presigned.url.starts_with(want_prefix),
+                "{public}: {}",
+                presigned.url
+            );
+            // The SAS token signs account/container/blob, not the host: for a
+            // pinned issue time the client URL carries exactly the token the
+            // internal URL would, on the public base.
+            let now = Utc::now();
+            let token = backend
+                .generate_sas_token_at("a/b.bin", Duration::from_secs(60), "r", now)
+                .unwrap();
+            let client = backend
+                .client_sas_url_at("a/b.bin", Duration::from_secs(60), now)
+                .unwrap();
+            assert_eq!(client, format!("{want_prefix}{token}"));
+            assert_eq!(
+                backend.blob_url("a/b.bin"),
+                "http://azurite.internal:10000/testaccount/testcontainer/a/b.bin",
+                "backend-internal URLs keep the internal endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn test_azure_config_from_env_reads_public_endpoint_4417() {
+        let saved: Vec<(&str, Option<String>)> = [
+            "AZURE_STORAGE_ACCOUNT",
+            "AZURE_STORAGE_CONTAINER",
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+        std::env::set_var("AZURE_STORAGE_ACCOUNT", "acct");
+        std::env::set_var("AZURE_STORAGE_CONTAINER", "c");
+
+        std::env::set_var(
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+            "https://blobs.example.com/",
+        );
+        let config = AzureConfig::from_env().unwrap();
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://blobs.example.com")
+        );
+
+        std::env::set_var("AZURE_STORAGE_PUBLIC_ENDPOINT", "blobs.example.com");
+        let err = AzureConfig::from_env().expect_err("malformed");
+        assert!(
+            err.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT"),
+            "{err}"
+        );
+
+        std::env::remove_var("AZURE_STORAGE_PUBLIC_ENDPOINT");
+        assert!(AzureConfig::from_env().unwrap().public_endpoint.is_none());
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── SAS URL generation (Shared Key only) ─────────────────────────────
