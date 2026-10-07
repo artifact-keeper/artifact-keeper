@@ -749,6 +749,54 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/:subdir/:filename/attestation",
             get(get_attestation).put(put_attestation),
         )
+        .layer(axum::middleware::from_fn(private_cache_when_authenticated))
+}
+
+/// Downgrade `Cache-Control: public` to `private` on any response to a request
+/// that carried credentials.
+///
+/// The channel documents are built per caller (a virtual merges only the
+/// members the caller may read) and a private channel answers only with
+/// credentials, so a shared cache that stored such a response under `public`
+/// would hand one caller's view, or a private channel, to the next requester
+/// of the same URL. Anonymous responses keep `public`: they are by
+/// construction what any anonymous caller would get. The token-in-URL routers
+/// already send `private, no-store`.
+async fn private_cache_when_authenticated(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let authenticated = request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        || request.headers().contains_key(axum::http::header::COOKIE);
+    let mut response = next.run(request).await;
+    if authenticated {
+        privatize_cache_control(response.headers_mut());
+    }
+    response
+}
+
+/// Replace the `public` directive of a `Cache-Control` header with `private`.
+fn privatize_cache_control(headers: &mut HeaderMap) {
+    let Some(value) = headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    let rewritten: Vec<String> = value
+        .split(',')
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            if d.eq_ignore_ascii_case("public") {
+                "private".to_string()
+            } else {
+                d.to_string()
+            }
+        })
+        .collect();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rewritten.join(", ")) {
+        headers.insert(CACHE_CONTROL, v);
+    }
 }
 
 /// Router for token-authenticated conda endpoints, mounted at `/conda/t`.
@@ -15490,6 +15538,47 @@ mod virtual_channel_tests {
         let h_doc: serde_json::Value = serde_json::from_slice(&h_body).unwrap();
         assert!(listed(&h_doc).is_empty());
         assert_eq!(h_doc["info"]["subdir"], "unknown");
+    }
+
+    #[test]
+    fn privatize_cache_control_only_swaps_public() {
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, "public, max-age=60".parse().unwrap());
+        privatize_cache_control(&mut h);
+        assert_eq!(h[CACHE_CONTROL], "private, max-age=60");
+        h.insert(CACHE_CONTROL, "no-store".parse().unwrap());
+        privatize_cache_control(&mut h);
+        assert_eq!(h[CACHE_CONTROL], "no-store");
+    }
+
+    /// F14: the same repodata URL is `public` anonymously and `private` when
+    /// the request carried credentials.
+    #[tokio::test]
+    async fn authenticated_repodata_is_not_publicly_cacheable() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let uri = format!("/{hosted_key}/noarch/repodata.json");
+        let (_, _, anon) = rig.get(uri.clone()).await;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .header("Authorization", "Bearer something")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let app = tdh::router_anon(router(), rig.state.clone());
+        let (status, _, authed) = tdh::send_with_headers(app, req).await;
+        rig.cleanup().await;
+
+        assert_eq!(anon[CACHE_CONTROL], "public, max-age=60");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(authed[CACHE_CONTROL], "private, max-age=60");
     }
 }
 
