@@ -73,14 +73,26 @@ re-capitalised VS Code asset type) share one cache entry and one decision. A
 path holding `?`, `#`, `;`, a control character or a stray `%` is always
 treated as a package.
 
-**Ambiguous upstream paths.** For every format, a Remote fetch whose relative
-upstream path contains `#`, a `;`, a control character or a `%` that is not a
-valid `%XX` escape in a path segment, or a `?` that does not start a non-empty
-query without `/`, is refused with `400` before any upstream request. Such a
-path could make the upstream answer for a different file than the one
-classified and cached. Valid escapes (npm's scoped `%2F`), Go's `!`
-case-escaping and absolute URLs taken from an upstream index (Helm, PyPI,
-npm) are unaffected.
+**Ambiguous proxied paths.** Two checks keep the upstream from answering for a
+different file than the one classified and cached, each a `400` before any
+upstream request:
+
+- *What the client sent.* On the npm tarball, PyPI file and Cargo download
+  routes, the generic download route's Remote arm, and (already before) the
+  Maven, sbt, NuGet and VS Code routes, a client path containing any `?`,
+  `#`, `;`, `\`, a control character or a `%` that is not a valid `%XX`
+  escape is refused. The format routes also refuse raw spaces; the generic
+  route allows them, since stored file names may contain them.
+- *The upstream path ProxyService builds.* Every relative upstream path a
+  Remote fetch sends, for every format, is refused if its path part contains
+  `#`, `;`, `\`, a control character, a stray `%` or a trailing space, or if
+  a `?` starts an empty query or one containing `/`. Queries a handler
+  appends itself (Ansible version pages, Conan search, OCI `tags/list`) pass.
+  Absolute URLs a handler builds or takes from an upstream index (Helm,
+  PyPI, npm, NuGet, the VS Code gallery) are not checked here; those
+  handlers validate the client's segments themselves before building them.
+
+Valid escapes (npm's scoped `%2F`) and Go's `!` case-escaping are unaffected.
 
 **Unreadable configuration.** If a repository's scan configuration cannot be
 read, the pull fails with a retryable `503` on every enforced format's Remote

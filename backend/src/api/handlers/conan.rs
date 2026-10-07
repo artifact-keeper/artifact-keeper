@@ -465,6 +465,13 @@ async fn check_credentials(
 }
 
 // ---------------------------------------------------------------------------
+/// The upstream search path for `pattern`, relative to the remote's base. The
+/// pattern is percent-encoded, so the query never carries a `/` (#4365 item 3:
+/// `ProxyService::check_upstream_fetch_path` accepts it).
+pub(crate) fn upstream_search_path(pattern: &str) -> String {
+    format!("v2/conans/search?q={}", urlencoding::encode(pattern))
+}
+
 // GET /conan/{repo_key}/v2/conans/search?q=pattern
 // ---------------------------------------------------------------------------
 
@@ -538,8 +545,7 @@ async fn search_recipes_from_remote(
     upstream_url: &str,
     pattern: &str,
 ) -> Vec<String> {
-    let encoded = urlencoding::encode(pattern);
-    let upstream_path = format!("v2/conans/search?q={}", encoded);
+    let upstream_path = upstream_search_path(pattern);
     match proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,

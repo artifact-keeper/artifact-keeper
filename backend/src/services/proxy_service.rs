@@ -22904,6 +22904,16 @@ mod upstream_fetch_path_tests {
         ] {
             assert!(check_upstream_fetch_path(ok).is_ok(), "{ok}");
         }
+        // The handler-built relative queries, from the handlers' own builders,
+        // with inputs that would put a `/` or a `#` in a naive query.
+        for built in [
+            crate::api::handlers::ansible::upstream_versions_page_path("ns", "name", 3),
+            crate::api::handlers::conan::upstream_search_path("zlib/1.*#rev"),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(100, Some("v1/+build#x")),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(10, None),
+        ] {
+            assert!(check_upstream_fetch_path(&built).is_ok(), "{built}");
+        }
     }
 
     #[test]

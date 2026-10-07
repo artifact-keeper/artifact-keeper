@@ -1186,6 +1186,19 @@ pub(crate) fn is_jvm_archive_name(filename: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// The `(groupId:artifactId, version)` a Maven download is curated as, both
+/// from the cache-normalized path (#4365 item 6), so every spelling the proxy
+/// cache serves as one entry is curated as one package. `None` for metadata,
+/// checksums and paths that name no coordinate.
+fn maven_curation_target(path: &str) -> Option<(String, Option<String>)> {
+    let pkg = crate::services::proxy_service::maven_proxy_package_name(path)?;
+    let version =
+        MavenHandler::parse_coordinates(crate::services::proxy_service::normalize_cache_path(path))
+            .ok()
+            .map(|c| c.version);
+    Some((pkg, version))
+}
+
 /// Refuse a Maven/sbt proxy path that the upstream request could read
 /// differently from the classified and cached path (#4100): a decoded `?`
 /// or `#` becomes a query or fragment when joined into the upstream URL,
@@ -1689,12 +1702,7 @@ async fn download(
     //
     // Both the name and the version come from the cache-normalized path
     // (#4365 item 6), so a trailing `/` cannot dodge a rule.
-    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
-        let version = crate::formats::maven::MavenHandler::parse_coordinates(
-            crate::services::proxy_service::normalize_cache_path(&path),
-        )
-        .ok()
-        .map(|c| c.version);
+    if let Some((pkg, version)) = maven_curation_target(&path) {
         proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
     }
 
@@ -11101,6 +11109,29 @@ mod serve_key_4365_tests {
                 assert_eq!(target.path, key, "{path}");
             }
         }
+    }
+
+    /// #4365 item 6: the curated package AND version come from the
+    /// cache-normalized path, so a trailing or doubled `/` names the same
+    /// curation target as the canonical spelling.
+    #[test]
+    fn curation_target_uses_the_cache_normalized_path() {
+        let expected = Some(("com.acme:widget".to_string(), Some("1.0".to_string())));
+        for path in [
+            "com/acme/widget/1.0/widget-1.0.jar",
+            "com/acme/widget/1.0/widget-1.0.jar/",
+            "/com/acme/widget/1.0/widget-1.0.jar//",
+        ] {
+            assert_eq!(maven_curation_target(path), expected, "{path}");
+        }
+        assert_eq!(
+            maven_curation_target("com/acme/widget/1.0/widget-1.0.jar.sha1/"),
+            None
+        );
+        assert_eq!(
+            maven_curation_target("com/acme/widget/maven-metadata.xml"),
+            None
+        );
     }
 }
 

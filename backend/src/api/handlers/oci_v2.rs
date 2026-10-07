@@ -11079,7 +11079,7 @@ fn build_tags_response_with_pagination(
 ///
 /// Requests one extra tag so this server can determine whether it should emit
 /// its own `Link` header while still returning at most `n` tags to the client.
-fn build_remote_tags_list_path(n: usize, last: Option<&str>) -> String {
+pub(crate) fn build_remote_tags_list_path(n: usize, last: Option<&str>) -> String {
     let mut path = format!("tags/list?n={}", n.saturating_add(1));
     if let Some(last) = last {
         path.push_str("&last=");
