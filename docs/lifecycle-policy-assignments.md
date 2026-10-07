@@ -48,16 +48,16 @@ Policies stored before these checks are not changed. On every start the backend
 logs one WARN per stored policy with a pattern PostgreSQL cannot compile or
 that uses `\b` / `\B`. A preview (`POST /api/v1/admin/lifecycle/{id}/preview`)
 lists the problems in `errors`, and stops with zero matches when a pattern
-cannot compile or a `match.version_pattern` uses `\b` / `\B`. A live run
-refuses (400) a policy whose protective pattern -- an `exclude.version_patterns`
-entry, or the `pattern` of `tag_pattern_keep` -- has such a problem, because it
-would delete what it was written to keep. It also refuses (400) a policy whose
-`match.version_pattern` uses `\b` / `\B`: "matches nothing" does not make a
-scope safe, since inside a negative lookahead such as `^(?!.*\bstable)` it
-makes the scope match every version. A live run of a policy with any pattern
+cannot compile or a selecting pattern -- `match.version_pattern`, or the
+`pattern` of `tag_pattern_delete` -- uses `\b` / `\B`. A live run refuses (400)
+a policy whose protective pattern -- an `exclude.version_patterns` entry, or
+the `pattern` of `tag_pattern_keep` -- has such a problem, because it would
+delete what it was written to keep. It also refuses (400) a policy whose
+selecting pattern uses `\b` / `\B`: "matches nothing" does not make a
+selector safe, since inside a negative lookahead such as `^(?!.*\bstable)` it
+selects every version or tag. A live run of a policy with any pattern
 PostgreSQL cannot compile is refused (400, naming the field) before it starts,
-rather than failing part-way. A `tag_pattern_delete` pattern with `\b` still
-runs; the preview and the startup WARN report it. Fix the policy with
+rather than failing part-way. Fix the policy with
 `PATCH /api/v1/admin/lifecycle/{id}`.
 
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept

@@ -226,18 +226,22 @@ pub(crate) struct StoredRegexProblem {
 }
 
 impl StoredRegexProblem {
-    /// The policy cannot run as stored, so a preview stops here: the pattern
-    /// does not compile, or it is a `match.version_pattern` with `\b`/`\B`,
-    /// which a run refuses (#4459, #4502). A selector that "matches nothing"
-    /// is not safe in general: inside a negative lookahead such as
-    /// `^(?!.*\bstable)` it makes the scope match EVERY version.
-    pub(crate) fn blocks_run(&self) -> bool {
-        self.issue == StoredRegexIssue::DoesNotCompile || self.is_match_word_boundary()
+    /// A policy of `policy_type` cannot run as stored, so a preview stops
+    /// here: the pattern does not compile, or it is a SELECTING pattern
+    /// (`match.version_pattern`, or the `pattern` of `tag_pattern_delete`)
+    /// with `\b`/`\B`, which a run refuses (#4459, #4502). A selector that
+    /// "matches nothing" is not safe in general: inside a negative lookahead
+    /// such as `^(?!.*\bstable)` it selects EVERY version or tag.
+    pub(crate) fn blocks_run(&self, policy_type: &str) -> bool {
+        self.issue == StoredRegexIssue::DoesNotCompile
+            || self.is_selector_word_boundary(policy_type)
     }
 
-    /// `match.version_pattern` with `\b`/`\B` (#4459).
-    fn is_match_word_boundary(&self) -> bool {
-        self.issue == StoredRegexIssue::WordBoundary && self.field == "match.version_pattern"
+    /// A selecting pattern of a `policy_type` policy with `\b`/`\B`.
+    fn is_selector_word_boundary(&self, policy_type: &str) -> bool {
+        self.issue == StoredRegexIssue::WordBoundary
+            && (self.field == "match.version_pattern"
+                || (policy_type == "tag_pattern_delete" && self.field == "pattern"))
     }
 
     /// A live run of a policy of `policy_type` must refuse this problem:
@@ -245,7 +249,7 @@ impl StoredRegexProblem {
     /// not compile is refused up front with a 400 naming the field, instead
     /// of reaching PostgreSQL mid-run as a 500 `DATABASE_ERROR` (#4504).
     pub(crate) fn refuses_live_run(&self, policy_type: &str) -> bool {
-        self.fails_open(policy_type) || self.blocks_run()
+        self.fails_open(policy_type) || self.blocks_run(policy_type)
     }
 
     /// The pattern PROTECTS artifacts in a policy of `policy_type` (an
@@ -330,7 +334,7 @@ pub async fn warn_invalid_lifecycle_regexes(db: &PgPool) {
                     policy_id = %id,
                     policy_name = %name,
                     "lifecycle policy has a regex PostgreSQL does not run as written; a live run \
-                     refuses it when the pattern protects artifacts (fix it with \
+                     refuses it when the pattern protects or selects artifacts (fix it with \
                      PATCH /api/v1/admin/lifecycle/{{id}}): {}",
                     messages.join("; ")
                 );

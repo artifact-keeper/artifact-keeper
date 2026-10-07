@@ -210,11 +210,13 @@ async fn stored_policy_regex_problems_are_reported_4461() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].issue, StoredRegexIssue::WordBoundary);
     assert!(found[0].message.contains(r"\y"), "{found:?}");
-    assert!(found[0].fails_open("max_age_days") && !found[0].blocks_run());
+    assert!(found[0].fails_open("max_age_days") && !found[0].blocks_run("max_age_days"));
     let found = problems_of(broken).expect("the uncompilable pattern is reported");
     assert_eq!(found[0].issue, StoredRegexIssue::DoesNotCompile);
     assert!(found[0].message.contains("PostgreSQL"), "{found:?}");
-    assert!(found[0].blocks_run() && !found[0].fails_open("tag_pattern_delete"));
+    assert!(
+        found[0].blocks_run("tag_pattern_delete") && !found[0].fails_open("tag_pattern_delete")
+    );
     // `\b` AND a syntax error: compiled first, so it is classed as
     // not compiling (the preview stops rather than erroring out later).
     let found = problems_of(both).expect("the \\b + syntax error pattern is reported");
@@ -336,9 +338,8 @@ async fn slow_regex_compile_is_bounded_by_the_timeout_4461() {
 
 /// A live run refuses a stored policy whose PROTECTIVE pattern (an
 /// exclusion, or the keep pattern of tag_pattern_keep) fails open, and one
-/// whose `match.version_pattern` uses `\b` (#4459, #4502); a
-/// `tag_pattern_delete` pattern with the same `\b` still runs. Nothing stored
-/// is changed.
+/// whose selecting pattern (`match.version_pattern`, or the `pattern` of
+/// tag_pattern_delete) uses `\b` (#4459, #4502). Nothing stored is changed.
 #[tokio::test]
 async fn live_run_refuses_fail_open_stored_patterns_4461() {
     let Some(pool) = crate::testing::try_pool_with(2).await else {
@@ -360,6 +361,7 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
             "max_age_days",
             json!({"days": 1, "match": {"version_pattern": r"\bsha"}}),
         ),
+        ("tag_pattern_delete", json!({"pattern": r"\btmp"})),
     ];
     for (policy_type, config) in refused {
         let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
@@ -368,15 +370,6 @@ async fn live_run_refuses_fail_open_stored_patterns_4461() {
             other => panic!("{config}: expected a refusal, got {other:?}"),
         }
         assert_eq!(service.get_policy(id).await.unwrap().config, config);
-        service.delete_policy(id).await.expect("cleanup");
-    }
-    let report_only = [("tag_pattern_delete", json!({"pattern": r"\btmp"}))];
-    for (policy_type, config) in report_only {
-        let id = insert_unvalidated(&pool, policy_type, config.clone()).await;
-        service
-            .execute_policy(id, false)
-            .await
-            .unwrap_or_else(|e| panic!("{config}: a selecting pattern still runs: {e}"));
         service.delete_policy(id).await.expect("cleanup");
     }
 }
@@ -461,7 +454,7 @@ fn live_run_refusal_covers_protective_and_unrunnable_patterns_4502() {
     };
     let m = refusal("max_age_days", &[exclusion]).expect("exclusion");
     assert!(m.contains("would protect nothing"), "{m}");
-    assert!(matcher.blocks_run());
+    assert!(matcher.blocks_run("max_age_days"));
     let m = refusal("max_age_days", &[matcher]).expect("match pattern");
     assert!(
         m.contains("match.version_pattern") && m.contains("cannot run this pattern"),
@@ -472,8 +465,14 @@ fn live_run_refusal_covers_protective_and_unrunnable_patterns_4502() {
     let m = refusal("tag_pattern_delete", &[broken]).expect("does not compile");
     assert!(m.contains("cannot run this pattern"), "{m}");
     assert!(refusal("tag_pattern_keep", std::slice::from_ref(&delete)).is_some());
-    assert!(!delete.blocks_run());
-    assert!(refusal("tag_pattern_delete", &[delete]).is_none());
+    // A `tag_pattern_delete` pattern with `\b` selects what to delete, like
+    // `match.version_pattern`, so it is refused for the same reason.
+    assert!(delete.blocks_run("tag_pattern_delete"));
+    let m = refusal("tag_pattern_delete", &[delete]).expect("delete pattern");
+    assert!(m.contains("cannot run this pattern"), "{m}");
+    // `pattern` is not a selector of other policy types.
+    let stray = problem("pattern", StoredRegexIssue::WordBoundary);
+    assert!(!stray.blocks_run("max_age_days"));
     assert!(refusal("max_age_days", &[]).is_none());
 }
 

@@ -1364,8 +1364,8 @@ impl LifecycleService {
         if dry_run {
             // Report every stored-regex problem in the preview, and stop when
             // the policy cannot run as stored (a pattern that does not
-            // compile, or a `\b` match pattern that a run refuses, #4502).
-            let blocked = problems.iter().any(|p| p.blocks_run());
+            // compile, or a `\b` selecting pattern that a run refuses, #4502).
+            let blocked = problems.iter().any(|p| p.blocks_run(&policy.policy_type));
             result
                 .errors
                 .extend(problems.into_iter().map(|p| p.message));
