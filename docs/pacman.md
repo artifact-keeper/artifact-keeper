@@ -57,6 +57,8 @@ kept in memory (up to 256 MiB in total) for as long as the set of packages it
 lists is unchanged, shared by every architecture name that selects the same
 packages, with at most one render in flight per repository; a publish, delete or signature upload is picked up on the
 next request, because the cache key is derived from the live package rows.
+Peer replication carries the file list inside the replicated metadata
+document, and the receiving peer moves it back into `pacman_file_lists`.
 
 ## Publishing
 

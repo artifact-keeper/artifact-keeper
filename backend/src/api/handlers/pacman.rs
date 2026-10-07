@@ -342,6 +342,51 @@ async fn load_file_lists(
     Ok(rows.into_iter().collect())
 }
 
+/// Split the `files` array out of a pacman metadata document, as a peer's
+/// replication payload carries it (`sync_worker` re-attaches the list, and a
+/// peer older than #4424 stores it there anyway), so it can be written to
+/// `pacman_file_lists` and never stored in `artifact_metadata`. Anything that
+/// is not a string (a JSON `null` in a hand-edited list) is skipped, since
+/// `pacman_file_lists.files` holds text only. A `files` value that is not an
+/// array is dropped.
+pub(crate) fn take_file_list(metadata: &mut serde_json::Value) -> Option<Vec<String>> {
+    let serde_json::Value::Array(items) = metadata.as_object_mut()?.remove("files")? else {
+        return None;
+    };
+    let total = items.len();
+    let files: Vec<String> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    if files.len() != total {
+        tracing::warn!(
+            skipped = total - files.len(),
+            "pacman file list: skipped entries that are not strings"
+        );
+    }
+    Some(files)
+}
+
+/// Store (or replace, on a re-sync of the same artifact) a package's list.
+pub(crate) async fn store_file_list(
+    db: &PgPool,
+    artifact_id: uuid::Uuid,
+    files: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pacman_file_lists (artifact_id, files) VALUES ($1, $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET files = EXCLUDED.files",
+    )
+    .bind(artifact_id)
+    .bind(files)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 /// The live artifact row behind one of `paths`, with its metadata.
 async fn find_package(
     db: &PgPool,
@@ -1010,6 +1055,21 @@ mod tests {
     }
 
     #[test]
+    fn take_file_list_splits_strings_out_of_the_document() {
+        let mut doc = serde_json::json!({"filename": "a", "files": ["usr/", null, 7, "usr/a"]});
+        assert_eq!(
+            take_file_list(&mut doc),
+            Some(vec!["usr/".to_string(), "usr/a".to_string()])
+        );
+        assert_eq!(doc, serde_json::json!({"filename": "a"}));
+        let mut odd = serde_json::json!({"files": "not-a-list"});
+        assert_eq!(take_file_list(&mut odd), None);
+        assert_eq!(odd, serde_json::json!({}));
+        assert_eq!(take_file_list(&mut serde_json::json!({"x": 1})), None);
+        assert_eq!(take_file_list(&mut serde_json::json!([1])), None);
+    }
+
+    #[test]
     fn path_helpers() {
         let f = "foo-1.0-1-x86_64.pkg.tar.zst";
         assert_eq!(
@@ -1566,6 +1626,74 @@ mod db_tests {
         let members = db_members(&files);
         assert_eq!(members[1].0, "legacy-1.0-1/files");
         assert_eq!(members[1].1, "%FILES%\nusr/\nusr/bin/legacy\n");
+        fx.teardown().await;
+    }
+
+    /// Push `{pkg}-1.0-1-any` through a chunked replication session (trusted
+    /// when `admin`) whose document carries a file list with a `null` entry.
+    async fn replicate(fx: &tdh::Fixture, pkg: &str, admin: bool) -> StatusCode {
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = admin;
+        let (file, payload) = build_package(pkg, "1.0-1", "any");
+        let extra = serde_json::json!({
+            "artifact_metadata_format": "pacman",
+            "artifact_metadata": {
+                "filename": file,
+                "arch": "any",
+                "pkginfo": {"pkgname": pkg, "pkgver": "1.0-1", "arch": "any"},
+                "files": ["usr/", null, format!("usr/share/{pkg}/data")],
+            },
+        });
+        fx.chunked_upload_as(auth, &format!("any/{file}"), &payload, extra, true)
+            .await
+            .0
+    }
+
+    /// #4424: a peer's replicated document carries the file list inside it
+    /// (re-attached by the sender's sync worker, or as a pre-#4424 peer
+    /// stored it). A trusted replication session moves it into
+    /// `pacman_file_lists`; an untrusted session's list is dropped. Neither
+    /// leaves `files` in `artifact_metadata`.
+    #[tokio::test]
+    async fn replicated_metadata_moves_the_file_list_out() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        assert!(replicate(&fx, "peer", true).await.is_success());
+        assert!(replicate(&fx, "forged", false).await.is_success());
+
+        let rows: Vec<(String, bool, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT a.name, am.metadata ? 'files', fl.files \
+             FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             LEFT JOIN pacman_file_lists fl ON fl.artifact_id = a.id \
+             WHERE a.repository_id = $1 ORDER BY a.path",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        let by_path: std::collections::HashMap<_, _> = rows
+            .into_iter()
+            .map(|(name, has_key, files)| (name, (has_key, files)))
+            .collect();
+        assert_eq!(by_path.len(), 2, "{by_path:?}");
+        for (_, (has_key, _)) in by_path.iter() {
+            assert!(!has_key, "files left in artifact_metadata: {by_path:?}");
+        }
+        let lists: Vec<_> = by_path.values().filter_map(|(_, f)| f.clone()).collect();
+        assert_eq!(
+            lists,
+            vec![vec!["usr/".to_string(), "usr/share/peer/data".to_string()]]
+        );
+
+        let (_, files) = get(&fx, "x86_64/myrepo.files").await;
+        let members = db_members(&files);
+        let peer = members
+            .iter()
+            .find(|(p, _)| p == "peer-1.0-1/files")
+            .expect("replicated package listed");
+        assert_eq!(peer.1, "%FILES%\nusr/\nusr/share/peer/data\n");
         fx.teardown().await;
     }
 

@@ -716,7 +716,14 @@ async fn claim_pending_sync_tasks(
             a.version AS artifact_version,
             a.path AS artifact_path,
             am.format AS artifact_metadata_format,
-            am.metadata AS artifact_metadata,
+            -- #4424: a pacman file list lives in pacman_file_lists; the
+            -- payload carries it inside the document, where a peer of any
+            -- version finds it (a current one moves it back out).
+            CASE
+                WHEN am.format = 'pacman' AND fl.files IS NOT NULL
+                    THEN am.metadata || jsonb_build_object('files', to_jsonb(fl.files))
+                ELSE am.metadata
+            END AS artifact_metadata,
             am.properties AS artifact_metadata_properties,
             CASE
                 WHEN p.version = a.version THEN p.description
@@ -743,6 +750,7 @@ async fn claim_pending_sync_tasks(
         JOIN artifacts a ON a.id = c.artifact_id
         JOIN repositories r ON r.id = a.repository_id
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        LEFT JOIN pacman_file_lists fl ON fl.artifact_id = a.id
         LEFT JOIN packages p
             ON p.repository_id = r.id
            AND p.name = a.name
@@ -4245,6 +4253,71 @@ mod tests {
         assert_eq!(status, "completed");
         assert!(token.is_none(), "completion must clear the claim");
 
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// #4424: a claimed pacman task carries its file list inside the
+    /// replicated metadata document, so the receiving peer's `.files` is
+    /// complete; other formats' documents are sent unchanged.
+    #[tokio::test]
+    async fn claimed_pacman_task_carries_its_file_list() {
+        let Some(f) = setup_claim_fixture(2).await else {
+            return;
+        };
+        let artifact_of = |task: Uuid| {
+            sqlx::query_scalar::<_, Uuid>("SELECT artifact_id FROM sync_tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&f.pool)
+        };
+        let (pacman, generic) = (
+            artifact_of(f.task_ids[0]).await.unwrap(),
+            artifact_of(f.task_ids[1]).await.unwrap(),
+        );
+        for (id, format, metadata) in [
+            (
+                pacman,
+                "pacman",
+                serde_json::json!({"filename": "p.pkg.tar"}),
+            ),
+            (
+                generic,
+                "maven",
+                serde_json::json!({"files": ["kept.class"]}),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(format)
+            .bind(metadata)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO pacman_file_lists (artifact_id, files) VALUES ($1, $2)")
+            .bind(pacman)
+            .bind(vec!["usr/".to_string(), "usr/bin/p".to_string()])
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let claimed = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        let metadata_of = |id: Uuid| {
+            claimed
+                .iter()
+                .find(|t| t.artifact_id == id)
+                .and_then(|t| t.artifact_metadata.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            metadata_of(pacman),
+            serde_json::json!({"filename": "p.pkg.tar", "files": ["usr/", "usr/bin/p"]})
+        );
+        assert_eq!(
+            metadata_of(generic),
+            serde_json::json!({"files": ["kept.class"]})
+        );
         teardown_claim_fixture(&f).await;
     }
 

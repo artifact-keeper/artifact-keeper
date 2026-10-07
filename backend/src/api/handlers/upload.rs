@@ -954,15 +954,33 @@ async fn complete_session_commit(
                 }
             }
         }
+        // #4424: a pacman file list lives in `pacman_file_lists`, never in
+        // the document. A trusted peer's list (re-attached by its sync
+        // worker, or left in place by a peer older than #4424) is moved
+        // there; an untrusted client's is dropped.
+        let pacman_files = if format == "pacman" {
+            super::pacman::take_file_list(&mut metadata).filter(|_| replication_trusted)
+        } else {
+            None
+        };
         let properties = session
             .artifact_metadata_properties
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
         let artifact_service = state.create_artifact_service(storage.clone());
-        if let Err(e) = artifact_service
+        let written = match artifact_service
             .set_metadata(artifact_id, format, metadata, properties)
             .await
         {
+            Ok(_) => match &pacman_files {
+                Some(files) => super::pacman::store_file_list(&state.db, artifact_id, files)
+                    .await
+                    .map_err(crate::error::AppError::from),
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
             UploadService::fail_committing(
                 &state.db,
                 &session,
