@@ -1094,6 +1094,17 @@ async fn upload_chart(
         .await
         .map_err(|e| proxy_helpers::internal_error("Database", e))?;
 
+    // Each row is admitted against the storage quotas in this transaction
+    // right before its INSERT, so the prov is admitted against usage that
+    // already includes the chart (#4422).
+    super::publish_quota::admit_publish_in_tx(
+        &mut tx,
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = proxy_helpers::insert_artifact_row(
         &mut tx,
         proxy_helpers::NewArtifact {
@@ -1111,25 +1122,36 @@ async fn upload_chart(
     .await?;
 
     let prov_artifact_id = match prov_put.as_ref() {
-        Some(prov_put) => Some(
-            // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
-            // signature, not package content; the chart row above is scanned.
-            proxy_helpers::insert_artifact_row(
+        Some(prov_put) => {
+            let prov_size = prov_put.bytes_written as i64;
+            super::publish_quota::admit_publish_in_tx(
                 &mut tx,
-                proxy_helpers::NewArtifact {
-                    repository_id: repo.id,
-                    path: &prov_artifact_path,
-                    name: chart_name,
-                    version: chart_version,
-                    size_bytes: prov_put.bytes_written as i64,
-                    checksum_sha256: &prov_put.checksum_sha256,
-                    content_type: PROV_CONTENT_TYPE,
-                    storage_key: &prov_storage_key,
-                    uploaded_by: user_id,
-                },
+                &state.db,
+                repo.id,
+                &prov_artifact_path,
+                prov_size,
             )
-            .await?,
-        ),
+            .await?;
+            Some(
+                // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
+                // signature, not package content; the chart row above is scanned.
+                proxy_helpers::insert_artifact_row(
+                    &mut tx,
+                    proxy_helpers::NewArtifact {
+                        repository_id: repo.id,
+                        path: &prov_artifact_path,
+                        name: chart_name,
+                        version: chart_version,
+                        size_bytes: prov_size,
+                        checksum_sha256: &prov_put.checksum_sha256,
+                        content_type: PROV_CONTENT_TYPE,
+                        storage_key: &prov_storage_key,
+                        uploaded_by: user_id,
+                    },
+                )
+                .await?,
+            )
+        }
         None => None,
     };
 

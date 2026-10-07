@@ -677,7 +677,13 @@ async fn insert_package_rows(
             super::internal_err_message("Failed to encode package metadata", &e),
         )
     })?;
-    let mut tx = db.begin().await.map_err(super::db_err)?;
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        db,
+        repository_id,
+        artifact.path,
+        artifact.size_bytes,
+    )
+    .await?;
     let artifact_id = proxy_helpers::insert_artifact_row(&mut tx, artifact).await?;
     sqlx::query(
         "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'pacman', $2)",

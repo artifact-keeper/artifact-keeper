@@ -712,6 +712,20 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     } = p;
     let content_type = content_type_for_artifact(artifact_path);
 
+    // Authoritative storage-quota admission, in the transaction of the row it
+    // admits (#4422). The client already has its 202, so a denial is recorded
+    // on the upload session as the scope's message.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
+    if let Some(scope) =
+        super::publish_quota::locked_quota_denial(&mut tx, db, repo_id, artifact_path, size_bytes)
+            .await
+            .map_err(|e| format!("database error: {e}"))?
+    {
+        return Err(scope.exceeded_message().to_string());
+    }
     let artifact = sqlx::query(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -732,9 +746,12 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     .bind(content_type)
     .bind(storage_key)
     .bind(user_id)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| format!("database error: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
 
     let artifact_id: Uuid = artifact.get("id");
 
@@ -1108,6 +1125,9 @@ async fn upload_image(
     // (504) even though the body was fully received (#1471/#1494). The
     // session row makes the async finalize observable: the client polls
     // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`.
+    // Refuse an over-quota image synchronously, while the staged body is
+    // still guarded and before the 202 (#4422).
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
     let storage_key = build_storage_key(&repo.id, &artifact_path);
     let session_id = Uuid::new_v4();
     // Fresh session, but it still carries a finalize lease so the background
@@ -2324,6 +2344,15 @@ async fn run_finalize(
     repo: &RepoInfo,
     p: &FinalizeParams,
 ) -> Result<Uuid, String> {
+    // Refuse an over-quota image before pushing its bytes to the backend
+    // (#4422); the authoritative admission runs with the row INSERT.
+    if let Some(scope) =
+        super::publish_quota::preflight_quota_denial(&state.db, p.repo_id, p.size_bytes)
+            .await
+            .map_err(|e| format!("database error: {e}"))?
+    {
+        return Err(scope.exceeded_message().to_string());
+    }
     put_staged_upload_to_storage(
         state,
         repo,
