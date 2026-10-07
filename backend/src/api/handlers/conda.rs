@@ -4710,16 +4710,19 @@ async fn store_attestation(
         )
             .into_response()
     })?;
-    let allowlist: Vec<String> = attestation_verify::DEFAULT_ISSUER_ALLOWLIST
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // The operator trust policy (#4033): which OIDC issuers and identities a
+    // keyless bundle may carry, and which public keys may sign a key-based
+    // one (`cosign attest-blob --key`, for on-premises CI with no public
+    // OIDC issuer or transparency log).
+    let policy = attestation_verify::policy::CondaTrustPolicy::from_config(&state.config);
     let verdict = cep27::verify_conda_bundle(
         &attestation,
         cep27::CondaVerifyInput {
             artifact_digest,
             expected_filename: filename,
-            issuer_allowlist: &allowlist,
+            issuer_allowlist: &policy.issuers,
+            identity_allowlist: &policy.identities,
+            trusted_keys: &policy.keys,
         },
         &trust,
     )
@@ -14983,6 +14986,116 @@ mod attestation_verification_tests {
             2
         );
 
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4033: key-based attestations under the operator trust policy
+    // -----------------------------------------------------------------------
+
+    const COSIGN_BUNDLE: &str = include_str!(
+        "../../services/curation/attestation_verify/testdata/conda-key/acme-core-1.0-py_0.conda.cosign-bundle.json"
+    );
+    const COSIGN_PUB: &str =
+        include_str!("../../services/curation/attestation_verify/testdata/conda-key/cosign.pub");
+    const COSIGN_PKG: &[u8] = include_bytes!(
+        "../../services/curation/attestation_verify/testdata/conda-key/acme-core-1.0-py_0.conda"
+    );
+    const COSIGN_PKG_NAME: &str = "acme-core-1.0-py_0.conda";
+
+    async fn key_fixture(keys: Vec<String>) -> Option<tdh::Fixture> {
+        let fx = tdh::Fixture::setup("local", "conda").await?;
+        let repo = fx.repo_info("local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{}/noarch/{COSIGN_PKG_NAME}", fx.repo_id),
+            &format!("noarch/{COSIGN_PKG_NAME}"),
+            "acme-core",
+            "1.0",
+            "application/octet-stream",
+            Bytes::from_static(COSIGN_PKG),
+            fx.user_id,
+        )
+        .await;
+        let state = tdh::build_state_with(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), |c| {
+            c.conda_attestation_public_keys = keys
+        });
+        Some(tdh::Fixture { state, ..fx })
+    }
+
+    fn put_key_attestation(fx: &tdh::Fixture) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/noarch/{COSIGN_PKG_NAME}/attestation",
+                fx.repo_key
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(COSIGN_BUNDLE))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn key_based_attestation_verifies_and_records_the_key() {
+        let Some(fx) = key_fixture(vec![format!("acme-ci={COSIGN_PUB}")]).await else {
+            return;
+        };
+        let (status, body) = tdh::send(write_router(&fx), put_key_attestation(&fx)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a bundle signed by a configured key must verify: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let metadata = stored_metadata(&fx).await.expect("stored");
+        let record = &metadata[cep27::VERIFICATION_METADATA_KEY];
+        assert_eq!(record["state"], "verified", "{record}");
+        assert_eq!(record["method"], "sigstore-key");
+        assert_eq!(
+            record["statement_type"],
+            "https://in-toto.io/Statement/v0.1"
+        );
+        assert_eq!(record["identity"], "acme-ci");
+        assert_eq!(record["issuer"], "key:8ef972c8a32ae989");
+        assert_eq!(
+            record["key_fingerprint"],
+            "8ef972c8a32ae9895a41291a27819c5d87681024e8fd9c553bea38db5e0b93ec"
+        );
+        // repodata.json advertises the sidecar on the package's record.
+        let repodata = build_repodata(&fx.pool, fx.repo_id, &fx.repo_key, "noarch", false)
+            .await
+            .expect("repodata");
+        assert_eq!(
+            repodata["packages.conda"][COSIGN_PKG_NAME]["attestations_sha256"],
+            metadata[SIDECAR_SHA256_METADATA_KEY],
+            "{repodata}"
+        );
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn key_based_attestation_from_an_untrusted_key_is_refused() {
+        // A different (valid) key is configured; the bundle's key is not.
+        let other = sigstore::crypto::SigningScheme::ECDSA_P256_SHA256_ASN1
+            .create_signer()
+            .unwrap()
+            .to_sigstore_keypair()
+            .unwrap()
+            .public_key_to_pem()
+            .unwrap();
+        let Some(fx) = key_fixture(vec![other]).await else {
+            return;
+        };
+        let (status, body) = tdh::send(write_router(&fx), put_key_attestation(&fx)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("not a configured trusted key"), "{text}");
+        assert!(stored_metadata(&fx)
+            .await
+            .map(|m| m.get("attestation").is_none())
+            .unwrap_or(true));
         fx.teardown().await;
     }
 

@@ -206,6 +206,24 @@ fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
     secs
 }
 
+/// Parse a comma-separated environment variable into its trimmed, non-empty
+/// entries. Unset or empty yields an empty list.
+fn parse_comma_list_env(key: &str) -> Vec<String> {
+    parse_comma_list(env::var(key).ok().as_deref())
+}
+
+/// The pure half of [`parse_comma_list_env`].
+fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
 ///
 /// Whitespace around each entry is trimmed and empty entries are dropped.
@@ -608,6 +626,22 @@ pub struct Config {
     /// Fail-closed by default. Set `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`/
     /// `0` to accept unverified attestations in a trusted/dev environment.
     pub conda_attestation_require_verified: bool,
+
+    /// OIDC issuers a keyless CEP-27 bundle's certificate may name
+    /// (`CONDA_ATTESTATION_ISSUERS`, comma list). Empty means the default,
+    /// the GitHub Actions issuer.
+    pub conda_attestation_issuers: Vec<String>,
+
+    /// Certificate identity (SAN) patterns a keyless CEP-27 bundle must match
+    /// (`CONDA_ATTESTATION_IDENTITIES`, comma list, `*` wildcard). Empty
+    /// means any identity the issuer vouches for.
+    pub conda_attestation_identities: Vec<String>,
+
+    /// Public keys for key-based CEP-27 bundles
+    /// (`CONDA_ATTESTATION_PUBLIC_KEYS`, comma list of PEM file paths or
+    /// inline PEMs, each optionally `name=`-prefixed). See
+    /// `services::curation::attestation_verify::policy`.
+    pub conda_attestation_public_keys: Vec<String>,
 
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
@@ -1266,6 +1300,9 @@ redacted_debug!(Config {
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
+    show conda_attestation_issuers,
+    show conda_attestation_identities,
+    show conda_attestation_public_keys,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -1409,6 +1446,9 @@ impl Default for Config {
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -1649,6 +1689,9 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            conda_attestation_issuers: parse_comma_list_env("CONDA_ATTESTATION_ISSUERS"),
+            conda_attestation_identities: parse_comma_list_env("CONDA_ATTESTATION_IDENTITIES"),
+            conda_attestation_public_keys: parse_comma_list_env("CONDA_ATTESTATION_PUBLIC_KEYS"),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")

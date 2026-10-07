@@ -312,6 +312,7 @@ pub mod approval;
 pub mod artifact_labels;
 pub mod artifact_presence;
 pub mod artifacts;
+pub mod attestations;
 pub mod auth;
 pub mod banners;
 pub mod bazel;

@@ -1098,6 +1098,14 @@ fn api_v1_routes(
             "/sbom/",
             get(|| async { axum::response::Redirect::permanent("/api/v1/sbom") }),
         )
+        // CEP-27 attestation trust policy (#4033): any authenticated caller.
+        .nest(
+            "/attestations",
+            handlers::attestations::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Promotion routes with auth middleware (staging -> release workflow)
         .nest(
             "/promotion",
