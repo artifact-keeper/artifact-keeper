@@ -884,6 +884,22 @@ async fn insert_promoted_artifact_row(
         origin
     )
     .execute(db)
+    .await?;
+
+    // Carry the format metadata document across (F9). The copy is a new
+    // artifact row, and everything format handlers serve about it is read
+    // from `artifact_metadata` keyed by THAT row: a conda channel builds each
+    // repodata record (depends, constrains, md5, license, the CEP-50
+    // attestation sidecar and its verdict) from it. Without the copy a
+    // promoted package was served with no dependencies and no attestation.
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         SELECT $1, format, metadata FROM artifact_metadata WHERE artifact_id = $2 \
+         ON CONFLICT (artifact_id) DO NOTHING",
+    )
+    .bind(new_artifact_id)
+    .bind(artifact.id)
+    .execute(db)
     .await
     .map(|_| ())
 }
@@ -4867,6 +4883,131 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- F9: promotion carries the artifact's metadata --------------------
+
+        /// Seed a conda artifact with the metadata document a conda upload and
+        /// an attestation upload write (depends, md5, attestation + verdict).
+        async fn make_conda_artifact_with_metadata(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            filename: &str,
+        ) -> (Uuid, serde_json::Value) {
+            let path = format!("noarch/{filename}");
+            let id = make_maven_artifact(pool, repo_id, storage, &path).await;
+            let metadata = serde_json::json!({
+                "name": "acme-core",
+                "version": "1.0",
+                "build": "py_0",
+                "subdir": "noarch",
+                "depends": ["python >=3.10", "rich"],
+                "md5": "0123456789abcdef0123456789abcdef",
+                "license": "BSD-3-Clause",
+                "attestation": {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"},
+                "attestation_verification": {"state": "verified", "method": "sigstore-key"},
+            });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'conda', $2)",
+            )
+            .bind(id)
+            .bind(&metadata)
+            .execute(pool)
+            .await
+            .expect("insert conda metadata");
+            (id, metadata)
+        }
+
+        async fn target_metadata(
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+        ) -> Option<serde_json::Value> {
+            sqlx::query_scalar(
+                "SELECT am.metadata FROM artifacts a \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+            )
+            .bind(repo)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .expect("query target metadata")
+        }
+
+        /// F9: a promoted conda package keeps its `depends`, `md5` and
+        /// attestation. The copy is a new `artifacts` row, and the target
+        /// channel's repodata is built from that row's `artifact_metadata`,
+        /// so a copy without it is served with no dependencies at all.
+        #[tokio::test]
+        async fn test_promotion_copies_artifact_metadata() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (src, src_key, sdir) = tdh::create_repo(&pool, "staging", "conda").await;
+            let (tgt, tgt_key, tdir) = tdh::create_repo(&pool, "local", "conda").await;
+            let user = make_admin(&pool, "f9meta").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (single, metadata) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-core-1.0-py_0.conda")
+                    .await;
+            let (bulk, _) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-util-1.0-py_0.conda")
+                    .await;
+
+            let single_res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), single)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("single promote");
+            let bulk_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![bulk],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote");
+            let single_meta = target_metadata(&pool, tgt, "noarch/acme-core-1.0-py_0.conda").await;
+            let bulk_meta = target_metadata(&pool, tgt, "noarch/acme-util-1.0-py_0.conda").await;
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(single_res.0.promoted, "{:?}", single_res.0.message);
+            assert_eq!(bulk_res.0.promoted, 1, "{:?}", bulk_res.0.results);
+            assert_eq!(
+                single_meta.as_ref(),
+                Some(&metadata),
+                "the promoted copy must carry the source's metadata"
+            );
+            let bulk_meta = bulk_meta.expect("bulk copy must carry metadata");
+            for key in [
+                "build",
+                "depends",
+                "md5",
+                "license",
+                "attestation",
+                "attestation_verification",
+            ] {
+                assert_eq!(bulk_meta[key], metadata[key], "bulk copy lost `{key}`");
+            }
         }
 
         // ---- promoted artifact must appear in the target's prefixes.txt ------
