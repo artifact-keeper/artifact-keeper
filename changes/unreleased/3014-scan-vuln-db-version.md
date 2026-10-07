@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#3014]
+---
+- **Scan results now record which vulnerability database the scan ran against, not only which scanner binary** (#3014). `scanner_version` named the binary (`trivy-0.71.2`), but the same binary returns different answers about identical bytes depending on how old its database is, so a scan against a stale database was indistinguishable from a fresh one and a reused (dedup) verdict silently inherited an unknown vintage. `scan_results` gains `vuln_db_version` and `vuln_db_published_at` (migration 259), returned on the scan API: grype reports `grype-db-<schema>` and its build time from `grype db status`, trivy reports `trivy-db-v<schema>` and its `UpdatedAt` through the scanner-adapter, and the dependency scanner, which queries live advisory APIs, reports `live:osv` (or `live:osv+ghsa`) stamped with the query time. A reused scan carries its source scan's database provenance. Both fields are NULL ("unknown", never "fresh") for scan types without a database, for scans recorded before this release, and for trivy until the scanner-adapter is upgraded to a release that reports its database metadata.

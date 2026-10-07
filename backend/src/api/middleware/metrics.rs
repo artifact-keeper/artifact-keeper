@@ -46,7 +46,9 @@ impl Drop for InFlightGuard {
 /// - `ak_http_responses_total` (counter): incremented after the response is
 ///   produced. Labels: `method`, `path`, `status`.
 /// - `ak_http_request_duration_seconds` (histogram): request latency in
-///   seconds. Labels: `method`, `path`, `status`.
+///   seconds. Labels: `method`, `path`, `status`. Exported with `_bucket`
+///   series (bounds in `metrics_service::HTTP_REQUEST_DURATION_BUCKETS`), not
+///   as a summary, so `histogram_quantile()` works across replicas (#3954).
 /// - `ak_http_requests_in_flight` (gauge): number of requests currently being
 ///   processed. Labels: `method`, `path`.
 ///
@@ -84,7 +86,7 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let status = response.status().as_u16().to_string();
 
     histogram!(
-        "ak_http_request_duration_seconds",
+        crate::services::metrics_service::HTTP_REQUEST_DURATION_METRIC,
         "method" => method.clone(),
         "path" => path.clone(),
         "status" => status.clone(),

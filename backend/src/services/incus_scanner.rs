@@ -846,13 +846,17 @@ impl IncusScanner {
         &self,
         client: &ScannerAdapterFsClient,
         rootfs: &Path,
-    ) -> Result<TrivyReport> {
+    ) -> Result<(
+        TrivyReport,
+        Option<crate::models::security::VulnDbProvenance>,
+    )> {
         // Incus reports feed `from_trivy_report` (no stderr context), so the
-        // stderr half of the adapter result is dropped here.
+        // stderr half of the adapter result is dropped here; the DB this scan
+        // ran against (#3014) travels with the report.
         self.engine
             .scan_dir_via_adapter(client, rootfs, max_extracted_bytes())
             .await
-            .map(|(report, _stderr)| report)
+            .map(|scan| (scan.report, scan.vuln_db))
     }
 
     /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
@@ -931,11 +935,14 @@ impl Scanner for IncusScanner {
         // `fail_scan` preserves `ScannerEngineUnavailable` so an absent
         // engine degrades to `not_applicable` (#2324) instead of `failed`.
         let scan_result = match self.engine.backend() {
-            TrivyFsBackend::Cli { trivy_url } => self.run_cli_scan(&rootfs, trivy_url).await,
+            TrivyFsBackend::Cli { trivy_url } => self
+                .run_cli_scan(&rootfs, trivy_url)
+                .await
+                .map(|report| (report, None)),
             TrivyFsBackend::Adapter(client) => self.run_adapter_scan(client, &rootfs).await,
         };
-        let report = match scan_result {
-            Ok(report) => report,
+        let (report, vuln_db) = match scan_result {
+            Ok(out) => out,
             Err(e) => {
                 return Err(
                     fail_scan("Trivy Incus scan", artifact, &e, Some(&mut workspace)).await,
@@ -943,7 +950,8 @@ impl Scanner for IncusScanner {
             }
         };
 
-        let output = ScanOutput::from_trivy_report(&report, "trivy-incus");
+        let mut output = ScanOutput::from_trivy_report(&report, "trivy-incus");
+        output.vuln_db = vuln_db;
 
         info!(
             "Incus image scan complete for {}: {} vulnerabilities, {} packages",
@@ -1103,7 +1111,8 @@ mod tests {
                     "Packages": [{"Name": "libssl3", "Version": "3.0.13-0ubuntu3"}]
                 }]},
                 "stderr": "",
-                "scanner_version": "0.71.2"
+                "scanner_version": "0.71.2",
+                "vulnerability_db": {"version": 2, "updated_at": "2026-10-04T19:39:34Z"}
             }),
         )
         .await;
@@ -1123,7 +1132,7 @@ mod tests {
             ws.path().to_string_lossy().to_string(),
         );
         let client = ScannerAdapterFsClient::new(server.uri());
-        let report = scanner
+        let (report, vuln_db) = scanner
             .run_adapter_scan(&client, &rootfs)
             .await
             .expect("adapter incus scan should complete");
@@ -1135,6 +1144,8 @@ mod tests {
         // Provenance flows from the adapter.
         use crate::services::scanner_service::Scanner as _;
         assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+        // #3014: the DB the adapter reported travels with this report.
+        assert_eq!(vuln_db.map(|p| p.version), Some("trivy-db-v2".to_string()));
     }
 
     /// A down adapter degrades the incus scan gracefully — the same #2324

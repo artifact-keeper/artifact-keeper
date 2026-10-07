@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE signing_key_id = $2 RETURNING repository_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_config",
+            "name": "repository_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0d52fb6eae024ec00fdfa1375ea86dc924fdd0067617a0121589c1ebe51eaab5"
+}

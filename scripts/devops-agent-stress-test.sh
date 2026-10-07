@@ -892,7 +892,7 @@ log_section "Phase 10: Webhook & Event System"
 
 WEBHOOK_RESP=$(api_full POST "/api/v1/webhooks" -d '{
     "url":"https://httpbin.org/post",
-    "events":["artifact.uploaded","artifact.promoted"],
+    "events":["artifact_uploaded"],
     "repository_key":"'"$GENERIC_KEY"'",
     "enabled":true
 }')

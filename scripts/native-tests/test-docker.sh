@@ -13,6 +13,15 @@ _ak_test_env="$(dirname "$0")/../lib/test-env.sh"
 [ -r "$_ak_test_env" ] && . "$_ak_test_env"
 REGISTRY_PASS="${REGISTRY_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 REPO_KEY="${REPO_KEY:-test-docker}"
+# STORAGE_BACKEND (optional, #1529): the storage backend the server under test
+# is configured with (`filesystem`, `s3`, ...). When set, the suite asserts
+# that REPO_KEY really is stored on it, so a run meant to cover S3 cannot
+# silently measure the filesystem backend instead. Unset: not asserted.
+STORAGE_BACKEND="${STORAGE_BACKEND:-}"
+# Size of the layer pushed by the large-blob tests. Above 5 MiB (the S3
+# multipart part minimum) so the upload is promoted through the backend's
+# streamed multipart write rather than a single PUT.
+LARGE_LAYER_MIB="${LARGE_LAYER_MIB:-12}"
 TEST_VERSION="1.0.$(date +%s)"
 FAILURES=0
 REGISTRY_SCHEME="${REGISTRY_SCHEME:-http}"
@@ -25,6 +34,36 @@ fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 echo "==> Docker Registry V2 E2E Test"
 echo "Registry: $REGISTRY_URL"
 echo "Version: $TEST_VERSION"
+echo "Storage backend: ${STORAGE_BACKEND:-(not asserted)}"
+echo ""
+
+# --------------------------------------------------------------------------
+# 0. Ensure the repository exists and sits on the expected storage backend
+# --------------------------------------------------------------------------
+# docker-compose.test.yml's setup service creates REPO_KEY in advance; a stack
+# without it (scheduled-tests.yml's oci-storage-e2e job) relies on this.
+echo "--- Test: Repository ${REPO_KEY} ---"
+REPO_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "$REGISTRY_USER:$REGISTRY_PASS" \
+    "$REGISTRY_BASE_URL/api/v1/repositories/$REPO_KEY")
+if [ "$REPO_CODE" = "404" ]; then
+    CREATE_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "$REGISTRY_USER:$REGISTRY_PASS" \
+        -X POST "$REGISTRY_BASE_URL/api/v1/repositories" -H 'Content-Type: application/json' \
+        -d "{\"key\":\"$REPO_KEY\",\"name\":\"$REPO_KEY\",\"format\":\"docker\",\"repo_type\":\"local\",\"is_public\":false}")
+    if [ "$CREATE_CODE" = "200" ] || [ "$CREATE_CODE" = "201" ]; then
+        pass "Created repository $REPO_KEY"
+    else
+        fail "Creating repository $REPO_KEY returned $CREATE_CODE"
+    fi
+fi
+if [ -n "$STORAGE_BACKEND" ]; then
+    ACTUAL_BACKEND=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/api/v1/repositories/$REPO_KEY" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("storage_backend",""))' 2>/dev/null || echo "")
+    if [ "$ACTUAL_BACKEND" = "$STORAGE_BACKEND" ]; then
+        pass "Repository $REPO_KEY is stored on $STORAGE_BACKEND"
+    else
+        fail "Repository $REPO_KEY reports storage_backend='$ACTUAL_BACKEND', expected '$STORAGE_BACKEND'"
+    fi
+fi
 echo ""
 
 # --------------------------------------------------------------------------
@@ -312,6 +351,111 @@ if [[ "$CATALOG_NOAUTH" = "401" ]]; then
     pass "Catalog without auth returns 401"
 else
     fail "Catalog without auth returned $CATALOG_NOAUTH, expected 401"
+fi
+
+# --------------------------------------------------------------------------
+# 13. Push and pull an image with a layer above the multipart threshold
+# --------------------------------------------------------------------------
+# #1529: everything above pushes layers of a few KiB, which a cloud backend
+# stores with one PUT. A layer over 5 MiB goes through the streamed multipart
+# write (`put_stream`) instead, the path only object-storage backends have.
+# The payload is random so gzip cannot shrink the layer under the threshold.
+echo ""
+echo "--- Test: Large layer (${LARGE_LAYER_MIB} MiB) push/pull ---"
+BIG_DIR="$WORK_DIR/big"
+mkdir -p "$BIG_DIR"
+head -c "$((LARGE_LAYER_MIB * 1024 * 1024))" /dev/urandom > "$BIG_DIR/big.bin"
+BIG_SHA=$(sha256sum "$BIG_DIR/big.bin" | awk '{print $1}')
+printf '%s\n' 'FROM alpine:3.19' 'COPY big.bin /big.bin' 'CMD ["sha256sum", "/big.bin"]' > "$BIG_DIR/Dockerfile"
+BIG_IMAGE="$REGISTRY_URL/$REPO_KEY/e2e-large:$TEST_VERSION"
+docker build -t "$BIG_IMAGE" "$BIG_DIR" -q >/dev/null 2>&1
+if docker push "$BIG_IMAGE" 2>&1; then
+    pass "Large-layer push succeeded"
+else
+    fail "Large-layer push failed"
+fi
+docker rmi "$BIG_IMAGE" >/dev/null 2>&1 || true
+if docker pull "$BIG_IMAGE" >/dev/null 2>&1; then
+    pass "Large-layer pull succeeded"
+else
+    fail "Large-layer pull failed"
+fi
+BIG_OUT=$(docker run --rm "$BIG_IMAGE" 2>&1 || true)
+if echo "$BIG_OUT" | grep -q "$BIG_SHA"; then
+    pass "Pulled large layer is byte-identical (sha256 $BIG_SHA)"
+else
+    fail "Pulled large layer differs: expected $BIG_SHA, got: $BIG_OUT"
+fi
+docker rmi "$BIG_IMAGE" >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------------------
+# 14. Chunked blob upload across the multipart boundary
+# --------------------------------------------------------------------------
+# A docker client sends each layer as one PATCH. Several PATCHes store several
+# upload parts, which completion concatenates (`storage_concat_stream`) into
+# the final blob. Upload a 6 MiB + 3 MiB blob in two chunks and read it back.
+echo ""
+echo "--- Test: Chunked blob upload (6 MiB + 3 MiB) ---"
+TOKEN=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/v2/token" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+CHUNK_A="$WORK_DIR/chunk-a.bin"
+CHUNK_B="$WORK_DIR/chunk-b.bin"
+head -c $((6 * 1024 * 1024)) /dev/urandom > "$CHUNK_A"
+head -c $((3 * 1024 * 1024)) /dev/urandom > "$CHUNK_B"
+SIZE_A=$(wc -c < "$CHUNK_A" | tr -d ' ')
+SIZE_B=$(wc -c < "$CHUNK_B" | tr -d ' ')
+CHUNKED_DIGEST="sha256:$(cat "$CHUNK_A" "$CHUNK_B" | sha256sum | awk '{print $1}')"
+
+# Resolve the Location header of a dumped response (absolute or path-only).
+upload_url() {
+    local loc
+    loc=$(grep -i '^location:' "$1" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+    case "$loc" in
+        http://*|https://*) echo "$loc" ;;
+        *) echo "$REGISTRY_BASE_URL$loc" ;;
+    esac
+}
+
+HDRS="$WORK_DIR/upload-headers"
+START_CODE=$(curl -s -o /dev/null -D "$HDRS" -w "$HTTP_CODE_FORMAT" -X POST \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-chunked/blobs/uploads/")
+if [ "$START_CODE" = "202" ]; then
+    pass "Upload session started"
+else
+    fail "Starting an upload session returned $START_CODE, expected 202"
+fi
+LOCATION=$(upload_url "$HDRS")
+
+PATCH_A=$(curl -s -o /dev/null -D "$HDRS" -w "$HTTP_CODE_FORMAT" -X PATCH \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
+    -H "Content-Range: 0-$((SIZE_A - 1))" --data-binary "@$CHUNK_A" "$LOCATION")
+LOCATION=$(upload_url "$HDRS")
+PATCH_B=$(curl -s -o /dev/null -D "$HDRS" -w "$HTTP_CODE_FORMAT" -X PATCH \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
+    -H "Content-Range: ${SIZE_A}-$((SIZE_A + SIZE_B - 1))" --data-binary "@$CHUNK_B" "$LOCATION")
+LOCATION=$(upload_url "$HDRS")
+if [ "$PATCH_A" = "202" ] && [ "$PATCH_B" = "202" ]; then
+    pass "Both chunks accepted"
+else
+    fail "Chunk PATCHes returned $PATCH_A / $PATCH_B, expected 202 / 202"
+fi
+
+case "$LOCATION" in *\?*) SEP="&" ;; *) SEP="?" ;; esac
+PUT_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -X PUT \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+    "${LOCATION}${SEP}digest=${CHUNKED_DIGEST}")
+if [ "$PUT_CODE" = "201" ]; then
+    pass "Chunked upload completed with digest $CHUNKED_DIGEST"
+else
+    fail "Completing the chunked upload returned $PUT_CODE, expected 201"
+fi
+
+GOT_DIGEST="sha256:$(curl -s -L -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-chunked/blobs/$CHUNKED_DIGEST" | sha256sum | awk '{print $1}')"
+if [ "$GOT_DIGEST" = "$CHUNKED_DIGEST" ]; then
+    pass "Chunked blob reads back byte-identical ($((SIZE_A + SIZE_B)) bytes)"
+else
+    fail "Chunked blob read back as $GOT_DIGEST, expected $CHUNKED_DIGEST"
 fi
 
 # --------------------------------------------------------------------------

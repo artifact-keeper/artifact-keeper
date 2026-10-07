@@ -81,13 +81,16 @@ stale-metadata one.
 
 ## Relationship to guest access
 
-`AK_GUEST_ACCESS_ENABLED` is a server-wide policy, not a per-repository one. When
+Guest access is a server-wide policy, not a per-repository one. An administrator
+switches it at runtime with `PATCH /api/v1/admin/settings/system`
+(`{"guest_access_enabled": false}`, #867); `AK_GUEST_ACCESS_ENABLED`, when set
+explicitly to `true`/`1`/`false`/`0`, pins it and wins over that setting. When
 it is disabled, no anonymous request is served at all, so a `public` repository
 is unreachable by the audience that makes it public.
 
 A request to create or update a repository as `public` while guest access is
-disabled is therefore **refused with a 400** (#3855) that names
-`AK_GUEST_ACCESS_ENABLED=false`. Earlier versions silently coerced such a request
+disabled is therefore **refused with a 400** (#3855) that names both switches
+(the admin setting and `AK_GUEST_ACCESS_ENABLED=false`). Earlier versions silently coerced such a request
 to `private`, which a Terraform provider read back as drift on every plan.
 
 `internal` is never refused: it does not ask for anonymous access, so it passes

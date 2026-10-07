@@ -1,0 +1,293 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8,\n                scanner_version = $9,\n                pin_identity = $10,\n                scan_completeness = $11,\n                scan_completeness_reason = $12,\n                inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8),\n                vuln_db_version = $13,\n                vuln_db_published_at = $14\n            WHERE id = $1 AND status = 'running'\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "artifact_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_type",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "findings_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "findings_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "critical_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "critical_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "high_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "high_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "medium_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "medium_count"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "low_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "low_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "info_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "info_count"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "scanner_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scanner_version"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "error_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "completed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "completed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "is_reused"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "source_scan_id"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "scan_completeness",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "scan_completeness_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "scan_completeness_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "vuln_db_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_version"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "vuln_db_published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "vuln_db_published_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Uuid",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5c6e410920b157f5e62e5d9bd5f93a50909d0477ecd3a151b970c78d52b9cfdb"
+}

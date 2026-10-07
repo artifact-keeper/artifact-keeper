@@ -13,7 +13,7 @@ use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-use pgp::types::{KeyVersion, PublicKeyTrait, SecretKeyTrait};
+use pgp::types::{KeyVersion, PublicKeyTrait};
 use pgp::ArmorOptions;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
@@ -106,6 +106,108 @@ fn algorithm_to_bits_u32(algorithm: &str) -> std::result::Result<u32, String> {
     algorithm_to_bits(algorithm).and_then(|bits| {
         u32::try_from(bits).map_err(|_| format!("Unsupported RSA key size: {}", bits))
     })
+}
+
+/// `algorithm` value selecting an Ed25519 OpenPGP key (#1326).
+pub const ED25519_ALGORITHM: &str = "ed25519";
+
+/// The primary-key algorithm a `key_type='gpg'` key is generated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPgpKeyAlgo {
+    Rsa(u32),
+    /// Ed25519 in the v4 "EdDSA legacy" encoding (algorithm 22), which is
+    /// what `gpg --quick-gen-key ... ed25519` produces and what apt/gpgv/sqv on
+    /// Debian bookworm+ and Ubuntu noble verify. The RFC 9580 Ed25519 (27)
+    /// encoding is v6-only in practice and not understood by GnuPG 2.2/2.4.
+    Ed25519,
+}
+
+impl OpenPgpKeyAlgo {
+    fn key_type(self) -> KeyType {
+        match self {
+            OpenPgpKeyAlgo::Rsa(bits) => KeyType::Rsa(bits),
+            OpenPgpKeyAlgo::Ed25519 => KeyType::EdDSALegacy,
+        }
+    }
+}
+
+fn openpgp_key_algo(algorithm: &str) -> std::result::Result<OpenPgpKeyAlgo, String> {
+    if algorithm == ED25519_ALGORITHM {
+        return Ok(OpenPgpKeyAlgo::Ed25519);
+    }
+    algorithm_to_bits_u32(algorithm)
+        .map(OpenPgpKeyAlgo::Rsa)
+        .map_err(|_| {
+            format!(
+                "Unsupported algorithm: {}. Use rsa2048, rsa4096, or ed25519.",
+                algorithm
+            )
+        })
+}
+
+/// Check that a (normalized) key family and algorithm describe a key this
+/// service can actually generate (#1326).
+///
+/// * `gpg` accepts the RSA sizes and `ed25519`.
+/// * `rsa` (an X.509 keypair for raw-RSA formats) accepts only the RSA sizes;
+///   Ed25519 exists here only as an OpenPGP key.
+/// * `ed25519` as a *key type* is refused for new keys. It never produced an
+///   Ed25519 key: generation fell through to RSA, leaving an RSA keypair
+///   labelled `ed25519` that could sign neither OpenPGP metadata nor anything
+///   Ed25519-shaped. The DB constraint still admits it so such legacy rows
+///   keep loading.
+pub(crate) fn validate_key_spec(
+    key_type: &str,
+    algorithm: &str,
+) -> std::result::Result<(), String> {
+    match key_type {
+        "gpg" => openpgp_key_algo(algorithm).map(|_| ()),
+        "ed25519" => Err(
+            "key_type='ed25519' is not supported for new keys. For an Ed25519 \
+             OpenPGP key (Debian/RPM metadata signing) use key_type='gpg' with \
+             algorithm='ed25519'."
+                .to_string(),
+        ),
+        _ if algorithm == ED25519_ALGORITHM => Err("algorithm='ed25519' is only available for \
+             OpenPGP keys; use key_type='gpg' with algorithm='ed25519'."
+            .to_string()),
+        _ => algorithm_to_bits(algorithm).map(|_| ()),
+    }
+}
+
+/// Key family and algorithm for the successor of `old` on rotation.
+///
+/// A successor inherits its predecessor's parameters, except that a legacy
+/// `key_type='ed25519'` row (which, per [`validate_key_spec`], always held RSA
+/// material) is succeeded by the `rsa` key it actually was, so rotating it
+/// keeps the raw-RSA formats it serves working.
+fn successor_key_spec(old_key_type: &str, old_algorithm: &str) -> (String, String) {
+    if old_key_type == "ed25519" {
+        return ("rsa".to_string(), rsa_algorithm_or_default(old_algorithm));
+    }
+    (old_key_type.to_string(), old_algorithm.to_string())
+}
+
+/// `algorithm` when it names an RSA key size, else `rsa4096`: the size a
+/// replacement for a key holding RSA material is generated with.
+fn rsa_algorithm_or_default(algorithm: &str) -> String {
+    if algorithm_to_bits(algorithm).is_ok() {
+        algorithm.to_string()
+    } else {
+        "rsa4096".to_string()
+    }
+}
+
+/// Digest for an OpenPGP signature made by a key of `algorithm`.
+///
+/// RSA keeps SHA-256 (the digest every signature minted before #1326 used, so
+/// existing RSA output is unchanged). EdDSA signs with SHA-512, matching what
+/// GnuPG emits for Ed25519 keys.
+fn openpgp_signature_hash(algorithm: PublicKeyAlgorithm) -> HashAlgorithm {
+    match algorithm {
+        PublicKeyAlgorithm::EdDSALegacy | PublicKeyAlgorithm::Ed25519 => HashAlgorithm::SHA2_512,
+        _ => HashAlgorithm::SHA2_256,
+    }
 }
 
 fn pgp_user_id(uid_name: Option<&str>, uid_email: Option<&str>, fallback_name: &str) -> String {
@@ -206,11 +308,11 @@ pub(crate) fn build_rotated_key_name(original_name: &str) -> String {
 /// Parameters describing an OpenPGP key to generate. Owns its data so it can
 /// cross a `spawn_blocking` boundary.
 struct OpenPgpKeyParams {
-    bits: u32,
+    algo: OpenPgpKeyAlgo,
     user_id: String,
 }
 
-/// Generate an OpenPGP RSA key pair and return
+/// Generate an OpenPGP (RSA or Ed25519) key pair and return
 /// (armored_public, armored_private, fingerprint_hex, key_id_hex).
 ///
 /// CPU-bound. Call from within `spawn_blocking`.
@@ -220,7 +322,7 @@ fn generate_openpgp_key_blocking(
     let mut key_params = SecretKeyParamsBuilder::default();
     key_params
         .version(KeyVersion::V4)
-        .key_type(KeyType::Rsa(params.bits))
+        .key_type(params.algo.key_type())
         .can_certify(true)
         .can_sign(true)
         .primary_user_id(params.user_id)
@@ -386,69 +488,30 @@ fn openpgp_hashed_subpackets(
     subpackets
 }
 
-/// Create an ASCII-armored detached OpenPGP signature.
+/// Build the v4/v6 `SignatureConfig` for a signature of `typ` by `secret_key`.
 ///
-/// `expiry` is the validity window recorded in the `SignatureExpirationTime`
-/// subpacket; `None` omits the subpacket entirely (#1327).
-///
-/// CPU-bound. Call from within `spawn_blocking`.
-fn sign_openpgp_detached_blocking(
-    secret_key: pgp::SignedSecretKey,
-    data: Vec<u8>,
+/// Shared by the detached and cleartext signers so they cannot drift apart on
+/// algorithm, digest or subpackets (#1327, #1326).
+fn openpgp_signature_config(
+    secret_key: &pgp::SignedSecretKey,
+    typ: SignatureType,
     expiry: Option<Duration>,
-) -> Result<String> {
-    let mut config = SignatureConfig::v4(
-        SignatureType::Binary,
-        PublicKeyAlgorithm::RSA,
-        HashAlgorithm::SHA2_256,
-    );
-    config.hashed_subpackets = openpgp_hashed_subpackets(secret_key.fingerprint(), expiry);
-    config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
-        secret_key.key_id(),
-    ))];
-
-    let signature = config
-        .sign(&secret_key, String::new, &data[..])
-        .map_err(|e| AppError::Internal(format!("Failed to sign OpenPGP data: {}", e)))?;
-    StandaloneSignature::new(signature)
-        .to_armored_string(ArmorOptions::default())
-        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP signature: {}", e)))
-}
-
-/// Create an OpenPGP cleartext signed message.
-///
-/// Builds the `SignatureConfig` explicitly (rather than calling
-/// `CleartextSignedMessage::sign`) so the expiration subpacket can be attached;
-/// the algorithm/hash/type selection below mirrors what that helper does, so
-/// the only difference from the previous behaviour is the added subpacket.
-///
-/// CPU-bound. Call from within `spawn_blocking`.
-fn sign_openpgp_cleartext_blocking(
-    secret_key: pgp::SignedSecretKey,
-    text: String,
-    expiry: Option<Duration>,
-) -> Result<String> {
+) -> Result<SignatureConfig> {
+    let algorithm = secret_key.algorithm();
+    let hash = openpgp_signature_hash(algorithm);
     let mut config = match secret_key.version() {
-        KeyVersion::V4 => SignatureConfig::v4(
-            SignatureType::Text,
-            secret_key.algorithm(),
-            secret_key.hash_alg(),
-        ),
-        KeyVersion::V6 => SignatureConfig::v6(
-            rand08::rngs::OsRng,
-            SignatureType::Text,
-            secret_key.algorithm(),
-            secret_key.hash_alg(),
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "Failed to build OpenPGP v6 signature config: {}",
-                e
-            ))
-        })?,
+        KeyVersion::V4 => SignatureConfig::v4(typ, algorithm, hash),
+        KeyVersion::V6 => {
+            SignatureConfig::v6(rand08::rngs::OsRng, typ, algorithm, hash).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to build OpenPGP v6 signature config: {}",
+                    e
+                ))
+            })?
+        }
         other => {
             return Err(AppError::Internal(format!(
-                "Unsupported OpenPGP key version for cleartext signing: {:?}",
+                "Unsupported OpenPGP key version for signing: {:?}",
                 other
             )))
         }
@@ -457,15 +520,328 @@ fn sign_openpgp_cleartext_blocking(
     config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
         secret_key.key_id(),
     ))];
+    Ok(config)
+}
 
-    CleartextSignedMessage::new(&text, config, &secret_key, String::new)
-        .and_then(|msg| msg.to_armored_string(ArmorOptions::default()))
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "Failed to create OpenPGP cleartext signature: {}",
-                e
-            ))
-        })
+/// Create an ASCII-armored detached OpenPGP signature block holding one
+/// signature per key in `secret_keys`.
+///
+/// More than one key is only passed during a key-rotation overlap window
+/// (#1329): apt, gpgv and sqv accept a signature block as soon as any one of
+/// its signatures verifies against the client's keyring, so signing with both
+/// the predecessor and the successor keeps clients that trust either key
+/// working. With a single key the output is a plain single-signature block.
+///
+/// `expiry` is the validity window recorded in the `SignatureExpirationTime`
+/// subpacket; `None` omits the subpacket entirely (#1327).
+///
+/// CPU-bound. Call from within `spawn_blocking`.
+fn sign_openpgp_detached_blocking(
+    secret_keys: Vec<pgp::SignedSecretKey>,
+    data: Vec<u8>,
+    expiry: Option<Duration>,
+) -> Result<String> {
+    let mut signatures = Vec::with_capacity(secret_keys.len());
+    for secret_key in &secret_keys {
+        let signature = openpgp_signature_config(secret_key, SignatureType::Binary, expiry)?
+            .sign(secret_key, String::new, &data[..])
+            .map_err(|e| AppError::Internal(format!("Failed to sign OpenPGP data: {}", e)))?;
+        signatures.push(StandaloneSignature::new(signature));
+    }
+    armor_many(&signatures, pgp::armor::BlockType::Signature)
+}
+
+/// ASCII-armor `items` as a single block of type `block`, with the default
+/// armor options (CRC24 checksum, no headers) every other armored output here
+/// uses.
+fn armor_many<T: pgp::ser::Serialize>(items: &[T], block: pgp::armor::BlockType) -> Result<String> {
+    let opts = ArmorOptions::default();
+    let mut out = Vec::new();
+    pgp::armor::write(&items, block, &mut out, opts.headers, opts.include_checksum)
+        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP data: {}", e)))?;
+    String::from_utf8(out)
+        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP data: {}", e)))
+}
+
+/// Create an OpenPGP cleartext signed message carrying one signature per key
+/// in `secret_keys` (see [`sign_openpgp_detached_blocking`] for when that is
+/// more than one).
+///
+/// Builds each `SignatureConfig` explicitly (rather than calling
+/// `CleartextSignedMessage::sign`) so the expiration subpacket can be attached.
+///
+/// CPU-bound. Call from within `spawn_blocking`.
+fn sign_openpgp_cleartext_blocking(
+    secret_keys: Vec<pgp::SignedSecretKey>,
+    text: String,
+    expiry: Option<Duration>,
+) -> Result<String> {
+    let configs = secret_keys
+        .iter()
+        .map(|k| openpgp_signature_config(k, SignatureType::Text, expiry))
+        .collect::<Result<Vec<_>>>()?;
+    CleartextSignedMessage::new_many(&text, |normalized| {
+        configs
+            .into_iter()
+            .zip(&secret_keys)
+            .map(|(config, key)| config.sign(key, String::new, normalized))
+            .collect()
+    })
+    .and_then(|msg| msg.to_armored_string(ArmorOptions::default()))
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to create OpenPGP cleartext signature: {}",
+            e
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Key-rotation overlap window (#1329)
+//
+// apt (and dnf's repo_gpgcheck) trust a static keyring: a client that pinned
+// the old key keeps verifying against the old key until someone replaces the
+// keyring file. OpenPGP cross-certification does not help there — apt ignores
+// web-of-trust certifications entirely. What does work is dual signing: for a
+// window after a rotation, every signed metadata file carries a signature from
+// the successor AND from the predecessor, and the public-key endpoints serve
+// both keys. apt/gpgv/sqv accept a signature block when any one signature
+// verifies, so clients holding either key keep working while operators roll
+// the new key out.
+//
+// The window end is stored on the predecessor as its `expires_at` when it is
+// rotated out (the key really does retire then), and `revoke_key` pulls it in
+// to "now", so revoking a predecessor ends its overlap immediately.
+// ---------------------------------------------------------------------------
+
+/// Default rotation overlap window: 14 days.
+pub const DEFAULT_ROTATION_OVERLAP_SECONDS: u64 = 14 * 24 * 60 * 60;
+
+/// Ceiling on a configured overlap window (1 year), which also keeps the
+/// timestamp arithmetic far from overflow.
+pub const MAX_ROTATION_OVERLAP_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// How many rotations back the overlap search walks. Rotating more often than
+/// this within one window is not a supported rollover pattern.
+const MAX_ROTATION_OVERLAP_CHAIN: i32 = 8;
+
+/// When the overlap window for a key rotated out at `rotated_at` ends.
+/// `0` disables the overlap: the predecessor retires immediately.
+pub fn rotation_overlap_end(rotated_at: DateTime<Utc>, configured_seconds: u64) -> DateTime<Utc> {
+    let secs = configured_seconds.min(MAX_ROTATION_OVERLAP_SECONDS);
+    rotated_at + Duration::seconds(secs as i64)
+}
+
+/// The `details` of a `rotated` audit row: the successor, and when the old
+/// key's co-signing overlap ends (`null` when there is none, with the reason
+/// when the key could not co-sign at all).
+fn rotation_audit_details(
+    new_key_id: Uuid,
+    overlap_seconds: u64,
+    overlap_ends_at: DateTime<Utc>,
+    co_sign_problem: Option<&str>,
+    repointed_repository_ids: &[Uuid],
+) -> serde_json::Value {
+    let ends_at = (overlap_seconds > 0).then(|| overlap_ends_at.to_rfc3339());
+    let repointed: Vec<String> = repointed_repository_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect();
+    let mut details = serde_json::json!({
+        "new_key_id": new_key_id.to_string(),
+        "overlap_ends_at": ends_at,
+        // Every repository whose signing config moved to the successor
+        // (#4416); a key can be bound to repositories other than its own.
+        "repointed_repository_ids": repointed,
+    });
+    if let Some(reason) = co_sign_problem {
+        details["overlap_skipped"] = serde_json::Value::from(reason);
+    }
+    details
+}
+
+/// WARN that rotation predecessor `key_id` cannot co-sign (`reason`), at most
+/// once per key per process: the check runs on anonymous metadata requests,
+/// and one line per poll would flood the log for the whole overlap window.
+fn warn_predecessor_skipped_once(key_id: Uuid, reason: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+        std::sync::OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(key_id))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(
+            key_id = %key_id,
+            reason,
+            "rotation predecessor cannot co-sign; dropping it from the overlap signer set"
+        );
+    }
+}
+
+/// Cache-key component identifying a signer set. For a single key this is
+/// exactly that key's fingerprint, so signed-Release cache keys outside an
+/// overlap window are unchanged.
+pub fn signer_set_fingerprint(keys: &[SigningKey]) -> String {
+    keys.iter()
+        .map(|k| k.fingerprint.as_deref().unwrap_or("unknown"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The public-key document for a signer set: the active key's stored armor
+/// verbatim when it signs alone, otherwise one armored `PUBLIC KEY BLOCK`
+/// holding every key (a keyring, as `gpg --export --armor A B` would emit).
+///
+/// One block rather than concatenated blocks, because the common install
+/// recipe `curl .../gpg-key.asc | gpg --dearmor > keyring.gpg` only decodes the
+/// first armor block it sees.
+///
+/// `keys[0]` (the active key) must parse. A predecessor whose public key does
+/// not parse is left out with a WARN, mirroring how the signers drop it, so
+/// the served keyring never fails because of a key that is only co-signing.
+pub fn openpgp_public_keyring(keys: &[SigningKey]) -> Result<String> {
+    let Some((active, predecessors)) = keys.split_first() else {
+        return Err(AppError::Internal(
+            "No OpenPGP signing key supplied".to_string(),
+        ));
+    };
+    if predecessors.is_empty() {
+        return Ok(active.public_key_pem.clone());
+    }
+    let (first, _) = SignedPublicKey::from_string(&active.public_key_pem).map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to parse OpenPGP public key of signing key {}: {}",
+            active.id, e
+        ))
+    })?;
+    let mut parsed = vec![first];
+    for key in predecessors {
+        match SignedPublicKey::from_string(&key.public_key_pem) {
+            Ok((public, _)) => parsed.push(public),
+            Err(_) => warn_predecessor_skipped_once(key.id, "public key is not OpenPGP"),
+        }
+    }
+    if parsed.len() == 1 {
+        return Ok(active.public_key_pem.clone());
+    }
+    armor_many(&parsed, pgp::armor::BlockType::PublicKey)
+}
+
+// ---------------------------------------------------------------------------
+// Legacy (non-OpenPGP) metadata signing keys (#1331)
+//
+// Debian InRelease/Release.gpg and RPM repomd.xml.asc can only be signed by an
+// OpenPGP key. Keys created before #1236 (and every key_type='rsa' key since)
+// hold PKCS#8 material instead, so a Debian/RPM repository bound to one fails
+// every anonymous metadata poll with a 409. The startup scan below names each
+// such key once per boot, and — only when SIGNING_AUTO_MIGRATE_LEGACY_KEYS is
+// set — replaces it with a freshly generated key_type='gpg' key.
+// ---------------------------------------------------------------------------
+
+/// Repository formats whose metadata is OpenPGP-signed.
+const OPENPGP_METADATA_FORMATS: &[&str] = &["debian", "rpm"];
+
+/// Why a key bound to OpenPGP metadata signing cannot do that job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyKeyProblem {
+    /// `key_type` is not `gpg`: the row holds an X.509/PKCS#8 keypair.
+    NotOpenPgpKeyType(String),
+    /// `key_type='gpg'`, but the stored private key is a pre-#1236 PKCS#8 PEM.
+    LegacyPemMaterial,
+    /// The private key cannot be decrypted or parsed at all.
+    Unreadable(String),
+}
+
+impl LegacyKeyProblem {
+    /// Whether the auto-migration may replace a key with this problem.
+    ///
+    /// Only keys positively identified as holding the wrong kind of material
+    /// qualify. An unreadable key never does: the likeliest cause is a changed
+    /// `JWT_SECRET` (the at-rest encryption key), and auto-replacing every key
+    /// would turn that recoverable mistake into a permanent key change.
+    pub fn auto_migratable(&self) -> bool {
+        !matches!(self, LegacyKeyProblem::Unreadable(_))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            LegacyKeyProblem::NotOpenPgpKeyType(t) => format!(
+                "key_type='{t}' holds an X.509/PKCS#8 keypair, which cannot produce OpenPGP signatures"
+            ),
+            LegacyKeyProblem::LegacyPemMaterial => {
+                "key_type='gpg' but the stored private key is a legacy PKCS#8 PEM, not OpenPGP"
+                    .to_string()
+            }
+            LegacyKeyProblem::Unreadable(why) => {
+                format!("the stored private key cannot be read ({why})")
+            }
+        }
+    }
+}
+
+/// Classify the decrypted private-key material of a `key_type='gpg'` row:
+/// `None` when it is a usable OpenPGP secret key.
+fn classify_gpg_key_material(plaintext: &[u8]) -> Option<LegacyKeyProblem> {
+    let Ok(text) = std::str::from_utf8(plaintext) else {
+        return Some(LegacyKeyProblem::Unreadable("not UTF-8".to_string()));
+    };
+    if pgp::SignedSecretKey::from_string(text).is_ok() {
+        return None;
+    }
+    if RsaPrivateKey::from_pkcs8_pem(text).is_ok() {
+        return Some(LegacyKeyProblem::LegacyPemMaterial);
+    }
+    Some(LegacyKeyProblem::Unreadable(
+        "neither OpenPGP nor PKCS#8 PEM".to_string(),
+    ))
+}
+
+/// The operator-facing WARN text for one legacy key. `/rotate` is deliberately
+/// not suggested: rotation keeps the key type, so rotating an `rsa` key yields
+/// another `rsa` key.
+pub fn legacy_key_warning(
+    key: &SigningKey,
+    repositories: &[String],
+    problem: &LegacyKeyProblem,
+) -> String {
+    let fix = if problem.auto_migratable() {
+        "create a key_type='gpg' key (POST /api/v1/signing/keys) and point these repositories' \
+         signing config at it, or restart with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true to have \
+         that done automatically"
+    } else {
+        "check that JWT_SECRET is the value the key was created under; if the key is genuinely \
+         lost, create a key_type='gpg' key and point these repositories' signing config at it"
+    };
+    format!(
+        "Signing key {} ('{}') signs metadata for Debian/RPM repositories [{}] but cannot \
+         produce OpenPGP signatures: {}. Their InRelease/Release.gpg/repomd.xml.asc requests \
+         fail until this is fixed. To fix: {}.",
+        key.id,
+        key.name,
+        repositories.join(", "),
+        problem.describe(),
+        fix
+    )
+}
+
+/// One key found by [`SigningService::find_legacy_metadata_keys`].
+#[derive(Debug, Clone)]
+pub struct LegacyMetadataKey {
+    pub key: SigningKey,
+    /// Keys of the Debian/RPM repositories whose metadata it is bound to sign.
+    pub repositories: Vec<String>,
+    pub problem: LegacyKeyProblem,
+}
+
+/// Outcome of [`SigningService::run_legacy_key_scan`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LegacyKeyScanReport {
+    pub found: usize,
+    /// `(old_key_id, new_key_id)` for each auto-migrated key.
+    pub migrated: Vec<(Uuid, Uuid)>,
+    pub failed: usize,
 }
 
 /// Helper to dispatch a CPU-bound crypto closure to the blocking pool and
@@ -496,6 +872,9 @@ pub struct SigningService {
     /// [`SigningService::with_signature_expiry`] means any signing path not
     /// explicitly audited for re-signing keeps its pre-#1327 behaviour.
     signature_expiry_seconds: u64,
+    /// Overlap window, in seconds, applied when this service rotates a key
+    /// (#1329). See [`rotation_overlap_end`].
+    rotation_overlap_seconds: u64,
 }
 
 /// Result of a deliberate per-artifact signing action (#2535). The signature
@@ -511,8 +890,11 @@ pub struct ArtifactSignature {
 pub struct CreateKeyRequest {
     pub repository_id: Option<Uuid>,
     pub name: String,
-    pub key_type: String,  // "gpg", "rsa", "ed25519"
-    pub algorithm: String, // "rsa2048", "rsa4096"
+    /// `gpg` or `rsa` for new keys (see [`validate_key_spec`]); `ed25519`
+    /// survives only on legacy rows.
+    pub key_type: String,
+    /// `rsa2048`, `rsa4096`, or `ed25519` (`gpg` only).
+    pub algorithm: String,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
     pub created_by: Option<Uuid>,
@@ -541,7 +923,15 @@ impl SigningService {
             encryption: CredentialEncryption::from_passphrase(encryption_key),
             // No expiry unless a call site opts in — see the field docs.
             signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
         }
+    }
+
+    /// Set the overlap window [`Self::rotate_key`] stamps on the predecessor
+    /// (`SIGNING_KEY_ROTATION_OVERLAP_SECS`, #1329). `0` disables dual signing.
+    pub fn with_rotation_overlap(mut self, seconds: u64) -> Self {
+        self.rotation_overlap_seconds = seconds;
+        self
     }
 
     /// Opt this service into stamping an OpenPGP signature expiration window
@@ -612,6 +1002,7 @@ impl SigningService {
         let key_type = normalize_key_type(&req.key_type)
             .map_err(AppError::Validation)?
             .to_string();
+        validate_key_spec(&key_type, &req.algorithm).map_err(AppError::Validation)?;
 
         let (public_key_out, private_key_material, fingerprint, key_id) = if key_type == "gpg" {
             self.generate_openpgp_key(req).await?
@@ -712,12 +1103,12 @@ impl SigningService {
         &self,
         req: &CreateKeyRequest,
     ) -> Result<(String, String, String, String)> {
-        let bits = algorithm_to_bits_u32(&req.algorithm).map_err(AppError::Validation)?;
+        let algo = openpgp_key_algo(&req.algorithm).map_err(AppError::Validation)?;
         let user_id = pgp_user_id(req.uid_name.as_deref(), req.uid_email.as_deref(), &req.name);
 
         // Building and signing an RSA-4096 OpenPGP key is CPU-bound and can
         // take multiple seconds. Run on the blocking pool (#1236 review).
-        let params = OpenPgpKeyParams { bits, user_id };
+        let params = OpenPgpKeyParams { algo, user_id };
         run_blocking("openpgp_keygen", move || {
             generate_openpgp_key_blocking(params)
         })
@@ -780,8 +1171,17 @@ impl SigningService {
 
     /// Deactivate (revoke) a signing key.
     pub async fn revoke_key(&self, key_id: Uuid, user_id: Option<Uuid>) -> Result<()> {
+        // Also pull `expires_at` in to now: a revoked rotation predecessor must
+        // stop co-signing immediately rather than at the end of its overlap
+        // window (#1329). An already-past expiry is left as it was.
         let result = sqlx::query!(
-            "UPDATE signing_keys SET is_active = false WHERE id = $1",
+            r#"
+            UPDATE signing_keys
+            SET is_active = false,
+                expires_at = CASE WHEN expires_at IS NULL OR expires_at > NOW()
+                                  THEN NOW() ELSE expires_at END
+            WHERE id = $1
+            "#,
             key_id,
         )
         .execute(&self.db)
@@ -1241,14 +1641,27 @@ impl SigningService {
         key: &SigningKey,
         data: &[u8],
     ) -> Result<String> {
+        self.sign_openpgp_detached_with_keys(std::slice::from_ref(key), data)
+            .await
+    }
+
+    /// Like [`Self::sign_openpgp_detached_with_key`], but with one signature
+    /// per key in `keys` in a single armored block. `keys[0]` is the
+    /// repository's active key; any further keys are rotation predecessors
+    /// still inside their overlap window (see [`Self::openpgp_signers`]).
+    pub async fn sign_openpgp_detached_with_keys(
+        &self,
+        keys: &[SigningKey],
+        data: &[u8],
+    ) -> Result<String> {
         // Decrypt + parse on the runtime: cheap relative to the signing work
         // itself, and lets us avoid cloning the encryption state across the
         // spawn_blocking boundary.
-        let secret_key = self.load_openpgp_secret_key(key)?;
+        let secret_keys = self.load_openpgp_signer_keys(keys)?;
         let data_owned = data.to_vec();
         let expiry = self.signature_expiry();
         run_blocking("openpgp_sign_detached", move || {
-            sign_openpgp_detached_blocking(secret_key, data_owned, expiry)
+            sign_openpgp_detached_blocking(secret_keys, data_owned, expiry)
         })
         .await
     }
@@ -1261,13 +1674,42 @@ impl SigningService {
         key: &SigningKey,
         text: &str,
     ) -> Result<String> {
-        let secret_key = self.load_openpgp_secret_key(key)?;
+        self.sign_openpgp_cleartext_with_keys(std::slice::from_ref(key), text)
+            .await
+    }
+
+    /// Cleartext counterpart of [`Self::sign_openpgp_detached_with_keys`].
+    pub async fn sign_openpgp_cleartext_with_keys(
+        &self,
+        keys: &[SigningKey],
+        text: &str,
+    ) -> Result<String> {
+        let secret_keys = self.load_openpgp_signer_keys(keys)?;
         let text_owned = text.to_string();
         let expiry = self.signature_expiry();
         run_blocking("openpgp_sign_cleartext", move || {
-            sign_openpgp_cleartext_blocking(secret_key, text_owned, expiry)
+            sign_openpgp_cleartext_blocking(secret_keys, text_owned, expiry)
         })
         .await
+    }
+
+    /// Load the secret keys for a signer set: `keys[0]` (the active key) must
+    /// load, or signing fails as it always has. A rotation predecessor that
+    /// no longer loads is dropped with a WARN instead — losing the overlap
+    /// signature degrades to the post-overlap state, which is better than
+    /// failing every metadata request.
+    fn load_openpgp_signer_keys(&self, keys: &[SigningKey]) -> Result<Vec<pgp::SignedSecretKey>> {
+        let (active, predecessors) = keys
+            .split_first()
+            .ok_or_else(|| AppError::Internal("No OpenPGP signing key supplied".to_string()))?;
+        let mut loaded = vec![self.load_openpgp_secret_key(active)?];
+        for key in predecessors {
+            match self.load_openpgp_secret_key(key) {
+                Ok(secret) => loaded.push(secret),
+                Err(_) => warn_predecessor_skipped_once(key.id, "secret key cannot be loaded"),
+            }
+        }
+        Ok(loaded)
     }
 
     /// Stamp the `last_used_at` column for `key_id`. Public so callers
@@ -1286,6 +1728,95 @@ impl SigningService {
     pub async fn get_repo_public_key(&self, repo_id: Uuid) -> Result<Option<String>> {
         let key = self.get_active_key_for_repo(repo_id).await?;
         Ok(key.map(|k| k.public_key_pem))
+    }
+
+    /// Rotation predecessors of `active` that are still inside their overlap
+    /// window (#1329), nearest first. Empty — without touching the database —
+    /// for a key that was never rotated in, or one that cannot sign OpenPGP.
+    ///
+    /// The walk stops at the first predecessor that does not qualify (active,
+    /// not `gpg`, or window closed / revoked): rotating B→C with overlap `0`, or
+    /// revoking B, also ends A's co-signing even if A's own window is open.
+    /// The window is compared against the database clock (`NOW()`), the same
+    /// clock `revoke_key` stamps with. Keys retired before #1329 have no
+    /// `expires_at` and never qualify.
+    pub async fn rotation_overlap_keys(&self, active: &SigningKey) -> Result<Vec<SigningKey>> {
+        let Some(predecessor) = active.rotated_from else {
+            return Ok(Vec::new());
+        };
+        if !active.supports_openpgp() {
+            return Ok(Vec::new());
+        }
+        // Walk the rotated_from chain: rotating twice inside one window must
+        // keep the oldest still-trusted key co-signing as well.
+        let chain = sqlx::query_as::<_, SigningKey>(
+            r#"
+            WITH RECURSIVE chain AS (
+                SELECT id, rotated_from, 1 AS depth FROM signing_keys
+                WHERE id = $1
+                  AND NOT is_active AND key_type = 'gpg' AND expires_at > NOW()
+                UNION ALL
+                SELECT sk.id, sk.rotated_from, chain.depth + 1
+                FROM signing_keys sk JOIN chain ON sk.id = chain.rotated_from
+                WHERE chain.depth < $2
+                  AND NOT sk.is_active AND sk.key_type = 'gpg' AND sk.expires_at > NOW()
+            )
+            SELECT sk.* FROM signing_keys sk JOIN chain ON chain.id = sk.id
+            ORDER BY chain.depth
+            "#,
+        )
+        .bind(predecessor)
+        .bind(MAX_ROTATION_OVERLAP_CHAIN)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(chain)
+    }
+
+    /// The keys that sign a repository's OpenPGP metadata: `active` first,
+    /// followed by any rotation predecessors still in their overlap window
+    /// that can actually co-sign (see [`Self::co_sign_problem`]). A
+    /// predecessor that cannot is dropped with a once-per-key WARN, so the
+    /// signatures served and the keyring served always name the same keys.
+    pub async fn openpgp_signers(&self, active: SigningKey) -> Result<Vec<SigningKey>> {
+        let predecessors = self.rotation_overlap_keys(&active).await?;
+        let mut keys = Vec::with_capacity(1 + predecessors.len());
+        keys.push(active);
+        for key in predecessors {
+            match self.co_sign_problem(&key) {
+                None => keys.push(key),
+                Some(reason) => warn_predecessor_skipped_once(key.id, reason),
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Why `key` could not co-sign as a rotation predecessor, or `None` if it
+    /// can: it must be `gpg`, its public half must be an OpenPGP key (a
+    /// pre-#1236 `gpg` row stores an X.509 SPKI there), and its secret half
+    /// must load.
+    fn co_sign_problem(&self, key: &SigningKey) -> Option<&'static str> {
+        if !key.supports_openpgp() {
+            return Some("not an OpenPGP key type");
+        }
+        if SignedPublicKey::from_string(&key.public_key_pem).is_err() {
+            return Some("public key is not OpenPGP");
+        }
+        if self.load_openpgp_secret_key(key).is_err() {
+            return Some("secret key cannot be loaded");
+        }
+        None
+    }
+
+    /// The OpenPGP public key(s) a repository's metadata currently verifies
+    /// against: the active key, plus any rotation predecessor still in its
+    /// overlap window, as a single armored keyring (#1329). Outside a window
+    /// this is exactly [`Self::get_repo_public_key`].
+    pub async fn get_repo_public_keyring(&self, repo_id: Uuid) -> Result<Option<String>> {
+        let Some(active) = self.get_active_key_for_repo(repo_id).await? else {
+            return Ok(None);
+        };
+        let signers = self.openpgp_signers(active).await?;
+        openpgp_public_keyring(&signers).map(Some)
     }
 
     /// Get or create signing configuration for a repository.
@@ -1397,15 +1928,23 @@ impl SigningService {
         }
 
         // Successor inherits the old key's parameters.
+        let (key_type, algorithm) = successor_key_spec(&old_key.key_type, &old_key.algorithm);
         let req = CreateKeyRequest {
             repository_id: old_key.repository_id,
             name: build_rotated_key_name(&old_key.name),
-            key_type: old_key.key_type.clone(),
-            algorithm: old_key.algorithm.clone(),
+            key_type,
+            algorithm,
             uid_name: old_key.uid_name.clone(),
             uid_email: old_key.uid_email.clone(),
             created_by: user_id,
         };
+
+        // Only a key that can actually co-sign gets an overlap window (#1329).
+        // A pre-#1236 `gpg` row over PKCS#8 PEM — the very key the "legacy PEM
+        // key; rotate or recreate it" error sends operators here with — must
+        // retire immediately, or it would sit in the signer set for the whole
+        // window as a key nobody can use.
+        let co_sign_problem = self.co_sign_problem(&old_key);
 
         // Slow keygen OUTSIDE the transaction — no lock held across it.
         let material = self.generate_key_material(&req).await?;
@@ -1445,24 +1984,34 @@ impl SigningService {
         )
         .await?;
 
-        // (2) Repoint the signing config to the new (active) key — the config
-        //     now references an active key. Guarded on the old id so a
-        //     concurrent winner's repoint is never clobbered.
-        if let Some(repo_id) = locked.repository_id {
-            sqlx::query!(
-                "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE repository_id = $2 AND signing_key_id = $3",
-                new_id,
-                repo_id,
-                old_key_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // (3) Deactivate the old key LAST.
-        sqlx::query!(
-            "UPDATE signing_keys SET is_active = false WHERE id = $1",
+        // (2) Repoint EVERY signing config bound to the old key at the new
+        //     (active) key. Keyed on the binding, not on the old key's
+        //     `repository_id`: a key created without one and bound to one or
+        //     more repositories through their signing config would otherwise
+        //     leave those configs on a retired key, and every InRelease /
+        //     Release.gpg / repomd.xml.asc request 404s (#4416). Guarded on
+        //     the old id so a concurrent winner's repoint is never clobbered.
+        //     The repointed repositories are recorded in the `rotated` audit.
+        let repointed = sqlx::query_scalar!(
+            "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE signing_key_id = $2 RETURNING repository_id",
+            new_id,
             old_key_id,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // (3) Deactivate the old key LAST, recording when its rotation overlap
+        //     window ends (#1329): until then it keeps co-signing metadata.
+        let overlap_seconds = if co_sign_problem.is_some() {
+            0
+        } else {
+            self.rotation_overlap_seconds
+        };
+        let overlap_ends_at = rotation_overlap_end(now, overlap_seconds);
+        sqlx::query!(
+            "UPDATE signing_keys SET is_active = false, expires_at = $2 WHERE id = $1",
+            old_key_id,
+            overlap_ends_at,
         )
         .execute(&mut *tx)
         .await?;
@@ -1474,7 +2023,13 @@ impl SigningService {
             old_key_id,
             "rotated",
             user_id,
-            Some(serde_json::json!({"new_key_id": new_id.to_string()})),
+            Some(rotation_audit_details(
+                new_id,
+                overlap_seconds,
+                overlap_ends_at,
+                co_sign_problem,
+                &repointed,
+            )),
         )
         .await?;
 
@@ -1496,6 +2051,200 @@ impl SigningService {
             created_at: now,
             last_used_at: None,
         })
+    }
+
+    /// Active keys bound (`sign_metadata = true`) to a Debian/RPM repository
+    /// that cannot produce the OpenPGP signatures those formats need (#1331).
+    pub async fn find_legacy_metadata_keys(&self) -> Result<Vec<LegacyMetadataKey>> {
+        let bindings = sqlx::query_as::<_, (Uuid, String)>(
+            r#"
+            SELECT rsc.signing_key_id, r.key
+            FROM repository_signing_config rsc
+            JOIN repositories r ON r.id = rsc.repository_id
+            JOIN signing_keys sk ON sk.id = rsc.signing_key_id
+            WHERE rsc.sign_metadata AND sk.is_active AND r.format::text = ANY($1)
+            ORDER BY r.key
+            "#,
+        )
+        .bind(OPENPGP_METADATA_FORMATS)
+        .fetch_all(&self.db)
+        .await?;
+        let mut repos_by_key: std::collections::BTreeMap<Uuid, Vec<String>> = Default::default();
+        for (key_id, repo_key) in bindings {
+            repos_by_key.entry(key_id).or_default().push(repo_key);
+        }
+        let ids: Vec<Uuid> = repos_by_key.keys().copied().collect();
+        let keys = sqlx::query_as::<_, SigningKey>(
+            "SELECT * FROM signing_keys WHERE id = ANY($1) ORDER BY created_at",
+        )
+        .bind(&ids)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| {
+                let problem = self.legacy_key_problem(&key)?;
+                let repositories = repos_by_key.remove(&key.id).unwrap_or_default();
+                Some(LegacyMetadataKey {
+                    key,
+                    repositories,
+                    problem,
+                })
+            })
+            .collect())
+    }
+
+    /// Why `key` cannot sign OpenPGP metadata, or `None` if it can.
+    fn legacy_key_problem(&self, key: &SigningKey) -> Option<LegacyKeyProblem> {
+        if !key.supports_openpgp() {
+            return Some(LegacyKeyProblem::NotOpenPgpKeyType(key.key_type.clone()));
+        }
+        match self.encryption.decrypt(&key.private_key_enc) {
+            Ok(plain) => classify_gpg_key_material(&Zeroizing::new(plain)),
+            Err(e) => Some(LegacyKeyProblem::Unreadable(format!("cannot decrypt: {e}"))),
+        }
+    }
+
+    /// Replace a legacy metadata key with a fresh `key_type='gpg'` key (#1331):
+    /// insert the successor, repoint every Debian/RPM metadata-signing config
+    /// bound to the old key at it, and audit the old key as `auto_migrated`.
+    ///
+    /// Unlike [`Self::rotate_key`] the successor is always `gpg` (rotation keeps
+    /// the key type), and only the OpenPGP bindings move: a key also bound to,
+    /// say, an Alpine repository (which signs with raw RSA) stays active for
+    /// that repository. It is retired only once nothing references it.
+    ///
+    /// Returns the new key id, or `None` when there was nothing left to migrate
+    /// (another replica got there first, or the key was revoked meanwhile).
+    pub async fn migrate_legacy_metadata_key(&self, old: &SigningKey) -> Result<Option<Uuid>> {
+        let req = CreateKeyRequest {
+            repository_id: old.repository_id,
+            name: build_rotated_key_name(&old.name),
+            key_type: "gpg".to_string(),
+            algorithm: rsa_algorithm_or_default(&old.algorithm),
+            uid_name: old.uid_name.clone(),
+            uid_email: old.uid_email.clone(),
+            created_by: None,
+        };
+        let material = self.generate_key_material(&req).await?;
+        let new_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut tx = self.db.begin().await?;
+        let still_active: Option<bool> =
+            sqlx::query_scalar("SELECT is_active FROM signing_keys WHERE id = $1 FOR UPDATE")
+                .bind(old.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if still_active != Some(true) {
+            return Ok(None);
+        }
+        Self::insert_key_row(&mut *tx, new_id, &req, &material, true, Some(old.id), now).await?;
+        let repointed: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE repository_signing_config rsc
+            SET signing_key_id = $1, updated_at = NOW()
+            FROM repositories r
+            WHERE r.id = rsc.repository_id AND rsc.signing_key_id = $2
+              AND rsc.sign_metadata AND r.format::text = ANY($3)
+            RETURNING rsc.repository_id
+            "#,
+        )
+        .bind(new_id)
+        .bind(old.id)
+        .bind(OPENPGP_METADATA_FORMATS)
+        .fetch_all(&mut *tx)
+        .await?;
+        if repointed.is_empty() {
+            // Dropping the transaction rolls the successor insert back.
+            return Ok(None);
+        }
+        sqlx::query(
+            r#"
+            UPDATE signing_keys SET is_active = false, expires_at = $2
+            WHERE id = $1
+              AND NOT EXISTS (SELECT 1 FROM repository_signing_config WHERE signing_key_id = $1)
+            "#,
+        )
+        .bind(old.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        Self::audit_key_action_exec(&mut *tx, new_id, "created", None, None).await?;
+        Self::audit_key_action_exec(
+            &mut *tx,
+            old.id,
+            "auto_migrated",
+            None,
+            Some(serde_json::json!({
+                "new_key_id": new_id.to_string(),
+                "repository_ids": repointed,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(new_id))
+    }
+
+    /// Startup scan for legacy metadata signing keys (#1331): one WARN per
+    /// key, and with `auto_migrate` a replacement for each key whose problem
+    /// is [`LegacyKeyProblem::auto_migratable`]. Never fails startup.
+    pub async fn run_legacy_key_scan(&self, auto_migrate: bool) -> LegacyKeyScanReport {
+        match self.find_legacy_metadata_keys().await {
+            Ok(legacy) => self.process_legacy_keys(legacy, auto_migrate).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "legacy signing-key scan failed");
+                LegacyKeyScanReport {
+                    failed: 1,
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    /// The per-key half of [`Self::run_legacy_key_scan`]: WARN about each
+    /// item and, with `auto_migrate`, migrate the auto-migratable ones.
+    pub async fn process_legacy_keys(
+        &self,
+        legacy: Vec<LegacyMetadataKey>,
+        auto_migrate: bool,
+    ) -> LegacyKeyScanReport {
+        let mut report = LegacyKeyScanReport {
+            found: legacy.len(),
+            ..Default::default()
+        };
+        for item in legacy {
+            tracing::warn!(
+                signing_key_id = %item.key.id,
+                "{}",
+                legacy_key_warning(&item.key, &item.repositories, &item.problem)
+            );
+            if !(auto_migrate && item.problem.auto_migratable()) {
+                continue;
+            }
+            match self.migrate_legacy_metadata_key(&item.key).await {
+                Ok(Some(new_id)) => {
+                    tracing::warn!(
+                        old_signing_key_id = %item.key.id,
+                        new_signing_key_id = %new_id,
+                        "SIGNING_AUTO_MIGRATE_LEGACY_KEYS: replaced legacy signing key {} with \
+                         OpenPGP key {} for [{}]; clients must import the new public key \
+                         (gpg-key.asc / repomd.xml.key)",
+                        item.key.id,
+                        new_id,
+                        item.repositories.join(", ")
+                    );
+                    report.migrated.push((item.key.id, new_id));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(signing_key_id = %item.key.id, error = %e, "auto-migration of legacy signing key failed");
+                    report.failed += 1;
+                }
+            }
+        }
+        report
     }
 
     async fn audit_key_action(
@@ -1762,6 +2511,7 @@ mod tests {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
             signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
         };
         let req = CreateKeyRequest {
             repository_id: None,
@@ -1808,6 +2558,7 @@ mod tests {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
             signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
         };
         let (public_key, _) = pgp::SignedPublicKey::from_string(&key.public_key_pem).unwrap();
         public_key.verify().unwrap();
@@ -1845,6 +2596,7 @@ mod tests {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
             signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
         };
 
         let repomd = b"<repomd><data type=\"primary\"></data></repomd>";
@@ -2784,40 +3536,17 @@ mod tests {
             db: pool,
             encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
             signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
         }
     }
 
     async fn seed_repo(pool: &sqlx::PgPool) -> Uuid {
-        let key = format!("rotate-test-{}", Uuid::new_v4().as_simple());
-        sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
-             VALUES ($1, $1, 'debian', 'local', '/tmp/test') RETURNING id",
-        )
-        .bind(&key)
-        .fetch_one(pool)
-        .await
-        .expect("failed to create test repository")
+        seed_repo_of_format(pool, "debian").await
     }
 
     /// Create an active RSA key for `repo` and point its signing config at it.
     async fn seed_active_key(service: &SigningService, repo: Uuid) -> Uuid {
-        let key = service
-            .create_key(CreateKeyRequest {
-                repository_id: Some(repo),
-                name: "rotate-test-key".to_string(),
-                key_type: "rsa".to_string(),
-                algorithm: "rsa2048".to_string(),
-                uid_name: None,
-                uid_email: None,
-                created_by: None,
-            })
-            .await
-            .expect("create_key failed");
-        service
-            .update_signing_config(repo, Some(key.id), true, false, false)
-            .await
-            .expect("update_signing_config failed");
-        key.id
+        bound_key(service, repo, "rsa", "rsa2048").await
     }
 
     /// Count `is_active=true` keys for a repository.
@@ -3529,5 +4258,946 @@ mod tests {
             .expect("rotating an ordinary signing key must still succeed");
         assert_ne!(new.id, old);
         assert_eq!(active_key_ids(&pool, repo).await, vec![new.id]);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1326 Ed25519 OpenPGP keys, #1329 rotation overlap, #1331 legacy keys
+    // -----------------------------------------------------------------------
+
+    const TEST_RSA_ALGORITHM: &str = "rsa2048";
+
+    fn offline_service(passphrase: &str) -> SigningService {
+        SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(passphrase),
+            signature_expiry_seconds: 0,
+            rotation_overlap_seconds: DEFAULT_ROTATION_OVERLAP_SECONDS,
+        }
+    }
+
+    /// An in-memory `key_type='gpg'` key of `algorithm`, encrypted under
+    /// `passphrase`, as `create_key` would store it.
+    async fn openpgp_key_of(passphrase: &str, algorithm: &str) -> SigningKey {
+        let service = offline_service(passphrase);
+        let req = CreateKeyRequest {
+            repository_id: None,
+            name: format!("test-{algorithm}"),
+            key_type: "gpg".to_string(),
+            algorithm: algorithm.to_string(),
+            uid_name: Some("Test".to_string()),
+            uid_email: None,
+            created_by: None,
+        };
+        let material = service.generate_key_material(&req).await.unwrap();
+        SigningKey {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: req.name,
+            key_type: material.key_type,
+            fingerprint: Some(material.fingerprint),
+            key_id: Some(material.key_id),
+            public_key_pem: material.public_key_pem,
+            private_key_enc: material.private_key_enc,
+            algorithm: req.algorithm,
+            uid_name: req.uid_name,
+            uid_email: None,
+            expires_at: None,
+            is_active: true,
+            created_at: Utc::now(),
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    fn public_of(key: &SigningKey) -> pgp::SignedPublicKey {
+        pgp::SignedPublicKey::from_string(&key.public_key_pem)
+            .unwrap()
+            .0
+    }
+
+    /// Run `gpgv` over `signed` (cleartext, or detached when `data` is given)
+    /// with a keyring holding only `trusted`; returns whether it reported a
+    /// GOODSIG. `None` when gpgv is not installed.
+    fn gpgv_goodsig(trusted: &SigningKey, signed: &str, data: Option<&[u8]>) -> Option<bool> {
+        use pgp::ser::Serialize as _;
+        let dir = tempfile::tempdir().unwrap();
+        let keyring = dir.path().join("trusted.gpg");
+        std::fs::write(&keyring, public_of(trusted).to_bytes().unwrap()).unwrap();
+        let sig = dir.path().join("sig.asc");
+        std::fs::write(&sig, signed).unwrap();
+        let mut cmd = std::process::Command::new("gpgv");
+        cmd.env("GNUPGHOME", dir.path())
+            .arg("--status-fd")
+            .arg("1")
+            .arg("--keyring")
+            .arg(&keyring)
+            .arg(&sig);
+        if let Some(data) = data {
+            let path = dir.path().join("data");
+            std::fs::write(&path, data).unwrap();
+            cmd.arg(&path);
+        }
+        let out = cmd.output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).contains("[GNUPG:] GOODSIG"))
+    }
+
+    #[test]
+    fn validate_key_spec_accepts_only_generatable_pairs() {
+        assert!(validate_key_spec("gpg", "rsa2048").is_ok());
+        assert!(validate_key_spec("gpg", "rsa4096").is_ok());
+        assert!(validate_key_spec("gpg", ED25519_ALGORITHM).is_ok());
+        assert!(validate_key_spec("rsa", "rsa4096").is_ok());
+        assert!(validate_key_spec("rsa", ED25519_ALGORITHM)
+            .unwrap_err()
+            .contains("key_type='gpg'"));
+        assert!(validate_key_spec("ed25519", ED25519_ALGORITHM)
+            .unwrap_err()
+            .contains("key_type='gpg'"));
+        assert!(validate_key_spec("ed25519", "rsa4096").is_err());
+        assert!(validate_key_spec("gpg", "dsa1024")
+            .unwrap_err()
+            .contains("ed25519"));
+        assert!(validate_key_spec("rsa", "dsa1024").is_err());
+    }
+
+    #[test]
+    fn successor_of_a_legacy_ed25519_row_is_the_rsa_key_it_really_was() {
+        assert_eq!(
+            successor_key_spec("ed25519", "rsa2048"),
+            ("rsa".to_string(), "rsa2048".to_string())
+        );
+        assert_eq!(
+            successor_key_spec("ed25519", "ed25519"),
+            ("rsa".to_string(), "rsa4096".to_string())
+        );
+        assert_eq!(
+            successor_key_spec("gpg", ED25519_ALGORITHM),
+            ("gpg".to_string(), ED25519_ALGORITHM.to_string())
+        );
+        assert_eq!(
+            successor_key_spec("rsa", "rsa4096"),
+            ("rsa".to_string(), "rsa4096".to_string())
+        );
+    }
+
+    #[test]
+    fn openpgp_signature_hash_is_sha512_for_eddsa_and_sha256_otherwise() {
+        assert_eq!(
+            openpgp_signature_hash(PublicKeyAlgorithm::EdDSALegacy),
+            HashAlgorithm::SHA2_512
+        );
+        assert_eq!(
+            openpgp_signature_hash(PublicKeyAlgorithm::Ed25519),
+            HashAlgorithm::SHA2_512
+        );
+        assert_eq!(
+            openpgp_signature_hash(PublicKeyAlgorithm::RSA),
+            HashAlgorithm::SHA2_256
+        );
+    }
+
+    #[tokio::test]
+    async fn create_key_service_path_rejects_ed25519_key_type() {
+        let service = offline_service(TEST_PASSPHRASE);
+        let req = CreateKeyRequest {
+            repository_id: None,
+            name: "x".to_string(),
+            key_type: "ed25519".to_string(),
+            algorithm: ED25519_ALGORITHM.to_string(),
+            uid_name: None,
+            uid_email: None,
+            created_by: None,
+        };
+        assert!(matches!(
+            service.generate_key_material(&req).await,
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ed25519_key_is_a_v4_eddsa_openpgp_key_with_a_sha1_fingerprint() {
+        let key = openpgp_key_of(TEST_PASSPHRASE, ED25519_ALGORITHM).await;
+        assert_eq!(key.key_type, "gpg");
+        assert!(key.supports_openpgp());
+        // v4 fingerprints are SHA-1 regardless of algorithm: 20 bytes.
+        let fp = key.fingerprint.as_deref().unwrap();
+        assert_eq!(fp.len(), 40, "fingerprint {fp}");
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(key.key_id.as_deref().unwrap().len(), 16);
+        assert!(fp.ends_with(key.key_id.as_deref().unwrap()));
+
+        let public = public_of(&key);
+        public.verify().unwrap();
+        assert_eq!(public.version(), KeyVersion::V4);
+        assert_eq!(public.algorithm(), PublicKeyAlgorithm::EdDSALegacy);
+        assert_eq!(hex::encode(public.fingerprint().as_bytes()), fp);
+    }
+
+    #[tokio::test]
+    async fn ed25519_key_signs_inrelease_and_release_gpg() {
+        let passphrase = TEST_PASSPHRASE;
+        let key = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        let service = offline_service(passphrase).with_signature_expiry(7 * 24 * 3600);
+        let public = public_of(&key);
+        let release = "Origin: artifact-keeper\nSuite: stable\nCodename: stable\n";
+
+        let detached = service
+            .sign_openpgp_detached_with_key(&key, release.as_bytes())
+            .await
+            .unwrap();
+        let (sig, _) = StandaloneSignature::from_string(&detached).unwrap();
+        sig.verify(&public, release.as_bytes()).unwrap();
+        assert_eq!(
+            sig.signature.config.pub_alg,
+            PublicKeyAlgorithm::EdDSALegacy
+        );
+        assert_eq!(sig.signature.config.hash_alg, HashAlgorithm::SHA2_512);
+
+        let inrelease = service
+            .sign_openpgp_cleartext_with_key(&key, release)
+            .await
+            .unwrap();
+        assert!(inrelease.contains("Hash: SHA512"), "{inrelease}");
+        let (msg, _) = CleartextSignedMessage::from_string(&inrelease).unwrap();
+        msg.verify(&public).unwrap();
+
+        // Interop: GnuPG's gpgv (what apt runs) accepts both forms.
+        if let Some(good) = gpgv_goodsig(&key, &inrelease, None) {
+            assert!(good, "gpgv rejected the Ed25519 InRelease");
+            assert_eq!(
+                gpgv_goodsig(&key, &detached, Some(release.as_bytes())),
+                Some(true),
+                "gpgv rejected the Ed25519 Release.gpg"
+            );
+        } else {
+            eprintln!("gpgv not installed; pgp-crate verification only");
+        }
+    }
+
+    #[tokio::test]
+    async fn rsa_openpgp_signatures_still_use_sha256() {
+        let passphrase = TEST_PASSPHRASE;
+        let key = openpgp_key_of(passphrase, TEST_RSA_ALGORITHM).await;
+        let service = offline_service(passphrase);
+        let detached = service
+            .sign_openpgp_detached_with_key(&key, b"data")
+            .await
+            .unwrap();
+        let (sig, _) = StandaloneSignature::from_string(&detached).unwrap();
+        assert_eq!(sig.signature.config.pub_alg, PublicKeyAlgorithm::RSA);
+        assert_eq!(sig.signature.config.hash_alg, HashAlgorithm::SHA2_256);
+        let cleartext = service
+            .sign_openpgp_cleartext_with_key(&key, "text\n")
+            .await
+            .unwrap();
+        assert!(cleartext.contains("Hash: SHA256"));
+    }
+
+    #[test]
+    fn rotation_overlap_end_adds_the_window_and_clamps_it() {
+        let t = Utc::now();
+        assert_eq!(rotation_overlap_end(t, 0), t);
+        assert_eq!(rotation_overlap_end(t, 60), t + Duration::seconds(60));
+        assert_eq!(
+            rotation_overlap_end(t, u64::MAX),
+            t + Duration::seconds(MAX_ROTATION_OVERLAP_SECONDS as i64)
+        );
+    }
+
+    #[test]
+    fn rotation_audit_records_the_window_end_or_why_there_is_none() {
+        let id = Uuid::new_v4();
+        let end = Utc::now() + Duration::days(14);
+        let repo = Uuid::new_v4();
+        let d = rotation_audit_details(id, 60, end, None, &[repo]);
+        assert_eq!(d["new_key_id"], id.to_string());
+        assert_eq!(
+            d["repointed_repository_ids"],
+            serde_json::json!([repo.to_string()])
+        );
+        assert_eq!(d["overlap_ends_at"], end.to_rfc3339());
+        assert!(d.get("overlap_skipped").is_none());
+
+        let d = rotation_audit_details(id, 0, end, None, &[]);
+        assert!(d["overlap_ends_at"].is_null(), "overlap disabled");
+
+        let d = rotation_audit_details(id, 0, end, Some("public key is not OpenPGP"), &[]);
+        assert!(d["overlap_ends_at"].is_null());
+        assert_eq!(d["overlap_skipped"], "public key is not OpenPGP");
+    }
+
+    #[tokio::test]
+    async fn dual_signed_metadata_verifies_against_either_key_alone() {
+        let passphrase = TEST_PASSPHRASE;
+        let old = openpgp_key_of(passphrase, TEST_RSA_ALGORITHM).await;
+        let new = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        let service = offline_service(passphrase);
+        let signers = vec![new.clone(), old.clone()];
+        let release = "Origin: ak\nSuite: stable\n";
+
+        let detached = service
+            .sign_openpgp_detached_with_keys(&signers, release.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(detached.matches("-----BEGIN PGP SIGNATURE-----").count(), 1);
+        let sigs: Vec<StandaloneSignature> = StandaloneSignature::from_string_many(&detached)
+            .unwrap()
+            .0
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(sigs.len(), 2);
+        for key in [&new, &old] {
+            assert!(
+                sigs.iter()
+                    .any(|s| s.verify(&public_of(key), release.as_bytes()).is_ok()),
+                "a detached signature by {} must be present",
+                key.algorithm
+            );
+        }
+
+        let inrelease = service
+            .sign_openpgp_cleartext_with_keys(&signers, release)
+            .await
+            .unwrap();
+        let (msg, _) = CleartextSignedMessage::from_string(&inrelease).unwrap();
+        assert_eq!(msg.signatures().len(), 2);
+        msg.verify(&public_of(&new)).unwrap();
+        msg.verify(&public_of(&old)).unwrap();
+
+        // What apt actually does: gpgv against a keyring holding ONE key. An
+        // unrelated key must not verify, or the helper proves nothing.
+        let stranger = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        if let Some(good) = gpgv_goodsig(&stranger, &inrelease, None) {
+            assert!(
+                !good,
+                "gpgv accepted a signature from a key it does not hold"
+            );
+        }
+        for key in [&new, &old] {
+            if let Some(good) = gpgv_goodsig(key, &inrelease, None) {
+                assert!(good, "gpgv with only the {} key", key.algorithm);
+                assert_eq!(
+                    gpgv_goodsig(key, &detached, Some(release.as_bytes())),
+                    Some(true)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloadable_predecessor_is_dropped_but_the_active_key_must_load() {
+        let passphrase = TEST_PASSPHRASE;
+        let active = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        let mut broken = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        broken.private_key_enc = vec![0u8; 8];
+        let service = offline_service(passphrase);
+
+        let detached = service
+            .sign_openpgp_detached_with_keys(&[active.clone(), broken.clone()], b"x")
+            .await
+            .unwrap();
+        let n = StandaloneSignature::from_string_many(&detached)
+            .unwrap()
+            .0
+            .count();
+        assert_eq!(n, 1, "the broken predecessor is skipped");
+
+        assert!(service
+            .sign_openpgp_detached_with_keys(&[broken, active], b"x")
+            .await
+            .is_err());
+        assert!(service
+            .sign_openpgp_detached_with_keys(&[], b"x")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn public_keyring_is_verbatim_for_one_key_and_one_block_for_two() {
+        let a = openpgp_key_of(TEST_PASSPHRASE, TEST_RSA_ALGORITHM).await;
+        let b = openpgp_key_of(TEST_PASSPHRASE, ED25519_ALGORITHM).await;
+        assert_eq!(
+            openpgp_public_keyring(std::slice::from_ref(&a)).unwrap(),
+            a.public_key_pem
+        );
+        let ring = openpgp_public_keyring(&[b.clone(), a.clone()]).unwrap();
+        assert_eq!(
+            ring.matches("-----BEGIN PGP PUBLIC KEY BLOCK-----").count(),
+            1
+        );
+        let keys: Vec<pgp::SignedPublicKey> = pgp::SignedPublicKey::from_string_many(&ring)
+            .unwrap()
+            .0
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let fps: Vec<String> = keys
+            .iter()
+            .map(|k| hex::encode(k.fingerprint().as_bytes()))
+            .collect();
+        assert_eq!(
+            fps,
+            vec![
+                b.fingerprint.clone().unwrap(),
+                a.fingerprint.clone().unwrap()
+            ]
+        );
+        assert_eq!(
+            signer_set_fingerprint(&[b.clone(), a.clone()]),
+            format!(
+                "{},{}",
+                b.fingerprint.as_ref().unwrap(),
+                a.fingerprint.as_ref().unwrap()
+            )
+        );
+
+        let mut bad = openpgp_key_of(TEST_PASSPHRASE, ED25519_ALGORITHM).await;
+        bad.public_key_pem = "not a key".to_string();
+        // A broken active key is an error; a broken predecessor is dropped.
+        assert!(openpgp_public_keyring(&[bad.clone(), a.clone()]).is_err());
+        assert_eq!(
+            openpgp_public_keyring(&[a.clone(), bad.clone()]).unwrap(),
+            a.public_key_pem,
+            "only the active key left: served verbatim"
+        );
+        let ring = openpgp_public_keyring(&[b.clone(), bad, a.clone()]).unwrap();
+        assert_eq!(
+            pgp::SignedPublicKey::from_string_many(&ring)
+                .unwrap()
+                .0
+                .count(),
+            2
+        );
+        assert!(openpgp_public_keyring(&[]).is_err());
+    }
+
+    #[test]
+    fn signer_set_fingerprint_of_one_key_is_its_fingerprint() {
+        let mut key = generate_test_signing_key(TEST_PASSPHRASE);
+        assert_eq!(
+            signer_set_fingerprint(std::slice::from_ref(&key)),
+            key.fingerprint.clone().unwrap()
+        );
+        key.fingerprint = None;
+        assert_eq!(signer_set_fingerprint(&[key]), "unknown");
+    }
+
+    #[tokio::test]
+    async fn gpg_material_is_classified_openpgp_legacy_pem_or_unreadable() {
+        let passphrase = TEST_PASSPHRASE;
+        let service = offline_service(passphrase);
+        let gpg = openpgp_key_of(passphrase, ED25519_ALGORITHM).await;
+        assert_eq!(service.legacy_key_problem(&gpg), None);
+
+        let rsa = generate_test_signing_key(passphrase);
+        assert_eq!(
+            service.legacy_key_problem(&rsa),
+            Some(LegacyKeyProblem::NotOpenPgpKeyType("rsa".to_string()))
+        );
+
+        // A pre-#1236 row: key_type='gpg' over PKCS#8 PEM material.
+        let mut pem_gpg = rsa.clone();
+        pem_gpg.key_type = "gpg".to_string();
+        assert_eq!(
+            service.legacy_key_problem(&pem_gpg),
+            Some(LegacyKeyProblem::LegacyPemMaterial)
+        );
+
+        // Encrypted under another secret (e.g. JWT_SECRET changed).
+        let other = offline_service(&TEST_PASSPHRASE.repeat(2));
+        assert!(matches!(
+            other.legacy_key_problem(&gpg),
+            Some(LegacyKeyProblem::Unreadable(_))
+        ));
+        assert!(matches!(
+            classify_gpg_key_material(b"garbage"),
+            Some(LegacyKeyProblem::Unreadable(_))
+        ));
+        assert!(matches!(
+            classify_gpg_key_material(&[0xff, 0xfe]),
+            Some(LegacyKeyProblem::Unreadable(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_key_warning_names_the_key_and_repos_and_never_suggests_rotate() {
+        let key = generate_test_signing_key(TEST_PASSPHRASE);
+        let repos = vec!["deb-a".to_string(), "rpm-b".to_string()];
+        for problem in [
+            LegacyKeyProblem::NotOpenPgpKeyType("rsa".to_string()),
+            LegacyKeyProblem::LegacyPemMaterial,
+            LegacyKeyProblem::Unreadable("cannot decrypt".to_string()),
+        ] {
+            let msg = legacy_key_warning(&key, &repos, &problem);
+            assert!(msg.contains(&key.id.to_string()));
+            assert!(msg.contains("deb-a, rpm-b"));
+            assert!(!msg.contains("rotate"), "{msg}");
+            assert!(msg.contains(&problem.describe()));
+            assert_eq!(
+                msg.contains("SIGNING_AUTO_MIGRATE_LEGACY_KEYS"),
+                problem.auto_migratable()
+            );
+        }
+        assert!(!LegacyKeyProblem::Unreadable(String::new()).auto_migratable());
+    }
+
+    // ---- DB-backed --------------------------------------------------------
+
+    async fn overlap_pool() -> Option<sqlx::PgPool> {
+        crate::testing::try_pool_with(4).await
+    }
+
+    async fn seed_repo_of_format(pool: &sqlx::PgPool, format: &str) -> Uuid {
+        let key = format!("rotate-test-{}", Uuid::new_v4().as_simple());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, $2::repository_format, 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .bind(format)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository")
+    }
+
+    async fn bound_key(
+        service: &SigningService,
+        repo: Uuid,
+        key_type: &str,
+        algorithm: &str,
+    ) -> Uuid {
+        let key = service
+            .create_key(CreateKeyRequest {
+                repository_id: Some(repo),
+                name: format!("k-{key_type}"),
+                key_type: key_type.to_string(),
+                algorithm: algorithm.to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        service
+            .update_signing_config(repo, Some(key.id), true, false, false)
+            .await
+            .unwrap();
+        key.id
+    }
+
+    async fn load_key(pool: &sqlx::PgPool, id: Uuid) -> SigningKey {
+        sqlx::query_as::<_, SigningKey>("SELECT * FROM signing_keys WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn audit_details(pool: &sqlx::PgPool, key: Uuid, action: &str) -> Vec<serde_json::Value> {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT details FROM signing_key_audit WHERE signing_key_id = $1 AND action = $2",
+        )
+        .bind(key)
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.unwrap_or_default())
+        .collect()
+    }
+
+    async fn signer_ids(service: &SigningService, repo: Uuid) -> Vec<Uuid> {
+        let active = service
+            .get_active_key_for_repo(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        service
+            .openpgp_signers(active)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|k| k.id)
+            .collect()
+    }
+
+    /// #4416: a key created without `repository_id` and bound to Debian
+    /// repositories through their signing config. Rotating it must repoint
+    /// every one of those configs at the successor; before the fix they kept
+    /// pointing at the retired key and metadata signing 404ed.
+    #[tokio::test]
+    async fn rotating_an_unscoped_key_repoints_every_bound_config_4416() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let unscoped = service
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("unscoped-{}", Uuid::new_v4().as_simple()),
+                key_type: "gpg".to_string(),
+                algorithm: ED25519_ALGORITHM.to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let repos = [
+            seed_repo_of_format(&pool, "debian").await,
+            seed_repo_of_format(&pool, "debian").await,
+        ];
+        for repo in repos {
+            service
+                .update_signing_config(repo, Some(unscoped.id), true, false, false)
+                .await
+                .unwrap();
+        }
+        // A repository bound to a different key is not touched.
+        let other_repo = seed_repo_of_format(&pool, "debian").await;
+        let other_key = bound_key(&service, other_repo, "gpg", ED25519_ALGORITHM).await;
+
+        let successor = service.rotate_key(unscoped.id, None).await.unwrap();
+        assert_eq!(
+            successor.repository_id, None,
+            "the successor stays unscoped"
+        );
+        assert!(
+            !load_key(&pool, unscoped.id).await.is_active,
+            "old key retired"
+        );
+        for repo in repos {
+            let active = service
+                .get_active_key_for_repo(repo)
+                .await
+                .unwrap()
+                .expect("the bound repository still has an active signing key");
+            assert_eq!(active.id, successor.id);
+            assert_eq!(
+                signer_ids(&service, repo).await,
+                vec![successor.id, unscoped.id],
+                "the retired key co-signs through the overlap window"
+            );
+        }
+        let other = service.get_active_key_for_repo(other_repo).await.unwrap();
+        assert_eq!(other.map(|k| k.id), Some(other_key));
+        let audit = audit_details(&pool, unscoped.id, "rotated").await;
+        let mut recorded: Vec<String> =
+            serde_json::from_value(audit[0]["repointed_repository_ids"].clone()).unwrap();
+        recorded.sort();
+        let mut expected: Vec<String> = repos.iter().map(Uuid::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            recorded, expected,
+            "the rotation audit names every repointed repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_keeps_the_predecessor_co_signing_until_revoked() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo_of_format(&pool, "debian").await;
+        let a = bound_key(&service, repo, "gpg", ED25519_ALGORITHM).await;
+        assert_eq!(signer_ids(&service, repo).await, vec![a]);
+
+        let before = Utc::now();
+        let b = service.rotate_key(a, None).await.unwrap().id;
+        let old = load_key(&pool, a).await;
+        assert!(!old.is_active);
+        let end = old.expires_at.expect("rotation stamps the overlap end");
+        let expected = before + Duration::seconds(DEFAULT_ROTATION_OVERLAP_SECONDS as i64);
+        assert!(
+            (end - expected).num_seconds().abs() < 60,
+            "{end} vs {expected}"
+        );
+        let audit = audit_details(&pool, a, "rotated").await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["new_key_id"], b.to_string());
+        assert!(audit[0]["overlap_ends_at"].is_string());
+
+        assert_eq!(signer_ids(&service, repo).await, vec![b, a]);
+        let ring = service
+            .get_repo_public_keyring(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pgp::SignedPublicKey::from_string_many(&ring)
+                .unwrap()
+                .0
+                .count(),
+            2
+        );
+
+        // Rotating again inside the window keeps the whole chain co-signing.
+        let c = service.rotate_key(b, None).await.unwrap().id;
+        assert_eq!(signer_ids(&service, repo).await, vec![c, b, a]);
+
+        // Revoking a predecessor ends its overlap at once.
+        service.revoke_key(a, None).await.unwrap();
+        assert_eq!(signer_ids(&service, repo).await, vec![c, b]);
+        let revoked = load_key(&pool, a).await;
+        assert!(revoked.expires_at.unwrap() <= Utc::now());
+    }
+
+    #[tokio::test]
+    async fn zero_overlap_retires_the_predecessor_immediately() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone()).with_rotation_overlap(0);
+        let repo = seed_repo_of_format(&pool, "rpm").await;
+        let a = bound_key(&service, repo, "gpg", ED25519_ALGORITHM).await;
+        let b = service.rotate_key(a, None).await.unwrap().id;
+        assert_eq!(signer_ids(&service, repo).await, vec![b]);
+        let ring = service
+            .get_repo_public_keyring(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ring, load_key(&pool, b).await.public_key_pem);
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_keys_are_found_and_auto_migrated_to_gpg() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let deb = seed_repo_of_format(&pool, "debian").await;
+        let legacy = bound_key(&service, deb, "rsa", "rsa2048").await;
+        let alpine = seed_repo_of_format(&pool, "alpine").await;
+        let alpine_rsa = bound_key(&service, alpine, "rsa", "rsa2048").await;
+        let rpm = seed_repo_of_format(&pool, "rpm").await;
+        let good = bound_key(&service, rpm, "gpg", ED25519_ALGORITHM).await;
+
+        let found = service.find_legacy_metadata_keys().await.unwrap();
+        let mine = found
+            .iter()
+            .find(|l| l.key.id == legacy)
+            .expect("an rsa key signing Debian metadata is legacy");
+        assert_eq!(
+            mine.problem,
+            LegacyKeyProblem::NotOpenPgpKeyType("rsa".to_string())
+        );
+        assert_eq!(mine.repositories.len(), 1);
+        assert!(
+            !found
+                .iter()
+                .any(|l| l.key.id == alpine_rsa || l.key.id == good),
+            "raw-RSA formats and OpenPGP keys are not legacy"
+        );
+
+        // Warn-only scan changes nothing.
+        let report = service.run_legacy_key_scan(false).await;
+        assert!(report.found >= 1);
+        assert!(report.migrated.is_empty());
+        assert!(load_key(&pool, legacy).await.is_active);
+
+        let new_id = service
+            .migrate_legacy_metadata_key(&mine.key)
+            .await
+            .unwrap()
+            .expect("migrated");
+        let new = load_key(&pool, new_id).await;
+        assert_eq!(new.key_type, "gpg");
+        assert_eq!(new.algorithm, "rsa2048");
+        assert_eq!(new.rotated_from, Some(legacy));
+        assert!(new.is_active);
+        assert!(service.legacy_key_problem(&new).is_none());
+        let active = service.get_active_key_for_repo(deb).await.unwrap().unwrap();
+        assert_eq!(active.id, new_id);
+        assert!(!load_key(&pool, legacy).await.is_active);
+        let audit = audit_details(&pool, legacy, "auto_migrated").await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["new_key_id"], new_id.to_string());
+        // The old rsa key is not OpenPGP-capable, so it never co-signs.
+        assert_eq!(signer_ids(&service, deb).await, vec![new_id]);
+
+        // Idempotent: a second attempt (another replica) is a no-op.
+        assert_eq!(
+            service
+                .migrate_legacy_metadata_key(&mine.key)
+                .await
+                .unwrap(),
+            None
+        );
+        // Unrelated bindings are untouched.
+        assert_eq!(
+            service
+                .get_active_key_for_repo(alpine)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            alpine_rsa
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_migration_keeps_a_shared_key_alive_for_raw_rsa_repos() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let deb = seed_repo_of_format(&pool, "debian").await;
+        let alpine = seed_repo_of_format(&pool, "alpine").await;
+        let shared = bound_key(&service, deb, "rsa", "rsa2048").await;
+        service
+            .update_signing_config(alpine, Some(shared), true, false, false)
+            .await
+            .unwrap();
+
+        let key = load_key(&pool, shared).await;
+        let new_id = service
+            .migrate_legacy_metadata_key(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service
+                .get_active_key_for_repo(deb)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            new_id
+        );
+        assert_eq!(
+            service
+                .get_active_key_for_repo(alpine)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            shared,
+            "Alpine still signs with the raw RSA key"
+        );
+        assert!(load_key(&pool, shared).await.is_active);
+    }
+
+    #[tokio::test]
+    async fn rotating_a_gpg_row_over_legacy_pem_does_not_open_an_overlap() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo_of_format(&pool, "debian").await;
+        // A pre-#1236 row: key_type='gpg' holding PKCS#8 / SPKI PEM material.
+        let legacy = bound_key(&service, repo, "rsa", "rsa2048").await;
+        sqlx::query("UPDATE signing_keys SET key_type = 'gpg' WHERE id = $1")
+            .bind(legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let new = service.rotate_key(legacy, None).await.unwrap();
+        assert_eq!(new.key_type, "gpg");
+        let old = load_key(&pool, legacy).await;
+        assert!(
+            old.expires_at.unwrap() <= Utc::now(),
+            "no window for a key that cannot co-sign"
+        );
+        let audit = audit_details(&pool, legacy, "rotated").await;
+        assert!(audit[0]["overlap_ends_at"].is_null());
+        assert_eq!(audit[0]["overlap_skipped"], "public key is not OpenPGP");
+
+        assert_eq!(signer_ids(&service, repo).await, vec![new.id]);
+        let ring = service
+            .get_repo_public_keyring(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ring, new.public_key_pem,
+            "gpg-key.asc serves the single new key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_link_ends_the_overlap_for_older_predecessors_too() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo_of_format(&pool, "debian").await;
+        let a = bound_key(&service, repo, "gpg", ED25519_ALGORITHM).await;
+        let b = service.rotate_key(a, None).await.unwrap().id;
+        assert_eq!(signer_ids(&service, repo).await, vec![b, a]);
+
+        // B -> C with overlap 0: B retires at once, and A (still inside its
+        // own window) must stop co-signing with it.
+        let c = rotation_test_service(pool.clone())
+            .with_rotation_overlap(0)
+            .rotate_key(b, None)
+            .await
+            .unwrap()
+            .id;
+        assert!(load_key(&pool, a).await.expires_at.unwrap() > Utc::now());
+        assert_eq!(signer_ids(&service, repo).await, vec![c]);
+    }
+
+    #[tokio::test]
+    async fn auto_migration_replaces_only_migratable_keys() {
+        let Some(pool) = overlap_pool().await else {
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let deb = seed_repo_of_format(&pool, "debian").await;
+        let rsa = bound_key(&service, deb, "rsa", "rsa2048").await;
+        let rpm = seed_repo_of_format(&pool, "rpm").await;
+        let unreadable = bound_key(&service, rpm, "gpg", ED25519_ALGORITHM).await;
+        sqlx::query("UPDATE signing_keys SET private_key_enc = '\\x00'::bytea WHERE id = $1")
+            .bind(unreadable)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut items = Vec::new();
+        for id in [rsa, unreadable] {
+            let key = load_key(&pool, id).await;
+            let problem = service.legacy_key_problem(&key).expect("legacy");
+            items.push(LegacyMetadataKey {
+                key,
+                repositories: vec![],
+                problem,
+            });
+        }
+        assert!(matches!(items[1].problem, LegacyKeyProblem::Unreadable(_)));
+
+        let warn_only = service.process_legacy_keys(items.clone(), false).await;
+        assert_eq!((warn_only.found, warn_only.migrated.len()), (2, 0));
+
+        let report = service.process_legacy_keys(items, true).await;
+        assert_eq!(report.found, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.migrated.len(), 1);
+        assert_eq!(report.migrated[0].0, rsa);
+        assert!(
+            load_key(&pool, unreadable).await.is_active,
+            "an unreadable key (changed JWT_SECRET?) is never replaced"
+        );
+        assert_eq!(
+            service
+                .get_active_key_for_repo(rpm)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            unreadable
+        );
+        assert_eq!(
+            service
+                .get_active_key_for_repo(deb)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            report.migrated[0].1
+        );
     }
 }

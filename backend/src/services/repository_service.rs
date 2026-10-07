@@ -68,12 +68,70 @@ impl RepoAccess {
     pub const READ: Self = Self::Action("read");
 }
 
+/// Which storage quota rejected an upload (#2474).
+///
+/// A repository's own `quota_bytes` and its project's `quota_bytes` are
+/// enforced independently: an upload must fit under both. The repository
+/// quota is evaluated first, so when both would be exceeded the narrower,
+/// repository-scoped reason is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaScope {
+    /// The target repository's own `quota_bytes`.
+    Repository,
+    /// The aggregate `quota_bytes` of the project the repository belongs to,
+    /// summed over every repository assigned to that project.
+    Project,
+}
+
+impl QuotaScope {
+    /// Client-facing reason for a quota rejection in this scope.
+    pub fn exceeded_message(self) -> &'static str {
+        match self {
+            QuotaScope::Repository => "Repository storage quota exceeded",
+            QuotaScope::Project => "Project storage quota exceeded",
+        }
+    }
+
+    /// The `507 QUOTA_EXCEEDED` error for a rejection in this scope.
+    pub fn into_error(self) -> AppError {
+        AppError::QuotaExceeded(self.exceeded_message().to_string())
+    }
+}
+
+/// A quota limit paired with the usage it is checked against (one level of
+/// [`RepositoryService::quota_denial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaUsage {
+    pub quota_bytes: Option<i64>,
+    pub used_bytes: i64,
+}
+
+impl QuotaUsage {
+    pub(crate) fn new(quota_bytes: Option<i64>, used_bytes: i64) -> Self {
+        Self {
+            quota_bytes,
+            used_bytes,
+        }
+    }
+}
+
+/// `Some(quota)` only for a real, finite limit; `None` for an unset or
+/// non-positive (unlimited sentinel) quota. Same convention as
+/// [`RepositoryService::quota_allows`].
+pub(crate) fn finite_quota(quota_bytes: Option<i64>) -> Option<i64> {
+    quota_bytes.filter(|quota| *quota > 0)
+}
+
 /// Outcome of an atomic, in-transaction quota admission check
 /// ([`RepositoryService::check_quota_locked`]).
 #[derive(Debug, Clone, Copy)]
 pub struct QuotaAdmission {
-    /// Whether the upload is permitted under the repository's storage quota.
+    /// Whether the upload is permitted under the repository's storage quota
+    /// and, when the repository belongs to a project with a finite quota,
+    /// under the project's aggregate quota.
     pub allowed: bool,
+    /// The quota that rejected the upload; `None` exactly when `allowed`.
+    pub denied_by: Option<QuotaScope>,
     /// The repository's ledger-tracked usage (`hosted + proxy + oci`
     /// counters from `repository_usage_ledger`, read under the admission
     /// row lock) EXCLUDING the row currently being written at the target
@@ -329,6 +387,7 @@ pub(crate) fn validate_remote_upstream(
                 ));
             }
             Some(url) => {
+                reject_url_controls_and_whitespace(url)?;
                 validate_outbound_url(url, "Upstream URL")?;
                 if *format == RepositoryFormat::Rpm && is_mirrorlist_or_metalink(url) {
                     return Err(AppError::Validation(
@@ -349,7 +408,26 @@ pub(crate) fn validate_remote_upstream(
             }
         }
     } else if let Some(url) = upstream_url {
+        reject_url_controls_and_whitespace(url)?;
         validate_outbound_url(url, "Upstream URL")?;
+    }
+    Ok(())
+}
+
+/// Refuse an upstream URL carrying ASCII control characters or whitespace
+/// (#4463). The WHATWG parser behind `validate_outbound_url` silently drops
+/// leading/trailing C0 controls and every tab/CR/LF, so `"\x01https://u:p@h/"`
+/// or `"ht\ttps://u:p@h/"` validate and authenticate, yet are stored raw;
+/// the origin normalizer, which works on the stored text, would not
+/// recognise their scheme and would keep the credentials at rest. No real
+/// upstream needs either: spaces must be percent-encoded.
+fn reject_url_controls_and_whitespace(url: &str) -> Result<()> {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::Validation(
+            "Upstream URL must not contain whitespace or control characters \
+             (percent-encode them)"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -860,6 +938,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "cran" => Some(RepositoryFormat::Cran),
         "vagrant" => Some(RepositoryFormat::Vagrant),
         "opkg" => Some(RepositoryFormat::Opkg),
+        "pacman" => Some(RepositoryFormat::Pacman),
         "p2" => Some(RepositoryFormat::P2),
         "bazel" => Some(RepositoryFormat::Bazel),
         "protobuf" => Some(RepositoryFormat::Protobuf),
@@ -971,6 +1050,35 @@ where
     Ok(false)
 }
 
+/// The storage figures a repository response displays (#4423).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayStorageUsage {
+    /// Bytes stored in the repository itself; 0 for a virtual repository.
+    /// Summing this over repositories never counts a byte twice.
+    pub own_bytes: i64,
+    /// For a virtual repository only: the union of the bytes of the members
+    /// the caller can see (#2785, #3081). `None` for every other type.
+    pub member_bytes: Option<i64>,
+}
+
+impl DisplayStorageUsage {
+    /// A non-virtual repository's own figure.
+    pub fn own(own_bytes: i64) -> Self {
+        Self {
+            own_bytes,
+            member_bytes: None,
+        }
+    }
+
+    /// A virtual repository: no own bytes, `member_bytes` through its members.
+    pub fn virtual_repo(member_bytes: i64) -> Self {
+        Self {
+            own_bytes: 0,
+            member_bytes: Some(member_bytes),
+        }
+    }
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -1072,6 +1180,23 @@ impl RepositoryService {
         &self,
         req: CreateRepositoryRequest,
         repodata_depth: u32,
+    ) -> Result<Repository> {
+        self.create_with_options(req, repodata_depth, true).await
+    }
+
+    /// Create with an explicit choice about the creator's owner auto-grant.
+    ///
+    /// `grant_owner_role = false` still records `created_by` but skips the
+    /// `repository-owner`/`developer` role assignments (#2473). A project
+    /// admin's access to a repository it creates must come only from its
+    /// revocable project grant: an owner role carries `admin`, which
+    /// `check_repository_action` honours regardless of project rules, so it
+    /// would outlive the creator's removal from the project.
+    pub async fn create_with_options(
+        &self,
+        req: CreateRepositoryRequest,
+        repodata_depth: u32,
+        grant_owner_role: bool,
     ) -> Result<Repository> {
         crate::services::rpm_layout::validate_depth(repodata_depth)?;
         if repodata_depth > 0
@@ -1224,17 +1349,19 @@ impl RepositoryService {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
-                    sqlx::query(
-                        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-                         SELECT $1, r.id, $2 FROM roles r \
-                         WHERE r.name IN ('repository-owner', 'developer') \
-                         ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
-                    )
-                    .bind(creator_id)
-                    .bind(repo.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    if grant_owner_role {
+                        sqlx::query(
+                            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                             SELECT $1, r.id, $2 FROM roles r \
+                             WHERE r.name IN ('repository-owner', 'developer') \
+                             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+                        )
+                        .bind(creator_id)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    }
                 }
                 if repodata_depth > 0 {
                     crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)
@@ -2203,30 +2330,33 @@ impl RepositoryService {
         Ok(usage)
     }
 
-    /// Storage figure to DISPLAY for `repo` (issue #2785).
+    /// Storage figures to DISPLAY for `repo` (issues #2785, #4423).
     ///
     /// A virtual repository owns no `artifacts` / `proxy_cache_artifacts` /
     /// `oci_blobs` rows of its own — its content is whatever resolves through
-    /// its members. A plain `get_storage_usage(virtual_id)` therefore reports
-    /// the virtual's *own* rows (effectively zero) even though browsing the
-    /// virtual surfaces real member data, so the detail view showed a total
-    /// that did not match the combined total of its child repos. For a virtual
-    /// repo we instead sum over the union of its resolvable member contents;
-    /// every other repo type keeps the existing per-repo figure unchanged.
+    /// its members. Its OWN figure is therefore 0, so a client (or the project
+    /// rollup) that sums `storage_used_bytes` over repositories counts every
+    /// byte once, in the member that stores it (#4423). The union of its
+    /// resolvable member contents (#2785) is reported separately as
+    /// [`DisplayStorageUsage::member_bytes`]. Every other repo type reports
+    /// its own per-repo figure and no member figure.
     ///
     /// `visibility` is the CALLER's member visibility (issue #3081): the
-    /// virtual total is aggregated only over the members that caller is
-    /// allowed to see. It is unused for non-virtual repositories, whose own
+    /// virtual's member total is aggregated only over the members that caller
+    /// is allowed to see. It is unused for non-virtual repositories, whose own
     /// figure is already gated by the handler's `require_visible` check.
     pub async fn get_display_storage_usage(
         &self,
         repo: &Repository,
         visibility: &MemberVisibility,
-    ) -> Result<i64> {
+    ) -> Result<DisplayStorageUsage> {
         if repo.repo_type == RepositoryType::Virtual {
-            self.get_virtual_storage_usage(repo.id, visibility).await
+            let members = self.get_virtual_storage_usage(repo.id, visibility).await?;
+            Ok(DisplayStorageUsage::virtual_repo(members))
         } else {
-            self.get_storage_usage(repo.id).await
+            Ok(DisplayStorageUsage::own(
+                self.get_storage_usage(repo.id).await?,
+            ))
         }
     }
 
@@ -2520,17 +2650,73 @@ impl RepositoryService {
     ///   invariant to repository size. This is the unlocked best-effort
     ///   preflight; the authoritative, race-free admission is
     ///   [`Self::check_quota_locked`].
+    ///
+    /// When the repository belongs to a project with a finite
+    /// `projects.quota_bytes` (#2474), the upload must additionally fit under
+    /// the project's aggregate ledger usage across every repository assigned
+    /// to it, so splitting uploads across sibling repositories cannot evade
+    /// the project cap. Use [`Self::quota_preflight`] to learn which quota
+    /// rejected the upload.
     pub async fn check_quota(&self, repo_id: Uuid, additional_bytes: i64) -> Result<bool> {
+        Ok(self
+            .quota_preflight(repo_id, additional_bytes)
+            .await?
+            .is_none())
+    }
+
+    /// Unlocked best-effort quota preflight: `None` when an upload of
+    /// `additional_bytes` fits under the repository quota and (if any) its
+    /// project quota, otherwise the scope that rejects it. The authoritative,
+    /// race-free admission is [`Self::check_quota_locked`].
+    pub async fn quota_preflight(
+        &self,
+        repo_id: Uuid,
+        additional_bytes: i64,
+    ) -> Result<Option<QuotaScope>> {
         let repo = self.get_by_id(repo_id).await?;
-        Ok(Self::quota_allows(
-            repo.quota_bytes,
-            // Only hit the DB for usage when a finite quota is actually set.
-            match repo.quota_bytes {
-                Some(quota) if quota > 0 => self.get_ledger_usage(repo_id).await?,
-                _ => 0,
-            },
+        let repo_quota = finite_quota(repo.quota_bytes);
+        // Only hit the DB for usage when a finite quota is actually set.
+        let repo_usage = match repo_quota {
+            Some(_) => self.get_ledger_usage(repo_id).await?,
+            None => 0,
+        };
+        let (project_quota, project_usage) = match repo.project_id {
+            Some(project_id) => {
+                let quota: Option<i64> = sqlx::query_scalar!(
+                    "SELECT quota_bytes FROM projects WHERE id = $1",
+                    project_id
+                )
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .flatten();
+                match finite_quota(quota) {
+                    Some(quota) => (
+                        Some(quota),
+                        self.get_project_ledger_usage(project_id).await?,
+                    ),
+                    None => (None, 0),
+                }
+            }
+            None => (None, 0),
+        };
+        Ok(Self::quota_denial(
+            QuotaUsage::new(repo_quota, repo_usage),
+            QuotaUsage::new(project_quota, project_usage),
             additional_bytes,
         ))
+    }
+
+    /// Unlocked aggregate ledger usage of every repository assigned to
+    /// `project_id` (#2474). Repositories that have no ledger row yet fall
+    /// back to their live sum ([`Self::get_storage_usage`]), mirroring
+    /// [`Self::get_ledger_usage`].
+    async fn get_project_ledger_usage(&self, project_id: Uuid) -> Result<i64> {
+        let (mut total, unseeded) = Self::project_ledger_rows(&self.db, project_id).await?;
+        for repo_id in unseeded {
+            total += self.get_storage_usage(repo_id).await?;
+        }
+        Ok(total)
     }
 
     /// Unlocked O(1) usage read for quota preflight (#2516 S2): the sum of
@@ -2567,6 +2753,25 @@ impl RepositoryService {
             Some(quota) if quota > 0 => current_usage + additional_bytes <= quota,
             // NULL or a non-positive sentinel (0 / negative) => unlimited.
             _ => true,
+        }
+    }
+
+    /// Pure two-level quota decision (#2474): `None` when an upload of
+    /// `additional_bytes` fits under both the repository quota and the
+    /// project quota, otherwise the scope that rejects it (repository first).
+    /// Each level follows [`Self::quota_allows`] semantics, so an unset or
+    /// non-positive quota at either level never rejects.
+    pub(crate) fn quota_denial(
+        repo: QuotaUsage,
+        project: QuotaUsage,
+        additional_bytes: i64,
+    ) -> Option<QuotaScope> {
+        if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
+            Some(QuotaScope::Repository)
+        } else if !Self::quota_allows(project.quota_bytes, project.used_bytes, additional_bytes) {
+            Some(QuotaScope::Project)
+        } else {
+            None
         }
     }
 
@@ -2624,8 +2829,19 @@ impl RepositoryService {
     /// `(repository_id, path)`), so an in-place overwrite is charged only its
     /// size delta rather than double-counting the bytes it replaces.
     ///
-    /// A `None`/non-positive quota means unlimited: the call returns
-    /// `allowed = true` without locking or touching the ledger.
+    /// Project quota (#2474): when the repository belongs to a project whose
+    /// `quota_bytes` is finite, the upload must also fit under the project's
+    /// aggregate ledger usage (every repository with that `project_id`, net
+    /// of the bytes at the target path). The `projects` row is locked
+    /// `FOR UPDATE` before any ledger row, so concurrent uploads into
+    /// different repositories of the same capped project serialize and the
+    /// later one observes the earlier one's committed charge — splitting
+    /// uploads across sibling repositories cannot over-admit. Proxy-cache and
+    /// OCI-blob bytes are part of the ledger, so they count toward the
+    /// project total exactly as they do toward a repository quota.
+    ///
+    /// A `None`/non-positive quota at both levels means unlimited: the call
+    /// returns `allowed = true` without locking or touching the ledger.
     pub async fn check_quota_locked(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2633,52 +2849,86 @@ impl RepositoryService {
         path: &str,
         new_size: i64,
     ) -> Result<QuotaAdmission> {
-        let quota_bytes: Option<i64> = sqlx::query_scalar!(
-            "SELECT quota_bytes FROM repositories WHERE id = $1",
+        let repo = sqlx::query!(
+            "SELECT quota_bytes, project_id FROM repositories WHERE id = $1",
             repo_id
         )
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let repo_quota = finite_quota(repo.quota_bytes);
 
-        let quota = match quota_bytes {
-            Some(quota) if quota > 0 => quota,
-            // NULL or a non-positive sentinel => unlimited: nothing to lock or
-            // count.
-            _ => {
-                return Ok(QuotaAdmission {
-                    allowed: true,
-                    base_usage: None,
-                })
-            }
+        // Project-wide quota (#2474). Lock ordering: the project row is
+        // locked BEFORE any ledger row, so every quota-checked upload into any
+        // repository of a capped project serializes here first; sibling
+        // uploads can therefore never both pass against the same pre-upload
+        // aggregate. The `quota_bytes > 0` predicate means only a project
+        // that actually has a finite quota is locked: unlimited projects add
+        // no serialization. The lock is held until the caller commits.
+        let project_quota: Option<(Uuid, i64)> = match repo.project_id {
+            Some(project_id) => sqlx::query_scalar!(
+                r#"SELECT quota_bytes as "quota_bytes!" FROM projects
+                    WHERE id = $1 AND quota_bytes > 0 FOR UPDATE"#,
+                project_id
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .map(|quota| (project_id, quota)),
+            None => None,
         };
+
+        if repo_quota.is_none() && project_quota.is_none() {
+            // NULL or a non-positive sentinel at both levels => unlimited:
+            // nothing to lock or count.
+            return Ok(QuotaAdmission {
+                allowed: true,
+                denied_by: None,
+                base_usage: None,
+            });
+        }
 
         // Serialize same-repo admissions on the ledger row and read the
         // maintained counters under that lock: a primary-key lookup, O(1) in
         // repository size. The lock is held until the caller commits (after
-        // its artifact INSERT).
-        let locked = sqlx::query!(
-            "SELECT hosted_bytes, proxy_bytes, oci_bytes \
-               FROM repository_usage_ledger \
-              WHERE repository_id = $1 FOR UPDATE",
-            repo_id
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let total: i64 = match locked {
-            Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
-            // Pre-ledger repository (no row yet): lazy-create it seeded from
-            // the authoritative live sums, NOT from column defaults — a
-            // zero-seeded row would admit everything until the first
-            // reconcile pass. One-time O(rows) for the first quota-checked
-            // upload; every later admission takes the O(1) branch above. The
-            // helper locks the row first and leaves it locked in `tx`.
-            None => {
-                let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
-                hosted + proxy + oci
+        // its artifact INSERT). Taken only when the repository itself has a
+        // finite quota; a project-only quota serializes on the project row.
+        let repo_total: Option<i64> = match repo_quota {
+            Some(_) => {
+                let locked = sqlx::query!(
+                    "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+                       FROM repository_usage_ledger \
+                      WHERE repository_id = $1 FOR UPDATE",
+                    repo_id
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                Some(match locked {
+                    Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
+                    // Pre-ledger repository (no row yet): lazy-create it
+                    // seeded from the authoritative live sums, NOT from
+                    // column defaults — a zero-seeded row would admit
+                    // everything until the first reconcile pass. One-time
+                    // O(rows) for the first quota-checked upload; every later
+                    // admission takes the O(1) branch above. The helper locks
+                    // the row first and leaves it locked in `tx`.
+                    None => {
+                        let (hosted, proxy, oci) =
+                            Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
+                        hosted + proxy + oci
+                    }
+                })
             }
+            None => None,
+        };
+
+        // Aggregate ledger usage across every repository in the project,
+        // read after the project lock (and this repository's ledger lock, if
+        // any) so it observes every previously admitted sibling upload.
+        let project_total: Option<i64> = match project_quota {
+            Some((project_id, _)) => Some(Self::project_ledger_usage_in_tx(tx, project_id).await?),
+            None => None,
         };
 
         // Net-delta accounting for overwrites: subtract the bytes already
@@ -2697,16 +2947,73 @@ impl RepositoryService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let base_usage = total - existing_at_path;
-        let allowed = Self::quota_allows(Some(quota), base_usage, new_size);
+        let base_usage = repo_total.map(|total| total - existing_at_path);
+        let denied_by = Self::quota_denial(
+            QuotaUsage::new(repo_quota, base_usage.unwrap_or(0)),
+            QuotaUsage::new(
+                project_quota.map(|(_, quota)| quota),
+                project_total.map_or(0, |total| total - existing_at_path),
+            ),
+            new_size,
+        );
         // No manual charge here: the caller's artifact INSERT (same
-        // transaction, made while the row lock taken above is still held)
+        // transaction, made while the row locks taken above are still held)
         // fires migration 182's trigger, which applies the exact delta to
         // `hosted_bytes` before the transaction commits.
         Ok(QuotaAdmission {
-            allowed,
-            base_usage: Some(base_usage),
+            allowed: denied_by.is_none(),
+            denied_by,
+            base_usage,
         })
+    }
+
+    /// One indexed pass over a project's repositories
+    /// (`idx_repositories_project_id`) joined to their ledger rows: the sum
+    /// of the maintained counters, plus the ids of member repositories that
+    /// have no ledger row yet (callers account for those from live sums).
+    /// Virtual repositories are skipped: they store nothing of their own,
+    /// their members (in this project or not) already carry the bytes, and
+    /// counting them here would double count (#4423).
+    async fn project_ledger_rows<'e, E>(executor: E, project_id: Uuid) -> Result<(i64, Vec<Uuid>)>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let row = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT
+                       AS "ledger_bytes!",
+                   COALESCE(ARRAY_AGG(r.id) FILTER (WHERE l.repository_id IS NULL),
+                            '{}'::uuid[]) AS "unseeded!"
+              FROM repositories r
+              LEFT JOIN repository_usage_ledger l ON l.repository_id = r.id
+             WHERE r.project_id = $1
+               AND r.repo_type <> 'virtual'
+            "#,
+            project_id
+        )
+        .fetch_one(executor)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok((row.ledger_bytes, row.unseeded))
+    }
+
+    /// Aggregate ledger usage of every repository assigned to `project_id`,
+    /// read inside the admission transaction (#2474). The caller must already
+    /// hold the project row's `FOR UPDATE` lock. Sibling repositories that
+    /// have no ledger row yet are seeded from their live sums via
+    /// [`Self::reconcile_usage_ledger_in_tx`] (one-time, same contract as the
+    /// single-repository admission path), so a pre-ledger sibling is never
+    /// counted as empty.
+    async fn project_ledger_usage_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        project_id: Uuid,
+    ) -> Result<i64> {
+        let (mut total, unseeded) = Self::project_ledger_rows(&mut **tx, project_id).await?;
+        for repo_id in unseeded {
+            let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
+            total += hosted + proxy + oci;
+        }
+        Ok(total)
     }
 
     /// Recompute one repository's usage-ledger components from the
@@ -3647,6 +3954,29 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_remote_upstream_rejects_controls_and_whitespace_4463() {
+        for url in [
+            "\x01https://u:p@upstream.example.test/",
+            "ht\ttps://u:p@upstream.example.test/x",
+            "https://upstream.example.test/a b",
+            "https://upstream.example.test/\n",
+            " https://upstream.example.test/",
+        ] {
+            for repo_type in [RepositoryType::Remote, RepositoryType::Local] {
+                let result = validate_remote_upstream(
+                    &repo_type,
+                    &Some(url.to_string()),
+                    &RepositoryFormat::Generic,
+                );
+                assert!(
+                    matches!(&result, Err(AppError::Validation(m)) if m.contains("whitespace")),
+                    "{url:?} ({repo_type:?}) must be refused, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_validate_remote_upstream_local_without_url_passes() {
         let result =
             validate_remote_upstream(&RepositoryType::Local, &None, &RepositoryFormat::Generic);
@@ -4030,6 +4360,123 @@ mod tests {
     //      at/under -> allow), and usage that frees up (post-delete) is admitted
     //      again -- the accounting is the live SUM passed as `current_usage`.
     // -----------------------------------------------------------------------
+
+    /// #2474: the two-level decision admits only when the upload fits under
+    /// BOTH the repository and the project quota, reports the repository
+    /// scope first, and treats an unset / non-positive quota at either level
+    /// as unlimited.
+    #[test]
+    fn test_quota_denial_two_level_table() {
+        let u = QuotaUsage::new;
+        // (label, repo, project, additional, expected)
+        let cases: &[(&str, QuotaUsage, QuotaUsage, i64, Option<QuotaScope>)] = &[
+            (
+                "both_unlimited",
+                u(None, 9_999),
+                u(None, 9_999),
+                1 << 40,
+                None,
+            ),
+            ("zero_sentinels", u(Some(0), 5), u(Some(0), 5), 10, None),
+            (
+                "negative_sentinels",
+                u(Some(-1), 5),
+                u(Some(-7), 5),
+                10,
+                None,
+            ),
+            (
+                "fits_both",
+                u(Some(1_000), 400),
+                u(Some(5_000), 4_000),
+                600,
+                None,
+            ),
+            (
+                "exact_both",
+                u(Some(1_000), 400),
+                u(Some(1_000), 400),
+                600,
+                None,
+            ),
+            (
+                "repo_over",
+                u(Some(1_000), 900),
+                u(Some(5_000), 0),
+                101,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                // The split-across-repos evasion: each repo is under its own
+                // (here: unset) quota but the project aggregate is not.
+                "project_over_repo_unlimited",
+                u(None, 0),
+                u(Some(1_000), 600),
+                401,
+                Some(QuotaScope::Project),
+            ),
+            (
+                "project_over_repo_fits",
+                u(Some(1_000), 0),
+                u(Some(1_000), 900),
+                200,
+                Some(QuotaScope::Project),
+            ),
+            (
+                "both_over_reports_repo",
+                u(Some(100), 100),
+                u(Some(100), 100),
+                1,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                "project_unlimited_repo_over",
+                u(Some(10), 10),
+                u(None, 0),
+                1,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                "zero_byte_at_both_caps",
+                u(Some(10), 10),
+                u(Some(10), 10),
+                0,
+                None,
+            ),
+        ];
+        for (label, repo, project, additional, expected) in cases {
+            assert_eq!(
+                RepositoryService::quota_denial(*repo, *project, *additional),
+                *expected,
+                "case {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finite_quota_filters_unlimited_sentinels() {
+        assert_eq!(finite_quota(None), None);
+        assert_eq!(finite_quota(Some(0)), None);
+        assert_eq!(finite_quota(Some(-5)), None);
+        assert_eq!(finite_quota(Some(1)), Some(1));
+        assert_eq!(finite_quota(Some(i64::MAX)), Some(i64::MAX));
+    }
+
+    #[test]
+    fn test_quota_scope_exceeded_messages() {
+        assert_eq!(
+            QuotaScope::Repository.exceeded_message(),
+            "Repository storage quota exceeded"
+        );
+        assert_eq!(
+            QuotaScope::Project.exceeded_message(),
+            "Project storage quota exceeded"
+        );
+        assert!(matches!(
+            QuotaScope::Project.into_error(),
+            AppError::QuotaExceeded(msg) if msg == "Project storage quota exceeded"
+        ));
+    }
 
     #[test]
     fn test_quota_allows_table() {
@@ -6226,8 +6673,9 @@ mod tests {
                     .get_display_storage_usage(&virt, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display"),
-                combined,
-                "display helper unions members for a virtual repo"
+                DisplayStorageUsage::virtual_repo(combined),
+                "display helper reports no own bytes and the member union for a virtual \
+                 repo (#4423)"
             );
             // A non-virtual repo keeps its own per-repo figure via the helper.
             assert_eq!(
@@ -6235,7 +6683,7 @@ mod tests {
                     .get_display_storage_usage(&m1, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display m1"),
-                m1_usage
+                DisplayStorageUsage::own(m1_usage)
             );
 
             cleanup_repo(&pool, virt.id).await;
@@ -7701,6 +8149,342 @@ mod tests {
             cleanup_repo(&pool, repo.id).await;
         }
 
+        // -------------------------------------------------------------------
+        // Project-wide quota enforcement (#2474)
+        // -------------------------------------------------------------------
+
+        /// Create a project with `quota` and `n` generic repositories assigned
+        /// to it (no repository-level quota). Returns `(project_id, repo_ids)`.
+        async fn project_with_repos(
+            pool: &PgPool,
+            service: &RepositoryService,
+            quota: Option<i64>,
+            n: usize,
+        ) -> (Uuid, Vec<Uuid>) {
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let project_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO projects (key, name, quota_bytes) VALUES ($1, $1, $2) RETURNING id",
+            )
+            .bind(format!("pq-{tag}"))
+            .bind(quota)
+            .fetch_one(pool)
+            .await
+            .expect("create project");
+            let mut repos = Vec::with_capacity(n);
+            for i in 0..n {
+                let repo = service
+                    .create(make_create_req(
+                        &format!("{tag}-{i}"),
+                        RepositoryFormat::Generic,
+                    ))
+                    .await
+                    .expect("create repo");
+                sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                    .bind(project_id)
+                    .bind(repo.id)
+                    .execute(pool)
+                    .await
+                    .expect("assign repo to project");
+                repos.push(repo.id);
+            }
+            (project_id, repos)
+        }
+
+        async fn cleanup_project_with_repos(pool: &PgPool, project_id: Uuid, repos: &[Uuid]) {
+            for repo in repos {
+                cleanup_repo(pool, *repo).await;
+            }
+            let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+                .bind(project_id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn admission(
+            service: &RepositoryService,
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+            size: i64,
+        ) -> QuotaAdmission {
+            let mut tx = pool.begin().await.expect("begin");
+            service
+                .check_quota_locked(&mut tx, repo, path, size)
+                .await
+                .expect("admission")
+        }
+
+        /// #4423: a virtual repository in the same project as its hosted
+        /// member must not count the member's bytes a second time. Its own
+        /// display figure is 0 (the member union is reported separately), the
+        /// project rollup skips it, and project admission never seeds a ledger
+        /// row for it.
+        #[tokio::test]
+        async fn test_virtual_repo_not_double_counted_in_project_4423() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(10_000), 1).await;
+            let hosted = repos[0];
+            let virt = service
+                .create(make_virtual_req(
+                    &format!("{}v", uuid::Uuid::new_v4().simple()),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create virtual");
+            sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                .bind(project)
+                .bind(virt.id)
+                .execute(&pool)
+                .await
+                .expect("assign virtual to project");
+            service
+                .add_virtual_member(virt.id, hosted, Some(1))
+                .await
+                .expect("add member");
+            assert!(admit_and_insert(&service, &pool, hosted, "dc/a", 600).await);
+
+            let mut displayed = 0;
+            for id in [hosted, virt.id] {
+                let repo = service.get_by_id(id).await.expect("repo");
+                let usage = service
+                    .get_display_storage_usage(&repo, &MemberVisibility::Unfiltered)
+                    .await
+                    .expect("display usage");
+                displayed += usage.own_bytes;
+                if id == virt.id {
+                    assert_eq!(usage, DisplayStorageUsage::virtual_repo(600));
+                }
+            }
+            assert_eq!(displayed, 600, "summing own figures counts each byte once");
+            assert_eq!(
+                service
+                    .get_project_ledger_usage(project)
+                    .await
+                    .expect("project usage"),
+                600
+            );
+            assert_eq!(
+                ledger_hosted(&pool, virt.id).await,
+                None,
+                "project admission must not seed a ledger row for a virtual repo"
+            );
+
+            cleanup_repo(&pool, virt.id).await;
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Quota evasion by splitting across repositories: two repositories
+        /// with no quota of their own share a 1000-byte project cap. Each
+        /// upload alone fits, but the aggregate must be rejected — in both
+        /// the locked admission and the unlocked preflight — and the
+        /// rejection names the project scope.
+        #[tokio::test]
+        async fn test_project_quota_rejects_aggregate_across_sibling_repos() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+
+            assert!(admit_and_insert(&service, &pool, a, "split/a", 600).await);
+            assert_eq!(
+                service.quota_preflight(b, 600).await.expect("preflight"),
+                Some(QuotaScope::Project),
+                "unlocked preflight must see the sibling's bytes"
+            );
+            assert!(!service.check_quota(b, 600).await.expect("check_quota"));
+            let denied = admission(&service, &pool, b, "split/b", 600).await;
+            assert!(!denied.allowed);
+            assert_eq!(denied.denied_by, Some(QuotaScope::Project));
+            assert_eq!(
+                denied.base_usage, None,
+                "no repository quota => no repository usage reported"
+            );
+
+            // What still fits under the project cap is admitted.
+            assert_eq!(service.quota_preflight(b, 400).await.unwrap(), None);
+            assert!(admit_and_insert(&service, &pool, b, "split/b", 400).await);
+            assert!(!admit_and_insert(&service, &pool, a, "split/c", 1).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// A repository under its own quota is still bound by the project
+        /// cap, and a repository over its own quota reports the repository
+        /// scope even when the project has room.
+        #[tokio::test]
+        async fn test_project_and_repo_quotas_both_apply() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+            set_quota(&pool, a, Some(800)).await;
+            set_quota(&pool, b, Some(800)).await;
+
+            assert!(admit_and_insert(&service, &pool, a, "both/a", 700).await);
+            let over_repo = admission(&service, &pool, a, "both/a2", 200).await;
+            assert_eq!(over_repo.denied_by, Some(QuotaScope::Repository));
+            assert_eq!(over_repo.base_usage, Some(700));
+
+            // b is far under its own 800-byte quota, but 700 + 400 > 1000.
+            let over_project = admission(&service, &pool, b, "both/b", 400).await;
+            assert_eq!(over_project.denied_by, Some(QuotaScope::Project));
+            assert_eq!(over_project.base_usage, Some(0));
+            assert!(admit_and_insert(&service, &pool, b, "both/b", 300).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Concurrent-upload race across sibling repositories: the first
+        /// admission holds the project row lock; an upload into a DIFFERENT
+        /// repository of the same project blocks on it and, once the first
+        /// commits, observes its bytes and is rejected. Without the project
+        /// row lock both would pass against the same pre-upload aggregate.
+        #[tokio::test]
+        async fn test_project_quota_concurrent_sibling_uploads_admit_exactly_one() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+
+            let mut tx1 = pool.begin().await.expect("begin tx1");
+            let adm1 = service
+                .check_quota_locked(&mut tx1, a, "prace/one", 600)
+                .await
+                .expect("admission 1");
+            assert!(adm1.allowed);
+
+            let pool2 = pool.clone();
+            let contender = tokio::spawn(async move {
+                let service2 = RepositoryService::new(pool2.clone());
+                admit_and_insert(&service2, &pool2, b, "prace/two", 600).await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                !contender.is_finished(),
+                "the sibling admission must block on the project row lock"
+            );
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key) \
+                 VALUES ($1, 'prace/one', 'prace/one', 600, repeat('a', 64), \
+                         'application/octet-stream', 'keys/prace/one')",
+            )
+            .bind(a)
+            .execute(&mut *tx1)
+            .await
+            .expect("artifact insert tx1");
+            tx1.commit().await.expect("commit tx1");
+
+            assert!(
+                !contender.await.expect("contender task"),
+                "the second of two jointly-over-quota sibling uploads must be rejected"
+            );
+            let live: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = ANY($1) AND is_deleted = false",
+            )
+            .bind(&repos)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+            assert_eq!(live, 1, "exactly one upload may land across the project");
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Proxy-cache and OCI-blob bytes of member repositories count toward
+        /// the project total (the issue's "proxy-cache undercount" vector),
+        /// overwrites are charged only their net delta, and a sibling with no
+        /// ledger row yet is seeded from its live sums instead of counting as
+        /// empty.
+        #[tokio::test]
+        async fn test_project_quota_counts_proxy_oci_and_unseeded_siblings() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 3).await;
+            let (hosted, cache, unseeded) = (repos[0], repos[1], repos[2]);
+
+            insert_proxy_cache(&pool, cache, "pkg/x.tgz", 300).await;
+            insert_oci_blob(
+                &pool,
+                cache,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                200,
+            )
+            .await;
+            insert_artifact(&pool, unseeded, "seed/a", "keys/seed/a", 250).await;
+            // Simulate a pre-ledger sibling: its bytes exist, its row does not.
+            sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+                .bind(unseeded)
+                .execute(&pool)
+                .await
+                .expect("drop ledger row");
+
+            // 300 + 200 + 250 = 750 used; 250 more fits, 251 does not.
+            assert_eq!(
+                service.quota_preflight(hosted, 251).await.unwrap(),
+                Some(QuotaScope::Project),
+                "preflight must count the unseeded sibling from live sums"
+            );
+            assert_eq!(service.quota_preflight(hosted, 250).await.unwrap(), None);
+            assert_eq!(
+                admission(&service, &pool, hosted, "h/a", 251)
+                    .await
+                    .denied_by,
+                Some(QuotaScope::Project)
+            );
+            assert!(admit_and_insert(&service, &pool, hosted, "h/a", 200).await);
+            assert_eq!(
+                ledger_hosted(&pool, unseeded).await,
+                Some(250),
+                "admission seeds the missing sibling ledger row from live sums"
+            );
+
+            // Overwriting h/a (200) with 250 bytes is a +50 delta: 950+50 fits.
+            assert!(admit_and_insert(&service, &pool, hosted, "h/a", 250).await);
+            assert!(!admit_and_insert(&service, &pool, hosted, "h/b", 1).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Unlimited projects (NULL or the `0` sentinel) are not enforced and
+        /// take no lock: the admission short-circuits exactly as for an
+        /// unassigned repository.
+        #[tokio::test]
+        async fn test_project_quota_unlimited_sentinels_admit() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            for quota in [None, Some(0)] {
+                let (project, repos) = project_with_repos(&pool, &service, quota, 1).await;
+                let adm = admission(&service, &pool, repos[0], "u/x", i64::MAX / 2).await;
+                assert!(adm.allowed, "quota {quota:?} must be unlimited");
+                assert_eq!(adm.denied_by, None);
+                assert_eq!(adm.base_usage, None);
+                assert_eq!(
+                    service
+                        .quota_preflight(repos[0], i64::MAX / 2)
+                        .await
+                        .unwrap(),
+                    None
+                );
+                cleanup_project_with_repos(&pool, project, &repos).await;
+            }
+        }
+
         /// O(1) contract pin (#2516 S2): the admission critical section must
         /// not re-aggregate the live source tables. The 3-way UNION aggregate
         /// (`artifacts` + `proxy_cache_artifacts` + `oci_blobs`) is the
@@ -7732,5 +8516,91 @@ mod tests {
                 "admission must keep serializing on the locked ledger row"
             );
         }
+    }
+
+    /// #3813 follow-up: migration 245's backfill is exactly access-preserving
+    /// (`is_public = true` -> `public`, `false` -> `private`) and re-running
+    /// it (it shipped under earlier numbers in review) leaves a repository
+    /// that has since become `internal` untouched. Runs in an isolated schema
+    /// inside a rolled-back transaction, so it never touches real rows.
+    #[tokio::test]
+    async fn migration_245_backfills_from_is_public_and_rerun_keeps_internal() {
+        const MIGRATION: &str = include_str!("../../migrations/245_repository_visibility.sql");
+        let Some(pool) = crate::testing::try_pool_with(2).await else {
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let schema = format!("visibility_245_{}", Uuid::new_v4().simple());
+        // The pre-245 shape: every column the migration's triggers name, and
+        // no `visibility` column yet. `public` stays on the path for the
+        // existing `ak_notify_repository_changed()` trigger function.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, public; \
+             CREATE TABLE repositories(id UUID PRIMARY KEY, key TEXT, format TEXT, \
+             repo_type TEXT, upstream_url TEXT, storage_backend TEXT, storage_path TEXT, \
+             is_public BOOLEAN NOT NULL DEFAULT false, promotion_only BOOLEAN, \
+             age_gate_enabled BOOLEAN, age_gate_min_age_days INT, age_gate_mode TEXT, \
+             curation_enabled BOOLEAN, curation_default_action TEXT);"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let (public_id, private_id, later_internal_id) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, is_public) in [
+            (public_id, true),
+            (private_id, false),
+            (later_internal_id, false),
+        ] {
+            sqlx::query("INSERT INTO repositories (id, is_public) VALUES ($1, $2)")
+                .bind(id)
+                .bind(is_public)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        let visibility = |id: Uuid| {
+            sqlx::query_as::<_, (String, bool)>(
+                "SELECT visibility::text, is_public FROM repositories WHERE id = $1",
+            )
+            .bind(id)
+        };
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+
+        // An operator narrows one repository to `internal`, then the migration
+        // is applied again: nothing moves.
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(later_internal_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            visibility(later_internal_id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            ("internal".to_string(), false),
+            "a re-run of migration 245 must not recompute an internal repository \
+             from is_public"
+        );
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+        tx.rollback().await.unwrap();
     }
 }

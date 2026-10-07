@@ -524,7 +524,7 @@ async fn fetch_remote_simple_root(
     if content.len() > MAX_SIMPLE_ROOT_BODY_BYTES {
         warn!(
             repo_key = %repo_key,
-            upstream = %effective_upstream,
+            upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&effective_upstream),
             body_bytes = content.len(),
             cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
             "upstream PEP 503 root index exceeds size cap; skipping parse. \
@@ -3702,7 +3702,7 @@ async fn resolve_pypi_remote_fetch_target(
         if let Err(e) = validate_outbound_url(url, "PyPI upstream file URL") {
             tracing::warn!(
                 "SSRF check rejected resolved file URL '{}' from upstream index: {}",
-                url,
+                crate::services::proxy_service::redact_url_for_diagnostics(url),
                 e
             );
             // Fall through to the fallback path instead of fetching the

@@ -60,9 +60,23 @@ echo '{"Results":[]}'
 // newTestServer builds a ready Server whose scanner execs the given stub trivy.
 func newTestServer(t *testing.T, trivyPath string) *httptest.Server {
 	t.Helper()
+	return newTestServerWithCache(t, trivyPath, t.TempDir())
+}
+
+// newTestServerWithCache is newTestServer over a caller-prepared trivy cache
+// dir, so DB-metadata provenance (#3014) can be exercised end to end.
+func newTestServerWithCache(t *testing.T, trivyPath, cacheDir string) *httptest.Server {
+	t.Helper()
+	return newTestServerWithConfig(t, trivyPath, cacheDir, nil)
+}
+
+// newTestServerWithConfig is newTestServerWithCache with a hook that adjusts
+// the config before the Server is built (e.g. to enable client mode).
+func newTestServerWithConfig(t *testing.T, trivyPath, cacheDir string, tweak func(*Config)) *httptest.Server {
+	t.Helper()
 	cfg := LoadConfig()
 	cfg.TrivyPath = trivyPath
-	cfg.CacheDir = t.TempDir()
+	cfg.CacheDir = cacheDir
 	cfg.ScanTimeout = 10 * time.Second
 	// Exercise the real probe against the stub.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -75,6 +89,9 @@ func newTestServer(t *testing.T, trivyPath string) *httptest.Server {
 		t.Fatalf("stub version = %q, want 0.71.2", version)
 	}
 	cfg.ScannerVersion = version
+	if tweak != nil {
+		tweak(cfg)
+	}
 	srv := NewServer(cfg)
 	srv.MarkReady()
 	return httptest.NewServer(srv.Handler())
@@ -176,6 +193,42 @@ func TestScanSucceedsWithFindings(t *testing.T) {
 	v := report.Vulnerabilities[0]
 	if v.ID != "CVE-2021-3711" || v.Severity != "Critical" || v.Package != "openssl" {
 		t.Errorf("finding mapped incorrectly: %+v", v)
+	}
+	// #3014: no DB metadata in the cache -> the field is omitted, not faked.
+	if report.VulnerabilityDB != nil {
+		t.Errorf("vulnerability_db = %+v, want omitted with no metadata.json", report.VulnerabilityDB)
+	}
+	if strings.Contains(string(body), "vulnerability_db") {
+		t.Errorf("vulnerability_db must be omitted from the wire when unknown: %s", body)
+	}
+}
+
+// TestScanReportCarriesVulnDB: the image report names the trivy DB the scan
+// ran against (#3014), read from <cache>/db/metadata.json after the scan.
+func TestScanReportCarriesVulnDB(t *testing.T) {
+	cache := cacheWithDBMetadata(t)
+	ts := newTestServerWithCache(t, succeedStub(t), cache)
+	defer ts.Close()
+
+	id := submitScan(t, ts.URL, ScanRequest{
+		Registry: RegistryRef{URL: "http://backend:8080"},
+		Artifact: ArtifactRef{Repository: "docker-local/alpine", MimeType: dockerManifestMimeType, Tag: "3.14"},
+	})
+	status, body := pollReport(t, ts.URL, id)
+	if status != http.StatusOK {
+		t.Fatalf("report status = %d, want 200; body=%s", status, body)
+	}
+	var wire struct {
+		VulnerabilityDB map[string]any `json:"vulnerability_db"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal report: %v", err)
+	}
+	if wire.VulnerabilityDB["version"] != float64(2) {
+		t.Errorf("vulnerability_db.version = %v, want 2; body=%s", wire.VulnerabilityDB["version"], body)
+	}
+	if wire.VulnerabilityDB["updated_at"] != "2026-10-04T19:39:34.715623444Z" {
+		t.Errorf("vulnerability_db.updated_at = %v; body=%s", wire.VulnerabilityDB["updated_at"], body)
 	}
 }
 

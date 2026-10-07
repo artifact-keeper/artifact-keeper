@@ -224,6 +224,8 @@ pub async fn get_system_config(
 ) -> Json<SystemConfigResponse> {
     let config = &state.config;
     let is_admin = auth.as_ref().map(|a| a.is_admin).unwrap_or(false);
+    // The runtime value (#867), not the startup env: an admin can flip it.
+    let guest_access_enabled = state.guest_access_policy.is_enabled().await;
 
     // Public-safe fields: always returned. Login UI needs to know which
     // providers are available before the user authenticates.
@@ -262,7 +264,7 @@ pub async fn get_system_config(
         return Json(SystemConfigResponse {
             max_upload_size_bytes: config.max_upload_size_bytes,
             demo_mode: config.demo_mode,
-            guest_access_enabled: config.guest_access_enabled,
+            guest_access_enabled,
             auth: auth_config,
             oidc_issuer: config.oidc_issuer.clone(),
             scanners: None,
@@ -322,7 +324,7 @@ pub async fn get_system_config(
     Json(SystemConfigResponse {
         max_upload_size_bytes: config.max_upload_size_bytes,
         demo_mode: config.demo_mode,
-        guest_access_enabled: config.guest_access_enabled,
+        guest_access_enabled,
         auth: auth_config,
         oidc_issuer: config.oidc_issuer.clone(),
         scanners: Some(scanners),

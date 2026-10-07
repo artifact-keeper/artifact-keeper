@@ -24,6 +24,11 @@ pub struct SearchResult {
     pub created_at: DateTime<Utc>,
     pub download_count: i64,
     pub score: f32,
+    /// Raw `artifacts.quarantine_status` column (#3066); the API maps it to
+    /// the always-present listing label.
+    pub quarantine_status: Option<String>,
+    /// Raw `artifacts.quarantine_until` column (#3066).
+    pub quarantine_until: Option<DateTime<Utc>>,
 }
 
 /// Search query
@@ -256,7 +261,7 @@ pub(crate) fn build_order_by_clause(
     Ok(clause)
 }
 
-/// Row type returned by all search SQL queries (12 fields).
+/// Row type returned by all search SQL queries (14 fields).
 type SearchResultRow = (
     Uuid,
     Uuid,
@@ -270,6 +275,8 @@ type SearchResultRow = (
     DateTime<Utc>,
     i64,
     f32,
+    Option<String>,
+    Option<DateTime<Utc>>,
 );
 
 /// Convert a database row tuple into a [`SearchResult`].
@@ -287,6 +294,8 @@ fn row_to_search_result(r: SearchResultRow) -> SearchResult {
         created_at: r.9,
         download_count: r.10,
         score: r.11,
+        quarantine_status: r.12,
+        quarantine_until: r.13,
     }
 }
 
@@ -353,7 +362,9 @@ impl SearchService {
                     a.content_type,
                     a.created_at,
                     COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0)::BIGINT,
-                    1.0::real
+                    1.0::real,
+                    a.quarantine_status,
+                    a.quarantine_until
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
@@ -535,7 +546,9 @@ impl SearchService {
                     a.content_type,
                     a.created_at,
                     COUNT(ds.id)::BIGINT,
-                    1.0::real
+                    1.0::real,
+                    a.quarantine_status,
+                    a.quarantine_until
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 LEFT JOIN download_statistics ds ON ds.artifact_id = a.id
@@ -580,7 +593,9 @@ impl SearchService {
                     a.content_type,
                     a.created_at,
                     COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0)::BIGINT,
-                    1.0::real
+                    1.0::real,
+                    a.quarantine_status,
+                    a.quarantine_until
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
@@ -930,6 +945,8 @@ mod tests {
                 .with_timezone(&Utc),
             download_count: 42,
             score: 1.0,
+            quarantine_status: None,
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["name"], "lib");
@@ -955,6 +972,8 @@ mod tests {
             created_at: Utc::now(),
             download_count: 0,
             score: 0.5,
+            quarantine_status: None,
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json["version"].is_null());
@@ -1068,6 +1087,8 @@ mod tests {
             now,
             10,
             0.95,
+            Some("quarantined".to_string()),
+            Some(now),
         );
         let result = row_to_search_result(row);
         assert_eq!(result.id, id);
@@ -1082,6 +1103,8 @@ mod tests {
         assert_eq!(result.created_at, now);
         assert_eq!(result.download_count, 10);
         assert!((result.score - 0.95).abs() < f32::EPSILON);
+        assert_eq!(result.quarantine_status.as_deref(), Some("quarantined"));
+        assert_eq!(result.quarantine_until, Some(now));
     }
 
     #[test]
@@ -1099,6 +1122,8 @@ mod tests {
             Utc::now(),
             0,
             1.0,
+            None,
+            None,
         );
         let result = row_to_search_result(row);
         assert_eq!(result.format, ""); // unwrap_or_default

@@ -33,7 +33,7 @@ test_ssrf_url() {
     RESPONSE=$(curl -s -w "\n%{http_code}" \
         -X POST -H "Content-Type: application/json" \
         -H "Authorization: Bearer ${TOKEN}" \
-        -d "{\"name\":\"ssrf-test\",\"url\":\"${url}\",\"events\":[\"artifact.pushed\"]}" \
+        -d "{\"name\":\"ssrf-test\",\"url\":\"${url}\",\"events\":[\"artifact_uploaded\"]}" \
         "${REGISTRY_URL}/api/v1/webhooks" 2>/dev/null) || true
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -1)
@@ -91,7 +91,7 @@ info "Testing that external URLs are accepted..."
 RESPONSE=$(curl -s -w "\n%{http_code}" \
     -X POST -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${TOKEN}" \
-    -d '{"name":"ssrf-legit-test","url":"https://example.com/webhook","events":["artifact.pushed"]}' \
+    -d '{"name":"ssrf-legit-test","url":"https://example.com/webhook","events":["artifact_uploaded"]}' \
     "${REGISTRY_URL}/api/v1/webhooks" 2>/dev/null) || true
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)

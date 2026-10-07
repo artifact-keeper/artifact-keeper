@@ -221,6 +221,10 @@ pub struct AppState {
     /// invalidation: npm forbids republishing a version, so entries are
     /// immutable facts that age out.
     pub npm_attestation_cache: Option<Arc<NpmAttestationCache>>,
+    /// Live state of this replica's npm upstream change-feed consumer
+    /// (#3069): written by the `FeedConsumer` (`main.rs` hands it this
+    /// handle), read by `GET /api/v1/admin/npm/upstream-feed/status`.
+    pub upstream_feed_status: Arc<crate::services::upstream_feed::FeedStatus>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -244,6 +248,11 @@ pub struct AppState {
     /// extra concurrent login starves the blocking-thread pool and the rest
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
+    /// Runtime guest-access setting (#867): env pin, else the
+    /// `system_settings` row, else the default; cached with a short TTL,
+    /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
+    /// asks this instead of `config.guest_access_enabled`.
+    pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -254,6 +263,20 @@ fn build_auth_semaphore(max: usize) -> Option<Arc<Semaphore>> {
     } else {
         Some(Arc::new(Semaphore::new(max)))
     }
+}
+
+/// The runtime guest-access handle every `AppState` constructor installs
+/// (#867): env pin and default from `config`, stored value from `db`.
+fn build_guest_access_policy(
+    db: &PgPool,
+    config: &Config,
+) -> Arc<crate::services::guest_access_policy::GuestAccessPolicy> {
+    Arc::new(
+        crate::services::guest_access_policy::GuestAccessPolicy::from_config(
+            Some(db.clone()),
+            config,
+        ),
+    )
 }
 
 impl AppState {
@@ -279,6 +302,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -302,10 +326,12 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -328,6 +354,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -351,10 +378,12 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 

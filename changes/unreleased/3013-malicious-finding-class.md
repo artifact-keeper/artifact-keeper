@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#3013]
+---
+- **Findings are now classified as `vulnerability`, `malicious` or `policy`, and known-malicious packages from OSV are flagged `malicious`** (#3013). Every finding used to be the same kind of row, so a known weakness and a known-hostile package were indistinguishable to any policy. `scan_findings` gains `finding_class` (migration 260, default `vulnerability`); the dependency scanner marks OSV `MAL-*` advisories (the ossf/malicious-packages feed) as `malicious` and grades them `Critical` (they usually carry no severity and previously defaulted to `Medium`, below a typical `max_severity = high` gate), external findings with a `MAL-*` id are classified the same way, OpenSCAP rule failures are classed `policy`, and the class is returned on every finding and filterable with `GET /api/v1/security/scans/{id}/findings?finding_class=malicious`. This is the first slice of malware detection; policy treatment of malicious findings and a signature-based scanner are follow-ups.

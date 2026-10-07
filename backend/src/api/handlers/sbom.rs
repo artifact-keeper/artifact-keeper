@@ -4497,7 +4497,7 @@ package:
     // -----------------------------------------------------------------------
 
     /// Set the authoritative visibility column directly. `set_repo_public`
-    /// writes the deprecated mirror instead, which the migration-217 trigger
+    /// writes the deprecated mirror instead, which the migration-245 trigger
     /// can only resolve to `public` or `private` — it cannot express
     /// `internal` at all, which is the whole point of the column.
     #[cfg(test)]

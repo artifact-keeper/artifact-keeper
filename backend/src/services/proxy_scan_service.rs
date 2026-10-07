@@ -74,6 +74,12 @@ pub enum ProxySeverityGate {
     /// Opted-in posture: findings at or above this severity block; a verdict
     /// whose highest severity is known and strictly below it serves.
     Threshold(Severity),
+    /// Record-only posture (#3645, `proxy_scan_action = 'record_only'`): the
+    /// verdict is scanned and recorded exactly as under enforcement, but no
+    /// verdict ever blocks a pull. Only a repository that explicitly selects
+    /// the record-only action resolves to this gate; it is the WEAKEST gate,
+    /// so any enforcing side of a stricter-of-two combination wins.
+    RecordOnly,
 }
 
 impl ProxySeverityGate {
@@ -96,6 +102,7 @@ impl ProxySeverityGate {
     /// gate: an ungraded vulnerable verdict is fail-closed, never fail-open.
     pub fn blocks(self, max_severity: Option<Severity>) -> bool {
         match self {
+            Self::RecordOnly => false,
             Self::BlockOnAny => true,
             Self::Threshold(t) => match max_severity {
                 None => true,
@@ -110,11 +117,19 @@ impl ProxySeverityGate {
     /// severities wins (`Severity` is ordered Critical=0 .. Info=4, and a
     /// threshold blocks everything at-or-above it, so the numerically larger
     /// variant is the stricter gate).
+    /// `RecordOnly` is the weakest gate: it yields to anything that enforces.
     pub fn stricter(a: Self, b: Self) -> Self {
         match (a, b) {
             (Self::BlockOnAny, _) | (_, Self::BlockOnAny) => Self::BlockOnAny,
+            (Self::RecordOnly, other) | (other, Self::RecordOnly) => other,
             (Self::Threshold(x), Self::Threshold(y)) => Self::Threshold(x.max(y)),
         }
+    }
+
+    /// True for the record-only gate (#3645): verdicts are recorded, never
+    /// enforced.
+    pub fn is_record_only(self) -> bool {
+        matches!(self, Self::RecordOnly)
     }
 }
 
@@ -154,6 +169,12 @@ pub enum ProxyScanAction {
     /// verdict is a 403, and an over-cap / budget-exceeded / scan-error object
     /// returns 423 rather than a 200 of unscanned bytes.
     FailClosed,
+    /// Record-only (#3645): scan and record exactly as fail-open does (serve
+    /// the first pull with `X-AK-Scan: pending`, scan asynchronously), but
+    /// never withhold a pull: a vulnerable verdict is served with
+    /// `X-AK-Scan: recorded`, and an over-cap / inconclusive scan serves
+    /// pending. Visibility without enforcement.
+    RecordOnly,
 }
 
 impl ProxyScanAction {
@@ -163,12 +184,26 @@ impl ProxyScanAction {
     pub fn from_db(value: &str) -> Self {
         match value {
             "fail_closed" => ProxyScanAction::FailClosed,
+            "record_only" => ProxyScanAction::RecordOnly,
             _ => ProxyScanAction::FailOpen,
+        }
+    }
+
+    /// The `scan_configs.proxy_scan_action` token for this action.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ProxyScanAction::FailOpen => "fail_open",
+            ProxyScanAction::FailClosed => "fail_closed",
+            ProxyScanAction::RecordOnly => "record_only",
         }
     }
 
     pub fn is_fail_closed(self) -> bool {
         matches!(self, ProxyScanAction::FailClosed)
+    }
+
+    pub fn is_record_only(self) -> bool {
+        matches!(self, ProxyScanAction::RecordOnly)
     }
 }
 
@@ -237,10 +272,13 @@ pub enum InconclusiveOutcome {
 }
 
 /// Pure decision for the inconclusive branch (over-cap / budget / scan error):
-/// fail-open serves-with-pending, fail-closed locks.
+/// fail-open serves-with-pending, fail-closed locks. Record-only (#3645)
+/// never withholds, so it serves pending like fail-open.
 pub fn decide_inconclusive(action: ProxyScanAction) -> InconclusiveOutcome {
     match action {
-        ProxyScanAction::FailOpen => InconclusiveOutcome::ServePending,
+        ProxyScanAction::FailOpen | ProxyScanAction::RecordOnly => {
+            InconclusiveOutcome::ServePending
+        }
         ProxyScanAction::FailClosed => InconclusiveOutcome::Locked,
     }
 }
@@ -886,6 +924,52 @@ mod tests {
             ProxySeverityGate::from_config(true, "garbage"),
             ProxySeverityGate::BlockOnAny,
             "an unparseable configured threshold must fail closed"
+        );
+    }
+
+    /// #3645: the record-only gate never blocks -- not even an ungraded
+    /// verdict -- and is the weakest gate in a stricter-of-two combination.
+    #[test]
+    fn record_only_gate_never_blocks_and_yields_to_any_enforcing_gate() {
+        let ro = ProxySeverityGate::RecordOnly;
+        for sev in [
+            Some(Severity::Critical),
+            Some(Severity::High),
+            Some(Severity::Info),
+            None,
+        ] {
+            assert!(!ro.blocks(sev), "record-only must not block {sev:?}");
+        }
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(ProxySeverityGate::stricter(ro, high), high);
+        assert_eq!(ProxySeverityGate::stricter(high, ro), high);
+        assert_eq!(
+            ProxySeverityGate::stricter(ro, ProxySeverityGate::BlockOnAny),
+            ProxySeverityGate::BlockOnAny
+        );
+        assert_eq!(ProxySeverityGate::stricter(ro, ro), ro);
+        assert!(ro.is_record_only());
+        assert!(!high.is_record_only());
+    }
+
+    /// #3645: the record-only action round-trips through the column, never
+    /// scans inline (so it can never 423 on a first pull), and serves an
+    /// inconclusive / over-cap outcome pending rather than locking.
+    #[test]
+    fn record_only_action_scans_async_and_never_locks() {
+        for a in [
+            ProxyScanAction::FailOpen,
+            ProxyScanAction::FailClosed,
+            ProxyScanAction::RecordOnly,
+        ] {
+            assert_eq!(ProxyScanAction::from_db(a.as_db_str()), a);
+        }
+        let ro = ProxyScanAction::RecordOnly;
+        assert!(ro.is_record_only() && !ro.is_fail_closed());
+        assert_eq!(decide_inconclusive(ro), InconclusiveOutcome::ServePending);
+        assert_eq!(
+            decide_serve(None, Some("grype-1"), ro, 30, Utc::now()),
+            ServeDecision::ServePendingScanAsync
         );
     }
 

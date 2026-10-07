@@ -153,6 +153,22 @@ names the same commit.
    When a commit is refused, each gate names the rule it failed and, for a
    near miss, the path that put it outside the set.
 
+   Check 6 refuses curated notes that are not finished: if
+   `.github/release-notes/<version>.md` exists for the version `Cargo.toml`
+   names, any uppercase `TODO` or `DRAFT` word in it is blocking. Notes may be
+   drafted on `main` before the cut (1.11.0's were, #4468) and their open
+   items are usually HTML comments, which GitHub does not render, so a
+   forgotten draft would otherwise publish with the gaps invisible. Resolve or
+   delete every marker in the prep PR.
+
+   **Cut checklist, beyond the preflight.** Before dispatching the candidate,
+   also confirm the secrets the post-release jobs need (step 8): the
+   `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
+   announcement failed with 404), and `AWS_AMI_BUILDER_ROLE_ARN` names a role
+   whose OIDC trust admits this repository. Neither is visible to the
+   preflight, and a missing one turns a published release's announcement or
+   AMI job red.
+
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
    all of them in one PR (or one PR per repo):
@@ -287,7 +303,33 @@ names the same commit.
 
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
-   predicate names the commit, the version, the run and every digest. A
+   predicate names the commit, the version, the run and every digest.
+   The scanner-adapter is certified at the digest the release ships
+   (#4076): this commit's `sha-<sha>` rebuild when its
+   `docker/scanner-adapter/VERSION` is new, but the already-published
+   `:<adapter VERSION>` digest when that version stays (published from an
+   earlier commit with unchanged sources). The predicate records which
+   (`scanner_adapter_decision`: `new`/`stays`, the owning revision, the
+   tag), the verifier anchors the adapter at that tag, and the promote's tag
+   message and summary print the certified adapter digest and decision.
+
+   Until artifact-keeper-test#380 lands (tracked here as #4439), the
+   adapter's attestation is **provenance of what ships, not proof that the
+   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
+   pinned adapter, for "new" and "stays" alike. The candidate exposes the
+   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+
+   **Maintenance lines need the #4076 verifier before their next cut.**
+   `release.yml` runs the *tagged* commit's copy of
+   `scripts/ci/assert-candidate-certified.sh`, and a copy older than #4076
+   cannot read a "stays" certification: it would refuse the release after
+   the tag already exists. So the candidate (and, again, the promote, before
+   anything is named) refuses to certify "stays" on a commit whose verifier
+   predates #4076, with an error naming the line. To cut a patch on a
+   `release/X.Y.x` whose adapter version is already published, first backport
+   #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
+   self-test, and main's current `release-candidate.yml`, which the line
+   needs byte-identical anyway), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
@@ -318,7 +360,9 @@ names the same commit.
    ```
 
    In order: it verifies the certification for the commit and that the
-   registry still serves the certified digests for `sha-<sha>`; re-checks the
+   registry still serves the certified digests for `sha-<sha>` (the scanner
+   adapter at its exact `:<adapter VERSION>` tag when its version stays, and
+   then that the commit's own verifier can read that certification); re-checks the
    preflight evidence; applies `:X.Y.Z` to the certified digests through
    Docker Publish's PROMOTE mode (`promote_version=X.Y.Z
    promote_source_sha=<sha>` — no rebuild, the digest-aware guard still runs,
@@ -372,6 +416,55 @@ names the same commit.
 
    A backport moves only its series alias: promoting `1.7.9` while `1.8.2`
    is the newest release advances `:1.7` and leaves `:latest` alone.
+
+   **What runs after the Release is published.** The Release is created
+   with `GITHUB_TOKEN`, and an event caused by `GITHUB_TOKEN` never starts
+   another workflow, so nothing that listens for `release: published` runs
+   for it (#3789, #3896, #3897). `release.yml` therefore dispatches each
+   post-release workflow itself, on the tag, once the `release` job has
+   succeeded, and follows each run to a verdict with
+   `scripts/ci/follow-dispatched-run.sh`. A red follow job means the release
+   IS published and the images are correct; only that side effect is
+   missing. Re-run the job, or dispatch the workflow by hand:
+
+   | `release.yml` job | dispatches | runs for | by hand |
+   |---|---|---|---|
+   | `sync-openapi-spec` | `sync-openapi-spec.yml` | every release | `gh workflow run sync-openapi-spec.yml --ref vX.Y.Z -f dry_run=false` |
+   | `release-announce` | `release-announce.yml` (Discord `#announcements`, secret `DISCORD_RELEASE_WEBHOOK`) | every release; a prerelease gets the amber "pre-release" embed | `gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z` |
+   | `ami-build` | `ami-build.yml` (Packer, AWS OIDC role secret `AWS_AMI_BUILDER_ROLE_ARN`) | **stable releases only**: an AMI costs money and an `-rc.N` AMI has no consumer | `gh workflow run ami-build.yml --ref vX.Y.Z -f version=X.Y.Z` |
+
+   For a tag whose own workflow files predate the dispatch inputs (anything
+   released before this chain landed), dispatch on `main` instead, e.g.
+   `--ref main -f tag=v1.9.0`. Both inputs are validated: the version or tag
+   must be well-formed, must name a **published** GitHub Release (a draft or
+   a missing Release is refused), and, when dispatched on a version tag, must
+   name that same tag. Each announcement run posts again; there is no
+   de-duplication, so re-run it only if the post did not happen. All three
+   keep their `release: published` trigger for a Release published by hand,
+   whose event does fire (`ami-build.yml` skips a hand-published prerelease
+   there too). No PAT or App token is involved: `workflow_dispatch` is the
+   documented exception to the rule above, and the dispatching jobs use
+   `GITHUB_TOKEN` with `actions: write`.
+   `scripts/ci/check-release-downstream-dispatch.sh` (Shell Tests) fails CI
+   if any dispatch, follow, manual trigger or prerelease rule is dropped.
+
+   Re-running a failed `ami-build` job (or `ami-build.yml` itself) builds a
+   **second** AMI for the same version; there is no de-duplication, so check
+   the AMI build run's summary for an AMI ID before re-running it.
+
+   **Release prerequisites for these jobs.** They fail until two secrets are
+   in place:
+
+   - `DISCORD_RELEASE_WEBHOOK` must be a live webhook. The last two announce
+     runs (v1.7.0, v1.7.3) got HTTP 404 from Discord, so it needs rotating
+     (channel → Integrations → Webhooks → new webhook → update the secret).
+   - `AWS_AMI_BUILDER_ROLE_ARN` (repo or org secret) must name an IAM role
+     whose OIDC trust policy admits this repository's runs on `refs/tags/v*`
+     (the dispatch runs on the tag) and on `refs/heads/main` (manual runs for
+     older tags). No AMI build has ever succeeded. Until one does, the
+     `ami-build` job in `release.yml` is `continue-on-error: true`: a red AMI
+     build shows as a failed job without failing the release run. Remove that
+     line (TODO in the job) once a tagged build succeeds.
 
 9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
@@ -931,7 +1024,10 @@ section**:
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
 commit it in the same PR as the CHANGELOG assembly (step 3). `release.yml`'s
-"Resolve release notes" step uses that file as the Release `body_path`.
+"Resolve release notes" step uses that file as the Release `body_path`. A
+long release may land a draft earlier, with its open items marked `TODO`;
+preflight check 6 refuses the cut until no `TODO` or `DRAFT` marker is left
+in the notes for the version being released.
 
 For a stable `vX.Y.Z` the file is **required**: with no curated file the
 release-preflight job refuses the tag, and the "Resolve release notes" step

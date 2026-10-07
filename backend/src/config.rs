@@ -151,6 +151,61 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Default listen IP for the gRPC and metrics listeners (#2161): every
+/// interface, which is what both listeners hard-coded before they were
+/// configurable.
+pub const DEFAULT_LISTENER_BIND_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// Parse the listen IP for a secondary listener from env var `key` (#2161).
+///
+/// Unset or blank means [`DEFAULT_LISTENER_BIND_IP`]. IPv6 literals are
+/// accepted bare (`::1`) or bracketed (`[::1]`), since operators copy them out
+/// of `host:port` strings. Anything else is a hard startup error rather than
+/// a silent fall-back to `0.0.0.0`: an operator who asked for loopback-only
+/// and got every interface would be exposed without knowing it.
+fn parse_bind_ip(key: &str, raw: Option<&str>) -> Result<std::net::IpAddr> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_LISTENER_BIND_IP);
+    };
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    unbracketed.parse().map_err(|_| {
+        AppError::Config(format!(
+            "{key} must be an IP address such as 127.0.0.1 or ::1 (no port), got {value:?}"
+        ))
+    })
+}
+
+/// Clamp `BLOB_GC_MIN_AGE_SECS` (#2906) and warn when the result is shorter
+/// than a slow real-world push can take. The clamp keeps a typo from either
+/// deleting a blob seconds after upload (floor) or disabling blob GC in
+/// practice (ceiling).
+fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
+    use crate::services::storage_gc_service as gc;
+    let secs = gc::clamp_min_blob_age_secs(raw);
+    if secs != raw {
+        tracing::warn!(
+            requested = raw,
+            effective = secs,
+            "BLOB_GC_MIN_AGE_SECS is outside [{}, {}] seconds and was clamped",
+            gc::MIN_BLOB_AGE_FLOOR_SECS,
+            gc::MIN_BLOB_AGE_CEILING_SECS,
+        );
+    }
+    if secs < gc::MIN_BLOB_AGE_RECOMMENDED_SECS {
+        tracing::warn!(
+            min_age_secs = secs,
+            "BLOB_GC_MIN_AGE_SECS is under one hour: a push whose manifest lands \
+             later than this after its blobs can lose a blob to GC; use only on \
+             short-lived test deployments"
+        );
+    }
+    secs
+}
+
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
 ///
 /// Whitespace around each entry is trimmed and empty entries are dropped.
@@ -355,6 +410,19 @@ pub struct Config {
     /// [`crate::services::signing_service::signature_expiry_duration`].
     pub signature_expiry_seconds: u64,
 
+    /// Rotation overlap window, in seconds (`SIGNING_KEY_ROTATION_OVERLAP_SECS`,
+    /// #1329). For this long after a signing key is rotated, Debian/RPM
+    /// metadata is signed by both the old and the new key and the public-key
+    /// endpoints serve both, so clients that still trust only the old key keep
+    /// verifying. Defaults to 14 days; `0` retires the old key immediately.
+    pub signing_key_rotation_overlap_secs: u64,
+
+    /// Replace legacy signing keys that are bound to Debian/RPM metadata
+    /// signing but cannot produce OpenPGP signatures with fresh
+    /// `key_type='gpg'` keys at startup (`SIGNING_AUTO_MIGRATE_LEGACY_KEYS`,
+    /// #1331). Off by default: the startup scan then only WARNs.
+    pub signing_auto_migrate_legacy_keys: bool,
+
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
 
@@ -463,6 +531,14 @@ pub struct Config {
     /// token itself while this is `false`.
     pub guest_access_enabled: bool,
 
+    /// True when `AK_GUEST_ACCESS_ENABLED` was set explicitly to `true`, `1`,
+    /// `false` or `0` (#867). The env value then pins the effective setting
+    /// and the runtime `security.guest_access_enabled` row in
+    /// `system_settings` has no effect (break-glass, like `TOTP_POLICY`).
+    /// Otherwise `guest_access_enabled` is only the default the stored row
+    /// overrides; see `services::guest_access_policy`.
+    pub guest_access_env_pinned: bool,
+
     /// When true, the unauthenticated `/health` (and `/healthz`) response
     /// includes operator-only detail: the exact git commit SHA (`commit`),
     /// the prerelease/`dirty` flag, and live connection-pool internals
@@ -563,6 +639,14 @@ pub struct Config {
     /// OpenTelemetry service name (default: "artifact-keeper").
     pub otel_service_name: String,
 
+    /// Days a soft-deleted artifact stays in the trash, restorable through
+    /// `POST /api/v1/admin/trash/{id}/restore`, before storage GC may reclaim
+    /// its row and object (#2072). Env `GC_TRASH_RETENTION_DAYS`, default `0`:
+    /// reclaimable on the next GC pass, exactly the behaviour before this
+    /// setting existed, so an upgrade never silently stops reclaiming storage.
+    /// Clamped to [0, 3650].
+    pub gc_trash_retention_days: u32,
+
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
 
@@ -604,6 +688,16 @@ pub struct Config {
     /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
     /// next pass with no extra delay.
     pub blob_gc_sweep_grace_secs: u64,
+
+    /// Minimum age (seconds) before an unreferenced OCI blob, or an OCI object
+    /// recorded as a GC candidate by a repository delete, may be reclaimed
+    /// (#2906). Shields an in-flight push whose blobs land before the manifest
+    /// that references them. Env `BLOB_GC_MIN_AGE_SECS`, default 86400 (24
+    /// hours, `storage_gc_service::MIN_BLOB_AGE_SECS`), clamped to
+    /// [60 s, 7 days]; a value under one hour is logged as a warning at
+    /// startup. Lowering it is for short-lived test deployments that need to
+    /// observe blob mark-and-sweep end to end.
+    pub blob_gc_min_age_secs: u64,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -698,6 +792,17 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// IP address the gRPC listener (`GRPC_PORT`) binds (#2161). Env
+    /// `GRPC_BIND_IP`, default `0.0.0.0` (every interface). Set `127.0.0.1`
+    /// (or `::1`) to keep the listener off the network, e.g. behind a
+    /// service-mesh sidecar. An invalid value fails startup.
+    pub grpc_bind_ip: std::net::IpAddr,
+
+    /// IP address the unauthenticated metrics listener ([`Self::metrics_port`])
+    /// binds (#2161). Env `METRICS_BIND_IP`, default `0.0.0.0`. An invalid
+    /// value fails startup.
+    pub metrics_bind_ip: std::net::IpAddr,
 
     /// Maximum number of connections in the PostgreSQL pool.
     /// Defaults to 20. Increase for higher concurrency, decrease for
@@ -1137,6 +1242,7 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show guest_access_env_pinned,
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
@@ -1151,11 +1257,13 @@ redacted_debug!(Config {
     show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
+    show gc_trash_retention_days,
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
     show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
+    show blob_gc_min_age_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -1167,6 +1275,8 @@ redacted_debug!(Config {
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
+    show grpc_bind_ip,
+    show metrics_bind_ip,
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
@@ -1250,6 +1360,9 @@ impl Default for Config {
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            signing_key_rotation_overlap_secs:
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1272,6 +1385,7 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
@@ -1286,11 +1400,13 @@ impl Default for Config {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -1302,6 +1418,8 @@ impl Default for Config {
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
@@ -1388,6 +1506,11 @@ impl Config {
 
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
+        let guest_access_pin = crate::services::guest_access_policy::parse_env_pin(
+            env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
+                .ok()
+                .as_deref(),
+        );
         let config = Self {
             database_url: env::var("DATABASE_URL")
                 .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
@@ -1412,6 +1535,13 @@ impl Config {
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
+            signing_key_rotation_overlap_secs: env_parse(
+                "SIGNING_KEY_ROTATION_OVERLAP_SECS",
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            ),
+            signing_auto_migrate_legacy_keys: parse_opt_in_flag(
+                env::var("SIGNING_AUTO_MIGRATE_LEGACY_KEYS").ok().as_deref(),
             ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),
@@ -1452,10 +1582,10 @@ impl Config {
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
             // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
             // Any other value (including unset, garbage, or empty) keeps guests enabled.
-            guest_access_enabled: !matches!(
-                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
-                Ok("false" | "0")
-            ),
+            // One parse (#867): only `false`/`0` disable guests, as before; the
+            // four explicit spellings also pin the runtime setting.
+            guest_access_enabled: guest_access_pin.unwrap_or(true),
+            guest_access_env_pinned: guest_access_pin.is_some(),
             storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
             storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
             storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),
@@ -1529,6 +1659,11 @@ impl Config {
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
+            gc_trash_retention_days:
+                crate::services::storage_gc_service::clamp_trash_retention_days(env_parse(
+                    "GC_TRASH_RETENTION_DAYS",
+                    0u32,
+                )),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
                 .unwrap_or_else(|_| "0 0 */4 * * *".into()),
@@ -1549,6 +1684,10 @@ impl Config {
             // sweep forever; `0` is allowed (sweep on the next pass).
             blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
                 .min(7 * 24 * 60 * 60),
+            blob_gc_min_age_secs: resolve_blob_gc_min_age_secs(env_parse(
+                "BLOB_GC_MIN_AGE_SECS",
+                crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
+            )),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -1608,6 +1747,11 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            grpc_bind_ip: parse_bind_ip("GRPC_BIND_IP", env::var("GRPC_BIND_IP").ok().as_deref())?,
+            metrics_bind_ip: parse_bind_ip(
+                "METRICS_BIND_IP",
+                env::var("METRICS_BIND_IP").ok().as_deref(),
+            )?,
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
@@ -3005,6 +3149,7 @@ mod tests {
 
         let config = Config::from_env().unwrap();
         assert!(config.guest_access_enabled);
+        assert!(!config.guest_access_env_pinned, "unset never pins (#867)");
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3104,6 +3249,24 @@ mod tests {
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "");
         assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        // #867: only the four explicit spellings pin the runtime setting;
+        // garbage and empty leave it to the admin-managed stored value.
+        for (raw, pinned) in [
+            ("false", true),
+            ("0", true),
+            ("true", true),
+            ("1", true),
+            ("yes", false),
+            ("", false),
+        ] {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", raw);
+            assert_eq!(
+                Config::from_env().unwrap().guest_access_env_pinned,
+                pinned,
+                "{raw:?}"
+            );
+        }
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3898,6 +4061,119 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOB_GC_MIN_AGE_SECS (#2906)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_blob_gc_min_age_from_env() {
+        use crate::services::storage_gc_service::MIN_BLOB_AGE_SECS;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let cases: [(Option<&str>, u64); 6] = [
+            (None, MIN_BLOB_AGE_SECS),
+            (Some("garbage"), MIN_BLOB_AGE_SECS),
+            (Some("120"), 120),
+            (Some("3600"), 3600),
+            (Some("1"), 60),
+            (Some("99999999"), 7 * 24 * 60 * 60),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => env::set_var("BLOB_GC_MIN_AGE_SECS", v),
+                None => env::remove_var("BLOB_GC_MIN_AGE_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(
+                config.blob_gc_min_age_secs, want,
+                "BLOB_GC_MIN_AGE_SECS={raw:?}"
+            );
+        }
+        env::remove_var("BLOB_GC_MIN_AGE_SECS");
+        assert_eq!(Config::default().blob_gc_min_age_secs, MIN_BLOB_AGE_SECS);
+    }
+
+    // -----------------------------------------------------------------------
+    // GRPC_BIND_IP / METRICS_BIND_IP (#2161)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bind_ip_defaults_to_every_interface_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_bind_ip("GRPC_BIND_IP", raw).unwrap(),
+                DEFAULT_LISTENER_BIND_IP,
+                "{raw:?} must keep the historical 0.0.0.0 bind"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_accepts_ipv4_and_ipv6_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let cases: [(&str, IpAddr); 5] = [
+            ("127.0.0.1", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            (" 10.1.2.3 ", IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
+            ("::1", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("[::1]", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_bind_ip("METRICS_BIND_IP", Some(raw)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_rejects_garbage_ports_and_hostnames() {
+        for raw in [
+            "localhost",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "999.0.0.1",
+            "[::1",
+        ] {
+            let err = parse_bind_ip("GRPC_BIND_IP", Some(raw))
+                .expect_err(&format!("{raw:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("GRPC_BIND_IP"), "error names the var: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_config_listener_bind_ips_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
+
+        let config = Config::from_env().expect("defaults load");
+        assert_eq!(config.grpc_bind_ip, DEFAULT_LISTENER_BIND_IP);
+        assert_eq!(config.metrics_bind_ip, DEFAULT_LISTENER_BIND_IP);
+
+        env::set_var("GRPC_BIND_IP", "127.0.0.1");
+        env::set_var("METRICS_BIND_IP", "::1");
+        let config = Config::from_env().expect("valid bind IPs load");
+        assert_eq!(config.grpc_bind_ip.to_string(), "127.0.0.1");
+        assert_eq!(config.metrics_bind_ip.to_string(), "::1");
+        assert_eq!(
+            std::net::SocketAddr::new(config.metrics_bind_ip, 9091).to_string(),
+            "[::1]:9091",
+            "an IPv6 bind IP must combine with the port without manual brackets"
+        );
+
+        // An invalid value fails startup instead of silently binding 0.0.0.0.
+        env::set_var("METRICS_BIND_IP", "not-an-ip");
+        assert!(Config::from_env().is_err());
+        env::set_var("METRICS_BIND_IP", "::1");
+        env::set_var("GRPC_BIND_IP", "127.0.0.1:9090");
+        assert!(Config::from_env().is_err());
+
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
     }
 
     #[test]

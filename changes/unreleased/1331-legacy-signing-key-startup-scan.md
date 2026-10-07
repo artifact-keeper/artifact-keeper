@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#1331]
+---
+- **Startup now warns about every signing key that cannot sign the Debian/RPM metadata it is configured for, and can replace them automatically** (#1331). A key created before OpenPGP signing existed, or any `key_type = rsa` key, holds X.509/PKCS#8 material, and a Debian or RPM repository bound to one fails every InRelease, Release.gpg and repomd.xml.asc request. On every boot the backend now logs one WARN per such key with its id and the repositories it is bound to. With `SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true` it also generates a fresh `key_type = gpg` key for each one, repoints those repositories at it, and audits the old key as `auto_migrated`. A key that is also bound to a raw-RSA format such as Alpine stays active for that repository. A key whose material cannot be decrypted, usually because `JWT_SECRET` changed, is only reported and never replaced. Clients must import the new public key after a migration. Rotating an `rsa` key is not a fix, because rotation keeps the key type.

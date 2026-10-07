@@ -576,6 +576,11 @@ async fn upload_object(
         artifact_id,
     )
     .await;
+    // #3939: Git LFS objects have no package catalog entry to hang the
+    // event off, so the upload emits it against the row it just wrote.
+    state
+        .event_bus
+        .emit_artifact_uploaded(artifact_id, repo.id, Some(user_id));
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -2324,6 +2329,39 @@ mod tests {
                 1,
                 "a scope-denied unlock must not delete the row"
             );
+            fx.cleanup().await;
+        }
+
+        /// #3939: a Git LFS object upload writes an `artifacts` row and must
+        /// fire exactly one `artifact.uploaded` for it (it used to fire none).
+        #[tokio::test]
+        async fn upload_object_emits_artifact_uploaded_3939() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let content = b"lfs-object-bytes".to_vec();
+            let oid = format!("{:x}", Sha256::digest(&content));
+            let mut events = fx.state.event_bus.subscribe();
+
+            let (status, body) = parts(
+                upload_object(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), oid.clone())),
+                    Bytes::from(content),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+            let artifact_id = tdh::artifact_id_at(&fx.pool, fx.repo_id, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, fx.repo_id, artifact_id);
             fx.cleanup().await;
         }
     }

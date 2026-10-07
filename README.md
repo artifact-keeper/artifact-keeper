@@ -24,7 +24,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **Full-Text Search** - OpenSearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
 - **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
-- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, and Conda handlers
+- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, Pacman, and Conda handlers
 
 ## System Architecture
 
@@ -140,6 +140,7 @@ flowchart TD
 | **RPM** | RHEL, Fedora, CentOS |
 | **Debian** | Ubuntu, Debian |
 | **Alpine** | Alpine Linux (APK) |
+| **Pacman** | Arch Linux (hosted) |
 | **Conda** | Conda channels |
 | **OPKG** | OpenWrt, embedded Linux |
 
@@ -204,7 +205,7 @@ flowchart LR
 - **Dual scanner** - Trivy for filesystem/container analysis, Grype for dependency trees
 - **Scoring** - A through F grades based on finding severity and count
 - **Policies** - Configurable rules that block or quarantine artifacts
-- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, and Conda packages
+- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, Pacman, and Conda packages
 
 > **Container-image scanning (`TRIVY_ADAPTER_URL`).** The base `docker-compose.yml`
 > wires `TRIVY_URL` for the legacy trivy *server* (filesystem / incus rootfs
@@ -293,6 +294,8 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 - **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Mirror GitHub release assets using the github, mise or aqua format with finite caching
+- **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
+- **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
 
 ## Project Structure
 

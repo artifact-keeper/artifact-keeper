@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Whole-repo duplication baseline for the weekly jscpd scan (#1619):",
+    "scripts/ci/jscpd-repo-scan.sh, run by scheduled-tests.yml's",
+    "`duplication-report` job. The scan fails (a red scheduled run, never a PR",
+    "gate) when the measured percentage exceeds percentage + tolerance.",
+    "",
+    "percentage was measured on main at a37c3969 (2026-10-04): 1.79%, 4,758 of",
+    "265,493 production lines in 340 files, 345 clone pairs. Same scope as the",
+    "per-PR duplication gate: .jscpd.json ignores, inline #[cfg(test)] stripped.",
+    "",
+    "When a refactor brings the number down, the job summary says so; lower",
+    "percentage here in that PR to lock the improvement in. Raising it is a",
+    "deliberate decision and belongs in its own reviewed change."
+  ],
+  "percentage": 1.79,
+  "tolerance": 0.10
+}

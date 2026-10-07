@@ -962,3 +962,127 @@ async fn transient_heal_failures_do_not_rotate_a_depth_root_4216() {
     assert_eq!(f.state.rpm_repodata_cache.renders(), renders + 1);
     f.teardown().await;
 }
+
+/// #4346: the caller now reaches the depth path. A hosted depth root is not
+/// caller-dependent: an anonymous caller, a grant-holding non-admin and an
+/// admin get the same bytes for every generated document, from one render,
+/// with no caller-dependent cache headers.
+#[tokio::test]
+async fn depth_root_repodata_is_caller_independent_4346() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    upload(&f, &format!("a/{RPM}"), "a").await;
+    let base = format!("/rpm/{}", f.repo_key);
+    let routers = || {
+        [
+            tdh::router_anon(Router::new().nest("/rpm", super::router()), f.state.clone()),
+            tdh::router_with_auth(
+                Router::new().nest("/rpm", super::router()),
+                f.state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            ),
+            app(&f),
+        ]
+    };
+    let renders = f.state.rpm_repodata_cache.renders();
+    for file in [
+        "repomd.xml",
+        "primary.xml.gz",
+        "filelists.xml.gz",
+        "other.xml.gz",
+    ] {
+        let mut bodies = Vec::new();
+        for router in routers() {
+            let (status, body, headers) = tdh::send_with_headers(
+                router,
+                Request::builder()
+                    .uri(format!("{base}/a/repodata/{file}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{file}");
+            assert!(headers.get(axum::http::header::VARY).is_none(), "{file}");
+            bodies.push(body);
+        }
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "{file}: every caller gets the same hosted document"
+        );
+    }
+    assert_eq!(
+        f.state.rpm_repodata_cache.renders(),
+        renders + 1,
+        "one render serves every caller of a hosted root"
+    );
+    assert!(text(
+        &get(&f, &format!("{base}/a/repodata/primary.xml.gz"))
+            .await
+            .1
+    )
+    .contains("<name>pkg</name>"));
+    f.teardown().await;
+}
+
+/// #1329 through the RPM handlers: after a rotation repomd.xml.asc carries a
+/// signature from each key and repomd.xml.key serves both keys.
+#[tokio::test]
+async fn rotation_dual_signs_repomd_and_serves_both_keys_1329() {
+    use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
+
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    depth(&f, 1, StatusCode::OK).await;
+    attach_signing_key(&f).await;
+    upload(&f, &format!("a/{RPM}"), "rotate").await;
+    let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+    let old = svc
+        .get_active_key_for_repo(f.repo_id)
+        .await
+        .unwrap()
+        .expect("attached key");
+    let base = format!("/rpm/{}/a/repodata", f.repo_key);
+    let fetch = |file: &'static str| {
+        let path = format!("{base}/{file}");
+        let f = &f;
+        async move {
+            let (status, body) = get(f, &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+    let sigs = |text: &str| {
+        StandaloneSignature::from_string_many(text)
+            .unwrap()
+            .0
+            .count()
+    };
+    let keys = |text: &str| SignedPublicKey::from_string_many(text).unwrap().0.count();
+
+    assert_eq!(sigs(&fetch("repomd.xml.asc").await), 1);
+    assert_eq!(keys(&fetch("repomd.xml.key").await), 1);
+
+    let new = svc.rotate_key(old.id, None).await.expect("rotate");
+    let repomd = fetch("repomd.xml").await;
+    let asc = fetch("repomd.xml.asc").await;
+    assert_eq!(sigs(&asc), 2);
+    assert_eq!(keys(&fetch("repomd.xml.key").await), 2);
+    let signatures: Vec<StandaloneSignature> = StandaloneSignature::from_string_many(&asc)
+        .unwrap()
+        .0
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for pem in [&old.public_key_pem, &new.public_key_pem] {
+        let public = SignedPublicKey::from_string(pem).unwrap().0;
+        assert!(
+            signatures
+                .iter()
+                .any(|sig| sig.verify(&public, repomd.as_bytes()).is_ok()),
+            "each key alone verifies the dual-signed repomd.xml"
+        );
+    }
+    f.teardown().await;
+}

@@ -27,7 +27,8 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::upstream_tracing::send_upstream;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -288,7 +289,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     tracing::debug!("Proxying sumdb request to {}", url);
 
     let client = crate::services::http_client::default_client();
-    let upstream_resp = client.get(&url).send().await.map_err(|e| {
+    let upstream_resp = send_upstream(client.get(&url)).await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
         (StatusCode::BAD_GATEWAY, "Failed to reach checksum database").into_response()
     })?;
@@ -391,13 +392,14 @@ async fn try_proxy_go_metadata(
             (&repo.upstream_url, &state.proxy_service)
         {
             if let Ok((content, content_type, content_encoding)) =
-                proxy_helpers::proxy_fetch_capped_encoded(
+                proxy_helpers::proxy_fetch_capped_encoded_with_format(
                     proxy,
                     repo.id,
                     &repo.key,
                     upstream_url,
                     upstream_path,
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    RepositoryFormat::Go,
                 )
                 .await
             {
@@ -492,16 +494,18 @@ async fn fetch_go_metadata_with_source(
     let proxy = state.proxy_service.as_ref()?;
     if repo.repo_type == RepositoryType::Remote {
         let upstream_url = repo.upstream_url.as_deref()?;
-        let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
-            proxy,
-            repo.id,
-            &repo.key,
-            upstream_url,
-            upstream_path,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-        )
-        .await
-        .ok()?;
+        let (content, _content_type, content_encoding) =
+            proxy_helpers::proxy_fetch_capped_encoded_with_format(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                RepositoryFormat::Go,
+            )
+            .await
+            .ok()?;
         return Some((repo.id, content, content_encoding));
     }
     if repo.repo_type == RepositoryType::Virtual {
@@ -520,13 +524,14 @@ async fn fetch_go_metadata_with_source(
                 continue;
             };
             if let Ok((content, _content_type, content_encoding)) =
-                proxy_helpers::proxy_fetch_capped_encoded(
+                proxy_helpers::proxy_fetch_capped_encoded_with_format(
                     proxy,
                     member.id,
                     &member.key,
                     upstream_url,
                     upstream_path,
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    RepositoryFormat::Go,
                 )
                 .await
             {
@@ -713,13 +718,14 @@ async fn go_version_exists_upstream(
         return false;
     };
     let upstream_path = build_go_upstream_path(module, version, "info");
-    proxy_helpers::proxy_fetch_capped(
+    proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         params.id,
         &params.key,
         upstream_url,
         &upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Go,
     )
     .await
     .is_ok()
@@ -935,23 +941,25 @@ async fn fetch_member_version_list(
 ) -> Option<String> {
     let proxy = state.proxy_service.as_ref()?;
     let upstream_url = member.upstream_url.as_deref()?;
-    let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
-        proxy,
-        member.id,
-        &member.key,
-        upstream_url,
-        upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-    )
-    .await
-    .map_err(|_| {
-        tracing::debug!(
-            member_key = %member.key,
-            module = %module,
-            "@v/list upstream fetch miss for virtual member; skipping it"
-        );
-    })
-    .ok()?;
+    let (content, _content_type, content_encoding) =
+        proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            RepositoryFormat::Go,
+        )
+        .await
+        .map_err(|_| {
+            tracing::debug!(
+                member_key = %member.key,
+                module = %module,
+                "@v/list upstream fetch miss for virtual member; skipping it"
+            );
+        })
+        .ok()?;
     let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())
         .map_err(|_| {
             tracing::warn!(
@@ -1147,13 +1155,14 @@ async fn get_mod_file(
                     // present (RFC 9110 §8.4, #3260).
                     let upstream_path = build_go_upstream_path(module, version, "mod");
                     let (content, content_type, content_encoding) =
-                        proxy_helpers::proxy_fetch_capped_encoded(
+                        proxy_helpers::proxy_fetch_capped_encoded_with_format(
                             proxy,
                             repo.id,
                             &repo.key,
                             upstream_url,
                             &upstream_path,
                             proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            RepositoryFormat::Go,
                         )
                         .await?;
                     return Ok(proxy_helpers::forward_verbatim_metadata(
@@ -1291,13 +1300,14 @@ async fn download_zip(
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
                     // upstream omits the header (review N2).
-                    let response = proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         &repo.key,
                         upstream_url,
                         &upstream_path,
                         "application/zip",
+                        RepositoryFormat::Go,
                     )
                     .await?;
                     // #3446: count the proxied module zip. The `.mod` and
@@ -3046,6 +3056,91 @@ mod tests {
                 counted(zip_path.clone()).await,
                 expected,
                 "#3446: proxied module zip download {expected} must be counted"
+            );
+        }
+    }
+
+    /// #4120. Every Remote Go fetch used to hand `cache_classifier::classify`
+    /// the `Generic` stand-in, which has no Go arm, so a module version's
+    /// `.info`/`.mod`/`.zip` (pinned by the checksum database, never changing
+    /// upstream) got the 5-minute mutable TTL and was revalidated against the
+    /// upstream proxy on every later request.
+    ///
+    /// The assertions read the TTL each fetch WROTE into its cache sidecar: a
+    /// classifier-level test passes with the bug intact, because the bug is
+    /// that the Go arm was never consulted. `@v/list` and `@latest` travel the
+    /// same helpers with the same format and are the mutable negative
+    /// controls, so a "cache every Go path forever" change fails here.
+    #[tokio::test]
+    async fn test_go_remote_proxy_cache_ttl_is_format_classified_4120() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+
+        let module = "example.com/pinned";
+        let version = "v1.4.0";
+        let info = format!("{module}/@v/{version}.info");
+        let mod_file = format!("{module}/@v/{version}.mod");
+        let zip = format!("{module}/@v/{version}.zip");
+        let list = format!("{module}/@v/list");
+        let latest = format!("{module}/@latest");
+        let info_json = format!(r#"{{"Version":"{version}","Time":"2024-01-02T03:04:05Z"}}"#);
+
+        let server = MockServer::start().await;
+        for (p, body) in [
+            (&info, info_json.clone().into_bytes()),
+            (&mod_file, b"module example.com/pinned\n".to_vec()),
+            (&zip, b"PK\x03\x04 pretend module zip".repeat(4)),
+            (&list, format!("{version}\n").into_bytes()),
+            (&latest, info_json.clone().into_bytes()),
+        ] {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+        }
+
+        let (state, dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        for p in [&info, &mod_file, &zip, &list, &latest] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/{p}", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "GET {p} must proxy 200 before its cache TTL means anything"
+            );
+            // Draining is what lets the streaming tee commit a sidecar to read.
+            let _ = body.len();
+        }
+
+        let mut ttls = Vec::new();
+        for p in [&info, &mod_file, &zip, &list, &latest] {
+            ttls.push(tdh::written_proxy_ttl_secs(dir.path(), &fx.repo_key, p).await);
+        }
+        fx.teardown().await;
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        for (p, ttl) in [&info, &mod_file, &zip].into_iter().zip(&ttls) {
+            assert!(
+                *ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+                "{p} names a module version the checksum database pins forever and \
+                 must be cached as such; got {ttl}s — {mutable}s is the #4120 symptom \
+                 (the Go handler handing the classifier a `Generic` format)"
+            );
+        }
+        for (p, ttl) in [&list, &latest].into_iter().zip(&ttls[3..]) {
+            assert!(
+                *ttl <= mutable,
+                "{p} resolves afresh upstream and must stay mutable, got {ttl}s — this \
+                 negative control keeps the immutable assertions from passing under a \
+                 'cache every Go path forever' change"
             );
         }
     }

@@ -28,6 +28,7 @@ pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod pacman;
 pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
@@ -141,6 +142,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
+        "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
         _ => None,
     }
 }
@@ -205,6 +207,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
+        RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
     }
 }
 
@@ -271,7 +274,9 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 
 /// Core handler keys whose Remote/Virtual download path enforces the inline
 /// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
-/// through `proxy_helpers::serve_scanned_proxy_file` (npm, PyPI, VS Code) or,
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Maven, npm,
+/// NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
+/// repositories, and `nuget` serves `chocolatey` and `powershell`) or,
 /// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
 ///
 /// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
@@ -280,8 +285,32 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// reads every format handler's source and fails when a handler reaches the
 /// gate without being listed here, or is listed without reaching it, so the
 /// capability cannot drift from the router. Adopting the gate in a new format
-/// (#4100 Maven, #4101 Cargo, #4102 NuGet, ...) adds its key here.
-pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &["npm", "oci", "pypi", "vscode"];
+/// adds its key here, and a row to the coverage table in
+/// `docs/security/scan-on-proxy.md` (#4114), which
+/// `scan_on_proxy_coverage_doc_matches_the_capability` keeps in step.
+///
+/// `enforced` is a per-FORMAT capability: the format's proxy path runs the
+/// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
+/// choice (`scan_configs.proxy_scan_action`: `fail_open` / `fail_closed` /
+/// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
+/// the formats API carries no mode indicator: under `record_only` an
+/// `enforced` format still scans and records every pull, and serves it.
+///
+/// It is also per handler, not per file type. Maven/sbt scan every proxied
+/// file except an allowlist of non-package files (POMs, `.xml` metadata,
+/// Gradle `.module`, checksums, signatures, and `-sources`/`-javadoc` jars,
+/// skipped by name). Only `.jar`/`.war`/`.ear` carry an identity pin, and
+/// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
+/// they are scanned as raw files, not unpacked (#4100). NuGet scans every
+/// proxied flat-container and V2 package file except the `.nuspec` manifest
+/// (#4102).
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "cargo", // #4101
+    "maven", // #4100 (also serves gradle)
+    "nuget", // #4102 (also serves chocolatey and powershell)
+    "sbt",   // #4100
+    "npm", "oci", "pypi", "vscode",
+];
 
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
 pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
@@ -354,6 +383,11 @@ fn core_handler_metadata(
         "bazel" => ("Bazel", "Bazel modules and rulesets", &[".tar.gz"]),
         "protobuf" => ("Protobuf", "Protocol Buffer schema registry", &[".proto"]),
         "incus" => ("Incus/LXC", "Incus and LXC container images", &[".tar.xz"]),
+        "pacman" => (
+            "Pacman",
+            "Arch Linux pacman packages",
+            &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.
         other => (other, "Compiled-in format handler", &[]),

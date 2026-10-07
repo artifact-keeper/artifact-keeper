@@ -39,6 +39,8 @@ pub enum AuditAction {
     ArtifactDownloaded,
     ArtifactDeleted,
     ArtifactMetadataUpdated,
+    /// A soft-deleted artifact was restored from the trash (#2072).
+    ArtifactRestored,
 
     // System operations
     BackupStarted,
@@ -169,6 +171,7 @@ impl AuditAction {
             AuditAction::ArtifactDownloaded => "ARTIFACT_DOWNLOADED",
             AuditAction::ArtifactDeleted => "ARTIFACT_DELETED",
             AuditAction::ArtifactMetadataUpdated => "ARTIFACT_METADATA_UPDATED",
+            AuditAction::ArtifactRestored => "ARTIFACT_RESTORED",
             AuditAction::BackupStarted => "BACKUP_STARTED",
             AuditAction::BackupCompleted => "BACKUP_COMPLETED",
             AuditAction::BackupFailed => "BACKUP_FAILED",
@@ -331,12 +334,28 @@ fn audit_detail_key_is_sensitive(key: &str) -> bool {
     )
 }
 
+/// Keys whose value is a repository upstream URL. Unlike a proxy URL the URL
+/// itself is useful audit context, so only its embedded userinfo is stripped
+/// (#4452), through the same helper the repository API renders it with.
+fn audit_detail_key_is_upstream_url(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "upstream_url" | "index_upstream_url"
+    )
+}
+
 fn redact_audit_detail_secrets(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 if audit_detail_key_is_sensitive(key) {
                     *child = serde_json::Value::String(AUDIT_REDACTED_VALUE.to_owned());
+                } else if let (true, serde_json::Value::String(url)) =
+                    (audit_detail_key_is_upstream_url(key), &*child)
+                {
+                    *child = serde_json::Value::String(
+                        crate::services::proxy_service::strip_url_userinfo(url).0,
+                    );
                 } else {
                     redact_audit_detail_secrets(child);
                 }
@@ -1228,6 +1247,7 @@ mod tests {
             AuditAction::ArtifactMetadataUpdated.as_str(),
             "ARTIFACT_METADATA_UPDATED"
         );
+        assert_eq!(AuditAction::ArtifactRestored.as_str(), "ARTIFACT_RESTORED");
     }
 
     #[test]
@@ -1409,6 +1429,29 @@ mod tests {
         assert_eq!(details["nested"]["Authorization"], AUDIT_REDACTED_VALUE);
         assert_eq!(details["nested"]["token_name"], "safe metadata");
         assert_eq!(details["items"][0]["client-secret"], AUDIT_REDACTED_VALUE);
+    }
+
+    #[test]
+    fn test_audit_entry_details_strips_upstream_url_userinfo() {
+        // #4452: an upstream URL keeps its host/path as audit context but
+        // never its embedded credentials, at any nesting depth.
+        let entry = AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .details(serde_json::json!({
+                "upstream_url": "https://alice:s3cret@registry.example.com/simple",
+                "repo": {"Index-Upstream-Url": "https://tok@index.example.com/"},
+                "upstream_url_count": 3
+            }));
+        let details = entry.details.unwrap();
+        assert_eq!(
+            details["upstream_url"],
+            "https://registry.example.com/simple"
+        );
+        assert_eq!(
+            details["repo"]["Index-Upstream-Url"],
+            "https://index.example.com/"
+        );
+        // A non-string value under a non-URL key is left alone.
+        assert_eq!(details["upstream_url_count"], 3);
     }
 
     #[test]

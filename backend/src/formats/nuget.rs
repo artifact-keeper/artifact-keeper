@@ -13,6 +13,68 @@ use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
 
+/// Read ceiling for the `.nuspec` entry of a `.nupkg`. Real manifests are a
+/// few KiB (release notes included); 4 MiB is far above any of them.
+const NUSPEC_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The `.nuspec` nuget.org serves inside Newtonsoft.Json 12.0.1 (MIT), with
+/// LF line endings. The real file also starts with a UTF-8 byte-order mark and
+/// uses CRLF; [`real_world_nuspec`] puts both back. Test fixture (#4102):
+/// every package `nuget pack` writes carries the XML declaration.
+#[cfg(test)]
+pub(crate) const NEWTONSOFT_JSON_12_0_1_NUSPEC: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata minClientVersion="2.12">
+    <id>Newtonsoft.Json</id>
+    <version>12.0.1</version>
+    <title>Json.NET</title>
+    <authors>James Newton-King</authors>
+    <owners>James Newton-King</owners>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <projectUrl>https://www.newtonsoft.com/json</projectUrl>
+    <iconUrl>https://www.newtonsoft.com/content/images/nugeticon.png</iconUrl>
+    <description>Json.NET is a popular high-performance JSON framework for .NET</description>
+    <copyright>Copyright © James Newton-King 2008</copyright>
+    <tags>json</tags>
+    <repository type="git" url="https://github.com/JamesNK/Newtonsoft.Json" commit="509643a8952ce731e0207710c429ad6e67dc43db" />
+    <dependencies>
+      <group targetFramework=".NETFramework2.0" />
+      <group targetFramework=".NETFramework3.5" />
+      <group targetFramework=".NETFramework4.0" />
+      <group targetFramework=".NETFramework4.5" />
+      <group targetFramework=".NETPortable0.0-Profile259" />
+      <group targetFramework=".NETPortable0.0-Profile328" />
+      <group targetFramework=".NETStandard1.0">
+        <dependency id="Microsoft.CSharp" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="NETStandard.Library" version="1.6.1" exclude="Build,Analyzers" />
+        <dependency id="System.ComponentModel.TypeConverter" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.Runtime.Serialization.Primitives" version="4.3.0" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework=".NETStandard1.3">
+        <dependency id="Microsoft.CSharp" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="NETStandard.Library" version="1.6.1" exclude="Build,Analyzers" />
+        <dependency id="System.ComponentModel.TypeConverter" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.Runtime.Serialization.Formatters" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.Runtime.Serialization.Primitives" version="4.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.Xml.XmlDocument" version="4.3.0" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework=".NETStandard2.0" />
+    </dependencies>
+  </metadata>
+</package>"#;
+
+/// [`NEWTONSOFT_JSON_12_0_1_NUSPEC`] exactly as it ships: BOM, declaration,
+/// CRLF line endings.
+#[cfg(test)]
+pub(crate) fn real_world_nuspec() -> String {
+    format!(
+        "\u{feff}{}",
+        NEWTONSOFT_JSON_12_0_1_NUSPEC.replace('\n', "\r\n")
+    )
+}
+
 /// NuGet format handler
 pub struct NugetHandler;
 
@@ -170,6 +232,54 @@ impl NugetHandler {
         id.to_lowercase()
     }
 
+    /// NuGet's normalized form of a version string, lowercased (#4102): what
+    /// `NuGetVersion.ToNormalizedString()` produces and the V3 flat container
+    /// addresses a package by. Build metadata (`+...`) is dropped, each numeric
+    /// part loses its leading zeros, a one- or two-part version is padded to
+    /// three, a fourth part is kept only when it is not zero, and the release
+    /// label is kept as is. So `1.0`, `1.00.0.0` and `1.0.0+abc` are all
+    /// `1.0.0`, and `1.0.0.1-Beta` is `1.0.0.1-beta`.
+    ///
+    /// `None` for anything that is not a NuGet version (no numeric part, more
+    /// than four of them, or an empty label). Callers comparing two versions
+    /// fall back to plain equality then.
+    pub fn normalized_version(version: &str) -> Option<String> {
+        let version = version.trim();
+        let version = version.split_once('+').map_or(version, |(v, _)| v);
+        let (numbers, label) = match version.split_once('-') {
+            Some((numbers, label)) => (numbers, Some(label)),
+            None => (version, None),
+        };
+        let mut parts = Vec::with_capacity(4);
+        for part in numbers.split('.') {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            parts.push(part.parse::<u64>().ok()?);
+        }
+        if parts.is_empty() || parts.len() > 4 {
+            return None;
+        }
+        parts.resize(parts.len().max(3), 0);
+        if parts.len() == 4 && parts[3] == 0 {
+            parts.pop();
+        }
+        let mut out = parts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        match label {
+            Some("") => return None,
+            Some(label) => {
+                out.push('-');
+                out.push_str(label);
+            }
+            None => {}
+        }
+        Some(out.to_ascii_lowercase())
+    }
+
     /// Extract nuspec from nupkg file
     pub fn extract_nuspec(content: &[u8]) -> Result<NuSpec> {
         let cursor = std::io::Cursor::new(content);
@@ -184,9 +294,19 @@ impl NugetHandler {
             let name = file.name().to_string();
 
             if name.ends_with(".nuspec") {
+                // Bounded (#4102): the proxy scan gate parses UPSTREAM bytes
+                // here, so a nuspec entry that inflates without limit must
+                // not be read into memory whole.
                 let mut content = String::new();
-                file.read_to_string(&mut content)
+                file.by_ref()
+                    .take(NUSPEC_MAX_BYTES + 1)
+                    .read_to_string(&mut content)
                     .map_err(|e| AppError::Validation(format!("Failed to read nuspec: {}", e)))?;
+                if content.len() as u64 > NUSPEC_MAX_BYTES {
+                    return Err(AppError::Validation(
+                        "nuspec exceeds the size limit".to_string(),
+                    ));
+                }
 
                 return Self::parse_nuspec(&content);
             }
@@ -198,16 +318,17 @@ impl NugetHandler {
     }
 
     /// Parse nuspec XML content
+    ///
+    /// The deserializer skips the `<?xml ...?>` declaration itself; only what
+    /// may precede the first `<` (a UTF-8 byte-order mark, whitespace) is cut.
+    /// This used to strip the declaration by searching a TRIMMED copy and
+    /// slicing the ORIGINAL at that offset, which handed the parser
+    /// `?>\r\n<package ...` for every `.nuspec` that carries a declaration,
+    /// i.e. every one `nuget pack` / `dotnet pack` writes. Every real
+    /// package then failed to parse: the proxy scan gate could not establish
+    /// its identity (#4102) and hosted scans lost their pin (#3603).
     pub fn parse_nuspec(content: &str) -> Result<NuSpec> {
-        // Remove XML declaration if present for easier parsing
-        let content = content
-            .trim_start_matches(|c: char| c != '<')
-            .trim_start_matches("<?xml")
-            .find('<')
-            .map(|i| &content[i..])
-            .unwrap_or(content);
-
-        // Handle namespace prefixes by trying different approaches
+        let content = content.trim_start_matches(|c: char| c != '<');
         from_str(content).map_err(|e| AppError::Validation(format!("Invalid nuspec XML: {}", e)))
     }
 }
@@ -558,6 +679,96 @@ mod tests {
     #[test]
     fn test_normalize_id_empty() {
         assert_eq!(NugetHandler::normalize_id(""), "");
+    }
+
+    // ---- parse_nuspec: XML declaration, BOM, CRLF (#4102) ----
+
+    #[test]
+    fn test_parse_nuspec_with_declaration_bom_and_crlf() {
+        let body = "<package><metadata><id>Widget</id><version>1.0.0</version>\
+                    <authors>a</authors><description>d</description></metadata></package>";
+        let declared = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n{body}");
+        for (what, xml) in [
+            ("no declaration", body.to_string()),
+            ("declaration + CRLF", declared.clone()),
+            ("BOM + declaration + CRLF", format!("\u{feff}{declared}")),
+            ("BOM, no declaration", format!("\u{feff}{body}")),
+            ("leading whitespace", format!("\r\n  {declared}")),
+        ] {
+            let spec = NugetHandler::parse_nuspec(&xml).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(spec.metadata.id, "Widget", "{what}");
+            assert_eq!(spec.metadata.version, "1.0.0", "{what}");
+        }
+    }
+
+    /// The real Newtonsoft.Json 12.0.1 manifest, as nuget.org serves it, read
+    /// from a `.nupkg` the way the scan gate and the hosted pin read it.
+    #[test]
+    fn test_extract_nuspec_reads_a_real_world_manifest() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "Newtonsoft.Json.nuspec",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(real_world_nuspec().as_bytes()).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let spec = NugetHandler::extract_nuspec(&bytes).expect("a real nuspec parses");
+        assert_eq!(spec.metadata.id, "Newtonsoft.Json");
+        assert_eq!(spec.metadata.version, "12.0.1");
+        let groups = &spec.metadata.dependencies.as_ref().unwrap().groups;
+        assert_eq!(groups.len(), 9);
+    }
+
+    // ---- normalized_version (#4102) ----
+
+    #[test]
+    fn test_normalized_version() {
+        for (raw, normalized) in [
+            ("1.0.0", "1.0.0"),
+            ("1.0", "1.0.0"),
+            ("1", "1.0.0"),
+            ("1.00.0.0", "1.0.0"),
+            ("01.2.3", "1.2.3"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("1.2.3.0", "1.2.3"),
+            ("1.0.0+abc", "1.0.0"),
+            ("1.0.0-Beta.1+sha.5", "1.0.0-beta.1"),
+            ("1.0-RC-2", "1.0.0-rc-2"),
+            (" 12.0.1 ", "12.0.1"),
+        ] {
+            assert_eq!(
+                NugetHandler::normalized_version(raw).as_deref(),
+                Some(normalized),
+                "{raw}"
+            );
+        }
+        for invalid in [
+            "",
+            "abc",
+            "1.x",
+            "1.2.3.4.5",
+            "1..2",
+            "1.0-",
+            "-beta",
+            "+meta",
+        ] {
+            assert_eq!(NugetHandler::normalized_version(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_extract_nuspec_refuses_an_oversized_manifest() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("big.nuspec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let filler = vec![b' '; (NUSPEC_MAX_BYTES + 1) as usize];
+        zip.write_all(&filler).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let err = NugetHandler::extract_nuspec(&bytes).unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
     }
 
     // ---- parse_nupkg_filename ----

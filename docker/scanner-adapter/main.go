@@ -19,6 +19,45 @@ func main() {
 	cfg := LoadConfig()
 	srv := NewServer(cfg)
 
+	if cfg.TrivyServer != "" {
+		// Client mode: the vulnerability DB and the matching live on the trivy
+		// server, so no local DB is downloaded. startClientMode validates the
+		// settings and probes the bundled CLI (always, even with a pinned
+		// SCANNER_SCANNER_VERSION); readiness is then re-checked against the
+		// server on /probe/ready (cached briefly; see remote.go).
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := srv.startClientMode(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("trivy client mode not started (staying not-ready): %v", err)
+		} else {
+			log.Printf("trivy client mode: server %s holds the vuln DB; readiness follows it (trivy=%s)", redactURL(cfg.TrivyServer), cfg.ClientVersion)
+			if cfg.CachePartition != "" {
+				log.Printf("trivy analysis cache partitioned (%s)", cachePartitionDir(cfg.CachePartition))
+			}
+		}
+	} else {
+		startStandalone(srv, cfg)
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go srv.jobs.RunSweeper(stop)
+
+	server := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Printf("scanner-adapter listening on %s (trivy=%s)", cfg.Addr, cfg.TrivyPath)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+// startStandalone is the standalone-mode startup: probe the trivy version
+// (unless pinned), download the vuln DB, and mark ready only once it is present.
+func startStandalone(srv *Server, cfg *Config) {
 	// Probe the trivy version at startup (unless pinned via env). A failed probe
 	// leaves the adapter not-ready so the backend does not dispatch scans to an
 	// adapter whose trivy binary is missing/broken.
@@ -56,19 +95,5 @@ func main() {
 		} else {
 			log.Printf("trivy vuln DB not present in %s (staying not-ready)", cfg.CacheDir)
 		}
-	}
-
-	stop := make(chan struct{})
-	defer close(stop)
-	go srv.jobs.RunSweeper(stop)
-
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	log.Printf("scanner-adapter listening on %s (trivy=%s)", cfg.Addr, cfg.TrivyPath)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
 	}
 }

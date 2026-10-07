@@ -18,6 +18,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
+use crate::services::audit_export::details as audit_details;
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::policy_service::PolicyService;
 use crate::services::proxy_catalog;
 use crate::services::proxy_scan_service::ProxyScanService;
@@ -222,6 +224,11 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
 /// `scan_findings.severity` values every writer normalizes to.
 pub(crate) const KNOWN_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 
+/// Canonical finding-class vocabulary for the findings filter (#3013),
+/// matching the `scan_findings.finding_class` CHECK (migration 260) and
+/// [`crate::models::security::FindingClass::as_str`].
+pub(crate) const KNOWN_FINDING_CLASSES: &[&str] = &["vulnerability", "malicious", "policy"];
+
 /// Longest accepted value for the free-text findings filters (`source`,
 /// `cve_id`). Both columns are `VARCHAR(100)`, so anything longer cannot match
 /// a stored row and is rejected rather than run as a guaranteed-empty query.
@@ -327,6 +334,16 @@ pub struct ScanResponse {
     /// Why the scan is not `complete`, when known (e.g. which scanner
     /// cataloged nothing). `None` for complete scans.
     pub scan_completeness_reason: Option<String>,
+    /// Vulnerability database the scan ran against (#3014), distinct from
+    /// `scanner_version` (the binary): e.g. `trivy-db-v2`, `grype-db-v6.1.10`,
+    /// or `live:osv` / `live:osv+ghsa` for the dependency scanner, which
+    /// queries live advisory APIs. `null` when the scan type has no database
+    /// or the scan predates this field. A reused scan reports its source's.
+    #[schema(example = "grype-db-v6.1.10")]
+    pub vuln_db_version: Option<String>,
+    /// When that database was built / last updated (#3014); for a live-API
+    /// scanner, the query time. `null` means unknown, never fresh.
+    pub vuln_db_published_at: Option<chrono::DateTime<chrono::Utc>>,
     /// #2471: number of `not_applicable` scanner rows folded into this row.
     /// `Some(n)` marks a synthetic *summary* row that collapses `n` redundant
     /// "this scanner does not apply" results (e.g. the image-family scanners
@@ -391,6 +408,8 @@ impl ScanResponse {
             source_scan_id: s.source_scan_id,
             scan_completeness: s.scan_completeness,
             scan_completeness_reason: s.scan_completeness_reason,
+            vuln_db_version: s.vuln_db_version,
+            vuln_db_published_at: s.vuln_db_published_at,
             collapsed_not_applicable_count: None,
             collapsed_scan_types: None,
         }
@@ -491,6 +510,7 @@ impl From<crate::models::security::ScanFinding> for FindingResponse {
             acknowledged_reason: f.acknowledged_reason,
             acknowledged_at: f.acknowledged_at,
             created_at: f.created_at,
+            finding_class: f.finding_class,
         }
     }
 }
@@ -604,24 +624,29 @@ pub struct ListFindingsQuery {
     /// Matched exactly against `scan_findings.cve_id`.
     #[param(example = "CVE-2024-3094")]
     pub cve_id: Option<String>,
+    /// Restrict the listing to one finding class (#3013): `vulnerability`,
+    /// `malicious` or `policy`. Validated against [`KNOWN_FINDING_CLASSES`];
+    /// an unrecognized token is a `400`.
+    #[param(example = "malicious")]
+    pub finding_class: Option<String>,
     pub page: Option<i64>,
     pub per_page: Option<i64>,
 }
 
-/// The filters [`ListFindingsQuery`] contributes to the findings listing,
-/// validated.
-struct FindingFilters<'a> {
-    severity: Option<&'a str>,
-    source: Option<&'a str>,
-    cve_id: Option<&'a str>,
-}
-
 impl ListFindingsQuery {
-    fn validated_filters(&self) -> Result<FindingFilters<'_>> {
-        Ok(FindingFilters {
+    /// The filters this query contributes to the findings listing, validated.
+    fn validated_filters(
+        &self,
+    ) -> Result<crate::services::scan_result_service::FindingListFilter<'_>> {
+        Ok(crate::services::scan_result_service::FindingListFilter {
             severity: validate_enum_filter(self.severity.as_ref(), KNOWN_SEVERITIES, "severity")?,
             source: validate_text_filter(self.source.as_ref(), "source")?,
             cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id")?,
+            finding_class: validate_enum_filter(
+                self.finding_class.as_ref(),
+                KNOWN_FINDING_CLASSES,
+                "finding_class",
+            )?,
         })
     }
 }
@@ -651,6 +676,11 @@ pub struct FindingResponse {
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// What kind of finding this is (#3013): `vulnerability` (a known
+    /// weakness), `malicious` (the package itself is known to be hostile,
+    /// e.g. an OSV `MAL-*` advisory) or `policy` (a compliance rule failure).
+    #[schema(example = "vulnerability")]
+    pub finding_class: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -757,16 +787,20 @@ pub struct ScanConfigResponse {
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
     /// Opt-in that makes `severity_threshold` enforced on the proxy/OCI
-    /// inline scan gate (#3243/#3246). When false (default), the gate blocks
-    /// on any finding above `info`. Hosted-artifact blocking remains
-    /// configured via scan policies.
+    /// inline scan gate (#3243/#3246). `false` (the default) does NOT mean
+    /// "don't block": the threshold is off and the gate blocks on ANY finding
+    /// above `info`. The non-blocking mode is `proxy_scan_action =
+    /// record_only`. Hosted-artifact blocking remains configured via scan
+    /// policies.
     pub block_on_policy_violation: bool,
     /// Severity floor for the inline proxy scan gate; live only when
     /// `block_on_policy_violation` is set (#3243/#3246). Findings at or above
     /// it block the pull.
     pub severity_threshold: String,
-    /// #2954: fail-open (default) / fail-closed action for the inline proxy
-    /// scan-on-fetch.
+    /// Inline proxy scan-on-fetch action: `fail_open` (default) /
+    /// `fail_closed` (#2954) / `record_only` (#3645: findings, verdicts and
+    /// SBOM data are recorded but no pull is ever blocked; overrides
+    /// `block_on_policy_violation` / `severity_threshold`).
     pub proxy_scan_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -1157,14 +1191,7 @@ async fn list_findings(
     let offset = (page - 1) * per_page;
 
     let (findings, total) = svc
-        .list_findings(
-            scan_id,
-            filters.severity,
-            filters.source,
-            filters.cve_id,
-            offset,
-            per_page,
-        )
+        .list_findings(scan_id, &filters, offset, per_page)
         .await?;
 
     let items: Vec<FindingResponse> = findings.into_iter().map(FindingResponse::from).collect();
@@ -1299,8 +1326,12 @@ fn build_external_findings(
                     "Every finding requires a non-empty title".to_string(),
                 ));
             }
+            // #3013: an external `MAL-*` id is a malicious package, classed
+            // (and graded) exactly as the dependency scanner classes one.
+            let finding_class =
+                crate::models::security::FindingClass::from_advisory_ids(f.cve_id.as_deref());
             Ok(RawFinding {
-                severity: Severity::from_scanner_token(&f.severity),
+                severity: finding_class.graded_severity(Severity::from_scanner_token(&f.severity)),
                 title,
                 description: f.description,
                 cve_id: f.cve_id,
@@ -1309,6 +1340,7 @@ fn build_external_findings(
                 fixed_version: f.fixed_version,
                 source: Some(f.source.unwrap_or_else(|| scanner.to_string())),
                 source_url: f.source_url,
+                finding_class,
             })
         })
         .collect()
@@ -1732,12 +1764,110 @@ async fn update_repo_security(
     // fail-closed gate as the configuration subresources fixed in #2745
     // (#2603 sibling, #2750).
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
-    let repo = repo.id;
-
     let svc = ScanConfigService::new(state.db.clone());
-    let c = svc.upsert_config(repo, &body).await?;
+    // #3645: the previous row is read in the same transaction as the write,
+    // so the audited "before" is exactly what this write replaced.
+    let write = svc.upsert_config_with_previous(repo.id, &body).await?;
 
-    Ok(Json(ScanConfigResponse::from(c)))
+    // Every change to the scan configuration is an enforcement change
+    // (scanning on/off, threshold, block_on_policy_violation, or the proxy
+    // scan action, where `record_only` turns proxy-scan blocking off), so each
+    // one is audited with both states. A no-op write is not.
+    if let Some(entry) = scan_config_change_audit(&auth, &repo, &write) {
+        if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+            tracing::warn!(
+                repo = %repo.key, error = %e,
+                "failed to record the scan-config change audit entry"
+            );
+        }
+    }
+
+    Ok(Json(ScanConfigResponse::from(write.current)))
+}
+
+/// The audit view of one scan configuration.
+fn scan_config_audit_state(
+    c: &crate::services::scan_config_service::MergedScanConfig,
+) -> audit_details::ScanConfigAuditState {
+    audit_details::ScanConfigAuditState {
+        scan_enabled: c.scan_enabled,
+        scan_on_upload: c.scan_on_upload,
+        scan_on_proxy: c.scan_on_proxy,
+        block_on_policy_violation: c.block_on_policy_violation,
+        severity_threshold: c.severity_threshold.clone(),
+        proxy_scan_action: c.proxy_scan_action.clone(),
+    }
+}
+
+/// Names of the scan-config fields that differ between two states.
+fn scan_config_changed_fields(
+    a: &crate::services::scan_config_service::MergedScanConfig,
+    b: &crate::services::scan_config_service::MergedScanConfig,
+) -> Vec<String> {
+    [
+        ("scan_enabled", a.scan_enabled != b.scan_enabled),
+        ("scan_on_upload", a.scan_on_upload != b.scan_on_upload),
+        ("scan_on_proxy", a.scan_on_proxy != b.scan_on_proxy),
+        (
+            "block_on_policy_violation",
+            a.block_on_policy_violation != b.block_on_policy_violation,
+        ),
+        (
+            "severity_threshold",
+            a.severity_threshold != b.severity_threshold,
+        ),
+        (
+            "proxy_scan_action",
+            a.proxy_scan_action != b.proxy_scan_action,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, changed)| *changed)
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
+/// The `REPOSITORY_UPDATED` audit entry for a scan-config write that changed
+/// anything (#3645), or `None` for a no-op write. A repository with no prior
+/// row is compared against the effective defaults it ran on.
+fn scan_config_change_audit(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    write: &crate::services::scan_config_service::ScanConfigWrite,
+) -> Option<AuditEntry> {
+    use crate::services::scan_config_service::MergedScanConfig;
+    let before = write
+        .previous
+        .as_ref()
+        .map(MergedScanConfig::of)
+        .unwrap_or_else(MergedScanConfig::defaults);
+    let after = MergedScanConfig::of(&write.current);
+    let changed = scan_config_changed_fields(&before, &after);
+    if changed.is_empty() {
+        return None;
+    }
+    Some(
+        AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(crate::services::repository_service::derive_format_key(
+                    &repo.format,
+                )),
+                visibility: Some(repo.visibility.as_str().to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+                age_gate_mode: None,
+                scan_config: Some(scan_config_audit_state(&after)),
+                previous_scan_config: Some(scan_config_audit_state(&before)),
+                scan_config_changed: Some(changed),
+            }),
+    )
 }
 
 #[utoipa::path(
@@ -2022,8 +2152,10 @@ pub struct ProxyScansResponse {
     /// scanning on it means pulls are blocked; with scanning off it means the
     /// artifact is served anyway and the verdict was recorded elsewhere.
     pub scan_on_proxy: bool,
-    /// `fail_open` | `fail_closed`. Lets `not_scanned` be read as "may have
-    /// been served unscanned" versus "was withheld".
+    /// `fail_open` | `fail_closed` | `record_only`. Lets `not_scanned` be
+    /// read as "may have been served unscanned" versus "was withheld"; under
+    /// `record_only` (#3645) a `vulnerable` item was recorded and still
+    /// served.
     pub proxy_scan_action: String,
     /// Omitted for a single-path (`?path=`) read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4906,6 +5038,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3645: `proxy_scan_action = record_only` round-trips through the
+    /// repository security API (case-insensitively, and survives a partial
+    /// PUT that omits it), resolves to the never-blocking gate, a malformed
+    /// action is a 400 that writes nothing, and EVERY scan-config change --
+    /// and only a change -- is audited with the before and after states.
+    #[tokio::test]
+    async fn record_only_proxy_scan_action_round_trips_and_is_audited_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let put = |body: UpsertScanConfigRequest| {
+            update_repo_security(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path(key.clone()),
+                Json(body),
+            )
+        };
+
+        // Opt in to record-only, with the #3868 reporter's threshold knobs.
+        let Json(resp) = put(UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            scan_on_proxy: Some(true),
+            block_on_policy_violation: Some(false),
+            severity_threshold: Some("critical".into()),
+            proxy_scan_action: Some(" RECORD_ONLY ".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("PUT record_only");
+        assert_eq!(resp.proxy_scan_action, "record_only");
+
+        let svc = ScanConfigService::new(pool.clone());
+        assert_eq!(
+            svc.proxy_scan_action(repo_id).await.unwrap(),
+            ProxyScanAction::RecordOnly
+        );
+        assert_eq!(
+            svc.proxy_severity_gate(repo_id).await.unwrap(),
+            ProxySeverityGate::RecordOnly,
+            "record_only overrides the threshold knobs"
+        );
+
+        // A malformed action is rejected and writes nothing.
+        let bad = put(UpsertScanConfigRequest {
+            proxy_scan_action: Some("fail-closed".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            matches!(bad, Err(AppError::Validation(_))),
+            "a hyphenated action must be a 400, got {bad:?}"
+        );
+
+        // A partial PUT that omits the action keeps it (threshold change).
+        let Json(resp) = put(UpsertScanConfigRequest {
+            severity_threshold: Some("high".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("partial PUT");
+        assert_eq!(resp.proxy_scan_action, "record_only");
+
+        // A no-op write is not audited.
+        let _no_op = put(UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("no-op PUT");
+
+        // Back to enforcement.
+        let Json(resp) = put(UpsertScanConfigRequest {
+            proxy_scan_action: Some("fail_closed".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("PUT fail_closed");
+        assert_eq!(resp.proxy_scan_action, "fail_closed");
+        assert_eq!(
+            svc.proxy_severity_gate(repo_id).await.unwrap(),
+            ProxySeverityGate::BlockOnAny
+        );
+
+        let rows = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT details->'previous_scan_config'->>'proxy_scan_action', \
+                    details->'scan_config'->>'proxy_scan_action', \
+                    details->>'scan_config_changed' \
+             FROM audit_log WHERE resource_id = $1 AND action = 'REPOSITORY_UPDATED' \
+             ORDER BY created_at, id",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read audit_log");
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let s = |v: &str| Some(v.to_string());
+        let changed = |names: &[&str]| Some(serde_json::json!(names).to_string());
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(a, b, c)| {
+                let c = c.map(|c| {
+                    serde_json::from_str::<serde_json::Value>(&c)
+                        .unwrap()
+                        .to_string()
+                });
+                (a, b, c)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    s("fail_open"),
+                    s("record_only"),
+                    changed(&[
+                        "scan_enabled",
+                        "scan_on_proxy",
+                        "severity_threshold",
+                        "proxy_scan_action"
+                    ])
+                ),
+                (
+                    s("record_only"),
+                    s("record_only"),
+                    changed(&["severity_threshold"])
+                ),
+                (
+                    s("record_only"),
+                    s("fail_closed"),
+                    changed(&["proxy_scan_action"])
+                ),
+            ],
+            "every change -- and only a change -- is audited with both states"
+        );
+    }
+
     /// Admin gate on the GLOBAL security-policy write handlers. The global
     /// /api/v1/security/policies write endpoints must be admin-only, matching
     /// every sibling governance endpoint; otherwise any authenticated user can
@@ -5155,6 +5438,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         }
     }
 
@@ -5180,6 +5465,50 @@ mod tests {
         assert_eq!(resp.error_message, None);
         assert_eq!(resp.artifact_name, Some("my-artifact".to_string()));
         assert_eq!(resp.artifact_version, Some("1.0.0".to_string()));
+        assert_eq!(resp.vuln_db_version, None);
+    }
+
+    /// #3014: the vulnerability-DB provenance reaches the scan API.
+    #[test]
+    fn test_scan_response_carries_vuln_db_provenance() {
+        let built = chrono::Utc::now();
+        let scan = ScanResult {
+            vuln_db_version: Some("trivy-db-v2".to_string()),
+            vuln_db_published_at: Some(built),
+            ..make_scan_result()
+        };
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(resp.vuln_db_version.as_deref(), Some("trivy-db-v2"));
+        assert_eq!(resp.vuln_db_published_at, Some(built));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["vuln_db_version"], "trivy-db-v2");
+    }
+
+    /// #3013: the persisted class reaches the findings API.
+    #[test]
+    fn test_finding_response_carries_finding_class() {
+        let finding = crate::models::security::ScanFinding {
+            id: Uuid::new_v4(),
+            scan_result_id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            severity: "medium".to_string(),
+            title: "Malicious code in evil-pkg (PyPI)".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: Some("evil-pkg".to_string()),
+            affected_version: Some("1.0.0".to_string()),
+            fixed_version: None,
+            source: Some("osv".to_string()),
+            source_url: None,
+            is_acknowledged: false,
+            acknowledged_by: None,
+            acknowledged_reason: None,
+            acknowledged_at: None,
+            created_at: chrono::Utc::now(),
+            finding_class: "malicious".to_string(),
+        };
+        let json = serde_json::to_value(FindingResponse::from(finding)).unwrap();
+        assert_eq!(json["finding_class"], "malicious");
     }
 
     #[test]
@@ -5205,6 +5534,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.artifact_name, None);
@@ -5241,6 +5572,8 @@ mod tests {
             source_scan_id: None,
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, Some("lib".to_string()), None);
         assert_eq!(resp.findings_count, 100);
@@ -5275,6 +5608,8 @@ mod tests {
             source_scan_id: Some(source_id),
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, Some("artifact".into()), None);
         assert!(resp.is_reused);
@@ -5315,6 +5650,8 @@ mod tests {
             source_scan_id: Some(source_id),
             scan_completeness: "complete".to_string(),
             scan_completeness_reason: None,
+            vuln_db_version: None,
+            vuln_db_published_at: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(
@@ -6418,6 +6755,7 @@ mod tests {
             acknowledged_reason: None,
             acknowledged_at: None,
             created_at: now,
+            finding_class: "vulnerability".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["severity"], "critical");
@@ -6449,6 +6787,7 @@ mod tests {
             acknowledged_reason: Some("False positive".to_string()),
             acknowledged_at: Some(now),
             created_at: now,
+            finding_class: "vulnerability".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["is_acknowledged"], true);
@@ -7002,6 +7341,36 @@ mod tests {
         let findings = ListFindingsQuery::default();
         let f = findings.validated_filters().unwrap();
         assert!(f.severity.is_none() && f.source.is_none() && f.cve_id.is_none());
+        assert!(f.finding_class.is_none());
+    }
+
+    /// #3013: the `finding_class` filter is a closed vocabulary that matches
+    /// the DB CHECK exactly; a typo is a 400, never an unfiltered page.
+    #[test]
+    fn test_finding_class_filter_accepts_vocabulary_and_rejects_typos() {
+        assert_eq!(
+            KNOWN_FINDING_CLASSES,
+            crate::models::security::FindingClass::ALL
+                .map(crate::models::security::FindingClass::as_str)
+                .as_slice()
+        );
+        for class in KNOWN_FINDING_CLASSES {
+            let q = ListFindingsQuery {
+                finding_class: Some(class.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(q.validated_filters().unwrap().finding_class, Some(*class));
+        }
+        for bad in ["Malicious", "malware", ""] {
+            let q = ListFindingsQuery {
+                finding_class: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(q.validated_filters(), Err(AppError::Validation(_))),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -7211,6 +7580,30 @@ mod tests {
     // #3411: external findings ingestion.
     // -----------------------------------------------------------------------
 
+    /// #3013: an externally submitted `MAL-*` finding is classed and graded
+    /// like the dependency scanner's: malicious, Critical.
+    #[test]
+    fn test_external_mal_finding_is_malicious_and_critical() {
+        use crate::models::security::{FindingClass, Severity};
+        let input = |cve: &str| ExternalFindingInput {
+            severity: "low".to_string(),
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        };
+        let out = build_external_findings("acme", vec![input("MAL-2025-7"), input("CVE-2024-1")])
+            .expect("valid findings");
+        assert_eq!(out[0].finding_class, FindingClass::Malicious);
+        assert_eq!(out[0].severity, Severity::Critical);
+        assert_eq!(out[1].finding_class, FindingClass::Vulnerability);
+        assert_eq!(out[1].severity, Severity::Low);
+    }
+
     #[test]
     fn test_external_severity_normalization_fails_closed() {
         use crate::models::security::Severity;
@@ -7286,6 +7679,7 @@ mod tests {
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let counts = tally_severities(&[
             f(Severity::Critical),

@@ -219,6 +219,18 @@ FAKE_LABELS="ci:fullish,xci:image" expect_kv "labels match exactly" "ci_full=fal
 FAKE_LABELS_FAIL=1 PR_LABELS="ci:image,ci:full" \
   expect_kv "live label read fails -> the payload's labels" "ci_full=true ci_image=true" pull_request backend/src/main.rs
 
+echo "ci.yml changes gate: the scanner adapter's Go job (scanner_adapter, #4437)"
+expect_kv "adapter Go source"                          "scanner_adapter=true"  pull_request docker/scanner-adapter/scan.go
+expect_kv "adapter Dockerfile"                         "scanner_adapter=true"  pull_request docker/Dockerfile.scanner-adapter
+expect_kv "ci.yml itself exercises the Go job"         "scanner_adapter=true"  pull_request .github/workflows/ci.yml
+expect_kv "adapter README is docs"                     "scanner_adapter=false code=false" pull_request docker/scanner-adapter/README.md
+expect_kv "backend code: no Go job"                    "scanner_adapter=false" pull_request backend/src/main.rs
+expect_kv "another Dockerfile: no Go job"              "scanner_adapter=false" pull_request docker/Dockerfile.backend
+FAKE_GH_FAIL=1 expect_kv "file listing fails -> Go job runs" "scanner_adapter=true" pull_request whatever
+expect_kv "merge group, adapter source"                "scanner_adapter=true"  merge_group docker/scanner-adapter/server.go
+expect_kv "merge group, docs only"                     "scanner_adapter=false" merge_group docs/guide.md
+expect_kv "workflow_dispatch runs the Go job"          "scanner_adapter=true"  workflow_dispatch
+
 echo "ci.yml changes gate: merge groups (classified from base..head)"
 #                                                   code  backend manifest rust
 expect "merge group, docs only"                    "false false false false" merge_group README.md docs/guide.md
@@ -330,6 +342,14 @@ complete "merge group, a failed Backend Unit Tests -> fails"        1 merge_grou
 complete "merge group, a skipped Check Rust with Rust inputs -> fails" 1 merge_group true true true "${NOPIN[@]}" RESULT_CHECK_RUST=skipped
 complete "merge group, docs-only group -> passes"                   0 merge_group false false false "${NOPIN[@]}" "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
 complete "PR, a skipped version-pin gate still fails"               1 pull_request true true true RESULT_VERSION_PIN=skipped
+
+echo "ci.yml CI Complete: the scanner adapter's Go job (#4437)"
+complete "PR, no adapter input: Go job skipped -> passes"           0 pull_request true true true SCANNER_ADAPTER_CHANGED=false RESULT_SCANNER_ADAPTER=skipped
+complete "PR, adapter changed: Go job skipped -> fails"             1 pull_request true true true SCANNER_ADAPTER_CHANGED=true RESULT_SCANNER_ADAPTER=skipped
+complete "PR, gate output missing: Go job skipped -> fails"         1 pull_request true true true SCANNER_ADAPTER_CHANGED= RESULT_SCANNER_ADAPTER=skipped
+complete "PR, adapter changed: Go job red -> fails"                 1 pull_request true true true SCANNER_ADAPTER_CHANGED=true RESULT_SCANNER_ADAPTER=failure
+complete "PR, no adapter input, yet Go job red -> fails"            1 pull_request true true true SCANNER_ADAPTER_CHANGED=false RESULT_SCANNER_ADAPTER=failure
+complete "PR, adapter changed: Go job green -> passes"              0 pull_request true true true SCANNER_ADAPTER_CHANGED=true
 # The image jobs are not inputs any more: a red image result cannot reach it.
 if grep -q 'RESULT_SMOKE\|RESULT_BUILD_BACKEND\|RESULT_BUILD_OPENSCAP' "$WORK/results.txt"; then
   fail "CI Complete still reads an image-job result: $(tr '\n' ' ' < "$WORK/results.txt")"

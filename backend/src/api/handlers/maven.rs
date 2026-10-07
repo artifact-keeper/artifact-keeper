@@ -1028,6 +1028,519 @@ async fn resolve_maven_sha1_sidecar(
     parse_maven_sha1_sidecar(&content)
 }
 
+/// Stream one proxied Maven file from a Remote repository's upstream through
+/// the proxy cache (the unscanned serve; the caller records the download).
+///
+/// #895: large bodies stream; `content_type_for_path` gives `.pom` ->
+/// `text/xml`, `.jar` -> `application/java-archive` when upstream omits
+/// Content-Type (closes review N2).
+///
+/// GHSA-qxv7-p3mq-88fv: when the upstream's `.sha1` sidecar for a package
+/// asset resolves, the proxy-cache commit is gated on it — a body whose SHA-1
+/// disagrees with the sidecar is streamed to the client (which verifies it)
+/// but never cached. No sidecar -> the unverified fetch, exactly as before.
+///
+/// #3982: the sidecar resolution is DEFERRED, not awaited before the content
+/// fetch starts. The two used to run as sequential proxy-cache round-trips on
+/// EVERY GET — on network-attached storage (NFS) that roughly doubled
+/// warm-cache latency. The digest is only needed by the final
+/// verify-and-commit step, so the content fetch starts immediately: a warm
+/// hit never resolves the sidecar at all (one round-trip total) and a cold
+/// miss overlaps the sidecar with the body stream, deciding the cache commit
+/// on both results exactly as before.
+///
+/// #3459: the Maven format is carried so a released coordinate caches
+/// immutably (`proxy_fetch_streaming` would synthesize a `Generic`
+/// repository, which has no classifier arm). `Maven` also classifies a
+/// `gradle`-format repository correctly — both share
+/// `cache_classifier::classify_maven`.
+async fn maven_remote_stream(
+    proxy: &Arc<crate::services::proxy_service::ProxyService>,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<Response, Response> {
+    if maven_sha1_sidecar_gate_applies(path) {
+        let proxy_for_sidecar = Arc::clone(proxy);
+        let sidecar_repo_key = repo_key.to_string();
+        let sidecar_upstream = upstream_url.to_string();
+        let sidecar_path = path.to_string();
+        let digest = async move {
+            resolve_maven_sha1_sidecar(
+                &proxy_for_sidecar,
+                repo_id,
+                &sidecar_repo_key,
+                &sidecar_upstream,
+                &sidecar_path,
+            )
+            .await
+        }
+        .boxed()
+        .shared();
+        let gated_repo = proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            repo_key,
+            upstream_url,
+            RepositoryFormat::Maven,
+        );
+        let result = proxy
+            .fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+                &gated_repo,
+                path,
+                path,
+                crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
+                digest,
+            )
+            .await
+            .map_err(IntoResponse::into_response)?;
+        return proxy_helpers::build_streaming_response_with_disposition(
+            result,
+            content_type_for_path(path),
+            None,
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("failed to build response: {}", e)).into_response()
+        });
+    }
+    proxy_helpers::proxy_fetch_streaming_with_format(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        content_type_for_path(path),
+        RepositoryFormat::Maven,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// #4100: scan-on-proxy for Maven-layout package archives (Maven, Gradle, sbt)
+// ---------------------------------------------------------------------------
+
+/// The `groupId:artifactId:version` a proxied JVM archive is requested as,
+/// derived from the REQUEST path (never from upstream bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmArchiveCoordinate {
+    pub group_id: String,
+    pub artifact_id: String,
+    /// The coordinate's version directory. For a SNAPSHOT this is the base
+    /// `1.0-SNAPSHOT` even when the file is a timestamped
+    /// `lib-1.0-20260101.120000-1.jar`, which is also what the archive's own
+    /// `pom.properties` declares.
+    pub version: String,
+}
+
+/// Whether a proxied file name is a known NON-package file the scan-on-proxy
+/// gate lets through unscanned (#4100). This is an allowlist on purpose:
+/// with scan-on-proxy on, EVERY other Maven/sbt proxy request is scanned,
+/// including unknown extensions and odd suffixes, so a spelling nobody
+/// thought of fails toward the gate rather than around it. Matched
+/// case-insensitively on the cache-normalized path's final segment:
+///
+/// * `.pom`, `.xml` (`maven-metadata*.xml`, `ivy*.xml`), Gradle `.module`,
+///   checksum sidecars (`.sha1`, `.sha256`, `.sha512`, `.md5`) and
+///   signatures (`.asc`, `.sig`, so also `.jar.asc`) are metadata. A POM's
+///   `<dependencies>` name OTHER components, each graded when its own
+///   archive is pulled; grading them against the POM would block the wrong
+///   file.
+/// * `-sources.jar` / `-javadoc.jar` carry no bytecode and no dependency
+///   metadata, so there is nothing to grade and an empty catalog would read
+///   as inconclusive. Caveat: the skip trusts the classifier in the NAME.
+///   Build tools never put a `sources`/`javadoc` artifact on a classpath, so
+///   bytes served under that name are not executed by an ordinary build, but
+///   they are not graded either.
+pub(crate) fn is_unscanned_jvm_companion(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    [
+        ".pom",
+        ".xml",
+        ".module",
+        ".sha1",
+        ".sha256",
+        ".sha512",
+        ".md5",
+        ".asc",
+        ".sig",
+        "-sources.jar",
+        "-javadoc.jar",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Whether a proxied file name is a JVM archive whose identity can be read
+/// from its own `pom.properties` (#4100): `.jar`, `.war` or `.ear`, any
+/// letter case. Only these get a coordinate (an identity pin). Every other
+/// scanned file (`.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`,
+/// native bundles, unknown extensions) is scanned with NO pin, so a format
+/// that is not a ZIP is not withheld as "unreadable". Known gap: the scan
+/// workspace does not unpack `.aar`'s inner `classes.jar` (or the other
+/// archive types above), so their engine catalog is whatever syft reads from
+/// the raw file.
+pub(crate) fn is_jvm_archive_name(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    [".jar", ".war", ".ear"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Refuse a Maven/sbt proxy path that the upstream request could read
+/// differently from the classified and cached path (#4100): a decoded `?`
+/// or `#` becomes a query or fragment when joined into the upstream URL,
+/// `;` is a path parameter (`;jsessionid=`) and a trailing `.` is stripped
+/// by Jetty/Tomcat-based upstreams (Nexus, Artifactory). Control characters
+/// (C0 incl. tab/CR/LF, and DEL) are removed by URL parsing, so
+/// `widget-1.0.ja%09r` reached upstream as `widget-1.0.jar` while being
+/// classified as something else; a space is likewise not a Maven path
+/// character, and a literal `%` (from `%25`) would be decoded AGAIN by a
+/// double-decoding upstream. Any of them lets one spelling fetch another
+/// file's bytes. No legitimate Maven or Ivy path contains them. Checked
+/// before classification and before any fetch.
+///
+/// Also refused: an allowlisted (unscanned) file name UNDER a segment that is
+/// itself a JVM archive name (`.../widget-1.0.jar/x.pom`). The allowlist
+/// decides on the final segment only, and an upstream that serves PATH_INFO
+/// for static files answers that request with the jar's bytes, unscanned. No
+/// Maven or Ivy layout nests a file under an archive.
+pub(crate) fn reject_ambiguous_proxy_path(path: &str) -> Result<(), Response> {
+    let normalized = crate::services::proxy_service::normalize_cache_path(path);
+    let ambiguous = |c: char| matches!(c, '?' | '#' | ';' | '%' | ' ') || c.is_ascii_control();
+    if normalized.contains(ambiguous) || normalized.ends_with('.') {
+        return Err(AppError::Validation(
+            "proxied path must not contain '?', '#', ';', '%', spaces or control characters, \
+             or end with '.'"
+                .to_string(),
+        )
+        .into_response());
+    }
+    if let Some((dirs, filename)) = normalized.rsplit_once('/') {
+        if is_unscanned_jvm_companion(filename) && dirs.split('/').any(is_jvm_archive_name) {
+            return Err(AppError::Validation(
+                "proxied path must not nest a file under an archive".to_string(),
+            )
+            .into_response());
+        }
+    }
+    Ok(())
+}
+
+/// A proxied request the scan-on-proxy gate must see (#4100).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmScanTarget<'p> {
+    /// The request path normalized EXACTLY as the proxy cache keys it
+    /// ([`normalize_cache_path`](crate::services::proxy_service::normalize_cache_path)),
+    /// which is also the path the gate fetches and caches under. Classifying
+    /// any other spelling would let an alias of a refused archive (a trailing
+    /// `/`) stream the same cached bytes unscanned.
+    pub path: &'p str,
+    /// The coordinate the path names, when it parses. `None` is still
+    /// scanned, with no identity pin.
+    pub coordinate: Option<JvmArchiveCoordinate>,
+}
+
+/// Whether a proxied Maven-layout request goes through the scan gate and,
+/// if so, what it is requested as (#4100). Everything is scanned EXCEPT the
+/// known non-package files of [`is_unscanned_jvm_companion`], decided on the
+/// cache-normalized path's file name, so ANY spelling that reaches a cache
+/// entry is classified as that entry. The coordinate is only identity, and
+/// only for a `.jar`/`.war`/`.ear` whose path parses as a Maven coordinate;
+/// anything else is scanned with no pin. A classifier (`-tests`,
+/// `-linux-x86_64`, ...) names the same coordinate, since Maven's archiver
+/// writes the project's `pom.properties` into every classified jar it builds.
+pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget<'_>> {
+    let path = crate::services::proxy_service::normalize_cache_path(path);
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    if filename.is_empty() || is_unscanned_jvm_companion(filename) {
+        return None;
+    }
+    let coordinate = is_jvm_archive_name(filename)
+        .then(|| MavenHandler::parse_coordinates(path).ok())
+        .flatten()
+        .map(|coords| JvmArchiveCoordinate {
+            group_id: coords.group_id,
+            artifact_id: coords.artifact_id,
+            version: coords.version,
+        });
+    Some(JvmScanTarget { path, coordinate })
+}
+
+/// What a proxied JVM archive is served as (#3003 for #4100).
+///
+/// The coordinate comes from the request; it is pinned ONLY when the
+/// archive's own `META-INF/maven/<groupId>/<artifactId>/pom.properties`
+/// agrees (the #3603/#3604 `pin_agrees_with_content` rule), because that is
+/// the entry the CVE engine catalogs the archive from:
+///
+/// * agrees -> `Established`: the engine must actually grade that
+///   `artifactId@version` before a clean verdict is trusted.
+/// * declares a DIFFERENT coordinate for the requested `groupId:artifactId`,
+///   or the bytes are not a readable archive -> `Unestablished`: these bytes
+///   are not what they are served as, so nothing a scanner says about them
+///   can be vouched for (fail-closed 423, fail-open loudly pending).
+/// * no such entry -> `NotApplicable`. Gradle- and sbt-built jars do not
+///   write one, so withholding them would lock a large share of Maven
+///   Central under fail-closed; they are scanned without the assessment
+///   gate (findings still block), exactly as before #3003.
+/// * no request coordinate (an Ivy path that does not parse) ->
+///   `NotApplicable` for the same reason.
+pub(crate) fn jvm_archive_identity(
+    coordinate: Option<&JvmArchiveCoordinate>,
+    bytes: &Bytes,
+) -> proxy_helpers::ProxyScanIdentity {
+    use crate::services::scanner_service::{
+        maven_archive_claim, pin_agrees_with_content, ComponentEcosystem, ExpectedComponent,
+        MavenArchiveClaim,
+    };
+    let Some(c) = coordinate else {
+        return proxy_helpers::ProxyScanIdentity::NotApplicable;
+    };
+    if matches!(
+        maven_archive_claim(bytes, &c.group_id, &c.artifact_id),
+        MavenArchiveClaim::Absent
+    ) {
+        return proxy_helpers::ProxyScanIdentity::NotApplicable;
+    }
+    // One agreement rule for every ecosystem (#3603): the scanner's
+    // `pin_agrees_with_content`, which also rejects an unreadable archive.
+    let pin = ExpectedComponent::new(
+        ComponentEcosystem::Maven,
+        &format!("{}:{}", c.group_id, c.artifact_id),
+        &c.version,
+    );
+    // The Maven arm reads `pom.properties` from the archive, not a file name.
+    if pin_agrees_with_content(bytes, &pin, "") {
+        proxy_helpers::ProxyScanIdentity::Established(pin)
+    } else {
+        proxy_helpers::ProxyScanIdentity::Unestablished
+    }
+}
+
+/// The 200 for a JVM archive the scan gate let through: the buffered bytes,
+/// verbatim (so the coding they arrived under is declared, #3149/#3184).
+pub(crate) fn scanned_jvm_archive_response(
+    content_type: &str,
+    body: proxy_helpers::ScannedProxyBody,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.bytes.len().to_string())
+        .header("X-Checksum-SHA256", &body.digest);
+    if let Some(enc) = body.content_encoding {
+        builder = builder.header(axum::http::header::CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(body.bytes)).unwrap()
+}
+
+/// A Remote repository (a Virtual's member on the walk) a Maven file is
+/// proxied from.
+struct MavenRemote<'a> {
+    proxy: &'a Arc<crate::services::proxy_service::ProxyService>,
+    repo_id: Uuid,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+}
+
+/// Inline scan-and-block for one proxied Maven package archive (#4100), on
+/// the generic gate ([`proxy_helpers::serve_scanned_proxy_file`]). Cached
+/// under the same path the streaming route commits to, so the buffered and
+/// streaming arms share one cache entry and one catalog row.
+async fn serve_scanned_maven_archive(
+    state: &SharedState,
+    remote: &MavenRemote<'_>,
+    path: &str,
+    coordinate: Option<&JvmArchiveCoordinate>,
+    (action, severity_gate): (
+        crate::services::proxy_scan_service::ProxyScanAction,
+        crate::services::proxy_scan_service::ProxySeverityGate,
+    ),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id: remote.repo_id,
+        repo_key: remote.repo_key,
+        fetch_base: remote.upstream_url,
+        // `Maven` for a `gradle` repository too: both share the Maven cache
+        // classifier (#3459).
+        format: RepositoryFormat::Maven,
+        source_path: path,
+        cache_path: path,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = MavenScannedArchive::new(remote, path, coordinate);
+    proxy_helpers::serve_scanned_proxy_file(state, remote.proxy, &req, &file).await
+}
+
+/// The `.sha1` sidecar resolution a buffered Maven gate checks its body
+/// against, started before the body fetch so the two overlap.
+type SidecarTask =
+    tokio::task::JoinHandle<Option<crate::services::proxy_service::CacheCommitDigest>>;
+
+/// The Maven half of the generic proxy scan gate. The wrapper records the
+/// download on both serve arms, including the unscanned over-cap stream.
+struct MavenScannedArchive<'a> {
+    proxy: &'a Arc<crate::services::proxy_service::ProxyService>,
+    upstream_url: &'a str,
+    coordinate: Option<&'a JvmArchiveCoordinate>,
+    /// Spawned at construction (only where
+    /// [`maven_sha1_sidecar_gate_applies`]), awaited in `after_buffered_fetch`:
+    /// the sidecar round trip runs alongside the capped body fetch instead of
+    /// after it, as the streaming arm defers it (#3982).
+    sidecar: std::sync::Mutex<Option<SidecarTask>>,
+}
+
+impl<'a> MavenScannedArchive<'a> {
+    fn new(
+        remote: &MavenRemote<'a>,
+        path: &str,
+        coordinate: Option<&'a JvmArchiveCoordinate>,
+    ) -> Self {
+        let sidecar = maven_sha1_sidecar_gate_applies(path).then(|| {
+            let proxy = Arc::clone(remote.proxy);
+            let (repo_id, repo_key) = (remote.repo_id, remote.repo_key.to_string());
+            let (upstream_url, path) = (remote.upstream_url.to_string(), path.to_string());
+            tokio::spawn(async move {
+                resolve_maven_sha1_sidecar(&proxy, repo_id, &repo_key, &upstream_url, &path).await
+            })
+        });
+        Self {
+            proxy: remote.proxy,
+            upstream_url: remote.upstream_url,
+            coordinate,
+            sidecar: std::sync::Mutex::new(sidecar),
+        }
+    }
+
+    /// Take the pre-started sidecar resolution (at most once).
+    async fn expected_sha1(&self) -> Option<String> {
+        use crate::services::proxy_service::CacheCommitDigest;
+        let task = self.sidecar.lock().ok()?.take()?;
+        match task.await {
+            Ok(Some(CacheCommitDigest::Sha1Hex(expected))) => Some(expected),
+            _ => None,
+        }
+    }
+}
+
+/// Evict a sidecar-mismatched body from the proxy cache, retrying once
+/// (#4100). `false` means it is STILL cached after two attempts.
+async fn evict_with_one_retry<F, Fut>(mut evict: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    for attempt in 1..=2 {
+        match evict().await {
+            Ok(()) => return true,
+            Err(e) => warn!(attempt, error = %e, "failed to evict sidecar-mismatched maven body"),
+        }
+    }
+    false
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for MavenScannedArchive<'_> {
+    const LABEL: &'static str = "maven archive";
+
+    fn synthetic_content_type(filename: &str) -> String {
+        content_type_for_path(filename).to_string()
+    }
+
+    fn identity(
+        &self,
+        _req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        _digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        jvm_archive_identity(self.coordinate, bytes)
+    }
+
+    /// GHSA-qxv7-p3mq-88fv on the buffered arm: the capped fetch cannot gate
+    /// its cache commit on the `.sha1` sidecar the way the streaming arm
+    /// does, so the committed bytes are checked here instead. A mismatch is
+    /// evicted from the proxy cache and REFUSED with 502, exactly like
+    /// Cargo's index `cksum` mismatch: the bytes are not what upstream
+    /// published, so they are never scanned, served or recorded (a virtual
+    /// walk treats it as this member's miss). Release coordinates only,
+    /// exactly like the streaming gate; no sidecar, nothing to check.
+    async fn after_buffered_fetch(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        _digest: &str,
+    ) -> Result<(), Response> {
+        let Some(expected) = self.expected_sha1().await else {
+            return Ok(());
+        };
+        let actual = hex::encode(sha1::Sha1::digest(&bytes[..]));
+        if actual == expected {
+            return Ok(());
+        }
+        warn!(
+            repo_key = %req.repo_key, path = %req.cache_path,
+            expected = %expected, actual = %actual,
+            "maven proxy body disagrees with its .sha1 sidecar; evicting it and refusing the pull"
+        );
+        let evicted = evict_with_one_retry(|| {
+            self.proxy
+                .invalidate_cache_by_key(req.repo_key, req.cache_path)
+        })
+        .await;
+        if !evicted {
+            // Still cached: refuse with a retryable 503 rather than the 502
+            // "upstream is wrong" answer. The gate re-checks the sidecar on
+            // every warm hit, so this route never serves it; routes that do
+            // not re-verify a warm entry are #4365 item 2 (commit only after
+            // the gate).
+            tracing::error!(
+                repo_key = %req.repo_key, path = %req.cache_path,
+                "sidecar-mismatched maven body could not be evicted from the proxy cache"
+            );
+            return Err(AppError::ServiceUnavailable(format!(
+                "upstream {} does not match its .sha1 sidecar and could not be evicted",
+                req.filename
+            ))
+            .into_response());
+        }
+        Err(AppError::BadGateway(format!(
+            "upstream {} does not match its .sha1 sidecar",
+            req.filename
+        ))
+        .into_response())
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        maven_remote_stream(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            self.upstream_url,
+            req.source_path,
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        _pending: bool,
+    ) -> Response {
+        scanned_jvm_archive_response(content_type_for_path(req.filename), body)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /maven/{repo_key}  (and /maven/{repo_key}/) — Repository root probe
 // ---------------------------------------------------------------------------
@@ -1149,6 +1662,11 @@ async fn download(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key, &state.repo_cache).await?;
+    // #4100: a proxied path the upstream could read as a different file than
+    // the one classified and cached here is refused before anything else.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        reject_ambiguous_proxy_path(&path)?;
+    }
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -2397,102 +2915,51 @@ async fn serve_artifact(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    // #895: stream large bodies; pass content_type_for_path
-                    // so .pom -> text/xml, .jar -> application/java-archive
-                    // when upstream omits Content-Type (closes review N2).
-                    //
-                    // GHSA-qxv7-p3mq-88fv: when the upstream's `.sha1`
-                    // sidecar for this package asset resolves, gate the
-                    // proxy-cache commit on it — a body whose SHA-1 disagrees
-                    // with the sidecar is streamed to the client (which
-                    // verifies it) but never cached. No sidecar -> the
-                    // unverified fetch, exactly as before.
-                    //
-                    // #3982: the sidecar resolution is DEFERRED, not awaited
-                    // before the content fetch starts. The two used to run as
-                    // sequential proxy-cache round-trips on EVERY GET — on
-                    // network-attached storage (NFS) that roughly doubled
-                    // warm-cache latency. The digest is only needed by the
-                    // final verify-and-commit step, so the content fetch
-                    // starts immediately: a warm hit never resolves the
-                    // sidecar at all (one round-trip total) and a cold miss
-                    // overlaps the sidecar with the body stream, deciding the
-                    // cache commit on both results exactly as before.
-                    if maven_sha1_sidecar_gate_applies(path) {
-                        let repo_id = repo.id;
-                        let proxy_for_sidecar = Arc::clone(proxy);
-                        let sidecar_repo_key = repo_key.to_string();
-                        let sidecar_upstream = upstream_url.clone();
-                        let sidecar_path = path.to_string();
-                        let digest = async move {
-                            resolve_maven_sha1_sidecar(
-                                &proxy_for_sidecar,
-                                repo_id,
-                                &sidecar_repo_key,
-                                &sidecar_upstream,
-                                &sidecar_path,
+                    // #4100: scan-on-proxy gates the PACKAGE archives a Maven,
+                    // Gradle or sbt client resolves through this route (jar /
+                    // war / ear; see `maven_scan_target`). The gate fetches
+                    // buffered, cache-first, and records the serve itself.
+                    // POMs, Gradle module files, signatures, checksums and
+                    // metadata never reach it, and a repository that has not
+                    // enabled scan-on-proxy keeps the streaming path below
+                    // untouched.
+                    if let Some(target) = maven_scan_target(path) {
+                        if crate::services::scan_config_service::ScanConfigService::new(
+                            state.db.clone(),
+                        )
+                        .is_proxy_scan_enabled(repo.id)
+                        .await
+                        .unwrap_or(false)
+                        {
+                            let policy =
+                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+                            let remote = MavenRemote {
+                                proxy,
+                                repo_id: repo.id,
+                                repo_key,
+                                upstream_url,
+                            };
+                            return serve_scanned_maven_archive(
+                                state,
+                                &remote,
+                                target.path,
+                                target.coordinate.as_ref(),
+                                policy,
+                                ctx,
                             )
-                            .await
+                            .await;
                         }
-                        .boxed()
-                        .shared();
-                        let gated_repo = proxy_helpers::build_remote_repo_with_format(
-                            repo.id,
-                            repo_key,
-                            upstream_url,
-                            RepositoryFormat::Maven,
-                        );
-                        let result = proxy
-                            .fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
-                                &gated_repo,
-                                path,
-                                path,
-                                crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
-                                digest,
-                            )
-                            .await
-                            .map_err(IntoResponse::into_response)?;
-                        let response = proxy_helpers::build_streaming_response_with_disposition(
-                            result,
-                            content_type_for_path(path),
-                            None,
-                        )
-                        .map_err(|e| {
-                            AppError::Internal(format!("failed to build response: {}", e))
-                                .into_response()
-                        })?;
-                        // #3265: count the proxy serve. Every other proxying
-                        // format (pypi, npm, and the shared
-                        // `try_remote_or_virtual_download` path) records here;
-                        // Maven has its own remote branch and was the one
-                        // format that never did, so a jar pulled through a
-                        // maven-central proxy always reported 0 downloads.
-                        // HEAD-guarded + best-effort inside.
-                        proxy_helpers::record_proxy_download_deferred(
-                            state, repo.id, repo_key, path, ctx,
-                        )
-                        .await;
-                        return Ok(response);
                     }
-                    // #3459: carry the Maven format so a released coordinate
-                    // caches immutably. `proxy_fetch_streaming` synthesizes a
-                    // `Generic` repository, which has no classifier arm, so
-                    // every jar/pom reaching this ungated arm was stamped with
-                    // the conservative 5-minute mutable TTL. `Maven` also
-                    // classifies a `gradle`-format repository correctly — both
-                    // share `cache_classifier::classify_maven`.
-                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
-                        proxy,
-                        repo.id,
-                        repo_key,
-                        upstream_url,
-                        path,
-                        content_type_for_path(path),
-                        RepositoryFormat::Maven,
-                    )
-                    .await?;
-                    // #3265: same counting as the sidecar-gated branch above;
-                    // #3778: recorded off the response path (spawned task).
+                    let response =
+                        maven_remote_stream(proxy, repo.id, repo_key, upstream_url, path).await?;
+                    // #3265: count the proxy serve. Every other proxying
+                    // format (pypi, npm, and the shared
+                    // `try_remote_or_virtual_download` path) records here;
+                    // Maven has its own remote branch and was the one
+                    // format that never did, so a jar pulled through a
+                    // maven-central proxy always reported 0 downloads.
+                    // HEAD-guarded + best-effort inside. #3778: recorded off
+                    // the response path (spawned task).
                     proxy_helpers::record_proxy_download_deferred(
                         state, repo.id, repo_key, path, ctx,
                     )
@@ -2555,103 +3022,167 @@ async fn serve_artifact(
                 // caller could not read directly are dropped, so a denied
                 // member behaves exactly as if it did not contain the artifact
                 // (404), never leaking its existence.
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                //
+                // The fallible form, as sbt uses: a failed visibility query is
+                // a retryable server error, not a definitive 404 (#3321).
                 let members =
-                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
-                        .await;
+                    proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+
+                let local_fetch = |member_id: Uuid, location: crate::storage::StorageLocation| {
+                    let db = db.clone();
+                    let state = state.clone();
+                    let artifact_path = artifact_path.clone();
+                    async move {
+                        // Fast path: strict path match (covers release artifacts
+                        // and SNAPSHOT files deployed under their `-SNAPSHOT` alias).
+                        //
+                        // #4286: only a genuine miss (404) falls through to the
+                        // fallbacks below. A quarantine / scan-policy refusal
+                        // (403/409) or an infrastructure error from the gated
+                        // lookup is this member's answer; swallowing it let the
+                        // storage-direct fallback anchor on a different,
+                        // passing GAV sibling and serve the refused bytes.
+                        match proxy_helpers::local_fetch_by_path(
+                            &db,
+                            &state,
+                            member_id,
+                            &location,
+                            &artifact_path,
+                        )
+                        .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+                            Err(resp) => return Err(resp),
+                        }
+
+                        // Fallback A: SNAPSHOT alias resolution (#839).
+                        // Maven deploys store SNAPSHOTs under timestamped filenames
+                        // (`foo-1.0-20260101.120000-1.jar`). The client still asks
+                        // for the `-SNAPSHOT` filename, so map that alias to the
+                        // latest timestamped file before giving up.
+                        //
+                        // For SNAPSHOT paths we ALWAYS stop here — never fall
+                        // through to the storage-direct fallback below. The
+                        // storage path is keyed by the literal `-SNAPSHOT`
+                        // string the client sent, but SNAPSHOT bytes on disk
+                        // live under the timestamped filename — so the storage
+                        // probe would either 404 cleanly (best case) or, if
+                        // member A happens to carry a stale snapshot of a
+                        // different artifact at the same -SNAPSHOT path, serve
+                        // that stale byte stream instead of advancing the
+                        // virtual-resolution loop to member B. Confine the
+                        // SNAPSHOT codepath to its dedicated helper.
+                        let is_snapshot = artifact_path.contains("-SNAPSHOT");
+                        if is_snapshot {
+                            return maven_local_fetch_snapshot(
+                                &db,
+                                &state,
+                                member_id,
+                                &location,
+                                &artifact_path,
+                            )
+                            .await;
+                        }
+                        if let Ok(result) = maven_local_fetch_snapshot(
+                            &db,
+                            &state,
+                            member_id,
+                            &location,
+                            &artifact_path,
+                        )
+                        .await
+                        {
+                            return Ok(result);
+                        }
+
+                        // Legacy storage-direct fallback for old Maven rows
+                        // created by the former GAV grouping model. Fresh
+                        // uploads now create one artifact row per physical
+                        // Maven asset, but older repositories may still only
+                        // have a primary row while companion bytes live at
+                        // `maven/<path>`. The helper gates this on a known
+                        // Maven companion path and an active, non-quarantined
+                        // primary artifact in the same GAV directory.
+                        crate::api::handlers::maven_proxy::maven_local_fetch_storage_fallback(
+                            &db,
+                            &state,
+                            member_id,
+                            &location,
+                            &artifact_path,
+                        )
+                        .await
+                    }
+                };
+
+                // #4100: a scanning Remote member serves its package archive
+                // through the scan gate (stricter-of-two policy, see
+                // `walk_virtual_members_with_scan`); runs of non-scanning
+                // members keep the resolver below. A locally owned GAV
+                // (`local_owns`) disables every Remote member anyway, so it
+                // never reaches the gate.
+                if let (Some(target), Some(proxy)) = (
+                    maven_scan_target(path),
+                    proxy_for_virtual.and(state.proxy_service.as_ref()),
+                ) {
+                    // A hosted member's serve on the walk is counted exactly
+                    // as on the fallback resolver below (#4268).
+                    let resolve_run = |run: Vec<crate::models::repository::Repository>| {
+                        proxy_helpers::resolve_unscanned_member_run(
+                            run,
+                            proxy_for_virtual,
+                            path,
+                            &local_fetch,
+                            content_type_for_path(path),
+                            Some((&state.db, ctx)),
+                        )
+                    };
+                    let target = &target;
+                    let scanned = |member: crate::models::repository::Repository, policy| async move {
+                        let upstream_url = member.upstream_url.clone().unwrap_or_default();
+                        let remote = MavenRemote {
+                            proxy,
+                            repo_id: member.id,
+                            repo_key: &member.key,
+                            upstream_url: &upstream_url,
+                        };
+                        serve_scanned_maven_archive(
+                            state,
+                            &remote,
+                            target.path,
+                            target.coordinate.as_ref(),
+                            policy,
+                            ctx,
+                        )
+                        .await
+                    };
+                    if let Some(served) = proxy_helpers::walk_virtual_members_with_scan(
+                        &state.db,
+                        repo.id,
+                        members.clone(),
+                        resolve_run,
+                        scanned,
+                    )
+                    .await
+                    {
+                        return served;
+                    }
+                }
 
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     members,
                     proxy_for_virtual,
                     path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let artifact_path = artifact_path.clone();
-                        async move {
-                            // Fast path: strict path match (covers release artifacts
-                            // and SNAPSHOT files deployed under their `-SNAPSHOT` alias).
-                            //
-                            // #4286: only a genuine miss (404) falls through to the
-                            // fallbacks below. A quarantine / scan-policy refusal
-                            // (403/409) or an infrastructure error from the gated
-                            // lookup is this member's answer; swallowing it let the
-                            // storage-direct fallback anchor on a different,
-                            // passing GAV sibling and serve the refused bytes.
-                            match proxy_helpers::local_fetch_by_path(
-                                &db,
-                                &state,
-                                member_id,
-                                &location,
-                                &artifact_path,
-                            )
-                            .await
-                            {
-                                Ok(result) => return Ok(result),
-                                Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
-                                Err(resp) => return Err(resp),
-                            }
-
-                            // Fallback A: SNAPSHOT alias resolution (#839).
-                            // Maven deploys store SNAPSHOTs under timestamped filenames
-                            // (`foo-1.0-20260101.120000-1.jar`). The client still asks
-                            // for the `-SNAPSHOT` filename, so map that alias to the
-                            // latest timestamped file before giving up.
-                            //
-                            // For SNAPSHOT paths we ALWAYS stop here — never fall
-                            // through to the storage-direct fallback below. The
-                            // storage path is keyed by the literal `-SNAPSHOT`
-                            // string the client sent, but SNAPSHOT bytes on disk
-                            // live under the timestamped filename — so the storage
-                            // probe would either 404 cleanly (best case) or, if
-                            // member A happens to carry a stale snapshot of a
-                            // different artifact at the same -SNAPSHOT path, serve
-                            // that stale byte stream instead of advancing the
-                            // virtual-resolution loop to member B. Confine the
-                            // SNAPSHOT codepath to its dedicated helper.
-                            let is_snapshot = artifact_path.contains("-SNAPSHOT");
-                            if is_snapshot {
-                                return maven_local_fetch_snapshot(
-                                    &db,
-                                    &state,
-                                    member_id,
-                                    &location,
-                                    &artifact_path,
-                                )
-                                .await;
-                            }
-                            if let Ok(result) = maven_local_fetch_snapshot(
-                                &db,
-                                &state,
-                                member_id,
-                                &location,
-                                &artifact_path,
-                            )
-                            .await
-                            {
-                                return Ok(result);
-                            }
-
-                            // Legacy storage-direct fallback for old Maven rows
-                            // created by the former GAV grouping model. Fresh
-                            // uploads now create one artifact row per physical
-                            // Maven asset, but older repositories may still only
-                            // have a primary row while companion bytes live at
-                            // `maven/<path>`. The helper gates this on a known
-                            // Maven companion path and an active, non-quarantined
-                            // primary artifact in the same GAV directory.
-                            crate::api::handlers::maven_proxy::maven_local_fetch_storage_fallback(
-                                &db,
-                                &state,
-                                member_id,
-                                &location,
-                                &artifact_path,
-                            )
-                            .await
-                        }
-                    },
+                    local_fetch,
                 )
                 .await?;
+
+                // Only the winning member's result reaches here, so this counts once;
+                // proxy-member and row-less legacy serves carry `None` (#1278).
+                if let Some(artifact_id) = result.artifact_id {
+                    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
+                        .await;
+                }
 
                 return proxy_helpers::stream_fetch_result(
                     result,
@@ -5817,6 +6348,7 @@ mod tests {
             .body(Body::empty())
             .expect("build GET alias jar");
         let (status, body) = tdh::send(router, req).await;
+        let recorded = poll_download_count(&pool, artifact_id_db, 1).await;
 
         // -- Cleanup first so a failed assert does not leak DB state.
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
@@ -5844,6 +6376,97 @@ mod tests {
             &jar_bytes[..],
             "virtual-served bytes must match the original jar content"
         );
+        assert_eq!(
+            recorded, 1,
+            "a SNAPSHOT alias served from a hosted virtual member must be counted once"
+        );
+    }
+
+    /// Poll (bounded, ~2s) until `artifact_id` has at least `expected`
+    /// `download_statistics` rows; `record_download` writes asynchronously (#2522).
+    async fn poll_download_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    /// A release jar served through a virtual repo from its hosted member is
+    /// counted exactly once, like the same jar fetched from the hosted repo
+    /// directly; a HEAD probe through the virtual is not counted.
+    #[tokio::test]
+    async fn test_virtual_repo_hosted_member_download_is_recorded() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (hosted_id, _hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let artifact_row_id =
+            insert_maven_artifact_row(&pool, hosted_id, user_id, "com.example.vdl", "counted")
+                .await;
+        let path = "com/example/vdl/counted/1.0.0/counted-1.0.0.jar";
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: hosted_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage_for_repo")
+            .put(&format!("maven/{path}"), bytes::Bytes::from_static(b"j"))
+            .await
+            .expect("put jar bytes on hosted storage");
+
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        tdh::publish_repo(&pool, hosted_id).await;
+
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let request = |method: &str| {
+            Request::builder()
+                .method(method)
+                .uri(format!("/{virtual_key}/{path}"))
+                .body(Body::empty())
+                .expect("build virtual jar request")
+        };
+
+        let (get_status, get_body) = tdh::send(router.clone(), request("GET")).await;
+        let after_get = poll_download_count(&pool, artifact_row_id, 1).await;
+        let (head_status, _) = tdh::send(router, request("HEAD")).await;
+        let after_head = poll_download_count(&pool, artifact_row_id, 2).await;
+
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            get_status,
+            StatusCode::OK,
+            "virtual GET must serve the hosted jar"
+        );
+        assert_eq!(&get_body[..], b"j");
+        assert_eq!(after_get, 1, "the virtual GET must record one download");
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(after_head, 1, "a HEAD through the virtual must not record");
     }
 
     /// #4286: every read of a hosted Maven artifact, direct or through a
@@ -6000,7 +6623,7 @@ mod tests {
         user_id: Uuid,
         group_id: &str,
         artifact_id: &str,
-    ) {
+    ) -> Uuid {
         let group_path = group_id.replace('.', "/");
         let version = "1.0.0";
         let path = format!(
@@ -6059,6 +6682,8 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert packages catalog row");
+
+        artifact_row_id
     }
 
     #[tokio::test]
@@ -6193,24 +6818,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_virtual_repo_merges_prefixes_from_members() {
+    /// GET `.meta/prefixes.txt` of a virtual repo over one hosted member per
+    /// group, each holding a single artifact; `None` without a test database.
+    async fn virtual_prefixes(member_groups: &[&str]) -> Option<(StatusCode, String)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
 
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-
-        let (member_a_id, _member_a_key, member_a_dir) =
-            tdh::create_repo(&pool, "local", "maven").await;
-        let (member_b_id, _member_b_key, member_b_dir) =
-            tdh::create_repo(&pool, "local", "maven").await;
+        let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
-
-        insert_maven_artifact_row(&pool, member_a_id, user_id, "com.acme.prfxv", "moda").await;
-        insert_maven_artifact_row(&pool, member_b_id, user_id, "org.acme.prfxv", "modb").await;
+        let mut members = Vec::new();
+        for group in member_groups {
+            let (id, _key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+            insert_maven_artifact_row(&pool, id, user_id, group, "lib").await;
+            members.push((id, dir));
+        }
+        let member_ids: Vec<Uuid> = members.iter().map(|(id, _)| *id).collect();
 
         let virtual_id = Uuid::new_v4();
         let virtual_key = format!("v-prfxv-{}", virtual_id.simple());
@@ -6228,27 +6849,26 @@ mod tests {
         .await
         .expect("insert virtual repo");
 
-        tdh::link_virtual_member(&pool, virtual_id, member_a_id, 1).await;
-        tdh::link_virtual_member(&pool, virtual_id, member_b_id, 2).await;
+        for (priority, id) in member_ids.iter().enumerate() {
+            tdh::link_virtual_member(&pool, virtual_id, *id, priority as i32 + 1).await;
+        }
 
         // `authorize_virtual_members` filters by caller visibility (#3178);
         // publish the members so this fixture stays about merging, not authz.
         sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
-            .bind(vec![member_a_id, member_b_id])
+            .bind(&member_ids)
             .execute(&pool)
             .await
             .expect("publish virtual members");
 
-        let state = tdh::build_state(pool.clone(), member_a_dir.to_str().unwrap());
+        let state = tdh::build_state(pool.clone(), members[0].1.to_str().unwrap());
         let auth = tdh::make_auth(user_id, &username);
         let router = tdh::router_with_auth(super::router(), state.clone(), auth);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("/{}/.meta/prefixes.txt", virtual_key))
-            .body(Body::empty())
-            .expect("build GET prefixes.txt");
-        let (status, body) = tdh::send(router, req).await;
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
 
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
             .bind(virtual_id)
@@ -6258,25 +6878,37 @@ mod tests {
             .bind(virtual_id)
             .execute(&pool)
             .await;
-        tdh::cleanup_member_repo(&pool, member_a_id, &member_a_dir).await;
-        tdh::cleanup_member_repo(&pool, member_b_id, &member_b_dir).await;
+        for (id, dir) in &members {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&virtual_dir);
 
+        Some((status, String::from_utf8_lossy(&body).into_owned()))
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_merges_prefixes_from_members() {
+        let Some((status, text)) = virtual_prefixes(&["com.acme.prfxv", "org.acme.prfxv"]).await
+        else {
+            return;
+        };
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            status,
-            StatusCode::OK,
-            "expected 200 for virtual .meta/prefixes.txt"
+            text, "## repository-prefixes/2.0\n/com/acme/prfxv\n/org/acme/prfxv\n",
+            "expected merged prefixes from both members, sorted"
         );
-        let text = String::from_utf8_lossy(&body);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "## repository-prefixes/2.0");
-        assert_eq!(
-            lines[1..],
-            ["/com/acme/prfxv", "/org/acme/prfxv"],
-            "expected merged prefixes from both members, sorted: {}",
-            text
-        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_drop_group_nested_across_members() {
+        let Some((status, text)) =
+            virtual_prefixes(&["org.acme.prfxn", "org.acme.prfxn.sub"]).await
+        else {
+            return;
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "## repository-prefixes/2.0\n/org/acme/prfxn\n");
     }
 
     // -----------------------------------------------------------------------
@@ -9184,6 +9816,1178 @@ mod maven_prefix_reserved_tests {
             "with every version deleted the metadata must not resurrect a stale list"
         );
 
+        fx.teardown().await;
+    }
+}
+
+/// #840: a Remote member's upstream filter keeps a Maven virtual from ever
+/// contacting that member's upstream for a path the filter refuses. The
+/// reporter's shape: a virtual over a main remote and a fringe remote that
+/// hosts a handful of groups; with the fringe one down, every
+/// `maven-metadata.xml` merge waited on it until the upstream timeout.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod upstream_filter_virtual_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+    use axum::http::StatusCode;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn metadata_xml(group: &str, artifact: &str, version: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\
+             <groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+             <versioning><latest>{version}</latest><release>{version}</release>\
+             <versions><version>{version}</version></versions>\
+             <lastUpdated>20260101000000</lastUpdated></versioning></metadata>"
+        )
+    }
+
+    /// Requests `mock` received whose path starts with `/prefix`.
+    async fn hits(mock: &MockServer, prefix: &str) -> usize {
+        mock.received_requests()
+            .await
+            .expect("request recording enabled")
+            .iter()
+            .filter(|r| r.url.path().starts_with(prefix))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn virtual_never_contacts_a_member_whose_upstream_filter_refuses_the_path_840() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+
+        // Main remote: has org.acme metadata, nothing else (wiremock 404s).
+        let main = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/org/acme/lib/maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(metadata_xml("org.acme", "lib", "1.0")),
+            )
+            .mount(&main)
+            .await;
+
+        // Fringe remote: would answer EVERYTHING (so any request that leaks
+        // through the filter changes the result), but only `com/fringe/` is
+        // admitted by its filter.
+        let fringe = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(metadata_xml("org.acme", "lib", "9.9")),
+            )
+            .mount(&fringe)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fringe-jar".to_vec()))
+            .mount(&fringe)
+            .await;
+
+        let (main_id, _, main_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &main.uri(), 1).await;
+        let (fringe_id, fringe_key, fringe_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &fringe.uri(), 2).await;
+        save_upstream_filter(
+            &fx.pool,
+            fringe_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/fringe/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .expect("save fringe upstream filter");
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let app = || {
+            tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::admin_auth(fx.user_id, &fx.username),
+            )
+        };
+        let get = |path: String| tdh::send(app(), tdh::get(path));
+
+        // 1. The metadata merge: served from `main` alone.
+        let (meta_status, meta_body) =
+            get(format!("/{}/org/acme/lib/maven-metadata.xml", fx.repo_key)).await;
+        // 2. A jar `main` does not have: the fringe member is skipped, so 404.
+        let (jar_status, _) = get(format!("/{}/org/acme/lib/1.0/lib-1.0.jar", fx.repo_key)).await;
+        // 3. The same refusal on the fringe remote addressed directly.
+        let (direct_status, _) = get(format!("/{fringe_key}/org/acme/lib/1.0/lib-1.0.jar")).await;
+        let fringe_hits_refused = hits(&fringe, "/org/").await;
+        let main_hits = hits(&main, "/org/acme/lib/maven-metadata.xml").await;
+        // 4. A path the filter admits still reaches the fringe upstream.
+        let (admitted_status, admitted_body) =
+            get(format!("/{}/com/fringe/x/1.0/x-1.0.jar", fx.repo_key)).await;
+        let fringe_hits_admitted = hits(&fringe, "/com/fringe/x/1.0/x-1.0.jar").await;
+
+        tdh::cleanup_member_repo(&fx.pool, main_id, &main_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, fringe_id, &fringe_dir).await;
+        fx.teardown().await;
+
+        let meta = String::from_utf8_lossy(&meta_body);
+        assert_eq!(meta_status, StatusCode::OK, "{meta}");
+        assert!(meta.contains("<version>1.0</version>"), "{meta}");
+        assert!(
+            !meta.contains("9.9"),
+            "the fringe member's metadata must not be merged: {meta}"
+        );
+        assert!(main_hits >= 1, "the main member serves the merge");
+        assert_eq!(jar_status, StatusCode::NOT_FOUND);
+        assert_eq!(direct_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            fringe_hits_refused, 0,
+            "the fringe upstream must receive zero requests for paths its filter refuses"
+        );
+        assert_eq!(admitted_status, StatusCode::OK);
+        assert_eq!(&admitted_body[..], b"fringe-jar");
+        assert!(
+            fringe_hits_admitted >= 1,
+            "an admitted path still reaches the fringe upstream"
+        );
+    }
+}
+
+/// #4100: scan-on-proxy for Maven (and Gradle, which rides the Maven route)
+/// package archives, Remote and Virtual.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::scanner_service::ExpectedComponent;
+    use wiremock::matchers::{method, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const GROUP: &str = "com.acme";
+    const JAR: &str = "com/acme/widget/1.0/widget-1.0.jar";
+
+    fn jar(artifact: &str, version: &str) -> Vec<u8> {
+        tdh::maven_jar_fixture(GROUP, artifact, version)
+    }
+
+    async fn seed_verdict(pool: &PgPool, bytes: &[u8], repo_id: Uuid, vulnerable: bool) -> String {
+        tdh::seed_proxy_verdict(pool, bytes, repo_id, vulnerable).await
+    }
+
+    async fn drop_verdicts(pool: &PgPool, digests: &[String]) {
+        tdh::drop_proxy_verdicts(pool, digests).await
+    }
+
+    async fn recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+        tdh::proxy_downloads_recorded(pool, repo_id, path).await
+    }
+
+    async fn mount(server: &MockServer, route: &str, body: Vec<u8>, times: u64) {
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{route}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    async fn pull(
+        state: &SharedState,
+        repo_key: &str,
+        route: &str,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{repo_key}/{route}")),
+        )
+        .await
+    }
+
+    #[test]
+    fn scan_targets_are_package_archives_only() {
+        let target = maven_scan_target(JAR).expect("a release jar is scanned");
+        assert_eq!(target.path, JAR);
+        assert_eq!(
+            target.coordinate.unwrap(),
+            JvmArchiveCoordinate {
+                group_id: GROUP.into(),
+                artifact_id: "widget".into(),
+                version: "1.0".into(),
+            }
+        );
+        for scanned in [
+            "com/acme/widget/1.0/widget-1.0.war",
+            "com/acme/widget/1.0/widget-1.0.ear",
+            "com/acme/widget/1.0/widget-1.0-tests.jar",
+            "com/acme/widget/1.0/widget-1.0-linux-x86_64.jar",
+            "com/acme/widget/1.0/widget-1.0.JAR",
+            "com/acme/widget/1.0/widget-1.0.Jar",
+        ] {
+            assert!(maven_scan_target(scanned).is_some(), "{scanned}");
+        }
+        // Every spelling that reaches the jar's cache entry is classified on
+        // that entry's key (the trailing-slash alias of a refused jar used to
+        // stream it unscanned).
+        for alias in [
+            "com/acme/widget/1.0/widget-1.0.jar/",
+            "/com/acme/widget/1.0/widget-1.0.jar//",
+        ] {
+            let target = maven_scan_target(alias).expect(alias);
+            assert_eq!(target.path, JAR, "{alias}");
+            assert!(target.coordinate.is_some(), "{alias}");
+        }
+        // Non-canonical archive names are still scanned; they just carry no
+        // coordinate to pin.
+        for unparsed in [
+            "com/acme/widget/1.0/other-1.0.jar",
+            "widget/widget-1.0.jar",
+            "widget-1.0.war",
+        ] {
+            let target = maven_scan_target(unparsed).expect(unparsed);
+            assert!(target.coordinate.is_none(), "{unparsed}");
+        }
+        // A timestamped SNAPSHOT is the base SNAPSHOT coordinate, which is
+        // what its own pom.properties declares.
+        assert_eq!(
+            maven_scan_target("com/acme/widget/1.0-SNAPSHOT/widget-1.0-20260101.120000-1.jar")
+                .unwrap()
+                .coordinate
+                .unwrap()
+                .version,
+            "1.0-SNAPSHOT"
+        );
+        for passthrough in [
+            "com/acme/widget/1.0/widget-1.0.pom",
+            "com/acme/widget/1.0/widget-1.0.module",
+            "com/acme/widget/1.0/widget-1.0.jar.asc",
+            "com/acme/widget/1.0/widget-1.0.jar.sha1",
+            "com/acme/widget/1.0/widget-1.0.jar.md5",
+            "com/acme/widget/1.0/widget-1.0-sources.jar",
+            "com/acme/widget/1.0/widget-1.0-javadoc.jar",
+            "com/acme/widget/1.0/widget-1.0-SOURCES.JAR",
+            "com/acme/widget/1.0/widget-1.0.POM",
+            "com/acme/widget/1.0/widget-1.0.jar.SHA256",
+            "com/acme/widget/1.0/widget-1.0.jar.sha512",
+            "com/acme/widget/1.0/widget-1.0.jar.sig",
+            "com/acme/widget/maven-metadata.xml",
+            "com/acme/widget/maven-metadata-central.xml",
+        ] {
+            assert!(maven_scan_target(passthrough).is_none(), "{passthrough}");
+        }
+        // Everything outside the allowlist is scanned, with a pin only for a
+        // jar/war/ear that names a coordinate.
+        for unknown in [
+            "com/acme/widget/1.0/widget-1.0.aar",
+            "com/acme/widget/1.0/widget-1.0.klib",
+            "com/acme/widget/1.0/widget-1.0.tar.gz",
+            "com/acme/widget/1.0/widget-1.0.jar.bak",
+            "com/acme/widget/1.0/",
+        ] {
+            let target = maven_scan_target(unknown).expect(unknown);
+            assert!(target.coordinate.is_none(), "{unknown}");
+        }
+    }
+
+    /// Spellings the upstream could read as a different file than the one
+    /// classified and cached are refused outright.
+    #[test]
+    fn ambiguous_proxy_paths_are_rejected() {
+        for bad in [
+            "com/acme/widget/1.0/widget-1.0.jar?x",
+            "com/acme/widget/1.0/widget-1.0.jar#x",
+            "com/acme/widget/1.0/widget-1.0.jar;jsessionid=x",
+            "com/acme/widget/1.0/widget-1.0.jar.",
+            "com/acme/widget/1.0/widget-1.0.jar./",
+            "com/acme/widget/1.0/widget-1.0.ja\tr",
+            "com/acme/widget/1.0/widget-1.0.ja\nr",
+            "com/acme/widget/1.0/widget-1.0.ja\rr",
+            "com/acme/widget/1.0/widget-1.0.ja\u{7f}r",
+            "com/acme/widget/1.0/widget-1.0.ja\u{1}r",
+            "com/acme/widget/1.0/widget 1.0.jar",
+            "com/acme/widget/1.0/widget-1.0.ja%72",
+            "com/acme/widget/1.0/widget-1.0.jar/x.pom",
+            "com/acme/widget/1.0/widget-1.0.JAR/maven-metadata.xml",
+            "com/acme/widget/1.0/widget-1.0.war/a/b.sha1",
+        ] {
+            let resp = reject_ambiguous_proxy_path(bad).expect_err(bad);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        for ok in [
+            JAR,
+            "com/acme/widget/maven-metadata.xml",
+            "com/acme/widget/1.0/",
+            "com/acme/widget/1.0/widget-1.0.jar.sha1",
+            "com/acme/widget/1.0/widget-1.0-sources.jar",
+            // A scanned final segment under an archive name is not a bypass:
+            // the gate scans whatever bytes it gets.
+            "com/acme/widget/1.0/widget-1.0.jar/inner.jar",
+        ] {
+            assert!(reject_ambiguous_proxy_path(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn identity_is_pinned_only_when_the_archive_agrees() {
+        use proxy_helpers::ProxyScanIdentity as Id;
+        let coordinate = maven_scan_target(JAR).unwrap().coordinate.unwrap();
+        let ours = Bytes::from(jar("widget", "1.0"));
+        match jvm_archive_identity(Some(&coordinate), &ours) {
+            Id::Established(pin) => assert_eq!(
+                pin,
+                ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::Maven,
+                    "com.acme:widget",
+                    "1.0"
+                )
+            ),
+            _ => panic!("an agreeing pom.properties establishes the coordinate"),
+        }
+        // The archive is a different version of the requested artifact.
+        let other = Bytes::from(jar("widget", "2.0"));
+        assert!(matches!(
+            jvm_archive_identity(Some(&coordinate), &other),
+            Id::Unestablished
+        ));
+        // Not an archive at all.
+        assert!(matches!(
+            jvm_archive_identity(Some(&coordinate), &Bytes::from_static(b"<html>")),
+            Id::Unestablished
+        ));
+        // A jar with no pom.properties for this coordinate (Gradle-built).
+        let gradle = Bytes::from(jar("something-else", "1.0"));
+        assert!(matches!(
+            jvm_archive_identity(Some(&coordinate), &gradle),
+            Id::NotApplicable
+        ));
+        assert!(matches!(
+            jvm_archive_identity(None, &ours),
+            Id::NotApplicable
+        ));
+    }
+
+    /// Vulnerable jar: 403 `scan_blocked`, nothing recorded.
+    #[tokio::test]
+    async fn remote_vulnerable_jar_is_blocked() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, body, _) = pull(&state, &fx.repo_key, JAR).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+        assert_eq!(body["file"], "widget-1.0.jar");
+        assert_eq!(recorded(&fx.pool, fx.repo_id, JAR).await, 0);
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// Clean jar: served with `X-AK-Scan: clean`, the second pull reuses both
+    /// the verdict and the cache (one upstream hit), and each serve records
+    /// exactly one download. (Fail-open: with no live scanner on the test
+    /// state, fail-closed deliberately refuses to reuse a stored clean verdict
+    /// and re-scans.)
+    #[tokio::test]
+    async fn remote_clean_jar_is_served_and_recorded_once_per_pull() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+
+        for pulls in 1..=2 {
+            let (status, body, headers) = pull(&state, &fx.repo_key, JAR).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], &bytes[..]);
+            assert_eq!(headers["X-AK-Scan"], "clean");
+            assert_eq!(headers[CONTENT_TYPE], "application/java-archive");
+            assert_eq!(recorded(&fx.pool, fx.repo_id, JAR).await, pulls);
+        }
+
+        server.verify().await;
+        drop_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// No verdict yet and no scanner: fail-open serves loudly pending and
+    /// records once; fail-closed withholds (423) and records nothing.
+    #[tokio::test]
+    async fn remote_unscanned_jar_honours_fail_open_and_fail_closed() {
+        for (action, expect) in [
+            ("fail_open", StatusCode::OK),
+            ("fail_closed", StatusCode::LOCKED),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+                return;
+            };
+            let server = MockServer::start().await;
+            let bytes = jar("widget", "1.0");
+            mount(&server, JAR, bytes.clone(), 1).await;
+            let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+            tdh::enable_proxy_scan(&fx.pool, fx.repo_id, action).await;
+
+            let (status, body, headers) = pull(&state, &fx.repo_key, JAR).await;
+            assert_eq!(status, expect, "{action}");
+            let served = status == StatusCode::OK;
+            if served {
+                assert_eq!(&body[..], &bytes[..]);
+                assert_eq!(headers["X-AK-Scan"], "pending");
+            }
+            assert_eq!(
+                recorded(&fx.pool, fx.repo_id, JAR).await,
+                i64::from(served),
+                "{action}"
+            );
+            drop(server);
+            fx.teardown().await;
+        }
+    }
+
+    /// A timestamped SNAPSHOT jar is gated like a release.
+    #[tokio::test]
+    async fn remote_snapshot_jar_is_gated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let route = "com/acme/widget/1.0-SNAPSHOT/widget-1.0-20260101.120000-1.jar";
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0-SNAPSHOT");
+        mount(&server, route, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, _, _) = pull(&state, &fx.repo_key, route).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// POMs, Gradle module files, signatures, sources jars and metadata are
+    /// not package archives: they pass through unchanged and unscanned even
+    /// when their bytes carry a vulnerable verdict under fail-closed.
+    #[tokio::test]
+    async fn remote_metadata_and_companions_pass_through() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let mut digests = Vec::new();
+        let routes = [
+            "com/acme/widget/1.0/widget-1.0.pom",
+            "com/acme/widget/1.0/widget-1.0.module",
+            "com/acme/widget/1.0/widget-1.0.jar.asc",
+            "com/acme/widget/1.0/widget-1.0-sources.jar",
+        ];
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        for route in routes {
+            let bytes = format!("{route}-{}", Uuid::new_v4()).into_bytes();
+            mount(&server, route, bytes.clone(), 1).await;
+            digests.push(seed_verdict(&fx.pool, &bytes, fx.repo_id, true).await);
+            let (status, body, headers) = pull(&state, &fx.repo_key, route).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(&body[..], &bytes[..], "{route}");
+            assert!(headers.get("X-AK-Scan").is_none(), "{route} is not scanned");
+        }
+        let metadata = format!(
+            "<metadata><groupId>{GROUP}</groupId><artifactId>widget</artifactId>\
+             <versioning><versions><version>1.0</version></versions></versioning></metadata>"
+        );
+        mount(
+            &server,
+            "com/acme/widget/maven-metadata.xml",
+            metadata.clone().into_bytes(),
+            1,
+        )
+        .await;
+        let (status, body, headers) =
+            pull(&state, &fx.repo_key, "com/acme/widget/maven-metadata.xml").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<version>1.0</version>"));
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        drop_verdicts(&fx.pool, &digests).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// GHSA-qxv7-p3mq-88fv on the buffered arm: a jar whose bytes disagree
+    /// with its `.sha1` sidecar is refused (502, like Cargo's cksum) and not
+    /// left in the cache, so the next pull goes back upstream and is refused
+    /// again rather than served from a poisoned entry.
+    #[tokio::test]
+    async fn remote_sidecar_mismatch_is_not_cached() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 2).await;
+        // Not `expect`ed: whether the second resolution is a sidecar cache
+        // hit is the proxy cache's business, not this test's.
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{JAR}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"0123456789abcdef0123456789abcdef01234567".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+
+        for _ in 0..2 {
+            let (status, body, _) = pull(&state, &fx.repo_key, JAR).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_ne!(&body[..], &bytes[..]);
+            assert_eq!(recorded(&fx.pool, fx.repo_id, JAR).await, 0);
+        }
+
+        server.verify().await;
+        drop_verdicts(&fx.pool, &[digest]).await;
+        fx.teardown().await;
+    }
+
+    /// The over-cap fail-open arm hands the Maven half the unscanned stream:
+    /// it must serve the upstream bytes through the normal streaming path.
+    /// (The wrapper's over-cap decision itself is pinned by
+    /// `proxy_helpers::scanned_proxy_file_tests`.)
+    #[tokio::test]
+    async fn oversized_fallback_streams_the_upstream_jar() {
+        use proxy_helpers::ScannedProxyFile;
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let proxy = state.proxy_service.clone().expect("proxy");
+        let uri = server.uri();
+        let coordinate = maven_scan_target(JAR).unwrap().coordinate;
+        let remote = MavenRemote {
+            proxy: &proxy,
+            repo_id: fx.repo_id,
+            repo_key: &fx.repo_key,
+            upstream_url: &uri,
+        };
+        let file = MavenScannedArchive::new(&remote, JAR, coordinate.as_ref());
+        let req = proxy_helpers::ScannedProxyRequest {
+            repo_id: fx.repo_id,
+            repo_key: &fx.repo_key,
+            fetch_base: &uri,
+            format: RepositoryFormat::Maven,
+            source_path: JAR,
+            cache_path: JAR,
+            filename: "widget-1.0.jar",
+            action: crate::services::proxy_scan_service::ProxyScanAction::FailOpen,
+            severity_gate: crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+            ctx: None,
+        };
+        let resp = file
+            .serve_unscanned_stream(&state, &req)
+            .await
+            .expect("streams");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &bytes[..]);
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// Virtual: a scanning member's vulnerable jar is blocked, a clean one is
+    /// served (loudly pending under fail-open) and recorded once on the member.
+    #[tokio::test]
+    async fn virtual_member_scan_blocks_vulnerable_and_serves_clean() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bad_route = "com/acme/bad/1.0/bad-1.0.jar";
+        let good_route = "com/acme/good/1.0/good-1.0.jar";
+        let bad = jar("bad", "1.0");
+        let good = jar("good", "1.0");
+        mount(&server, bad_route, bad.clone(), 1).await;
+        mount(&server, good_route, good.clone(), 1).await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_open").await;
+        let digest = seed_verdict(&fx.pool, &bad, remote_id, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        let (status, body, _) = pull(&state, &virtual_key, bad_route).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "vulnerable member bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "scan_blocked");
+
+        let (status, body, headers) = pull(&state, &virtual_key, good_route).await;
+        assert_eq!(status, StatusCode::OK, "a clean jar still serves");
+        assert_eq!(&body[..], &good[..]);
+        assert_eq!(headers["X-AK-Scan"], "pending");
+        assert_eq!(recorded(&fx.pool, remote_id, good_route).await, 1);
+        assert_eq!(recorded(&fx.pool, remote_id, bad_route).await, 0);
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// Virtual with scanning off everywhere keeps the untouched resolver: a
+    /// digest with a vulnerable verdict streams as before.
+    #[tokio::test]
+    async fn virtual_without_scanning_is_unchanged() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 1).await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        let digest = seed_verdict(&fx.pool, &bytes, remote_id, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        let (status, body, headers) = pull(&state, &virtual_key, JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &bytes[..]);
+        assert!(headers.get("X-AK-Scan").is_none());
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// The cache-key aliases of a refused jar (trailing `/`, and an
+    /// upper-case extension upstream serves the same bytes at) are gated too,
+    /// on the direct Remote route. Before the fix the trailing-slash pull
+    /// streamed the cached vulnerable body with no `X-AK-Scan`.
+    #[tokio::test]
+    async fn remote_archive_aliases_are_gated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        let upper = "com/acme/widget/1.0/widget-1.0.JAR";
+        mount(&server, JAR, bytes.clone(), 1).await;
+        mount(&server, upper, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        // The refused pull caches the body under the jar's key ...
+        let (status, _, _) = pull(&state, &fx.repo_key, JAR).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // ... which the trailing-slash spelling reads back.
+        for route in [format!("{JAR}/"), upper.to_string()] {
+            let (status, body, _) = pull(&state, &fx.repo_key, &route).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route}");
+            assert_ne!(&body[..], &bytes[..], "{route}");
+        }
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// The same aliases through a Virtual whose scanning member already
+    /// cached (and refused) the jar.
+    #[tokio::test]
+    async fn virtual_archive_aliases_are_gated() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        let upper = "com/acme/widget/1.0/widget-1.0.JAR";
+        mount(&server, JAR, bytes.clone(), 1).await;
+        mount(&server, upper, bytes.clone(), 1).await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        let digest = seed_verdict(&fx.pool, &bytes, remote_id, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        for route in [JAR.to_string(), format!("{JAR}/"), upper.to_string()] {
+            let (status, body, _) = pull(&state, &virtual_key, &route).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route}");
+            assert_ne!(&body[..], &bytes[..], "{route}");
+        }
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// A jar whose file name is not the canonical `<artifactId>-<version>`
+    /// is still scanned (no identity pin) instead of streaming unscanned.
+    #[tokio::test]
+    async fn remote_non_canonical_archive_name_is_gated() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let route = "com/acme/widget/1.0/other-1.0.jar";
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, route, bytes.clone(), 1).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+
+        let (status, _, _) = pull(&state, &fx.repo_key, route).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// Encoded `?`/`#`, `;` path parameters and a trailing `.` are refused
+    /// (400) on Remote and Virtual before any classification or fetch: each
+    /// let a non-archive spelling fetch the jar's bytes unscanned.
+    #[tokio::test]
+    async fn ambiguous_paths_are_refused_on_remote_and_virtual() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount(&server, JAR, jar("widget", "1.0"), 0).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        for key in [&remote_key, &virtual_key] {
+            for route in [
+                format!("{JAR}%3Fx"),
+                format!("{JAR}%23x"),
+                format!("{JAR};jsessionid=x"),
+                format!("{JAR}%3Bjsessionid=x"),
+                format!("{JAR}."),
+                "com/acme/widget/1.0/widget-1.0.ja%09r".to_string(),
+                "com/acme/widget/1.0/widget-1.0.ja%0Ar".to_string(),
+                "com/acme/widget/1.0/widget-1.0.ja%7Fr".to_string(),
+                "com/acme/widget/1.0/widget%201.0.jar".to_string(),
+                "com/acme/widget/1.0/widget-1.0.ja%2572".to_string(),
+            ] {
+                let (status, _, _) = pull(&state, key, &route).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{key} {route}");
+            }
+        }
+
+        server.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// With scan-on-proxy on, anything outside the metadata allowlist is
+    /// scanned: an unknown extension is blocked on Remote and Virtual, while
+    /// an allowlisted POM still passes through unscanned.
+    #[tokio::test]
+    async fn unknown_extensions_are_gated_and_metadata_passes_on_remote_and_virtual() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let klib_route = "com/acme/widget/1.0/widget-1.0.klib";
+        let pom_route = "com/acme/widget/1.0/widget-1.0.pom";
+        let klib = format!("klib-{}", Uuid::new_v4()).into_bytes();
+        let pom = format!("<project><!-- {} --></project>", Uuid::new_v4()).into_bytes();
+        mount(&server, klib_route, klib.clone(), 1).await;
+        mount(&server, pom_route, pom.clone(), 1).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        let digests = vec![
+            seed_verdict(&fx.pool, &klib, remote_id, true).await,
+            seed_verdict(&fx.pool, &pom, remote_id, true).await,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        for key in [&remote_key, &virtual_key] {
+            let (status, body, _) = pull(&state, key, klib_route).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{key}");
+            assert_ne!(&body[..], &klib[..], "{key}");
+            let (status, body, headers) = pull(&state, key, pom_route).await;
+            assert_eq!(status, StatusCode::OK, "{key}");
+            assert_eq!(&body[..], &pom[..], "{key}");
+            assert!(headers.get("X-AK-Scan").is_none(), "{key}");
+        }
+
+        drop_verdicts(&fx.pool, &digests).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// Record-only (#3645) on the Maven gate: a vulnerable jar is SERVED and
+    /// marked `X-AK-Scan: recorded`, never blocked, on the direct Remote and
+    /// through a Virtual whose own scanning is off (the member's record-only
+    /// choice then decides the combined policy).
+    #[tokio::test]
+    async fn record_only_serves_recorded_on_remote_and_virtual() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let bytes = jar("widget", "1.0");
+        mount(&server, JAR, bytes.clone(), 1).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "maven", &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "record_only").await;
+        let digest = seed_verdict(&fx.pool, &bytes, remote_id, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        for key in [&remote_key, &virtual_key] {
+            let (status, body, headers) = pull(&state, key, JAR).await;
+            assert_eq!(status, StatusCode::OK, "{key}");
+            assert_eq!(&body[..], &bytes[..], "{key}");
+            assert_eq!(headers["X-AK-Scan"], "recorded", "{key}");
+        }
+        assert_eq!(recorded(&fx.pool, remote_id, JAR).await, 2);
+
+        drop_verdicts(&fx.pool, &[digest]).await;
+        drop(server);
+        tdh::cleanup_member_repo(&fx.pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&fx.pool, virtual_id, dir.path()).await;
+        fx.teardown().await;
+    }
+
+    /// The batched member policy read agrees with the per-member
+    /// stricter-of-two helper for every mix of virtual/member configs.
+    #[tokio::test]
+    async fn batched_member_policies_match_the_per_member_helper() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let up = "http://upstream.example.test";
+        let (closed, _, d1) = tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", up, 1).await;
+        let (open, _, d2) = tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", up, 2).await;
+        let (off, _, d3) = tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", up, 3).await;
+        let (rec, _, d4) = tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", up, 4).await;
+        tdh::enable_proxy_scan(&fx.pool, closed, "fail_closed").await;
+        tdh::enable_proxy_scan(&fx.pool, open, "fail_open").await;
+        tdh::enable_proxy_scan(&fx.pool, rec, "record_only").await;
+        let members = proxy_helpers::authorized_virtual_members(&fx.pool, None, fx.repo_id)
+            .await
+            .unwrap_or_else(|_| panic!("authorized members"));
+        assert_eq!(members.len(), 4);
+        let check = |label: &'static str| {
+            let members = members.clone();
+            let pool = fx.pool.clone();
+            let virtual_id = fx.repo_id;
+            async move {
+                let batched =
+                    proxy_helpers::virtual_member_scan_policies(&pool, virtual_id, &members)
+                        .await
+                        .unwrap_or_else(|_| panic!("policies readable"));
+                for (member, got) in members.iter().zip(batched) {
+                    let (enabled, action, gate) =
+                        proxy_helpers::effective_virtual_scan_policy(&pool, virtual_id, member.id)
+                            .await;
+                    assert_eq!(
+                        got,
+                        enabled.then_some((action, gate)),
+                        "{label}: {}",
+                        member.key
+                    );
+                }
+            }
+        };
+        check("virtual unscanned").await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        check("virtual fail-closed").await;
+
+        // An unreadable config fails the walk closed (503), never unscanned.
+        let dead = tdh::try_pool().await.expect("pool");
+        dead.close().await;
+        let err = proxy_helpers::virtual_member_scan_policies(&dead, fx.repo_id, &members)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for (id, dir) in [(closed, d1), (open, d2), (off, d3), (rec, d4)] {
+            tdh::cleanup_member_repo(&fx.pool, id, &dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// Rows in `download_statistics` for a hosted artifact, polled (bounded)
+    /// because `record_download` writes asynchronously (#2522).
+    async fn hosted_downloads(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    /// A public hosted Maven repository holding `bytes` at `path`, attached
+    /// to the fixture's virtual at `priority`. Returns `(id, dir, artifact)`.
+    async fn attach_hosted_member(
+        fx: &tdh::Fixture,
+        state: &SharedState,
+        path: &str,
+        bytes: &[u8],
+        priority: i32,
+    ) -> (Uuid, std::path::PathBuf, Uuid) {
+        let (hosted_id, hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "maven").await;
+        tdh::publish_repo(&fx.pool, hosted_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, priority).await;
+        let info = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let artifact = tdh::seed_artifact(
+            state,
+            &fx.pool,
+            &info,
+            &format!("maven/{path}"),
+            path,
+            "widget",
+            "1.0",
+            "application/java-archive",
+            Bytes::copy_from_slice(bytes),
+            fx.user_id,
+        )
+        .await;
+        (hosted_id, hosted_dir, artifact)
+    }
+
+    fn virtual_state(fx: &tdh::Fixture) -> SharedState {
+        let storage = fx.storage_dir.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy)
+    }
+
+    /// The common real layout: hosted releases @1, a scanning Central proxy
+    /// @2. The hosted copy is served (and counted once, #4268) and the
+    /// scanning member's upstream is never contacted. For a GAV the hosted
+    /// member owns, `local_owns` takes every Remote member out of the walk;
+    /// for a path that names no GAV, the walk's own unscanned run serves it
+    /// before the scanning member is reached.
+    #[tokio::test]
+    async fn virtual_hosted_member_before_a_scanning_remote_is_served() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let no_gav = "tools/widget/widget-1.0.jar";
+        let state = virtual_state(&fx);
+        let central = MockServer::start().await;
+        mount(&central, JAR, jar("widget", "1.0"), 0).await;
+        mount(&central, no_gav, jar("widget", "1.0"), 0).await;
+        let hosted_bytes = b"hosted-jar".to_vec();
+        let (hosted_id, hosted_dir, gav_row) =
+            attach_hosted_member(&fx, &state, JAR, &hosted_bytes, 1).await;
+        let info = tdh::make_repo_info(hosted_id, "unused", &hosted_dir, "local", None);
+        let no_gav_row = tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &info,
+            &format!("maven/{no_gav}"),
+            no_gav,
+            "widget",
+            "1.0",
+            "application/java-archive",
+            Bytes::copy_from_slice(&hosted_bytes),
+            fx.user_id,
+        )
+        .await;
+        let (remote_id, _, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &central.uri(), 2).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+
+        for (route, row) in [(JAR, gav_row), (no_gav, no_gav_row)] {
+            let (status, body, headers) = pull(&state, &fx.repo_key, route).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(&body[..], &hosted_bytes[..], "{route}");
+            assert!(headers.get("X-AK-Scan").is_none(), "{route}");
+            assert_eq!(hosted_downloads(&fx.pool, row, 1).await, 1, "{route}");
+        }
+
+        central.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        fx.teardown().await;
+    }
+
+    /// A scanning member that misses (upstream 404) or refuses its body as
+    /// not what upstream published (`.sha1` mismatch, 502) is a miss, not a
+    /// verdict: the next, non-scanning member serves, unscanned.
+    #[tokio::test]
+    async fn virtual_scanning_member_miss_falls_through_to_the_next_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let state = virtual_state(&fx);
+        let mismatched = "com/acme/widget/2.0/widget-2.0.jar";
+        let scanning = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{JAR}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1..)
+            .mount(&scanning)
+            .await;
+        let bad = jar("widget", "2.0");
+        mount(&scanning, mismatched, bad.clone(), 1).await;
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{mismatched}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"0123456789abcdef0123456789abcdef01234567".to_vec()),
+            )
+            .mount(&scanning)
+            .await;
+        let plain = MockServer::start().await;
+        let good = jar("widget", "1.0");
+        let good2 = jar("widget", "2.0-plain");
+        mount(&plain, JAR, good.clone(), 1).await;
+        mount(&plain, mismatched, good2.clone(), 1).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &scanning.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &plain.uri(), 2).await;
+        tdh::enable_proxy_scan(&fx.pool, first, "fail_open").await;
+        let digest = seed_verdict(&fx.pool, &bad, first, false).await;
+
+        for (route, expected) in [(JAR, &good), (mismatched, &good2)] {
+            let (status, body, headers) = pull(&state, &fx.repo_key, route).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(&body[..], &expected[..], "{route}: member 2's bytes");
+            assert!(
+                headers.get("X-AK-Scan").is_none(),
+                "{route}: member 2 does not scan"
+            );
+            assert_eq!(recorded(&fx.pool, first, route).await, 0, "{route}");
+        }
+
+        scanning.verify().await;
+        plain.verify().await;
+        drop_verdicts(&fx.pool, &[digest]).await;
+        tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+    }
+
+    /// A sidecar-mismatched body that cannot be evicted is retried once, then
+    /// reported as still cached so the gate refuses with a retryable 503.
+    #[tokio::test]
+    async fn eviction_is_retried_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (fail_first, expected_ok, expected_calls) in [(0, true, 1), (1, true, 2), (2, false, 2)]
+        {
+            let calls = AtomicUsize::new(0);
+            let evicted = evict_with_one_retry(|| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < fail_first {
+                        Err(AppError::Storage("cache backend down".into()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(evicted, expected_ok, "fail_first={fail_first}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "fail_first={fail_first}"
+            );
+        }
+    }
+
+    /// A scanning member's quarantine hold (409) is final: the walk does not
+    /// fall through to a lower-priority member for the same jar.
+    #[tokio::test]
+    async fn virtual_walk_stops_at_a_quarantined_scanning_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let bytes = jar("widget", "1.0");
+        let held = MockServer::start().await;
+        mount(&held, JAR, bytes.clone(), 1).await;
+        let fallback = MockServer::start().await;
+        mount(&fallback, JAR, bytes, 0).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &held.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &fallback.uri(), 2).await;
+        for member in [first, second] {
+            tdh::enable_proxy_scan(&fx.pool, member, "fail_open").await;
+        }
+        tdh::enable_proxy_quarantine(&fx.pool, first, 60).await;
+        let storage = fx.storage_dir.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage, proxy);
+
+        let (status, _, _) = pull(&state, &fx.repo_key, JAR).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the hold is final, not a miss"
+        );
+
+        fallback.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
     }
 }

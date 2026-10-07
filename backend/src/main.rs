@@ -169,6 +169,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+    artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
 
     // Log active allocator
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
@@ -254,23 +255,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             event = "setup_required",
             "Default admin password has not been changed. API mutations are gated by the setup middleware until the change-password flow runs. See the deployment documentation for credential bootstrap details."
         );
-    }
-
-    // Guest access is on by default for backward compatibility; a fresh install
-    // still exposes nothing because repositories are private unless marked
-    // public. Say so, loudly and once, when both are true (#3489).
-    {
-        use artifact_keeper_backend::api::middleware::guest_access;
-        let public_repositories = guest_access::public_repository_count(&db_pool).await?;
-        if let Some(message) =
-            guest_access::startup_notice(config.guest_access_enabled, public_repositories)
-        {
-            tracing::warn!(
-                event = "guest_access_public_repositories",
-                public_repositories,
-                "{message}"
-            );
-        }
     }
 
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
@@ -450,10 +434,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(
                 target: "security",
                 "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
-                 now target ALL RFC1918 / unique-local addresses. Cloud \
-                 metadata IPs and loopback remain blocked. Prefer \
+                 now target ALL RFC1918 / unique-local addresses, whether or \
+                 not AK_SSRF_ALLOW_PRIVATE_CIDRS is also set. Cloud \
+                 metadata IPs and loopback remain blocked. Unset it and use \
                  AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
-                 narrower SSRF surface (issue #1435)."
+                 narrower SSRF surface (issues #1435, #4428)."
             );
         }
     }
@@ -527,20 +512,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // Try to register additional backends if credentials are available and
         // they are not already the primary backend.
         if config.storage_backend != "s3" {
-            if let Ok(s3) = artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
-                tracing::info!("Additional S3 storage backend registered");
-                backends.insert("s3".to_string(), Arc::new(s3));
+            match artifact_keeper_backend::storage::s3::S3Backend::from_env().await {
+                Ok(s3) => {
+                    tracing::info!("Additional S3 storage backend registered");
+                    backends.insert("s3".to_string(), Arc::new(s3));
+                }
+                // Not configured (no S3_BUCKET, no credentials) is the normal
+                // case and stays silent; a malformed public endpoint is an
+                // operator mistake worth surfacing (#4417).
+                Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional S3 storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "azure" {
-            if let Ok(azure_cfg) = artifact_keeper_backend::storage::azure::AzureConfig::from_env()
-            {
-                if let Ok(azure) =
-                    artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
-                {
-                    tracing::info!("Additional Azure storage backend registered");
-                    backends.insert("azure".to_string(), Arc::new(azure));
+            match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
+                Ok(azure_cfg) => {
+                    if let Ok(azure) =
+                        artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
+                    {
+                        tracing::info!("Additional Azure storage backend registered");
+                        backends.insert("azure".to_string(), Arc::new(azure));
+                    }
                 }
+                Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
+                    tracing::warn!(error = %e, "Additional Azure storage backend skipped");
+                }
+                Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
@@ -640,6 +639,25 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // One-shot backfill of the first-class `oci_manifests` existence table
+    // (#1683 / #4433) for manifests committed before migration 268. Every
+    // push/cache since then records its row inline. Backgrounded: nothing
+    // reads the table yet, the pass is additive and idempotent (no-op once
+    // every manifest has a row), and it reads each body from storage, so it
+    // must not delay the HTTP listener bind. Failures are logged inside and
+    // retried on the next start.
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::oci_manifests::run_backfill(
+                &db_pool,
+                storage_registry,
+            )
+            .await;
+        });
+    }
+
     // One-shot repair for Docker/OCI artifacts imported by migration runs
     // that pre-date #2457: those runs stored manifest/blob bytes under
     // generic CAS keys with only `artifacts` rows, so migrated tags were
@@ -701,6 +719,36 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 &db_pool,
             )
             .await;
+        });
+    }
+
+    // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
+    // were compiled by PostgreSQL at create/update time can carry a pattern
+    // that fails every run or (`\b`) protects nothing; name them once per
+    // boot without changing them.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::lifecycle_service::warn_invalid_lifecycle_regexes(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
+    // #1331: name every signing key that is bound to Debian/RPM metadata
+    // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
+    // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
+    // with a fresh key_type='gpg' key. Backgrounded: keygen is slow and this
+    // must never delay or fail startup.
+    {
+        let signing = artifact_keeper_backend::services::signing_service::SigningService::new(
+            db_pool.clone(),
+            &config.jwt_secret,
+        );
+        let auto_migrate = config.signing_auto_migrate_legacy_keys;
+        tokio::spawn(async move {
+            signing.run_legacy_key_scan(auto_migrate).await;
         });
     }
 
@@ -999,6 +1047,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
+    // Prime the runtime guest-access handle (#867) with a real read before
+    // serving anything. Refuse to start if it fails: an instance an admin
+    // locked down through the API must not come up on the default (open).
+    let guest_access = state.guest_access_policy.try_refresh().await.map_err(|e| {
+        artifact_keeper_backend::error::AppError::Database(format!(
+            "failed to read the guest-access setting at startup: {e}"
+        ))
+    })?;
+
+    // Guest access is on by default for backward compatibility; a fresh install
+    // still exposes nothing because repositories are private unless marked
+    // public. Say so, loudly and once, when both are true (#3489).
+    {
+        use artifact_keeper_backend::api::middleware::guest_access;
+        let public_repositories = guest_access::public_repository_count(&state.db).await?;
+        if let Some(message) =
+            guest_access::startup_notice(guest_access.enabled, public_repositories)
+        {
+            tracing::warn!(
+                event = "guest_access_public_repositories",
+                public_repositories,
+                "{message}"
+            );
+        }
+    }
+
     // Fan out authorization-cache and npm computed-packument invalidations
     // from other replicas via Postgres LISTEN/NOTIFY (migration 142 triggers
     // + services/cache_invalidation.rs; the packument event is emitted
@@ -1029,6 +1103,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             db_pool.clone(),
             state.npm_packument_cache.clone(),
             runtime_shutdown_token.clone(),
+            state.upstream_feed_status.clone(),
         );
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
@@ -1040,6 +1115,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.smtp_service.clone(),
         state.event_bus.clone(),
         advisory_client.clone(),
+        state.proxy_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -1056,6 +1132,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Conditionally clone state for the metrics listener before the router takes
     // ownership. The clone only happens when METRICS_PORT is actually configured.
     let metrics_state = config.metrics_port.map(|_| state.clone());
+
+    // Trusted-proxy ranges for the `http_request` span builder below (#4195),
+    // shared into the per-request closure without copying the list.
+    let trace_context_trusted_proxies: std::sync::Arc<
+        [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
+    > = config.rate_limit_trusted_proxy_cidrs.clone().into();
 
     // Build router
     let app = Router::new()
@@ -1152,7 +1234,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
         .layer(TraceLayer::new_for_http().make_span_with(
-            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+            move |request: &axum::http::Request<axum::body::Body>| {
+                // Inbound W3C trace context is adopted only from trusted
+                // proxies once RATE_LIMIT_TRUSTED_PROXY_CIDRS is set (#4195).
+                artifact_keeper_backend::api::middleware::tracing::make_http_request_span(
+                    request,
+                    &trace_context_trusted_proxies,
+                )
+            },
+        )
+        // Status, body size and 5xx error status onto the same span (#4455),
+        // then the default DEBUG "finished processing request" event.
+        .on_response(
+            artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
 
     // The concrete shutdown token used by all servers and background tasks
@@ -1170,7 +1264,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .unwrap_or_else(|_| "9090".to_string())
         .parse::<u16>()
         .unwrap_or(9090);
-    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
+    // (`::1`) needs no brackets (#2161).
+    let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1245,10 +1341,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
+            bind_ip = %config.metrics_bind_ip,
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
+        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
         tokio::spawn(async move {
             let metrics_app = Router::new()

@@ -141,6 +141,7 @@ RUN mkdir -p /mnt/rootfs && \
         tar \
         gzip \
         zstd \
+        libzstd \
     && dnf --installroot /mnt/rootfs --releasever 9 \
         --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
     && dnf --installroot /mnt/rootfs clean all \
@@ -551,6 +552,59 @@ RUN set -eu; \
     fi; \
     echo "grype build: build info verified — google.golang.org/grpc ${recorded} across ${deps} deps"
 
+# ---------- Stage 5a: unsquashfs for the Incus scanner (#4469) ----------
+# incus_scanner.rs extracts SquashFS rootfs images with `unsquashfs`, on both
+# the local Trivy path and the scanner-adapter path. squashfs-tools is a RHEL
+# BaseOS package that the UBI 9 repositories do not carry (checked: `dnf list
+# --available squashfs-tools` and `dnf provides '*/unsquashfs'` find nothing
+# in ubi-9-baseos/appstream/codeready-builder), and CI builds unentitled, so
+# it is built here from the pinned upstream release, as grype is above.
+#
+# Only unsquashfs ships. gzip, xz and zstd cover what Incus/LXD images use;
+# LZO and LZ4 are left out because their runtime libraries are not in the
+# rootfs. The binary links zlib, liblzma and libzstd, all installed by
+# rootfs-builder (`libzstd` is listed there explicitly: the `zstd` CLI package
+# does not pull it in). This UBI build therefore cannot extract LZO- or
+# LZ4-compressed images, which the Alpine image's distro package can.
+#
+# unsquashfs parses attacker-supplied images, so it is built hardened (stack
+# protector, _FORTIFY_SOURCE, PIE, full RELRO); upstream's Makefile defaults to
+# a bare -O2 and RHEL's gcc only adds these under rpmbuild. The build asserts
+# PIE and BIND_NOW with readelf.
+#
+# A self-built C binary is INVISIBLE to the image scanners (Trivy, grype) and
+# to dependabot: nothing will report a future squashfs-tools CVE. Watch
+# upstream releases by hand. The version lives in the one ARG below, so a bump
+# is that line plus its sha256:
+#   curl -sL https://github.com/plougher/squashfs-tools/releases/download/${V}/squashfs-tools-${V}.tar.gz | sha256sum
+#
+# GPL-2.0 s.3(a): the exact source tarball this binary is built from ships in
+# the runtime image next to the licence, under /licenses/squashfs-tools/.
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS squashfs-bin
+ARG SQUASHFS_TOOLS_VERSION=4.7.5
+ARG SQUASHFS_TOOLS_SHA256=547b7b7f4d2e44bf91b6fc554664850c69563701deab9fd9cd7e21f694c88ea6
+RUN dnf install -y --nodocs gcc make binutils zlib-devel xz-devel libzstd-devel \
+    && dnf clean all
+RUN set -eu; \
+    curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://github.com/plougher/squashfs-tools/releases/download/${SQUASHFS_TOOLS_VERSION}/squashfs-tools-${SQUASHFS_TOOLS_VERSION}.tar.gz" \
+      -o /tmp/squashfs-tools.tar.gz; \
+    echo "${SQUASHFS_TOOLS_SHA256}  /tmp/squashfs-tools.tar.gz" | sha256sum -c -; \
+    mkdir -p /src; \
+    tar -xzf /tmp/squashfs-tools.tar.gz -C /src --strip-components=1; \
+    make -C /src/squashfs-tools -j"$(nproc)" \
+      GZIP_SUPPORT=1 XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZO_SUPPORT=0 LZ4_SUPPORT=0 \
+      EXTRA_CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE" \
+      EXTRA_LDFLAGS="-pie -Wl,-z,relro,-z,now" \
+      unsquashfs; \
+    readelf -h /src/squashfs-tools/unsquashfs | grep -q 'DYN '; \
+    readelf -d /src/squashfs-tools/unsquashfs | grep -q 'BIND_NOW'; \
+    install -Dm755 /src/squashfs-tools/unsquashfs /out/unsquashfs; \
+    install -Dm644 /src/COPYING /licenses/squashfs-tools/COPYING; \
+    install -Dm644 /tmp/squashfs-tools.tar.gz \
+      "/licenses/squashfs-tools/squashfs-tools-${SQUASHFS_TOOLS_VERSION}.tar.gz"; \
+    /out/unsquashfs -help >/dev/null
+
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
 # networks (e.g. ARC runner pods) without a first-scan network fetch from
@@ -583,6 +637,11 @@ COPY --from=buildkit-bin /usr/bin/buildctl /usr/local/bin/buildctl
 # licence has to travel with it. Same arrangement the scanner-adapter uses for
 # its self-built trivy (/licenses/trivy).
 COPY --from=grype-bin /licenses/grype /licenses/grype
+
+# unsquashfs for the Incus scanner's SquashFS extraction (#4469), with its
+# GPL-2.0 licence text and the corresponding source tarball (GPL-2.0 s.3(a)).
+COPY --from=squashfs-bin /out/unsquashfs /usr/local/bin/unsquashfs
+COPY --from=squashfs-bin /licenses/squashfs-tools /licenses/squashfs-tools
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
 #

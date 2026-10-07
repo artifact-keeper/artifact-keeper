@@ -28,12 +28,17 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
+use crate::api::handlers::oci_blob_redirect;
+use crate::api::handlers::oci_digest::{
+    compute_sha256, is_digest_reference, verify_digest_or_fall_through,
+};
 use crate::api::handlers::proxy_helpers;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
@@ -1028,12 +1033,6 @@ fn upload_complete_created_response(image_name: &str, digest: &str) -> Response 
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
-}
-
-pub(crate) fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn request_body_stream(
@@ -2767,6 +2766,21 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
         .await?;
     }
 
+    // 4. First-class manifest existence record (#1683 / #4433), in the SAME
+    //    transaction, so a manifest the registry acknowledged always has its
+    //    `oci_manifests` row and a rolled-back commit leaves none. Write-only
+    //    for now: no reader consults the table yet.
+    crate::services::oci_manifests::upsert_in_tx(
+        tx,
+        repo_id,
+        manifest_digest,
+        &crate::services::oci_manifests::ManifestRecord::from_body(
+            manifest_content_type,
+            manifest_body,
+        ),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -3168,6 +3182,9 @@ async fn resolve_repo_inner(
     };
 
     let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
+    // `/v2` does not pass through the repository-visibility middleware, so
+    // the resolved repository is recorded on the request span here (#4455).
+    crate::api::middleware::request_span::record_repository_key(&resolved_key);
     let format: String = repo.try_get("format").map_err(map_db_err)?;
 
     let location = crate::storage::StorageLocation {
@@ -3256,41 +3273,6 @@ fn upstream_blob_path(image: &str, digest: &str) -> String {
 /// Spec: <https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-manifests>
 fn upstream_manifest_path(image: &str, reference: &str) -> String {
     format!("v2/{}/manifests/{}", image, reference)
-}
-
-/// Pure decision: given a requested `digest` reference and the actual
-/// `content` bytes served by an upstream, decide whether to *reject* the
-/// response on a digest mismatch.
-///
-/// Returns `true` only when (a) the requested reference is itself a
-/// content-addressable digest, and (b) the SHA-256 of the served bytes
-/// does not match it. Tags and other non-digest references always return
-/// `false` (nothing to compare against).
-///
-/// Extracted out of `resolve_virtual_blob` / `resolve_virtual_manifest`
-/// for unit-test coverage of the #1348 round-1 security fix without
-/// having to stand up a wiremock upstream.
-fn upstream_content_violates_digest(reference: &str, content: &[u8]) -> bool {
-    is_digest_reference(reference) && compute_sha256(content) != reference
-}
-
-/// Positive-sense counterpart to [`upstream_content_violates_digest`].
-///
-/// Returns `true` when the served `content` is acceptable to forward to the
-/// client: either the reference is a human-readable tag (no digest to
-/// verify against) or the SHA-256 of the bytes matches the requested
-/// content-addressable digest. Returns `false` only on a true digest
-/// mismatch, in which case the caller must "fall through" to the next
-/// virtual-repo member (or surface a 404).
-///
-/// Reads at call sites as
-/// `if !verify_digest_or_fall_through(content, reference) { continue }`,
-/// matching the resolver's existing control flow without the double
-/// negative of the older `if upstream_content_violates_digest(..)` form.
-/// Kept as a thin wrapper instead of replacing the original so existing
-/// call sites + their tests stay stable.
-fn verify_digest_or_fall_through(content: &[u8], reference: &str) -> bool {
-    !upstream_content_violates_digest(reference, content)
 }
 
 /// Where (and how) a virtual-repo blob was found.
@@ -3872,7 +3854,9 @@ pub async fn resolve_virtual_manifest(
                     None => {
                         warn!(
                             "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
-                            member.upstream_url.as_deref().unwrap_or(""),
+                            crate::services::proxy_service::redact_url_for_diagnostics(
+                                member.upstream_url.as_deref().unwrap_or("")
+                            ),
                             reference
                         );
                         // #3836: the member HAS something under this reference,
@@ -3895,31 +3879,6 @@ pub async fn resolve_virtual_manifest(
         );
     }
     None
-}
-
-/// Check whether `reference` looks like an OCI content-addressable digest
-/// rather than a human-readable tag. The grammar (from the OCI Distribution
-/// Spec) is:
-///
-/// ```text
-/// digest    ::= algorithm ":" encoded
-/// algorithm ::= [a-z0-9]([a-z0-9._+-]*[a-z0-9])?
-/// encoded   ::= [a-zA-Z0-9=_-]+
-/// ```
-fn is_digest_reference(reference: &str) -> bool {
-    let Some((algorithm, encoded)) = reference.split_once(':') else {
-        return false;
-    };
-
-    // OCI spec: algorithm = `[a-z0-9]+([+._-][a-z0-9]+)*` (lowercase only)
-    !algorithm.is_empty()
-        && !encoded.is_empty()
-        && algorithm.chars().all(|ch| {
-            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '+' | '.' | '-')
-        })
-        && encoded
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '=' | '_' | '-'))
 }
 
 fn cached_manifest_reference_key(repo_type: &str, reference: &str, digest: &str) -> String {
@@ -4723,19 +4682,27 @@ fn build_oci_proxy_response(
 /// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
 /// path: they are parsed JSON (blob-ref resolution) and, when referenced by
 /// digest, content-address-verified before serving, so they must be buffered.
+/// The upstream path a remote repo's blob is fetched from, which is also the
+/// key the streaming pull-through caches it under. `None` for a repo that is
+/// not a remote with an upstream URL.
+fn remote_blob_cache_path(repo: &OciRepoInfo, digest: &str) -> Option<String> {
+    if repo.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_ref()?;
+    let image = normalize_docker_image(&repo.image, upstream_url);
+    Some(upstream_blob_path(&image, digest))
+}
+
 async fn try_upstream_fetch_streaming_blob_with_range(
     repo: &OciRepoInfo,
     state: &SharedState,
     digest: &str,
     range_header: Option<&str>,
 ) -> Option<Response> {
-    if repo.repo_type != RepositoryType::Remote {
-        return None;
-    }
+    let upstream_path = remote_blob_cache_path(repo, digest)?;
     let upstream_url = repo.upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let image = normalize_docker_image(&repo.image, upstream_url);
-    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
     // UNRECORDED-PROXY-SERVE: a blob is deliberately never counted. #2260 fixed
     // the unit of a Docker "download" as the PULL, counted once at the manifest
     // (`record_oci_manifest_pull`); one pull fetches N blobs, many of them
@@ -5261,10 +5228,10 @@ async fn token(
             // refusal above: an anonymous prober must not be able to tell from
             // the wire whether this instance runs with guest access disabled.
             // The distinction is recorded in the log instead.
-            if !state.config.guest_access_enabled {
+            if !state.guest_access_policy.is_enabled().await {
                 info!(
                     "refusing to mint the anonymous pull token: guest access is \
-                     disabled server-wide (AK_GUEST_ACCESS_ENABLED=false)"
+                     disabled server-wide"
                 );
                 return oci_error(
                     StatusCode::UNAUTHORIZED,
@@ -6060,6 +6027,20 @@ async fn handle_get_blob(
                     )
                 }
             };
+            // #2894: offload the transfer to the object store with a 307 to a
+            // presigned URL when enabled. A remote repo probes for the object
+            // first, because a missing one is re-fetched from upstream below.
+            if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
+                state,
+                storage.as_ref(),
+                &b.storage_key,
+                digest,
+                repo.repo_type == RepositoryType::Remote,
+            )
+            .await
+            {
+                return redirect;
+            }
             // Stream the blob straight from the backend instead of buffering the
             // whole (potentially multi-GiB) layer in heap. Content-Length comes
             // from the authoritative oci_blobs.size_bytes column. (#1528)
@@ -6127,6 +6108,18 @@ async fn handle_get_blob(
                             )
                         }
                     };
+                    // #2894: presigned 307 for a local member's blob.
+                    if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
+                        state,
+                        storage.as_ref(),
+                        &storage_key,
+                        digest,
+                        false,
+                    )
+                    .await
+                    {
+                        return redirect;
+                    }
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
                         Ok(stream) => {
@@ -6193,6 +6186,17 @@ async fn handle_get_blob(
     // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
     // content-address-verify the digest before serving, so streaming
     // introduces no verification regression. (#2192 / #1608 Phase 4c)
+    //
+    // #2894: a blob the proxy cache already holds is redirected to a presigned
+    // URL instead; a cold cache streams (and fills the cache) as before.
+    if let Some(cache_path) = remote_blob_cache_path(&repo, digest) {
+        if let Some(redirect) =
+            oci_blob_redirect::try_proxy_cached_blob_redirect(state, &repo.key, &cache_path, digest)
+                .await
+        {
+            return redirect;
+        }
+    }
     if let Some(resp) =
         try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header).await
     {
@@ -9470,24 +9474,52 @@ async fn blob_reblock_applies(
 /// proxy owners the STRICTEST configured gate across the set wins (the same
 /// OR-of-both-sides direction as #3025), and a config read fault fails closed
 /// to block-on-any.
+///
+/// Record-only (#3645) uses the same rule as the manifest half
+/// ([`proxy_helpers::stricter_scan_policy`]) but over a WIDER population:
+/// the manifest gate combines only the virtual and the ONE member that
+/// resolved the manifest, while this gate combines every owner in
+/// `ref_owners` (for a virtual: every gated member plus the virtual itself,
+/// because a blob digest is not tied to one member). It is record-only exactly
+/// when every owner with scanning enabled chose `record_only` and no owner is
+/// fail-closed. On a direct Remote, or a virtual whose members all agree, a
+/// layer of an image served `recorded` therefore serves too. On a virtual that
+/// mixes a record-only member with an enforcing one, the blob seam can still
+/// enforce for a manifest the record-only member served (the stricter
+/// direction). Beside an enforcing owner, a record-only owner contributes no
+/// gate of its own, so the enforcing owner's own threshold applies.
 async fn blob_severity_gate(
     scan_cfg: &crate::services::scan_config_service::ScanConfigService,
     ref_owners: &[(&str, Uuid)],
 ) -> crate::services::proxy_scan_service::ProxySeverityGate {
-    use crate::services::proxy_scan_service::ProxySeverityGate;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let mut gate: Option<ProxySeverityGate> = None;
+    let mut any_enabled = false;
+    let mut all_enabled_record_only = true;
+    let mut any_fail_closed = false;
     for (repo_type, repo_id) in ref_owners {
         if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
             return ProxySeverityGate::BlockOnAny;
         }
-        let g = scan_cfg
-            .proxy_severity_gate(*repo_id)
-            .await
-            .unwrap_or(ProxySeverityGate::BlockOnAny);
+        let (Ok(g), Ok(action), Ok(enabled)) = (
+            scan_cfg.proxy_severity_gate(*repo_id).await,
+            scan_cfg.proxy_scan_action(*repo_id).await,
+            scan_cfg.is_proxy_scan_enabled(*repo_id).await,
+        ) else {
+            return ProxySeverityGate::BlockOnAny;
+        };
+        any_fail_closed |= action == ProxyScanAction::FailClosed;
+        if enabled {
+            any_enabled = true;
+            all_enabled_record_only &= action.is_record_only();
+        }
         gate = Some(match gate {
             Some(acc) => ProxySeverityGate::stricter(acc, g),
             None => g,
         });
+    }
+    if any_enabled && all_enabled_record_only && !any_fail_closed {
+        return ProxySeverityGate::RecordOnly;
     }
     gate.unwrap_or(ProxySeverityGate::BlockOnAny)
 }
@@ -9793,10 +9825,11 @@ pub(crate) async fn oci_stage_and_scan_image(
 }
 
 /// The digest-keyed verdict gate for a proxy-served OCI image manifest.
-/// Returns `Ok(pending)` when the manifest may be served (`pending` selects
+/// Returns `Ok(served)` when the manifest may be served (`served` selects
 /// the loud `X-AK-Scan: pending` header on the fail-open
-/// serve-before-verdict path), or `Err(response)` with the fully-built OCI
-/// error (403 vulnerable / 423 inconclusive-fail-closed).
+/// serve-before-verdict path, or `X-AK-Scan: recorded` when a record-only
+/// repository serves a vulnerable verdict, #3645), or `Err(response)` with
+/// the fully-built OCI error (403 vulnerable / 423 inconclusive-fail-closed).
 async fn gate_oci_proxy_manifest_scan(
     state: &SharedState,
     repo: &OciRepoInfo,
@@ -9805,7 +9838,7 @@ async fn gate_oci_proxy_manifest_scan(
     manifest_content_type: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
-) -> Result<bool, Response> {
+) -> Result<proxy_helpers::ProxyScanServed, Response> {
     // The verdict key is the CONTENT digest computed over the bytes being
     // served — the same digest `docker pull` pins — never anything the
     // upstream index advertised.
@@ -9844,7 +9877,7 @@ async fn gate_oci_proxy_manifest_scan(
     )
     .await
     {
-        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => Ok(pending),
+        proxy_helpers::ProxyScanServeOutcome::Serve(served) => Ok(served),
         proxy_helpers::ProxyScanServeOutcome::Deny(resp) => {
             Err(oci_scan_deny_response(resp.status(), &image_ref))
         }
@@ -9852,8 +9885,9 @@ async fn gate_oci_proxy_manifest_scan(
 }
 
 /// Run the #3003 PR-2 inline scan gate for a Remote-repo manifest serve when
-/// it applies. `Ok(false)` = serve normally, `Ok(true)` = serve with the
-/// loud pending header, `Err(response)` = blocked/withheld.
+/// it applies. `Ok(None)` = not gated, serve normally; `Ok(Some(served))` =
+/// gated and served (see [`with_scan_header`]); `Err(response)` =
+/// blocked/withheld.
 ///
 /// Applies ONLY to Remote (proxy) repositories: hosted content is already
 /// blocked on pull by scan-on-upload + quarantine
@@ -9867,16 +9901,16 @@ async fn maybe_gate_remote_manifest_scan(
     reference: &str,
     manifest_body: &Bytes,
     manifest_content_type: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<proxy_helpers::ProxyScanServed>, Response> {
     if repo.repo_type != RepositoryType::Remote || oci_pull_is_scan_scoped(claims) {
-        return Ok(false);
+        return Ok(None);
     }
     if !crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
         .is_proxy_scan_enabled(repo.id)
         .await
         .unwrap_or(false)
     {
-        return Ok(false);
+        return Ok(None);
     }
     // #3024: a Docker schema1 (v2s1) manifest has no config descriptor, so
     // the runnable-image predicate below can never gate it AND the scanner
@@ -9896,7 +9930,7 @@ async fn maybe_gate_remote_manifest_scan(
         ));
     }
     if !oci_manifest_requires_proxy_scan(manifest_body) {
-        return Ok(false);
+        return Ok(None);
     }
     let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
     gate_oci_proxy_manifest_scan(
@@ -9909,14 +9943,24 @@ async fn maybe_gate_remote_manifest_scan(
         severity_gate,
     )
     .await
+    .map(Some)
 }
 
-/// Attach the loud fail-open `X-AK-Scan: pending` header to a manifest
-/// response served before a verdict exists.
-fn with_scan_pending_header(mut resp: Response, pending: bool) -> Response {
-    if pending {
-        resp.headers_mut()
-            .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+/// Attach `X-AK-Scan` to a gated manifest response: the loud fail-open
+/// `pending` when served before a verdict exists, or `recorded` when a
+/// record-only repository serves a vulnerable verdict (#3645). A clean (or
+/// ungated) manifest carries no header, as before.
+fn with_scan_header(
+    mut resp: Response,
+    served: Option<proxy_helpers::ProxyScanServed>,
+) -> Response {
+    if let Some(served) = served {
+        if served != proxy_helpers::ProxyScanServed::Clean {
+            resp.headers_mut().insert(
+                "X-AK-Scan",
+                axum::http::HeaderValue::from_static(served.header_value()),
+            );
+        }
     }
     resp
 }
@@ -10150,7 +10194,7 @@ async fn handle_get_manifest(
                 reindex_parent_index_packages_for_child(state, &repo, &manifest_digest).await;
             }
             record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
-            return with_scan_pending_header(
+            return with_scan_header(
                 build_local_manifest_response(&manifest_digest, &content_type, data, true),
                 scan_pending,
             );
@@ -10199,7 +10243,7 @@ async fn handle_get_manifest(
             // manifest by digest and (b) on a cold pull runs `stage_proxy_image_blobs`
             // under the member id, so the blob blocklist below has refs to find.
             // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
-            let mut scan_pending = false;
+            let mut scan_pending = None;
             if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
                 let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
@@ -10219,7 +10263,7 @@ async fn handle_get_manifest(
                     )
                     .await
                     {
-                        Ok(pending) => pending,
+                        Ok(served) => Some(served),
                         Err(resp) => return resp,
                     };
                 }
@@ -10267,7 +10311,7 @@ async fn handle_get_manifest(
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
             }
-            return with_scan_pending_header(
+            return with_scan_header(
                 build_oci_proxy_response(
                     &data,
                     content_type,
@@ -10336,7 +10380,7 @@ async fn handle_get_manifest(
         // re-sizes the PARENT's row instead of publishing one for the child.
         reindex_parent_index_packages_for_child(state, &repo, &digest).await;
         record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
-        return with_scan_pending_header(
+        return with_scan_header(
             build_oci_proxy_response(
                 &content,
                 ct,
@@ -12022,26 +12066,23 @@ async fn handle_delete_manifest(
     } else {
         OciIndexDeleteScope::NamedReference
     };
-    if let Err(e) =
-        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest, scope)
-            .await
+    if let Err(e) = delete_oci_manifest_and_artifacts(
+        &state.db,
+        repo.id,
+        &repo.image,
+        reference,
+        &digest,
+        scope,
+    )
+    .await
     {
+        // The raw sqlx text is logged, never returned (#3667).
         return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
-            &e.to_string(),
+            crate::api::handlers::db_err_message(&e),
         );
     }
-
-    // Soft-delete the corresponding artifact record
-    let artifact_path = format!("v2/{}/manifests/{}", repo.image, reference);
-    let _ = sqlx::query!(
-        "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE repository_id = $1 AND path = $2",
-        repo.id,
-        artifact_path
-    )
-    .execute(&state.db)
-    .await;
 
     info!(
         "Manifest deleted: {}:{} (digest {})",
@@ -12146,19 +12187,79 @@ pub(crate) fn rest_unwind_digest<'a>(
     }
 }
 
-/// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
-/// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
-/// tag, its `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects`
-/// edges so storage GC can reclaim the blobs. Shared by the OCI
-/// `handle_delete_manifest` path and the REST `delete_artifact` path so a UI
-/// delete leaves the index consistent.
+/// Soft-deletes the `artifacts` rows a `/v2` manifest delete removes (#4450).
 ///
-/// Thin begin/commit wrapper around [`delete_oci_manifest_content_in_tx`],
-/// mirroring the `persist_tag_and_refs` / `persist_tag_and_refs_in_tx` pair.
+/// Binds: `$1` repository id, `$2` the exact `v2/<image>/manifests/<reference>`
+/// path the request named, `$3` whether the delete is content-addressed, `$4`
+/// the deleted digest's sha256 hex (NULL for a non-sha256 digest).
 ///
-/// The caller is responsible for soft-deleting the corresponding `artifacts`
-/// row and for resolving `digest`; this function only unwinds the OCI index.
-pub(crate) async fn delete_oci_manifest_content(
+/// * Every delete tombstones the row at the named path.
+/// * A content-addressed delete (`DELETE .../manifests/<digest>`) also
+///   tombstones every other manifest-shaped row in the repository whose bytes
+///   ARE that digest: the tag rows (`v2/<image>/manifests/<tag>`) and any
+///   migrated source-layout rows. The index unwind already removed every
+///   `oci_tags` row for the digest repository-wide, so these rows are the last
+///   record claiming the manifest exists. Left live, the startup
+///   `oci_migration_reindex` took them for never-indexed migrated manifests
+///   and re-registered the deleted image on the next restart, and storage GC
+///   could never reclaim its body.
+///
+/// The path shape is the one the reindex scans
+/// ([`crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql`]),
+/// so no row the reindex could pick up for this digest survives the delete.
+/// Blob and non-manifest rows are never touched. Rows already in the trash are
+/// skipped so their `updated_at` keeps the time they were really deleted.
+pub(crate) const SOFT_DELETE_MANIFEST_ARTIFACTS_SQL: &str = concat!(
+    r#"
+    UPDATE artifacts a
+    SET is_deleted = true, updated_at = NOW()
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+      AND (
+            a.path = $2
+         OR ($3 AND a.checksum_sha256 = $4 AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+    r#")
+      )
+    "#
+);
+
+/// The `artifacts` path a `/v2` manifest request names.
+fn v2_manifest_artifact_path(image: &str, reference: &str) -> String {
+    format!("v2/{}/manifests/{}", image, reference)
+}
+
+/// Soft-delete the `artifacts` rows for a `/v2` manifest delete inside the
+/// caller's transaction. See [`SOFT_DELETE_MANIFEST_ARTIFACTS_SQL`] for which
+/// rows go. Returns the number of rows tombstoned.
+pub(crate) async fn soft_delete_manifest_artifacts_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(SOFT_DELETE_MANIFEST_ARTIFACTS_SQL)
+        .bind(repo_id)
+        .bind(v2_manifest_artifact_path(image, reference))
+        .bind(scope == OciIndexDeleteScope::ContentAddressed)
+        .bind(digest.strip_prefix("sha256:"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// The whole database side of `DELETE /v2/<name>/manifests/<reference>`: the
+/// OCI index unwind ([`delete_oci_manifest_content_in_tx`]) and the `artifacts`
+/// soft-delete ([`soft_delete_manifest_artifacts_in_tx`]) in ONE transaction,
+/// so a failure of either leaves neither half applied (#4450). Previously the
+/// soft-delete ran after the unwind had committed and its error was dropped.
+///
+/// Lock order matches the push path and the REST delete: the index rows
+/// (`oci_tags`, the ref edges, `oci_manifests` last within the unwind, as
+/// documented in #4441) before the `artifacts` rows.
+pub(crate) async fn delete_oci_manifest_and_artifacts(
     pool: &PgPool,
     repo_id: Uuid,
     image: &str,
@@ -12168,10 +12269,16 @@ pub(crate) async fn delete_oci_manifest_content(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    soft_delete_manifest_artifacts_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
     tx.commit().await
 }
 
-/// Transaction-participating form of [`delete_oci_manifest_content`]. Runs the
+/// Remove a Docker/OCI manifest from the OCI index: delete its `oci_tags`
+/// row(s) and, when the digest is no longer tagged by any sibling tag, its
+/// `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects` edges so
+/// storage GC can reclaim the blobs. Shared by the OCI `handle_delete_manifest`
+/// path (through [`delete_oci_manifest_and_artifacts`]) and the REST
+/// `delete_artifact` path so a UI delete leaves the index consistent. Runs the
 /// tag removal and index cleanup against a caller-owned transaction WITHOUT
 /// committing, so the caller can bind the unwind to a larger atomic unit — the
 /// REST delete pairs it with the `artifacts` soft-delete UPDATE so a failure of
@@ -12243,6 +12350,18 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
         .bind(digest)
         .execute(&mut **tx)
         .await?;
+
+        // #1683 / #4433: a delete that names the manifest by digest deletes
+        // the manifest itself, so forget its existence record (kept while a
+        // live parent index still references it). A tag-name delete only
+        // removes a tag; the manifest stays addressable by digest.
+        if crate::services::oci_manifests::delete_removes_record(
+            scope == OciIndexDeleteScope::ContentAddressed,
+            reference,
+            digest,
+        ) {
+            crate::services::oci_manifests::delete_in_tx(tx, repo_id, digest).await?;
+        }
     }
 
     Ok(())
@@ -13974,45 +14093,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // compute_sha256
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_compute_sha256_empty() {
-        let hash = compute_sha256(b"");
-        assert!(hash.starts_with("sha256:"));
-        // SHA256 of empty string is a well-known value
-        assert_eq!(
-            hash,
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn test_compute_sha256_hello_world() {
-        let hash = compute_sha256(b"hello world");
-        assert!(hash.starts_with("sha256:"));
-        assert_eq!(
-            hash,
-            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-
-    #[test]
-    fn test_compute_sha256_deterministic() {
-        let h1 = compute_sha256(b"test data");
-        let h2 = compute_sha256(b"test data");
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_compute_sha256_different_data() {
-        let h1 = compute_sha256(b"data1");
-        let h2 = compute_sha256(b"data2");
-        assert_ne!(h1, h2);
-    }
-
-    // -----------------------------------------------------------------------
     // parse_oci_path
     // -----------------------------------------------------------------------
 
@@ -14396,31 +14476,6 @@ mod tests {
         assert!(!oci_manifest_is_docker_schema1(
             br#"{"schemaVersion":2,"fsLayers":"x"}"#
         ));
-    }
-
-    #[test]
-    fn test_is_digest_reference_accepts_sha256_reference() {
-        assert!(is_digest_reference(
-            "sha256:4d3f1c5bcf9f2f7e4a3e2d1c0b9a887766554433221100ffeeddccbbaa998877"
-        ));
-    }
-
-    #[test]
-    fn test_is_digest_reference_accepts_non_hex_encoded() {
-        // OCI spec allows [a-zA-Z0-9=_-]+ in the encoded part
-        assert!(is_digest_reference(
-            "multihash+base58:QmRZxt2b1FVZPNqd8hsiykDL3TdBDeTSPX9Kv46HmX4Kgd"
-        ));
-    }
-
-    #[test]
-    fn test_is_digest_reference_rejects_tag_name() {
-        assert!(!is_digest_reference("latest"));
-    }
-
-    #[test]
-    fn test_is_digest_reference_rejects_tag_with_dot() {
-        assert!(!is_digest_reference("v1.0.0"));
     }
 
     // -----------------------------------------------------------------------
@@ -16267,189 +16322,6 @@ mod tests {
             super::upstream_manifest_path("nginx", "sha256:1234"),
             "v2/nginx/manifests/sha256:1234"
         );
-    }
-
-    // upstream_content_violates_digest: pure decision used by both
-    // resolve_virtual_blob and resolve_virtual_manifest before serving
-    // upstream content. This is the #1348 round-1 security fix.
-
-    #[test]
-    fn test_upstream_content_violates_digest_tag_reference_never_rejects() {
-        // Tags carry no content-addressable contract: the resolver must
-        // accept whatever upstream serves and let the caller compute the
-        // digest itself.
-        assert!(!super::upstream_content_violates_digest(
-            "latest",
-            b"any bytes here"
-        ));
-        assert!(!super::upstream_content_violates_digest("v1.2.3", b""));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_matching_digest_accepts() {
-        // sha256 of "hello world" is a well-known value. The resolver must
-        // accept content whose computed digest equals the requested digest.
-        let bytes = b"hello world";
-        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        assert!(!super::upstream_content_violates_digest(digest, bytes));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_mismatch_rejects() {
-        // Requesting a digest that does *not* match the upstream's bytes
-        // must trip the violation guard. This is the bytes-substitution
-        // attack vector PR #1348 round 1 concern #3 closes.
-        let bytes = b"hello world";
-        // Anything other than the real sha256 of "hello world".
-        let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(super::upstream_content_violates_digest(fake_digest, bytes));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_empty_content_with_wrong_digest() {
-        // Real sha256 of "" is e3b0c44...b855. Anything else with empty
-        // content must be rejected.
-        assert!(super::upstream_content_violates_digest(
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            b""
-        ));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_empty_content_with_correct_digest() {
-        // The canonical empty-string sha256 must pass.
-        assert!(!super::upstream_content_violates_digest(
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            b""
-        ));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_invalid_digest_format_rejects() {
-        // A reference that *looks* like a digest but fails `is_digest_reference`
-        // (uppercase algorithm, empty algorithm, empty encoded) must not be
-        // treated as a content-addressable assertion, even when the bytes
-        // would not match. Belt-and-braces: violates_digest returns false
-        // because `is_digest_reference` short-circuits to false first.
-        assert!(!super::upstream_content_violates_digest(
-            "SHA256:abc",
-            b"hi"
-        ));
-        assert!(!super::upstream_content_violates_digest(":abc", b"hi"));
-        assert!(!super::upstream_content_violates_digest("sha256:", b"hi"));
-    }
-
-    #[test]
-    fn test_upstream_content_violates_digest_case_sensitive_hex_mismatch() {
-        // sha256 hex digests are lowercase per the OCI grammar. An uppercase
-        // hex reference does not equal the lowercase computed digest, so the
-        // helper must reject it as a mismatch.
-        let bytes = b"hello world";
-        let upper = "sha256:B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
-        assert!(super::upstream_content_violates_digest(upper, bytes));
-    }
-
-    // verify_digest_or_fall_through: positive-sense counterpart used by
-    // resolver call sites to keep the control flow readable. The wrapper is
-    // a strict negation of upstream_content_violates_digest; the tests here
-    // pin both that contract and the call-site idiom ("continue when false").
-
-    #[test]
-    fn test_verify_digest_or_fall_through_tag_reference_always_accepts() {
-        // Tags have no content-addressable contract — the caller must
-        // forward whatever upstream served and compute the digest itself.
-        assert!(super::verify_digest_or_fall_through(b"anything", "latest"));
-        assert!(super::verify_digest_or_fall_through(b"", "v1.2.3"));
-        assert!(super::verify_digest_or_fall_through(
-            b"\x00\x01\x02",
-            "release-candidate"
-        ));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_matching_digest_accepts() {
-        let bytes = b"hello world";
-        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        assert!(super::verify_digest_or_fall_through(bytes, digest));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_mismatched_digest_falls_through() {
-        // The exact resolver idiom: "false" means the caller should `continue`
-        // to the next virtual-repo member instead of forwarding bytes.
-        let bytes = b"hello world";
-        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(!super::verify_digest_or_fall_through(bytes, wrong));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_empty_content_with_canonical_digest() {
-        // The canonical empty-string sha256 verifies correctly.
-        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(super::verify_digest_or_fall_through(b"", canonical));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_empty_content_with_wrong_digest_falls_through() {
-        // Empty body + non-canonical empty-digest = mismatch, must fall through.
-        let wrong = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        assert!(!super::verify_digest_or_fall_through(b"", wrong));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_invalid_digest_format_accepts() {
-        // Malformed digest references (uppercase algorithm, empty parts) are
-        // *not* content-addressable. The wrapper treats them as tag-like and
-        // accepts the content; the caller still computes a digest from the
-        // bytes for response headers.
-        assert!(super::verify_digest_or_fall_through(b"hi", "SHA256:abc"));
-        assert!(super::verify_digest_or_fall_through(b"hi", ":abc"));
-        assert!(super::verify_digest_or_fall_through(b"hi", "sha256:"));
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_is_inverse_of_violates_digest() {
-        // Property: the wrapper is the strict negation of the underlying
-        // helper across both branch outputs.
-        let cases: &[(&[u8], &str)] = &[
-            (b"hello world", "latest"),
-            (
-                b"hello world",
-                "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-            ),
-            (
-                b"hello world",
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            ),
-            (
-                b"",
-                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            ),
-            (b"hi", "SHA256:abc"),
-        ];
-        for (bytes, reference) in cases {
-            assert_eq!(
-                super::verify_digest_or_fall_through(bytes, reference),
-                !super::upstream_content_violates_digest(reference, bytes),
-                "wrapper must invert violates_digest for ({:?}, {:?})",
-                std::str::from_utf8(bytes).unwrap_or("<binary>"),
-                reference,
-            );
-        }
-    }
-
-    #[test]
-    fn test_verify_digest_or_fall_through_large_content_canonical_digest() {
-        // Realistic OCI blob size (~256KiB) of a deterministic byte pattern.
-        // Confirms the helper computes the digest over the *whole* slice,
-        // not just a prefix, by feeding a pattern whose sha256 we precompute.
-        let bytes: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
-        let computed = super::compute_sha256(&bytes);
-        assert!(super::verify_digest_or_fall_through(&bytes, &computed));
-
-        // And a one-byte truncation must trip the mismatch path.
-        let truncated = &bytes[..bytes.len() - 1];
-        assert!(!super::verify_digest_or_fall_through(truncated, &computed));
     }
 
     // VirtualResolveKey / VirtualResolveKind: constructor, equality,
@@ -23172,8 +23044,12 @@ mod oci_blob_upload_streaming_tests {
             .await
         });
 
+        // The final PUT is parked at the storage copy until `release_copy` is
+        // notified below, so a PATCH that waited behind the commit would never
+        // complete. A generous timeout therefore still proves "rejected, not
+        // blocked" without racing request auth on a loaded runner (#4353).
         let patch_result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), &mut patch_task).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut patch_task).await;
         let (patch_status, _patch_headers, _patch_body) = patch_result
             .expect("PATCH should be rejected promptly while final PUT is committing")
             .expect("PATCH task should complete");
@@ -28260,6 +28136,7 @@ mod token_refresh_grant_tests {
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |c| {
             c.guest_access_enabled = enabled;
+            c.guest_access_env_pinned = true;
         });
         let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         Some((pool, user_id, username, state, auth_service))
@@ -30003,7 +29880,7 @@ mod proxy_scan_block_tests {
         fx.teardown().await;
 
         assert!(
-            matches!(exempt, Ok(false)),
+            matches!(exempt, Ok(None)),
             "a scan-scoped pull must bypass the gate entirely"
         );
         match unscoped {
@@ -33789,6 +33666,269 @@ mod proxy_scan_block_tests {
              the packages catalog; got {rows:?}"
         );
     }
+
+    // ── #3645: record-only on the OCI manifest gate and the blob seam ──
+
+    async fn set_scan_config(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        enabled: bool,
+        block: bool,
+        threshold: &str,
+        action: &str,
+    ) {
+        crate::services::scan_config_service::ScanConfigService::new(pool.clone())
+            .upsert_config(
+                repo_id,
+                &crate::services::scan_config_service::UpsertScanConfigRequest {
+                    scan_enabled: Some(true),
+                    scan_on_upload: Some(false),
+                    scan_on_proxy: Some(enabled),
+                    block_on_policy_violation: Some(block),
+                    severity_threshold: Some(threshold.to_string()),
+                    proxy_scan_action: Some(action.to_string()),
+                },
+            )
+            .await
+            .expect("upsert scan config");
+    }
+
+    /// `with_scan_header` stamps `pending` and `recorded`; a clean or
+    /// ungated manifest carries no header, exactly as before #3645.
+    #[test]
+    fn with_scan_header_stamps_pending_and_recorded_only() {
+        use crate::api::handlers::proxy_helpers::ProxyScanServed;
+        let header = |served| {
+            with_scan_header(
+                axum::response::IntoResponse::into_response(StatusCode::OK),
+                served,
+            )
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(header(None), None);
+        assert_eq!(header(Some(ProxyScanServed::Clean)), None);
+        assert_eq!(
+            header(Some(ProxyScanServed::Pending)).as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            header(Some(ProxyScanServed::Recorded)).as_deref(),
+            Some("recorded")
+        );
+    }
+
+    /// The blob seam's severity gate under record-only: all-record-only
+    /// owners (a scanning-off owner does not veto) never block; a fail-closed
+    /// owner, a hosted owner, or an enabled fail-open owner keeps enforcing,
+    /// and a record-only owner beside an enforcing owner yields to that
+    /// owner's own threshold.
+    #[tokio::test]
+    async fn blob_severity_gate_record_only_matrix() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mk = |t: &'static str| {
+            let pool = pool.clone();
+            async move { tdh::create_repo(&pool, t, "docker").await.0 }
+        };
+        let ro = mk("remote").await;
+        let ro2 = mk("remote").await;
+        let off = mk("remote").await; // no scan_configs row: scanning off
+        let closed_off = mk("remote").await;
+        let open = mk("remote").await;
+        let open_threshold = mk("remote").await;
+        let hosted = mk("local").await;
+        set_scan_config(&pool, ro, true, false, "high", "record_only").await;
+        set_scan_config(&pool, ro2, true, true, "critical", "record_only").await;
+        set_scan_config(&pool, closed_off, false, false, "high", "fail_closed").await;
+        set_scan_config(&pool, open, true, false, "high", "fail_open").await;
+        set_scan_config(&pool, open_threshold, true, true, "high", "fail_open").await;
+
+        let cfg = crate::services::scan_config_service::ScanConfigService::new(pool.clone());
+        let r = "remote";
+        type Case<'a> = (&'a str, Vec<(&'a str, Uuid)>, ProxySeverityGate);
+        let cases: Vec<Case> = vec![
+            (
+                "all record-only",
+                vec![(r, ro), (r, ro2)],
+                ProxySeverityGate::RecordOnly,
+            ),
+            (
+                "scanning-off owner does not veto",
+                vec![(r, ro), (r, off)],
+                ProxySeverityGate::RecordOnly,
+            ),
+            (
+                "fail-closed owner (even scanning-off) enforces",
+                vec![(r, ro), (r, closed_off)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "hosted owner enforces",
+                vec![(r, ro), ("local", hosted)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "enabled fail-open owner enforces",
+                vec![(r, ro), (r, open)],
+                ProxySeverityGate::BlockOnAny,
+            ),
+            (
+                "record-only yields to the enforcing owner's threshold",
+                vec![(r, ro), (r, open_threshold)],
+                ProxySeverityGate::Threshold(Severity::High),
+            ),
+        ];
+        let mut got = Vec::new();
+        for (name, owners, _) in &cases {
+            got.push((*name, blob_severity_gate(&cfg, owners).await));
+        }
+        for id in [ro, ro2, off, closed_off, open, open_threshold, hosted] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        for ((name, _, want), (_, got)) in cases.iter().zip(got) {
+            assert_eq!(got, *want, "{name}");
+        }
+    }
+
+    /// End to end on a record-only Remote: an image with a cached vulnerable
+    /// verdict is served `X-AK-Scan: recorded`, and its config and layer
+    /// blobs serve too (no layer 403 behind a served manifest). Switching the
+    /// repository to enforcement blocks the manifest AND its blobs from the
+    /// same recorded verdict.
+    #[tokio::test]
+    async fn record_only_manifest_is_recorded_and_its_blobs_serve() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let cfg_bytes = unique_fixture_bytes("ro-cfg");
+        let layer_bytes = unique_fixture_bytes("ro-layer");
+        let (manifest, config, layer) = image_manifest(&cfg_bytes, &layer_bytes);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "latest",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+        set_scan_config(&fx.pool, fx.repo_id, true, false, "high", "record_only").await;
+
+        record_manifest_blob_refs(&fx.pool, fx.repo_id, &format!("sha256:{digest}"), &manifest)
+            .await
+            .expect("record blob refs");
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [(&config, cfg_bytes.clone()), (&layer, layer_bytes.clone())] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let get_blob = |d: String| {
+            let state = state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(None), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let manifest_resp = pull_manifest(&state, &fx.repo_key, "latest").await;
+        let ro_manifest = (
+            manifest_resp.status(),
+            manifest_resp
+                .headers()
+                .get("X-AK-Scan")
+                .map(|v| v.to_str().unwrap().to_string()),
+        );
+        let ro_blobs = (
+            get_blob(config.clone()).await,
+            get_blob(layer.clone()).await,
+        );
+
+        set_scan_config(&fx.pool, fx.repo_id, true, false, "high", "fail_open").await;
+        let enforced_manifest = pull_manifest(&state, &fx.repo_key, "latest").await.status();
+        let enforced_blobs = (
+            get_blob(config.clone()).await,
+            get_blob(layer.clone()).await,
+        );
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            ro_manifest,
+            (StatusCode::OK, Some("recorded".to_string())),
+            "record-only serves the vulnerable manifest, marked recorded"
+        );
+        assert_eq!(
+            ro_blobs,
+            (StatusCode::OK, StatusCode::OK),
+            "a manifest served recorded must not be followed by a blob 403"
+        );
+        assert_eq!(enforced_manifest, StatusCode::FORBIDDEN);
+        assert_eq!(
+            enforced_blobs,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "enforcement blocks the blobs from the same recorded verdict"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -35206,6 +35346,154 @@ mod content_encoding_forwarding_tests {
         let _ = std::fs::remove_dir_all(&storage_path);
         let _ = std::fs::remove_dir_all(format!("/tmp/oci-ce-{}", repo_id));
     }
+
+    /// Seed a blob into an S3-backed repo's storage plus its `oci_blobs` row.
+    async fn seed_cloud_blob(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        blob: &[u8],
+    ) -> String {
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(blob.to_vec()))
+        );
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set cloud backend");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: format!("/tmp/oci-ce-{}", repo_id),
+        };
+        let storage_key = super::blob_storage_key(&digest);
+        state
+            .storage_for_repo(&location)
+            .expect("storage backend for repo")
+            .put(&storage_key, bytes::Bytes::from(blob.to_vec()))
+            .await
+            .expect("seed blob bytes");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(blob.len() as i64)
+        .bind(&storage_key)
+        .execute(pool)
+        .await
+        .expect("insert oci_blobs row");
+        digest
+    }
+
+    /// #2894: with presigned downloads enabled on a signing backend, a blob GET
+    /// (with or without Range, direct or through a virtual repo's local member)
+    /// answers 307 to the signed URL with Docker-Content-Digest, while HEAD
+    /// keeps answering 200 with headers only (a presigned URL is bound to GET).
+    #[tokio::test]
+    async fn test_get_blob_redirects_to_presigned_url_2894() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let (virt_id, virt_key) = insert_repo(&pool, "virtual", None).await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("link member");
+        let digest = seed_cloud_blob(&state, &pool, repo_id, b"presigned oci layer").await;
+
+        let mut ranged = anon_headers();
+        ranged.insert(RANGE, "bytes=0-3".parse().unwrap());
+        let mut results = Vec::new();
+        for (image, headers) in [
+            (format!("{repo_key}/myimage"), anon_headers()),
+            (format!("{repo_key}/myimage"), ranged),
+            (format!("{virt_key}/myimage"), anon_headers()),
+        ] {
+            let resp =
+                super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+            results.push(tdh::collect_response(resp).await);
+        }
+        let head = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &format!("{repo_key}/myimage"),
+            &digest,
+        )
+        .await;
+        let (head_status, _b, head_headers) = tdh::collect_response(head).await;
+
+        for id in [virt_id, repo_id] {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        for (status, body, headers) in &results {
+            assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT, "GET must 307");
+            assert!(body.is_empty(), "a redirect carries no layer bytes");
+            let location = tdh::header_str(headers, LOCATION).unwrap_or_default();
+            assert!(
+                location.contains("X-Amz-Signature") && location.contains(&digest[7..]),
+                "must redirect to the signed blob key, got {location}"
+            );
+            assert_eq!(
+                tdh::header_str(
+                    headers,
+                    axum::http::header::HeaderName::from_static("docker-content-digest")
+                )
+                .as_deref(),
+                Some(digest.as_str())
+            );
+        }
+        assert_eq!(head_status, StatusCode::OK, "HEAD must never redirect");
+        assert!(tdh::header_str(&head_headers, LOCATION).is_none());
+    }
+
+    /// #2894 negative control: the same S3-shaped backend without the operator
+    /// opt-in keeps streaming the layer with 200.
+    #[tokio::test]
+    async fn test_get_blob_streams_when_presigned_downloads_disabled_2894() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let blob = b"streamed oci layer";
+        let digest = seed_cloud_blob(&state, &pool, repo_id, blob).await;
+        let resp = super::handle_get_blob(
+            &state,
+            &anon_headers(),
+            "http://ak.test",
+            &format!("{repo_key}/myimage"),
+            &digest,
+        )
+        .await;
+        let (status, body, _h) = tdh::collect_response(resp).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &blob[..]);
+    }
 }
 
 /// #3206: a Docker Remote repository must behave as a pull-through cache.
@@ -36092,6 +36380,48 @@ mod oci_read_authz_tests {
              read baseline on a public repo (#2329)"
         );
         assert_eq!(outsider_tags, StatusCode::OK, "public tags/list unchanged");
+    }
+
+    /// #3813 follow-up: an `internal` repository is pullable over `/v2` by an
+    /// authenticated principal holding no grant on it (manifest, blob and
+    /// tags), through the real router, while the anonymous pull token is
+    /// still refused.
+    #[tokio::test]
+    async fn internal_repo_reads_allowed_for_ungranted_authenticated_principal() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("make repo internal");
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+
+        let (manifest, manifest_body) = f.call("GET", f.manifest_path(), &outsider_bearer).await;
+        let (blob, blob_body) = f.call("GET", f.blob_path(), &outsider_bearer).await;
+        let (tags, _) = f.call("GET", f.tags_path(), &outsider_bearer).await;
+        let (anon_manifest, anon_body) = f.call("GET", f.manifest_path(), &anon).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            manifest,
+            StatusCode::OK,
+            "an authenticated grant-less principal must pull an internal manifest"
+        );
+        assert!(String::from_utf8_lossy(&manifest_body).contains(MANIFEST_MARKER));
+        assert_eq!(blob, StatusCode::OK, "and its layer blob");
+        assert_eq!(blob_body.as_ref(), LAYER_BODY);
+        assert_eq!(tags, StatusCode::OK, "and list its tags");
+        assert_ne!(
+            anon_manifest,
+            StatusCode::OK,
+            "the anonymous pull token must not reach an internal repository"
+        );
+        assert!(!String::from_utf8_lossy(&anon_body).contains(MANIFEST_MARKER));
     }
 
     /// When fine-grained `permissions` rules exist for the repository, the

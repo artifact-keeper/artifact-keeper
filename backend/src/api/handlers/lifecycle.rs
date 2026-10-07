@@ -14,7 +14,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::lifecycle_service::{
     CreateLifecyclePolicyRequest, LifecyclePolicy, LifecycleService, PolicyExecutionResult,
-    UpdateLifecyclePolicyRequest,
+    ProxyCacheExecutionResult, UpdateLifecyclePolicyRequest,
 };
 
 #[derive(OpenApi)]
@@ -37,10 +37,17 @@ use crate::services::lifecycle_service::{
         CreateLifecyclePolicyRequest,
         UpdateLifecyclePolicyRequest,
         PolicyExecutionResult,
+        ProxyCacheExecutionResult,
         LifecycleCapabilities,
     ))
 )]
 pub struct LifecycleApiDoc;
+
+/// The lifecycle service with the proxy cache attached, so a run can evict
+/// Remote repositories' cached objects (#3734).
+fn lifecycle_service(state: &SharedState) -> LifecycleService {
+    LifecycleService::new(state.db.clone()).with_proxy_service(state.proxy_service.clone())
+}
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -99,7 +106,7 @@ pub async fn capabilities() -> Json<LifecycleCapabilities> {
         (status = 403, description = "Administrator required"),
         (status = 404, description = "Policy or repository not found"),
         (status = 409, description = "Concurrent scope edits; retry the request"),
-        (status = 422, description = "Global policy cannot have explicit assignments"),
+        (status = 422, description = "Global policy cannot have explicit assignments, or a Remote repository the policy cannot reclaim anything in"),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -107,7 +114,7 @@ pub async fn attach_repository(
     State(state): State<SharedState>,
     Path((id, repository_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<LifecyclePolicy>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     Ok(Json(
         service
             .set_repository_assignment(id, repository_id, true)
@@ -137,7 +144,7 @@ pub async fn detach_repository(
     State(state): State<SharedState>,
     Path((id, repository_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<LifecyclePolicy>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     Ok(Json(
         service
             .set_repository_assignment(id, repository_id, false)
@@ -167,7 +174,7 @@ pub async fn list_policies(
     State(state): State<SharedState>,
     Query(query): Query<ListPoliciesQuery>,
 ) -> Result<Json<Vec<LifecyclePolicy>>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let policies = service.list_policies(query.repository_id).await?;
     Ok(Json(policies))
 }
@@ -182,6 +189,7 @@ pub async fn list_policies(
     request_body = CreateLifecyclePolicyRequest,
     responses(
         (status = 200, description = "Policy created successfully", body = LifecyclePolicy),
+        (status = 422, description = "Invalid scope, or a Remote repository the policy cannot reclaim anything in"),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -190,7 +198,7 @@ pub async fn create_policy(
     Extension(_auth): Extension<AuthExtension>,
     Json(payload): Json<CreateLifecyclePolicyRequest>,
 ) -> Result<Json<LifecyclePolicy>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let policy = service.create_policy(payload).await?;
     Ok(Json(policy))
 }
@@ -214,7 +222,7 @@ pub async fn get_policy(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LifecyclePolicy>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let policy = service.get_policy(id).await?;
     Ok(Json(policy))
 }
@@ -232,6 +240,7 @@ pub async fn get_policy(
     request_body = UpdateLifecyclePolicyRequest,
     responses(
         (status = 200, description = "Policy updated successfully", body = LifecyclePolicy),
+        (status = 422, description = "Invalid scope, or a Remote repository the policy cannot reclaim anything in"),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -241,7 +250,7 @@ pub async fn update_policy(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateLifecyclePolicyRequest>,
 ) -> Result<Json<LifecyclePolicy>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let policy = service.update_policy(id, payload).await?;
     Ok(Json(policy))
 }
@@ -266,7 +275,7 @@ pub async fn delete_policy(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     service.delete_policy(id).await?;
     Ok(())
 }
@@ -295,7 +304,7 @@ pub async fn execute_policy(
             "Admin privileges required".to_string(),
         ));
     }
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let result = service.execute_policy(id, false).await?;
     Ok(Json(result))
 }
@@ -318,7 +327,7 @@ pub async fn preview_policy(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PolicyExecutionResult>> {
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let result = service.execute_policy(id, true).await?;
     Ok(Json(result))
 }
@@ -343,7 +352,7 @@ pub async fn execute_all_policies(
             "Admin privileges required".to_string(),
         ));
     }
-    let service = LifecycleService::new(state.db.clone());
+    let service = lifecycle_service(&state);
     let results = service.execute_all_enabled().await?;
     Ok(Json(results))
 }
@@ -676,6 +685,7 @@ mod tests {
             bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["policy_name"], "test-policy");
@@ -700,6 +710,7 @@ mod tests {
                 "timeout on artifact A".to_string(),
                 "locked artifact B".to_string(),
             ],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["errors"].as_array().unwrap().len(), 2);

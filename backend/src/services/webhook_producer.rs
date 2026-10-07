@@ -25,44 +25,56 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::event_bus::{DomainEvent, EventBus};
 
-/// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
-/// to the underscore-form string used in the `webhooks.events` text array
-/// (e.g. "artifact_uploaded", "repository_deleted").
+/// Every EventBus event type that produces a webhook delivery, paired with
+/// the underscore-form string used in the `webhooks.events` text array
+/// (e.g. `"artifact.uploaded"` -> `"artifact_uploaded"`).
 ///
 /// The webhook system uses snake_case underscore identifiers to match
 /// `WebhookEvent::Display` in `crate::api::handlers::webhooks`. The EventBus
-/// uses dotted, lower-case identifiers. This function bridges the two.
+/// uses dotted, lower-case identifiers. This table bridges the two and is
+/// the single source of truth for which webhook events can fire: webhook
+/// create validates subscriptions against `WebhookEvent::ALL`, and a test
+/// there pins that set to exactly the right-hand column here (#4419).
+pub const BUS_TO_WEBHOOK_EVENT: &[(&str, &str)] = &[
+    // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
+    // the artifact_uploaded webhook. Same alias as email_dispatcher.
+    //
+    // #3411 settled which of the two is the event: `artifact.uploaded` is
+    // what `ArtifactService::finalize_upload` publishes, and
+    // `artifact.created` stays an accepted ALIAS on this side only — it is
+    // emitted by nothing, deliberately, because both names collapse onto
+    // one subscription and emitting both would double-deliver.
+    ("artifact.created", "artifact_uploaded"),
+    ("artifact.uploaded", "artifact_uploaded"),
+    ("artifact.deleted", "artifact_deleted"),
+    ("repository.created", "repository_created"),
+    ("repository.deleted", "repository_deleted"),
+    ("user.created", "user_created"),
+    ("user.deleted", "user_deleted"),
+    ("build.started", "build_started"),
+    ("build.completed", "build_completed"),
+    ("build.failed", "build_failed"),
+    ("age_gate.queued", "age_gate_queued"),
+    ("age_gate.approved", "age_gate_approved"),
+    ("age_gate.rejected", "age_gate_rejected"),
+    // A decided review voided back to pending (#2968): without this entry
+    // subscribers that saw the approval/rejection never learn it was
+    // reopened — the gap #2264's review-identity work rides along with.
+    ("age_gate.reopened", "age_gate_reopened"),
+];
+
+/// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
+/// to the underscore-form string used in the `webhooks.events` text array
+/// (e.g. "artifact_uploaded", "repository_deleted"), per
+/// [`BUS_TO_WEBHOOK_EVENT`].
 ///
 /// Returns `None` for events that do not have a corresponding `WebhookEvent`
 /// variant. Such events are silently skipped (no rows are enqueued).
 pub fn map_event_type(event_type: &str) -> Option<&'static str> {
-    match event_type {
-        // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
-        // the artifact_uploaded webhook. Same alias as email_dispatcher.
-        //
-        // #3411 settled which of the two is the event: `artifact.uploaded` is
-        // what `ArtifactService::finalize_upload` publishes, and
-        // `artifact.created` stays an accepted ALIAS on this side only — it is
-        // emitted by nothing, deliberately, because both names collapse onto
-        // one subscription and emitting both would double-deliver.
-        "artifact.created" | "artifact.uploaded" => Some("artifact_uploaded"),
-        "artifact.deleted" => Some("artifact_deleted"),
-        "repository.created" => Some("repository_created"),
-        "repository.deleted" => Some("repository_deleted"),
-        "user.created" => Some("user_created"),
-        "user.deleted" => Some("user_deleted"),
-        "build.started" => Some("build_started"),
-        "build.completed" => Some("build_completed"),
-        "build.failed" => Some("build_failed"),
-        "age_gate.queued" => Some("age_gate_queued"),
-        "age_gate.approved" => Some("age_gate_approved"),
-        "age_gate.rejected" => Some("age_gate_rejected"),
-        // A decided review voided back to pending (#2968): without this arm
-        // subscribers that saw the approval/rejection never learn it was
-        // reopened — the gap #2264's review-identity work rides along with.
-        "age_gate.reopened" => Some("age_gate_reopened"),
-        _ => None,
-    }
+    BUS_TO_WEBHOOK_EVENT
+        .iter()
+        .find(|(bus, _)| *bus == event_type)
+        .map(|(_, webhook)| *webhook)
 }
 
 /// Build the v1 JSON payload that gets stored in `webhook_deliveries.payload`.
@@ -375,6 +387,35 @@ const MAPPED_WITHOUT_PRODUCER: &[(&str, &str)] = &[
 mod tests {
     // ----- producer inventory gate (#3411) -------------------------------
 
+    /// Every `.rs` file under `rel` (relative to the crate root), recursively.
+    fn rust_sources(rel: &str) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("crate src readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel),
+            &mut files,
+        );
+        files
+    }
+
+    /// A source file truncated at its `#[cfg(test)] mod tests {` marker, so
+    /// what only a test does never counts as production behaviour.
+    fn production_source(body: &str) -> &str {
+        match body.find("#[cfg(test)]\nmod tests {") {
+            Some(at) => &body[..at],
+            None => body,
+        }
+    }
+
     /// Collect every event-type string literal the tree publishes.
     ///
     /// Scans the crate source for the `EventBus` emit/publish surface and takes
@@ -411,21 +452,7 @@ mod tests {
             "DomainEvent::now(",
             "DomainEvent::now_for_repo(",
         ];
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("crate src readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let files = rust_sources("src");
         assert!(
             files.len() >= 100,
             "found only {} source files — wrong crate root?",
@@ -439,10 +466,7 @@ mod tests {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let body = std::fs::read_to_string(&path).unwrap_or_default();
-            let body = match body.find("#[cfg(test)]\nmod tests {") {
-                Some(at) => &body[..at],
-                None => &body[..],
-            };
+            let body = production_source(&body);
             for call in CALLS {
                 let mut from = 0usize;
                 while let Some(rel) = body[from..].find(call) {
@@ -541,6 +565,135 @@ mod tests {
                 by_file.get(file)
             );
         }
+    }
+
+    // ----- artifact-writer gate (#3939) ----------------------------------
+
+    /// Handler files whose production code writes an `artifacts` row but
+    /// legitimately references no `artifact.uploaded` producer, each with the
+    /// reason. Everything else that writes the table must produce the event.
+    const ARTIFACT_WRITERS_WITHOUT_PRODUCER: &[(&str, &str)] = &[
+        (
+            "proxy_helpers.rs",
+            "defines the shared `insert_artifact` chokepoint; every caller \
+             registers through `register_published_package` (scanned in its own \
+             file), so emitting here would double-deliver (#3939)",
+        ),
+        (
+            "test_db_helpers.rs",
+            "test-only fixtures that seed rows; not a publish path",
+        ),
+    ];
+
+    /// What counts as an `artifact.uploaded` producer reference in a handler:
+    /// the hosted-publish catalog registration (which emits) and the
+    /// row-holding emit used by promotion, approval, Git LFS and chunked
+    /// upload completion.
+    const ARTIFACT_UPLOADED_PRODUCER_REFS: &[&str] =
+        &["register_published_package", ".emit_artifact_uploaded("];
+
+    /// True when `src` writes the `artifacts` table: a raw
+    /// `INSERT INTO artifacts` (not `artifacts_*` / `artifact_metadata`) or a
+    /// call through the shared `insert_artifact` helper.
+    fn writes_artifacts(src: &str) -> bool {
+        const INSERT: &str = "INSERT INTO artifacts";
+        let raw = src.match_indices(INSERT).any(|(at, _)| {
+            !src[at + INSERT.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        raw || src.contains("insert_artifact(")
+    }
+
+    /// Map each `api/handlers` file that writes `artifacts` in production code
+    /// to whether it references an `artifact.uploaded` producer.
+    fn handler_artifact_writers() -> std::collections::BTreeMap<String, bool> {
+        let mut out = std::collections::BTreeMap::new();
+        for path in rust_sources("src/api/handlers") {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let src = production_source(&body);
+            if !writes_artifacts(src) {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let produces = ARTIFACT_UPLOADED_PRODUCER_REFS
+                .iter()
+                .any(|r| src.contains(r));
+            out.insert(file, produces);
+        }
+        out
+    }
+
+    /// THE #3939 gate: a handler that writes an `artifacts` row must also
+    /// produce `artifact.uploaded`, or a webhook subscriber silently hears
+    /// nothing for that format (cran, hex, ansible, puppet, rubygems, the
+    /// promotion and approval copies, Git LFS and chunked uploads all did).
+    /// The allowlist is checked in both directions so it cannot rot.
+    #[test]
+    fn every_handler_that_writes_artifacts_produces_artifact_uploaded() {
+        let writers = handler_artifact_writers();
+        let allowed: std::collections::BTreeSet<&str> = ARTIFACT_WRITERS_WITHOUT_PRODUCER
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+
+        let silent: Vec<&str> = writers
+            .iter()
+            .filter(|(file, produces)| !**produces && !allowed.contains(file.as_str()))
+            .map(|(file, _)| file.as_str())
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "these handlers write `artifacts` but never produce artifact.uploaded, \
+             so webhooks never fire for them: {silent:?}. Call \
+             package_service::register_published_package (hosted publish) or \
+             EventBus::emit_artifact_uploaded (row already in hand), or record \
+             the reason in ARTIFACT_WRITERS_WITHOUT_PRODUCER."
+        );
+
+        let stale: Vec<&str> = allowed
+            .iter()
+            .filter(|f| writers.get(**f) != Some(&false))
+            .copied()
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "ARTIFACT_WRITERS_WITHOUT_PRODUCER entries that no longer write \
+             `artifacts` silently (or no longer exist): {stale:?}. Remove them."
+        );
+    }
+
+    /// The writer gate is only as good as its scanner: it must find the
+    /// formats known to write `artifacts` both ways (raw SQL and the shared
+    /// helper), or the gate above would pass vacuously.
+    #[test]
+    fn artifact_writer_scanner_finds_known_writers() {
+        let writers = handler_artifact_writers();
+        for known in ["cargo.rs", "hex.rs", "promotion.rs", "proxy_helpers.rs"] {
+            assert!(
+                writers.contains_key(known),
+                "the artifact-writer scanner must flag {known}; it found {writers:?}"
+            );
+        }
+        assert!(writers.len() >= 25, "suspiciously few writers: {writers:?}");
+    }
+
+    #[test]
+    fn writes_artifacts_matches_the_table_not_its_neighbours() {
+        assert!(writes_artifacts(
+            "sqlx::query(\"INSERT INTO artifacts (id) VALUES ($1)\")"
+        ));
+        assert!(writes_artifacts("INSERT INTO artifacts\n"));
+        assert!(writes_artifacts("proxy_helpers::insert_artifact(&db, art)"));
+        assert!(!writes_artifacts(
+            "INSERT INTO artifact_metadata (artifact_id)"
+        ));
+        assert!(!writes_artifacts("INSERT INTO artifacts_archive (id)"));
+        assert!(!writes_artifacts("SELECT * FROM artifacts"));
     }
 
     use super::*;

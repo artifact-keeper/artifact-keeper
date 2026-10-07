@@ -1,0 +1,6 @@
+---
+section: Added
+issues: [#4400, #2464]
+---
+- **Offline content bundles: versioned manifest format, job tables and an admin-only `/api/v1/bundles` API skeleton** (#4400, #2464). This is the first of three steps toward exporting repositories on an online instance and importing them into a disconnected one. The bundle is an uncompressed, inspectable tar with content-addressed blobs that keep their real file extension, and a versioned `manifest.json` that already reserves fields for sequenced delta sets, per-record signatures and media volume sets (DVD-R through BD-R XL). `GET /api/v1/bundles/format` describes the format, `POST /api/v1/bundles/manifest/validate` checks a manifest, and the job endpoints list export and import jobs. `POST /exports` and `POST /imports` answer 501 Not Implemented until the later steps land. The bundle reader refuses path traversal, absolute paths, links, devices, duplicate entries, compressed streams and oversized input before anything is unpacked.
+  Scan results now record whether this instance's scanner produced them (`scan_results.origin`), and hash-based scan reuse only considers local scans. Scan evidence carried in a bundle is stored separately, so it can never mark future uploads of the same bytes as already scanned.

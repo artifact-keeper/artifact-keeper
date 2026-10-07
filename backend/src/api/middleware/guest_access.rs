@@ -1,7 +1,10 @@
 //! Guest-access guard middleware (issue #850).
 //!
 //! Enforces a server-wide policy that disables anonymous (unauthenticated)
-//! access. When `config.guest_access_enabled` is `false`, this middleware
+//! access. The policy is read at request time from the runtime
+//! [`GuestAccessPolicy`] handle (#867: `AK_GUEST_ACCESS_ENABLED` when set
+//! explicitly, else the admin-managed `system_settings` row, else `true`), so
+//! an admin flip applies without a restart. When it is `false`, this middleware
 //! returns `401 Unauthorized` for any request that does not present valid
 //! credentials, with a small allowlist for endpoints that must remain
 //! reachable so users and package clients can authenticate:
@@ -9,6 +12,8 @@
 //! * `/api/v1/auth/*`              login, refresh, logout, SSO callbacks
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
+//! * `/api/v1/banners`             active maintenance banners (#2155)
+//! * `/api/v1/webhooks/jwks`       public keys webhook receivers verify with
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -78,13 +83,17 @@ use crate::api::middleware::auth::{
 };
 use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
+use crate::services::guest_access_policy::GuestAccessPolicy;
 
 /// Shared state for the guest-access guard.
 ///
-/// Holds the policy flag and the `AuthService` needed to validate tokens.
+/// Holds the runtime policy handle and the `AuthService` needed to validate
+/// tokens. The policy is the same `Arc` the admin settings endpoint writes
+/// through (#867), so a flip is enforced on the next request without a
+/// restart: the write refreshes the handle's cache with the new value.
 #[derive(Clone)]
 pub struct GuestAccessState {
-    pub guest_access_enabled: bool,
+    pub policy: Arc<GuestAccessPolicy>,
     pub auth_service: Arc<AuthService>,
 }
 
@@ -96,6 +105,11 @@ pub struct GuestAccessState {
 /// endpoint is exempt — the OCI Distribution *content* surface included
 /// (#3854). An OCI client still learns where to authenticate, because the
 /// refusal it gets carries the token-endpoint challenge; see the module docs.
+///
+/// `/api/v1/webhooks/jwks` (#921) serves only public keys: webhook
+/// receivers hold no Artifact Keeper credentials and must still be able to
+/// verify `v2=` signatures. Exact match; the rest of `/api/v1/webhooks`
+/// stays gated.
 ///
 /// `/v2/token` is the one OCI entry, and it is not a carve-out for anonymity:
 /// it is the endpoint by which credentials are *obtained*, the OCI analogue of
@@ -116,6 +130,8 @@ fn is_allowlisted(path: &str) -> bool {
             | "/readyz"
             | "/livez"
             | "/api/v1/system/config"
+            | "/api/v1/banners"
+            | "/api/v1/webhooks/jwks"
             | "/v2/token"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
@@ -213,7 +229,7 @@ pub async fn guest_access_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.guest_access_enabled {
+    if state.policy.is_enabled().await {
         return next.run(request).await;
     }
 
@@ -286,10 +302,11 @@ pub fn startup_notice(guest_access_enabled: bool, public_repositories: i64) -> O
         "repositories are"
     };
     Some(format!(
-        "AK_GUEST_ACCESS_ENABLED is on and {public_repositories} {plural} public: anonymous \
-         clients can list and download from them. Set AK_GUEST_ACCESS_ENABLED=false to refuse \
-         anonymous access server-wide (this also coerces every repository to private), or mark \
-         the repositories private individually."
+        "Guest access is on and {public_repositories} {plural} public: anonymous clients can \
+         list and download from them. To refuse anonymous access server-wide, turn guest access \
+         off with PATCH /api/v1/admin/settings/system {{\"guest_access_enabled\": false}} \
+         (or pin it with AK_GUEST_ACCESS_ENABLED=false), or mark the repositories private \
+         individually."
     ))
 }
 
@@ -327,6 +344,22 @@ mod tests {
     fn allowlist_setup_namespace() {
         assert!(is_allowlisted("/api/v1/setup"));
         assert!(is_allowlisted("/api/v1/setup/status"));
+    }
+
+    #[test]
+    fn allowlist_public_banners_exactly() {
+        // #2155: the login page shows maintenance banners before anyone has
+        // authenticated. Only the public list is exempt -- the admin CRUD
+        // surface and anything that merely starts with the bytes stay gated.
+        assert!(is_allowlisted("/api/v1/banners"));
+        for p in [
+            "/api/v1/banners/",
+            "/api/v1/banners/x",
+            "/api/v1/bannersX",
+            "/api/v1/admin/banners",
+        ] {
+            assert!(!is_allowlisted(p), "{p} must not be allowlisted");
+        }
     }
 
     #[test]
@@ -383,6 +416,17 @@ mod tests {
                 "{p} must not ride the /v2/token entry into the allowlist"
             );
         }
+    }
+
+    #[test]
+    fn allowlist_webhook_jwks_is_exact() {
+        assert!(is_allowlisted("/api/v1/webhooks/jwks"));
+        assert!(!is_allowlisted("/api/v1/webhooks"));
+        assert!(!is_allowlisted("/api/v1/webhooks/"));
+        assert!(!is_allowlisted("/api/v1/webhooks/jwks/extra"));
+        assert!(!is_allowlisted(
+            "/api/v1/webhooks/00000000-0000-0000-0000-000000000000"
+        ));
     }
 
     #[test]
@@ -594,7 +638,7 @@ mod tests {
         config.guest_access_enabled = guest_access_enabled;
         let auth_service = Arc::new(AuthService::new(lazy_pool(), Arc::new(config)));
         GuestAccessState {
-            guest_access_enabled,
+            policy: Arc::new(GuestAccessPolicy::fixed(guest_access_enabled)),
             auth_service,
         }
     }
@@ -1022,7 +1066,7 @@ mod tests {
         let _phantom: Option<AuthExtension> = None;
 
         let state = GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service,
         };
         let app = make_app(state);
@@ -1071,7 +1115,7 @@ mod tests {
         config.guest_access_enabled = false;
         let auth_service = Arc::new(AuthService::new(pool, Arc::new(config)));
         let state = GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service,
         };
 
@@ -1116,7 +1160,7 @@ mod tests {
         let mut config = Config::test_config();
         config.guest_access_enabled = false;
         GuestAccessState {
-            guest_access_enabled: false,
+            policy: Arc::new(GuestAccessPolicy::fixed(false)),
             auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
         }
     }
@@ -1399,8 +1443,8 @@ mod tests {
         let many = startup_notice(true, 7).expect("public repositories warn");
         assert!(many.contains("7 repositories are public"), "{many}");
         for m in [&one, &many] {
+            assert!(m.contains("PATCH /api/v1/admin/settings/system"), "{m}");
             assert!(m.contains("AK_GUEST_ACCESS_ENABLED=false"), "{m}");
-            assert!(m.contains("coerces every repository to private"), "{m}");
         }
     }
 

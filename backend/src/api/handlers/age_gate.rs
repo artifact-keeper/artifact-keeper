@@ -477,6 +477,9 @@ pub async fn update_repo_age_gate(
                     age_gate_enabled: Some(body.enabled),
                     age_gate_min_age_days: Some(body.min_age_days),
                     age_gate_mode: Some(mode.as_str().to_string()),
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
                 }),
         )
         .await;

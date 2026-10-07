@@ -118,6 +118,7 @@ async fn test_tag_pattern_keep_deletes_non_matching_artifacts() {
             config: serde_json::json!({"pattern": "^(release-|v)"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .expect("failed to create policy");
@@ -201,6 +202,7 @@ async fn test_tag_pattern_keep_all_match_deletes_nothing() {
             config: serde_json::json!({"pattern": "^release-"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -242,6 +244,7 @@ async fn test_tag_pattern_keep_none_match_deletes_all() {
             config: serde_json::json!({"pattern": "^release-"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -284,6 +287,7 @@ async fn test_tag_pattern_delete_still_works() {
             config: serde_json::json!({"pattern": "^snapshot-"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -388,6 +392,7 @@ async fn test_size_quota_lru_evicts_never_downloaded_first() {
             config: serde_json::json!({"quota_bytes": 200}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -458,6 +463,7 @@ async fn test_size_quota_lru_frequently_downloaded_survives() {
             config: serde_json::json!({"quota_bytes": 100}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -784,6 +790,7 @@ async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
             config: serde_json::json!({"pattern": "-snapshot-images$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .expect("failed to create policy");
@@ -875,6 +882,7 @@ async fn test_max_age_days_cascades_oci_tags() {
             config: serde_json::json!({"days": 7}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .expect("failed to create policy");
@@ -993,6 +1001,7 @@ async fn test_max_age_days_uses_last_push_for_moving_oci_tag() {
             config: serde_json::json!({"days": 90}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .expect("failed to create max-age policy");
@@ -1074,6 +1083,7 @@ async fn test_cascade_respects_repo_scope() {
             config: serde_json::json!({"pattern": "-images$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1137,6 +1147,7 @@ async fn test_cascade_handles_port_in_image_name() {
             config: serde_json::json!({"pattern": "snapshot-keep-me$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1210,6 +1221,7 @@ async fn test_cascade_handles_digest_reference() {
             config: serde_json::json!({"days": 7}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1303,6 +1315,7 @@ async fn test_execute_policy_reclaims_orphan_oci_tags() {
             config: serde_json::json!({"pattern": "^never-matches$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1424,6 +1437,7 @@ async fn test_cascade_picks_up_orphans_from_prior_run() {
             config: serde_json::json!({"pattern": "^never-matches-anything$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1493,6 +1507,7 @@ async fn test_size_quota_under_limit_evicts_nothing() {
             config: serde_json::json!({"quota_bytes": 500}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1593,6 +1608,7 @@ async fn test_max_versions_cascades_oci_tags() {
             config: serde_json::json!({"keep": 1}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1691,6 +1707,7 @@ async fn test_no_downloads_days_cascades_oci_tags() {
             config: serde_json::json!({"days": 7}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1762,6 +1779,7 @@ async fn test_tag_pattern_keep_cascades_oci_tags() {
             config: serde_json::json!({"pattern": ":v"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1836,6 +1854,7 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
             config: serde_json::json!({"quota_bytes": 200}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1924,6 +1943,7 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
             config: serde_json::json!({"days": 7}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -1992,6 +2012,7 @@ async fn cascade_prunes_sole_tag_of_expired_manifest() {
             config: serde_json::json!({"pattern": ":prod$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -2052,6 +2073,7 @@ async fn cascade_prunes_redundant_tag_when_sibling_survives() {
             config: serde_json::json!({"pattern": ":stale$"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();
@@ -2117,6 +2139,7 @@ async fn cascade_prunes_all_tags_when_every_backing_artifact_expired() {
             config: serde_json::json!({"pattern": ":prod"}),
             priority: None,
             cron_schedule: None,
+            enabled: None,
         })
         .await
         .unwrap();

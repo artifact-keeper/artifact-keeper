@@ -167,13 +167,20 @@ impl CargoHandler {
             .map_err(|e| AppError::Validation(format!("Invalid Cargo.toml: {}", e)))
     }
 
-    /// Extract Cargo.toml from .crate package
+    /// Extract Cargo.toml from .crate package.
+    ///
+    /// The package's own manifest is the top-level `<name>-<version>/Cargo.toml`
+    /// entry. It is preferred over any nested `Cargo.toml` (a vendored or
+    /// example crate inside the package), whatever the entry order, so a
+    /// nested manifest cannot stand in for the package's identity (#4101). A
+    /// nested one is used only when the package has no top-level manifest.
     pub fn extract_cargo_toml(content: &[u8]) -> Result<CargoToml> {
         use crate::util::bounded_archive::budgeted;
 
         // Budget the decoded stream before the tar reader sees it (#3672).
         let gz = GzDecoder::new(content);
         let mut archive = Archive::new(budgeted(gz));
+        let mut nested: Option<String> = None;
 
         for entry in archive
             .entries()
@@ -187,18 +194,28 @@ impl CargoHandler {
                 .map_err(|e| AppError::Validation(format!("Invalid path in crate: {}", e)))?;
 
             if path.ends_with("Cargo.toml") {
+                let top_level = path.components().count() <= 2;
+                if !top_level && nested.is_some() {
+                    continue;
+                }
                 let mut content = String::new();
                 entry.read_to_string(&mut content).map_err(|e| {
                     AppError::Validation(format!("Failed to read Cargo.toml: {}", e))
                 })?;
 
-                return Self::parse_cargo_toml(&content);
+                if top_level {
+                    return Self::parse_cargo_toml(&content);
+                }
+                nested = Some(content);
             }
         }
 
-        Err(AppError::Validation(
-            "Cargo.toml not found in crate package".to_string(),
-        ))
+        match nested {
+            Some(content) => Self::parse_cargo_toml(&content),
+            None => Err(AppError::Validation(
+                "Cargo.toml not found in crate package".to_string(),
+            )),
+        }
     }
 
     /// Parse index entry from JSON line
@@ -1363,5 +1380,32 @@ members = ["crate-a"]
         let package = toml.package.unwrap();
         assert_eq!(package.name, "pkg");
         assert_eq!(package.version, "0.1.0");
+    }
+
+    /// #4101: the package's top-level `<name>-<version>/Cargo.toml` wins over
+    /// a nested manifest, whatever the entry order; a nested one is only the
+    /// fallback when there is no top-level manifest.
+    #[test]
+    fn test_extract_cargo_toml_prefers_the_top_level_manifest() {
+        let nested: &[u8] = b"[package]\nname = \"vendored\"\nversion = \"9.9.9\"\n";
+        let crate_bytes = build_tgz(&[
+            ("pkg-0.1.0/vendor/vendored/Cargo.toml", nested),
+            ("pkg-0.1.0/Cargo.toml", CARGO_TOML),
+        ]);
+        let package = CargoHandler::extract_cargo_toml(&crate_bytes)
+            .unwrap()
+            .package
+            .unwrap();
+        assert_eq!(
+            (package.name.as_str(), package.version.as_str()),
+            ("pkg", "0.1.0")
+        );
+
+        let only_nested = build_tgz(&[("pkg-0.1.0/vendor/vendored/Cargo.toml", nested)]);
+        let package = CargoHandler::extract_cargo_toml(&only_nested)
+            .unwrap()
+            .package
+            .unwrap();
+        assert_eq!(package.name, "vendored");
     }
 }

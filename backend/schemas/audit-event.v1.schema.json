@@ -180,7 +180,24 @@
         "format": { "type": "string" },
         "visibility": { "type": "string" },
         "age_gate_enabled": { "type": "boolean" },
-        "age_gate_min_age_days": { "type": "integer", "minimum": 0 }
+        "age_gate_min_age_days": { "type": "integer", "minimum": 0 },
+        "scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
+        "previous_scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
+        "scan_config_changed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ScanConfigAuditState": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["scan_enabled", "scan_on_upload", "scan_on_proxy", "block_on_policy_violation", "severity_threshold", "proxy_scan_action"],
+      "description": "A repository scan configuration carried by a REPOSITORY_UPDATED scan-config change (#3645).",
+      "properties": {
+        "scan_enabled": { "type": "boolean" },
+        "scan_on_upload": { "type": "boolean" },
+        "scan_on_proxy": { "type": "boolean" },
+        "block_on_policy_violation": { "type": "boolean" },
+        "severity_threshold": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+        "proxy_scan_action": { "type": "string", "enum": ["fail_open", "fail_closed", "record_only"] }
       }
     },
     "PermissionDetails": {

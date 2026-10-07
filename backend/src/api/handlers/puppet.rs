@@ -445,6 +445,24 @@ async fn publish_module(
     )
     .await;
 
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "puppet",
+        &full_name,
+        &module_version,
+        size_bytes,
+        &computed_sha256,
+        puppet_metadata
+            .pointer("/module_json/summary")
+            .and_then(|d| d.as_str()),
+    )
+    .await;
+
     info!(
         "Puppet publish: {}-{} {} ({}) to repo {}",
         owner, module_name, module_version, filename, repo_key
@@ -723,5 +741,43 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         f.teardown().await;
+    }
+
+    /// #3939: a hosted publish registers its catalog row (with the module's
+    /// `summary` as the description) and fires exactly one
+    /// `artifact.uploaded`; before, a Puppet publish fired none.
+    #[tokio::test]
+    async fn test_puppet_publish_registers_and_emits_artifact_uploaded() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let module = r#"{"owner":"acme","name":"ntp","version":"2.0.1","summary":"time sync"}"#;
+        let body = format!(
+            "--B\r\nContent-Disposition: form-data; name=\"module\"\r\n\r\n{module}\r\n\
+             --B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"m.tar.gz\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\nmodule-bytes\r\n--B--\r\n"
+        );
+        let mut events = f.state.event_bus.subscribe();
+        let (status, resp) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/v3/releases", f.repo_key),
+                "multipart/form-data; boundary=B",
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "puppet publish failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "acme-ntp", "2.0.1")
+            .await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "acme-ntp").await;
+        f.teardown().await;
+        let row = row.expect("a puppet publish must write a packages row");
+        assert_eq!(row.version, "2.0.1");
+        assert_eq!(row.description.as_deref(), Some("time sync"));
     }
 }

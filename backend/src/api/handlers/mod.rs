@@ -310,9 +310,13 @@ pub mod analytics;
 pub mod ansible;
 pub mod approval;
 pub mod artifact_labels;
+pub mod artifact_presence;
 pub mod artifacts;
 pub mod auth;
+pub mod banners;
+pub mod bazel;
 pub mod builds;
+pub mod bundles;
 pub mod cache_headers;
 pub mod cargo;
 pub mod chef;
@@ -341,6 +345,7 @@ pub mod huggingface;
 pub mod image_builds;
 pub mod incus;
 pub mod jetbrains;
+pub mod last_promotion;
 pub mod lifecycle;
 pub mod maven;
 pub mod maven_proxy;
@@ -348,9 +353,12 @@ pub mod migration;
 pub mod monitoring;
 pub mod npm;
 pub mod nuget;
+pub mod oci_blob_redirect;
+pub mod oci_digest;
 pub mod oci_v2;
 pub mod package_analysis;
 pub mod packages;
+pub mod pacman;
 pub mod peer;
 pub mod peer_instance_labels;
 pub mod peers;
@@ -391,6 +399,7 @@ pub mod telemetry;
 pub mod terraform;
 pub mod totp;
 pub mod transfer;
+pub mod trash;
 pub mod tree;
 pub mod upload;
 pub mod users;
@@ -2252,7 +2261,16 @@ mod raw_error_body_class_tests {
     /// #3718's storage and IO wordings for the same class. `I/O error: {` is
     /// preventive — `upload.rs` answers a constant `"I/O error"` today — so the
     /// gate covers the spelling a future site is as likely to reach for.
-    const STORAGE_NEEDLES: &[&str] = &["\"Storage error: {", "\"IO error: {", "\"I/O error: {"];
+    ///
+    /// #3907 adds the two wordings the detailed health payload used for the
+    /// filesystem probe, which interpolated the same `std::io::Error`.
+    const STORAGE_NEEDLES: &[&str] = &[
+        "\"Storage error: {",
+        "\"IO error: {",
+        "\"I/O error: {",
+        "\"Storage path not accessible: {",
+        "\"Storage write failed: {",
+    ];
 
     /// `AppError` variants whose [`crate::error::AppError::user_message`] is a
     /// fixed string, so a `format!` passed to them never reaches a client. The
@@ -2639,6 +2657,16 @@ mod raw_error_body_class_tests {
         assert!(carries_a_needle(r#"    &format!("Storage error: {}", e),"#));
         assert!(carries_a_needle(r#"    format!("IO error: {e}"),"#));
         assert!(carries_a_needle(r#"    format!("I/O error: {}", e),"#));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage path not accessible: {}", e)),"#
+        ));
+        assert!(carries_a_needle(
+            r#"    message: Some(format!("Storage write failed: {e}")),"#
+        ));
+        // #3907's replacement names the step without interpolating.
+        assert!(!carries_a_needle(
+            r#"    Err(e) => unhealthy_filesystem_storage("Storage write failed", &e),"#
+        ));
         // The sweep's own replacements must NOT read as offenders.
         assert!(!carries_a_needle(
             r#"    crate::api::handlers::storage_err_message(&e),"#

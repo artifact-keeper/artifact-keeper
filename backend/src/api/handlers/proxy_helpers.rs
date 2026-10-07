@@ -138,6 +138,226 @@ pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
 }
 
 // ---------------------------------------------------------------------------
+// Per-family metadata sub-budgets (#3914)
+// ---------------------------------------------------------------------------
+
+/// A protocol family whose buffered-metadata reservations are additionally
+/// capped by a sub-budget of their own, carved out of
+/// [`proxy_metadata_budget`] (#3914).
+///
+/// The shared budget bounds total resident memory but not who holds it: one
+/// anonymously-reachable family can take all of it and park every other
+/// format's buffered fetch behind its own. A family sub-budget caps that
+/// family's share. A family reservation draws from BOTH its sub-budget and
+/// the shared budget, so the shared total stays the process-wide memory bound,
+/// and whatever the family cannot hold stays available to every other format.
+///
+/// The family's hold on the shared budget is bounded by its share, or by one
+/// reservation when a single reservation is larger than the whole share (an
+/// operator who sizes the share below one reservation): the sub-budget charge
+/// is clamped to the share so it cannot wait forever, while the shared charge
+/// stays the full reservation, and only one such reservation fits at a time.
+/// An idle family holds nothing, so other formats can still use the whole
+/// shared budget when it is quiet.
+///
+/// The VS Code gallery is the first family; RPM repodata (#2665) has the same
+/// shape and joins by adding a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataBudgetFamily {
+    /// Open VSX gallery queries on a VS Code Remote (#3255, #3914).
+    VscodeGallery,
+}
+
+impl MetadataBudgetFamily {
+    /// Every family, for registry sizing and tests.
+    pub const ALL: [MetadataBudgetFamily; 1] = [MetadataBudgetFamily::VscodeGallery];
+
+    fn index(self) -> usize {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => 0,
+        }
+    }
+
+    /// `family` label value on the sub-budget metrics.
+    pub fn label(self) -> &'static str {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => "vscode_gallery",
+        }
+    }
+
+    /// Env var overriding the sub-budget size in bytes. A blank, non-numeric
+    /// or zero value falls back to the default share; any value is clamped to
+    /// the shared total.
+    pub fn size_env(self) -> &'static str {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => "AK_VSCODE_GALLERY_METADATA_BUDGET_BYTES",
+        }
+    }
+
+    /// Default share of the shared budget, as `(numerator, denominator)`.
+    /// Floored by [`Self::default_floor_bytes`].
+    ///
+    /// Gallery: 3/8, which is 384 MiB of the default 1 GiB. One composed
+    /// gallery response at full width holds four concurrent 64 MiB skeleton
+    /// reservations (256 MiB), so the share admits that plus a handful of
+    /// plain queries, while at least 640 MiB — five worst-case 128 MiB
+    /// `LARGE_METADATA_MAX_BYTES` buffers — always stays available to npm,
+    /// PyPI, Debian, RPM and the rest however many gallery reads are in flight.
+    fn default_share(self) -> (usize, usize) {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => (3, 8),
+        }
+    }
+
+    /// Smallest default share: the family's peak concurrent reservation for
+    /// ONE request, so a lone request never sheds against its own family on a
+    /// shrunken shared budget. For the gallery that is one full-width composed
+    /// response (four concurrent 64 MiB skeleton fetches); 3/8 of a shared
+    /// budget below ~683 MiB would be less than that.
+    fn default_floor_bytes(self) -> usize {
+        match self {
+            MetadataBudgetFamily::VscodeGallery => {
+                crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES
+            }
+        }
+    }
+}
+
+/// Size of a family sub-budget: the env override when it parses to a positive
+/// byte count, else the family's default share of `shared_total` floored at
+/// [`MetadataBudgetFamily::default_floor_bytes`]; either way clamped to
+/// `[1, shared_total]` — a sub-budget larger than the budget it is carved out
+/// of would bound nothing.
+pub fn metadata_sub_budget_bytes(
+    family: MetadataBudgetFamily,
+    env_value: Option<&str>,
+    shared_total: usize,
+) -> usize {
+    let (num, den) = family.default_share();
+    env_value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| (shared_total / den * num).max(family.default_floor_bytes()))
+        .clamp(1, shared_total.max(1))
+}
+
+/// A family's sub-budget: a [`ProxyMetadataBudget`] tagged with the family it
+/// meters, so reservations against it can report saturation.
+pub struct MetadataSubBudget {
+    family: MetadataBudgetFamily,
+    budget: ProxyMetadataBudget,
+}
+
+impl MetadataSubBudget {
+    pub fn new(family: MetadataBudgetFamily, total_bytes: usize) -> Self {
+        Self {
+            family,
+            budget: ProxyMetadataBudget::new(total_bytes),
+        }
+    }
+
+    pub fn family(&self) -> MetadataBudgetFamily {
+        self.family
+    }
+
+    pub fn budget(&self) -> &ProxyMetadataBudget {
+        &self.budget
+    }
+
+    /// Fraction of the sub-budget currently reserved, in `[0, 1]`.
+    pub fn saturation(&self) -> f64 {
+        let total = self.budget.total_bytes();
+        total.saturating_sub(self.budget.available_bytes()) as f64 / total as f64
+    }
+
+    fn record_saturation(&self) {
+        metrics::gauge!(
+            "ak_proxy_metadata_sub_budget_saturation_ratio",
+            "family" => self.family.label()
+        )
+        .set(self.saturation());
+    }
+}
+
+/// Process-wide sub-budget for `family`, sized once from
+/// [`MetadataBudgetFamily::size_env`] against the shared budget's total.
+pub fn metadata_sub_budget(family: MetadataBudgetFamily) -> &'static MetadataSubBudget {
+    static SUB_BUDGETS: [OnceLock<MetadataSubBudget>; MetadataBudgetFamily::ALL.len()] =
+        [const { OnceLock::new() }; MetadataBudgetFamily::ALL.len()];
+    SUB_BUDGETS[family.index()].get_or_init(|| {
+        let env = std::env::var(family.size_env()).ok();
+        let bytes = metadata_sub_budget_bytes(
+            family,
+            env.as_deref(),
+            proxy_metadata_budget().total_bytes(),
+        );
+        let sub = MetadataSubBudget::new(family, bytes);
+        // Publish 0 up front so an idle replica reports an empty share
+        // rather than no series at all.
+        sub.record_saturation();
+        sub
+    })
+}
+
+/// A buffered-metadata reservation: a slice of the shared budget and, for a
+/// family reservation, the matching slice of that family's sub-budget. Hold it
+/// for as long as the buffered bytes are resident; dropping it releases both
+/// and refreshes the family's saturation gauge.
+pub struct MetadataBudgetPermit {
+    _shared: OwnedSemaphorePermit,
+    family: Option<(&'static MetadataSubBudget, OwnedSemaphorePermit)>,
+}
+
+impl Drop for MetadataBudgetPermit {
+    fn drop(&mut self) {
+        if let Some((sub, permit)) = self.family.take() {
+            drop(permit);
+            sub.record_saturation();
+        }
+    }
+}
+
+/// Reserve `bytes` from `shared` and, when given, from the family sub-budget
+/// `sub` too, all inside one optional `wait` bound (503 when it elapses).
+///
+/// The sub-budget is acquired FIRST and the shared budget second, always: a
+/// family request queues on its own share before it can occupy any of the
+/// shared budget, so a family burst waits against itself instead of against
+/// every other format, and the fixed order means no cycle between the two
+/// semaphores can form.
+pub async fn reserve_metadata_budget_in(
+    shared: &ProxyMetadataBudget,
+    sub: Option<&'static MetadataSubBudget>,
+    bytes: usize,
+    wait: Option<Duration>,
+) -> Result<MetadataBudgetPermit, Response> {
+    let reserve = async {
+        let family = match sub {
+            Some(sub) => {
+                let permit = sub.budget.reserve(bytes).await;
+                sub.record_saturation();
+                Some((sub, permit))
+            }
+            None => None,
+        };
+        let shared = shared.reserve(bytes).await;
+        MetadataBudgetPermit {
+            _shared: shared,
+            family,
+        }
+    };
+    match wait {
+        None => Ok(reserve.await),
+        Some(wait) => tokio::time::timeout(wait, reserve).await.map_err(|_| {
+            if let Some(sub) = sub {
+                sub.record_saturation();
+            }
+            metadata_budget_saturated_response()
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared RepoInfo
 // ---------------------------------------------------------------------------
 
@@ -712,6 +932,30 @@ pub async fn proxy_fetch_capped_encoded(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_capped_encoded`] (#4120).
+///
+/// Identical except that the synthesized [`Repository`] carries the caller's
+/// REAL format, so `cache_classifier::classify` reaches its per-format arm.
+/// The same caution as [`proxy_fetch_capped_with_format`] applies: pass a real
+/// format only when `path` is the format-relative path that format's
+/// classifier rules were written against.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_encoded_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_capped_with_encoding(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Build the 200 response for buffered upstream metadata that is forwarded
 /// VERBATIM (#3260, the shared form of Maven's #3211 `forward_root_verbatim`).
 ///
@@ -843,6 +1087,10 @@ pub struct MetadataWorkingSetLimits {
     /// anonymously-reachable protocol cannot park behind every other format's
     /// buffered metadata fetch for as long as an upstream takes (#3255).
     pub reservation_wait: Option<Duration>,
+    /// Family sub-budget the reservation is also charged against (#3914), so
+    /// one protocol's burst cannot hold the whole shared budget. `None`
+    /// reserves from the shared budget alone.
+    pub family: Option<MetadataBudgetFamily>,
 }
 
 /// 503 for a buffered-metadata reservation that could not be satisfied inside
@@ -858,19 +1106,21 @@ pub fn metadata_budget_saturated_response() -> Response {
         .into_response()
 }
 
-/// Reserve `bytes` of the shared buffered-metadata budget, optionally bounding
-/// how long the caller is willing to queue for it.
+/// Reserve `bytes` of the shared buffered-metadata budget, and of `family`'s
+/// sub-budget when given (#3914), optionally bounding how long the caller is
+/// willing to queue for it. See [`reserve_metadata_budget_in`].
 pub async fn reserve_metadata_budget_bounded(
     bytes: usize,
     wait: Option<Duration>,
-) -> Result<OwnedSemaphorePermit, Response> {
-    let reserve = proxy_metadata_budget().reserve(bytes);
-    match wait {
-        None => Ok(reserve.await),
-        Some(wait) => tokio::time::timeout(wait, reserve)
-            .await
-            .map_err(|_| metadata_budget_saturated_response()),
-    }
+    family: Option<MetadataBudgetFamily>,
+) -> Result<MetadataBudgetPermit, Response> {
+    reserve_metadata_budget_in(
+        proxy_metadata_budget(),
+        family.map(metadata_sub_budget),
+        bytes,
+        wait,
+    )
+    .await
 }
 
 /// Outcome of a capped buffered-metadata POST, keeping the byte-ceiling abort
@@ -887,7 +1137,7 @@ pub enum CappedMetadataPost {
     Buffered {
         content: Bytes,
         content_type: Option<String>,
-        budget_permit: OwnedSemaphorePermit,
+        budget_permit: MetadataBudgetPermit,
     },
     /// Upstream exceeded `limits.max_bytes`; nothing past the ceiling was ever
     /// buffered, and no truncated body is returned.
@@ -910,6 +1160,7 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     let budget_permit = reserve_metadata_budget_bounded(
         limits.reservation_bytes.max(limits.max_bytes),
         limits.reservation_wait,
+        limits.family,
     )
     .await?;
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
@@ -2353,6 +2604,15 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 ///   low-priority member. The remaining-candidate fan-out is naturally bounded:
 ///   it only includes candidates ranked above the first Pass-1 cache hit, minus
 ///   the top one already confirmed.
+///
+/// Runs in an `INTERNAL` `resolve_virtual_members` span (#4455); each member's
+/// proxy fetch is a `proxy_fetch` child of it.
+#[tracing::instrument(
+    name = "resolve_virtual_members",
+    level = "info",
+    skip_all,
+    fields(artifact_keeper.virtual.member_count = members.len())
+)]
 pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
     members: &'a [Repository],
     probe: P,
@@ -3329,6 +3589,14 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
 /// — OR on a member yields blocking, and a fail-closed member is never
 /// downgraded to fail-open by a fail-open virtual. Pure so the stricter-of-two
 /// logic is unit-testable without a DB.
+///
+/// Record-only (#3645) is the weakest action and results only when EVERY side
+/// that has proxy scanning enabled chose it (and neither side is fail-closed).
+/// A side with scanning disabled asserts no enforcement of its own (a direct
+/// pull of it is served unscanned), so it does not veto a record-only choice
+/// made on the other side; an enabled fail-open side does. A record-only
+/// member behind a virtual that enforces a threshold therefore yields to the
+/// virtual's threshold (see [`combined_severity_gate`]), and vice versa.
 pub fn stricter_scan_policy(
     virtual_enabled: bool,
     virtual_action: crate::services::proxy_scan_service::ProxyScanAction,
@@ -3341,10 +3609,32 @@ pub fn stricter_scan_policy(
         || matches!(member_action, ProxyScanAction::FailClosed)
     {
         ProxyScanAction::FailClosed
+    } else if enabled
+        && (!virtual_enabled || virtual_action.is_record_only())
+        && (!member_enabled || member_action.is_record_only())
+    {
+        ProxyScanAction::RecordOnly
     } else {
         ProxyScanAction::FailOpen
     };
     (enabled, action)
+}
+
+/// The severity gate that goes with a combined proxy-scan action (#3645): a
+/// record-only combination never blocks, whatever the sides' threshold knobs
+/// say; anything else is the stricter-of-two gate, where a side's own
+/// record-only gate yields to the other side.
+pub(crate) fn combined_severity_gate(
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    a: crate::services::proxy_scan_service::ProxySeverityGate,
+    b: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> crate::services::proxy_scan_service::ProxySeverityGate {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    if action.is_record_only() {
+        ProxySeverityGate::RecordOnly
+    } else {
+        ProxySeverityGate::stricter(a, b)
+    }
 }
 
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
@@ -3395,7 +3685,7 @@ pub async fn effective_virtual_scan_policy(
     (
         enabled,
         action,
-        ProxySeverityGate::stricter(virtual_gate, member_gate),
+        combined_severity_gate(action, virtual_gate, member_gate),
     )
 }
 
@@ -3422,6 +3712,24 @@ pub async fn direct_scan_policy(
         .await
         .unwrap_or(ProxySeverityGate::BlockOnAny);
     (action, gate)
+}
+
+/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
+/// when the repository has not enabled scan-on-proxy (#4102): the
+/// enabled-check plus [`direct_scan_policy`] a format's Remote arm runs before
+/// choosing the gate over its streaming path. NuGet uses it; the older
+/// formats still inline the same two calls. An unreadable
+/// enabled flag reads as off, the reading the npm / PyPI / Cargo / Maven
+/// arms already take (#4365 item 5 tracks failing it closed).
+pub(crate) async fn remote_scan_policy(db: &PgPool, repo_id: Uuid) -> Option<MemberScanPolicy> {
+    let enabled = crate::services::scan_config_service::ScanConfigService::new(db.clone())
+        .is_proxy_scan_enabled(repo_id)
+        .await
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    Some(direct_scan_policy(db, repo_id).await)
 }
 
 /// Edges of the membership subgraph reachable from a virtual repository root,
@@ -5152,6 +5460,10 @@ pub(crate) fn classify_remote_or_virtual(repo_type: &str) -> RemoteOrVirtualActi
 /// false` predicate matches the partial-index WHERE clause exactly so
 /// the planner uses the index.
 ///
+/// `format` is the caller's format label (`"hex"`, `"npm"`, ...), carried
+/// only into the fail-closed `shadowing_guard_db_error` log line so a guard
+/// failure names the format that hit it (#3767).
+///
 /// Fails closed: a database error returns 500 rather than allowing the
 /// caller to proceed without the guard. Returns false (allow proxy
 /// fan-out) on the benign "no non-Remote members" case so virtual repos
@@ -5162,8 +5474,9 @@ pub async fn virtual_non_remote_owns_name(
     db: &PgPool,
     virtual_repo_id: Uuid,
     package_name: &str,
+    format: &str,
 ) -> Result<bool, Response> {
-    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None).await
+    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None, format).await
 }
 
 /// Version-aware variant of [`virtual_non_remote_owns_name`]. When `version`
@@ -5177,6 +5490,7 @@ pub async fn virtual_non_remote_owns_name_version(
     virtual_repo_id: Uuid,
     package_name: &str,
     version: Option<&str>,
+    format: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
@@ -5203,7 +5517,7 @@ pub async fn virtual_non_remote_owns_name_version(
         .bind(package_name)
         .fetch_optional(db)
         .await
-        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
         return Ok(exists.is_some());
     };
 
@@ -5223,7 +5537,7 @@ pub async fn virtual_non_remote_owns_name_version(
     .bind(package_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
 
     Ok(pypi_version_owned(version, &stored_versions))
 }
@@ -5317,6 +5631,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     virtual_repo_id: Uuid,
     package_name: &str,
     version: &str,
+    format: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
@@ -5342,7 +5657,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     .bind(version)
     .fetch_optional(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, format, e))?;
     Ok(exists.is_some())
 }
 
@@ -5452,7 +5767,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "pypi", e))?;
 
     if owning_ids.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
@@ -5470,7 +5785,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_one(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "pypi", e))?;
 
     if tracked > 0 {
         return Ok(None);
@@ -8187,13 +8502,43 @@ pub(crate) enum ProxyScanIdentity {
     NotApplicable,
 }
 
+/// What a served proxy pull's `X-AK-Scan` header reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyScanServed {
+    /// A verdict exists and lets these bytes through: no findings, or
+    /// findings below the repository's opted-in severity threshold.
+    Clean,
+    /// Served before a verdict exists (fail-open / record-only first pull, or
+    /// an over-cap object); an async scan records the verdict.
+    Pending,
+    /// Record-only (#3645): the verdict is `vulnerable` and recorded, but the
+    /// repository does not enforce it, so the bytes are served anyway.
+    Recorded,
+}
+
+impl ProxyScanServed {
+    /// The `X-AK-Scan` header value for this serve.
+    pub(crate) fn header_value(self) -> &'static str {
+        match self {
+            ProxyScanServed::Clean => "clean",
+            ProxyScanServed::Pending => "pending",
+            ProxyScanServed::Recorded => "recorded",
+        }
+    }
+
+    pub(crate) fn is_pending(self) -> bool {
+        matches!(self, ProxyScanServed::Pending)
+    }
+}
+
 /// Outcome of [`gate_proxy_scan_serve`], mapped by the caller onto its
-/// format-specific 200 response (`pending` selects the `X-AK-Scan` header
+/// format-specific 200 response (`served` selects the `X-AK-Scan` header
 /// value) or returned as the block/lock response as-is.
 pub(crate) enum ProxyScanServeOutcome {
-    /// Serve the buffered bytes; `pending: true` means fail-open served
-    /// before a verdict (loud `X-AK-Scan: pending`, async scan running).
-    Serve { pending: bool },
+    /// Serve the buffered bytes. `Pending` means served before a verdict
+    /// (loud `X-AK-Scan: pending`, async scan running); `Recorded` means a
+    /// record-only repository served a vulnerable verdict (#3645).
+    Serve(ProxyScanServed),
     /// The pull is blocked (403 vulnerable) or locked (423 inconclusive
     /// under fail-closed); the response is fully built.
     Deny(Response),
@@ -8236,6 +8581,32 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     }
 }
 
+/// Whether a STORED `vulnerable` verdict for `digest` refuses a pull under
+/// `severity_gate` (#4102), without fetching or scanning anything: for a
+/// serve path whose bytes are already pinned to a known digest (NuGet's
+/// digest-verified row repair). Record-only never refuses, a verdict below an
+/// opted-in severity threshold serves, and a missing or unreadable verdict
+/// does not refuse (the path is not otherwise gated).
+pub(crate) async fn stored_vulnerable_verdict_blocks(
+    db: &PgPool,
+    digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> bool {
+    use crate::services::proxy_scan_service::{verdict_blocks, ProxyScanService};
+    if severity_gate.is_record_only() {
+        return false;
+    }
+    match ProxyScanService::new(db.clone())
+        .lookup_verdict(digest, PROXY_SCAN_TYPE)
+        .await
+    {
+        Ok(Some(row)) if verdict_blocks(&row.verdict) => {
+            stored_verdict_blocks_under_gate(Some(&row), severity_gate)
+        }
+        _ => false,
+    }
+}
+
 /// Pure decision for the `ScanInline` (fail-closed) arm of
 /// [`gate_proxy_scan_serve`]: given the outcome of one
 /// [`proxy_scan_and_record`] call, decide serve vs. deny.
@@ -8262,7 +8633,10 @@ fn scan_inline_serve_decision(
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
-        Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.is_record_only() => {
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded)
+        }
+        Ok(_) => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         // Inconclusive under fail-closed => 423, never unscanned bytes.
         Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
     }
@@ -8309,18 +8683,28 @@ pub(crate) async fn gate_proxy_scan_serve(
             // #3243 stage 3 / #3246: a repo that explicitly opted in via
             // `block_on_policy_violation` applies its `severity_threshold` to
             // the stored verdict — see [`stored_verdict_blocks_under_gate`].
+            if severity_gate.is_record_only() {
+                // #3645: the verdict stays recorded (and reported by the
+                // proxy-scans endpoint); a record-only repo never withholds.
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    "serving proxy pull: cached vulnerable verdict recorded, not \
+                     enforced (record-only proxy scan, #3645)"
+                );
+                return ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded);
+            }
             if !stored_verdict_blocks_under_gate(row.as_ref(), severity_gate) {
                 tracing::info!(
                     repo_id = %repo_id, file = %filename, digest = %digest,
                     "serving proxy pull: cached vulnerable verdict is below this \
                      repo's configured severity threshold (#3243)"
                 );
-                return ProxyScanServeOutcome::Serve { pending: false };
+                return ProxyScanServeOutcome::Serve(ProxyScanServed::Clean);
             }
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
-        ServeDecision::ServeCached => ProxyScanServeOutcome::Serve { pending: false },
+        ServeDecision::ServeCached => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         ServeDecision::ScanInline => {
             // Fail-closed: scan inline before serving a single byte.
             //
@@ -8377,7 +8761,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 // posture) but do not run a scan whose only possible result
                 // would be an unfounded `clean` row for this digest.
                 ProxyScanIdentity::Unestablished => {
-                    return ProxyScanServeOutcome::Serve { pending: true }
+                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
@@ -8396,7 +8780,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 )
                 .await;
             });
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         }
     }
 }
@@ -8552,12 +8936,22 @@ pub(crate) trait ScannedProxyFile: Send + Sync {
     ) -> ProxyScanIdentity;
 
     /// Runs once the buffered fetch has the bytes (cache hit or fill), before
-    /// the gate. Formats that fix up the cached record hook in here.
+    /// the gate, with the SHA-256 of exactly those bytes. Formats that fix up
+    /// the cached record hook in here, as do formats holding a
+    /// registry-recorded digest the bytes must match (Cargo's index `cksum`,
+    /// #2929): `Err` refuses the bytes outright (never scanned, served or
+    /// recorded), and a virtual walk treats it as this member's miss.
+    /// `bytes` are those exact bytes, for a format that must verify them
+    /// against an upstream-published digest in another algorithm (Maven's
+    /// `.sha1` sidecar, #4100, refused like Cargo's `cksum`).
     async fn after_buffered_fetch(
         &self,
         _state: &crate::api::SharedState,
         _req: &ScannedProxyRequest<'_>,
-    ) {
+        _bytes: &Bytes,
+        _digest: &str,
+    ) -> Result<(), Response> {
+        Ok(())
     }
 
     /// Fail-open over the scan byte cap: serve the object UNSCANNED through
@@ -8620,9 +9014,10 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         }
         Err(e) => return Err(e.into_response()),
     };
-    file.after_buffered_fetch(state, req).await;
-
     let digest = sha256_hex(&bytes);
+    file.after_buffered_fetch(state, req, &bytes, &digest)
+        .await?;
+
     let identity = file.identity(req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
@@ -8640,7 +9035,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     .await
     {
         ProxyScanServeOutcome::Deny(resp) => Err(resp),
-        ProxyScanServeOutcome::Serve { pending } => {
+        ProxyScanServeOutcome::Serve(served) => {
             record_scanned_proxy_download(state, req).await;
             let body = ScannedProxyBody {
                 bytes,
@@ -8648,10 +9043,10 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
                 content_encoding,
                 digest,
             };
-            let mut resp = file.scanned_response(req, body, pending);
+            let mut resp = file.scanned_response(req, body, served.is_pending());
             resp.headers_mut().insert(
                 "X-AK-Scan",
-                axum::http::HeaderValue::from_static(if pending { "pending" } else { "clean" }),
+                axum::http::HeaderValue::from_static(served.header_value()),
             );
             Ok(resp)
         }
@@ -8688,6 +9083,17 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
     }
 }
 
+/// Test-only entry to the over-cap branch, for format suites (Cargo) that pin
+/// their own fallback through it without a 200 MiB fixture.
+#[cfg(test)]
+pub(crate) async fn serve_oversized_proxy_file_for_test<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+) -> Result<Response, Response> {
+    serve_oversized_proxy_file(state, req, file).await
+}
+
 /// Record a download served by [`serve_scanned_proxy_file`], on either arm.
 async fn record_scanned_proxy_download(
     state: &crate::api::SharedState,
@@ -8695,6 +9101,437 @@ async fn record_scanned_proxy_download(
 ) {
     if let Some(ctx) = req.ctx {
         record_proxy_download(state, req.repo_id, req.repo_key, req.cache_path, ctx).await;
+    }
+}
+
+/// The scan-on-proxy policy each member of a Virtual walk is served under
+/// (#4100): `Some((action, severity_gate))` for a Remote member with an
+/// upstream whose stricter-of-two policy enables scanning, `None` for every
+/// member that keeps the unscanned path (hosted members, Remote members that
+/// do not scan).
+///
+/// Exactly [`effective_virtual_scan_policy`] per member, but from ONE
+/// `scan_configs` read for the virtual and all its Remote members instead of
+/// six queries per member on every archive request, combined by the same
+/// [`stricter_scan_policy`] / [`combined_severity_gate`] (so record-only,
+/// #3645, resolves identically). No Remote member, no
+/// query. A missing row is disabled / fail-open / block-on-any. An
+/// UNREADABLE config fails closed with a retryable 503: whether any side is
+/// fail-closed is exactly what cannot be read, so serving the walk unscanned
+/// could hand out a fail-closed member's unscanned bytes.
+pub(crate) async fn virtual_member_scan_policies(
+    db: &PgPool,
+    virtual_id: Uuid,
+    members: &[Repository],
+) -> Result<Vec<Option<MemberScanPolicy>>, Response> {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let scannable =
+        |m: &Repository| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some();
+    if !members.iter().any(scannable) {
+        return Ok(vec![None; members.len()]);
+    }
+    let mut ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| scannable(m))
+        .map(|m| m.id)
+        .collect();
+    ids.push(virtual_id);
+    let rows: Vec<(Uuid, bool, String, bool, String)> = match sqlx::query_as(
+        r#"SELECT repository_id, scan_on_proxy, proxy_scan_action,
+                  block_on_policy_violation, severity_threshold
+           FROM scan_configs WHERE repository_id = ANY($1)"#,
+    )
+    .bind(&ids)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                virtual_id = %virtual_id, error = %e,
+                "could not read member scan-on-proxy configs; failing the walk closed"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "scan-on-proxy configuration is temporarily unreadable".to_string(),
+            )
+            .into_response());
+        }
+    };
+    let config = |id: Uuid| {
+        rows.iter()
+            .find(|row| row.0 == id)
+            .map(|(_, enabled, action, block, threshold)| {
+                (
+                    *enabled,
+                    ProxyScanAction::from_db(action),
+                    crate::services::scan_config_service::proxy_severity_gate_for_row(
+                        *block, threshold, action,
+                    ),
+                )
+            })
+            .unwrap_or((
+                false,
+                ProxyScanAction::FailOpen,
+                ProxySeverityGate::BlockOnAny,
+            ))
+    };
+    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
+    Ok(members
+        .iter()
+        .map(|member| {
+            if !scannable(member) {
+                return None;
+            }
+            let (member_enabled, member_action, member_gate) = config(member.id);
+            let (enabled, action) = stricter_scan_policy(
+                virtual_enabled,
+                virtual_action,
+                member_enabled,
+                member_action,
+            );
+            enabled.then(|| {
+                (
+                    action,
+                    combined_severity_gate(action, virtual_gate, member_gate),
+                )
+            })
+        })
+        .collect())
+}
+
+/// A Virtual download walk with scan-on-proxy (#4100), over an
+/// already-authorized member list.
+///
+/// `None` when no member scans: the caller then takes its untouched resolver,
+/// so a virtual with scanning off everywhere sees no change. Otherwise members
+/// are walked in strict priority order. Each run of members that do not scan
+/// goes through `unscanned_run` (the caller's existing resolver over just
+/// that run; `None` is a miss), and each scanning Remote member through
+/// `scanned` (the format's [`serve_scanned_proxy_file`] call). A 403
+/// (vulnerable or a member's policy block), 409 (quarantine hold) or 423
+/// (inconclusive under fail-closed) from a scanning member is that member's
+/// verdict on bytes it holds and ends the walk; any other failure falls
+/// through to the next member. So a lower-priority remote can never shadow a
+/// hosted copy, and no unscanned path ever serves a scanning member's bytes.
+pub(crate) async fn walk_virtual_members_with_scan<U, UFut, S, SFut>(
+    db: &PgPool,
+    virtual_id: Uuid,
+    members: Vec<Repository>,
+    unscanned_run: U,
+    scanned: S,
+) -> Option<Result<Response, Response>>
+where
+    U: FnMut(Vec<Repository>) -> UFut,
+    UFut: Future<Output = Option<Result<Response, Response>>>,
+    S: FnMut(Repository, MemberScanPolicy) -> SFut,
+    SFut: Future<Output = Result<Response, Response>>,
+{
+    let policies = match virtual_member_scan_policies(db, virtual_id, &members).await {
+        Ok(policies) => policies,
+        Err(resp) => return Some(Err(resp)),
+    };
+    walk_members_with_policies(members, policies, unscanned_run, scanned).await
+}
+
+/// The scan-on-proxy policy a scanning Virtual member is served under: the
+/// stricter-of-two action and the combined severity gate (#4100).
+pub(crate) type MemberScanPolicy = (
+    crate::services::proxy_scan_service::ProxyScanAction,
+    crate::services::proxy_scan_service::ProxySeverityGate,
+);
+
+/// The DB-free core of [`walk_virtual_members_with_scan`]: the priority walk
+/// over members already paired with their resolved policy (`None` = this
+/// member does not scan). Split out so every member layout is pinned with fake
+/// closures, independently of the format handlers.
+async fn walk_members_with_policies<U, UFut, S, SFut>(
+    members: Vec<Repository>,
+    policies: Vec<Option<MemberScanPolicy>>,
+    mut unscanned_run: U,
+    mut scanned: S,
+) -> Option<Result<Response, Response>>
+where
+    U: FnMut(Vec<Repository>) -> UFut,
+    UFut: Future<Output = Option<Result<Response, Response>>>,
+    S: FnMut(Repository, MemberScanPolicy) -> SFut,
+    SFut: Future<Output = Result<Response, Response>>,
+{
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut unscanned = Vec::new();
+    for (member, policy) in members.into_iter().zip(policies) {
+        let Some(policy) = policy else {
+            unscanned.push(member);
+            continue;
+        };
+        let run = std::mem::take(&mut unscanned);
+        if !run.is_empty() {
+            if let Some(served) = unscanned_run(run).await {
+                return Some(served);
+            }
+        }
+        let member_key = member.key.clone();
+        match scanned(member, policy).await {
+            Ok(resp) => return Some(Ok(resp)),
+            Err(resp)
+                if is_member_policy_block_response(&resp)
+                    || resp.status() == StatusCode::LOCKED =>
+            {
+                return Some(Err(resp))
+            }
+            Err(resp) => {
+                tracing::debug!(
+                    member_key = %member_key, status = %resp.status(),
+                    "scanned virtual member did not serve; trying next member"
+                );
+            }
+        }
+    }
+    if !unscanned.is_empty() {
+        if let Some(served) = unscanned_run(unscanned).await {
+            return Some(served);
+        }
+    }
+    Some(Err(member_miss_response()))
+}
+
+/// The unscanned half of a scan-aware Virtual walk (#4100), shared by the
+/// Maven and sbt handlers: resolve one run of non-scanning members through
+/// the existing resolver and stream the winner. A member policy block
+/// (403/409) is that member's verdict and ends the walk; any other failure is
+/// a miss (`None`), so the walk moves on.
+///
+/// `record` counts a HOSTED member's serve once (#4268): the resolver carries
+/// the winning artifact row's id only for hosted members (proxy-member and
+/// row-less legacy serves carry `None`, #1278), exactly as the format's
+/// fallback resolver path records it.
+pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
+    run: Vec<Repository>,
+    proxy: Option<&ProxyService>,
+    path: &str,
+    local_fetch: F,
+    default_content_type: &str,
+    record: Option<(
+        &PgPool,
+        &crate::api::middleware::download_telemetry::DownloadContext,
+    )>,
+) -> Option<Result<Response, Response>>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    match resolve_virtual_download_from_members(run, proxy, path, local_fetch).await {
+        Ok(result) => {
+            if let (Some(artifact_id), Some((db, ctx))) = (result.artifact_id, record) {
+                crate::services::artifact_service::record_download(db, artifact_id, ctx).await;
+            }
+            Some(stream_fetch_result(result, default_content_type, None))
+        }
+        Err(resp) if is_member_policy_block_response(&resp) => Some(Err(resp)),
+        Err(_) => None,
+    }
+}
+
+/// #4100: every member layout of the scan-aware Virtual walk, driven through
+/// fake closures so the priority rules are pinned without a database or an
+/// upstream. The format suites (`maven::scan_on_proxy_tests`,
+/// `sbt::scan_on_proxy_tests`) prove the real resolvers behind the closures.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod virtual_scan_walk_tests {
+    use super::*;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    use std::sync::Mutex;
+
+    const SCAN: Option<MemberScanPolicy> =
+        Some((ProxyScanAction::FailOpen, ProxySeverityGate::BlockOnAny));
+
+    fn member(key: &str) -> Repository {
+        build_remote_repo(Uuid::new_v4(), key, "http://upstream.invalid")
+    }
+
+    fn status(code: StatusCode) -> Response {
+        code.into_response()
+    }
+
+    fn ok_from(key: &str) -> Response {
+        (StatusCode::OK, key.to_string()).into_response()
+    }
+
+    /// One walk over `layout` (`(key, policy)` in priority order). Unscanned
+    /// runs serve the first key in `run_serves` they contain (`None` = miss,
+    /// or `run_blocks` answers 403); scanning members answer from
+    /// `scanned_answers`. Returns the walk's result and the call log.
+    async fn walk(
+        layout: &[(&str, Option<MemberScanPolicy>)],
+        run_serves: &[&str],
+        run_blocks: &[&str],
+        scanned_answers: &[(&str, StatusCode)],
+    ) -> (Option<Result<Response, Response>>, Vec<String>) {
+        let log = Mutex::new(Vec::new());
+        let members = layout.iter().map(|(key, _)| member(key)).collect();
+        let policies = layout.iter().map(|(_, policy)| *policy).collect();
+        let unscanned_run = |run: Vec<Repository>| {
+            let keys: Vec<String> = run.iter().map(|m| m.key.clone()).collect();
+            log.lock().unwrap().push(format!("run[{}]", keys.join(",")));
+            let served = keys.iter().find_map(|k| {
+                if run_blocks.contains(&k.as_str()) {
+                    Some(Err(status(StatusCode::FORBIDDEN)))
+                } else {
+                    run_serves.contains(&k.as_str()).then(|| Ok(ok_from(k)))
+                }
+            });
+            async move { served }
+        };
+        let scanned = |m: Repository, _policy: MemberScanPolicy| {
+            log.lock().unwrap().push(format!("scan[{}]", m.key));
+            let code = scanned_answers
+                .iter()
+                .find(|(k, _)| *k == m.key)
+                .map(|(_, c)| *c)
+                .unwrap_or(StatusCode::NOT_FOUND);
+            async move {
+                if code == StatusCode::OK {
+                    Ok(ok_from(&m.key))
+                } else {
+                    Err(status(code))
+                }
+            }
+        };
+        let result = walk_members_with_policies(members, policies, unscanned_run, scanned).await;
+        let log = log.into_inner().unwrap();
+        (result, log)
+    }
+
+    async fn body_of(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_scanning_member_leaves_the_resolver_untouched() {
+        let (result, log) = walk(&[("local", None), ("remote", None)], &["local"], &[], &[]).await;
+        assert!(
+            result.is_none(),
+            "no member scans: the caller's resolver runs"
+        );
+        assert!(log.is_empty(), "nothing is walked: {log:?}");
+    }
+
+    /// The common layout: hosted releases first, a scanning Central proxy
+    /// after. The hosted copy wins and the scanning member is never asked.
+    #[tokio::test]
+    async fn hosted_member_before_a_scanning_remote_serves_first() {
+        let (result, log) = walk(
+            &[("local", None), ("central", SCAN)],
+            &["local"],
+            &[],
+            &[("central", StatusCode::OK)],
+        )
+        .await;
+        let resp = result.expect("walked").expect("served");
+        assert_eq!(body_of(resp).await, "local");
+        assert_eq!(log, ["run[local]"]);
+    }
+
+    /// A scanning member that misses (404) or refuses its own bytes as not
+    /// what upstream published (502 sidecar mismatch) or cannot answer (503)
+    /// falls through to the next member.
+    #[tokio::test]
+    async fn scanning_member_miss_or_bad_gateway_falls_through() {
+        for code in [
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let (result, log) = walk(
+                &[("scanning", SCAN), ("plain", None)],
+                &["plain"],
+                &[],
+                &[("scanning", code)],
+            )
+            .await;
+            let resp = result.expect("walked").expect("served");
+            assert_eq!(body_of(resp).await, "plain", "{code}");
+            assert_eq!(log, ["scan[scanning]", "run[plain]"], "{code}");
+
+            let (result, log) = walk(
+                &[("first", SCAN), ("second", SCAN)],
+                &[],
+                &[],
+                &[("first", code), ("second", StatusCode::OK)],
+            )
+            .await;
+            let resp = result.expect("walked").expect("served");
+            assert_eq!(body_of(resp).await, "second", "{code}");
+            assert_eq!(log, ["scan[first]", "scan[second]"], "{code}");
+        }
+    }
+
+    /// A scanning member's 403 (vulnerable / policy), 409 (quarantine hold)
+    /// or 423 (inconclusive under fail-closed) is its verdict on bytes it
+    /// holds: the walk ends there and no later member is asked.
+    #[tokio::test]
+    async fn scanning_member_verdict_ends_the_walk() {
+        for code in [
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
+        ] {
+            let (result, log) = walk(
+                &[("scanning", SCAN), ("plain", None)],
+                &["plain"],
+                &[],
+                &[("scanning", code)],
+            )
+            .await;
+            let resp = result.expect("walked").expect_err("refused");
+            assert_eq!(resp.status(), code);
+            assert_eq!(log, ["scan[scanning]"], "{code}");
+        }
+    }
+
+    /// Runs are split at every scanning member and keep their order; a
+    /// trailing run is tried after the last scanner, and when nothing serves
+    /// the walk answers the one member-miss 404.
+    #[tokio::test]
+    async fn trailing_run_then_member_miss() {
+        let (result, log) = walk(
+            &[("a", None), ("s1", SCAN), ("b", None), ("c", None)],
+            &[],
+            &[],
+            &[],
+        )
+        .await;
+        let resp = result.expect("walked").expect_err("miss");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_of(resp).await, body_of(member_miss_response()).await);
+        assert_eq!(log, ["run[a]", "scan[s1]", "run[b,c]"]);
+
+        let (result, log) = walk(&[("s1", SCAN), ("b", None)], &["b"], &[], &[]).await;
+        assert_eq!(body_of(result.unwrap().unwrap()).await, "b");
+        assert_eq!(log, ["scan[s1]", "run[b]"]);
+    }
+
+    /// A member policy block from an unscanned run (a quarantined hosted
+    /// artifact) is final too: the scanning member after it is not asked.
+    #[tokio::test]
+    async fn unscanned_run_block_ends_the_walk() {
+        let (result, log) = walk(
+            &[("local", None), ("central", SCAN)],
+            &[],
+            &["local"],
+            &[("central", StatusCode::OK)],
+        )
+        .await;
+        let resp = result.expect("walked").expect_err("blocked");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(log, ["run[local]"]);
     }
 }
 
@@ -8744,8 +9581,11 @@ mod scanned_proxy_file_tests {
             &self,
             _state: &crate::api::SharedState,
             _req: &ScannedProxyRequest<'_>,
-        ) {
+            _bytes: &Bytes,
+            _digest: &str,
+        ) -> Result<(), Response> {
             self.after_fetch.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn serve_unscanned_stream(
@@ -9052,6 +9892,292 @@ mod scanned_proxy_file_tests {
         assert_eq!(file.streamed.load(Ordering::SeqCst), 0);
         fx.teardown().await;
     }
+
+    // ── #3645: record-only proxy scan mode ──
+    //
+    // These drive the gate from a REAL `scan_configs` row through
+    // `direct_scan_policy`, so the config -> (action, gate) resolution is
+    // covered along with the serve decision.
+
+    /// Write the repository's scan config through the same service the
+    /// `PUT /repositories/{key}/security` handler uses.
+    async fn set_scan_config(fx: &tdh::Fixture, block: bool, threshold: &str, action: &str) {
+        crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone())
+            .upsert_config(
+                fx.repo_id,
+                &crate::services::scan_config_service::UpsertScanConfigRequest {
+                    scan_enabled: Some(true),
+                    scan_on_upload: Some(false),
+                    scan_on_proxy: Some(true),
+                    block_on_policy_violation: Some(block),
+                    severity_threshold: Some(threshold.to_string()),
+                    proxy_scan_action: Some(action.to_string()),
+                },
+            )
+            .await
+            .expect("upsert scan config");
+    }
+
+    async fn seed_vulnerable(fx: &tdh::Fixture, digest: &str, max_severity: &str) {
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                i32::from(max_severity == "critical"),
+                i32::from(max_severity == "high"),
+                0,
+                0,
+                Some(max_severity),
+                Some("grype-3645-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+    }
+
+    async fn cleanup_verdict(fx: &tdh::Fixture, digest: &str) {
+        for sql in [
+            "DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1",
+            "DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(digest).execute(&fx.pool).await;
+        }
+    }
+
+    /// One pull through the wrapper under the repository's CURRENT config.
+    async fn pull_under_config(
+        fx: &tdh::Fixture,
+        state: &crate::api::SharedState,
+        proxy: &ProxyService,
+        base: &str,
+        file: &FakeFormat,
+    ) -> Result<Response, Response> {
+        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, base, action);
+        req.severity_gate = gate;
+        req.ctx = Some(&ctx);
+        serve_scanned_proxy_file(state, proxy, &req, file).await
+    }
+
+    fn scan_header(resp: &Response) -> &str {
+        resp.headers()["X-AK-Scan"].to_str().unwrap()
+    }
+
+    /// The #3645 acceptance criteria on a cached vulnerable (critical) verdict:
+    /// record-only serves it on every pull with `X-AK-Scan: recorded` and the
+    /// verdict row stays `vulnerable`; switching enforcement on blocks the
+    /// SAME digest from the SAME row, and switching back serves again --
+    /// the mode changes only blocking, never what is recorded.
+    #[tokio::test]
+    async fn record_only_serves_a_vulnerable_digest_and_the_mode_only_changes_blocking() {
+        let bytes = format!("fake-3645-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        seed_vulnerable(&fx, &digest, "critical").await;
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        let before = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        set_scan_config(&fx, false, "high", "record_only").await;
+        for pull in 1..=2 {
+            let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+                .await
+                .unwrap_or_else(|r| panic!("record-only pull {pull} withheld: {}", r.status()));
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(scan_header(&resp), "recorded");
+            assert_eq!(resp.headers()["X-Fake-Pending"], "false");
+            assert_eq!(&body_of(resp).await[..], &bytes[..]);
+        }
+        assert_eq!(recorded(&fx).await, 2, "every served pull is recorded");
+
+        // Enforcement on (default knobs): the same verdict now blocks.
+        set_scan_config(&fx, false, "high", "fail_open").await;
+        let denied = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // And fail-closed blocks it too.
+        set_scan_config(&fx, false, "high", "fail_closed").await;
+        let denied = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        set_scan_config(&fx, false, "high", "record_only").await;
+        let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only withheld after switch-back: {}", r.status()));
+        assert_eq!(scan_header(&resp), "recorded");
+
+        let after = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+        let (before, after) = (before.unwrap(), after.unwrap());
+        assert_eq!(after.verdict, "vulnerable");
+        assert_eq!(after.max_severity.as_deref(), Some("critical"));
+        assert_eq!(
+            after.scanned_at, before.scanned_at,
+            "switching the mode never rewrites the recorded verdict"
+        );
+    }
+
+    /// Record-only first pull with a CVE engine that flags the bytes: served
+    /// at once (pending), the async scan records a `vulnerable` verdict WITH
+    /// its findings, and the next pull is served `recorded` instead of 403.
+    #[tokio::test]
+    async fn record_only_records_findings_from_the_async_scan_and_keeps_serving() {
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let bytes = format!("fake-3645-async-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, _state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage,
+            vec![Arc::new(VersionedCveScanner::new(
+                Some("grype-3645-live"),
+                MockCveRescan::Vulnerable,
+            ))],
+        );
+        set_scan_config(&fx, true, "low", "record_only").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        let first = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only first pull withheld: {}", r.status()));
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(scan_header(&first), "pending");
+
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone());
+        // The verdict row lands before its per-CVE findings; wait for both.
+        let (mut row, mut findings) = (None, 0i64);
+        for _ in 0..150 {
+            row = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await.unwrap();
+            findings = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_scan_findings WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            if row.is_some() && findings > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let second = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        cleanup_verdict(&fx, &digest).await;
+        let downloads = recorded(&fx).await;
+        fx.teardown().await;
+
+        let row = row.expect("the async record-only scan records a verdict");
+        assert_eq!(row.verdict, "vulnerable");
+        assert_eq!(row.max_severity.as_deref(), Some("critical"));
+        assert!(findings >= 1, "the findings are recorded with the verdict");
+        let second = second.unwrap_or_else(|r| panic!("second pull withheld: {}", r.status()));
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(scan_header(&second), "recorded");
+        assert_eq!(downloads, 2);
+    }
+
+    /// Record-only never withholds on an inconclusive outcome either: with no
+    /// scanner wired the first pull serves pending (fail-closed 423s the same
+    /// pull, `fail_closed_unscannable_first_pull_is_locked`), and an object
+    /// over the scan byte cap streams pending instead of 423.
+    #[tokio::test]
+    async fn record_only_inconclusive_and_over_cap_pulls_are_served() {
+        let bytes = format!("fake-3645-unscannable-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes.clone())).await else {
+            return;
+        };
+        set_scan_config(&fx, true, "critical", "record_only").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let resp = pull_under_config(&fx, &state, &proxy, &base, &file)
+            .await
+            .unwrap_or_else(|r| panic!("record-only unscannable pull withheld: {}", r.status()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(scan_header(&resp), "pending");
+        assert_eq!(&body_of(resp).await[..], &bytes[..]);
+
+        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let mut over = request(fx.repo_id, &fx.repo_key, &base, action);
+        over.severity_gate = gate;
+        over.ctx = Some(&ctx);
+        let resp = serve_oversized_proxy_file(&state, &over, &file).await;
+        let downloads = recorded(&fx).await;
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(action, ProxyScanAction::RecordOnly);
+        let resp = resp.unwrap_or_else(|r| panic!("record-only over-cap withheld: {}", r.status()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["X-AK-Scan"], "pending");
+        assert_eq!(file.streamed.load(Ordering::SeqCst), 1);
+        assert_eq!(downloads, 2);
+    }
+
+    /// #3868 part 2, the reporter's exact policy: `severity_threshold =
+    /// critical`, `block_on_policy_violation = false`, and a cached
+    /// `vulnerable` verdict whose `max_severity` is `high`.
+    ///
+    /// * As configured it blocks: `block_on_policy_violation = false` means
+    ///   the threshold was never opted into, so the gate is block-on-any (the
+    ///   documented #3243/#3246 contract, not a threshold bug).
+    /// * Opting in (`block_on_policy_violation = true`) honours the critical
+    ///   threshold: a `high` verdict serves.
+    /// * The reporter's actual intent, "do not block at all", is the
+    ///   record-only action: served `recorded` with the same knobs.
+    #[tokio::test]
+    async fn issue_3868_reporter_policy_blocks_until_opted_in_or_record_only() {
+        let bytes = format!("fake-3868-psycopg2-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        seed_vulnerable(&fx, &digest, "high").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        set_scan_config(&fx, false, "critical", "fail_open").await;
+        let as_reported = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        set_scan_config(&fx, true, "critical", "fail_open").await;
+        let opted_in = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        set_scan_config(&fx, false, "critical", "record_only").await;
+        let record_only = pull_under_config(&fx, &state, &proxy, &base, &file).await;
+
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            as_reported.unwrap_err().status(),
+            StatusCode::FORBIDDEN,
+            "block_on_policy_violation=false never opted into the threshold"
+        );
+        let opted_in =
+            opted_in.unwrap_or_else(|r| panic!("opted-in high withheld: {}", r.status()));
+        assert_eq!(opted_in.status(), StatusCode::OK);
+        assert_eq!(scan_header(&opted_in), "clean");
+        let record_only =
+            record_only.unwrap_or_else(|r| panic!("record-only withheld: {}", r.status()));
+        assert_eq!(record_only.status(), StatusCode::OK);
+        assert_eq!(scan_header(&record_only), "recorded");
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -9236,6 +10362,7 @@ mod tests {
                     fixed_version: None,
                     source: None,
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }],
                 ..Default::default()
             })
@@ -9377,7 +10504,7 @@ mod tests {
                 StatusCode::LOCKED,
                 "inconclusive under fail-closed must 423, never serve unscanned bytes"
             ),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on an inconclusive scan")
             }
         }
@@ -9385,7 +10512,7 @@ mod tests {
         assert!(
             matches!(
                 run_gate(&fx.state, ProxyScanAction::FailOpen).await,
-                ProxyScanServeOutcome::Serve { pending: true }
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
             ),
             "inconclusive under fail-open must still serve loudly pending"
         );
@@ -9413,7 +10540,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
         match run_gate(&fail_closed_state, ProxyScanAction::FailClosed).await {
             ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve when the scan errored")
             }
         }
@@ -9422,7 +10549,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
         assert!(matches!(
             run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         ));
     }
 
@@ -9447,7 +10574,7 @@ mod tests {
     //
     // fail-open is proven end-to-end with a real, UNPAUSED clock and is safe
     // to do so: `ServePendingScanAsync` fires the scan in a background
-    // `tokio::spawn` and returns `Serve { pending: true }` without ever
+    // `tokio::spawn` and returns `Serve(ProxyScanServed::Pending)` without ever
     // looking at its outcome (see that arm in `gate_proxy_scan_serve`), so
     // the assertion below returns long before the mock's hang could matter --
     // there is no timer this test needs to wait out, paused or otherwise.
@@ -9466,7 +10593,7 @@ mod tests {
             "deadbeef",
         ) {
             ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
-            ProxyScanServeOutcome::Serve { .. } => {
+            ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on a budget-exceeded scan")
             }
         }
@@ -9495,7 +10622,7 @@ mod tests {
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);
         assert!(matches!(
             run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
-            ProxyScanServeOutcome::Serve { pending: true }
+            ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
         ));
     }
 
@@ -9642,6 +10769,53 @@ mod tests {
         assert_eq!(action, ProxyScanAction::FailOpen);
     }
 
+    /// #3645: record-only results only when every side with scanning enabled
+    /// chose it; an enabled fail-open/fail-closed side wins, and a side with
+    /// scanning off does not veto. The combined gate follows the action.
+    #[test]
+    fn stricter_scan_policy_record_only_needs_every_enabled_side() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+        let ro = ProxyScanAction::RecordOnly;
+        let open = ProxyScanAction::FailOpen;
+        let closed = ProxyScanAction::FailClosed;
+        assert_eq!(stricter_scan_policy(true, ro, true, ro), (true, ro));
+        // Member scanning off (its default action): the virtual's choice holds.
+        assert_eq!(stricter_scan_policy(true, ro, false, open), (true, ro));
+        assert_eq!(stricter_scan_policy(false, open, true, ro), (true, ro));
+        // An enabled enforcing side wins.
+        assert_eq!(stricter_scan_policy(true, ro, true, open), (true, open));
+        assert_eq!(stricter_scan_policy(true, open, true, ro), (true, open));
+        assert_eq!(stricter_scan_policy(true, ro, true, closed), (true, closed));
+        // Fail-closed anywhere still dominates, as before.
+        assert_eq!(
+            stricter_scan_policy(true, ro, false, closed),
+            (true, closed)
+        );
+        // Nothing enabled: not record-only.
+        assert_eq!(stricter_scan_policy(false, ro, false, ro), (false, open));
+
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(
+            combined_severity_gate(
+                ro,
+                ProxySeverityGate::RecordOnly,
+                ProxySeverityGate::BlockOnAny
+            ),
+            ProxySeverityGate::RecordOnly,
+            "a record-only combination never blocks, whatever a scanning-off side's row says"
+        );
+        assert_eq!(
+            combined_severity_gate(open, ProxySeverityGate::RecordOnly, high),
+            high,
+            "an enforcing combination keeps the enforcing side's gate"
+        );
+        assert_eq!(
+            combined_severity_gate(open, high, ProxySeverityGate::BlockOnAny),
+            ProxySeverityGate::BlockOnAny
+        );
+    }
+
     // ── Global buffered-metadata byte budget (#2665) ─────────────────
     //
     // Before this fix the buffered proxy-metadata path (RPM repodata) had a
@@ -9732,6 +10906,208 @@ mod tests {
             budget.total_bytes() >= LARGE_METADATA_MAX_BYTES,
             "shared budget must fit at least one full RPM metadata buffer"
         );
+    }
+
+    // ── Per-family metadata sub-budgets (#3914) ─────────────────────
+
+    fn leaked_sub_budget(bytes: usize) -> &'static MetadataSubBudget {
+        Box::leak(Box::new(MetadataSubBudget::new(
+            MetadataBudgetFamily::VscodeGallery,
+            bytes,
+        )))
+    }
+
+    #[test]
+    fn metadata_sub_budget_bytes_defaults_to_the_family_share_and_clamps() {
+        let family = MetadataBudgetFamily::VscodeGallery;
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, gib),
+            384 * 1024 * 1024
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, Some(" 4096 "), gib), 4096);
+        for unusable in ["", "  ", "lots", "0", "-5"] {
+            assert_eq!(
+                metadata_sub_budget_bytes(family, Some(unusable), gib),
+                384 * 1024 * 1024,
+                "{unusable:?} falls back to the default share"
+            );
+        }
+        assert_eq!(
+            metadata_sub_budget_bytes(family, Some("999999999999"), gib),
+            gib,
+            "a sub-budget never exceeds the budget it is carved out of"
+        );
+        // Small shared budgets: the default share is floored at one
+        // full-width composed gallery response, clamped to the total.
+        let mib = 1024 * 1024;
+        let floor = crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES;
+        assert_eq!(floor, 256 * mib);
+        assert_eq!(metadata_sub_budget_bytes(family, None, 512 * mib), floor);
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, 200 * mib),
+            200 * mib
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 2 * gib), 768 * mib);
+        // An explicit override is the operator's call and is not floored.
+        assert_eq!(
+            metadata_sub_budget_bytes(family, Some("1024"), 512 * mib),
+            1024
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 4), 4);
+        assert_eq!(metadata_sub_budget_bytes(family, None, 0), 1);
+    }
+
+    #[test]
+    fn metadata_budget_family_metadata_is_distinct_per_family() {
+        let labels: std::collections::HashSet<_> = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| f.label())
+            .collect();
+        let envs: std::collections::HashSet<_> = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| f.size_env())
+            .collect();
+        assert_eq!(labels.len(), MetadataBudgetFamily::ALL.len());
+        assert_eq!(envs.len(), MetadataBudgetFamily::ALL.len());
+        for (i, family) in MetadataBudgetFamily::ALL.iter().enumerate() {
+            assert_eq!(family.index(), i);
+            assert!(family.size_env().starts_with("AK_"));
+        }
+        assert_eq!(
+            metadata_sub_budget(MetadataBudgetFamily::VscodeGallery).family(),
+            MetadataBudgetFamily::VscodeGallery
+        );
+    }
+
+    /// The core #3914 property: a saturated family sub-budget sheds the
+    /// family's next reservation, holds none of the shared budget while doing
+    /// so, and leaves the rest of the shared budget to other formats.
+    #[tokio::test]
+    async fn saturated_sub_budget_sheds_family_but_admits_other_formats() {
+        let shared = ProxyMetadataBudget::new(1000);
+        let sub = leaked_sub_budget(250);
+
+        let first = reserve_metadata_budget_in(&shared, Some(sub), 250, None)
+            .await
+            .unwrap_or_else(|_| panic!("the family's first reservation fits its share"));
+        assert_eq!(sub.saturation(), 1.0);
+        assert_eq!(
+            shared.available_bytes(),
+            750,
+            "family bytes count against the shared total"
+        );
+
+        let shed =
+            reserve_metadata_budget_in(&shared, Some(sub), 10, Some(Duration::from_millis(20)))
+                .await;
+        let Err(response) = shed else {
+            panic!("a saturated family sub-budget must shed")
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shared.available_bytes(),
+            750,
+            "the shed reservation held nothing"
+        );
+
+        let npm = reserve_metadata_budget_in(&shared, None, 750, Some(Duration::from_millis(20)))
+            .await
+            .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
+        assert_eq!(shared.available_bytes(), 0);
+
+        drop(first);
+        assert_eq!(
+            sub.saturation(),
+            0.0,
+            "dropping the permit releases the family share"
+        );
+        assert_eq!(shared.available_bytes(), 250);
+        drop(npm);
+        assert_eq!(shared.available_bytes(), 1000);
+    }
+
+    /// The family share is queued on first, so when the SHARED budget is
+    /// what is saturated, a timed-out family reservation also gives its
+    /// family slice back rather than leaking it.
+    #[tokio::test]
+    async fn family_reservation_releases_its_share_when_the_shared_budget_sheds() {
+        let shared = ProxyMetadataBudget::new(100);
+        let sub = leaked_sub_budget(100);
+        let hog = shared.try_reserve(100).expect("fresh budget");
+
+        let shed =
+            reserve_metadata_budget_in(&shared, Some(sub), 40, Some(Duration::from_millis(20)))
+                .await;
+        assert!(
+            shed.is_err(),
+            "a saturated shared budget still sheds a family read"
+        );
+        assert_eq!(sub.budget().available_bytes(), 100);
+        assert_eq!(sub.saturation(), 0.0);
+        drop(hog);
+
+        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40, None)
+            .await
+            .unwrap_or_else(|_| panic!("unbounded reservation succeeds once free"));
+        assert_eq!(sub.budget().available_bytes(), 60);
+        assert_eq!(shared.available_bytes(), 60);
+        drop(permit);
+    }
+
+    /// The saturation gauge is emitted per family and follows reserve and
+    /// release, including the initial 0 an idle family must report.
+    #[test]
+    fn sub_budget_saturation_gauge_tracks_reserve_and_release() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let gauge = || -> Option<f64> {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, value)| {
+                    let key = ck.key();
+                    let labelled = key
+                        .labels()
+                        .any(|l| l.key() == "family" && l.value() == "vscode_gallery");
+                    match value {
+                        DebugValue::Gauge(v)
+                            if key.name() == "ak_proxy_metadata_sub_budget_saturation_ratio"
+                                && labelled =>
+                        {
+                            Some(v.into_inner())
+                        }
+                        _ => None,
+                    }
+                })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let sub = leaked_sub_budget(100);
+            sub.record_saturation();
+            assert_eq!(gauge(), Some(0.0));
+            let shared = ProxyMetadataBudget::new(1000);
+            let permit = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25, None))
+                .unwrap_or_else(|_| panic!("fits"));
+            assert_eq!(gauge(), Some(0.25));
+            drop(permit);
+            assert_eq!(gauge(), Some(0.0));
+        });
+    }
+
+    #[tokio::test]
+    async fn reserve_metadata_budget_bounded_without_family_uses_shared_only() {
+        let before = proxy_metadata_budget().available_bytes();
+        let permit = reserve_metadata_budget_bounded(4096, Some(Duration::from_secs(1)), None)
+            .await
+            .unwrap_or_else(|_| panic!("a small shared reservation is admitted"));
+        assert_eq!(proxy_metadata_budget().available_bytes(), before - 4096);
+        drop(permit);
+        assert_eq!(proxy_metadata_budget().available_bytes(), before);
     }
 
     /// #2665: a budgeted response body must keep its reservation debited for
@@ -12995,6 +14371,8 @@ mod tests {
                 s3_endpoint: None,
                 jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
                 signature_expiry_seconds: 604_800,
+                signing_key_rotation_overlap_secs: 1_209_600,
+                signing_auto_migrate_legacy_keys: false,
                 jwt_expiration_secs: 86400,
                 jwt_access_token_expiry_minutes: 30,
                 jwt_refresh_token_expiry_days: 7,
@@ -13016,6 +14394,7 @@ mod tests {
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
+                guest_access_env_pinned: false,
                 expose_detailed_health: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
@@ -13030,11 +14409,13 @@ mod tests {
                 dependency_track_enabled: false,
                 otel_exporter_otlp_endpoint: None,
                 otel_service_name: "test".into(),
+                gc_trash_retention_days: 0,
                 gc_schedule: "0 0 * * * *".into(),
                 storage_stats_schedule: "0 0 */4 * * *".into(),
                 blob_gc_enabled: false,
                 maven_flat_gc_enabled: false,
                 blob_gc_sweep_grace_secs: 3600,
+                blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
@@ -13046,6 +14427,8 @@ mod tests {
                 api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
+                grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+                metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
                 database_max_connections: 20,
                 database_min_connections: 5,
                 database_acquire_timeout_secs: 30,
@@ -14717,7 +16100,8 @@ mod tests {
     /// `proxy_fetch_streaming` (no buffering), plus the repository's REAL
     /// format, so `cache_classifier::classify` can reach its per-format arm
     /// instead of the `Generic` stand-in `build_remote_repo` synthesizes. The
-    /// Maven and sbt artifact downloads moved to this helper in #3459 — with
+    /// Maven and sbt artifact downloads moved to this helper in #3459 (the Go
+    /// module `.zip` followed in #4120) — with
     /// `Generic` every released coordinate was stamped with the conservative
     /// 5-minute mutable TTL and re-fetched from upstream after it — so their
     /// pins assert this token. A revert to the buffered `proxy_fetch` OR to
@@ -14762,7 +16146,7 @@ mod tests {
     streaming_pin_test!(
         test_goproxy_remote_fetch_uses_streaming_helper_1183,
         "goproxy.rs",
-        STREAMING_CALL_TOKEN,
+        FORMAT_STREAMING_CALL_TOKEN,
         "the remote `@v/<ver>.zip` download"
     );
     streaming_pin_test!(
@@ -18103,6 +19487,134 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
+    // ── #2475: cross-project virtual governance ──────────────────────────
+
+    /// Projects P4 (#2475): a virtual repository may aggregate members from
+    /// OTHER projects, but each member stays governed by its own project.
+    ///
+    /// * A caller with read+write on member project A but nothing on member
+    ///   project B sees only A's member through the virtual (B's private
+    ///   member is neither listed nor resolvable), and a through-virtual
+    ///   publish resolves to A's member even though B's member has the
+    ///   higher priority.
+    /// * A caller whose only grant is on the VIRTUAL's project gets nothing
+    ///   from either member — a grant on the virtual's project must not leak
+    ///   into members of other projects — and has no deploy target.
+    #[tokio::test]
+    async fn cross_project_virtual_members_follow_their_own_project_grants() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let member_user = db_helpers::create_user(&pool).await;
+        let (virtual_only_user, _u) = tdh::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (b_id, _kb, db_) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (a_id, _ka, da) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, b_id, 1).await;
+        db_helpers::link_member(&pool, root_id, a_id, 2).await;
+
+        let mut projects = Vec::new();
+        for (tag, repo) in [("virtual", root_id), ("a", a_id), ("b", b_id)] {
+            let project: Uuid =
+                sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+                    .bind(format!("p4-{tag}-{}", Uuid::new_v4().simple()))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create project");
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(repo)
+                .bind(project)
+                .execute(&pool)
+                .await
+                .expect("assign project");
+            projects.push(project);
+        }
+        let (virtual_project, a_project) = (projects[0], projects[1]);
+        for user in [member_user, virtual_only_user] {
+            tdh::grant_permission(
+                &pool,
+                "user",
+                user,
+                "project",
+                virtual_project,
+                &["read", "write"],
+            )
+            .await;
+        }
+        tdh::grant_permission(
+            &pool,
+            "user",
+            member_user,
+            "project",
+            a_project,
+            &["read", "write"],
+        )
+        .await;
+
+        let svc = crate::services::permission_service::PermissionService::new(pool.clone());
+        let member_auth = nonadmin_auth(member_user);
+        let virtual_only_auth = nonadmin_auth(virtual_only_user);
+        let ids = |r: Result<Vec<Repository>, Response>| -> Vec<Uuid> {
+            r.map(|ms| ms.into_iter().map(|m| m.id).collect())
+                .unwrap_or_else(|e| panic!("authorize members failed: {}", e.status()))
+        };
+        let member_visible =
+            ids(authorized_virtual_members(&pool, Some(&member_auth), root_id).await);
+        let virtual_only_visible =
+            ids(authorized_virtual_members(&pool, Some(&virtual_only_auth), root_id).await);
+        let anonymous_visible = ids(authorized_virtual_members(&pool, None, root_id).await);
+        let member_target = resolve_virtual_deploy_target(&pool, &svc, &member_auth, root_id)
+            .await
+            .map(|r| r.id);
+        let virtual_only_target =
+            resolve_virtual_deploy_target(&pool, &svc, &virtual_only_auth, root_id)
+                .await
+                .map(|r| r.id);
+
+        // Clean up BEFORE asserting so a failure does not leak the fixtures.
+        let _ = sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'project' AND target_id = ANY($1)",
+        )
+        .bind(&projects)
+        .execute(&pool)
+        .await;
+        cleanup_member_graph(&pool, &[root_id, b_id, a_id], member_user, &[rd, db_, da]).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(virtual_only_user)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = ANY($1)")
+            .bind(&projects)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            member_visible,
+            vec![a_id],
+            "only the member whose project grants the caller read may aggregate"
+        );
+        assert!(
+            virtual_only_visible.is_empty(),
+            "a grant on the virtual's project must not leak other projects' members"
+        );
+        assert!(
+            anonymous_visible.is_empty(),
+            "private members never reach anonymous"
+        );
+        assert_eq!(
+            member_target.expect("A's member is writable via its project grant"),
+            a_id,
+            "the deploy target skips the higher-priority member of an ungranted project"
+        );
+        assert_eq!(
+            virtual_only_target
+                .expect_err("no member project grants write")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     /// #3813 F1: the virtual-parent byte fan-out and a direct member fetch must
     /// give an authenticated grant-less caller the SAME answer for an
     /// `internal` member.
@@ -18212,6 +19724,60 @@ mod tests {
             "the fan-out must not widen a private member; a fix that returns \
              true unconditionally passes the internal half and fails here"
         );
+    }
+
+    /// #3813 follow-up: an ANONYMOUS caller of a PUBLIC virtual must not
+    /// reach an `internal` member through it. `internal` is the
+    /// authenticated baseline; a public parent must not launder it down to
+    /// anonymous. A public member is the positive control.
+    #[tokio::test]
+    async fn anonymous_caller_of_public_virtual_cannot_read_internal_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vk, virtual_dir) =
+            db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (internal_id, _ik, internal_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (public_id, _pk, public_dir) = db_helpers::create_repo(&pool, "local", "generic").await;
+        for (id, visibility) in [
+            (virtual_id, "public"),
+            (internal_id, "internal"),
+            (public_id, "public"),
+        ] {
+            sqlx::query(
+                "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+            )
+            .bind(id)
+            .bind(visibility)
+            .execute(&pool)
+            .await
+            .expect("set visibility");
+        }
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let internal = svc.get_by_id(internal_id).await.expect("load internal");
+        let public = svc.get_by_id(public_id).await.expect("load public");
+
+        let anon_internal = caller_can_read_member(&pool, None, virtual_id, &internal).await;
+        let anon_public = caller_can_read_member(&pool, None, virtual_id, &public).await;
+
+        for (id, dir) in [
+            (virtual_id, virtual_dir),
+            (internal_id, internal_dir),
+            (public_id, public_dir),
+        ] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert!(
+            !anon_internal,
+            "an anonymous caller of a public virtual must not read an internal member"
+        );
+        assert!(anon_public, "control: a public member stays readable");
     }
 
     #[test]
@@ -19317,9 +20883,12 @@ mod virtual_read_authz_tests {
     ///   within [`AUTHZ_WINDOW`] bytes (the content-serving shape — most sites
     ///   now call [`authorized_virtual_members`], which is the pair fused into
     ///   one call and matches this substring too); or
-    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` or
-    ///   `UNFILTERED-DEFERRED` marker, which forces the author to state in the
-    ///   source WHY this walk must not be narrowed.
+    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` marker, which forces
+    ///   the author to state in the source WHY this walk must not be narrowed.
+    ///
+    /// The deferral escape is gone: its only user, the RPM virtual repodata
+    /// walk, is caller-authorized since #4346, so a content-serving walk can no
+    /// longer be parked as "fix later".
     ///
     /// The marker exists because filtering is not universally correct: a walk
     /// that computes a DENY-set (OCI's scan-verdict blocklist) or a shadowing
@@ -19360,9 +20929,7 @@ mod virtual_read_authz_tests {
                 // multi-byte characters (em dashes in the comments), and slicing
                 // mid-codepoint would panic.
                 let before = &src[floor_boundary(src, at.saturating_sub(MARKER_WINDOW))..at];
-                if before.contains("UNFILTERED-ENFORCEMENT")
-                    || before.contains("UNFILTERED-DEFERRED")
-                {
+                if before.contains("UNFILTERED-ENFORCEMENT") {
                     continue;
                 }
 
@@ -19380,11 +20947,28 @@ mod virtual_read_authz_tests {
         assert!(
             unguarded.is_empty(),
             "#3323: these virtual-repo member walks neither authorize the member set \
-             against the caller nor carry an UNFILTERED-ENFORCEMENT / \
-             UNFILTERED-DEFERRED marker explaining why they must not: {unguarded:?}. \
+             against the caller nor carry an UNFILTERED-ENFORCEMENT marker \
+             explaining why they must not: {unguarded:?}. \
              A content-serving path must use `proxy_helpers::authorized_virtual_members`; \
              an enforcement path (deny-set, shadowing guard, cache invalidation) must \
              say so in a comment immediately above the call."
+        );
+    }
+
+    /// #4346: no content-serving member walk is parked behind a deferral
+    /// marker any more. The RPM repodata walk was the last one (#3323); a new
+    /// deferral marker would reopen the class, so the count is pinned at zero.
+    #[test]
+    fn no_virtual_member_walk_is_deferred_4346() {
+        let deferred: Vec<&str> = HANDLER_SOURCES
+            .iter()
+            .filter(|(_, src)| src.contains(concat!("UNFILTERED", "-DEFERRED")))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "#4346: content-serving virtual member walks must be caller-authorized, \
+             not deferred: {deferred:?}"
         );
     }
 
@@ -20127,6 +21711,8 @@ mod proxy_download_recording_tests {
                 "conda.rs",
                 "proxy_fetch_streaming_with_disposition_and_format(",
             ),
+            // #4120 moved the Go module `.zip` download the same way.
+            ("goproxy.rs", "proxy_fetch_streaming_with_format("),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()
@@ -20219,6 +21805,21 @@ mod proxy_download_recording_tests {
         // named functions' bodies, not every branch inside them; a new
         // package-serving route must be added to this table.
         const ROUTE_PINS: &[(&str, &str, &str, usize)] = &[
+            // #4101: the Remote `.crate` arm and the Virtual member walk.
+            ("cargo.rs", "download", "serve_scanned_crate(", 1),
+            ("cargo.rs", "download", "serve_scanned_virtual_crate(", 1),
+            (
+                "cargo.rs",
+                "serve_scanned_virtual_crate",
+                "serve_scanned_crate(",
+                1,
+            ),
+            (
+                "cargo.rs",
+                "serve_scanned_crate",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
             // Direct Remote arm + the Virtual member walk.
             ("npm.rs", "serve_tarball", "serve_scanned_npm_tarball(", 2),
             (
@@ -20287,6 +21888,75 @@ mod proxy_download_recording_tests {
                 "oci_v2.rs",
                 "handle_get_blob",
                 "enforce_blob_scan_reblock(",
+                1,
+            ),
+            // #4100: Maven (and Gradle) direct Remote arm + the Virtual walk.
+            (
+                "maven.rs",
+                "serve_artifact",
+                "serve_scanned_maven_archive(",
+                2,
+            ),
+            (
+                "maven.rs",
+                "serve_scanned_maven_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4100: sbt's Ivy route, direct Remote arm + the Virtual walk.
+            (
+                "sbt.rs",
+                "download_by_path",
+                "serve_scanned_sbt_archive(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "download_by_path",
+                "serve_scanned_sbt_virtual(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "serve_scanned_sbt_virtual",
+                "serve_scanned_sbt_archive(",
+                1,
+            ),
+            (
+                "sbt.rs",
+                "serve_scanned_sbt_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4102: NuGet (and Chocolatey / PowerShell). The V3 Remote arm
+            // and the row-repair arm pass the repository's policy into the
+            // flat-container fetch, which gates package files; the V2
+            // `package/` Remote arm; the Virtual walk (both routes).
+            (
+                "nuget.rs",
+                "flatcontainer_download",
+                "remote_scan_policy(",
+                2,
+            ),
+            (
+                "nuget.rs",
+                "proxy_v3_flatcontainer",
+                "serve_scanned_nupkg(",
+                1,
+            ),
+            ("nuget.rs", "v2_download", "remote_scan_policy(", 1),
+            ("nuget.rs", "v2_download", "proxy_v2_download(", 1),
+            ("nuget.rs", "proxy_v2_download", "serve_scanned_nupkg(", 1),
+            (
+                "nuget.rs",
+                "virtual_member_download",
+                "walk_virtual_members_with_scan(",
+                1,
+            ),
+            (
+                "nuget.rs",
+                "serve_scanned_nupkg",
+                "serve_scanned_proxy_file(",
                 1,
             ),
         ];

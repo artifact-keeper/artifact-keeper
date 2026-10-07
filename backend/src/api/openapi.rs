@@ -51,12 +51,14 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "webhooks", description = "Event webhook management"),
         (name = "peers", description = "Peer replication and sync"),
         (name = "admin", description = "System administration"),
+        (name = "banners", description = "System-wide maintenance and downtime banners"),
         (name = "analytics", description = "Storage and download analytics"),
         (name = "lifecycle", description = "Retention policies and cleanup"),
         (name = "monitoring", description = "Health monitoring and alerts"),
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "bundles", description = "Offline content bundle export and import"),
         (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "age-gate", description = "Age-based proxy quality gate"),
@@ -163,7 +165,12 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "environments",
             handlers::environments::EnvironmentsApiDoc::openapi(),
         ),
+        (
+            "artifact_presence",
+            handlers::artifact_presence::ArtifactPresenceApiDoc::openapi(),
+        ),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
+        ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
             "admin_security",
             handlers::admin_security::AdminSecurityApiDoc::openapi(),
@@ -178,6 +185,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "storage_integrity",
             handlers::storage_integrity::StorageIntegrityApiDoc::openapi(),
         ),
+        ("trash", handlers::trash::TrashApiDoc::openapi()),
         (
             "monitoring",
             handlers::monitoring::MonitoringApiDoc::openapi(),
@@ -190,6 +198,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("projects", handlers::projects::ProjectsApiDoc::openapi()),
         ("migration", handlers::migration::MigrationApiDoc::openapi()),
+        ("bundles", handlers::bundles::BundlesApiDoc::openapi()),
         ("sso", handlers::sso::SsoApiDoc::openapi()),
         ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),
         ("totp", handlers::totp::TotpApiDoc::openapi()),
@@ -609,6 +618,26 @@ mod tests {
         }
     }
 
+    /// #3522: `POST /api/v1/users/{id}/roles` is deprecated in favour of
+    /// `POST /api/v1/permissions`, and the spec must say so (generated SDKs
+    /// key their deprecation warnings off this flag). The sibling `GET` on
+    /// the same path is not deprecated.
+    #[test]
+    fn test_3522_openapi_assign_user_role_is_deprecated() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let item = &spec["paths"]["/api/v1/users/{id}/roles"];
+        assert!(item.is_object(), "path missing from the spec");
+        assert_eq!(item["post"]["deprecated"], serde_json::Value::Bool(true));
+        assert!(item["get"]["deprecated"].is_null());
+        let headers = &item["post"]["responses"]["200"]["headers"];
+        assert!(
+            headers["Deprecation"].is_object(),
+            "Deprecation header documented"
+        );
+        assert!(headers["Link"].is_object(), "Link header documented");
+        assert!(spec["paths"]["/api/v1/permissions"]["post"].is_object());
+    }
+
     /// #3812: `visibility` is the authoritative field; the legacy boolean and
     /// its alias stay accepted and returned but are flagged deprecated in the
     /// spec so generated SDKs surface it.
@@ -748,6 +777,7 @@ mod tests {
                     include_str!("handlers/security.rs"),
                     include_str!("handlers/repo_tokens.rs"),
                     include_str!("handlers/environments.rs"),
+                    include_str!("handlers/artifact_presence.rs"),
                 ],
             ),
             (
@@ -853,6 +883,10 @@ mod tests {
             (
                 "/api/v1/migrations/",
                 vec![include_str!("handlers/migration.rs")],
+            ),
+            (
+                "/api/v1/bundles/",
+                vec![include_str!("handlers/bundles.rs")],
             ),
             (
                 "/api/v1/curation/",
