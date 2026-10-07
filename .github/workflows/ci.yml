@@ -1483,6 +1483,13 @@ jobs:
       - name: Check Trivy gate severity filter
         run: ./scripts/ci/check-trivy-gate-severity.sh
 
+      # Stock compose image names (#4479): a short name like
+      # `postgres:18-alpine` resolves per host under podman's enforcing
+      # short-name mode, so the same file could run different images.
+      # Pure YAML inspection, ~1s.
+      - name: Check the stock compose names every image's registry
+        run: bash scripts/ci/check-compose-image-names.sh
+
       # Same species as the check above, one layer out (#3308). That one asks
       # "does the publish gate apply the filter it declares?"; this one asks
       # "does the PRE-TAG gate block on what it just measured?" It did not:
