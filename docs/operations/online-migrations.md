@@ -134,8 +134,9 @@ uses. A later "drop the old index" migration then removes the only valid one.
 The reset migration cannot help, because it was recorded on the first boot and
 does not run again.
 
-So the backend repairs it before migrating. On every start, before
-`MIGRATOR.run` and under the migrator's advisory lock,
+So the backend repairs it before migrating. On every start that runs
+migrations (not with `SKIP_MIGRATIONS=true`), before `MIGRATOR.run` and under
+the migrator's advisory lock,
 `migration_repair::repair_invalid_concurrent_indexes` walks
 `CONCURRENT_INDEX_MIGRATIONS`. For each registered build migration that is not
 yet recorded in `_sqlx_migrations`, it drops the named index if
