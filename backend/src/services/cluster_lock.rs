@@ -493,6 +493,7 @@ mod tests {
             "dropping the guard must release the advisory lock (connection close)"
         );
     }
+
     #[test]
     fn lock_timeout_setting_never_becomes_unbounded() {
         // `lock_timeout = 0` is "wait forever" in Postgres: a zero timeout

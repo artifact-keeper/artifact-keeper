@@ -80,8 +80,8 @@ CONCURRENCY=200            # number of concurrent GETs
 LB_URL=http://localhost:18080
 MOCK_UPSTREAM_URL=http://localhost:19999
 REPLICAS=3                 # backend replicas behind the LB (sets the LARGE default)
-FETCH_TOLERANCE=0          # allow upstream counter up to 1+tolerance
-                           # (default: 0, or REPLICAS-1 for an object > 16 MiB)
+FETCH_TOLERANCE=           # unset = automatic: 0, or REPLICAS-1 for an object
+                           # > 16 MiB; set a number to override (0 = strict)
 ```
 
 Operator note (#4013): with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`, a
