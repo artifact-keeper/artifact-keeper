@@ -10766,8 +10766,9 @@ struct PushedManifest<'a> {
 }
 
 /// Commit a pushed manifest's tag, references and `artifacts` row on ONE
-/// transaction (#4422), returning the artifact id or the OCI error the push
-/// answers. Nothing commits unless everything does.
+/// transaction (#4422), then apply the upload quarantine hold and
+/// scan-on-upload to the committed row. Returns the artifact id or the OCI
+/// error the push answers; nothing commits unless everything does.
 async fn commit_pushed_manifest(
     state: &SharedState,
     m: PushedManifest<'_>,
@@ -10814,6 +10815,21 @@ async fn commit_pushed_manifest(
     .await
     .map_err(|e| internal(&e))?;
     tx.commit().await.map_err(|e| internal(&e))?;
+
+    // Post-commit: the hold and the scan read the committed row.
+    crate::services::quarantine_service::apply_upload_hold_hosted(
+        &state.db,
+        m.repo_id,
+        artifact_id,
+    )
+    .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        m.repo_id,
+        artifact_id,
+    )
+    .await;
     Ok(artifact_id)
 }
 
@@ -11076,23 +11092,8 @@ async fn handle_put_manifest(
         },
     )
     .await;
-    match committed {
-        Ok(artifact_id) => {
-            crate::services::quarantine_service::apply_upload_hold_hosted(
-                &state.db,
-                repo_id,
-                artifact_id,
-            )
-            .await;
-            crate::services::scanner_service::trigger_scan_on_upload(
-                &state.db,
-                state.scanner_service.clone(),
-                repo_id,
-                artifact_id,
-            )
-            .await;
-        }
-        Err(refusal) => return refusal,
+    if let Err(refusal) = committed {
+        return refusal;
     }
 
     // Surface the pushed image in the packages catalog. The web UI's
