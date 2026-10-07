@@ -1065,6 +1065,14 @@ where
     let obj = lease_object_id(lease_key);
     match lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
         Ok(Some(lease)) => match open_leader().await {
+            // A body that will never be cached (over-quota bypass,
+            // stale-if-error) gives waiters nothing to wait for: release now
+            // so each replica fetches in parallel, once per process, instead
+            // of queueing behind this whole stream.
+            Ok(handle) if handle.cache_published.is_none() => {
+                lease.release().await;
+                Ok(LeaderOpen::Body(handle))
+            }
             Ok(handle) => Ok(LeaderOpen::Body(hold_lease_until_published(lease, handle))),
             Err(e) => {
                 // No body, no cache write: release now so a waiter re-elects.
@@ -2184,6 +2192,32 @@ mod tests {
             lock_frees_within(&lock, &key, Duration::from_secs(2)).await,
             "cluster lock released once the cache publish finished"
         );
+    }
+
+    /// #4013 review: a cluster leader whose body is never cached (no publish
+    /// signal) releases the lock at once, so remote waiters fetch in parallel
+    /// instead of queueing behind the whole uncacheable stream.
+    #[tokio::test]
+    async fn advisory_streaming_uncached_leader_releases_lock_at_open() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let key = format!("proxy-stream:uncached-{}", uuid::Uuid::new_v4());
+        let coord = advisory_over(&lock);
+        let handle = coord
+            .coordinate_stream(&key, || async {
+                Ok(StreamHandle {
+                    body: body_of(&[b"abc"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            })
+            .await
+            .expect("ok")
+            .expect("leader");
+        assert!(
+            lock_frees_within(&lock, &key, Duration::ZERO).await,
+            "no publish to wait for: the lock is free before the body is read"
+        );
+        assert_eq!(drain(handle.body).await.expect("bytes"), b"abc");
     }
 
     /// A leader body dropped mid-stream (client gone) still releases once its
