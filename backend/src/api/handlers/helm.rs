@@ -1094,6 +1094,17 @@ async fn upload_chart(
         .await
         .map_err(|e| proxy_helpers::internal_error("Database", e))?;
 
+    // Each row is admitted against the storage quotas in this transaction
+    // right before its INSERT, so the prov is admitted against usage that
+    // already includes the chart (#4422).
+    super::publish_quota::admit_publish_in_tx(
+        &mut tx,
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = proxy_helpers::insert_artifact_row(
         &mut tx,
         proxy_helpers::NewArtifact {
@@ -1111,25 +1122,36 @@ async fn upload_chart(
     .await?;
 
     let prov_artifact_id = match prov_put.as_ref() {
-        Some(prov_put) => Some(
-            // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
-            // signature, not package content; the chart row above is scanned.
-            proxy_helpers::insert_artifact_row(
+        Some(prov_put) => {
+            let prov_size = prov_put.bytes_written as i64;
+            super::publish_quota::admit_publish_in_tx(
                 &mut tx,
-                proxy_helpers::NewArtifact {
-                    repository_id: repo.id,
-                    path: &prov_artifact_path,
-                    name: chart_name,
-                    version: chart_version,
-                    size_bytes: prov_put.bytes_written as i64,
-                    checksum_sha256: &prov_put.checksum_sha256,
-                    content_type: PROV_CONTENT_TYPE,
-                    storage_key: &prov_storage_key,
-                    uploaded_by: user_id,
-                },
+                &state.db,
+                repo.id,
+                &prov_artifact_path,
+                prov_size,
             )
-            .await?,
-        ),
+            .await?;
+            Some(
+                // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
+                // signature, not package content; the chart row above is scanned.
+                proxy_helpers::insert_artifact_row(
+                    &mut tx,
+                    proxy_helpers::NewArtifact {
+                        repository_id: repo.id,
+                        path: &prov_artifact_path,
+                        name: chart_name,
+                        version: chart_version,
+                        size_bytes: prov_size,
+                        checksum_sha256: &prov_put.checksum_sha256,
+                        content_type: PROV_CONTENT_TYPE,
+                        storage_key: &prov_storage_key,
+                        uploaded_by: user_id,
+                    },
+                )
+                .await?,
+            )
+        }
         None => None,
     };
 
@@ -2447,6 +2469,57 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             .unwrap();
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
+
+    /// #4422 review: chart and `.prov` are admitted row by row in ONE
+    /// transaction, the prov against usage that already includes the chart.
+    /// When each fits alone but not together, the push is refused with 507
+    /// and neither row lands; at exactly their sum both are admitted.
+    #[tokio::test]
+    async fn test_helm_chart_and_prov_admitted_together_against_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let together = (tgz.len() + REAL_PROV.len()) as i64;
+        let set_quota = |quota: i64| {
+            sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                .bind(f.repo_id)
+                .bind(quota)
+                .execute(&f.pool)
+        };
+        let parts: &[(&str, &str, &[u8])] = &[
+            ("chart", "provchart-0.1.0.tgz", &tgz),
+            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+        ];
+        let rows = || {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+        };
+
+        set_quota(together - 1).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 0, "neither row may land");
+
+        set_quota(together).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 2);
+
         f.teardown().await;
     }
 

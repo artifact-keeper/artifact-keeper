@@ -390,6 +390,40 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     )
 }
 
+/// A database failure as the Connect `internal` error.
+fn connect_db_error(e: sqlx::Error) -> Response {
+    connect_error(
+        crate::api::handlers::db_status(&e),
+        "internal",
+        crate::api::handlers::db_err_message(&e),
+    )
+}
+
+/// #4422: a storage-quota decision as the Connect error an upload answers:
+/// `507 resource_exhausted` naming the repository or project quota that
+/// refuses it, or `internal` when the check itself failed.
+#[allow(clippy::result_large_err)]
+fn connect_quota_decision(
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+) -> Result<(), Response> {
+    match decision {
+        Ok(None) => Ok(()),
+        Ok(Some(scope)) => Err(connect_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "resource_exhausted",
+            scope.exceeded_message(),
+        )),
+        Err(e) => {
+            tracing::error!("storage quota check failed: {e}");
+            Err(connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "storage quota check failed",
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -711,6 +745,8 @@ async fn save_label_index(
             // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
             // JSON document, not uploaded content; the module upload itself
             // triggers the scan (#4166).
+            // NO-QUOTA-ADMISSION: the generated `_labels` index is a few bytes
+            // the registry writes for an already-admitted module commit (#4422).
             let row = sqlx::query(
                 r#"INSERT INTO artifacts (
                     repository_id, path, name, version, size_bytes,
@@ -1140,6 +1176,18 @@ async fn upload(
         let bundle_bytes = Bytes::from(bundle);
         let size_bytes = bundle_bytes.len() as i64;
 
+        // Refuse an over-quota commit before its bundle is stored (#4422).
+        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
+        connect_quota_decision(
+            super::publish_quota::preflight_quota_denial(
+                &state.db,
+                repo.id,
+                super::publish_quota::PublishAt::Path(&artifact_path),
+                size_bytes,
+            )
+            .await,
+        )?;
+
         // Store via StorageBackend
         let storage_key = build_module_storage_key(&module_name, &commit_digest);
         proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
@@ -1155,11 +1203,21 @@ async fn upload(
             )
         })?;
 
-        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
-
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-        // Insert artifact record
+        // Insert artifact record, admitted against the storage quotas in the
+        // same transaction (#4422).
+        let mut tx = state.db.begin().await.map_err(connect_db_error)?;
+        connect_quota_decision(
+            super::publish_quota::locked_quota_denial(
+                &mut tx,
+                &state.db,
+                repo.id,
+                &artifact_path,
+                size_bytes,
+            )
+            .await,
+        )?;
         let row = sqlx::query(
             r#"INSERT INTO artifacts (
                 repository_id, path, name, version, size_bytes,
@@ -1177,7 +1235,7 @@ async fn upload(
         .bind("application/gzip")
         .bind(&storage_key)
         .bind(user_id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             connect_error(
@@ -1186,6 +1244,7 @@ async fn upload(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
+        tx.commit().await.map_err(connect_db_error)?;
 
         let artifact_id: uuid::Uuid = row.get("id");
 
@@ -1937,6 +1996,20 @@ fn extract_graph_edges(metadata: &Option<serde_json::Value>, commit_id: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4422: a quota decision maps to the Connect error an upload answers.
+    #[test]
+    fn connect_quota_decision_maps_scopes_4422() {
+        use crate::services::repository_service::QuotaScope;
+        assert!(connect_quota_decision(Ok(None)).is_ok());
+        for scope in [QuotaScope::Repository, QuotaScope::Project] {
+            let resp = connect_quota_decision(Ok(Some(scope))).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        }
+        let resp =
+            connect_quota_decision(Err(crate::error::AppError::Database("x".into()))).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // -----------------------------------------------------------------------
     // connect_error
@@ -2791,6 +2864,61 @@ mod catalog_registration_tests {
         let row = row.expect("a protobuf upload must write a packages row (#3659)");
         assert_eq!(row.version, digest);
         assert_eq!(row.versions, vec![digest]);
+    }
+
+    /// #4422 review: a `buf push` past the repository quota answers the
+    /// Connect `resource_exhausted` error with status 507 and writes no row.
+    #[tokio::test]
+    async fn module_upload_refused_by_quota_answers_connect_507_4422() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "quota" },
+                "files": [{
+                    "path": "acme/quota/v1/q.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let resp: serde_json::Value = serde_json::from_slice(&resp).expect("connect error json");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{resp}"
+        );
+        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
+        assert_eq!(resp["message"], "Repository storage quota exceeded");
+        assert_eq!(rows, 0);
     }
 }
 

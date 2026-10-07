@@ -5492,14 +5492,13 @@ async fn store_npm_version(
     // before any bytes are written; the authoritative admission happens
     // under lock in the same transaction as the artifact INSERT below.
     let size_bytes = ver.tarball_bytes.len() as i64;
-    let repo_service = state.create_repository_service();
-    if let Some(scope) = repo_service
-        .quota_preflight(repo_id, size_bytes)
-        .await
-        .map_err(IntoResponse::into_response)?
-    {
-        return Err(scope.into_error().into_response());
-    }
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo_id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
 
     // Store the tarball
     let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
@@ -5515,14 +5514,13 @@ async fn store_npm_version(
     // a capped project) cannot jointly over-admit. A denial here is only
     // reachable when a concurrent upload consumed the headroom after the
     // preflight above.
-    let mut tx = state.db.begin().await.map_err(map_db_err)?;
-    let admission = repo_service
-        .check_quota_locked(&mut tx, repo_id, &artifact_path, size_bytes)
-        .await
-        .map_err(IntoResponse::into_response)?;
-    if let Some(scope) = admission.denied_by {
-        return Err(scope.into_error().into_response());
-    }
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(

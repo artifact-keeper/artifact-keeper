@@ -6855,6 +6855,15 @@ pub async fn put_artifact_bytes(
     storage_key: &str,
     body: Bytes,
 ) -> Result<(), Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        body.len() as i64,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -7009,6 +7018,15 @@ pub async fn put_artifact_stream(
     storage_key: &str,
     staged: StagedUpload,
 ) -> Result<crate::storage::PutStreamResult, Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        staged.size_bytes,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -7469,21 +7487,25 @@ pub struct NewArtifact<'a> {
     pub uploaded_by: Uuid,
 }
 
-/// Insert a row into `artifacts` and return the new id.
+/// Insert a hosted publish's row into `artifacts` and return the new id.
 ///
 /// Replaces the duplicated nine-column INSERT macro that every multipart
-/// upload handler otherwise repeats verbatim. Errors map to a 500
-/// "Database error" response.
+/// upload handler otherwise repeats verbatim. The INSERT runs in the
+/// transaction that decides the repository / project storage-quota admission
+/// for the row (#4422), so a publish that would exceed a quota answers the
+/// generic route's `507` and leaves no row. Other database errors map to a
+/// 500 "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
     let repository_id = art.repository_id;
 
-    let mut conn = db
-        .acquire()
+    let mut tx =
+        super::publish_quota::begin_admitted_publish(db, repository_id, art.path, art.size_bytes)
+            .await?;
+    let id = insert_artifact_row(&mut tx, art).await?;
+    tx.commit()
         .await
         .map_err(|e| internal_error("Database", e))?;
-    let id = insert_artifact_row(&mut conn, art).await?;
-    drop(conn);
 
     // Apply the upload-time quarantine hold at the shared chokepoint used by the
     // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
@@ -21472,18 +21494,34 @@ mod scan_on_upload_coverage_tests {
     /// without anyone remembering to list it.
     fn handler_sources() -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
-        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
-            .expect("read src/api/handlers")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-            .map(|p| {
-                let name = p.file_name().unwrap().to_string_lossy().into_owned();
-                let src = std::fs::read_to_string(&p).expect("read handler source");
-                (name, src)
-            })
-            .collect();
+        let mut out = Vec::new();
+        collect_handler_sources(&dir, "", &mut out);
         out.sort();
         out
+    }
+
+    /// Every `.rs` file under `dir`, recursively, keyed by its path relative
+    /// to `src/api/handlers` (`rpm/depth_tests.rs`), so a handler written as a
+    /// directory module is scanned too (#4422 review). Files of a
+    /// subdirectory named `tests.rs` / `*_tests.rs` are test modules declared
+    /// from their parent under `#[cfg(test)]`, and are skipped.
+    fn collect_handler_sources(
+        dir: &std::path::Path,
+        prefix: &str,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read a handlers directory") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                collect_handler_sources(&path, &format!("{prefix}{name}/"), out);
+            } else if name.ends_with(".rs")
+                && !(!prefix.is_empty() && (name == "tests.rs" || name.ends_with("_tests.rs")))
+            {
+                let src = std::fs::read_to_string(&path).expect("read handler source");
+                out.push((format!("{prefix}{name}"), src));
+            }
+        }
     }
 
     /// One production insert site: the enclosing function and whether the
@@ -21492,6 +21530,8 @@ mod scan_on_upload_coverage_tests {
     struct Site {
         func: String,
         covered: bool,
+        /// Covered by the gate's marker comment rather than by a check.
+        exempt: bool,
     }
 
     /// Source text of the `i`th top-level function (up to the next one).
@@ -21501,10 +21541,10 @@ mod scan_on_upload_coverage_tests {
     }
 
     /// Byte offsets of every insert site (SQL or primitive call) in `src`.
-    fn insert_offsets(src: &str) -> Vec<usize> {
-        let sql = regex::Regex::new(INSERT_SQL).expect("valid insert regex");
+    fn insert_offsets(src: &str, gate: &InsertGate) -> Vec<usize> {
+        let sql = regex::Regex::new(gate.insert_sql).expect("valid insert regex");
         let mut out: Vec<usize> = sql.find_iter(src).map(|m| m.start()).collect();
-        for needle in INSERT_CALLS {
+        for needle in gate.insert_calls {
             out.extend(src.match_indices(needle).map(|(at, _)| at));
         }
         out.sort_unstable();
@@ -21515,15 +21555,20 @@ mod scan_on_upload_coverage_tests {
     /// insert at `at` carries the marker. Walks up from the insert's line
     /// through the statement's own code lines; a line ending a previous
     /// statement or block (`;`, `{`, `}`) or a blank line ends the search.
-    fn marker_above(src: &str, at: usize) -> bool {
+    /// Shortest reason text a marker must carry after its colon.
+    const MIN_MARKER_REASON: usize = 15;
+
+    fn marker_above(src: &str, at: usize, marker: &str) -> bool {
         let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let mut in_comment = false;
         for line in src[..line_start].lines().rev().take(12) {
             let t = line.trim();
             if t.starts_with("//") {
                 in_comment = true;
-                if t.contains(MARKER) {
-                    return true;
+                // The marker must say WHY (#4422 review): a bare marker, or
+                // one followed by a word or two, does not exempt the site.
+                if let Some((_, why)) = t.split_once(marker) {
+                    return why.trim().len() >= MIN_MARKER_REASON;
                 }
             } else if in_comment
                 || t.is_empty()
@@ -21537,21 +21582,59 @@ mod scan_on_upload_coverage_tests {
         false
     }
 
-    /// `TRIGGER` calls on code (not comment) lines of `body`.
-    fn trigger_calls(body: &str) -> usize {
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//") && l.contains(TRIGGER))
-            .count()
+    /// Whether `body` calls `call` (`name(`) as a whole word: `upload(` is not
+    /// matched by `recipe_file_upload(` (#4422 review).
+    fn calls(body: &str, call: &str) -> bool {
+        body.match_indices(call).any(|(at, _)| {
+            body[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
     }
+
+    /// Calls of any of `triggers` on code (not comment) lines of `body`.
+    fn trigger_calls(body: &str, triggers: &[&str]) -> usize {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| triggers.iter().filter(|t| l.contains(**t)).count())
+            .sum()
+    }
+
+    /// One structural gate over the production `artifacts` insert sites: the
+    /// calls that cover a site (each covers ONE), the marker that exempts a
+    /// site, and the insert-primitive calls that satisfy the gate by
+    /// themselves because the primitive runs the check inside.
+    struct InsertGate {
+        insert_sql: &'static str,
+        insert_calls: &'static [&'static str],
+        triggers: &'static [&'static str],
+        marker: &'static str,
+        self_covering: &'static [&'static str],
+    }
+
+    /// The #4166 scan-on-upload gate.
+    const SCAN_GATE: InsertGate = InsertGate {
+        insert_sql: INSERT_SQL,
+        insert_calls: INSERT_CALLS,
+        triggers: &[TRIGGER],
+        marker: MARKER,
+        self_covering: &[],
+    };
 
     /// Classify every production insert site in one source file.
     fn insert_sites(file: &str, src: &str) -> Vec<Site> {
+        gate_sites(file, src, &SCAN_GATE)
+    }
+
+    /// Classify every production insert site in one source file under `gate`.
+    fn gate_sites(file: &str, src: &str, gate: &InsertGate) -> Vec<Site> {
         let spans = test_spans(src);
         let fns = top_level_fns(src, &spans);
         let mut out = Vec::new();
         // Unmarked sites already charged against each function's triggers.
         let mut charged: std::collections::HashMap<usize, usize> = Default::default();
-        for at in insert_offsets(src) {
+        for at in insert_offsets(src, gate) {
             if spans.iter().any(|(a, b)| *a <= at && at < *b) {
                 continue;
             }
@@ -21566,24 +21649,28 @@ mod scan_on_upload_coverage_tests {
             if file == "proxy_helpers.rs" && PRIMITIVES.contains(&func.as_str()) {
                 continue;
             }
-            if marker_above(src, at) {
+            let exempt = marker_above(src, at, gate.marker);
+            if exempt || gate.self_covering.iter().any(|c| src[at..].starts_with(c)) {
                 out.push(Site {
                     func,
                     covered: true,
+                    exempt,
                 });
                 continue;
             }
             let call = format!("{func}(");
             let caller_triggers = (0..fns.len()).any(|j| {
                 let caller = body_of(src, &fns, j);
-                j != idx && caller.contains(&call) && trigger_calls(caller) > 0
+                j != idx && calls(caller, &call) && trigger_calls(caller, gate.triggers) > 0
             });
-            let budget = trigger_calls(body_of(src, &fns, idx)) + usize::from(caller_triggers);
+            let budget = trigger_calls(body_of(src, &fns, idx), gate.triggers)
+                + usize::from(caller_triggers);
             let used = charged.entry(idx).or_default();
             *used += 1;
             out.push(Site {
                 func,
                 covered: *used <= budget,
+                exempt: false,
             });
         }
         out
@@ -21661,6 +21748,210 @@ mod scan_on_upload_coverage_tests {
                 ("two".to_string(), true),
                 ("two".to_string(), false),
                 ("prim".to_string(), true),
+            ]
+        );
+    }
+
+    /// #4422: the storage-quota admission gate, over the same insert sites.
+    /// A site is covered by one of the shared admission calls in its function
+    /// (or one call hop up), by `insert_artifact` (which admits inside), or by
+    /// a `NO-QUOTA-ADMISSION:` comment saying why the row is not a publish.
+    const QUOTA_GATE: InsertGate = InsertGate {
+        insert_sql: INSERT_SQL,
+        insert_calls: INSERT_CALLS,
+        triggers: &[
+            "begin_admitted_publish(",
+            "admit_publish_in_tx(",
+            "locked_quota_denial(",
+            // The chunked-upload completion admits through the service call.
+            "check_quota_locked(",
+        ],
+        marker: QUOTA_MARKER,
+        self_covering: &["insert_artifact("],
+    };
+    const QUOTA_MARKER: &str = "NO-QUOTA-ADMISSION:";
+
+    /// #4422: the same gate over the `oci_blobs` rows a `docker push` writes.
+    const OCI_BLOB_QUOTA_GATE: InsertGate = InsertGate {
+        insert_sql: r"(?i)INSERT\s+INTO\s+(public\.)?oci_blobs\b",
+        insert_calls: &[],
+        triggers: &["oci_blob_quota_refusal(", "mount_quota_refusal("],
+        marker: QUOTA_MARKER,
+        self_covering: &[],
+    };
+
+    /// Every publish handler #4422 covers, as `(file, function holding the
+    /// insert)`: each must have an insert site ADMITTED by a check (not
+    /// exempted by a marker), so a rename or a matcher regression fails
+    /// loudly instead of silently dropping a handler out of the gate.
+    const ISSUE_4422_PUBLISH_HANDLERS: &[(&str, &str)] = &[
+        ("alpine.rs", "store_apk"),
+        ("ansible.rs", "upload_collection"),
+        ("bazel.rs", "put_file"),
+        ("cargo.rs", "store_crate_artifact"),
+        ("chef.rs", "upload_cookbook"),
+        ("cocoapods.rs", "push_pod"),
+        ("composer.rs", "upload"),
+        ("conan.rs", "recipe_file_upload"),
+        ("conan.rs", "package_file_upload"),
+        ("conda.rs", "store_conda_package"),
+        ("cran.rs", "upload_package"),
+        ("gitlfs.rs", "upload_object"),
+        ("goproxy.rs", "upload_zip"),
+        ("goproxy.rs", "upload_mod"),
+        ("helm.rs", "upload_chart"),
+        ("hex.rs", "publish_package"),
+        ("huggingface.rs", "upload_file_impl"),
+        ("incus.rs", "upsert_artifact"),
+        ("jetbrains.rs", "upload_plugin"),
+        ("maven.rs", "upload"),
+        ("npm.rs", "store_npm_version"),
+        ("pacman.rs", "insert_package_rows"),
+        ("protobuf.rs", "upload"),
+        ("pub_registry.rs", "upload_package"),
+        ("puppet.rs", "publish_module"),
+        ("rpm.rs", "store_rpm"),
+        ("rubygems.rs", "push_gem"),
+        ("sbt.rs", "upload_artifact"),
+        ("swift.rs", "publish_release"),
+        ("terraform.rs", "upload_module"),
+        ("terraform.rs", "upload_provider"),
+        ("upload.rs", "complete_session_commit"),
+        ("vscode.rs", "publish_extension"),
+    ];
+
+    /// The `oci_blobs` writers of a `docker push`: monolithic upload, chunked
+    /// completion and cross-repository mount.
+    const ISSUE_4422_OCI_BLOB_HANDLERS: &[&str] = &[
+        "handle_start_upload",
+        "handle_complete_upload",
+        "try_mount_blob",
+    ];
+
+    /// The only sites allowed to opt out of quota admission with a
+    /// `NO-QUOTA-ADMISSION:` reason (#4422 review): promotion copies, the
+    /// generated Protobuf label index, proxy-cache fills, and OCI manifest rows
+    /// (charged 0 until #4545). A new exemption is a review conversation: it
+    /// fails here until it is added to this list.
+    const ISSUE_4422_EXEMPT_SITES: &[(&str, &str)] = &[
+        ("approval.rs", "approve_promotion"),
+        ("oci_v2.rs", "cache_manifest_reference_locally"),
+        ("oci_v2.rs", "stage_proxy_image_blobs"),
+        ("oci_v2.rs", "upsert_manifest_artifact"),
+        ("promotion.rs", "insert_promoted_artifact_row"),
+        ("protobuf.rs", "save_label_index"),
+    ];
+
+    type SiteSet = std::collections::BTreeSet<(String, String)>;
+
+    /// Uncovered sites, the `(file, func)` of every check-admitted site, and
+    /// of every marker-exempted site.
+    fn run_gate(gate: &InsertGate) -> (Vec<String>, SiteSet, SiteSet) {
+        let mut uncovered = Vec::new();
+        let mut admitted = SiteSet::new();
+        let mut exempt = SiteSet::new();
+        for (file, src) in handler_sources() {
+            if EXEMPT_FILES.contains(&file.as_str()) {
+                continue;
+            }
+            for site in gate_sites(&file, &src, gate) {
+                if !site.covered {
+                    uncovered.push(format!("{file}::{}", site.func));
+                } else if site.exempt {
+                    exempt.insert((file.clone(), site.func));
+                } else {
+                    admitted.insert((file.clone(), site.func));
+                }
+            }
+        }
+        (uncovered, admitted, exempt)
+    }
+
+    /// THE #4422 gate: no production `artifacts` or `oci_blobs` insert in a
+    /// handler escapes storage-quota admission, and every enumerated publish
+    /// handler is admitted by a check rather than exempted.
+    #[test]
+    fn every_format_publish_runs_quota_admission_4422() {
+        let (uncovered, admitted, mut exempt) = run_gate(&QUOTA_GATE);
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `artifacts` row without storage-quota \
+             admission (run the INSERT in `publish_quota::begin_admitted_publish`'s \
+             transaction, or add a `{QUOTA_MARKER}` comment saying why the row is \
+             not a publish): {uncovered:?}"
+        );
+        for (file, func) in ISSUE_4422_PUBLISH_HANDLERS {
+            assert!(
+                admitted.contains(&(file.to_string(), func.to_string())),
+                "#4422 publish handler {file}::{func} has no quota-admitted insert \
+                 site the gate can see; update ISSUE_4422_PUBLISH_HANDLERS or the matcher"
+            );
+        }
+
+        let (uncovered, admitted, blob_exempt) = run_gate(&OCI_BLOB_QUOTA_GATE);
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `oci_blobs` row without storage-quota \
+             admission (`oci_blob_quota_refusal`): {uncovered:?}"
+        );
+        for func in ISSUE_4422_OCI_BLOB_HANDLERS {
+            assert!(
+                admitted.contains(&("oci_v2.rs".to_string(), func.to_string())),
+                "#4422 OCI blob writer oci_v2.rs::{func} is not quota-admitted"
+            );
+        }
+
+        exempt.extend(blob_exempt);
+        let pinned: SiteSet = ISSUE_4422_EXEMPT_SITES
+            .iter()
+            .map(|(f, func)| (f.to_string(), func.to_string()))
+            .collect();
+        assert_eq!(
+            exempt, pinned,
+            "the NO-QUOTA-ADMISSION exemptions changed; a new one must be justified \
+             and added to ISSUE_4422_EXEMPT_SITES"
+        );
+    }
+
+    /// The quota gate's matcher: an admission call covers one insert, a
+    /// caller's admission covers a primitive one hop down, `insert_artifact`
+    /// covers itself, a marker exempts (and is reported as exempt), and an
+    /// unadmitted insert fails.
+    #[test]
+    fn quota_gate_classifies_sites_4422() {
+        let src = "async fn bad() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn good() {\n    let mut tx = begin_admitted_publish(db, r, p, n).await?;\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn helper() {\n    let id = insert_artifact(db, a).await;\n}\n\
+                   async fn marked() {\n    // NO-QUOTA-ADMISSION: a promotion copy, not a publish\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn bare() {\n    // NO-QUOTA-ADMISSION: fine\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn two() {\n    admit_publish_in_tx(tx, db, r, p, n);\n    \
+                   insert_artifact_row(a);\n    insert_artifact_row(b);\n}\n\
+                   fn prim() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn caller() {\n    locked_quota_denial(tx, db, r, p, n);\n    prim();\n}\n\
+                   fn short() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn long_short() {\n    begin_admitted_publish(db, r, p, n);\n    \
+                   very_short();\n}\n";
+        let sites: Vec<(String, bool, bool)> = gate_sites("x.rs", src, &QUOTA_GATE)
+            .into_iter()
+            .map(|s| (s.func, s.covered, s.exempt))
+            .collect();
+        let site = |f: &str, covered, exempt| (f.to_string(), covered, exempt);
+        assert_eq!(
+            sites,
+            vec![
+                site("bad", false, false),
+                site("good", true, false),
+                site("helper", true, false),
+                site("marked", true, true),
+                site("bare", false, false),
+                site("two", true, false),
+                site("two", false, false),
+                site("prim", true, false),
+                // `very_short(` must not vouch for `short`.
+                site("short", false, false),
             ]
         );
     }

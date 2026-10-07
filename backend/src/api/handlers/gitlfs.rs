@@ -521,6 +521,15 @@ async fn upload_object(
             .unwrap());
     }
 
+    let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
+
     // Store the object
     let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
     let storage = state
@@ -534,11 +543,17 @@ async fn upload_object(
     })?;
 
     let size_bytes = body.len() as i64;
-    let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -558,9 +573,15 @@ async fn upload_object(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
+        lfs_error_response(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+    tx.commit().await.map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
             crate::api::handlers::db_err_message(&e),

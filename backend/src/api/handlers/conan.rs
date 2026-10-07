@@ -2024,6 +2024,16 @@ async fn recipe_file_upload(
     let size_bytes = body.len() as i64;
     let ct = content_type_for_conan_file(&file_path);
 
+    // Refuse an over-quota upload before the previous file at this path is
+    // retired or any bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
+
     // Check for duplicate — allow overwrite for the same revision
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -2074,6 +2084,13 @@ async fn recipe_file_upload(
     let metadata = build_recipe_metadata(&name, &version, &user, &channel, &revision, &file_path);
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -2093,9 +2110,10 @@ async fn recipe_file_upload(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -2941,6 +2959,16 @@ async fn package_file_upload(
     let size_bytes = body.len() as i64;
     let ct = content_type_for_conan_file(&file_path);
 
+    // Refuse an over-quota upload before the previous file at this path is
+    // retired or any bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
+
     // Check for duplicate — allow overwrite within same revision
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -2999,6 +3027,13 @@ async fn package_file_upload(
     );
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -3018,9 +3053,10 @@ async fn package_file_upload(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
