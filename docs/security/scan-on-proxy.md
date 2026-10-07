@@ -207,7 +207,7 @@ have no core proxy path to gate.
 | `puppet` | `puppet` | accepted | |
 | `ansible` | `ansible` | accepted | |
 | `gitlfs` | `gitlfs` | accepted | |
-| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). Gallery asset types are matched ignoring case; only display metadata (manifest, details, changelog, license, icons, `.vsixmanifest`, signature) streams unscanned, and any other asset type is `404` while scanning is on. |
+| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). Gallery asset types are matched ignoring case; only display metadata (manifest, details, changelog, license, icons, `.vsixmanifest`, signature, language-pack translations) streams unscanned, and any other asset type is `404` while scanning is on. |
 | `jetbrains` | `jetbrains` | accepted | |
 | `huggingface` | `huggingface` | accepted | |
 | `mlmodel` | `mlmodel` | accepted | |

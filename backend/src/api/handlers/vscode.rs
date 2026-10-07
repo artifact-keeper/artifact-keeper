@@ -325,6 +325,11 @@ const GALLERY_DISPLAY_ASSET_TYPES: [&str; 8] = [
     "Microsoft.VisualStudio.Services.VsixSignature",
 ];
 
+/// Prefix of a language pack's per-language translation asset type
+/// (`Microsoft.VisualStudio.Code.Translation.de`), display metadata
+/// (#4365 item 4).
+const GALLERY_TRANSLATION_ASSET_PREFIX: &str = "Microsoft.VisualStudio.Code.Translation.";
+
 /// What a requested gallery asset is served as (#4365 item 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GalleryAssetKind {
@@ -369,17 +374,37 @@ fn gallery_asset_serve_key(
 /// ignoring ASCII case and mapped to its canonical spelling, so every
 /// capitalisation shares one upstream URL, one cache entry and one decision.
 /// An unknown type keeps the requested spelling and is [`GalleryAssetKind::Other`].
-fn classify_gallery_asset_type(asset_type: &str) -> (&str, GalleryAssetKind) {
+///
+/// Language-pack translations (`Microsoft.VisualStudio.Code.Translation.<lang>`,
+/// JSON strings VS Code renders) are display metadata too; the prefix is
+/// canonicalized and the language id kept as requested.
+fn classify_gallery_asset_type(asset_type: &str) -> (Cow<'_, str>, GalleryAssetKind) {
     if asset_type.eq_ignore_ascii_case(GALLERY_VSIX_ASSET_TYPE) {
-        return (GALLERY_VSIX_ASSET_TYPE, GalleryAssetKind::Package);
+        return (
+            Cow::Borrowed(GALLERY_VSIX_ASSET_TYPE),
+            GalleryAssetKind::Package,
+        );
     }
-    match GALLERY_DISPLAY_ASSET_TYPES
+    if let Some(known) = GALLERY_DISPLAY_ASSET_TYPES
         .iter()
         .find(|known| asset_type.eq_ignore_ascii_case(known))
     {
-        Some(known) => (known, GalleryAssetKind::Display),
-        None => (asset_type, GalleryAssetKind::Other),
+        return (Cow::Borrowed(known), GalleryAssetKind::Display);
     }
+    let prefix_len = GALLERY_TRANSLATION_ASSET_PREFIX.len();
+    if asset_type.len() > prefix_len
+        && asset_type.is_char_boundary(prefix_len)
+        && asset_type[..prefix_len].eq_ignore_ascii_case(GALLERY_TRANSLATION_ASSET_PREFIX)
+    {
+        return (
+            Cow::Owned(format!(
+                "{GALLERY_TRANSLATION_ASSET_PREFIX}{}",
+                &asset_type[prefix_len..]
+            )),
+            GalleryAssetKind::Display,
+        );
+    }
+    (Cow::Borrowed(asset_type), GalleryAssetKind::Other)
 }
 
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
@@ -2684,6 +2709,7 @@ async fn gallery_asset(
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     let (asset_type, kind) = classify_gallery_asset_type(&asset_type);
+    let asset_type: &str = &asset_type;
     if repo.repo_type == RepositoryType::Local {
         gallery_gate(&state.db, &repo).await?;
         // A hosted version advertises only the package.
@@ -8147,6 +8173,24 @@ mod tests {
                 GalleryAssetKind::Other,
             ),
             ("README.md", "README.md", GalleryAssetKind::Other),
+            // Language-pack translations are display metadata; the prefix is
+            // canonicalized, the language id kept.
+            (
+                "Microsoft.VisualStudio.Code.Translation.de",
+                "Microsoft.VisualStudio.Code.Translation.de",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "microsoft.visualstudio.code.translation.zh-cn",
+                "Microsoft.VisualStudio.Code.Translation.zh-cn",
+                GalleryAssetKind::Display,
+            ),
+            // The bare prefix names no language.
+            (
+                "Microsoft.VisualStudio.Code.Translation.",
+                "Microsoft.VisualStudio.Code.Translation.",
+                GalleryAssetKind::Other,
+            ),
             // Near misses are not the package and not display metadata.
             (
                 "Microsoft.VisualStudio.Services.VSIXPackage2",
@@ -8155,11 +8199,8 @@ mod tests {
             ),
         ];
         for (requested, canonical, kind) in cases {
-            assert_eq!(
-                classify_gallery_asset_type(requested),
-                (*canonical, *kind),
-                "{requested}"
-            );
+            let (got, got_kind) = classify_gallery_asset_type(requested);
+            assert_eq!((got.as_ref(), got_kind), (*canonical, *kind), "{requested}");
         }
         // Every type the synthesized listing advertises is a known type.
         for advertised in GALLERY_SYNTHESIZED_ASSET_TYPES {
