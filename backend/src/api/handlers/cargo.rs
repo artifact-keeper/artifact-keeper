@@ -1707,6 +1707,8 @@ async fn store_crate_artifact(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, crate_bytes.len() as i64)
+        .await?;
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -1729,6 +1731,13 @@ async fn store_crate_artifact(
     .await
     .map_err(|e| e.into_response())?;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1748,9 +1757,10 @@ async fn store_crate_artifact(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -6831,6 +6841,46 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "0.2.0");
         assert_eq!(row.versions, vec!["0.2.0".to_string()]);
         assert_eq!(row.description.as_deref(), Some("a catalogued crate"));
+    }
+
+    /// #4422: `cargo publish` into a repository whose quota the crate would
+    /// exceed is refused with the generic upload route's 507 and leaves no
+    /// artifact row.
+    #[tokio::test]
+    async fn crate_publish_is_refused_by_repository_quota_4422() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 10 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/api/v1/crates/new", fx.repo_key),
+                publish_body("quota-crate", "0.1.0", "over the cap"),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{body}"
+        );
+        assert!(body.contains("Repository storage quota exceeded"), "{body}");
+        assert_eq!(rows, 0, "a refused publish must leave no artifact row");
     }
 
     /// #3411: a native publish must fire `artifact.uploaded` exactly once.

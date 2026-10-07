@@ -3734,6 +3734,10 @@ async fn upload(
         .map_err(|e| e.into_response())?;
     }
 
+    // Refuse an over-quota upload before claiming the key or writing its
+    // bytes (#4422).
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, size_bytes).await?;
+
     // Atomically claim the flat key BEFORE writing its bytes so that of two
     // concurrent first-publishers of the same key exactly one proceeds and the
     // other is refused (#2586). This runs after coordinate parsing + the
@@ -3821,6 +3825,8 @@ async fn upload(
     // would otherwise leave a live artifact with no Maven metadata, and a
     // concurrent republish must never observe the row without it.
     let mut tx = state.db.begin().await.map_err(map_db_err)?;
+    super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
+        .await?;
     let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as(
             r#"

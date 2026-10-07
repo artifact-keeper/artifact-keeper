@@ -4871,6 +4871,7 @@ async fn store_conda_package(
     .await
     .map_err(|e| e.into_response())?;
 
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, content.len() as i64).await?;
     // Store the file
     let storage_key = build_conda_storage_key(&repo.id, subdir, filename);
     let storage = state
@@ -4892,6 +4893,13 @@ async fn store_conda_package(
     };
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -4911,12 +4919,13 @@ async fn store_conda_package(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("Database error inserting artifact: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
