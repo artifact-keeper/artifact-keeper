@@ -309,6 +309,57 @@ const GALLERY_SYNTHESIZED_ASSET_TYPES: [&str; 4] = [
 /// protocol round-trip" rule goproxy applies to `.zip` over `.mod`/`.info`.
 const GALLERY_VSIX_ASSET_TYPE: &str = "Microsoft.VisualStudio.Services.VSIXPackage";
 
+/// The gallery asset types that are display metadata (#4365 item 4): what
+/// VS Code and Open VSX fetch while rendering a listing or verifying a
+/// download, never code the editor runs. Only these stream unscanned on a
+/// repository that scans on proxy. The signature archive is listed because a
+/// client checks the package against it; it is not executable either.
+const GALLERY_DISPLAY_ASSET_TYPES: [&str; 8] = [
+    "Microsoft.VisualStudio.Code.Manifest",
+    "Microsoft.VisualStudio.Services.Content.Details",
+    "Microsoft.VisualStudio.Services.Content.Changelog",
+    "Microsoft.VisualStudio.Services.Content.License",
+    "Microsoft.VisualStudio.Services.Icons.Default",
+    "Microsoft.VisualStudio.Services.Icons.Small",
+    "Microsoft.VisualStudio.Services.VsixManifest",
+    "Microsoft.VisualStudio.Services.VsixSignature",
+];
+
+/// What a requested gallery asset is served as (#4365 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GalleryAssetKind {
+    /// The extension package: scanned when the repository scans on proxy,
+    /// and counted as a download.
+    Package,
+    /// One of [`GALLERY_DISPLAY_ASSET_TYPES`]: streamed.
+    Display,
+    /// Anything else: refused (404) when the repository scans on proxy,
+    /// because it cannot be told apart from the package by name alone.
+    Other,
+}
+
+/// Classify a requested gallery asset type and return the spelling it is
+/// fetched and cached under (#4365 item 4).
+///
+/// Open VSX and the Marketplace match asset types case-insensitively, so an
+/// exact-case comparison let `microsoft.visualstudio.services.vsixpackage`
+/// stream the package unscanned as a "display" asset. A known type is matched
+/// ignoring ASCII case and mapped to its canonical spelling, so every
+/// capitalisation shares one upstream URL, one cache entry and one decision.
+/// An unknown type keeps the requested spelling and is [`GalleryAssetKind::Other`].
+fn classify_gallery_asset_type(asset_type: &str) -> (&str, GalleryAssetKind) {
+    if asset_type.eq_ignore_ascii_case(GALLERY_VSIX_ASSET_TYPE) {
+        return (GALLERY_VSIX_ASSET_TYPE, GalleryAssetKind::Package);
+    }
+    match GALLERY_DISPLAY_ASSET_TYPES
+        .iter()
+        .find(|known| asset_type.eq_ignore_ascii_case(known))
+    {
+        Some(known) => (known, GalleryAssetKind::Display),
+        None => (asset_type, GalleryAssetKind::Other),
+    }
+}
+
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
 
 #[derive(serde::Deserialize)]
@@ -334,13 +385,15 @@ struct GalleryAssetSource<'a> {
     /// [`proxy_gallery_asset`] does not re-run [`gallery_upstream`]'s
     /// `SELECT is_public` on the way to it (#3255).
     gallery_url: &'a str,
-    /// Are these bytes the extension PACKAGE (a `.vsix`)?
+    /// What these bytes are (#4365 item 4): the extension PACKAGE (a
+    /// `.vsix`), an allowlisted display asset, or an unknown asset type.
     ///
     /// Selects the scan-on-proxy gate in [`proxy_gallery_asset`]. Only the
-    /// package is code that runs in the developer's editor; the gallery's
-    /// other assets (icon, manifest, details/README, changelog) are display
-    /// metadata the client renders.
-    is_package: bool,
+    /// package is code that runs in the developer's editor; the allowlisted
+    /// assets (icon, manifest, details/README, changelog, license) are display
+    /// metadata the client renders, and an unknown type is refused while the
+    /// repository scans on proxy.
+    kind: GalleryAssetKind,
 }
 
 /// Parsed gallery metadata plus the reservation that covers the simultaneous
@@ -2589,7 +2642,7 @@ async fn gallery_vspackage(
         cache_path: &cache_path,
         default_content_type: "application/vsix",
         gallery_url: upstream_url,
-        is_package: true,
+        kind: GalleryAssetKind::Package,
     };
     // The `vspackage` route is the extension package itself, so it always
     // counts (#3649).
@@ -2609,10 +2662,11 @@ async fn gallery_asset(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
+    let (asset_type, kind) = classify_gallery_asset_type(&asset_type);
     if repo.repo_type == RepositoryType::Local {
         gallery_gate(&state.db, &repo).await?;
         // A hosted version advertises only the package.
-        if asset_type != GALLERY_VSIX_ASSET_TYPE {
+        if kind != GalleryAssetKind::Package {
             return Err((StatusCode::NOT_FOUND, "Asset not found").into_response());
         }
         return hosted_vsix_redirect(&repo_key, &publisher, &name, &version);
@@ -2624,7 +2678,7 @@ async fn gallery_asset(
         name.as_str(),
         version.as_str(),
         target_platform.as_ref(),
-        asset_type.as_str(),
+        asset_type,
     ] {
         validate_gallery_request_segment(segment)?;
     }
@@ -2634,7 +2688,7 @@ async fn gallery_asset(
         &publisher,
         &name,
         &version,
-        &asset_type,
+        asset_type,
         target_platform.as_ref(),
     )?;
     let cache_path = format!(
@@ -2657,14 +2711,14 @@ async fn gallery_asset(
         cache_path: &cache_path,
         default_content_type: "application/octet-stream",
         gallery_url: upstream_url,
-        is_package: asset_type == GALLERY_VSIX_ASSET_TYPE,
+        kind,
     };
     // #3649: this route serves BOTH the extension package and the gallery
     // metadata assets VS Code fetches while rendering a listing (manifest,
     // details, icon). Only the package is a download; passing `None` for the
     // rest keeps an icon fetch from inflating the count, the same way nuget's
     // `proxy_v3_flatcontainer` passes `None` on its version-list arm.
-    let download_ctx = source.is_package.then_some(&ctx);
+    let download_ctx = (kind == GalleryAssetKind::Package).then_some(&ctx);
     proxy_gallery_asset(&state, &repo, &coordinate, &source, download_ctx).await
 }
 
@@ -2740,12 +2794,20 @@ async fn proxy_gallery_asset(
     //
     // Repositories that have not enabled scan-on-proxy skip this entirely and
     // keep the untouched streaming behavior.
-    let scan = if source.is_package {
-        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
-    } else {
+    //
+    // #4365 item 4: only the allowlisted display types skip the policy read.
+    // On a repository that scans on proxy an asset type that is neither the
+    // package nor on the allowlist is refused: by name alone it cannot be told
+    // apart from the package an upstream would serve for it.
+    let scan = if source.kind == GalleryAssetKind::Display {
         None
+    } else {
+        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
     };
     if let Some((action, severity_gate)) = scan {
+        if source.kind == GalleryAssetKind::Other {
+            return Err((StatusCode::NOT_FOUND, "Asset not found").into_response());
+        }
         return serve_scanned_gallery_package(
             state,
             proxy,
@@ -8025,6 +8087,151 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&gated_body).unwrap()["error"],
             "age_gate_unavailable"
         );
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// #4365 item 4: every known asset type is matched ignoring ASCII case and
+    /// mapped to one canonical spelling; only the package is `Package`, only
+    /// the allowlist is `Display`, everything else is `Other`.
+    #[test]
+    fn gallery_asset_types_classify_case_insensitively_to_one_spelling() {
+        let cases: &[(&str, &str, GalleryAssetKind)] = &[
+            (
+                GALLERY_VSIX_ASSET_TYPE,
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "microsoft.visualstudio.services.vsixpackage",
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "MICROSOFT.VISUALSTUDIO.SERVICES.VSIXPACKAGE",
+                GALLERY_VSIX_ASSET_TYPE,
+                GalleryAssetKind::Package,
+            ),
+            (
+                "microsoft.visualstudio.services.icons.default",
+                "Microsoft.VisualStudio.Services.Icons.Default",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "Microsoft.VisualStudio.Services.Content.Changelog",
+                "Microsoft.VisualStudio.Services.Content.Changelog",
+                GalleryAssetKind::Display,
+            ),
+            (
+                "Microsoft.VisualStudio.Code.WebResources",
+                "Microsoft.VisualStudio.Code.WebResources",
+                GalleryAssetKind::Other,
+            ),
+            ("README.md", "README.md", GalleryAssetKind::Other),
+            // Near misses are not the package and not display metadata.
+            (
+                "Microsoft.VisualStudio.Services.VSIXPackage2",
+                "Microsoft.VisualStudio.Services.VSIXPackage2",
+                GalleryAssetKind::Other,
+            ),
+        ];
+        for (requested, canonical, kind) in cases {
+            assert_eq!(
+                classify_gallery_asset_type(requested),
+                (*canonical, *kind),
+                "{requested}"
+            );
+        }
+        // Every type the synthesized listing advertises is a known type.
+        for advertised in GALLERY_SYNTHESIZED_ASSET_TYPES {
+            assert_ne!(
+                classify_gallery_asset_type(advertised).1,
+                GalleryAssetKind::Other,
+                "{advertised}"
+            );
+        }
+    }
+
+    /// #4365 item 4: on a scanning repository a re-capitalised package asset
+    /// type goes through the gate (and is fetched under the canonical
+    /// spelling), and an asset type outside the allowlist is 404 without an
+    /// upstream request.
+    #[tokio::test]
+    async fn gallery_asset_scans_recapitalised_package_and_refuses_unknown_types() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let vsix = b"item4-vulnerable-vsix-bytes";
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/asset/RedHat/VSCode-YAML/1.0.0/Microsoft.VisualStudio.Services.VSIXPackage",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/asset/RedHat/VSCode-YAML/1.0.0/Microsoft.VisualStudio.Code.WebResources",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix.to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let digest = proxy_helpers::sha256_hex(&Bytes::from_static(vsix));
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let get = |asset: &str| {
+            tdh::get(format!(
+                "/{}/asset/RedHat/VSCode-YAML/1.0.0/universal/{asset}",
+                fx.repo_key
+            ))
+        };
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            get("microsoft.visualstudio.services.vsixpackage"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a re-capitalised package asset type must reach the scan gate"
+        );
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            get("Microsoft.VisualStudio.Code.WebResources"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
         drop(server);
         fx.teardown().await;
     }
