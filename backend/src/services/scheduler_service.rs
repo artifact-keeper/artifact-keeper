@@ -1844,6 +1844,20 @@ pub(crate) async fn run_curation_sync_cycle(
     only_repo: Option<uuid::Uuid>,
     abort: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let only: Option<Vec<uuid::Uuid>> = only_repo.map(|id| vec![id]);
+    run_curation_sync_cycle_for(db, only.as_deref(), abort).await
+}
+
+/// [`run_curation_sync_cycle`] over an explicit set of staging repos
+/// (`Some(ids)`, interval bypassed) or every due repo (`None`). Repos are
+/// swept least-recently-synced first, so a repo that keeps failing (and so is
+/// never stamped) cannot starve the others. The id-set form lets a test drive
+/// a multi-repo sweep without touching repos other tests have seeded.
+async fn run_curation_sync_cycle_for(
+    db: &PgPool,
+    only_repos: Option<&[uuid::Uuid]>,
+    abort: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
 
@@ -1868,16 +1882,17 @@ pub(crate) async fn run_curation_sync_cycle(
                  AND r.curation_source_repo_id IS NOT NULL
                  AND r.repo_type = 'staging'
                  AND remote.upstream_url IS NOT NULL
-                 AND ($1::uuid IS NULL OR r.id = $1)
+                 AND ($1::uuid[] IS NULL OR r.id = ANY($1))
                  AND (
-                    $1::uuid IS NOT NULL
+                    $1::uuid[] IS NOT NULL
                     OR r.curation_last_synced_at IS NULL
                     OR r.curation_last_synced_at
                        + make_interval(secs => GREATEST(r.curation_sync_interval_secs, 60)::double precision)
                        <= NOW()
-                 )"#,
+                 )
+               ORDER BY r.curation_last_synced_at ASC NULLS FIRST, r.id"#,
     )
-    .bind(only_repo)
+    .bind(only_repos)
     .fetch_all(db)
     .await?;
 
@@ -1976,17 +1991,29 @@ pub(crate) async fn run_curation_sync_cycle(
                         match resp.bytes().await {
                             Ok(b) => b,
                             Err(e) => {
-                                tracing::warn!("RPM repomd.xml read error: {}", e);
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    format_args!("repomd.xml read error: {e}"),
+                                );
                                 continue;
                             }
                         }
                     }
                     Ok(resp) => {
-                        tracing::warn!("RPM repomd.xml fetch failed: {}", resp.status());
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("repomd.xml fetch failed: {}", resp.status()),
+                        );
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("RPM repomd.xml fetch error: {}", e);
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("repomd.xml fetch error: {e}"),
+                        );
                         continue;
                     }
                 };
@@ -2017,9 +2044,10 @@ pub(crate) async fn run_curation_sync_cycle(
                                 resp.text().await.unwrap_or_default()
                             }
                             _ => {
-                                tracing::warn!(
-                                    "RPM curation sync: trusted GPG key set but repomd.xml.asc unavailable for staging repo {}; refusing unverified upstream",
-                                    staging_id
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    "trusted GPG key set but repomd.xml.asc unavailable; refusing unverified upstream",
                                 );
                                 continue;
                             }
@@ -2037,10 +2065,10 @@ pub(crate) async fn run_curation_sync_cycle(
                                 true
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "RPM curation sync: repomd.xml signature verification FAILED for staging repo {}: {}; refusing upstream (0 packages ingested)",
-                                    staging_id,
-                                    e
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    format_args!("repomd.xml signature verification FAILED: {e}; refusing upstream (0 packages ingested)"),
                                 );
                                 continue;
                             }
@@ -2050,9 +2078,10 @@ pub(crate) async fn run_curation_sync_cycle(
                         // Fail-closed default (#2569): no trusted key and no
                         // explicit opt-in — refuse the upstream, ingest nothing.
                         KeylessSync::Refuse => {
-                            tracing::warn!(
-                                "RPM curation sync: no trusted GPG key configured for staging repo {} and curation_allow_unverified is not set; refusing UNVERIFIED upstream (0 packages ingested). Set trusted_gpg_key to authenticate the upstream, or curation_allow_unverified=true to opt into unverified ingest.",
-                                staging_id
+                            record_curation_failure(
+                                &mut failures,
+                                *staging_id,
+                                "no trusted GPG key configured and curation_allow_unverified is not set; refusing UNVERIFIED upstream (0 packages ingested). Set trusted_gpg_key to authenticate the upstream, or curation_allow_unverified=true to opt into unverified ingest.",
                             );
                             continue;
                         }
@@ -2086,11 +2115,21 @@ pub(crate) async fn run_curation_sync_cycle(
                 match primary_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
-                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
-                        let bytes = resp.bytes().await?;
+                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for checksum-pin + decode; not an artifact blob (#1608)
+                        let bytes = match resp.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    format_args!("primary.xml read error: {e}"),
+                                );
+                                continue;
+                            }
+                        };
 
                         // Chain-of-trust (#2357 HIGH): when the repo is
-                        // signature-verified, the FETCHED primary.xml.gz must
+                        // signature-verified, the FETCHED primary.xml (any codec) must
                         // match the <checksum> pinned in the signed repomd.xml
                         // BEFORE it is parsed/ingested. Fail-closed on a
                         // missing / unsupported / mismatching checksum — this is
@@ -2099,14 +2138,15 @@ pub(crate) async fn run_curation_sync_cycle(
                         // (No enforcement on the unverified path: backward-compat
                         // for existing no-key RPM curation repos.)
                         if verified
-                            && !crate::services::curation_sync::primary_gz_pinned_by_repomd(
+                            && !crate::services::curation_sync::primary_pinned_by_repomd(
                                 primary_ref.as_ref(),
                                 &bytes,
                             )
                         {
-                            tracing::warn!(
-                                "RPM curation sync: primary.xml.gz does NOT match the checksum pinned in the signed repomd.xml for staging repo {}; refusing upstream (0 packages ingested)",
-                                staging_id
+                            record_curation_failure(
+                                &mut failures,
+                                *staging_id,
+                                "primary.xml does NOT match the checksum pinned in the signed repomd.xml; refusing upstream (0 packages ingested)",
                             );
                             continue;
                         }
@@ -2116,9 +2156,27 @@ pub(crate) async fn run_curation_sync_cycle(
                         // malicious/compromised upstream mirror cannot inflate the
                         // primary unbounded. #2561: the permit-scoped decode also
                         // caps CONCURRENT decodes.
-                        let xml = crate::util::bounded_archive::with_ingest_extraction(|| {
+                        //
+                        // A per-repo decode error (corrupt or mislabelled stream,
+                        // budget breach, non-UTF-8 text) fails THIS repo only and
+                        // the sweep moves on. The outer `?` deliberately still
+                        // aborts the cycle: it is the #2561 capacity shed (no
+                        // extraction permit free), a server-wide signal, and the
+                        // remaining repos would hit the same shed.
+                        let decoded = crate::util::bounded_archive::with_ingest_extraction(|| {
                             curation_sync::decode_rpm_primary(&primary_path, &bytes)
-                        })??;
+                        })?;
+                        let xml = match decoded {
+                            Ok(xml) => xml,
+                            Err(e) => {
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    format_args!("cannot decode {primary_path}: {e}"),
+                                );
+                                continue;
+                            }
+                        };
 
                         // Defense-in-depth: when the signed repomd also declares
                         // an <open-checksum> over the decompressed primary.xml,
@@ -2134,9 +2192,10 @@ pub(crate) async fn run_curation_sync_cycle(
                                         ov,
                                         xml.as_bytes(),
                                     ) {
-                                        tracing::warn!(
-                                            "RPM curation sync: decompressed primary.xml open-checksum mismatch vs signed repomd for staging repo {}; refusing upstream",
-                                            staging_id
+                                        record_curation_failure(
+                                            &mut failures,
+                                            *staging_id,
+                                            "decompressed primary.xml open-checksum mismatch vs signed repomd; refusing upstream",
                                         );
                                         continue;
                                     }
@@ -2149,22 +2208,25 @@ pub(crate) async fn run_curation_sync_cycle(
                         match curation_sync::parse_rpm_primary_xml_checked(&xml) {
                             Ok(entries) => entries,
                             Err(e) => {
-                                tracing::warn!(
-                                    "RPM curation sync for staging repo {}: {}",
-                                    staging_id,
-                                    e
-                                );
-                                failures.push(format!("staging repo {staging_id}: {e}"));
+                                record_curation_failure(&mut failures, *staging_id, e);
                                 continue;
                             }
                         }
                     }
                     Ok(resp) => {
-                        tracing::warn!("RPM primary.xml fetch failed: {}", resp.status());
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("primary.xml fetch failed: {}", resp.status()),
+                        );
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("RPM primary.xml fetch error: {}", e);
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("primary.xml fetch error: {e}"),
+                        );
                         continue;
                     }
                 }
@@ -2298,6 +2360,22 @@ pub(crate) async fn run_curation_sync_cycle(
     } else {
         Err(format!("curation sync failed: {}", failures.join("; ")).into())
     }
+}
+
+/// Log one staging repo's RPM curation-sync failure and record it so the cycle
+/// reports failure (manual trigger: `succeeded: false`) once the rest of the
+/// sweep has run (#4427). The repo is left unstamped, so it retries next tick.
+fn record_curation_failure(
+    failures: &mut Vec<String>,
+    staging_id: uuid::Uuid,
+    reason: impl std::fmt::Display,
+) {
+    tracing::warn!(
+        "RPM curation sync for staging repo {}: {}",
+        staging_id,
+        reason
+    );
+    failures.push(format!("staging repo {staging_id}: {reason}"));
 }
 
 /// Max distribution-file size the off-hot-path verifier will fetch to bind an
@@ -3838,6 +3916,151 @@ mod tests {
         let _ = sqlx::query("DELETE FROM repositories WHERE id IN ($1, $2)")
             .bind(staging_id)
             .bind(remote_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4427 — RPM curation sync reports per-repo failure without aborting
+    // -----------------------------------------------------------------------
+
+    /// Seed an RPM remote (upstream at `upstream_url`) + curation-enabled
+    /// staging pair that opts into unverified ingest (no GPG key), with the
+    /// staging id given so the test controls sweep order.
+    async fn seed_rpm_curation_pair(
+        pool: &sqlx::PgPool,
+        staging_id: uuid::Uuid,
+        upstream_url: &str,
+    ) -> uuid::Uuid {
+        let remote_id = uuid::Uuid::new_v4();
+        let remote_key = format!("rpm4427-remote-{}", remote_id.simple());
+        let staging_key = format!("rpm4427-staging-{}", staging_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $2, $3, 'remote', 'rpm'::repository_format, $4)",
+        )
+        .bind(remote_id)
+        .bind(&remote_key)
+        .bind(format!("/tmp/{remote_key}"))
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert rpm remote repo");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                                       curation_enabled, curation_source_repo_id, \
+                                       curation_allow_unverified) \
+             VALUES ($1, $2, $2, $3, 'staging', 'rpm'::repository_format, true, $4, true)",
+        )
+        .bind(staging_id)
+        .bind(&staging_key)
+        .bind(format!("/tmp/{staging_key}"))
+        .bind(remote_id)
+        .execute(pool)
+        .await
+        .expect("insert rpm staging repo");
+        remote_id
+    }
+
+    async fn mount_rpm_upstream(
+        server: &wiremock::MockServer,
+        prefix: &str,
+        primary_href: &str,
+        primary: Vec<u8>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let repomd = format!(
+            r#"<repomd><data type="primary"><location href="{primary_href}"/></data></repomd>"#
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/repodata/repomd.xml")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(repomd))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/{primary_href}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(primary))
+            .mount(server)
+            .await;
+    }
+
+    /// #4427: one staging repo whose upstream serves an undecodable primary
+    /// (a `.zst` href that is not zstd) must fail ITS sync without aborting the
+    /// sweep. The sweep visits it first (lower id, never synced), yet the next
+    /// repo still ingests its packages and is stamped, while the cycle returns
+    /// `Err` (manual trigger: `succeeded: false`) naming the failed repo,
+    /// which stays unstamped so it retries.
+    #[tokio::test]
+    async fn test_rpm_curation_decode_failure_fails_repo_without_aborting_sweep_4427() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" packages="2">
+<package type="rpm"><name>nginx</name><arch>x86_64</arch><version epoch="0" ver="1.24.0" rel="1.el9"/><checksum type="sha256" pkgid="YES">abc123</checksum><location href="Packages/nginx-1.24.0-1.el9.x86_64.rpm"/></package>
+<package type="rpm"><name>curl</name><arch>x86_64</arch><version epoch="0" ver="8.5.0" rel="1.el9"/><checksum type="sha256" pkgid="YES">def456</checksum><location href="Packages/curl-8.5.0-1.el9.x86_64.rpm"/></package>
+</metadata>"#;
+        mount_rpm_upstream(
+            &server,
+            "/bad",
+            "repodata/x-primary.xml.zst",
+            b"definitely not a zstd frame".to_vec(),
+        )
+        .await;
+        mount_rpm_upstream(
+            &server,
+            "/good",
+            "repodata/y-primary.xml.gz",
+            gzip(primary.as_bytes()),
+        )
+        .await;
+
+        let mut ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+        ids.sort();
+        let [bad_id, good_id] = ids;
+        let bad_remote =
+            seed_rpm_curation_pair(&pool, bad_id, &format!("{}/bad", server.uri())).await;
+        let good_remote =
+            seed_rpm_curation_pair(&pool, good_id, &format!("{}/good", server.uri())).await;
+
+        let result = run_curation_sync_cycle_for(&pool, Some(&ids), None).await;
+
+        let err = result.expect_err("a repo whose primary cannot be decoded fails the cycle");
+        assert!(
+            err.to_string().contains(&bad_id.to_string()),
+            "the failure names the failed staging repo: {err}"
+        );
+        assert!(
+            !err.to_string().contains(&good_id.to_string()),
+            "the healthy repo is not reported as failed: {err}"
+        );
+        assert!(
+            curation_last_synced_at(&pool, bad_id).await.is_none(),
+            "the failed repo stays unstamped so it retries"
+        );
+        assert!(
+            curation_last_synced_at(&pool, good_id).await.is_some(),
+            "the repo after the failed one is still synced"
+        );
+        let mut names: Vec<String> = sqlx::query_scalar(
+            "SELECT package_name FROM curation_packages WHERE staging_repo_id = $1",
+        )
+        .bind(good_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read curation packages");
+        names.sort();
+        assert_eq!(names, vec!["curl".to_string(), "nginx".to_string()]);
+
+        let _ = sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = ANY($1)")
+            .bind(&ids[..])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![bad_id, good_id, bad_remote, good_remote])
             .execute(&pool)
             .await;
     }

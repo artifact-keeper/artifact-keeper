@@ -720,9 +720,9 @@ pub fn parse_deb_packages_index(content: &str, component: &str) -> Vec<CurationP
 /// The `primary` data reference parsed from an RPM `repomd.xml`.
 ///
 /// In the yum/RPM trust model the signature over `repomd.xml` PINS
-/// `primary.xml.gz` through repomd's `<checksum>` (over the compressed file)
+/// the primary file through repomd's `<checksum>` (over the compressed file)
 /// and `<open-checksum>` (over the decompressed file). Verifying the repomd
-/// signature is therefore only half the chain — the fetched `primary.xml.gz`
+/// signature is therefore only half the chain — the fetched primary
 /// must then be digested and compared to these pinned values before it is
 /// parsed/ingested, or an attacker who can tamper the mirrored primary (MITM,
 /// CDN/cache poisoning, or replaying a valid signed repomd while serving a
@@ -730,7 +730,7 @@ pub fn parse_deb_packages_index(content: &str, component: &str) -> Vec<CurationP
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepomdPrimaryRef {
     pub href: String,
-    /// `<checksum type="...">` over the compressed `primary.xml.gz`.
+    /// `<checksum type="...">` over the primary file as served (compressed).
     pub checksum_type: Option<String>,
     pub checksum: Option<String>,
     /// `<open-checksum type="...">` over the decompressed `primary.xml`.
@@ -849,19 +849,19 @@ pub fn repodata_checksum_matches(algo: &str, expected_hex: &str, bytes: &[u8]) -
 }
 
 /// Fail-closed decision for the RPM chain-of-trust (#2357): is the fetched
-/// compressed `primary.xml.gz` bound to the (signed) repomd via its primary
-/// `<checksum>`? Returns `false` when there is no primary ref, no usable
-/// checksum, an unsupported algorithm, or the digests differ — so a
-/// signature-verified sync ingests nothing unless `primary.xml.gz` matches the
-/// checksum the signed repomd pins. Only consulted on the verified path; the
-/// unverified (no-key) path stays backward-compatible.
-pub fn primary_gz_pinned_by_repomd(
+/// primary (as served, in whatever codec: gz/zst/xz/bz2/plain) bound to the
+/// (signed) repomd via its primary `<checksum>`? Returns `false` when there is
+/// no primary ref, no usable checksum, an unsupported algorithm, or the
+/// digests differ — so a signature-verified sync ingests nothing unless the
+/// fetched primary matches the checksum the signed repomd pins. Only consulted
+/// on the verified path; the unverified (no-key) path stays backward-compatible.
+pub fn primary_pinned_by_repomd(
     primary_ref: Option<&RepomdPrimaryRef>,
-    gz_bytes: &[u8],
+    fetched_bytes: &[u8],
 ) -> bool {
     match primary_ref {
         Some(d) => match (d.checksum_type.as_deref(), d.checksum.as_deref()) {
-            (Some(ct), Some(cv)) => repodata_checksum_matches(ct, cv, gz_bytes),
+            (Some(ct), Some(cv)) => repodata_checksum_matches(ct, cv, fetched_bytes),
             _ => false,
         },
         None => false,
@@ -903,6 +903,26 @@ impl RepodataCompression {
         }
     }
 
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Plain => ".xml",
+            Self::Gzip => ".gz",
+            Self::Zstd => ".zst",
+            Self::Xz => ".xz",
+            Self::Bzip2 => ".bz2",
+        }
+    }
+
+    fn codec_name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain-text",
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+            Self::Xz => "xz",
+            Self::Bzip2 => "bzip2",
+        }
+    }
+
     fn from_href(href: &str) -> Self {
         let lower = href.to_ascii_lowercase();
         if lower.ends_with(".gz") {
@@ -928,7 +948,9 @@ impl RepodataCompression {
             (None, declared) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "repodata file {href} is named {declared:?} but has no {declared:?} header"
+                    "repodata file {href} has a {} href but no {} header",
+                    declared.extension(),
+                    declared.codec_name()
                 ),
             )),
         }
@@ -955,7 +977,9 @@ pub fn decode_rpm_primary_limited(
     use std::io::Read;
     let decoder: Box<dyn Read + '_> = match RepodataCompression::detect(href, bytes)? {
         RepodataCompression::Plain => Box::new(bytes),
-        RepodataCompression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
+        // Single-member `GzDecoder`, exactly as the pre-#4427 gzip path: bytes
+        // after the first member are ignored, not parsed as a new header.
+        RepodataCompression::Gzip => Box::new(flate2::read::GzDecoder::new(bytes)),
         RepodataCompression::Zstd => Box::new(zstd::stream::read::Decoder::new(bytes)?),
         RepodataCompression::Xz => Box::new(xz2::read::XzDecoder::new_multi_decoder(bytes)),
         RepodataCompression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)),
@@ -1283,7 +1307,7 @@ mod tests {
     // The HIGH repro at the unit level: the fetched primary.xml.gz is only
     // trusted when it matches the checksum the signed repomd pins.
     #[test]
-    fn test_primary_gz_pinned_by_repomd_match_and_mismatch() {
+    fn test_primary_pinned_by_repomd_match_and_mismatch() {
         let primary_gz = b"\x1f\x8b\x08fake-but-fixed-primary-bytes";
         let good = repodata_hex_digest("sha256", primary_gz).unwrap();
         let repomd = repomd_with_checksums(&good, "unused-open");
@@ -1291,7 +1315,7 @@ mod tests {
 
         // Matching bytes -> pinned (ingest allowed on the verified path).
         assert!(
-            primary_gz_pinned_by_repomd(d.as_ref(), primary_gz),
+            primary_pinned_by_repomd(d.as_ref(), primary_gz),
             "primary.xml.gz matching the signed repomd <checksum> must be accepted"
         );
 
@@ -1300,27 +1324,27 @@ mod tests {
         // primary.
         let tampered = b"\x1f\x8b\x08EVIL-primary-bytes-swapped-by-attacker";
         assert!(
-            !primary_gz_pinned_by_repomd(d.as_ref(), tampered),
+            !primary_pinned_by_repomd(d.as_ref(), tampered),
             "a tampered primary.xml.gz must be rejected (checksum mismatch)"
         );
 
         // Signed repomd with NO usable primary <checksum> -> fail closed.
         let no_ck =
             r#"<repomd><data type="primary"><location href="repodata/p.xml.gz"/></data></repomd>"#;
-        assert!(!primary_gz_pinned_by_repomd(
+        assert!(!primary_pinned_by_repomd(
             extract_primary_data(no_ck).as_ref(),
             primary_gz
         ));
 
         // Unsupported checksum algorithm in repomd -> fail closed.
         let md5 = r#"<repomd><data type="primary"><checksum type="md5">00</checksum><location href="repodata/p.xml.gz"/></data></repomd>"#;
-        assert!(!primary_gz_pinned_by_repomd(
+        assert!(!primary_pinned_by_repomd(
             extract_primary_data(md5).as_ref(),
             primary_gz
         ));
 
         // No primary ref at all -> fail closed.
-        assert!(!primary_gz_pinned_by_repomd(None, primary_gz));
+        assert!(!primary_pinned_by_repomd(None, primary_gz));
     }
 
     #[test]
@@ -1854,6 +1878,25 @@ mod primary_decode_tests {
                 "{href}"
             );
         }
+    }
+
+    /// `.gz` keeps the pre-#4427 single-member `GzDecoder` semantics: bytes
+    /// after the first gzip member are ignored, not an error.
+    #[test]
+    fn gzip_trailing_bytes_are_ignored_as_before() {
+        let mut bytes = gz(PRIMARY.as_bytes());
+        bytes.extend_from_slice(b"\0\0trailing padding");
+        assert_eq!(decode_rpm_primary("p.xml.gz", &bytes).unwrap(), PRIMARY);
+    }
+
+    #[test]
+    fn mislabelled_href_error_names_the_extension_and_codec() {
+        let err = decode_rpm_primary("repodata/p.xml.zst", b"plain").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has a .zst href but no zstd header"),
+            "{err}"
+        );
     }
 
     /// The decompression budget applies to every codec, matching the gzip cap.
