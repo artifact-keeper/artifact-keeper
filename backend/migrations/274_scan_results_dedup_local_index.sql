@@ -11,7 +11,15 @@
 -- scan_results table this is two table scans under SHARE UPDATE EXCLUSIVE
 -- with no write block, needing room for the new index beside the old one
 -- (which migration 275 then drops). It waits for transactions already open
--- when it starts. Re-runnable: migration 273 clears an INVALID leftover.
+-- when it starts.
+--
+-- If this build fails part-way it is not recorded and re-runs on the next
+-- boot. The INVALID index it leaves behind is dropped first by
+-- migration_repair::repair_invalid_concurrent_indexes (registered in
+-- CONCURRENT_INDEX_MIGRATIONS), so the retry builds from scratch. IF NOT
+-- EXISTS stays for the one remaining case: a VALID index already present
+-- while this migration is unrecorded (built by hand, or the build finished
+-- but the ledger write did not), which is correct to keep.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scan_results_dedup_local
     ON scan_results (checksum_sha256, scan_type, pin_identity)
     WHERE status = 'completed' AND origin = 'local_scan';
