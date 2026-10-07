@@ -1107,7 +1107,9 @@ pub struct Config {
     /// away within about a second, PG 14+). Keep it BELOW the ingress / load
     /// balancer read timeout (nginx-ingress: 60 s): a client cut off first
     /// retries into a fresh wait, so the per-replica fallback never fires.
-    /// Default: 65.
+    /// Default: 65. Concurrent waits per replica are capped by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` (default 32, read by
+    /// `HydrationCoordinator::from_env`); past the cap a replica fetches at once.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
     // -- OCI virtual-resolution negative cache (#1424) --

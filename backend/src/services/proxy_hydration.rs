@@ -21,6 +21,13 @@ pub const DEFAULT_PROXY_SINGLEFLIGHT_POLL_INTERVAL: Duration = Duration::from_mi
 
 const FOLLOWER_WAIT_SLICE: Duration = Duration::from_millis(250);
 
+/// Default cap on concurrent blocking cross-replica waits per process
+/// (`PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`, #4013). Each wait holds one Postgres
+/// connection outside the pool; past the cap a losing leader fetches as a
+/// per-process leader at once, so a burst of cold keys cannot push the server
+/// past `max_connections`.
+pub const DEFAULT_PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS: usize = 32;
+
 type LocalHydrationMap = Arc<Mutex<HashMap<String, Arc<Notify>>>>;
 
 enum LocalHydrationRole {
@@ -863,6 +870,8 @@ pub struct AdvisoryLockCoordinator {
     /// to its own (bounded, content-addressed-safe) produce. On the streaming
     /// path this is the `lock_timeout` of the losing leader's blocking wait.
     wait_timeout: Duration,
+    /// Permits for concurrent blocking waits in this process (#4013).
+    wait_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AdvisoryLockCoordinator {
@@ -881,7 +890,17 @@ impl AdvisoryLockCoordinator {
                 poll_interval
             },
             wait_timeout,
+            wait_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS,
+            )),
         }
+    }
+
+    /// Cap concurrent blocking cross-replica waits in this process at `max`
+    /// (0 disables waiting: a losing leader always fetches per process).
+    pub fn with_max_lock_waiters(mut self, max: usize) -> Self {
+        self.wait_permits = Arc::new(tokio::sync::Semaphore::new(max));
+        self
     }
 
     /// Follower path for the buffered API: poll `check` on a bounded cadence
@@ -992,13 +1011,25 @@ impl Coordinator for AdvisoryLockCoordinator {
         // contend for it (they follow the local fan-out), and a lock loser
         // costs one blocked connection per cold key per replica, not one per
         // request.
-        let lock = self.lock.as_ref();
-        let wait_timeout = self.wait_timeout;
+        let wait = ClusterWait {
+            lock: self.lock.as_ref(),
+            timeout: self.wait_timeout,
+            permits: &self.wait_permits,
+        };
         coordinate_stream_fanout_with(lease_key, move || {
-            open_as_cluster_leader(lock, lease_key, wait_timeout, open_leader)
+            open_as_cluster_leader(wait, lease_key, open_leader)
         })
         .await
     }
+}
+
+/// The cross-replica lock plus how a losing leader may wait on it.
+#[derive(Clone, Copy)]
+struct ClusterWait<'a> {
+    lock: &'a dyn ClusterLock,
+    timeout: Duration,
+    /// Concurrent-wait permits for this process; none free = fetch at once.
+    permits: &'a tokio::sync::Semaphore,
 }
 
 /// The in-process streaming leader's open step under the cross-replica lock
@@ -1014,17 +1045,23 @@ impl Coordinator for AdvisoryLockCoordinator {
 /// * Wait timed out (multi-GB or throttled remote leader): open upstream as a
 ///   per-process leader WITHOUT the lock, which is the flag-off behaviour: at
 ///   most one fetch per replica, never one per request.
+/// * No wait permit free (`PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`): fetch at once
+///   as a per-process leader.
 /// * Lock infrastructure error: per-process leader, as before.
 async fn open_as_cluster_leader<Open, OpenFut>(
-    lock: &dyn ClusterLock,
+    wait: ClusterWait<'_>,
     lease_key: &str,
-    wait_timeout: Duration,
     open_leader: Open,
 ) -> crate::error::Result<LeaderOpen>
 where
     Open: FnOnce() -> OpenFut,
     OpenFut: Future<Output = crate::error::Result<StreamHandle>>,
 {
+    let ClusterWait {
+        lock,
+        timeout: wait_timeout,
+        permits,
+    } = wait;
     let obj = lease_object_id(lease_key);
     match lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
         Ok(Some(lease)) => match open_leader().await {
@@ -1036,6 +1073,13 @@ where
             }
         },
         Ok(None) => {
+            let Ok(_permit) = permits.try_acquire() else {
+                tracing::debug!(
+                    lease_key,
+                    "too many cross-replica proxy waits in flight; fetching as a per-process leader"
+                );
+                return open_leader().await.map(LeaderOpen::Body);
+            };
             match lock
                 .acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, wait_timeout)
                 .await
@@ -1192,11 +1236,18 @@ impl HydrationCoordinator {
             .and_then(|v| v.parse().ok())
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_PROXY_HYDRATION_WAIT_TIMEOUT);
-        HydrationCoordinator::Advisory(AdvisoryLockCoordinator::new(
-            Arc::new(PgAdvisoryLock::new(pool)),
-            poll_interval,
-            wait_timeout,
-        ))
+        let max_lock_waiters = std::env::var("PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS);
+        HydrationCoordinator::Advisory(
+            AdvisoryLockCoordinator::new(
+                Arc::new(PgAdvisoryLock::new(pool)),
+                poll_interval,
+                wait_timeout,
+            )
+            .with_max_lock_waiters(max_lock_waiters),
+        )
     }
 }
 
@@ -2311,6 +2362,63 @@ mod tests {
         );
     }
 
+    /// #4013 review: blocking waits are capped per process. With the cap
+    /// reached, a losing leader for another cold key fetches at once instead
+    /// of opening one more Postgres wait.
+    #[tokio::test]
+    async fn advisory_streaming_wait_cap_falls_back_to_a_local_fetch() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let coord = Arc::new(advisory_over(&lock).with_max_lock_waiters(1));
+        let key_a = format!("proxy-stream:cap-a-{}", uuid::Uuid::new_v4());
+        let key_b = format!("proxy-stream:cap-b-{}", uuid::Uuid::new_v4());
+        let mut remote = Vec::new();
+        for key in [&key_a, &key_b] {
+            remote.push(
+                lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(key))
+                    .await
+                    .expect("no error")
+                    .expect("held remotely"),
+            );
+        }
+        // Key A's leader takes the only permit and waits.
+        let waiting = {
+            let coord = Arc::clone(&coord);
+            let key_a = key_a.clone();
+            tokio::spawn(async move { coord.coordinate_stream(&key_a, never_opens).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiting.is_finished(), "key A waits for its remote leader");
+        // Key B: no permit left, so it fetches immediately.
+        let opens = AtomicUsize::new(0);
+        let handle = tokio::time::timeout(
+            Duration::from_secs(1),
+            coord.coordinate_stream(&key_b, || async {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(StreamHandle {
+                    body: body_of(&[b"xy"]),
+                    headers: test_headers(),
+                    cache_published: None,
+                })
+            }),
+        )
+        .await
+        .expect("no wait when the cap is reached")
+        .expect("ok")
+        .expect("per-process leader handle");
+        assert_eq!(drain(handle.body).await.expect("bytes"), b"xy");
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(!waiting.is_finished(), "key A is still waiting");
+        for lease in remote {
+            lease.release().await;
+        }
+        let reentered = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("key A wakes")
+            .expect("join")
+            .expect("ok");
+        assert!(reentered.is_none(), "key A re-enters onto the cache");
+    }
+
     /// A lock lost and then a failing wait degrades to a per-process fetch.
     #[tokio::test]
     async fn advisory_streaming_wait_error_fetches_per_process() {
@@ -2354,10 +2462,14 @@ mod tests {
 
         // Replica A wins and streams.
         let (inner, publish) = handle_with_publish(&[b"hello ", b"world"]);
+        let permits = tokio::sync::Semaphore::new(4);
         let leader = match open_as_cluster_leader(
-            replica_a.as_ref(),
+            ClusterWait {
+                lock: replica_a.as_ref(),
+                timeout: Duration::from_secs(30),
+                permits: &permits,
+            },
             &key,
-            Duration::from_secs(30),
             || async move { Ok(inner) },
         )
         .await
@@ -2372,10 +2484,14 @@ mod tests {
             let opens = Arc::clone(&opens);
             let key = key.clone();
             tokio::spawn(async move {
+                let permits = tokio::sync::Semaphore::new(4);
                 let outcome = open_as_cluster_leader(
-                    replica_b.as_ref(),
+                    ClusterWait {
+                        lock: replica_b.as_ref(),
+                        timeout: Duration::from_secs(30),
+                        permits: &permits,
+                    },
                     &key,
-                    Duration::from_secs(30),
                     || async move {
                         opens.fetch_add(1, Ordering::SeqCst);
                         Err(crate::error::AppError::BadGateway("must not open".into()))
@@ -2428,17 +2544,22 @@ mod tests {
             .expect("query ok")
             .expect("held");
         let opens = AtomicUsize::new(0);
-        let outcome =
-            open_as_cluster_leader(&replica_b, &key, Duration::from_millis(200), || async {
-                opens.fetch_add(1, Ordering::SeqCst);
-                Ok(StreamHandle {
-                    body: body_of(&[b"xy"]),
-                    headers: test_headers(),
-                    cache_published: None,
-                })
+        let permits = tokio::sync::Semaphore::new(4);
+        let wait = ClusterWait {
+            lock: &replica_b,
+            timeout: Duration::from_millis(200),
+            permits: &permits,
+        };
+        let outcome = open_as_cluster_leader(wait, &key, || async {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(StreamHandle {
+                body: body_of(&[b"xy"]),
+                headers: test_headers(),
+                cache_published: None,
             })
-            .await
-            .expect("open ok");
+        })
+        .await
+        .expect("open ok");
         assert!(matches!(outcome, LeaderOpen::Body(_)));
         assert_eq!(opens.load(Ordering::SeqCst), 1);
         held.release().await;
