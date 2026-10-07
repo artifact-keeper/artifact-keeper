@@ -30,6 +30,9 @@
 //! # SAS redirect downloads (Shared Key only)
 //! AZURE_REDIRECT_DOWNLOADS=true
 //! AZURE_SAS_EXPIRY=3600  # seconds, default 1 hour
+//! # Client-facing base URL for SAS redirects when AZURE_STORAGE_ENDPOINT is
+//! # not reachable by clients (#4417). Backend calls keep the internal endpoint.
+//! AZURE_STORAGE_PUBLIC_ENDPOINT=https://blobs.example.com
 //!
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
@@ -49,6 +52,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::storage::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use crate::storage::{
     PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
 };
@@ -80,6 +84,13 @@ pub struct AzureConfig {
     pub access_key: Option<String>,
     /// Optional custom endpoint (for Azure Government, China, etc.)
     pub endpoint: Option<String>,
+    /// Client-facing base URL for SAS redirect URLs
+    /// (`AZURE_STORAGE_PUBLIC_ENDPOINT`, #4417). Replaces the account base URL
+    /// in the URLs handed to clients only; the SAS signature covers the
+    /// account, container and blob names, not the host, so the same token
+    /// validates through it. May carry a path (path-style endpoints such as
+    /// Azurite put the account name there).
+    pub public_endpoint: Option<String>,
     /// Enable redirect downloads via SAS URLs (requires access key)
     pub redirect_downloads: bool,
     /// SAS URL expiry duration
@@ -103,6 +114,8 @@ impl AzureConfig {
         let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY").ok();
 
         let endpoint = std::env::var("AZURE_STORAGE_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("AZURE_STORAGE_PUBLIC_ENDPOINT", EndpointPath::Allowed)?;
 
         let redirect_downloads = std::env::var("AZURE_REDIRECT_DOWNLOADS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -121,6 +134,7 @@ impl AzureConfig {
             container_name,
             access_key,
             endpoint,
+            public_endpoint,
             redirect_downloads,
             sas_expiry,
             path_format,
@@ -514,7 +528,20 @@ impl AzureBackend {
 
     /// Get the full URL for a blob
     fn blob_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.base_url(), self.config.container_name, key)
+        Self::blob_url_on(&self.base_url(), &self.config.container_name, key)
+    }
+
+    fn blob_url_on(base: &str, container: &str, key: &str) -> String {
+        format!("{}/{}/{}", base, container, key)
+    }
+
+    /// Base URL for the SAS URLs handed to clients: the public endpoint when
+    /// one is configured (#4417), otherwise the same base the backend uses.
+    fn presented_base_url(&self) -> String {
+        self.config
+            .public_endpoint
+            .clone()
+            .unwrap_or_else(|| self.base_url())
     }
 
     fn append_query(mut url: String, query: &str) -> String {
@@ -1045,6 +1072,15 @@ impl AzureBackend {
     pub fn generate_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
         let sas_token = self.generate_sas_token(key, expires_in)?;
         Ok(format!("{}?{}", self.blob_url(key), sas_token))
+    }
+
+    /// SAS URL for a client redirect: same token as [`Self::generate_sas_url`],
+    /// on [`Self::presented_base_url`]. Backend-internal reads keep
+    /// `generate_sas_url` so they never leave the internal endpoint.
+    fn generate_client_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        let sas_token = self.generate_sas_token(key, expires_in)?;
+        let url = Self::blob_url_on(&self.presented_base_url(), &self.config.container_name, key);
+        Ok(format!("{}?{}", url, sas_token))
     }
 
     fn generate_sas_url_with_permissions(
@@ -1660,7 +1696,7 @@ impl StorageBackend for AzureBackend {
             return Ok(None);
         }
 
-        let url = self.generate_sas_url(key, expires_in)?;
+        let url = self.generate_client_sas_url(key, expires_in)?;
 
         tracing::debug!(
             key = %key,
@@ -1801,6 +1837,7 @@ mod tests {
                     .to_string(),
             ),
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: true,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
@@ -1813,6 +1850,7 @@ mod tests {
             container_name: "testcontainer".to_string(),
             access_key: None,
             endpoint: None,
+            public_endpoint: None,
             redirect_downloads: false,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
@@ -2136,6 +2174,119 @@ mod tests {
             header,
             "SharedKey devstoreaccount1:b0RVKgjLFrvt4fqAuLLg3E+hGrJPhIU4Qr31NgdGlC8="
         );
+    }
+
+    // ── AZURE_STORAGE_PUBLIC_ENDPOINT (#4417) ───────────────────────────
+
+    /// The SAS query string of `url` (everything after `?`).
+    fn sas_query(url: &str) -> &str {
+        url.split_once('?').map(|(_, q)| q).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_is_unchanged_4417() {
+        let mut config = create_test_config();
+        config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+        let backend = AzureBackend::new(config).await.unwrap();
+        let presigned = backend
+            .get_presigned_url("a/b.bin", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            presigned
+                .url
+                .starts_with("http://azurite.internal:10000/testaccount/testcontainer/a/b.bin?"),
+            "{}",
+            presigned.url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_uses_public_endpoint_4417() {
+        for (public, want_prefix) in [
+            (
+                "https://blobs.example.com",
+                "https://blobs.example.com/testcontainer/a/b.bin?",
+            ),
+            (
+                "http://dl.example.com:10000/testaccount",
+                "http://dl.example.com:10000/testaccount/testcontainer/a/b.bin?",
+            ),
+        ] {
+            let mut config = create_test_config();
+            config.endpoint = Some("http://azurite.internal:10000/testaccount".to_string());
+            config.public_endpoint = Some(public.to_string());
+            let backend = AzureBackend::new(config).await.unwrap();
+            let presigned = backend
+                .get_presigned_url("a/b.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                presigned.url.starts_with(want_prefix),
+                "{public}: {}",
+                presigned.url
+            );
+            // The SAS token signs account/container/blob, not the host: the
+            // client URL carries exactly the token the internal URL would.
+            let internal = backend
+                .generate_sas_url("a/b.bin", Duration::from_secs(60))
+                .unwrap();
+            assert!(internal.starts_with("http://azurite.internal:10000/"));
+            let (pub_q, int_q) = (sas_query(&presigned.url), sas_query(&internal));
+            let sig = |q: &str| {
+                q.split('&')
+                    .find(|p| p.starts_with("sig="))
+                    .map(str::to_string)
+            };
+            assert!(sig(pub_q).is_some());
+            // Same second => same st/se => identical signature.
+            if pub_q.split("&sig=").next() == int_q.split("&sig=").next() {
+                assert_eq!(sig(pub_q), sig(int_q));
+            }
+        }
+    }
+
+    #[test]
+    fn test_azure_config_from_env_reads_public_endpoint_4417() {
+        let saved: Vec<(&str, Option<String>)> = [
+            "AZURE_STORAGE_ACCOUNT",
+            "AZURE_STORAGE_CONTAINER",
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+        std::env::set_var("AZURE_STORAGE_ACCOUNT", "acct");
+        std::env::set_var("AZURE_STORAGE_CONTAINER", "c");
+
+        std::env::set_var(
+            "AZURE_STORAGE_PUBLIC_ENDPOINT",
+            "https://blobs.example.com/",
+        );
+        let config = AzureConfig::from_env().unwrap();
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://blobs.example.com")
+        );
+
+        std::env::set_var("AZURE_STORAGE_PUBLIC_ENDPOINT", "blobs.example.com");
+        let err = AzureConfig::from_env().expect_err("malformed");
+        assert!(
+            err.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT"),
+            "{err}"
+        );
+
+        std::env::remove_var("AZURE_STORAGE_PUBLIC_ENDPOINT");
+        assert!(AzureConfig::from_env().unwrap().public_endpoint.is_none());
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── SAS URL generation (Shared Key only) ─────────────────────────────

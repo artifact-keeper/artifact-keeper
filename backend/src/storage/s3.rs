@@ -40,6 +40,10 @@
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
 //! - S3_PRESIGN_EXPIRY_SECS: URL expiry in seconds (default: 3600)
+//! - S3_PUBLIC_ENDPOINT: Origin (`scheme://host[:port]`) that clients use to
+//!   reach the object store, when it differs from S3_ENDPOINT (e.g. an
+//!   in-cluster MinIO service name). Presigned URLs are signed for and point
+//!   at this host; the backend's own S3 calls keep S3_ENDPOINT (#4417).
 //!
 //! For CloudFront CDN:
 //! - CLOUDFRONT_DISTRIBUTION_URL: CloudFront distribution URL (optional)
@@ -65,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+use super::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
 
@@ -753,6 +758,12 @@ pub struct S3Config {
     pub region: String,
     /// Custom endpoint URL (for MinIO compatibility)
     pub endpoint: Option<String>,
+    /// Client-facing origin for presigned download URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). When set, presigned GET URLs are signed for and point at this
+    /// host instead of [`Self::endpoint`]; the backend's own requests are
+    /// unaffected. Validated by
+    /// [`crate::storage::public_endpoint::parse_public_endpoint`].
+    pub public_endpoint: Option<String>,
     /// Optional key prefix for all objects
     pub prefix: Option<String>,
     /// Enable redirect downloads via presigned URLs
@@ -828,6 +839,8 @@ impl S3Config {
             std::env::var("S3_BUCKET").map_err(|_| AppError::Config("S3_BUCKET not set".into()))?;
         let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
         let endpoint = std::env::var("S3_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden)?;
         let prefix = std::env::var("S3_PREFIX").ok();
         if let Some(p) = prefix.as_deref() {
             if s3_prefix_collides_with_reserved_namespace(p) {
@@ -896,6 +909,7 @@ impl S3Config {
             bucket,
             region,
             endpoint,
+            public_endpoint,
             prefix,
             redirect_downloads,
             presign_expiry: Duration::from_secs(presign_expiry_secs),
@@ -964,6 +978,7 @@ impl S3Config {
             bucket,
             region,
             endpoint,
+            public_endpoint: None,
             prefix,
             redirect_downloads: false,
             presign_expiry: Duration::from_secs(3600),
@@ -992,6 +1007,13 @@ impl S3Config {
     /// Enable redirect downloads
     pub fn with_redirect_downloads(mut self, enabled: bool) -> Self {
         self.redirect_downloads = enabled;
+        self
+    }
+
+    /// Set the client-facing origin for presigned URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). The value is used as given; [`Self::from_env`] validates it.
+    pub fn with_public_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.public_endpoint = Some(endpoint.into());
         self
     }
 
@@ -1395,6 +1417,11 @@ pub struct S3Backend {
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
     path_format: StoragePathFormat,
+    /// Store used ONLY to presign the GET URLs handed to clients, built by
+    /// [`Self::build_signing_store`] when dedicated presign credentials or
+    /// `S3_PUBLIC_ENDPOINT` are configured. `None` signs with [`Self::store`].
+    /// Never used for the backend's own requests: its endpoint may be one the
+    /// backend cannot reach (#4417).
     signing_store: Option<AmazonS3>,
     /// When true, delete objects one at a time with HTTP DELETE instead of the
     /// S3 multi-object delete API (POST ?delete). Needed for providers like
@@ -1626,6 +1653,49 @@ impl S3Backend {
             .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
     }
 
+    /// The configuration [`Self::signing_store`] is built from, or `None`
+    /// when presigning can use the main store unchanged.
+    ///
+    /// The public endpoint replaces only the endpoint. Everything else --
+    /// bucket, region, credentials chain, path-style addressing -- stays the
+    /// same, so the URL is signed exactly as the backend would sign it for
+    /// itself, just for the host the client will send (SigV4 signs the
+    /// `host` header, so it cannot be rewritten after signing).
+    fn signing_config(config: &S3Config) -> Option<S3Config> {
+        let dedicated_creds =
+            config.presign_access_key.is_some() && config.presign_secret_key.is_some();
+        if !dedicated_creds && config.public_endpoint.is_none() {
+            return None;
+        }
+        let mut signing = config.clone();
+        if let Some(public) = &config.public_endpoint {
+            signing.endpoint = Some(public.clone());
+        }
+        Some(signing)
+    }
+
+    /// Build the presign-only store (see [`Self::signing_store`]): dedicated
+    /// `S3_PRESIGN_*` credentials when set, otherwise the normal credential
+    /// chain, and `S3_PUBLIC_ENDPOINT` as the endpoint when set.
+    fn build_signing_store(config: &S3Config) -> Result<Option<AmazonS3>> {
+        let Some(signing) = Self::signing_config(config) else {
+            return Ok(None);
+        };
+        // Only a complete pair overrides the chain: `build_store` with a lone
+        // access key would configure no credentials at all.
+        let (ak, sk) = match (&signing.presign_access_key, &signing.presign_secret_key) {
+            (Some(ak), Some(sk)) => {
+                tracing::info!("Using dedicated credentials for presigned URL signing");
+                (Some(ak.as_str()), Some(sk.as_str()))
+            }
+            _ => (None, None),
+        };
+        if let Some(public) = &signing.public_endpoint {
+            tracing::info!(public_endpoint = %public, "Presigned S3 URLs use S3_PUBLIC_ENDPOINT");
+        }
+        Self::build_store(&signing, ak, sk).map(Some)
+    }
+
     /// Validate at startup that some recognized credential source is configured.
     ///
     /// Without this check, `S3Backend::new` would silently construct a client
@@ -1753,23 +1823,28 @@ impl S3Backend {
         let store = Self::build_store(&config, None, None)?;
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
 
-        let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
-            (Some(ak), Some(sk)) => {
-                let ss = Self::build_store(&config, Some(ak), Some(sk))?;
-                tracing::info!("Using dedicated credentials for presigned URL signing");
-                Some(ss)
-            }
-            _ => None,
-        };
+        let signing_store = Self::build_signing_store(&config)?;
 
         if config.redirect_downloads {
             tracing::info!(
                 bucket = %config.bucket,
                 cloudfront = config.cloudfront.is_some(),
                 expiry_secs = config.presign_expiry.as_secs(),
-                dedicated_signing_creds = signing_store.is_some(),
+                dedicated_signing_creds = config.presign_access_key.is_some()
+                    && config.presign_secret_key.is_some(),
+                public_endpoint = config.public_endpoint.as_deref().unwrap_or("-"),
                 "S3 redirect downloads enabled"
             );
+            if config.endpoint.is_some()
+                && config.public_endpoint.is_none()
+                && config.cloudfront.is_none()
+            {
+                tracing::info!(
+                    "Presigned S3 URLs point at S3_ENDPOINT. If clients cannot reach that \
+                     address (for example an in-cluster service name), set \
+                     S3_PUBLIC_ENDPOINT to the address they use (#4417)."
+                );
+            }
         }
 
         if config.path_format != StoragePathFormat::Native {
@@ -2214,7 +2289,7 @@ impl super::StorageBackend for S3Backend {
 
         tracing::debug!(
             key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
-            dedicated_creds = self.signing_store.is_some(),
+            dedicated_signer = self.signing_store.is_some(),
             "Generated S3 presigned URL"
         );
 
@@ -4197,6 +4272,284 @@ mod tests {
         config.redirect_downloads = true;
         let backend = S3Backend::new(config).await;
         assert!(backend.is_ok());
+    }
+
+    // ---- S3_PUBLIC_ENDPOINT (#4417) ----
+
+    const PUBLIC_TEST_AK: &str = "AKIDPUBLIC4417";
+    const PUBLIC_TEST_SK: &str = "public-endpoint-secret-4417";
+
+    /// Recompute the SigV4 query-string signature of a presigned GET `url`
+    /// as the object store would when the request arrives with `Host: host`,
+    /// and report whether it matches the `X-Amz-Signature` in the URL.
+    /// Independent of object_store's signer, so it proves which host the
+    /// signature actually covers.
+    fn presigned_signature_valid_for_host(url: &url::Url, host: &str, secret: &str) -> bool {
+        use hmac::{Hmac, Mac};
+        fn hmac(key: &[u8], data: &str) -> Vec<u8> {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "X-Amz-Signature")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        let query = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        let amz_date = param("X-Amz-Date");
+        let credential = param("X-Amz-Credential");
+        let scope = credential
+            .split_once('/')
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let mut scope_parts = scope.split('/');
+        let (day, region, service) = (
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+        );
+        let canonical_request = format!(
+            "GET\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+            url.path(),
+            query,
+            host
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k_date = hmac(format!("AWS4{secret}").as_bytes(), day);
+        let k_region = hmac(&k_date, region);
+        let k_service = hmac(&k_region, service);
+        let k_signing = hmac(&k_service, "aws4_request");
+        hex::encode(hmac(&k_signing, &string_to_sign)) == param("X-Amz-Signature")
+    }
+
+    /// Presign `key` on a backend built from `config` (redirects on, static
+    /// presign credentials so no credential chain is consulted).
+    async fn presign_with(mut config: S3Config, key: &str) -> url::Url {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        config.redirect_downloads = true;
+        config.presign_access_key = Some(PUBLIC_TEST_AK.to_string());
+        config.presign_secret_key = Some(PUBLIC_TEST_SK.to_string());
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, key, Duration::from_secs(300))
+                .await
+                .expect("presign ok")
+                .expect("redirects enabled");
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
+        url::Url::parse(&presigned.url).expect("presigned URL parses")
+    }
+
+    #[test]
+    fn test_signing_config_unset_public_endpoint_is_unchanged_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        assert!(config.public_endpoint.is_none());
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "no public endpoint and no presign creds: presign with the main store"
+        );
+    }
+
+    #[test]
+    fn test_signing_config_swaps_only_the_endpoint_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "eu-west-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("pfx".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let signing = S3Backend::signing_config(&config).expect("signing config");
+        assert_eq!(signing.endpoint.as_deref(), Some("https://dl.example.com"));
+        assert_eq!(signing.bucket, "b");
+        assert_eq!(signing.region, "eu-west-1");
+        assert_eq!(signing.prefix.as_deref(), Some("pfx"));
+        // The caller's config (and so the backend's own store) keeps the
+        // internal endpoint.
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // Dedicated creds without a public endpoint keep the internal one.
+        let mut creds_only = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        creds_only.presign_access_key = Some("ak".into());
+        creds_only.presign_secret_key = Some("sk".into());
+        let signing = S3Backend::signing_config(&creds_only).expect("signing config");
+        assert_eq!(
+            signing.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // A lone presign key is not a credential pair and changes nothing.
+        let mut half = S3Config::new("b".into(), "us-east-1".into(), None, None);
+        half.presign_access_key = Some("ak".into());
+        assert!(S3Backend::signing_config(&half).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_keeps_internal_host_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        let url = presign_with(config, "maven/a.jar").await;
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("storage-minio"));
+        assert_eq!(url.port(), Some(9000));
+        assert_eq!(url.path(), "/artifacts/maven/a.jar");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_signed_for_public_endpoint_path_style_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("tenant-a".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let url = presign_with(config, "oci/blobs/sha256/ab/abcd").await;
+
+        // Path-style addressing, same as the backend's own requests, on the
+        // public origin (default https port dropped).
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("dl.example.com"));
+        assert_eq!(url.port(), None);
+        assert_eq!(url.path(), "/artifacts/tenant-a/oci/blobs/sha256/ab/abcd");
+        assert!(url.as_str().contains("X-Amz-Signature="));
+
+        // The signature validates for the Host the client sends, and would
+        // be rejected for the internal host.
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "dl.example.com",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_public_endpoint_with_port_over_aws_default_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // No internal custom endpoint (AWS default) and a public origin with an
+        // explicit port: the port is part of the signed Host.
+        let config = S3Config::new("artifacts".into(), "us-west-2".into(), None, None)
+            .with_public_endpoint("http://s3-gw.example.com:8443");
+        let url = presign_with(config, "generic/file.bin").await;
+        assert_eq!(url.host_str(), Some("s3-gw.example.com"));
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/artifacts/generic/file.bin");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com:8443",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_public_endpoint_does_not_move_backend_requests_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // The backend's own calls must keep S3_ENDPOINT: point it at a mock
+        // and the public endpoint at an unroutable host, then HEAD an object.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/artifacts/k"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 05 Oct 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some(server.uri()),
+            None,
+        )
+        .with_public_endpoint("http://public.invalid:9");
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        assert!(StorageBackendTrait::exists(&backend, "k")
+            .await
+            .expect("exists ok"));
+    }
+
+    #[test]
+    fn test_s3_config_from_env_rejects_malformed_public_endpoint_4417() {
+        let _env = CredEnvTestEnv::enter();
+        let saved_bucket = std::env::var("S3_BUCKET").ok();
+        let saved_public = std::env::var("S3_PUBLIC_ENDPOINT").ok();
+        std::env::set_var("S3_BUCKET", "b");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "dl.example.com:9000");
+        let err = S3Config::from_env().expect_err("malformed public endpoint");
+        assert!(err.to_string().contains("S3_PUBLIC_ENDPOINT"), "{err}");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "https://dl.example.com/");
+        let config = S3Config::from_env().expect("valid public endpoint");
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://dl.example.com")
+        );
+
+        std::env::remove_var("S3_PUBLIC_ENDPOINT");
+        assert!(S3Config::from_env().unwrap().public_endpoint.is_none());
+
+        match saved_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+        if let Some(v) = saved_public {
+            std::env::set_var("S3_PUBLIC_ENDPOINT", v);
+        }
     }
 
     #[tokio::test]
