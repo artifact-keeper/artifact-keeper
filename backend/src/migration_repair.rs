@@ -593,6 +593,7 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
     (272, "idx_proxy_cache_download_holds"),
     (274, "idx_scan_results_dedup_local"),
     (281, "idx_proxy_dl_stats_repo_path"),
+    (283, "idx_proxy_dl_stats_ip"),
 ];
 
 /// The index names from `table` whose migration version is not in
@@ -1664,16 +1665,13 @@ mod tests {
         const OPENER: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS ";
         for m in migrator.iter().filter(|m| m.version >= 260) {
             let sql = m.sql.as_str();
-            if !sql.starts_with("-- no-transaction") || !sql.contains("CREATE INDEX CONCURRENTLY")
-            {
+            if !sql.starts_with("-- no-transaction") || !sql.contains("CREATE INDEX CONCURRENTLY") {
                 continue;
             }
             let name: String = sql
                 .split(OPENER)
                 .nth(1)
-                .unwrap_or_else(|| {
-                    panic!("migration {} must use `{OPENER}<name>`", m.version)
-                })
+                .unwrap_or_else(|| panic!("migration {} must use `{OPENER}<name>`", m.version))
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();

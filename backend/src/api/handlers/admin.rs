@@ -4472,6 +4472,25 @@ mod tests {
                     .is_some_and(|p| p.starts_with("dl-telemetry/"))
         }));
 
+        // #4539: the repository filter reaches hosted rows through their
+        // artifact, and the source filter excludes them.
+        let in_repo = |source| ListDownloadsQuery {
+            repository_id: Some(repo_id),
+            source,
+            ..Default::default()
+        };
+        let repo_all = query_downloads(&pool, &in_repo(None))
+            .await
+            .expect("query by repository");
+        assert_eq!(
+            repo_all.total, 2,
+            "hosted rows match their artifact's repository"
+        );
+        let repo_proxy = query_downloads(&pool, &in_repo(Some(DownloadSource::Proxy)))
+            .await
+            .expect("query proxy in repository");
+        assert_eq!(repo_proxy.total, 0);
+
         // Filter by IP: only the authenticated row, with the username joined.
         let by_ip = query_downloads(
             &pool,
@@ -4598,6 +4617,83 @@ mod tests {
         assert_eq!(proxy_only.total, 1);
         assert_eq!(hosted_only.total, 0);
         assert_eq!(by_ip.total, 1, "the IP / user filters see proxy serves");
+    }
+
+    /// #4539: one page mixing hosted and proxy events is ordered newest
+    /// first across both tables, and pagination walks the union.
+    #[tokio::test]
+    async fn test_query_downloads_orders_and_pages_across_sources_4539() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (remote_id, _, _) = tdh::create_repo(&pool, "remote", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'mix/a.bin', 'mix', '1.0.0', 1, $2, 'application/octet-stream', \
+             'mix/a.bin') RETURNING id",
+        )
+        .bind(local_id)
+        .bind(format!("{:0>64}", "4539"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+        // hosted 1 min ago, proxy 2 min ago, hosted 3 min ago.
+        for minutes in [1, 3] {
+            sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, user_id, downloaded_at) \
+                 VALUES ($1, $2, NOW() - make_interval(mins => $3))",
+            )
+            .bind(artifact_id)
+            .bind(user_id)
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .expect("hosted row");
+        }
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (repository_id, path, user_id, downloaded_at) \
+             VALUES ($1, 'mix/b.bin', $2, NOW() - make_interval(mins => 2))",
+        )
+        .bind(remote_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("proxy row");
+
+        let page = |page| ListDownloadsQuery {
+            user_id: Some(user_id),
+            page: Some(page),
+            per_page: Some(2),
+            ..Default::default()
+        };
+        let first = query_downloads(&pool, &page(1)).await.expect("page 1");
+        let second = query_downloads(&pool, &page(2)).await.expect("page 2");
+        tdh::cleanup(&pool, remote_id, Uuid::nil()).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        let sources = |r: &DownloadListResponse| -> Vec<(DownloadSource, Option<Uuid>)> {
+            r.downloads
+                .iter()
+                .map(|d| (d.source, d.repository_id))
+                .collect()
+        };
+        assert_eq!((first.total, second.total), (3, 3));
+        assert_eq!(
+            sources(&first),
+            vec![
+                (DownloadSource::Hosted, Some(local_id)),
+                (DownloadSource::Proxy, Some(remote_id)),
+            ],
+            "newest first across both tables"
+        );
+        assert_eq!(
+            sources(&second),
+            vec![(DownloadSource::Hosted, Some(local_id))]
+        );
     }
 
     #[test]
