@@ -191,11 +191,17 @@ pub fn create_router(state: SharedState) -> Router {
         )
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
-        // `/v2/token` shares the login limiter (#4020): the same per-(username,
-        // IP) password-guessing budget and global backstop as /api/v1/auth/login.
+        // `/v2/token` shares the login limiter's global backstop and failed-
+        // verify pad budget (#4020) but has its own, larger per-(username, IP)
+        // bucket: an OCI client re-exchanges credentials for every scope it
+        // touches, so a single push + sign + verify spends more than the ten
+        // interactive logins the login bucket allows.
         .nest(
             "/v2",
-            handlers::oci_v2::router(Some(login_rate_limit_state)),
+            handlers::oci_v2::router(Some(build_token_exchange_rate_limit_state(
+                &login_rate_limit_state,
+                &state.config,
+            ))),
         )
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
@@ -480,6 +486,52 @@ fn build_login_rate_limit_state(
         backstop,
         failed_by_ip,
     }
+}
+
+/// Environment variable for the `/v2/token` per-(username, IP) budget.
+pub(crate) const TOKEN_EXCHANGE_PER_WINDOW_ENV: &str = "RATE_LIMIT_TOKEN_EXCHANGE_PER_WINDOW";
+
+/// Default `/v2/token` per-(username, IP) budget per login window.
+pub(crate) const DEFAULT_TOKEN_EXCHANGE_PER_WINDOW: u32 = 300;
+
+/// Parse the `/v2/token` budget; unset, unparseable or zero means the default.
+pub(crate) fn token_exchange_per_window(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_TOKEN_EXCHANGE_PER_WINDOW)
+}
+
+/// The `/v2/token` limiter: the login state with its per-(username, IP)
+/// bucket swapped for a larger one ([`TOKEN_EXCHANGE_PER_WINDOW_ENV`], default
+/// [`DEFAULT_TOKEN_EXCHANGE_PER_WINDOW`] per `rate_limit_login_window_secs`).
+///
+/// The global backstop and the per-IP failed-verify pad budget stay SHARED
+/// with `/api/v1/auth/login` (#4020), so the two surfaces together still bound
+/// total verification volume and padded failures per source IP; only the
+/// per-key bucket is separate. A container client exchanges credentials once
+/// per repository scope and per tool (podman push, cosign sign, cosign verify,
+/// skopeo), so ten per fifteen minutes made one ordinary build 429.
+fn build_token_exchange_rate_limit_state(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+) -> LoginRateLimitState {
+    let limiter = Arc::new(RateLimiter::new(
+        token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
+        config.rate_limit_login_window_secs,
+    ));
+    {
+        let cleanup = Arc::clone(&limiter);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup.cleanup_expired().await;
+            }
+        });
+    }
+    let mut state = login.clone();
+    state.inner.limiter = limiter;
+    state
 }
 
 /// API v1 routes.
@@ -1258,7 +1310,49 @@ mod tests {
     //! prefixes wired to the same handler until the `lxc` format is either
     //! folded into `incus` or given its own handler with prefix-aware URL
     //! construction (tracked as a follow-up to #1272).
+    use super::{
+        build_login_rate_limit_state, build_token_exchange_rate_limit_state,
+        token_exchange_per_window, DEFAULT_TOKEN_EXCHANGE_PER_WINDOW,
+    };
     use super::{is_byte_transfer_path, request_timed_out_response};
+    use crate::api::middleware::rate_limit::RateLimitExemptions;
+    use std::sync::Arc;
+
+    #[test]
+    fn token_exchange_budget_defaults_and_parses() {
+        assert_eq!(
+            token_exchange_per_window(None),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(
+            token_exchange_per_window(Some("0")),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(
+            token_exchange_per_window(Some("x")),
+            DEFAULT_TOKEN_EXCHANGE_PER_WINDOW
+        );
+        assert_eq!(token_exchange_per_window(Some(" 50 ")), 50);
+    }
+
+    /// `/v2/token` gets its own per-(username, IP) bucket, sized above the
+    /// login bucket, while the global backstop and failed-verify pad budget
+    /// stay shared with `/api/v1/auth/login` (#4020).
+    #[tokio::test]
+    async fn token_exchange_limiter_shares_the_backstop_but_not_the_bucket() {
+        let config = crate::config::Config::test_config();
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&config, &exemptions, &proxies);
+        let token = build_token_exchange_rate_limit_state(&login, &config);
+        assert!(Arc::ptr_eq(&login.backstop, &token.backstop));
+        assert!(Arc::ptr_eq(&login.failed_by_ip, &token.failed_by_ip));
+        assert!(!Arc::ptr_eq(&login.inner.limiter, &token.inner.limiter));
+    }
 
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
 
