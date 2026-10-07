@@ -1454,6 +1454,13 @@ jobs:
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
 
+      # Stock compose secrets (#4478): docker-compose.yml and .env.example
+      # shipped JWT_SECRET / AK_WEBHOOK_SECRET_KEY values the backend refuses
+      # at startup, so the quickstart stack restarted forever. Pure file
+      # inspection, ~1s.
+      - name: Check the stock compose ships no secret the backend rejects
+        run: bash scripts/ci/check-compose-secret-defaults.sh
+
       # The cache-correctness E2E reads its verdict off the mock upstream's
       # counters, so a wrong mock reports a product bug that is not there. It
       # did: the backend revalidates an expired TTL with a CONDITIONAL HEAD
