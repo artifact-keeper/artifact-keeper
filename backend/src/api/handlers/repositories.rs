@@ -8581,14 +8581,28 @@ pub async fn get_artifact_metadata(
         } else {
             state.proxy_service.as_deref()
         };
+        // #4442: this route streams a member's BYTES like `download_artifact`,
+        // so it takes the same check: the caller-authorized members, then a
+        // refusal when the shadowing guard left Remote members in play and one
+        // of them scans on proxy.
+        let not_found =
+            || AppError::NotFound("Artifact not found in any member repository".to_string());
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+            .await
+            .map_err(|_| not_found())?;
+        if proxy_for_virtual.is_some() {
+            if let Some(refusal) =
+                generic_route_virtual_refusal(&state.db, &repo, &members, &path).await
+            {
+                return Ok(refusal);
+            }
+        }
         let db = state.db.clone();
         let path_clone = path.clone();
         let state_clone = state.clone();
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
-            auth.as_ref(),
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &path,
             move |member_id, location| {
                 let db = db.clone();
@@ -9908,6 +9922,127 @@ async fn download_artifact_version(
     ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
+/// What the generic download route does with a proxied file of a format whose
+/// handler enforces scan-on-proxy (#4442).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericRouteProxyServe {
+    /// The repository does not scan on proxy: stream as before.
+    Stream,
+    /// The repository scans on proxy: refuse, naming the format route.
+    Refuse,
+    /// The `scan_on_proxy` flag could not be read: fail closed with a 503.
+    ConfigUnreadable,
+}
+
+/// The #4442 decision for an enforced format's Remote miss, from the
+/// repository's `scan_on_proxy` flag.
+///
+/// The generic download route (`/api/v1/repositories/{key}/download/*path`,
+/// and the same handler at `/general/{key}/*path`) streams a Remote miss from
+/// the proxy cache or the upstream with no scan gate. The format routes
+/// (`/npm`, `/maven`, `/cargo`, ...) gate the same bytes, from the same proxy
+/// cache, through `proxy_helpers::serve_scanned_proxy_file`, so for a
+/// repository that scans on proxy this route was the way around their 403. It
+/// cannot run the gate itself: the gate grades the package coordinate each
+/// format route parses from its own request shape (#3003), and npm and Cargo
+/// even fetch from a source their own metadata names (the packument's tarball
+/// URL, the index's `dl` template). This route has no per-format parser for
+/// any of that, so when the repository scans, it refuses.
+///
+/// That holds for every `proxy_scan_action`: `record_only` promises that every
+/// pull is scanned and recorded, which this route cannot do either. It also
+/// holds for every path, metadata included, because a per-format "is this a
+/// package file" carve-out is the classification drift #4365 item 1 warns
+/// about.
+///
+/// An unreadable flag fails closed. The format routes read it as off (#4365
+/// item 5), but this is a refusal gate, and reading it as off would reopen the
+/// bypass for exactly as long as the database is failing.
+fn generic_route_proxy_serve(scan_on_proxy: &Result<bool>) -> GenericRouteProxyServe {
+    match scan_on_proxy {
+        Ok(false) => GenericRouteProxyServe::Stream,
+        Ok(true) => GenericRouteProxyServe::Refuse,
+        Err(_) => GenericRouteProxyServe::ConfigUnreadable,
+    }
+}
+
+/// Whether #4442 applies to `format` on the generic download route: exactly the
+/// formats `GET /api/v1/formats` reports as `scan_on_proxy: "enforced"`, so a
+/// format that adopts the gate closes this route in the same change.
+fn generic_route_checks_scan_on_proxy(format: &RepositoryFormat) -> bool {
+    crate::formats::handler_enforces_scan_on_proxy(format.handler_key())
+}
+
+/// The #4442 refusal for `path`, logged so an operator can see clients using
+/// the wrong route.
+fn generic_route_scan_refusal(repo_key: &str, path: &str, format: &RepositoryFormat) -> Response {
+    let handler = format.handler_key();
+    tracing::warn!(
+        repo = %repo_key, path = %path, handler = %handler,
+        "refusing a proxied download on the generic route: the repository scans \
+         on proxy, so the file is served only through its format route (#4442)"
+    );
+    proxy_helpers::scan_on_proxy_route_required_response(download_filename(path), handler)
+}
+
+/// #4442 for a direct Remote miss: `Ok(Some(403))` refuses, `Ok(None)` streams
+/// as before, and an unreadable flag is a 503. A format that does not enforce
+/// scan-on-proxy streams without a query.
+async fn generic_route_remote_refusal(
+    db: &sqlx::PgPool,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<Response>> {
+    if !generic_route_checks_scan_on_proxy(&repo.format) {
+        return Ok(None);
+    }
+    let scan_on_proxy = crate::services::scan_config_service::ScanConfigService::new(db.clone())
+        .is_proxy_scan_enabled(repo.id)
+        .await;
+    match generic_route_proxy_serve(&scan_on_proxy) {
+        GenericRouteProxyServe::Stream => Ok(None),
+        GenericRouteProxyServe::Refuse => Ok(Some(generic_route_scan_refusal(
+            &repo.key,
+            path,
+            &repo.format,
+        ))),
+        GenericRouteProxyServe::ConfigUnreadable => {
+            tracing::warn!(
+                repo = %repo.key, result = ?scan_on_proxy,
+                "scan-on-proxy flag unreadable on the generic download route; \
+                 failing closed (#4442)"
+            );
+            Err(AppError::ServiceUnavailable(
+                "scan-on-proxy configuration is temporarily unreadable".to_string(),
+            ))
+        }
+    }
+}
+
+/// #4442 for a Virtual miss that would reach Remote members: refuse when any
+/// member the caller may read scans on proxy under the stricter-of-two policy
+/// (the virtual's own configuration or the member's), and pass through the 503
+/// `virtual_member_scan_policies` answers when that configuration cannot be
+/// read. `members` must already be narrowed to the caller, so the answer says
+/// nothing about members the caller cannot see.
+async fn generic_route_virtual_refusal(
+    db: &sqlx::PgPool,
+    repo: &crate::models::repository::Repository,
+    members: &[crate::models::repository::Repository],
+    path: &str,
+) -> Option<Response> {
+    if !generic_route_checks_scan_on_proxy(&repo.format) {
+        return None;
+    }
+    match proxy_helpers::virtual_member_scan_policies(db, repo.id, members).await {
+        Err(unreadable) => Some(unreadable),
+        Ok(policies) if policies.iter().any(Option::is_some) => {
+            Some(generic_route_scan_refusal(&repo.key, path, &repo.format))
+        }
+        Ok(_) => None,
+    }
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -9922,7 +10057,9 @@ async fn download_artifact_version(
     responses(
         (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
         (status = 302, description = "Redirect to S3 presigned URL"),
+        (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy: download it through the format's own route (`error: scan_on_proxy_route_required`)"),
         (status = 404, description = "Artifact not found"),
+        (status = 503, description = "The repository's scan-on-proxy configuration could not be read"),
     )
 )]
 pub async fn download_artifact(
@@ -10192,6 +10329,14 @@ pub async fn download_artifact(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // #4442: a repository that scans on proxy serves an enforced
+                // format's files only through the format route, which runs the
+                // gate. Refused before any routing-rule read, cache read or
+                // upstream request, so a HEAD cannot reach the upstream either.
+                if let Some(refusal) = generic_route_remote_refusal(&state.db, &repo, &path).await?
+                {
+                    return Ok(refusal);
+                }
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let rewritten = routing_rules::apply_routing_rules(&path, &rules);
                 let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
@@ -10280,13 +10425,31 @@ pub async fn download_artifact(
             } else {
                 state.proxy_service.as_deref()
             };
+            // The members the caller may read directly (#3178), fetched here
+            // rather than inside the walk so the #4442 check below sees exactly
+            // the set the walk serves from. A failure keeps the 404 every
+            // other walk failure on this route answers with.
+            let not_found =
+                || AppError::NotFound("Artifact not found in any member repository".to_string());
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await
+                    .map_err(|_| not_found())?;
+            // #4442: the walk streams Remote members unscanned. When the
+            // shadowing guard left them in play and one of them scans on proxy,
+            // refuse instead of serving around the format route's gate.
+            if proxy_for_virtual.is_some() {
+                if let Some(refusal) =
+                    generic_route_virtual_refusal(&state.db, &repo, &members, &path).await
+                {
+                    return Ok(refusal);
+                }
+            }
             let db = state.db.clone();
             let path_clone = path.clone();
-            let result = proxy_helpers::resolve_virtual_download(
-                &state.db,
-                auth.as_ref(),
+            let result = proxy_helpers::resolve_virtual_download_from_members(
+                members,
                 proxy_for_virtual,
-                repo.id,
                 &path,
                 |member_id, location| {
                     let db = db.clone();
@@ -10299,9 +10462,7 @@ pub async fn download_artifact(
                 },
             )
             .await
-            .map_err(|_| {
-                AppError::NotFound("Artifact not found in any member repository".to_string())
-            })?;
+            .map_err(|_| not_found())?;
 
             // #2398 (sibling of #2394): this arm is only reached when
             // `download_stream` returned NotFound for the virtual repo
@@ -25163,6 +25324,504 @@ mod tests {
              closed by #895/#1294; a revert to the format-less \
              `proxy_fetch_streaming` would re-introduce #3556."
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #4442: the generic download route must not serve around the
+    // scan-on-proxy gate.
+    //
+    // For a Remote of a format whose handler enforces scan-on-proxy, the
+    // format route (/npm, /maven, /cargo, ...) gates every proxied file, while
+    // this route streamed the same bytes, from the same proxy cache, with no
+    // gate. When the repository scans on proxy this route now refuses with
+    // a 403 naming the format handler, before any routing-rule read, cache
+    // read or upstream request. The DB tests assert that the upstream saw no
+    // request, which is what "refused before the proxy" means on the wire.
+    // ---------------------------------------------------------------------
+
+    /// The flag alone picks the arm, and an unreadable flag fails closed
+    /// rather than reading as off.
+    #[test]
+    fn generic_route_proxy_serve_decides_from_the_scan_flag_4442() {
+        assert_eq!(
+            generic_route_proxy_serve(&Ok(true)),
+            GenericRouteProxyServe::Refuse
+        );
+        assert_eq!(
+            generic_route_proxy_serve(&Ok(false)),
+            GenericRouteProxyServe::Stream
+        );
+        assert_eq!(
+            generic_route_proxy_serve(&Err(AppError::Database("connection reset".to_string()))),
+            GenericRouteProxyServe::ConfigUnreadable,
+            "an unreadable scan-on-proxy flag must fail closed on the generic route"
+        );
+    }
+
+    /// The route checks exactly the formats `GET /api/v1/formats` reports as
+    /// enforced, aliases included, so a format that adopts the gate closes this
+    /// route with no second list to update.
+    #[test]
+    fn generic_route_checks_exactly_the_enforced_formats_4442() {
+        use RepositoryFormat::*;
+        for format in RepositoryFormat::ALL {
+            assert_eq!(
+                generic_route_checks_scan_on_proxy(format),
+                crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&format.handler_key()),
+                "{format:?}"
+            );
+        }
+        for format in [
+            Npm, Yarn, Pnpm, Bower, Pypi, Poetry, Jupyter, Maven, Gradle, Sbt, Cargo, Nuget,
+            Chocolatey, Powershell, Vscode, Docker, HelmOci,
+        ] {
+            assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
+        }
+        for format in [
+            Generic,
+            Github,
+            Helm,
+            Go,
+            Rubygems,
+            Conda,
+            CondaNative,
+            Debian,
+        ] {
+            assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
+        }
+    }
+
+    /// The 403 body: the `scan_blocked` family with its own `error`, the
+    /// requested file's basename, and the handler key a client retries on.
+    #[tokio::test]
+    async fn generic_route_refusal_names_the_format_handler_4442() {
+        let resp = generic_route_scan_refusal(
+            "gradle-remote",
+            "com/example/lib/1.0/lib-1.0.jar",
+            &RepositoryFormat::Gradle,
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("refusal body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["error"], "scan_on_proxy_route_required");
+        assert_eq!(json["file"], "lib-1.0.jar");
+        assert_eq!(
+            json["handler"], "maven",
+            "a Gradle repository is served by the maven handler"
+        );
+        assert!(
+            json["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("maven format route")),
+            "{json}"
+        );
+    }
+
+    /// The refusals sit in front of every proxied serve in `download_artifact`.
+    /// `repositories.rs` is not in `proxy_helpers`' `SERVE_SOURCES`, so the
+    /// scan-on-proxy capability test there does not police this handler; this
+    /// pin does. A refusal moved after the routing-rule read or the streaming
+    /// fetch would let a request reach the cache or the upstream first.
+    #[test]
+    fn download_artifact_refuses_before_any_proxied_serve_4442() {
+        let src = include_str!("repositories.rs");
+        let start = src
+            .find("pub async fn download_artifact(")
+            .expect("download_artifact must exist");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("download_artifact must end with a column-0 brace")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("download_artifact must contain `{needle}`"))
+        };
+        let remote_refusal = at("generic_route_remote_refusal(&state.db");
+        assert!(
+            remote_refusal < at("load_routing_rules(&state.db"),
+            "#4442: the Remote refusal must precede the routing-rule read"
+        );
+        assert!(
+            remote_refusal < at("proxy_helpers::proxy_fetch_streaming_with_format("),
+            "#4442: the Remote refusal must precede the streaming proxy fetch"
+        );
+        assert!(
+            at("generic_route_virtual_refusal(&state.db")
+                < at("proxy_helpers::resolve_virtual_download_from_members("),
+            "#4442: the Virtual refusal must precede the member walk"
+        );
+
+        // `get_artifact_metadata` streams a Virtual member's bytes on
+        // `/artifacts/*path` and takes the same Virtual refusal first.
+        let start = src
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata must exist");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("get_artifact_metadata must end with a column-0 brace")];
+        let refusal = body
+            .find("generic_route_virtual_refusal(&state.db")
+            .expect("#4442: get_artifact_metadata must run the Virtual refusal");
+        let walk = body
+            .find("proxy_helpers::resolve_virtual_download_from_members(")
+            .expect("get_artifact_metadata must walk the authorized members");
+        assert!(
+            refusal < walk,
+            "#4442: the Virtual refusal must precede get_artifact_metadata's member walk"
+        );
+    }
+
+    /// A wiremock upstream that answers every GET with `body`.
+    async fn upstream_answering_4442(body: &'static [u8]) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn upstream_requests_4442(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock request recording is enabled")
+            .len()
+    }
+
+    /// A state whose proxy caches under `dir`.
+    fn proxy_state_4442(pool: &sqlx::PgPool, dir: &std::path::Path) -> SharedState {
+        let dir = dir.to_str().expect("utf-8 temp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir);
+        tdh::build_state_with_proxy(pool.clone(), dir, proxy)
+    }
+
+    /// Assert a response is the #4442 refusal of `file`, naming `handler`.
+    fn assert_scan_route_refusal_4442(
+        status: StatusCode,
+        body: &[u8],
+        file: &str,
+        handler: &str,
+        what: &str,
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(body).unwrap_or_else(|e| panic!("{what}: not JSON ({e})"));
+        assert_eq!(json["error"], "scan_on_proxy_route_required", "{what}");
+        assert_eq!(json["file"], file, "{what}");
+        assert_eq!(json["handler"], handler, "{what}");
+    }
+
+    /// An enforced-format Remote that scans on proxy is refused on the generic
+    /// route under every `proxy_scan_action`, with no upstream request.
+    #[tokio::test]
+    async fn generic_route_refuses_a_scanning_enforced_remote_4442() {
+        for (format, path, file) in [
+            ("npm", "left-pad/-/left-pad-1.3.0.tgz", "left-pad-1.3.0.tgz"),
+            ("maven", "com/example/lib/1.0/lib-1.0.jar", "lib-1.0.jar"),
+            (
+                "cargo",
+                "crates/serde/serde-1.0.0.crate",
+                "serde-1.0.0.crate",
+            ),
+        ] {
+            for action in ["fail_open", "fail_closed", "record_only"] {
+                let what = format!("{format} {action}");
+                let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                    return;
+                };
+                let server = upstream_answering_4442(b"unscanned-package-bytes").await;
+                point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+                tdh::enable_proxy_scan(&fx.pool, fx.repo_id, action).await;
+                let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+                let (status, body) = tdh::send(
+                    tdh::router_anon(download_router(), state),
+                    tdh::get(format!("/{}/download/{path}", fx.repo_key)),
+                )
+                .await;
+                assert_scan_route_refusal_4442(status, &body, file, format, &what);
+                assert_eq!(
+                    upstream_requests_4442(&server).await,
+                    0,
+                    "{what}: refused before any upstream request"
+                );
+                fx.teardown().await;
+            }
+        }
+    }
+
+    /// HEAD runs the same handler and is refused the same way, so it can
+    /// neither confirm an upstream file nor cost an upstream request. The
+    /// `/general/`
+    /// mount re-exports this handler for every format and is refused too.
+    #[tokio::test]
+    async fn generic_route_refusal_covers_head_and_the_general_mount_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"unscanned-package-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+        let path = "left-pad/-/left-pad-1.3.0.tgz";
+
+        let (status, _) = tdh::send(
+            tdh::router_anon(download_router(), state.clone()),
+            tdh::head(format!("/{}/download/{path}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "HEAD on the generic route");
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(crate::api::handlers::general::router(), state),
+            tdh::get(format!("/{}/{path}", fx.repo_key)),
+        )
+        .await;
+        assert_scan_route_refusal_4442(status, &body, "left-pad-1.3.0.tgz", "npm", "/general/");
+
+        assert_eq!(upstream_requests_4442(&server).await, 0);
+        fx.teardown().await;
+    }
+
+    /// The refusal precedes the cache read: a file an earlier pull cached
+    /// while scanning was off is not served once the repository scans.
+    #[tokio::test]
+    async fn generic_route_refuses_a_warm_cache_entry_once_scanning_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"cached-jar-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+        let uri = format!("/{}/download/com/example/lib/1.0/lib-1.0.jar", fx.repo_key);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(download_router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scan off: the route still streams");
+        assert_eq!(&body[..], b"cached-jar-bytes");
+        tdh::wait_for_cache_commit(&fx.storage_dir, body.len() as u64).await;
+        let warmed = upstream_requests_4442(&server).await;
+
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let (status, body) =
+            tdh::send(tdh::router_anon(download_router(), state), tdh::get(uri)).await;
+        assert_scan_route_refusal_4442(status, &body, "lib-1.0.jar", "maven", "warm cache");
+        assert_eq!(
+            upstream_requests_4442(&server).await,
+            warmed,
+            "no upstream request after the refusal"
+        );
+        fx.teardown().await;
+    }
+
+    /// What #4442 must not change: an enforced format with scan-on-proxy off,
+    /// and an `accepted` format with it on, still stream from the upstream.
+    #[tokio::test]
+    async fn generic_route_still_streams_where_the_gate_does_not_apply_4442() {
+        for (format, scan) in [("npm", false), ("generic", true)] {
+            let what = format!("{format} scan_on_proxy={scan}");
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = upstream_answering_4442(b"streamed-bytes").await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            if scan {
+                tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+            }
+            let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+            let (status, body) = tdh::send(
+                tdh::router_anon(download_router(), state),
+                tdh::get(format!("/{}/download/pkg/file-1.0.bin", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{what}");
+            assert_eq!(&body[..], b"streamed-bytes", "{what}");
+            fx.teardown().await;
+        }
+    }
+
+    /// A Virtual reaching a Remote member that scans on proxy is refused,
+    /// whichever side turns scanning on (the stricter-of-two rule the format
+    /// routes apply); with scanning off on both sides it still streams.
+    #[tokio::test]
+    async fn generic_route_virtual_follows_the_members_scan_policy_4442() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for scan_on in [None, Some("member"), Some("virtual")] {
+            let what = format!("scan on {scan_on:?}");
+            let server = upstream_answering_4442(b"virtual-member-bytes").await;
+            let (remote_id, _remote_key, virtual_id, virtual_key) =
+                tdh::create_remote_and_virtual(&pool, "npm", &server.uri()).await;
+            tdh::publish_repo(&pool, virtual_id).await;
+            match scan_on {
+                Some("member") => tdh::enable_proxy_scan(&pool, remote_id, "fail_open").await,
+                Some(_) => tdh::enable_proxy_scan(&pool, virtual_id, "fail_open").await,
+                None => {}
+            }
+            let dir = std::env::temp_dir().join(format!("ph-test-4442-{virtual_id}"));
+            std::fs::create_dir_all(&dir).expect("cache dir");
+            let state = proxy_state_4442(&pool, &dir);
+
+            // Both generic routes that stream a member's bytes: the download
+            // route and the artifacts route (`get_artifact_metadata`).
+            for route in ["download", "artifacts"] {
+                let what = format!("{what}, /{route}/");
+                let (status, body) = tdh::send(
+                    tdh::router_anon(download_router().merge(router()), state.clone()),
+                    tdh::get(format!(
+                        "/{virtual_key}/{route}/left-pad/-/left-pad-1.3.0.tgz"
+                    )),
+                )
+                .await;
+                if scan_on.is_some() {
+                    assert_scan_route_refusal_4442(
+                        status,
+                        &body,
+                        "left-pad-1.3.0.tgz",
+                        "npm",
+                        &what,
+                    );
+                    assert_eq!(upstream_requests_4442(&server).await, 0, "{what}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{what}");
+                    assert_eq!(&body[..], b"virtual-member-bytes", "{what}");
+                }
+            }
+
+            for id in [virtual_id, remote_id] {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("ph-test-{id}")));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The shadowing guard still decides first: when a hosted member owns the
+    /// exact path, Remote members are never consulted, so a scanning Remote
+    /// member does not stop the hosted bytes from being served.
+    #[tokio::test]
+    async fn generic_route_virtual_serves_a_hosted_owner_beside_a_scanning_remote_4442() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"upstream-bytes").await;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "npm").await;
+        point_repo_at_upstream(&fx.pool, remote_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, remote_id, "fail_closed").await;
+        for (member, priority) in [(remote_id, 1), (local_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("add virtual member");
+        }
+        for id in [fx.repo_id, local_id] {
+            tdh::publish_repo(&fx.pool, id).await;
+        }
+        let hosted: &[u8] = b"hosted-member-bytes";
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &local_repo,
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "vdl/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(hosted),
+            fx.user_id,
+        )
+        .await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+        for route in ["download", "artifacts"] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(download_router().merge(router()), state.clone()),
+                tdh::get(format!("/{}/{route}/vdl/blob.bin", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/{route}/: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(&body[..], hosted, "/{route}/");
+            assert_eq!(
+                upstream_requests_4442(&server).await,
+                0,
+                "/{route}/: the Remote member is never consulted"
+            );
+        }
+
+        for (id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            tdh::cleanup_member_repo(&fx.pool, id, dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// A file stored in a scanning Remote repository itself (an `artifacts`
+    /// row) is still served from storage: the refusal sits on the proxy
+    /// fallback only, after the row lookup, and the upstream is not contacted.
+    #[tokio::test]
+    async fn generic_route_still_serves_a_stored_file_of_a_scanning_remote_4442() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let server = upstream_answering_4442(b"upstream-bytes").await;
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let stored: &[u8] = b"stored-in-the-remote-bytes";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("remote", Some(&server.uri())),
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "pkg/stored-1.0.0.tgz",
+            "stored",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(stored),
+            fx.user_id,
+        )
+        .await;
+        let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(download_router(), state),
+            tdh::get(format!("/{}/download/pkg/stored-1.0.0.tgz", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], stored);
+        assert_eq!(upstream_requests_4442(&server).await, 0);
+        fx.teardown().await;
     }
 
     // ---------------------------------------------------------------------

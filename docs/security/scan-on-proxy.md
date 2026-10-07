@@ -54,6 +54,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
 **Identity.** The gate takes the package coordinate from the request (for
 example the NuGet id and version in the URL) and checks it against the
@@ -110,6 +111,42 @@ over the members the caller may read.
   error, a `502` checksum mismatch) moves on to the next member.
 - If the members' scan configuration cannot be read, the pull fails with a
   retryable `503` instead of serving unscanned.
+- On the generic routes that serve a member's bytes (`download/*path` and
+  `artifacts/*path`), a Virtual repository refuses with `403` when
+  a Remote member the caller may read would scan under the stricter-of-two
+  rule. See [The generic download route](#the-generic-download-route).
+
+## The generic download route
+
+`GET /api/v1/repositories/{key}/download/*path` serves any repository's files,
+and the web UI's download button and file viewer use it. The same handler also
+answers on `/general/{key}/*path`. It has no per-format request identity to run
+the gate against, so for an enforced format it does not proxy while scanning
+is on (#4442):
+
+- A Remote repository with `scan_on_proxy` on refuses every file it would
+  fetch from its proxy cache or upstream: `403` with
+  `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`.
+  `handler` is the format handler whose route serves the file through the
+  gate, for example `npm` (`/npm/{key}/...`) or `maven` (`/maven/{key}/...`,
+  for Gradle too). Two handlers are mounted under another name: `sbt` serves
+  `/ivy/{key}/...` and `oci` serves `/v2/...`.
+- The refusal applies under every `proxy_scan_action`, `record_only`
+  included, and to every path, metadata included. That is stricter than the
+  Maven route, which serves POMs, `.xml` metadata and checksums unscanned.
+  It applies to `HEAD` as well, so a `HEAD` can neither confirm an upstream
+  file nor cost an upstream request.
+- A Virtual repository refuses the same way when a Remote member the caller
+  may read scans under the stricter-of-two rule. This also covers
+  `GET /api/v1/repositories/{key}/artifacts/*path`, which serves a Virtual
+  member's bytes through the same member walk. A hosted member that owns the
+  exact path is still served.
+- If the `scan_on_proxy` flag cannot be read, the route answers `503` instead
+  of serving unscanned.
+
+Files stored in the repository itself (an `artifacts` row) are still served
+from storage behind the repository's download gate. Formats that do not
+enforce scan-on-proxy, and repositories with it off, are unaffected.
 
 ## Coverage
 
@@ -164,16 +201,17 @@ have no core proxy path to gate.
 
 ## Known gaps
 
-- **The generic download route.** `GET /api/v1/repositories/{key}/download/*path`
-  serves a Remote repository's upstream bytes without the gate, for every
-  format, including the enforced ones (#4442). Point clients at the format's
-  own route.
 - **Cache commit before the verdict.** The buffered fetch commits upstream
   bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4365).
+  re-check the verdict can then serve them warm (#4365). The generic download
+  route refuses before it reads the cache for a repository that scans on
+  proxy. A non-scanning Remote member of a scanning Virtual is still subject
+  to this gap: bytes the Virtual refused can be served warm by addressing the
+  member directly, on its format route or on the generic route.
 - **Unreadable configuration on a direct Remote pull.** If a Remote
-  repository's `scan_on_proxy` flag cannot be read, the pull is served as if
-  scanning were off (#4365). The Virtual walk fails closed instead (see above).
+  repository's `scan_on_proxy` flag cannot be read, a format route serves the
+  pull as if scanning were off (#4365). The Virtual walk and the generic
+  download route fail closed instead (see above).
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.

@@ -8182,6 +8182,34 @@ pub(crate) fn scan_blocked_response(filename: &str) -> Response {
         .into_response()
 }
 
+/// A 403 for a proxied file of a scan-on-proxy enforced format, requested
+/// through the generic download route of a repository that scans on proxy
+/// (#4442).
+///
+/// That route has no per-format request identity to run the gate against, so
+/// it refuses rather than stream unscanned bytes. `handler` is the format's
+/// handler key (`npm`, `maven`, ...), so a client can retry on that format's
+/// own route without the server guessing a per-format URL. Same body family as
+/// [`scan_blocked_response`], with a distinct `error` so a client can tell
+/// "use the other route" from "these bytes are blocked".
+pub(crate) fn scan_on_proxy_route_required_response(filename: &str, handler: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_on_proxy_route_required",
+        "file": filename,
+        "handler": handler,
+        "reason": format!(
+            "scan-on-proxy is enabled for this repository; proxied {handler} files \
+             are served only through the {handler} format route, which scans them"
+        ),
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// A 423 Locked for the fail-closed inconclusive branch (over-cap / budget /
 /// scan error): the object could not be scanned inline and fail-closed must
 /// NEVER serve unscanned bytes.
