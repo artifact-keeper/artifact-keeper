@@ -16516,6 +16516,8 @@ mod virtual_channel_tests {
         let (denied_status, denied_body, _) = rig
             .get(format!("/{v}/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda"))
             .await;
+        let (absent_status, absent_body, _) =
+            rig.get(format!("/{v}/noarch/nosuchpkg-1.0-0.conda")).await;
         let (old_tz_status, _, _) = rig
             .get(format!("/{v}/noarch/tzdata-2025a-h78e105d_0.conda"))
             .await;
@@ -16609,6 +16611,11 @@ mod virtual_channel_tests {
             StatusCode::NOT_FOUND,
             "{}",
             String::from_utf8_lossy(&denied_body)
+        );
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            denied_body, absent_body,
+            "a refused package answers exactly like one no member has"
         );
         assert!(
             !colorama_fetched_while_denied,
