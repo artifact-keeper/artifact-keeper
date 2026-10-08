@@ -314,10 +314,9 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 ///   `require_repo_access`. So a token scoped to some unrelated repository can
 ///   reach a PUBLIC virtual, and the grant-half aggregate then hands it a byte
 ///   total for private members it is scoped away from and whose own `GET`
-///   correctly 404s. Nor is read-through the right premise:
-///   `proxy_helpers::caller_can_read_member` gates the by-path download on
-///   `can_access_repo(member.id)` with no parent term anywhere, so such a
-///   token is DENIED those members' bytes.
+///   correctly 404s. The parent term #4559 added does not supply it either:
+///   it asks whether the VIRTUAL is in the token's scope, and for a token
+///   scoped to some unrelated repository it is not.
 ///
 /// [`MemberVisibility`] therefore carries the whole principal, and
 /// [`build_member_visibility_clause`] renders the predicate above verbatim.
@@ -327,10 +326,11 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 /// predicate, applied row-wise because that path has the rows in hand. The
 /// aggregate sums its rows inside the database, so it renders one clause.
 ///
-/// The consequence #3173 accepts deliberately holds here too: a token scoped
-/// only to a virtual sees 0 bytes for members it does not carry. That is
-/// consistent with the download, which also refuses. Scope tokens to the
-/// members, or to both.
+/// The storage aggregate applies the #4559 parent term too: a token whose
+/// scope names the virtual counts the members its owner may read, matching
+/// the listing and the download through the same virtual. The aggregate
+/// renders it with `build_member_visibility_clause_through`, keyed on the
+/// virtual being summed; this value carries the principal unchanged.
 pub(crate) fn member_read_visibility(auth: Option<&AuthExtension>) -> MemberVisibility {
     match auth {
         None => MemberVisibility::Anonymous,
@@ -376,38 +376,73 @@ pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisib
 /// The SCOPE half, applied per member row.
 ///
 /// A public member bypasses scope entirely, matching `require_visible`'s early
-/// return. Otherwise the member must itself be in the token's scope.
+/// return. Otherwise the member passes when it is itself in the token's scope,
+/// OR when `routed_virtual_id` is (#4559).
 ///
-/// An earlier revision also passed when the PARENT virtual was in scope,
-/// arguing that the by-path download already read through. That premise was
-/// wrong: `proxy_helpers::caller_can_read_member` gates on
-/// `can_access_repo(member.id)` and has no parent term anywhere, so a token
-/// scoped to a virtual but not to a member is DENIED that member's bytes.
-/// Read-through would have created the inconsistency it claimed to remove,
-/// reversed — and widened enumeration past `require_visible`, letting a token
-/// list artifact names, versions and sizes for a member it is scoped away
-/// from. Strict scoping is what agrees with both.
+/// # The parent term (#4559)
 ///
-/// Consequence, accepted deliberately: a token scoped only to a virtual sees
-/// an empty listing. That is consistent with the download, which also refuses.
-/// Scope tokens to the members, or to both.
+/// `routed_virtual_id` is the virtual repository the REQUEST was routed
+/// through (`/<format>/V/...`, `GET /api/v1/repositories/V/...`, the
+/// `/t/<token>/` forms of either), whose own read was already authorized for
+/// this caller, token scope included, before any member was resolved. Every
+/// caller passes exactly that id; never pass a virtual the request did not
+/// name, and pass the member's own id when there is no parent (as
+/// `last_promotion` does), which reduces the term to the member term.
+///
+/// A token minted on a virtual (a repository token, or a user token whose
+/// `repo_selector` names it) therefore reads the virtual's members THROUGH the
+/// virtual, without its scope naming them. What it does not get:
+///
+/// * the member's own URL. The term is evaluated only here, where the parent
+///   is the routed repository; `repo_visibility_middleware` and
+///   `require_visible` gate a direct request on `can_access_repo(member)`
+///   exactly as before, so a consumer token on `conda-virtual` still cannot
+///   read `conda-forge` directly (the allowlist bypass noted in #4583).
+/// * anything its owner cannot read. This is the SCOPE half only; the GRANT
+///   half ([`member_grant_visibility`] in SQL) and, on content paths, the
+///   read-action gate in `proxy_helpers::try_authorize_virtual_members` still
+///   apply to the member with the token owner's identity. A member the owner
+///   holds no grant on stays out of the listing and out of the walk.
+/// * writes. Deploy-target resolution through a virtual
+///   (`proxy_helpers::resolve_virtual_deploy_target`) checks
+///   `can_access_repo(member)` directly and is unchanged.
+///
+/// The listing paths (this function, per row) and the content paths
+/// (`proxy_helpers::try_authorize_virtual_members`, which calls this function
+/// with the same routed id) share the term, so what a token lists through a
+/// virtual and what it can fetch through it cannot drift. The storage
+/// aggregate renders the same term in SQL
+/// (`build_member_visibility_clause_through`). Nested virtuals are expanded
+/// into their leaves before this runs and every leaf is checked against the
+/// ROOT the request was routed through, so the term reaches nested members
+/// transitively; an intermediate virtual's own scope is not consulted, as its
+/// own ACL never was.
+///
+/// Before #4559 the parent id was ignored and a token scoped only to a virtual
+/// saw an empty listing and an empty walk; scoping a token to the members, or
+/// to both, still works and is no longer required.
 pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
-    parent_repo_id: Uuid,
+    routed_virtual_id: Uuid,
     member_id: Uuid,
     member_visibility: crate::models::repository::RepositoryVisibility,
 ) -> bool {
-    let _ = parent_repo_id;
     // `internal` behaves as `private` here, deliberately. The escape hatch this
     // helper grants past the token scope exists only because an ANONYMOUS
     // caller is served a public member anyway, so a scoped credential must not
     // be worse off than none (#3704). An internal member gives an anonymous
     // caller nothing, so there is no such baseline and the scope stays a
     // ceiling -- which is also what the spec requires: a repository-scoped
-    // token whose allowed set excludes an internal repository is refused.
+    // token whose allowed set excludes an internal repository is refused,
+    // unless it reaches that repository as a member of a virtual its scope
+    // names (#4559).
     match auth {
         None => member_visibility.allows_anonymous_read(),
-        Some(a) => member_visibility.allows_anonymous_read() || a.can_access_repo(member_id),
+        Some(a) => {
+            member_visibility.allows_anonymous_read()
+                || a.can_access_repo(member_id)
+                || a.can_access_repo(routed_virtual_id)
+        }
     }
 }
 
@@ -31392,8 +31427,12 @@ mod apt_validation_tests {
     ///
     /// * token scoped to `[x]` only          -> 0     (V reachable via the
     ///   `is_public` arm; NEITHER member is in scope)
-    /// * token scoped to `[virt, near]`      -> 1,000 (`far` withheld, `near`
-    ///   still counted — the control against an always-zero "fix")
+    /// * token scoped to `[near]`            -> 1,000 (V again reached via
+    ///   `is_public`, so no #4559 parent term: `far` withheld, `near` still
+    ///   counted — the control against an always-zero "fix")
+    /// * token scoped to `[virt]`            -> 10 GiB + 1,000 (#4559: the
+    ///   scope names the virtual being summed, so every member the owner may
+    ///   read is counted, as the listing and download through V admit them)
     /// * the same user with an UNRESTRICTED credential -> 10 GiB + 1,000
     ///   (proves the bytes are genuinely reachable, so the two figures above
     ///   are caused by scope and not by a broken fixture)
@@ -31452,14 +31491,27 @@ mod apt_validation_tests {
              a byte total for members it is scoped away from"
         );
 
-        // A token carrying the virtual and ONE member: exactly that member's
-        // bytes, on both aggregation paths.
-        let scoped_near = scoped_token_3081(u_id, &u_name, vec![virt, near]);
+        // A token carrying ONE member but not the virtual: exactly that
+        // member's bytes. Only the detail path: a repo-scoped listing shows
+        // only the repositories its scope names, so the virtual is not in it.
+        let scoped_near = scoped_token_3081(u_id, &u_name, vec![near]);
         assert_repo_hidden_3081(&pool, &far_key, scoped_near.clone()).await;
         assert_eq!(
-            virtual_total_seen_by_3081(&pool, &prefix, &virt_key, scoped_near).await,
+            virtual_total_from_detail_3081(&pool, &virt_key, scoped_near).await,
             NEAR_BYTES,
             "the total must count the in-scope member and withhold the out-of-scope one"
+        );
+
+        // #4559: a token carrying the VIRTUAL counts every member its owner
+        // may read through it, on both aggregation paths, while each member's
+        // own `GET` stays hidden from it.
+        let scoped_virt = scoped_token_3081(u_id, &u_name, vec![virt]);
+        assert_repo_hidden_3081(&pool, &far_key, scoped_virt.clone()).await;
+        assert_repo_hidden_3081(&pool, &near_key, scoped_virt.clone()).await;
+        assert_eq!(
+            virtual_total_seen_by_3081(&pool, &prefix, &virt_key, scoped_virt).await,
+            FAR_BYTES + NEAR_BYTES,
+            "a token scoped to the virtual must count the members its owner may read"
         );
 
         // Fixture control: the SAME user on an unrestricted credential sees
@@ -31478,10 +31530,11 @@ mod apt_validation_tests {
     /// #3081: the PATCH response carries the same aggregate as `GET`, and was
     /// untested. `update_repository` gates on `require_repo_access` (token
     /// scope on the PARENT) plus `repository:admin`, so the caller here is
-    /// scoped to the virtual — and must still be refused the bytes of a member
-    /// that scope does not carry.
+    /// scoped to the virtual. Since #4559 that scope covers the members read
+    /// through the virtual, so what withholds a member's bytes is the owner's
+    /// grant on it, not the token scope.
     #[tokio::test]
-    async fn test_patch_response_total_excludes_out_of_scope_members_3081() {
+    async fn test_patch_response_total_is_caller_scoped_3081() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::http::StatusCode;
 
@@ -31530,12 +31583,12 @@ mod apt_validation_tests {
             }
         };
 
-        // Scoped to the virtual and `near` only: `far`'s 500,000 bytes are
-        // withheld, `near`'s 1,000 are still reported.
+        // Scoped to the virtual only, owner granted on both members: the
+        // #4559 parent term counts both.
         assert_eq!(
-            patch_total(scoped_token_3081(u_id, &u_name, vec![virt, near])).await,
-            1_000,
-            "the PATCH response total must exclude a member the token is scoped away from"
+            patch_total(scoped_token_3081(u_id, &u_name, vec![virt])).await,
+            501_000,
+            "a token scoped to the virtual must count the members its owner may read"
         );
 
         // Control: the same user unrestricted sees the full union.
@@ -31543,6 +31596,20 @@ mod apt_validation_tests {
             patch_total(tdh::make_auth(u_id, &u_name)).await,
             501_000,
             "an unrestricted credential must still see the full union in the PATCH response"
+        );
+
+        // Revoke the owner's grant on `far`: the same virtual-scoped token now
+        // has its 500,000 bytes withheld, `near`'s 1,000 still reported.
+        sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1 AND user_id = $2")
+            .bind(far)
+            .bind(u_id)
+            .execute(&pool)
+            .await
+            .expect("revoke far grant");
+        assert_eq!(
+            patch_total(scoped_token_3081(u_id, &u_name, vec![virt])).await,
+            1_000,
+            "the PATCH response total must exclude a member the owner cannot read"
         );
 
         drop_repos_test(&pool, &[virt, far, near]).await;
@@ -32265,11 +32332,11 @@ mod virtual_member_visibility_tests {
     /// anonymous one; dropping the grant conjunct let a token keep reading a
     /// member after its owner's grant was revoked.
     ///
-    /// It also asserts read-through: a token scoped to the VIRTUAL reaches the
-    /// virtual's members. That is deliberate -- the by-path download through
-    /// the same virtual already serves member bytes to such a token, so
-    /// without it the listing returns `200 OK` with zero items while the
-    /// download of those same items succeeds.
+    /// It also asserts the #4559 parent term: a token scoped to the VIRTUAL
+    /// lists the members its owner may read, matching the download through the
+    /// same virtual, while the grant half still hides a member the owner holds
+    /// no grant on, and a token whose scope does not name the virtual does not
+    /// reach the virtual at all.
     #[tokio::test]
     async fn members_endpoint_honours_token_scope_and_grants_3163() {
         let Some(pool) = tdh::try_pool().await else {
@@ -32292,6 +32359,11 @@ mod virtual_member_visibility_tests {
         // scope was discarded entirely.
         let at = fx.scoped_admin_token(vec![fx.virt_id]);
         let (adm_status, adm_keys) = fx.members_seen(at).await;
+
+        // An ADMIN whose token is scoped to the public MEMBER only: the scope
+        // binds at the (private) virtual parent, so it is not listed at all.
+        let at_elsewhere = fx.scoped_admin_token(vec![fx.public_id]);
+        let (adm_elsewhere_status, _) = fx.members_seen(at_elsewhere).await;
 
         // Positive control: same caller, member now IN scope.
         let it2 = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
@@ -32318,16 +32390,14 @@ mod virtual_member_visibility_tests {
             "token scope must not substitute for a grant: {private_key} has no \
              grant for this caller; got {virt_keys:?}"
         );
-        // STRICT scoping: the private member is NOT in this token's scope, so
-        // even a caller who holds the grant must not enumerate it. This is what
-        // agrees with the download path -- `caller_can_read_member` gates on
-        // `can_access_repo(member.id)` with no parent term, so read-through
-        // here would let a token list what it cannot fetch.
+        // #4559 parent term: the private member is not named by this token's
+        // scope, but the virtual is and the owner holds a grant on the member,
+        // so it is listed -- as the download through the same virtual serves
+        // it (`caller_can_read_member` evaluates the same term).
         assert!(
-            !ins_keys.contains(&private_key),
-            "a token scoped only to the virtual must not enumerate a private \
-             member outside its scope, because the download refuses it too; \
-             got {ins_keys:?}"
+            ins_keys.contains(&private_key),
+            "a token scoped to the virtual must list a member its owner may \
+             read; got {ins_keys:?}"
         );
         // Scope the token to the MEMBER and the same caller does see it --
         // the positive control, without which the assertion above is
@@ -32338,13 +32408,21 @@ mod virtual_member_visibility_tests {
             "with {private_key} in scope AND a grant, it must be listed; \
              got {ins2_keys:?}"
         );
-        // An admin token scoped to the virtual only: the scope still binds.
-        // Before the fix `is_admin` was matched ahead of `Restricted`, so the
-        // scope was discarded entirely and every member was listed.
+        // An admin token scoped to the virtual: the parent term admits every
+        // member through it (an admin satisfies the grant half).
         assert!(
-            !adm_keys.contains(&private_key),
-            "an admin's deliberately-scoped token must stay scoped; \
-             got {adm_keys:?}"
+            adm_keys.contains(&private_key),
+            "an admin token scoped to the virtual reads its members through \
+             it; got {adm_keys:?}"
+        );
+        // ...but an admin token scoped elsewhere is still bound by its scope.
+        // Before the #3163 fix `is_admin` was matched ahead of `Restricted`,
+        // so the scope was discarded entirely.
+        assert_ne!(
+            adm_elsewhere_status,
+            StatusCode::OK,
+            "an admin's token scoped away from a private virtual must not \
+             reach it"
         );
     }
 

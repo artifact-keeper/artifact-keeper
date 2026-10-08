@@ -4298,6 +4298,10 @@ pub async fn resolve_virtual_deploy_target(
         if member.promotion_only {
             continue;
         }
+        // Strict member scope, deliberately: the #4559 parent term
+        // (`member_passes_token_scope`) is for READS through the routed
+        // virtual. A token minted on a virtual does not gain write access to
+        // the members behind it.
         if !auth.can_access_repo(member.id) {
             continue;
         }
@@ -4340,6 +4344,14 @@ pub async fn resolve_virtual_deploy_target(
 /// [`member_passes_token_scope`]. Reusing those two helpers is deliberate:
 /// listing and byte resolution now evaluate the SAME predicate from the SAME
 /// code, so "which members does this caller see" cannot drift between the two.
+///
+/// `in_scope` includes the #4559 parent term: a member is in scope when the
+/// token's scope names the member OR `virtual_repo_id`, so a token minted on a
+/// virtual reads that virtual's members through it, still subject to the
+/// owner's grants and the read-action gate below. `virtual_repo_id` must be
+/// the virtual the request was routed through (every caller passes the routed
+/// repository's id); a direct request to a member never reaches this function
+/// and keeps the strict scope check in `repo_visibility_middleware`.
 ///
 /// What this replaces (#3178). The previous implementation was NOT this
 /// predicate. Its entitlement half was
@@ -4862,7 +4874,8 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
 }
 
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
-/// model and the #1804 / #3178 background.
+/// model, the #1804 / #3178 background and the #4559 parent term
+/// (`virtual_repo_id` is the virtual the request was routed through).
 pub async fn caller_can_read_member(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -18555,15 +18568,19 @@ mod tests {
         tdh3452::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
         let parent_only = nonadmin_auth(user_id);
 
-        // (b) granted on BOTH, but the token ceiling carries only the parent,
-        //     so the member is out of scope. Same denial, different half of
-        //     `require_visible`.
+        // (b) granted on BOTH, but the token ceiling carries neither the
+        //     member nor the parent (since #4559 a ceiling naming the parent
+        //     reaches its members through it), so the member is out of
+        //     scope. Same denial, different half of `require_visible`; the
+        //     shape a token scoped elsewhere has on a PUBLIC virtual.
         let (scoped_user_id, _sn) = tdh3452::create_user(&pool).await;
         tdh3452::grant_repo_actions(&pool, parent_id, scoped_user_id, &["read"]).await;
         tdh3452::grant_repo_actions(&pool, member_id, scoped_user_id, &["read"]).await;
         let parent_scoped_token = crate::api::middleware::auth::AuthExtension {
             is_api_token: true,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![parent_id]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                empty_virtual_id,
+            ]),
             ..nonadmin_auth(scoped_user_id)
         };
 
@@ -19752,7 +19769,8 @@ mod tests {
         let target = resolve_virtual_deploy_target(&pool, &svc, &auth, root_id).await;
 
         // A token scoped to the virtual only (not to any member) resolves
-        // nothing: scope to the members, or to both (#3173's composition,
+        // nothing for a WRITE (the #4559 parent term covers reads only):
+        // scope to the members, or to both (#3173's composition,
         // applied to writes).
         let mut scoped = nonadmin_auth(user_id);
         scoped.allowed_repo_ids =
