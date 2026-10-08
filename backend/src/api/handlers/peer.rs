@@ -220,6 +220,7 @@ async fn discover_peers(
     request_body = ProbeBody,
     responses(
         (status = 200, description = "Probe result recorded", body = PeerResponse),
+        (status = 403, description = "Caller is not an administrator"),
         (status = 400, description = "target_peer_id equals the source peer id"),
         (status = 404, description = "Source or target peer instance not found"),
     ),
@@ -227,9 +228,16 @@ async fn discover_peers(
 )]
 async fn probe_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Json(body): Json<ProbeBody>,
 ) -> Result<Json<PeerResponse>> {
+    // Probe results (latency, bandwidth) feed peer and chunk-source
+    // selection, so recording one is federation administration, admin-only
+    // like `mark_unreachable` and `update_network_profile`
+    // (GHSA-mvmh-g8wm-r3cp).
+    auth.require_admin()?;
+
     // A peer cannot probe a connection to itself. The `peer_connections`
     // table enforces this with a CHECK (`source_peer_id != target_peer_id`),
     // which previously surfaced as an opaque 500 DATABASE_ERROR. Reject it up
@@ -995,7 +1003,9 @@ mod tests {
             // Mirror the production mount point: peer_router() lives under
             // /:id/connections.
             let router = Router::new().nest("/:id/connections", super::super::peer_router());
-            tdh::router_with_auth(router, state, tdh::make_auth(Uuid::new_v4(), "fed.admin"))
+            // Probing is admin-only (GHSA-mvmh-g8wm-r3cp); these tests cover
+            // the handler's validation, so they probe as an administrator.
+            tdh::router_with_auth_ext(router, state, tdh::admin_auth(Uuid::new_v4(), "fed.admin"))
         }
 
         /// Drive the probe handler: POST `{target_peer_id, latency_ms}` to
@@ -1226,6 +1236,56 @@ mod tests {
 
             let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
                 .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        /// GHSA-mvmh-g8wm-r3cp #8: probe results feed peer and chunk-source
+        /// selection, so recording one is admin-only like the other mutating
+        /// peer routes. The handler used to extract no identity at all.
+        #[tokio::test]
+        async fn probe_peer_is_admin_only() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let source = tdh::register_test_peer(&pool, "authz-probe", "src").await;
+            let target = tdh::register_test_peer(&pool, "authz-probe", "dst").await;
+            let probe = |auth: AuthExtension| {
+                let app = conn_app(state.clone(), auth);
+                let body = format!("{{\"target_peer_id\":\"{target}\",\"latency_ms\":1}}");
+                async move {
+                    tdh::send(
+                        app,
+                        tdh::post(
+                            format!("/{source}/connections/probe"),
+                            "application/json",
+                            Bytes::from(body),
+                        ),
+                    )
+                    .await
+                    .0
+                }
+            };
+            let recorded = || async {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM peer_connections \
+                     WHERE source_peer_id = $1 AND target_peer_id = $2",
+                )
+                .bind(source)
+                .bind(target)
+                .fetch_one(&pool)
+                .await
+                .expect("count probe rows")
+            };
+
+            assert_eq!(probe(non_admin()).await, StatusCode::FORBIDDEN);
+            assert_eq!(recorded().await, 0, "a refused probe must record nothing");
+            assert_eq!(probe(admin()).await, StatusCode::OK);
+            assert_eq!(recorded().await, 1);
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+                .bind(vec![source, target])
                 .execute(&pool)
                 .await;
         }

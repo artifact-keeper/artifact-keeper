@@ -27,6 +27,32 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Build records belong to the principal that created them: changing one
+/// (status, attached artifacts) needs the `write:artifacts` token scope and
+/// either administrator rights or being its creator. A build created before
+/// the creator was recorded is administrator-only (GHSA-mvmh-g8wm-r3cp).
+async fn require_build_owner(
+    state: &SharedState,
+    auth: &AuthExtension,
+    build_id: Uuid,
+) -> Result<()> {
+    auth.require_scope("write:artifacts")?;
+    let owner = BuildService::new(state.db.clone())
+        .created_by(build_id)
+        .await?;
+    if build_mutation_allowed(auth.is_admin, auth.user_id, owner) {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Only the build's creator or an administrator can change it".to_string(),
+        ))
+    }
+}
+
+fn build_mutation_allowed(is_admin: bool, caller: Uuid, owner: Option<Uuid>) -> bool {
+    is_admin || owner == Some(caller)
+}
+
 /// Create build routes
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -426,6 +452,7 @@ pub struct CreateBuildRequest {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Build created successfully", body = BuildResponse),
+        (status = 403, description = "The token lacks write:artifacts"),
         (status = 401, description = "Authentication required"),
     )
 )]
@@ -434,7 +461,8 @@ pub async fn create_build(
     Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreateBuildRequest>,
 ) -> Result<Json<BuildResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:artifacts")?;
 
     let service = BuildService::new(state.db.clone());
     let build = service
@@ -448,6 +476,7 @@ pub async fn create_build(
             vcs_branch: payload.vcs_branch,
             vcs_message: payload.vcs_message,
             metadata: payload.metadata,
+            created_by: Some(auth.user_id),
         })
         .await?;
 
@@ -473,6 +502,7 @@ pub struct UpdateBuildRequest {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Build updated successfully", body = BuildResponse),
+        (status = 403, description = "Caller is neither the build's creator nor an administrator, or the token lacks write:artifacts"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Build not found"),
     )
@@ -483,7 +513,8 @@ pub async fn update_build(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateBuildRequest>,
 ) -> Result<Json<BuildResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    require_build_owner(&state, &auth, id).await?;
 
     let service = BuildService::new(state.db.clone());
     let build = service
@@ -553,6 +584,7 @@ pub struct AddBuildArtifactsResponse {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifacts added to build", body = AddBuildArtifactsResponse),
+        (status = 403, description = "Caller is neither the build's creator nor an administrator, or the token lacks write:artifacts"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Build not found"),
     )
@@ -563,7 +595,8 @@ pub async fn add_build_artifacts(
     Path(id): Path<Uuid>,
     Json(payload): Json<AddBuildArtifactsRequest>,
 ) -> Result<Json<AddBuildArtifactsResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    require_build_owner(&state, &auth, id).await?;
 
     let service = BuildService::new(state.db.clone());
     let inputs: Vec<BuildArtifactInput> = payload
@@ -1413,5 +1446,137 @@ mod tests {
         let per_page: u32 = 20;
         let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
         assert_eq!(total_pages, 3);
+    }
+
+    #[test]
+    fn build_mutation_allowed_is_owner_or_admin() {
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(build_mutation_allowed(false, me, Some(me)));
+        assert!(!build_mutation_allowed(false, me, Some(other)));
+        assert!(!build_mutation_allowed(false, me, None));
+        assert!(build_mutation_allowed(true, me, Some(other)));
+        assert!(build_mutation_allowed(true, me, None));
+    }
+
+    /// GHSA-mvmh-g8wm-r3cp #7: a build record belongs to the principal that
+    /// created it. Another signed-in user used to be able to change its
+    /// status and attach artifacts to it (authentication was the only
+    /// check). Now only the creator or an administrator may, a build
+    /// created before ownership was recorded is administrator-only, and a
+    /// token needs `write:artifacts` to create or change one.
+    #[tokio::test]
+    async fn build_mutations_are_owner_or_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-mvmh-builds");
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let other = tdh::make_auth(other_id, &other_name);
+        let admin = tdh::admin_auth(other_id, &other_name);
+        let create = |auth: AuthExtension| {
+            create_build(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Json(CreateBuildRequest {
+                    name: "ph-mvmh-build".to_string(),
+                    build_number: 1,
+                    agent: None,
+                    started_at: None,
+                    vcs_url: None,
+                    vcs_revision: None,
+                    vcs_branch: None,
+                    vcs_message: None,
+                    metadata: None,
+                }),
+            )
+        };
+        let update = |auth: AuthExtension, id: Uuid| {
+            update_build(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Path(id),
+                Json(UpdateBuildRequest {
+                    status: "failed".to_string(),
+                    finished_at: None,
+                }),
+            )
+        };
+        let attach = |auth: AuthExtension, id: Uuid| {
+            add_build_artifacts(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Path(id),
+                Json(AddBuildArtifactsRequest {
+                    artifacts: vec![BuildArtifactInputPayload {
+                        module_name: None,
+                        name: "forged.bin".to_string(),
+                        path: "forged.bin".to_string(),
+                        checksum_sha256: "0".repeat(64),
+                        size_bytes: 1,
+                    }],
+                }),
+            )
+        };
+        let status_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM builds WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("build status")
+            }
+        };
+        let forbidden = |e: Option<AppError>| matches!(e, Some(AppError::Authorization(_)));
+
+        let Json(build) = create(owner.clone()).await.expect("owner creates");
+
+        // Another user: refused, and the record is untouched.
+        assert!(forbidden(update(other.clone(), build.id).await.err()));
+        assert!(forbidden(attach(other.clone(), build.id).await.err()));
+        assert_eq!(status_of(build.id).await, "running");
+
+        // A read-only token of the owner: refused at the scope gate.
+        let read_token = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            ..owner.clone()
+        };
+        assert!(forbidden(update(read_token.clone(), build.id).await.err()));
+        assert!(forbidden(create(read_token).await.err()));
+
+        // The owner and an administrator: allowed.
+        update(owner.clone(), build.id)
+            .await
+            .expect("owner updates");
+        attach(owner.clone(), build.id)
+            .await
+            .expect("owner attaches");
+        update(admin.clone(), build.id)
+            .await
+            .expect("admin updates");
+
+        // A build with no recorded creator (created before this change).
+        let legacy: Uuid = sqlx::query_scalar(
+            "INSERT INTO builds (name, build_number, status) \
+             VALUES ('ph-mvmh-legacy', 1, 'running') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("legacy build");
+        assert!(forbidden(update(owner.clone(), legacy).await.err()));
+        update(admin, legacy)
+            .await
+            .expect("admin updates a legacy build");
+
+        let _ = sqlx::query("DELETE FROM builds WHERE id = ANY($1)")
+            .bind(vec![build.id, legacy])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, owner_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
     }
 }

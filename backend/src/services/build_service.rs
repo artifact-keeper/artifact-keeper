@@ -60,6 +60,10 @@ pub struct CreateBuildInput {
     pub vcs_branch: Option<String>,
     pub vcs_message: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// The principal creating the build. Only it and administrators may
+    /// change the build afterwards (GHSA-mvmh-g8wm-r3cp).
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 /// Input for updating build status.
@@ -94,8 +98,9 @@ impl BuildService {
         let build: Build = sqlx::query_as(
             r#"
             INSERT INTO builds (name, build_number, status, started_at, agent,
-                                vcs_url, vcs_revision, vcs_branch, vcs_message, metadata)
-            VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9)
+                                vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
+                                created_by)
+            VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, name, build_number, status, started_at, finished_at,
                       duration_ms, agent, artifact_count,
                       vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
@@ -111,11 +116,25 @@ impl BuildService {
         .bind(&input.vcs_branch)
         .bind(&input.vcs_message)
         .bind(&input.metadata)
+        .bind(input.created_by)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(build)
+    }
+
+    /// The principal that created `build_id`: `Ok(None)` for a build created
+    /// before the creator was recorded, `NotFound` for no such build.
+    pub async fn created_by(&self, build_id: Uuid) -> Result<Option<Uuid>> {
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT created_by FROM builds WHERE id = $1")
+                .bind(build_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        row.map(|(owner,)| owner)
+            .ok_or_else(|| AppError::NotFound(format!("Build {} not found", build_id)))
     }
 
     /// Update build status and compute duration_ms if finished_at is provided.
@@ -451,6 +470,7 @@ mod tests {
             vcs_branch: None,
             vcs_message: None,
             metadata: None,
+            created_by: None,
         };
         assert!(input.name.is_empty());
     }

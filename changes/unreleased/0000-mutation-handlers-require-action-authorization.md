@@ -1,0 +1,15 @@
+---
+section: Security
+issues: [#0000]
+---
+- **Eight REST mutation endpoints now check the caller's action on the repository, not only that it can see or reach it** (#0000, GHSA-mvmh-g8wm-r3cp). Each of these stopped at a gate that does not authorize an interactive session: a token scope check (which a session always passes), the tenant gate (a no-op on a public repository, and satisfied by any grant on a private one, read-only included), or authentication alone. Any signed-in user could therefore make these changes on a public repository, and so could a read-only member of a private one:
+  - `PUT /api/v1/promotion/repositories/{key}/release-target` (relink or unlink where release promotions land) now needs read access to the staging repository, the `write:repositories` token scope and the repository `admin` action on it, and a release repository the caller cannot read is answered like a missing one. It previously checked nothing beyond a token scope, on private staging repositories too.
+  - `POST /api/v1/promotion/repositories/{key}/artifacts/{id}/reject` now needs the promotion capability (an administrator, or a `promote:artifacts` token) and the promotion tenant gate. A caller who cannot read the staging repository gets 404 for every artifact id, so the endpoint is no longer an existence oracle. It previously checked nothing.
+  - `PUT /api/v1/repositories/{key}/labels` and `POST`/`DELETE .../labels/{label_key}` (labels select repositories into sync policies) now need the repository `write` action and the `write:repositories` token scope.
+  - `GET`/`POST /api/v1/repositories/{key}/email-subscriptions` and `DELETE .../email-subscriptions/{id}` now need the repository `admin` action. Listing exposed recipient addresses, and creating a subscription made the instance send mail to arbitrary addresses.
+  - `POST /api/v1/repositories/{key}/image-builds` and `.../image-builds/render`, when `AK_IMAGE_BUILD_ADMIN_ONLY=false`, now need the repository `write` action and the `write:artifacts` token scope.
+  - `PUT /api/v1/builds/{id}` and `POST /api/v1/builds/{id}/artifacts` are now limited to the build's creator and administrators, and creating or changing a build needs the `write:artifacts` token scope. Migration 285 adds `builds.created_by`. Builds created before the upgrade have no recorded creator and can only be changed by an administrator.
+  - `POST /api/v1/peers/{id}/connections/probe` is now admin-only, like the other mutating peer routes. It previously did not read the caller's identity.
+  - `POST /api/v1/repositories/{key}/security/proxy-scans/rescan` now needs the repository `write` action.
+
+  Refusals answer 403, except where the caller cannot read the repository, which answers 404. Global administrators, `repository-owner` members and fine-grained grants carrying the named action are unaffected. A `developer` member keeps label writes, image builds and rescans, but now needs the repository `admin` action for email subscriptions and the release-target link. `POST /api/v1/repositories/{key}/test-upstream`, the ninth endpoint in the advisory, was already fixed on this line before this change.

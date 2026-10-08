@@ -26,7 +26,9 @@ use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_action, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -313,6 +315,28 @@ fn require_may_build(auth: &AuthExtension, settings: &ImageBuildSettings) -> Res
     Ok(())
 }
 
+/// Everything a caller needs to render or start a build into `repo`.
+///
+/// A build pushes an image into the repository, so beyond the instance-wide
+/// admin-only switch (`require_may_build`) it is a repository write: the
+/// `write:artifacts` token scope, the tenant gate, and the deny-by-default
+/// repository `write` action. The tenant gate alone is a no-op on a public
+/// repository and admits a read-only member of a private one, which with
+/// `AK_IMAGE_BUILD_ADMIN_ONLY=false` let either build and push
+/// (GHSA-mvmh-g8wm-r3cp).
+async fn authorize_build(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &Repository,
+    settings: &ImageBuildSettings,
+) -> Result<()> {
+    auth.require_scope("write:artifacts")?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_repo_write_access(auth, repo, &repo_service).await?;
+    require_may_build(auth, settings)?;
+    require_repo_action(auth, repo.id, "write", &state.permission_service).await
+}
+
 fn require_buildable(repo: &Repository) -> Result<()> {
     require_container_repo(repo)?;
     if repo.repo_type != RepositoryType::Local {
@@ -476,12 +500,7 @@ async fn build_settings(
     require_visible(&repo, &auth, &repo_service).await?;
     let s = ImageBuildSettings::from_env();
     let caller_may_build = match &auth {
-        Some(a) => {
-            s.caller_may_build(a.is_admin)
-                && require_repo_write_access(a, &repo, &repo_service)
-                    .await
-                    .is_ok()
-        }
+        Some(a) => authorize_build(&state, a, &repo, &s).await.is_ok(),
         None => false,
     };
     Ok(Json(settings_response(&repo, &s, caller_may_build)))
@@ -564,6 +583,7 @@ async fn base_image_info(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The Containerfile the server would build", body = RenderImageBuildResponse),
+        (status = 403, description = "Builds are admin-only on this instance, or the caller lacks the repository write action"),
         (status = 400, description = "The spec is invalid or refused by policy")
     )
 )]
@@ -576,10 +596,9 @@ async fn render_build(
     let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_container_repo(&repo)?;
     let settings = ImageBuildSettings::from_env();
-    require_may_build(&auth, &settings)?;
+    authorize_build(&state, &auth, &repo, &settings).await?;
+    require_container_repo(&repo)?;
     Ok(Json(render_response(&req.spec, &settings)?))
 }
 
@@ -621,6 +640,7 @@ async fn list_builds(
     security(("bearer_auth" = [])),
     responses(
         (status = 202, description = "Build queued", body = ImageBuildResponse),
+        (status = 403, description = "Builds are admin-only on this instance, or the caller lacks the repository write action"),
         (status = 400, description = "Invalid spec, image name or tag; or the repository cannot receive builds"),
         (status = 503, description = "Image builds are not configured on this instance")
     )
@@ -634,10 +654,9 @@ async fn create_build(
     let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_buildable(&repo)?;
     let settings = ImageBuildSettings::from_env();
-    require_may_build(&auth, &settings)?;
+    authorize_build(&state, &auth, &repo, &settings).await?;
+    require_buildable(&repo)?;
     let containerfile = prepare_build(&req, &settings)?;
     let store = ImageBuildStore::new(&state.db);
     let record = store
@@ -1101,5 +1120,74 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Authentication(_)), "{err}");
+    }
+
+    /// GHSA-mvmh-g8wm-r3cp #5: with `AK_IMAGE_BUILD_ADMIN_ONLY=false`,
+    /// rendering or starting a build pushes into the repository, so it needs
+    /// the repository `write` action. A signed-in user with no grant on a
+    /// public repository, and a read-only member, used to pass the tenant
+    /// gate alone. Router-level, so the full extractor chain runs.
+    #[tokio::test]
+    async fn builds_need_repository_write_when_not_admin_only_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Process-global, but nextest runs each test in its own process.
+        std::env::set_var("AK_IMAGE_BUILD_ADMIN_ONLY", "false");
+        std::env::remove_var("AK_IMAGE_BUILD_BASE_ALLOWLIST");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        let session = tdh::make_auth(user_id, &username);
+        let call = |path: &str, body: serde_json::Value| {
+            let app = tdh::router_with_auth(
+                repo_router(),
+                tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref()),
+                session.clone(),
+            );
+            let req = tdh::post(
+                format!("/{key}/image-builds{path}"),
+                "application/json",
+                axum::body::Bytes::from(body.to_string()),
+            );
+            async move { tdh::send(app, req).await.0 }
+        };
+        let spec = serde_json::json!({ "base_image": "python:3.12" });
+        let render = || call("/render", serde_json::json!({ "spec": spec }));
+        let create = || {
+            call(
+                "",
+                serde_json::json!({ "image": "team/app", "tag": "1", "spec": spec }),
+            )
+        };
+        let builds = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM image_builds WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count builds")
+        };
+
+        // 1) No grant, then 2) a read-only member: both refused.
+        assert_eq!(render().await, StatusCode::FORBIDDEN, "render, no grant");
+        assert_eq!(create().await, StatusCode::FORBIDDEN, "create, no grant");
+        tdh::grant_repo_role(&pool, repo_id, user_id, "reader").await;
+        assert_eq!(render().await, StatusCode::FORBIDDEN, "render, reader");
+        assert_eq!(create().await, StatusCode::FORBIDDEN, "create, reader");
+        assert_eq!(builds().await, 0, "a refused build must queue nothing");
+
+        // 3) A write member renders.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        assert_eq!(render().await, StatusCode::OK, "render, developer");
+
+        let _ = sqlx::query("DELETE FROM image_builds WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
