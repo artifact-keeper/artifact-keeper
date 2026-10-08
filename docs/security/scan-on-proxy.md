@@ -206,10 +206,10 @@ have no core proxy path to gate.
 | `conan` | `conan` | accepted | |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
-| `conda` | `conda` | accepted | |
+| `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
-| `conda_native` | `conda_native` | accepted | |
+| `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
 | `composer` | `composer` | accepted | |
 | `hex` | `hex` | accepted | |
 | `cocoapods` | `cocoapods` | accepted | |
@@ -256,6 +256,17 @@ have no core proxy path to gate.
     digest instead of being scanned, and a stored `vulnerable` verdict for
     that digest refuses the pull (`403`);
   - and the row records no digest, the re-fetch goes through the gate.
+- **Conda packages the scanner cannot catalog.** The gate pins a conda
+  package's `name@version` (from the file name, checked against its
+  `info/index.json`), and a clean verdict counts only when the engine graded
+  that coordinate. Python packages are graded through the `.dist-info` they
+  install, and many compiled packages through the binaries they ship; a
+  package the engine catalogs nothing for, or catalogs under a different
+  name, is inconclusive: `423` under `fail_closed`, served `pending` (and not
+  recorded) under `fail_open`.
+- **Conda `.sigs` sidecars** follow the stored verdict of their package's
+  cached bytes. Before the package has been pulled through the repository
+  there is nothing to follow and the sidecar is served.
 - **NuGet symbols packages** (`.snupkg`) are scanned without an identity pin:
   they hold `.pdb` files and no package identity the engine grades, so a
   vulnerable verdict blocks them but a missing pin does not withhold them.

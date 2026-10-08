@@ -3271,6 +3271,15 @@ async fn download_package(
 
     check_read_access(&state.db, auth.clone(), &repo).await?;
 
+    // #4365 item 3: on a proxying repository the subdir and file name are
+    // joined into the upstream path and key the proxy cache, so a segment an
+    // upstream could read as something other than a path is a 400 before
+    // anything is fetched.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&subdir, &filename],
+    )?;
+
     // CEP-50 attestation sidecars share the package route's shape
     // (`{subdir}/{file}.sigs[.<sha256>]`) and its read access.
     if let Some(request) = parse_sidecar_request(&filename) {
@@ -3307,7 +3316,33 @@ async fn download_package(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path = format!("{}/{}", subdir, filename);
+                    let serve_key = conda_package_serve_key(&subdir, &filename);
+                    // #4585: with scan-on-proxy on, a package goes through the
+                    // inline scan-and-block gate (buffered, cache-first,
+                    // digest-keyed verdict) INSTEAD of the streaming path
+                    // below, which serves bytes without consulting a verdict.
+                    // A repository that does not scan keeps streaming.
+                    if serve_key.scannable {
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                        {
+                            let target = CondaPackageTarget {
+                                filename: &filename,
+                                cache_key: &serve_key.cache_key,
+                                ctx: &ctx,
+                            };
+                            return serve_scanned_conda_package(
+                                &state,
+                                proxy,
+                                (repo.id, &repo_key),
+                                upstream_url,
+                                &target,
+                                policy,
+                            )
+                            .await;
+                        }
+                    }
+                    let upstream_path = serve_key.cache_key;
                     // #2915 BLOCKER: this is the PACKAGE path, not a metadata
                     // path, and it used to go through the buffered
                     // `proxy_fetch_capped` at the 8 MiB metadata ceiling. Real
@@ -3403,27 +3438,63 @@ async fn download_package(
                 } else {
                     state.proxy_service.as_deref()
                 };
-                let db = state.db.clone();
-                let upstream_path = format!("{}/{}", subdir, filename);
-                let artifact_path_clone = artifact_path.clone();
-                let result = proxy_helpers::resolve_virtual_download(
+                // Only members the caller could read directly may serve
+                // (#2073), and a fully filtered set answers exactly like an
+                // empty one (#3452), as `resolve_virtual_download` does.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let had_members = !members.is_empty();
+                let members = proxy_helpers::authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
-                    proxy_service,
                     repo.id,
-                    &upstream_path,
-                    Some(&ctx),
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let path = artifact_path_clone.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path(
-                                &db, &state, member_id, &location, &path,
-                            )
+                    members,
+                )
+                .await;
+                if had_members && members.is_empty() {
+                    return Err(proxy_helpers::no_accessible_members_response());
+                }
+                let serve_key = conda_package_serve_key(&subdir, &filename);
+                let db = state.db.clone();
+                let artifact_path_clone = artifact_path.clone();
+                let local_fetch = |member_id, location| {
+                    let db = db.clone();
+                    let state = state.clone();
+                    let path = artifact_path_clone.clone();
+                    async move {
+                        proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &path)
                             .await
-                        }
-                    },
+                    }
+                };
+
+                // #4585: a Remote member whose stricter-of-two (virtual,
+                // member) policy scans is served through the gate; `None`
+                // means no member scans and the walk below is unchanged.
+                if let Some(proxy) = proxy_service.filter(|_| serve_key.scannable) {
+                    let target = CondaPackageTarget {
+                        filename: &filename,
+                        cache_key: &serve_key.cache_key,
+                        ctx: &ctx,
+                    };
+                    if let Some(served) = serve_scanned_virtual_conda_package(
+                        &state,
+                        proxy,
+                        repo.id,
+                        &members,
+                        &target,
+                        &local_fetch,
+                    )
+                    .await
+                    {
+                        return served;
+                    }
+                }
+
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    members,
+                    proxy_service,
+                    &serve_key.cache_key,
+                    Some(&ctx),
+                    &local_fetch,
                 )
                 .await?;
 
@@ -3469,6 +3540,302 @@ async fn download_package(
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// #4585: scan-on-proxy for conda packages.
+//
+// The serve sequence is the generic `proxy_helpers::serve_scanned_proxy_file`
+// (#4098); this keeps only the conda glue: the cache key and "is it a
+// package" decision, the identity the bytes are served as, the response
+// shape, and the Virtual member walk. Channel indexes (repodata in every
+// encoding, channeldata, shards) are never gated: they list packages, and the
+// solver downloads the packages through this route, where the gate runs.
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied file on the
+/// package route (#4365 item 1), cached under `{subdir}/{filename}`, the key
+/// the streaming path has always used. `.conda` and `.tar.bz2` are packages;
+/// anything else the route proxies (`repodata_from_packages.json`, ...)
+/// streams as before.
+fn conda_package_serve_key(
+    subdir: &str,
+    filename: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(&format!("{subdir}/{filename}"), |file| {
+        is_conda_package(file)
+    })
+}
+
+/// One package request as the gate sees it.
+struct CondaPackageTarget<'a> {
+    /// The requested package file name; names the scan target and the 403/423
+    /// bodies.
+    filename: &'a str,
+    /// [`conda_package_serve_key`]'s key: the upstream path, the proxy-cache
+    /// key and the key the download is recorded under.
+    cache_key: &'a str,
+    ctx: &'a crate::api::middleware::download_telemetry::DownloadContext,
+}
+
+/// Inline scan-and-block for one conda package from one Remote repository (a
+/// Virtual's member on the walk), on the generic gate
+/// ([`proxy_helpers::serve_scanned_proxy_file`]). Verdicts and downloads count
+/// to `repo`.
+async fn serve_scanned_conda_package(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key): (uuid::Uuid, &str),
+    upstream_url: &str,
+    target: &CondaPackageTarget<'_>,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+) -> Result<Response, Response> {
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Conda,
+        source_path: target.cache_key,
+        cache_path: target.cache_key,
+        filename: target.filename,
+        action,
+        severity_gate,
+        ctx: Some(target.ctx),
+    };
+    let file = CondaScannedPackage {
+        proxy,
+        upstream_url,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The conda half of the generic proxy scan gate.
+struct CondaScannedPackage<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    upstream_url: &'a str,
+}
+
+#[async_trait::async_trait]
+impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
+    const LABEL: &'static str = "conda package";
+
+    fn synthetic_content_type(filename: &str) -> String {
+        conda_package_content_type(filename).to_string()
+    }
+
+    fn synthetic_version(filename: &str) -> Option<String> {
+        CondaNativeHandler::parse_package_filename(filename)
+            .ok()
+            .map(|(_, version, _)| version)
+    }
+
+    /// The `name@version` the file name requests, pinned only when the
+    /// package's own `info/index.json` agrees (#3003, #4039). The engine must
+    /// then actually grade that coordinate before a clean verdict counts; a
+    /// noarch Python package is graded through the `.dist-info` it installs.
+    /// A file name that does not parse, or bytes whose index disagrees or
+    /// cannot be read, are not what they are served as: inconclusive (423
+    /// under fail-closed, served `pending` and not scanned under fail-open).
+    fn identity(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        bytes: &Bytes,
+        digest: &str,
+    ) -> proxy_helpers::ProxyScanIdentity {
+        use crate::services::scanner_service::{hosted_upload_pin, pin_agrees_with_content};
+        let requested = CondaNativeHandler::parse_package_filename(req.filename).ok();
+        let pin = requested.as_ref().and_then(|(name, version, _)| {
+            hosted_upload_pin("conda", req.filename, name, Some(version))
+        });
+        match pin {
+            Some(pin) if pin_agrees_with_content(bytes, &pin, req.filename) => {
+                proxy_helpers::ProxyScanIdentity::Established(pin)
+            }
+            pin => {
+                tracing::warn!(
+                    repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+                    pinnable = pin.is_some(),
+                    "conda proxy package does not declare the identity it is served as"
+                );
+                proxy_helpers::ProxyScanIdentity::Unestablished
+            }
+        }
+    }
+
+    async fn serve_unscanned_stream(
+        &self,
+        _state: &SharedState,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+    ) -> Result<Response, Response> {
+        // UNRECORDED-PROXY-SERVE: counted by the caller,
+        // `proxy_helpers::serve_scanned_proxy_file`, which records this
+        // over-cap serve once it resolves.
+        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+            self.proxy,
+            req.repo_id,
+            req.repo_key,
+            self.upstream_url,
+            req.source_path,
+            conda_package_content_type(req.filename),
+            Some(req.filename),
+            crate::models::repository::RepositoryFormat::Conda,
+        )
+        .await
+    }
+
+    fn scanned_response(
+        &self,
+        req: &proxy_helpers::ScannedProxyRequest<'_>,
+        body: proxy_helpers::ScannedProxyBody,
+        pending: bool,
+    ) -> Response {
+        conda_scanned_package_response(req.filename, body, pending)
+    }
+}
+
+/// The 200 for package bytes the gate let through: the same type and
+/// disposition the streaming arm serves, the digest the gate computed, and
+/// the upstream coding of the buffered bytes (forwarded verbatim, so it must
+/// be declared, #3149). A fail-open serve before its verdict is not vouched
+/// for, so no shared cache may keep it.
+fn conda_scanned_package_response(
+    filename: &str,
+    body: proxy_helpers::ScannedProxyBody,
+    pending: bool,
+) -> Response {
+    let content_type = body
+        .content_type
+        .unwrap_or_else(|| conda_package_content_type(filename).to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, body.bytes.len().to_string())
+        .header("X-Checksum-SHA256", &body.digest);
+    if pending {
+        builder = builder.header(CACHE_CONTROL, "no-store");
+    }
+    if let Some(ref encoding) = body.content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
+    }
+    builder.body(Body::from(body.bytes)).unwrap()
+}
+
+/// The Virtual package walk with scan-on-proxy (#4585).
+///
+/// `None` when no member scans under the stricter-of-two (virtual, member)
+/// policy: the caller takes the unchanged resolver. Otherwise members are
+/// walked in priority order. Runs of members that do not scan (hosted
+/// members, unscanned remotes) go through the shared resolver as before; each
+/// scanning Remote member is served through the gate under its own id. A
+/// 403 (vulnerable), 409 (quarantine or age hold) or 423 (inconclusive,
+/// fail-closed) is that member's verdict on bytes it holds and ends the walk;
+/// any other failure falls through to the next member.
+async fn serve_scanned_virtual_conda_package<F, Fut>(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    virtual_id: uuid::Uuid,
+    members: &[crate::models::repository::Repository],
+    target: &CondaPackageTarget<'_>,
+    local_fetch: &F,
+) -> Option<Result<Response, Response>>
+where
+    F: Fn(uuid::Uuid, crate::storage::StorageLocation) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>,
+    >,
+{
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
+        };
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut unscanned = Vec::new();
+    for (member, policy) in members.iter().zip(policies) {
+        let (Some(policy), Some(upstream_url)) = (policy, member.upstream_url.as_deref()) else {
+            unscanned.push(member.clone());
+            continue;
+        };
+        let run = std::mem::take(&mut unscanned);
+        if let Some(served) = resolve_unscanned_conda_run(proxy, run, target, local_fetch).await {
+            return Some(served);
+        }
+        match serve_scanned_conda_package(
+            state,
+            proxy,
+            (member.id, &member.key),
+            upstream_url,
+            target,
+            policy,
+        )
+        .await
+        {
+            Ok(resp) => return Some(Ok(resp)),
+            Err(resp)
+                if proxy_helpers::is_member_policy_block_response(&resp)
+                    || resp.status() == StatusCode::LOCKED =>
+            {
+                return Some(Err(resp))
+            }
+            Err(resp) => {
+                tracing::debug!(
+                    member_key = %member.key, status = %resp.status(),
+                    "scanned conda virtual member did not serve; trying next member"
+                );
+            }
+        }
+    }
+    Some(
+        resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch)
+            .await
+            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
+    )
+}
+
+/// A run of non-scanning members inside the scanned walk, through the shared
+/// priority-preserving resolver: `None` is a miss (an empty run, or no member
+/// had it) and the walk moves on; a hit or a member's own policy block is
+/// final.
+async fn resolve_unscanned_conda_run<F, Fut>(
+    proxy: &crate::services::proxy_service::ProxyService,
+    run: Vec<crate::models::repository::Repository>,
+    target: &CondaPackageTarget<'_>,
+    local_fetch: &F,
+) -> Option<Result<Response, Response>>
+where
+    F: Fn(uuid::Uuid, crate::storage::StorageLocation) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>,
+    >,
+{
+    if run.is_empty() {
+        return None;
+    }
+    match proxy_helpers::resolve_virtual_download_from_members(
+        run,
+        Some(proxy),
+        target.cache_key,
+        Some(target.ctx),
+        local_fetch,
+    )
+    .await
+    {
+        Ok(result) => Some(proxy_helpers::stream_fetch_result(
+            result,
+            conda_package_content_type(target.filename),
+            Some(target.filename),
+        )),
+        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
+        Err(_) => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5206,6 +5573,55 @@ async fn proxy_sidecar(
         .unwrap())
 }
 
+/// The 403 a proxied `.sigs` sidecar answers when its package is refused
+/// (#4585), or `None` to serve it.
+///
+/// The sidecar carries signatures, not code, but serving the attestations of
+/// a package the channel refuses would tell a client the package is fine to
+/// fetch elsewhere. So it follows the package: when `repo_key` scans on proxy
+/// (`policy` is `Some`), the package's bytes sit in its proxy cache, and the
+/// stored verdict for their digest blocks under the repository's severity
+/// gate ([`proxy_helpers::stored_vulnerable_verdict_blocks`], which never
+/// refuses under record-only), the sidecar is refused with the package's
+/// `scan_blocked` body. With no cached package or no verdict yet there is
+/// nothing to follow, and the sidecar is served; the package download itself
+/// is gated.
+async fn sidecar_blocked_by_package_verdict(
+    state: &SharedState,
+    repo_key: &str,
+    policy: Option<proxy_helpers::MemberScanPolicy>,
+    subdir: &str,
+    filename: &str,
+    request: &SidecarRequest<'_>,
+) -> Option<Response> {
+    let (_, severity_gate) = policy?;
+    let proxy = state.proxy_service.as_deref()?;
+    let package = conda_package_serve_key(subdir, request.package());
+    if !package.scannable {
+        return None;
+    }
+    let cached = proxy
+        .get_cache_metadata(repo_key, &package.cache_key)
+        .await
+        .ok()
+        .flatten()?;
+    if !proxy_helpers::stored_vulnerable_verdict_blocks(
+        &state.db,
+        &cached.checksum_sha256,
+        severity_gate,
+    )
+    .await
+    {
+        return None;
+    }
+    tracing::warn!(
+        repo_key = %repo_key, file = %filename, package = %request.package(),
+        digest = %cached.checksum_sha256,
+        "refusing a conda attestation sidecar: its package has a blocking scan verdict"
+    );
+    Some(proxy_helpers::scan_blocked_response(filename))
+}
+
 /// `GET /conda/{repo}/{subdir}/{file}.sigs[.<sha256>]` (CEP-50).
 ///
 /// Readable by exactly who can read the package (the caller already passed
@@ -5226,6 +5642,14 @@ async fn serve_sidecar(
     let not_found = || (StatusCode::NOT_FOUND, "Attestation sidecar not found").into_response();
 
     if repo.repo_type == RepositoryType::Remote {
+        // #4585: the sidecar follows its package's verdict.
+        let policy = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
+        if let Some(blocked) =
+            sidecar_blocked_by_package_verdict(state, &repo.key, policy, subdir, filename, &request)
+                .await
+        {
+            return Err(blocked);
+        }
         return proxy_sidecar(
             state,
             repo.id,
@@ -5243,10 +5667,27 @@ async fn serve_sidecar(
         let remote_admitted = virtual_allowlist(&state.db, repo.id)
             .await?
             .is_none_or(|a| a.admits_filename(subdir, request.package()));
-        for member in &members {
+        // #4585: each Remote member's sidecar follows that member's verdict
+        // on the package, under the stricter-of-two policy the package walk
+        // uses; a refusal ends the walk, as it does for the package.
+        let policies =
+            proxy_helpers::virtual_member_scan_policies(&state.db, repo.id, &members).await?;
+        for (member, policy) in members.iter().zip(policies) {
             if member.repo_type == RepositoryType::Remote {
                 if !remote_admitted {
                     continue;
+                }
+                if let Some(blocked) = sidecar_blocked_by_package_verdict(
+                    state,
+                    &member.key,
+                    policy,
+                    subdir,
+                    filename,
+                    &request,
+                )
+                .await
+                {
+                    return Err(blocked);
                 }
                 if let Ok(response) = proxy_sidecar(
                     state,
@@ -16907,5 +17348,629 @@ mod rattler_token_layout_tests {
         assert_eq!(&dl_body[..], &content[..]);
         assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
         assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_tests {
+    //! #4585: the scan-on-proxy gate on conda Remote and Virtual package
+    //! downloads, through the router, mirroring the PyPI/Cargo gate tests.
+    use super::virtual_channel_tests::{upstream_repodata, VirtualRig};
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The `info/index.json` + nonce tar every fixture package carries; the
+    /// nonce makes each fixture's digest its own, since verdicts are global.
+    fn info_tar(name: &str, version: &str) -> Vec<u8> {
+        let index = serde_json::to_vec(&serde_json::json!({
+            "name": name, "version": version, "build": "0", "build_number": 0,
+            "depends": [], "subdir": "noarch",
+        }))
+        .unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, data) in [
+                ("info/index.json", index.as_slice()),
+                ("info/nonce", nonce.as_bytes()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        tar_buf
+    }
+
+    /// A `.conda` (v2) package declaring `name` / `version`.
+    fn conda_v2(name: &str, version: &str) -> Vec<u8> {
+        let info = zstd::encode_all(std::io::Cursor::new(info_tar(name, version)), 3).unwrap();
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("metadata.json", options).unwrap();
+            writer
+                .write_all(br#"{"conda_pkg_format_version":2}"#)
+                .unwrap();
+            writer
+                .start_file(format!("info-{name}-{version}-0.tar.zst"), options)
+                .unwrap();
+            writer.write_all(&info).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    /// A `.tar.bz2` (v1) package declaring `name` / `version`.
+    fn conda_v1(name: &str, version: &str) -> Vec<u8> {
+        bzip2_compress(&info_tar(name, version))
+    }
+
+    fn digest_of(bytes: &[u8]) -> String {
+        proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes))
+    }
+
+    /// Serve `body` at `/noarch/{file}` on the mock upstream.
+    async fn mount_package(server: &MockServer, file: &str, body: &[u8]) {
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    /// Scan-on-proxy on `repo_id` with `action`; `threshold` opts into
+    /// `block_on_policy_violation` at that severity, `None` blocks on any
+    /// finding.
+    async fn configure_scan(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        action: &str,
+        threshold: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold, \
+                 proxy_scan_action) \
+             VALUES ($1, true, false, true, $2, $3, $4) \
+             ON CONFLICT (repository_id) DO UPDATE SET scan_on_proxy = true, \
+                 block_on_policy_violation = EXCLUDED.block_on_policy_violation, \
+                 severity_threshold = EXCLUDED.severity_threshold, \
+                 proxy_scan_action = EXCLUDED.proxy_scan_action",
+        )
+        .bind(repo_id)
+        .bind(threshold.is_some())
+        .bind(threshold.unwrap_or("high"))
+        .bind(action)
+        .execute(pool)
+        .await
+        .expect("configure scan-on-proxy");
+    }
+
+    /// Seed a stored verdict for `digest` (`None` severity = clean).
+    async fn seed_verdict(pool: &sqlx::PgPool, digest: &str, severity: Option<&str>) {
+        let vulnerable = severity.is_some();
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                digest,
+                "grype",
+                if vulnerable { "vulnerable" } else { "clean" },
+                i32::from(vulnerable),
+                i32::from(severity == Some("critical")),
+                i32::from(severity == Some("high")),
+                i32::from(severity == Some("medium")),
+                0,
+                severity,
+                Some("grype-4585-test"),
+                None,
+            )
+            .await
+            .expect("seed verdict");
+    }
+
+    /// A public Remote conda repository pointed at `upstream`, and a state
+    /// with a proxy (and the given leaf scanners, if any).
+    struct RemoteRig {
+        fx: tdh::Fixture,
+        state: SharedState,
+        _cache: tempfile::TempDir,
+    }
+
+    impl RemoteRig {
+        async fn new(
+            upstream: &str,
+            scanners: Option<Vec<Arc<dyn crate::services::scanner_service::Scanner>>>,
+        ) -> Option<Self> {
+            let fx = tdh::Fixture::setup("remote", "conda").await?;
+            tdh::publish_repo(&fx.pool, fx.repo_id).await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(upstream)
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await
+                .expect("point remote at mock upstream");
+            let cache = tempfile::tempdir().expect("proxy cache tempdir");
+            let root = cache.path().to_str().expect("utf8 tempdir").to_string();
+            let state = match scanners {
+                Some(scanners) => tdh::build_scan_state_with_leaf_scanners(&fx, &root, scanners),
+                None => {
+                    let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &root);
+                    tdh::build_state_with_proxy(fx.pool.clone(), &root, proxy)
+                }
+            };
+            Some(Self {
+                fx,
+                state,
+                _cache: cache,
+            })
+        }
+
+        async fn get(&self, rel: &str) -> (StatusCode, Bytes, HeaderMap) {
+            let app = tdh::router_anon(router(), self.state.clone());
+            tdh::send_with_headers(app, tdh::get(format!("/{}/{rel}", self.fx.repo_key))).await
+        }
+
+        async fn teardown(self, digests: &[String]) {
+            tdh::drop_proxy_verdicts(&self.fx.pool, digests).await;
+            let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await;
+            self.fx.teardown().await;
+        }
+    }
+
+    fn assert_scan_blocked(status: StatusCode, body: &[u8], headers: &HeaderMap, file: &str) {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        let json: serde_json::Value = serde_json::from_slice(body).expect("JSON body");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "scan_blocked",
+                "file": file,
+                "reason": "blocked by inline vulnerability scan policy",
+            })
+        );
+    }
+
+    /// A stored vulnerable verdict at or above the threshold refuses the
+    /// package with the shared `scan_blocked` body under both blocking
+    /// actions, `.conda` and `.tar.bz2` alike.
+    #[tokio::test]
+    async fn remote_vulnerable_verdict_blocks_under_fail_open_and_fail_closed() {
+        for (action, file, body) in [
+            ("fail_open", "certifi-2022.12.7-pyhd8ed1ab_0.conda", true),
+            (
+                "fail_closed",
+                "certifi-2022.12.7-pyhd8ed1ab_0.tar.bz2",
+                false,
+            ),
+        ] {
+            let bytes = if body {
+                conda_v2("certifi", "2022.12.7")
+            } else {
+                conda_v1("certifi", "2022.12.7")
+            };
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, action, Some("high")).await;
+            let digest = digest_of(&bytes);
+            seed_verdict(&rig.fx.pool, &digest, Some("high")).await;
+
+            let (status, served, headers) = rig.get(&format!("noarch/{file}")).await;
+            rig.teardown(&[digest]).await;
+            assert_scan_blocked(status, &served, &headers, file);
+        }
+    }
+
+    /// `record_only` serves the vulnerable package, marked `recorded`.
+    #[tokio::test]
+    async fn remote_record_only_serves_a_vulnerable_package() {
+        let file = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let bytes = conda_v2("certifi", "2022.12.7");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "record_only", Some("high")).await;
+        let digest = digest_of(&bytes);
+        seed_verdict(&rig.fx.pool, &digest, Some("critical")).await;
+
+        let (status, served, headers) = rig.get(&format!("noarch/{file}")).await;
+        rig.teardown(&[digest]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["X-AK-Scan"], "recorded");
+        assert_eq!(&served[..], &bytes[..]);
+    }
+
+    /// A verdict below the opted-in threshold serves, and a clean verdict
+    /// serves `clean` with the digest the gate computed.
+    #[tokio::test]
+    async fn remote_below_threshold_and_clean_verdicts_serve() {
+        for (severity, file) in [
+            (Some("medium"), "rich-13.0.0-pyhd8ed1ab_0.conda"),
+            (None, "tzdata-2025b-h78e105d_0.conda"),
+        ] {
+            let (name, version, _) = CondaNativeHandler::parse_package_filename(file).unwrap();
+            let bytes = conda_v2(&name, &version);
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", Some("high")).await;
+            let digest = digest_of(&bytes);
+            seed_verdict(&rig.fx.pool, &digest, severity).await;
+
+            let (status, served, headers) = rig.get(&format!("noarch/{file}")).await;
+            rig.teardown(std::slice::from_ref(&digest)).await;
+            assert_eq!(status, StatusCode::OK, "{file}");
+            assert_eq!(headers["X-AK-Scan"], "clean", "{file}");
+            assert_eq!(headers["X-Checksum-SHA256"], digest.as_str());
+            assert_eq!(&served[..], &bytes[..]);
+        }
+    }
+
+    /// No verdict yet: fail-open serves loudly `pending` (not cacheable),
+    /// fail-closed with no conclusive scan is `423` and serves no byte.
+    #[tokio::test]
+    async fn remote_unscanned_package_pending_under_fail_open_locked_under_fail_closed() {
+        let file = "idna-3.6-pyhd8ed1ab_0.tar.bz2";
+        let bytes = conda_v1("idna", "3.6");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        let digest = digest_of(&bytes);
+
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", None).await;
+        let (open_status, open_body, open_headers) = rig.get(&format!("noarch/{file}")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+        let (closed_status, closed_body, _) = rig.get(&format!("noarch/{file}")).await;
+        rig.teardown(&[digest]).await;
+
+        assert_eq!(open_status, StatusCode::OK);
+        assert_eq!(open_headers["X-AK-Scan"], "pending");
+        assert_eq!(open_headers[CACHE_CONTROL], "no-store");
+        assert_eq!(&open_body[..], &bytes[..]);
+        assert_eq!(closed_status, StatusCode::LOCKED);
+        let json: serde_json::Value = serde_json::from_slice(&closed_body).unwrap();
+        assert_eq!(json["error"], "scan_pending");
+    }
+
+    /// Fail-closed scans inline before serving: a vulnerable result is `403`
+    /// and recorded, so the next pull is refused from the stored verdict
+    /// without scanning again; a clean result serves `clean`.
+    #[tokio::test]
+    async fn remote_fail_closed_scans_inline() {
+        for (rescan, vulnerable) in [
+            (MockCveRescan::Vulnerable, true),
+            (MockCveRescan::Clean, false),
+        ] {
+            let file = "urllib3-1.25.9-py_0.conda";
+            let bytes = conda_v2("urllib3", "1.25.9");
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let (scanner, scans) = VersionedCveScanner::counting(Some("grype-4585-test"), rescan);
+            let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await
+            else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+            let digest = digest_of(&bytes);
+
+            let (status, served, headers) = rig.get(&format!("noarch/{file}")).await;
+            let (again, _, _) = rig.get(&format!("noarch/{file}")).await;
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT verdict FROM proxy_scan_results WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .fetch_optional(&rig.fx.pool)
+            .await
+            .unwrap();
+            rig.teardown(&[digest]).await;
+
+            if vulnerable {
+                assert_scan_blocked(status, &served, &headers, file);
+                assert_eq!(again, StatusCode::FORBIDDEN);
+                assert_eq!(stored.as_deref(), Some("vulnerable"));
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(headers["X-AK-Scan"], "clean");
+                assert_eq!(again, StatusCode::OK);
+                assert_eq!(stored.as_deref(), Some("clean"));
+            }
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the second pull reuses the stored verdict"
+            );
+        }
+    }
+
+    /// Bytes whose `info/index.json` names a different package than the
+    /// request are not what they are served as: inconclusive, so fail-closed
+    /// withholds them without scanning.
+    #[tokio::test]
+    async fn remote_identity_mismatch_is_withheld_under_fail_closed() {
+        let file = "requests-2.31.0-pyhd8ed1ab_0.conda";
+        let bytes = conda_v2("evil", "6.6.6");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let (scanner, scans) =
+            VersionedCveScanner::counting(Some("grype-4585-test"), MockCveRescan::Clean);
+        let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+        let (status, _, _) = rig.get(&format!("noarch/{file}")).await;
+        rig.teardown(&[digest_of(&bytes)]).await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Repodata is not gated: a fail-closed scanning remote still serves its
+    /// index, and a repository that does not scan still streams packages.
+    #[tokio::test]
+    async fn remote_repodata_is_not_gated_and_unscanned_repos_stream() {
+        let file = "colorama-0.4.6-pyhd8ed1ab_0.conda";
+        let bytes = conda_v2("colorama", "0.4.6");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_repodata("noarch", &[file])),
+            )
+            .mount(&server)
+            .await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        let (plain_status, _, plain_headers) = rig.get(&format!("noarch/{file}")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+        let (index_status, index, _) = rig.get("noarch/repodata.json").await;
+        rig.teardown(&[digest_of(&bytes)]).await;
+
+        assert_eq!(plain_status, StatusCode::OK);
+        assert!(plain_headers.get("X-AK-Scan").is_none());
+        assert_eq!(index_status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&index).unwrap();
+        assert!(doc["packages.conda"].get(file).is_some(), "{doc}");
+    }
+
+    /// A `.sigs` sidecar follows its package: once the package's cached bytes
+    /// carry a blocking verdict the sidecar is refused with the same body, a
+    /// clean package's sidecar is served, and record-only refuses nothing.
+    #[tokio::test]
+    async fn remote_sigs_sidecar_follows_the_package_verdict() {
+        let vuln = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let clean = "certifi-2024.8.30-pyhd8ed1ab_0.conda";
+        let vuln_bytes = conda_v2("certifi", "2022.12.7");
+        let clean_bytes = conda_v2("certifi", "2024.8.30");
+        let server = MockServer::start().await;
+        mount_package(&server, vuln, &vuln_bytes).await;
+        mount_package(&server, clean, &clean_bytes).await;
+        for file in [vuln, clean] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/noarch/{file}.sigs")))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .mount(&server)
+                .await;
+        }
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", Some("high")).await;
+        let (vuln_digest, clean_digest) = (digest_of(&vuln_bytes), digest_of(&clean_bytes));
+        seed_verdict(&rig.fx.pool, &vuln_digest, Some("high")).await;
+        seed_verdict(&rig.fx.pool, &clean_digest, None).await;
+
+        // Before the package is cached there is nothing to follow.
+        let (early, _, _) = rig.get(&format!("noarch/{vuln}.sigs")).await;
+        let (pkg, _, _) = rig.get(&format!("noarch/{vuln}")).await;
+        let (sigs, sigs_body, sigs_headers) = rig.get(&format!("noarch/{vuln}.sigs")).await;
+        let (_, _, _) = rig.get(&format!("noarch/{clean}")).await;
+        let (clean_sigs, clean_sigs_body, _) = rig.get(&format!("noarch/{clean}.sigs")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "record_only", Some("high")).await;
+        let (recorded_sigs, _, _) = rig.get(&format!("noarch/{vuln}.sigs")).await;
+        rig.teardown(&[vuln_digest, clean_digest]).await;
+
+        assert_eq!(early, StatusCode::OK);
+        assert_eq!(pkg, StatusCode::FORBIDDEN);
+        assert_scan_blocked(sigs, &sigs_body, &sigs_headers, &format!("{vuln}.sigs"));
+        assert_eq!(clean_sigs, StatusCode::OK);
+        assert_eq!(&clean_sigs_body[..], b"[]");
+        assert_eq!(recorded_sigs, StatusCode::OK);
+    }
+
+    /// The `/t/<token>/` forms (conda's `.condarc` layout and rattler's) run
+    /// the same gate as the plain route.
+    #[tokio::test]
+    async fn token_url_forms_are_gated() {
+        let file = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let bytes = conda_v2("certifi", "2022.12.7");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
+        let digest = digest_of(&bytes);
+        seed_verdict(&rig.fx.pool, &digest, Some("critical")).await;
+        let auth_service =
+            AuthService::new(rig.fx.pool.clone(), Arc::new(rig.state.config.clone()));
+        let (token, _id) = auth_service
+            .generate_api_token(
+                rig.fx.user_id,
+                "scan-4585",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        let app = crate::api::routes::create_router(rig.state.clone());
+        let key = rig.fx.repo_key.clone();
+        let mut results = Vec::new();
+        for uri in [
+            format!("/conda/t/{token}/{key}/noarch/{file}"),
+            format!("/t/{token}/conda/{key}/noarch/{file}"),
+        ] {
+            results.push((uri.clone(), tdh::send(app.clone(), tdh::get(uri)).await));
+        }
+        rig.teardown(&[digest]).await;
+        for (uri, (status, body)) in results {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{}: {}",
+                uri.replace(&token, "<token>"),
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "scan_blocked");
+        }
+    }
+
+    /// The Virtual walk: the member's policy alone blocks a vulnerable
+    /// package, the virtual's fail-closed alone gates an unconfigured member
+    /// (stricter of two), a virtual record-only does not weaken a member's
+    /// block, the virtual's own sidecar follows, and a member with no
+    /// scanning anywhere still streams.
+    #[tokio::test]
+    async fn virtual_member_resolution_applies_the_stricter_policy() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let vuln = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let fresh = "idna-3.6-pyhd8ed1ab_0.conda";
+        let vuln_bytes = conda_v2("certifi", "2022.12.7");
+        let fresh_bytes = conda_v2("idna", "3.6");
+        let server = MockServer::start().await;
+        mount_package(&server, vuln, &vuln_bytes).await;
+        mount_package(&server, fresh, &fresh_bytes).await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{vuln}.sigs")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let v = rig.virtual_key.clone();
+        let vuln_digest = digest_of(&vuln_bytes);
+        seed_verdict(&rig.pool, &vuln_digest, Some("high")).await;
+
+        // No scanning anywhere: the walk streams as before.
+        let (unscanned, _, unscanned_headers) = rig.get(format!("/{v}/noarch/{fresh}")).await;
+
+        // Member fail-open with a threshold, virtual unconfigured.
+        configure_scan(&rig.pool, rig.remote_id, "fail_open", Some("high")).await;
+        let (member_block, member_body, member_headers) =
+            rig.get(format!("/{v}/noarch/{vuln}")).await;
+        let (sigs, sigs_body, sigs_headers) = rig.get(format!("/{v}/noarch/{vuln}.sigs")).await;
+
+        // Virtual record-only does not loosen the member's block.
+        configure_scan(&rig.pool, rig.virtual_id, "record_only", None).await;
+        let (record_only_virtual, _, _) = rig.get(format!("/{v}/noarch/{vuln}")).await;
+
+        // Member unconfigured, virtual fail-closed: the member is gated, and
+        // with no scanner the unscanned package is withheld.
+        sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(rig.remote_id)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        configure_scan(&rig.pool, rig.virtual_id, "fail_closed", None).await;
+        let (virtual_closed, _, _) = rig.get(format!("/{v}/noarch/{fresh}")).await;
+
+        tdh::drop_proxy_verdicts(&rig.pool, &[vuln_digest]).await;
+        for id in [rig.remote_id, rig.virtual_id] {
+            let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+                .bind(id)
+                .execute(&rig.pool)
+                .await;
+        }
+        rig.cleanup().await;
+
+        assert_eq!(unscanned, StatusCode::OK);
+        assert!(unscanned_headers.get("X-AK-Scan").is_none());
+        assert_scan_blocked(member_block, &member_body, &member_headers, vuln);
+        assert_scan_blocked(sigs, &sigs_body, &sigs_headers, &format!("{vuln}.sigs"));
+        assert_eq!(record_only_virtual, StatusCode::FORBIDDEN);
+        assert_eq!(virtual_closed, StatusCode::LOCKED);
+    }
+
+    /// A hosted member that owns the requested file still serves it ahead of
+    /// a scanning Remote member, and a scanning member's clean verdict serves
+    /// through the virtual.
+    #[tokio::test]
+    async fn virtual_hosted_member_and_clean_remote_serve() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let clean = "tzdata-2025b-h78e105d_0.conda";
+        let clean_bytes = conda_v2("tzdata", "2025b");
+        let server = MockServer::start().await;
+        mount_package(&server, clean, &clean_bytes).await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let v = rig.virtual_key.clone();
+        let digest = digest_of(&clean_bytes);
+        seed_verdict(&rig.pool, &digest, None).await;
+        configure_scan(&rig.pool, rig.remote_id, "fail_open", None).await;
+
+        let (status, served, headers) = rig.get(format!("/{v}/noarch/{clean}")).await;
+
+        tdh::drop_proxy_verdicts(&rig.pool, &[digest]).await;
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(rig.remote_id)
+            .execute(&rig.pool)
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["X-AK-Scan"], "clean");
+        assert_eq!(&served[..], &clean_bytes[..]);
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    //! #4365 item 1 / #4585: the conda package route's (cache_key, scannable)
+    //! decisions.
+    use super::*;
+
+    #[test]
+    fn package_serve_key_table() {
+        for (subdir, file, scannable) in [
+            ("noarch", "certifi-2022.12.7-pyhd8ed1ab_0.conda", true),
+            ("linux-64", "numpy-1.26.4-py312h_0.tar.bz2", true),
+            ("noarch", "repodata_from_packages.json", false),
+        ] {
+            let key = conda_package_serve_key(subdir, file);
+            assert_eq!(key.cache_key, format!("{subdir}/{file}"));
+            assert_eq!(key.scannable, scannable, "{file}");
+        }
     }
 }

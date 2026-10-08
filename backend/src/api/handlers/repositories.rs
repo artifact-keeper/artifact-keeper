@@ -10056,7 +10056,7 @@ fn generic_route_proxy_serve(scan_on_proxy: &Result<bool>) -> GenericRouteProxyS
 /// formats `GET /api/v1/formats` reports as `scan_on_proxy: "enforced"`, so a
 /// format that adopts the gate closes this route in the same change.
 fn generic_route_checks_scan_on_proxy(format: &RepositoryFormat) -> bool {
-    crate::formats::handler_enforces_scan_on_proxy(format.handler_key())
+    crate::formats::format_enforces_scan_on_proxy(format)
 }
 
 /// The #4442 refusal for `path`, logged so an operator can see clients using
@@ -25704,21 +25704,29 @@ mod tests {
             );
         }
         for format in [
-            Npm, Yarn, Pnpm, Bower, Pypi, Poetry, Jupyter, Maven, Gradle, Sbt, Cargo, Nuget,
-            Chocolatey, Powershell, Vscode, Docker, HelmOci,
+            Npm,
+            Yarn,
+            Pnpm,
+            Bower,
+            Pypi,
+            Poetry,
+            Jupyter,
+            Maven,
+            Gradle,
+            Sbt,
+            Cargo,
+            Nuget,
+            Chocolatey,
+            Powershell,
+            Vscode,
+            Docker,
+            HelmOci,
+            Conda,
+            CondaNative,
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
-        for format in [
-            Generic,
-            Github,
-            Helm,
-            Go,
-            Rubygems,
-            Conda,
-            CondaNative,
-            Debian,
-        ] {
+        for format in [Generic, Github, Helm, Go, Rubygems, Debian] {
             assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
     }
