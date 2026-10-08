@@ -302,6 +302,11 @@ pub mod metadata_epoch;
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
 
+/// #4559: router-level tests for tokens scoped to a virtual repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_token_scope_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;
