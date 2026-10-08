@@ -5492,8 +5492,12 @@ mod tests {
             Outsider,
             Insider,
             // The fixture user through a repository-scoped token that covers
-            // the virtual and the public member only.
+            // the public member only. The virtual is public, so the token
+            // reaches it without naming it, and gets no #4559 parent term.
             Scoped,
+            // The same user through a token scoped to the virtual only: the
+            // #4559 parent term reaches every member the user may read.
+            VirtualScoped,
         }
         let public_id = members[0];
         let fetch = |caller: Caller, file: &'static str| {
@@ -5508,9 +5512,13 @@ mod tests {
                 Caller::Scoped => {
                     let mut auth = tdh::make_auth(f.user_id, &f.username);
                     auth.allowed_repo_ids =
-                        crate::models::access_scope::AccessScope::Restricted(vec![
-                            f.repo_id, public_id,
-                        ]);
+                        crate::models::access_scope::AccessScope::Restricted(vec![public_id]);
+                    tdh::router_with_auth(super::router(), f.state.clone(), auth)
+                }
+                Caller::VirtualScoped => {
+                    let mut auth = tdh::make_auth(f.user_id, &f.username);
+                    auth.allowed_repo_ids =
+                        crate::models::access_scope::AccessScope::Restricted(vec![f.repo_id]);
                     tdh::router_with_auth(super::router(), f.state.clone(), auth)
                 }
             };
@@ -5559,6 +5567,7 @@ mod tests {
         let pubkey_served = fetch(Caller::Anonymous, "repomd.xml.key").await;
         // A repository-scoped token narrows the set below the user's grants.
         let scoped = docs(Caller::Scoped).await;
+        let virtual_scoped = docs(Caller::VirtualScoped).await;
         // Revoking the private grant: the caller no longer gets the old set's
         // cached render.
         sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
@@ -5654,6 +5663,11 @@ mod tests {
             names(&scoped),
             [true, false, false],
             "a repository-scoped token must narrow the member set to its ceiling"
+        );
+        assert_eq!(
+            names(&virtual_scoped),
+            [true, true, true],
+            "#4559: a token scoped to the virtual reads every member its owner may read"
         );
         assert_eq!(
             names(&revoked),

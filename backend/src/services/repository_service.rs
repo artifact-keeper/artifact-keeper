@@ -855,6 +855,44 @@ pub(crate) fn build_member_visibility_clause(
     table_alias: &str,
     first_param: usize,
 ) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(visibility, table_alias, first_param, None)
+}
+
+/// [`build_member_visibility_clause`] for the members of a virtual repository
+/// summed as part of THAT virtual (the storage aggregate), with the #4559
+/// parent term: `<scope>` becomes
+///
+/// ```text
+/// ({alias}.id = ANY($scope) OR {routed_virtual_expr} = ANY($scope))
+/// ```
+///
+/// so a token whose scope names the virtual counts the members its owner may
+/// read, exactly as `member_passes_token_scope` admits them on the listing and
+/// content paths. `routed_virtual_expr` is a fixed SQL expression naming the
+/// virtual being aggregated (`$1` in the per-repo walk, the CTE's `root_id` in
+/// the batch); it is never caller input. The grant half and the `public` arm
+/// are unchanged, and an unrestricted principal renders the same clause as
+/// [`build_member_visibility_clause`].
+pub(crate) fn build_member_visibility_clause_through(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: &'static str,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(
+        visibility,
+        table_alias,
+        first_param,
+        Some(routed_virtual_expr),
+    )
+}
+
+fn render_member_visibility_clause(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: Option<&'static str>,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
     match visibility {
         MemberVisibility::Unfiltered => ("true".to_string(), None, None),
         MemberVisibility::Anonymous => ("visibility = 'public'".to_string(), None, None),
@@ -864,9 +902,12 @@ pub(crate) fn build_member_visibility_clause(
             allowed_repo_ids,
         } => {
             let scope_param = first_param + 1;
-            let scope = match allowed_repo_ids {
-                None => "true".to_string(),
-                Some(_) => format!("{table_alias}.id = ANY(${scope_param})"),
+            let scope = match (allowed_repo_ids, routed_virtual_expr) {
+                (None, _) => "true".to_string(),
+                (Some(_), None) => format!("{table_alias}.id = ANY(${scope_param})"),
+                (Some(_), Some(parent)) => format!(
+                    "({table_alias}.id = ANY(${scope_param}) OR {parent} = ANY(${scope_param}))"
+                ),
             };
             let entitlement = if *is_admin {
                 "true".to_string()
@@ -2439,6 +2480,11 @@ impl RepositoryService {
     /// [`MemberVisibility::Unfiltered`] (internal oracles/reconcilers) produces
     /// the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
     ///
+    /// The scope half carries the #4559 parent term
+    /// ([`build_member_visibility_clause_through`] keyed on `$1`): a token
+    /// whose scope names THIS virtual counts the leaves its owner may read,
+    /// as the listing and the download through the virtual admit them.
+    ///
     /// Only the LEAVES are filtered — the membership walk itself is unchanged,
     /// so an invisible intermediate virtual still contributes the leaves the
     /// caller *can* see.
@@ -2450,7 +2496,7 @@ impl RepositoryService {
         // `$2` = user id, `$3` = token scope, `$4` = depth. The bind order is
         // the same for every variant; an unreferenced bind is a typed NULL.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "$1");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(repo_id, depth) AS (
@@ -2541,7 +2587,7 @@ impl RepositoryService {
         // clause, so an internal read is byte-identical to the pre-#3081
         // aggregate. `$2` = user id, `$3` = token scope, `$4` = depth.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "reachable.root_id");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
