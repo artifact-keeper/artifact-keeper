@@ -28,7 +28,10 @@ easy to assume the other way round:
 
 - **A repository-scoped API token still confines an `internal` repository.** A
   token whose `allowed_repo_ids` excludes the repository is refused, and the
-  refusal is the existence-hiding 404, not a 403. Public repositories are
+  refusal is the existence-hiding 404, not a 403. (The one exception is a read
+  routed through a virtual repository the token's scope names; see
+  [Tokens scoped to a virtual repository](#tokens-scoped-to-a-virtual-repository).)
+  Public repositories are
   exempted from that ceiling (a scoped credential must never be worse off than
   no credential at all), but an anonymous caller gets nothing from an internal
   repository, so there is no credential-free baseline for a scoped credential to
@@ -78,6 +81,32 @@ evicts the cached repository record. Without that, a repository narrowed from
 `internal` to `private` would keep being served under the old decision until the
 60-second cache TTL expired — a stale-*authorization* window, not merely a
 stale-metadata one.
+
+## Tokens scoped to a virtual repository
+
+A token whose repository scope names a virtual repository (a repository token
+minted on it, or a user token whose `repo_selector` matches it) reads the
+virtual's members through the virtual, even though its scope does not name the
+members. This is what lets a consumer use one per-repository, read-only token
+on the one URL it is told to use, for example a virtual conda channel.
+
+Three limits apply:
+
+- **Only through the virtual.** The members are readable on requests routed
+  through the virtual (`/<format>/<virtual>/...`, the virtual's REST listings and
+  downloads, and the `/t/<token>/` forms of those). A request to a member's own
+  URL is still refused with the existence-hiding 404, so a virtual's policies
+  (such as a conda package allowlist) cannot be bypassed by going to the member
+  directly.
+- **Only what the token's owner may read.** Each member is still checked
+  against the owner's grants, as a direct read by the owner would be. A member
+  the owner cannot read is left out of the virtual's listings and indexes and
+  cannot be downloaded through it.
+- **Reads only.** Publishing through a virtual still requires the token's scope
+  to name the hosted member it deploys to.
+
+Members of a nested virtual are reached the same way: they are resolved from
+the virtual the request names, and each is checked against the owner's grants.
 
 ## Relationship to guest access
 
