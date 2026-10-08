@@ -1011,6 +1011,9 @@ pub(crate) enum SampledSecurityWarn {
     /// The Remote's credentials were withheld from a cross-origin bearer
     /// realm (#3591).
     RealmCredentialsWithheld,
+    /// The Remote's credentials were withheld from a URL on another origin
+    /// than its configured upstream (GHSA-24rf-2gv2-j47c).
+    OffOriginCredentialsWithheld,
 }
 
 type SecurityWarnState = HashMap<(SampledSecurityWarn, Uuid), (Instant, u64)>;
@@ -2897,6 +2900,11 @@ const REALM_CREDENTIALS_WITHHELD: &str =
      service is trusted, add its https origin to the repository's oci_trusted_bearer_realms \
      (#3591)";
 
+const OFF_ORIGIN_CREDENTIALS_WITHHELD: &str =
+    "upstream URL is on a different origin than the remote's configured upstream \
+     (typically an absolute URL taken from index metadata); fetching it WITHOUT the \
+     remote's upstream credentials (GHSA-24rf-2gv2-j47c)";
+
 /// Outcome of the OCI bearer-realm credential-forwarding decision
 /// ([`UpstreamClient::realm_credential_forwarding`], GHSA-78h6-3wp8-2542,
 /// #3591).
@@ -3080,6 +3088,44 @@ impl UpstreamClient {
         self.egress_client_cache.write().await.remove(&repo_id);
     }
 
+    /// The upstream credentials to attach to a request for `url` on behalf of
+    /// repository `repo_id`: the configured ones (per `mode`) when `url` is on
+    /// the origin of the repository's configured upstream, `None` otherwise.
+    ///
+    /// Every fetcher below takes its credentials from here. Index metadata
+    /// can name any absolute URL, and the fetchers used to attach the
+    /// credentials to whatever URL they were given (GHSA-24rf-2gv2-j47c). The
+    /// configured URLs are only read when there are credentials to withhold,
+    /// so an anonymous Remote pays nothing extra.
+    async fn upstream_auth_for(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        mode: crate::services::upstream_auth::UpstreamAuthMode,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        use crate::services::upstream_auth as ua;
+        let Some(auth) = ua::load_upstream_auth_for_mode(&self.db, repo_id, mode).await? else {
+            return Ok(None);
+        };
+        let configured = ua::configured_upstream_urls(&self.db, repo_id).await?;
+        if ua::credentials_may_follow(url, &configured) {
+            return Ok(Some(auth));
+        }
+        if let Some(suppressed) = security_warn_admitted(
+            SampledSecurityWarn::OffOriginCredentialsWithheld,
+            Some(repo_id),
+        ) {
+            tracing::warn!(
+                target: "security",
+                url = %redact_url_for_diagnostics(url),
+                suppressed,
+                "{}",
+                OFF_ORIGIN_CREDENTIALS_WITHHELD
+            );
+        }
+        Ok(None)
+    }
+
     /// Buffered upstream fetch. Relocated verbatim from
     /// `ProxyService::fetch_from_upstream_with_accept`.
     ///
@@ -3112,10 +3158,7 @@ impl UpstreamClient {
         // #3130: `Anonymous` short-circuits to `None` before the credential
         // store is read, so neither the initial request nor the bearer retry
         // below can attach the repo's configured upstream credentials.
-        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
-            &self.db, repo_id, auth_mode,
-        )
-        .await?;
+        let upstream_auth = self.upstream_auth_for(url, repo_id, auth_mode).await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811): the shared client unless
         // this repo pins its own routing.
@@ -3189,8 +3232,13 @@ impl UpstreamClient {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!("Posting JSON metadata to upstream: {}", diagnostic_url);
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self
@@ -3340,8 +3388,13 @@ impl UpstreamClient {
             diagnostic_url
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811); see `client_for`.
         let client = self.client_for(repo_id, url).await?;
@@ -3945,8 +3998,13 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         // Conditional revalidation is an outbound upstream request like any
         // other, so it must honor this repository's egress routing (#2469).
         let client = self.client_for(repo_id, url).await?;
@@ -6280,8 +6338,14 @@ impl ProxyService {
         repo_id: Uuid,
         etag: &str,
     ) -> Result<Option<UpstreamResponse>> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_client
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
 
         // Conditional metadata refresh is an outbound upstream request, so it
         // routes through this repository's egress proxy like every other
@@ -14357,6 +14421,110 @@ mod tests {
         }
     }
 
+    /// Point Remote `repo_id` at `upstream_url`, the URL its credentials
+    /// belong to (GHSA-24rf-2gv2-j47c).
+    async fn point_remote_at(pool: &sqlx::PgPool, repo_id: Uuid, upstream_url: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point the remote at its upstream");
+    }
+
+    /// GHSA-24rf-2gv2-j47c: a Remote's configured upstream credentials go only
+    /// to the configured upstream's origin. Index metadata (a PyPI `href`, a
+    /// Helm `urls` entry, a Cargo `dl` template, a Composer `dist.url`, a
+    /// Terraform `download_url`) can name any absolute URL, and every shared
+    /// fetcher used to attach the credentials to whatever URL it was given.
+    /// Two listeners on different ports are two origins: the foreign one must
+    /// receive no `Authorization` from any fetcher, and the configured one
+    /// still gets the credentials.
+    #[tokio::test]
+    async fn upstream_credentials_only_go_to_the_configured_origin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::UpstreamAuthMode;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        for server in [&upstream, &foreign] {
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"fresh\"")
+                        .set_body_bytes(b"{}".as_ref()),
+                )
+                .mount(server)
+                .await;
+        }
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        point_remote_at(&pool, repo_id, &format!("{}/simple", upstream.uri())).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let client = &proxy.upstream_client;
+        let mode = UpstreamAuthMode::RepoConfigured;
+
+        let off_origin = format!("{}/files/pkg-1.0.tar.gz", foreign.uri());
+        let _ = client
+            .fetch_buffered(&off_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&off_origin, repo_id).await;
+        let _ = client
+            .check_etag_changed(&off_origin, "\"stale\"", repo_id, None)
+            .await;
+        let _ = proxy
+            .fetch_from_upstream_conditional(&off_origin, repo_id, "\"stale\"")
+            .await;
+        let _ = client
+            .post_json_buffered(&off_origin, repo_id, Bytes::from_static(b"{}"), 1 << 20)
+            .await;
+
+        // Control: the configured origin still gets the credentials.
+        let on_origin = format!("{}/files/pkg-1.0.tar.gz", upstream.uri());
+        let _ = client
+            .fetch_buffered(&on_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&on_origin, repo_id).await;
+
+        let foreign_requests = foreign.received_requests().await.unwrap_or_default();
+        let upstream_requests = upstream.received_requests().await.unwrap_or_default();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            foreign_requests.len(),
+            5,
+            "every fetcher must still reach the off-origin URL, only without credentials"
+        );
+        for r in &foreign_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "{} {} on another origin received the upstream credentials",
+                r.method,
+                r.url.path()
+            );
+        }
+        assert_eq!(upstream_requests.len(), 2);
+        for r in &upstream_requests {
+            assert!(
+                r.headers.contains_key("authorization"),
+                "the configured upstream must still receive its credentials"
+            );
+        }
+    }
+
     /// #4452: redacting `upstream_url` on read must not change what the
     /// proxy sends upstream. Userinfo embedded in a Remote's upstream URL is
     /// still presented as HTTP Basic auth; the mock only answers 200 when the
@@ -18282,6 +18450,9 @@ mod tests {
         let mut repos = Vec::new();
         for _ in 0..2 {
             let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+            // The registry is this Remote's configured upstream, so its
+            // credentials belong there (GHSA-24rf-2gv2-j47c).
+            point_remote_at(&pool, repo_id, &registry.uri()).await;
             save_upstream_auth(
                 &pool,
                 repo_id,
@@ -18412,6 +18583,9 @@ mod tests {
             .await;
 
         let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        // The registry is this Remote's configured upstream, so its
+        // credentials belong there (GHSA-24rf-2gv2-j47c).
+        point_remote_at(&pool, repo_id, &registry.uri()).await;
         save_upstream_auth(
             &pool,
             repo_id,

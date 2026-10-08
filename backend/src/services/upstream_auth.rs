@@ -265,6 +265,50 @@ pub(crate) fn parse_auth_credentials(
     }
 }
 
+/// Whether `a` and `b` are the same origin: scheme, host (compared
+/// case-insensitively) and port (default ports normalised). Userinfo, path,
+/// query and fragment are ignored. Anything unparseable, or without a host,
+/// is never the same origin (fail closed).
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.host_str().is_some()
+                && a.scheme() == b.scheme()
+                && a.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a Remote's configured upstream credentials may be sent with a
+/// request for `target`: only when `target` is on the origin of one of the
+/// URLs the administrator configured for the Remote (`configured`, its
+/// `upstream_url` and `index_upstream_url`). Index metadata can name any
+/// absolute URL (a PyPI `href`, a Helm `urls` entry, a Cargo `dl` template, a
+/// Composer `dist.url`, a Terraform `download_url`), and credentials must not
+/// follow it to another host (GHSA-24rf-2gv2-j47c).
+pub fn credentials_may_follow(target: &str, configured: &[String]) -> bool {
+    configured.iter().any(|origin| same_origin(origin, target))
+}
+
+/// The URLs an administrator configured for repository `repo_id` that its
+/// upstream credentials belong to: `upstream_url` and, when set, the
+/// `index_upstream_url` override (Cargo, Debian, Maven).
+pub async fn configured_upstream_urls(db: &PgPool, repo_id: Uuid) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT upstream_url FROM repositories WHERE id = $1 AND upstream_url IS NOT NULL \
+         UNION ALL \
+         SELECT value FROM repository_config \
+         WHERE repository_id = $1 AND key = 'index_upstream_url' AND value IS NOT NULL",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 /// Apply upstream auth to a reqwest RequestBuilder.
 pub fn apply_upstream_auth(builder: RequestBuilder, auth: &UpstreamAuthType) -> RequestBuilder {
     match auth {
@@ -418,6 +462,54 @@ pub fn build_credentials_json(auth: &UpstreamAuthType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GHSA-24rf-2gv2-j47c: the origin rule credentials follow.
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        for (a, b) in [
+            (
+                "https://pypi.example.com/simple",
+                "https://pypi.example.com/files/x.whl",
+            ),
+            ("https://PYPI.example.com", "https://pypi.example.com:443/x"),
+            ("http://10.0.0.5:8081/repo", "http://10.0.0.5:8081/other"),
+            ("https://u:p@host.example/x", "https://host.example/y"),
+        ] {
+            assert!(same_origin(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("https://pypi.example.com", "https://files.example.com/x"),
+            ("https://pypi.example.com", "http://pypi.example.com/x"),
+            ("https://host.example", "https://host.example:8443/x"),
+            ("https://host.example", "https://host.example.evil.test/x"),
+            ("https://host.example", "not a url"),
+            ("not a url", "not a url"),
+            ("file:///etc/passwd", "file:///etc/passwd"),
+        ] {
+            assert!(!same_origin(a, b), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn credentials_follow_only_a_configured_origin() {
+        let configured = vec![
+            "https://index.example.com/simple".to_string(),
+            "https://dl.example.com".to_string(),
+        ];
+        assert!(credentials_may_follow(
+            "https://index.example.com/simple/x/",
+            &configured
+        ));
+        assert!(credentials_may_follow(
+            "https://dl.example.com/crates/x/1/download",
+            &configured
+        ));
+        assert!(!credentials_may_follow(
+            "https://attacker.example/x",
+            &configured
+        ));
+        assert!(!credentials_may_follow("https://index.example.com/x", &[]));
+    }
 
     // -----------------------------------------------------------------------
     // apply_upstream_auth
@@ -945,6 +1037,39 @@ mod aws_provider_db_tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// GHSA-24rf-2gv2-j47c: credentials belong to the Remote's
+    /// `upstream_url` and, when set, its `index_upstream_url` override.
+    #[tokio::test]
+    async fn configured_upstream_urls_include_the_index_override() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "cargo").await;
+        set_upstream_url(&pool, repo_id, "https://dl.example.com").await;
+        assert_eq!(
+            configured_upstream_urls(&pool, repo_id).await.unwrap(),
+            vec!["https://dl.example.com".to_string()]
+        );
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'index_upstream_url', 'https://index.example.com')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut urls = configured_upstream_urls(&pool, repo_id).await.unwrap();
+        urls.sort();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        assert_eq!(
+            urls,
+            vec![
+                "https://dl.example.com".to_string(),
+                "https://index.example.com".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

@@ -21953,6 +21953,88 @@ mod legacy_json_xmlrpc_route_tests {
         assert_eq!(status7, StatusCode::NOT_FOUND);
     }
 
+    /// GHSA-24rf-2gv2-j47c, the advisory's live reproduction: an anonymous
+    /// download through a credentialed PyPI remote whose simple index names
+    /// the file by an absolute URL on ANOTHER origin. The file must still be
+    /// fetched from there, but without the remote's credentials, which keep
+    /// going to the configured upstream (the index fetch).
+    #[tokio::test]
+    async fn file_on_another_origin_is_fetched_without_upstream_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        // Same allow-listed address, another port: another origin.
+        let foreign_listener = std::net::TcpListener::bind((upstream.address().ip(), 0))
+            .expect("bind the foreign listener");
+        let foreign = MockServer::builder()
+            .listener(foreign_listener)
+            .start()
+            .await;
+        let file_url = format!("{}/files/advcpkg-1.0.tar.gz", foreign.uri());
+        Mock::given(method("GET"))
+            .and(path("/simple/advcpkg/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!(
+                        "<html><body><a href=\"{file_url}\">advcpkg-1.0.tar.gz</a></body></html>"
+                    )),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/advcpkg-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist-bytes".as_ref()))
+            .mount(&foreign)
+            .await;
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &fx.pool,
+            fx.repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/advcpkg/advcpkg-1.0.tar.gz",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let index_requests = upstream.received_requests().await.unwrap_or_default();
+        let file_requests = foreign.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"sdist-bytes");
+        assert!(
+            !file_requests.is_empty(),
+            "the file must come from the href's origin"
+        );
+        for r in &file_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "the remote's credentials were sent to {}",
+                r.url
+            );
+        }
+        assert!(
+            index_requests
+                .iter()
+                .any(|r| r.headers.contains_key("authorization")),
+            "the configured upstream must still receive the credentials"
+        );
+    }
+
     /// Remote repository: the upstream document is proxied and every download
     /// URL is rewritten to this repository; an upstream 404 is a 404, and an
     /// upstream configured as its simple index still reaches `/pypi/...`.
