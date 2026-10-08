@@ -42,6 +42,7 @@ use crate::services::audit_service::{
 };
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
+use crate::services::conda_allowlist;
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
@@ -819,6 +820,13 @@ pub fn router() -> Router<SharedState> {
             get(get_upstream_filter)
                 .put(set_upstream_filter)
                 .delete(delete_upstream_filter),
+        )
+        // Package allowlist on a virtual conda channel (#4576)
+        .route(
+            "/:key/allowlist",
+            get(get_conda_allowlist)
+                .put(set_conda_allowlist)
+                .delete(delete_conda_allowlist),
         )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
@@ -12121,6 +12129,240 @@ pub async fn delete_upstream_filter(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Conda virtual channel allowlist (#4576)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CondaAllowlistResponse {
+    pub repository_key: String,
+    /// Whether the list is enforced. `false` when none is configured. A
+    /// stored list that can no longer be read is enforced as admit-nothing,
+    /// so it reports `true` with `error` set and no entries.
+    pub enabled: bool,
+    /// The admitted packages.
+    pub entries: Vec<conda_allowlist::AllowlistEntry>,
+    /// `entries.len()`.
+    pub entry_count: usize,
+    /// Set when the stored list is unusable (only possible after a direct
+    /// database edit): nothing from remote members is admitted until a valid
+    /// list is saved or the list is deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CondaAllowlistResponse {
+    fn new(repository_key: String, stored: conda_allowlist::StoredAllowlist) -> Self {
+        use conda_allowlist::StoredAllowlist as Stored;
+        let (enabled, entries, error) = match stored {
+            Stored::None => (false, Vec::new(), None),
+            Stored::Valid(list) => (list.enabled, list.entries, None),
+            Stored::Unusable(err) => (true, Vec::new(), Some(err)),
+        };
+        Self {
+            repository_key,
+            enabled,
+            entry_count: entries.len(),
+            entries,
+            error,
+        }
+    }
+}
+
+/// Resolve `key` to a virtual conda repository the caller administers. The
+/// allowlist is a supply-chain control like the upstream filter, so reading
+/// and changing it both require the repository `admin` action.
+async fn conda_allowlist_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+    write: bool,
+) -> Result<(AuthExtension, crate::models::repository::Repository)> {
+    use crate::models::repository::RepositoryFormat;
+    let auth = require_auth(auth)?;
+    auth.require_scope(if write {
+        "write:repositories"
+    } else {
+        "read:repositories"
+    })?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(key).await?;
+    require_repo_access(&auth, repo.id)?;
+    if repo.repo_type != RepositoryType::Virtual
+        || !matches!(
+            repo.format,
+            RepositoryFormat::Conda | RepositoryFormat::CondaNative
+        )
+    {
+        return Err(AppError::Validation(
+            "The allowlist is only available on virtual conda repositories".to_string(),
+        ));
+    }
+    if write {
+        require_repo_write_access(&auth, &repo, &repo_service).await?;
+    }
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    Ok((auth, repo))
+}
+
+/// Audit a change to the allowlist (best-effort).
+async fn audit_conda_allowlist_change(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    previous: &conda_allowlist::StoredAllowlist,
+    current: Option<&conda_allowlist::CondaAllowlist>,
+) {
+    use conda_allowlist::StoredAllowlist as Stored;
+    let previous = match previous {
+        Stored::None => serde_json::Value::Null,
+        Stored::Valid(list) => serde_json::json!({
+            "enabled": list.enabled,
+            "entry_count": list.entries.len(),
+        }),
+        Stored::Unusable(_) => serde_json::json!({ "unusable": true }),
+    };
+    let current = current.map_or(serde_json::Value::Null, |list| {
+        serde_json::json!({
+            "enabled": list.enabled,
+            "entry_count": list.entries.len(),
+        })
+    });
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(
+            AuditAction::RepositoryAllowlistChanged,
+            ResourceType::Repository,
+        )
+        .user(auth.user_id)
+        .resource(repo.id)
+        .actor_name(auth.username.clone())
+        .resource_name(repo.key.clone())
+        .details(serde_json::json!({
+            "repository": repo.key,
+            "previous": previous,
+            "current": current,
+        })),
+    )
+    .await;
+}
+
+/// Get the package allowlist of a virtual conda repository
+#[utoipa::path(
+    get,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current allowlist", body = CondaAllowlistResponse),
+        (status = 400, description = "Repository is not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (_, repo) = conda_allowlist_repo(&state, auth, &key, false).await?;
+    let stored = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    Ok(Json(CondaAllowlistResponse::new(key, stored)))
+}
+
+/// Set the package allowlist of a virtual conda repository
+///
+/// Restricts what the virtual's REMOTE members contribute. When `enabled`,
+/// a remote package record is listed in the virtual's `repodata.json` (every
+/// encoding) only if some entry admits it, `channeldata.json` keeps only
+/// admitted names, and a download through the virtual of a package the list
+/// does not admit is never served from a remote member (404, as the index
+/// implies). Hosted (local/staging) members are not filtered.
+///
+/// An entry is `{"name": ..., "version": ..., "subdirs": [...]}`: `name` is an
+/// exact conda package name or a glob (`*`, `?`), case-insensitive; `version`
+/// is an optional conda version spec evaluated with conda ordering (`2.2.3`
+/// is exact, `2.2.*`, `>=2,<3`, `1.0|1.1`); a version that does not parse is
+/// not admitted by a constrained entry. `subdirs` optionally restricts the
+/// entry to platforms. A package is admitted when any entry admits it.
+///
+/// `enabled` is required: an enabled empty list admits nothing from remotes;
+/// `enabled: false` keeps the entries but restores the unfiltered merge.
+/// Limits: 10,000 entries, names up to 128 bytes, version specs up to 256
+/// bytes, 32 subdirs per entry. Changes apply to the next request.
+#[utoipa::path(
+    put,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = conda_allowlist::CondaAllowlist,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Allowlist saved", body = CondaAllowlistResponse),
+        (status = 400, description = "Invalid entry, too many entries, or not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<conda_allowlist::CondaAllowlist>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
+    let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    conda_allowlist::save_allowlist(&state.db, repo.id, &payload).await?;
+    audit_conda_allowlist_change(&state, &auth, &repo, &previous, Some(&payload)).await;
+    Ok(Json(CondaAllowlistResponse::new(
+        key,
+        conda_allowlist::StoredAllowlist::Valid(payload),
+    )))
+}
+
+/// Remove the package allowlist of a virtual conda repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Allowlist removed", body = CondaAllowlistResponse),
+        (status = 400, description = "Repository is not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
+    let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    if conda_allowlist::delete_allowlist(&state.db, repo.id).await? {
+        audit_conda_allowlist_change(&state, &auth, &repo, &previous, None).await;
+    }
+    Ok(Json(CondaAllowlistResponse::new(
+        key,
+        conda_allowlist::StoredAllowlist::None,
+    )))
+}
+
 /// Load routing rules from repository_config for a given repository ID.
 /// Returns an empty Vec if no rules are configured.
 async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
@@ -12176,6 +12418,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_upstream_filter,
         set_upstream_filter,
         delete_upstream_filter,
+        get_conda_allowlist,
+        set_conda_allowlist,
+        delete_conda_allowlist,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
@@ -12223,6 +12468,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RoutingRule,
         UpstreamFilter,
         UpstreamFilterResponse,
+        conda_allowlist::CondaAllowlist,
+        conda_allowlist::AllowlistEntry,
+        CondaAllowlistResponse,
         DebianRepositoryConfig,
         DebianConfigPatch,
         crate::formats::debian::DebianMetadataStrategy,
@@ -33087,5 +33335,160 @@ mod upstream_filter_endpoint_tests {
         assert_eq!(json(&after_body)["include_patterns"], serde_json::json!([]));
 
         assert_eq!(local_status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// `GET/PUT/DELETE /:key/allowlist` on a virtual conda repository (#4576).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod conda_allowlist_endpoint_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+
+    fn uri(key: &str) -> String {
+        format!("/{key}/allowlist")
+    }
+
+    fn put(key: &str, body: serde_json::Value) -> Request<Body> {
+        tdh::put_json(uri(key), Bytes::from(body.to_string()))
+    }
+
+    fn delete(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri(key))
+            .body(Body::empty())
+            .expect("build DELETE request")
+    }
+
+    fn json(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).expect("JSON body")
+    }
+
+    async fn audit_rows(pool: &sqlx::PgPool, repo_id: uuid::Uuid) -> i64 {
+        // The audit write is detached (fire-and-forget); give it a moment.
+        let mut count = 0;
+        for _ in 0..40 {
+            count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'REPOSITORY_ALLOWLIST_CHANGED' AND resource_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("count audit rows");
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn conda_allowlist_crud_is_admin_gated_validated_and_audited() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "conda").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let list = serde_json::json!({
+            "enabled": true,
+            "entries": [
+                {"name": "numpy", "version": ">=2,<3", "subdirs": ["linux-64"]},
+                {"name": "tzdata"},
+            ],
+        });
+
+        let (member_id, member_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, member_id).await;
+        let member_app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(member_id, &member_name),
+        );
+        let (member_put, _) = tdh::send(member_app, put(&key, list.clone())).await;
+        let (anon_get, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri(&key))).await;
+
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+
+        let (empty_status, empty_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let bad = serde_json::json!({"enabled": true, "entries": [
+            {"name": "numpy"},
+            {"name": "numpy", "version": ">=>2"},
+        ]});
+        let (bad_status, bad_body) = tdh::send(app(), put(&key, bad)).await;
+        let (bad_name_status, _) = tdh::send(
+            app(),
+            put(
+                &key,
+                serde_json::json!({"enabled": true, "entries": [{"name": "Num Py"}]}),
+            ),
+        )
+        .await;
+        let (no_enabled_status, _) = tdh::send(
+            app(),
+            put(&key, serde_json::json!({"entries": [{"name": "numpy"}]})),
+        )
+        .await;
+        let (put_status, put_body) = tdh::send(app(), put(&key, list.clone())).await;
+        let (get_status, get_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (del_status, del_body) = tdh::send(app(), delete(&key)).await;
+        let (after_status, after_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let audits = audit_rows(&fx.pool, fx.repo_id).await;
+
+        // Only a virtual conda repository carries an allowlist.
+        let (remote_id, remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "conda").await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        tdh::grant_repo_admin(&fx.pool, remote_id, fx.user_id).await;
+        let (remote_status, _) = tdh::send(app(), put(&remote_key, list.clone())).await;
+
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        tdh::cleanup_user(&fx.pool, member_id).await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_put, StatusCode::FORBIDDEN);
+        assert_eq!(anon_get, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(empty_status, StatusCode::OK);
+        let empty = json(&empty_body);
+        assert_eq!(empty["enabled"], false);
+        assert_eq!(empty["entry_count"], 0);
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        let bad = String::from_utf8_lossy(&bad_body);
+        assert!(bad.contains("entries[1]"), "{bad}");
+        assert_eq!(bad_name_status, StatusCode::BAD_REQUEST);
+        assert!(
+            no_enabled_status.is_client_error(),
+            "`enabled` is required, got {no_enabled_status}"
+        );
+
+        assert_eq!(put_status, StatusCode::OK);
+        let saved = json(&put_body);
+        assert_eq!(saved["repository_key"], key.as_str());
+        assert_eq!(saved["enabled"], true);
+        assert_eq!(saved["entry_count"], 2);
+        assert_eq!(saved["entries"], list["entries"]);
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(json(&get_body), saved);
+
+        assert_eq!(del_status, StatusCode::OK);
+        assert_eq!(json(&del_body)["enabled"], false);
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(json(&after_body)["entries"], serde_json::json!([]));
+
+        assert_eq!(audits, 2, "the PUT and the DELETE are audited");
+        assert_eq!(remote_status, StatusCode::BAD_REQUEST);
     }
 }

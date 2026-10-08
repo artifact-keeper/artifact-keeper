@@ -3010,6 +3010,33 @@ fn build_channeldata_entry(
 struct VirtualMerge {
     body: Vec<u8>,
     failed: Vec<virtual_merge::MemberFailure>,
+    /// Remote records (or channeldata entries) the virtual's allowlist left
+    /// out; `None` when no allowlist is enforced.
+    allowlist_dropped: Option<usize>,
+}
+
+/// Response header reporting how many remote records the virtual's allowlist
+/// (#4576) left out of a merged document. Present only when a list is
+/// enforced.
+const ALLOWLIST_DROPPED_HEADER: &str = "x-ak-allowlist-dropped";
+
+/// The enforced package allowlist of a virtual conda channel (#4576), or
+/// `None` when it has none or it is disabled. Fails closed: a database error
+/// is a 500, never an unfiltered merge or download.
+async fn virtual_allowlist(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>, Response> {
+    crate::services::conda_allowlist::enforced_allowlist(db, virtual_repo_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                virtual_repo_id = %virtual_repo_id,
+                error = %e,
+                "reading the conda virtual allowlist failed; refusing to serve unfiltered"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
 }
 
 /// Build merged repodata for a virtual repository, encoded as `encoding`.
@@ -3037,6 +3064,7 @@ async fn build_virtual_repodata(
     let members =
         proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
     let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
+    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
 
     let mut hosted = Vec::new();
     for member in members
@@ -3070,6 +3098,7 @@ async fn build_virtual_repodata(
 
     let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
     let subdir_owned = subdir.to_string();
+    let enforced = allowlist.is_some();
     let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
         virtual_merge::merge_repodata(
             &subdir_owned,
@@ -3077,23 +3106,33 @@ async fn build_virtual_repodata(
             &hosted,
             &documents,
             &owned,
+            allowlist.as_deref(),
             encoding,
         )
     })
     .await
     .map_err(virtual_merge::internal_error)?;
-    if dropped > 0 {
+    if dropped.owned > 0 {
         tracing::info!(
             virtual_repo = %virtual_repo_key,
             subdir,
-            dropped,
+            dropped = dropped.owned,
             "excluded remote conda records whose names a hosted member owns"
+        );
+    }
+    if enforced {
+        tracing::info!(
+            virtual_repo = %virtual_repo_key,
+            subdir,
+            dropped = dropped.not_allowed,
+            "excluded remote conda records the virtual's allowlist does not admit"
         );
     }
     failed.extend(parse_failures);
     Ok(VirtualMerge {
         body: body?,
         failed,
+        allowlist_dropped: enforced.then_some(dropped.not_allowed),
     })
 }
 
@@ -3109,6 +3148,7 @@ async fn build_virtual_channeldata(
     let members =
         proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
     let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
+    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
 
     let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -3148,15 +3188,24 @@ async fn build_virtual_channeldata(
         false,
     )
     .await;
-    let (body, parse_failures) = tokio::task::spawn_blocking(move || {
-        virtual_merge::merge_channeldata(&hosted, &documents, &owned)
+    let enforced = allowlist.is_some();
+    let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
+        virtual_merge::merge_channeldata(&hosted, &documents, &owned, allowlist.as_deref())
     })
     .await
     .map_err(virtual_merge::internal_error)?;
+    if enforced {
+        tracing::info!(
+            virtual_repo_id = %virtual_repo_id,
+            dropped = not_allowed,
+            "excluded remote conda channeldata entries the virtual's allowlist does not admit"
+        );
+    }
     failed.extend(parse_failures);
     Ok(VirtualMerge {
         body: body.map_err(virtual_merge::internal_error)?,
         failed,
+        allowlist_dropped: enforced.then_some(not_allowed),
     })
 }
 
@@ -3183,6 +3232,12 @@ async fn serve_virtual_merge(
     let mut response = cacheable_response(merged.body, content_type, headers).await;
     if let Some(missing) = partial {
         virtual_merge::mark_partial(&mut response, &missing);
+    }
+    if let Some(dropped) = merged.allowlist_dropped {
+        response.headers_mut().insert(
+            ALLOWLIST_DROPPED_HEADER,
+            axum::http::HeaderValue::from(dropped),
+        );
     }
     Ok(response)
 }
@@ -3334,7 +3389,16 @@ async fn download_package(
                     }
                     None => false,
                 };
-                let proxy_service = if hosted_owns_name {
+                // Allowlist (#4576): a remote member serves only what the
+                // virtual's allowlist admits, by the same name/version/subdir
+                // test the merged repodata applies, so a package the index
+                // does not list is not downloadable either. Hosted members are
+                // not filtered, so they still answer below.
+                let not_allowed = !hosted_owns_name
+                    && virtual_allowlist(&state.db, repo.id)
+                        .await?
+                        .is_some_and(|a| !a.admits_filename(&subdir, &filename));
+                let proxy_service = if hosted_owns_name || not_allowed {
                     None
                 } else {
                     state.proxy_service.as_deref()
@@ -5174,8 +5238,16 @@ async fn serve_sidecar(
     }
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        // A package the virtual's allowlist (#4576) does not admit has no
+        // sidecar through it from a remote member either.
+        let remote_admitted = virtual_allowlist(&state.db, repo.id)
+            .await?
+            .is_none_or(|a| a.admits_filename(subdir, request.package()));
         for member in &members {
             if member.repo_type == RepositoryType::Remote {
+                if !remote_admitted {
+                    continue;
+                }
                 if let Ok(response) = proxy_sidecar(
                     state,
                     member.id,
@@ -16069,6 +16141,7 @@ mod virtual_channel_tests {
             &hosted,
             &remote,
             &owned,
+            None,
             RepodataEncoding::Json,
         );
         let doc: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
@@ -16077,7 +16150,8 @@ mod virtual_channel_tests {
         assert_eq!(conda["rich-13.0-0.conda"]["from"], "remote-a");
         assert_eq!(conda["numpy-2.0-0.conda"]["from"], "remote-b");
         assert!(!conda.contains_key("rich-13.1-0.conda"));
-        assert_eq!(dropped, 1);
+        assert_eq!(dropped.owned, 1);
+        assert_eq!(dropped.not_allowed, 0);
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].member, "remote-c");
         assert_eq!(doc["info"]["base_url"], "/conda/v/noarch/");
@@ -16338,6 +16412,277 @@ mod virtual_channel_tests {
         let h_doc: serde_json::Value = serde_json::from_slice(&h_body).unwrap();
         assert!(listed(&h_doc).is_empty());
         assert_eq!(h_doc["info"]["subdir"], "unknown");
+    }
+
+    async fn set_allowlist(rig: &VirtualRig, list: serde_json::Value) {
+        let list: crate::services::conda_allowlist::CondaAllowlist =
+            serde_json::from_value(list).expect("allowlist fixture");
+        crate::services::conda_allowlist::save_allowlist(&rig.pool, rig.virtual_id, &list)
+            .await
+            .expect("save allowlist");
+    }
+
+    fn upstream_channeldata(names: &[&str]) -> serde_json::Value {
+        let packages: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    serde_json::json!({"subdirs": ["noarch"], "version": "1.0"}),
+                )
+            })
+            .collect();
+        serde_json::json!({"channeldata_version": 1, "packages": packages})
+    }
+
+    /// #4576: the allowlist of a virtual filters what its remote member
+    /// contributes, in the merged repodata (all three encodings), in
+    /// channeldata, and on download, while every hosted record stays; a
+    /// version-constrained entry admits matching builds only, an enabled empty
+    /// list admits nothing from the remote, and disabling the list restores
+    /// the full merge.
+    #[tokio::test]
+    async fn virtual_allowlist_filters_index_and_download_4576() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let noarch_files = [
+            "colorama-0.4.6-pyhd8ed1ab_1.conda",
+            "tzdata-2025b-h78e105d_0.conda",
+            "tzdata-2025a-h78e105d_0.conda",
+            "rich-13.0-pyh_0.conda",
+        ];
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &noarch_files)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/linux-64/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_repodata(
+                "linux-64",
+                &[
+                    "numpy-2.2.3-py313h17eae1a_0.conda",
+                    "numpy-1.26.4-py312h_0.conda",
+                ],
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_channeldata(&[
+                    "colorama", "numpy", "rich", "tzdata",
+                ])),
+            )
+            .mount(&server)
+            .await;
+        for file in noarch_files {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/noarch/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(file.as_bytes().to_vec()))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path("/linux-64/numpy-1.26.4-py312h_0.conda"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"old numpy".to_vec()))
+            .mount(&server)
+            .await;
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let v = rig.virtual_key.clone();
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": [
+                {"name": "tzdata", "version": "2025b"},
+                {"name": "numpy", "version": ">=2,<3", "subdirs": ["linux-64"]},
+                {"name": "ri*"},
+            ]}),
+        )
+        .await;
+
+        let (json_status, json_body, json_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (zst_status, zst_body, _) = rig.get(format!("/{v}/noarch/repodata.json.zst")).await;
+        let (bz2_status, bz2_body, _) = rig.get(format!("/{v}/noarch/repodata.json.bz2")).await;
+        let (linux_status, linux) = rig.repodata("linux-64").await;
+        let (cd_status, cd_body, cd_headers) = rig.get(format!("/{v}/channeldata.json")).await;
+        let (denied_status, denied_body, _) = rig
+            .get(format!("/{v}/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda"))
+            .await;
+        let (absent_status, absent_body, _) =
+            rig.get(format!("/{v}/noarch/nosuchpkg-1.0-0.conda")).await;
+        let (old_tz_status, _, _) = rig
+            .get(format!("/{v}/noarch/tzdata-2025a-h78e105d_0.conda"))
+            .await;
+        let (old_numpy_status, _, _) = rig
+            .get(format!("/{v}/linux-64/numpy-1.26.4-py312h_0.conda"))
+            .await;
+        let (allowed_status, allowed_body, _) = rig
+            .get(format!("/{v}/noarch/tzdata-2025b-h78e105d_0.conda"))
+            .await;
+        let colorama_fetched_while_denied = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().contains("colorama-0.4.6"));
+
+        // An enabled empty list admits nothing from the remote.
+        set_allowlist(&rig, serde_json::json!({"enabled": true, "entries": []})).await;
+        let (_, empty) = rig.repodata("noarch").await;
+
+        // Disabled: the full merge and the download come back.
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": false, "entries": [{"name": "tzdata"}]}),
+        )
+        .await;
+        let (off_status, off_body, off_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (off_dl_status, _, _) = rig
+            .get(format!("/{v}/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda"))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(json_status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(
+            listed(&doc),
+            vec![
+                "acme-core-1.0-0.conda",
+                "rich-13.0-pyh_0.conda",
+                "tzdata-2025b-h78e105d_0.conda"
+            ],
+            "only admitted remote records, plus every hosted record"
+        );
+        assert_eq!(
+            json_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(zst_status, StatusCode::OK);
+        let zst_doc: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&zst_body[..]).unwrap()).unwrap();
+        assert_eq!(zst_doc, doc, "repodata.json.zst is filtered the same way");
+        assert_eq!(bz2_status, StatusCode::OK);
+        let mut bz2_json = Vec::new();
+        std::io::Read::read_to_end(
+            &mut bzip2::read::MultiBzDecoder::new(&bz2_body[..]),
+            &mut bz2_json,
+        )
+        .unwrap();
+        let bz2_doc: serde_json::Value = serde_json::from_slice(&bz2_json).unwrap();
+        assert_eq!(bz2_doc, doc, "repodata.json.bz2 is filtered the same way");
+
+        assert_eq!(linux_status, StatusCode::OK);
+        assert_eq!(
+            listed(&linux),
+            vec!["numpy-2.2.3-py313h17eae1a_0.conda"],
+            "a version-constrained entry admits matching builds only"
+        );
+
+        assert_eq!(cd_status, StatusCode::OK);
+        let cd: serde_json::Value = serde_json::from_slice(&cd_body).unwrap();
+        let mut cd_names: Vec<&str> = cd["packages"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        cd_names.sort();
+        assert_eq!(cd_names, vec!["acme-core", "numpy", "rich", "tzdata"]);
+        assert_eq!(
+            cd_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("1")
+        );
+
+        assert_eq!(
+            denied_status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&denied_body)
+        );
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            denied_body, absent_body,
+            "a refused package answers exactly like one no member has"
+        );
+        assert!(
+            !colorama_fetched_while_denied,
+            "a package the allowlist refuses must not be requested upstream"
+        );
+        assert_eq!(old_tz_status, StatusCode::NOT_FOUND);
+        assert_eq!(old_numpy_status, StatusCode::NOT_FOUND);
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert_eq!(&allowed_body[..], b"tzdata-2025b-h78e105d_0.conda");
+
+        assert_eq!(listed(&empty), vec!["acme-core-1.0-0.conda"]);
+
+        assert_eq!(off_status, StatusCode::OK);
+        let off: serde_json::Value = serde_json::from_slice(&off_body).unwrap();
+        assert_eq!(listed(&off).len(), 5, "{off}");
+        assert!(off_headers.get(ALLOWLIST_DROPPED_HEADER).is_none());
+        assert_eq!(off_dl_status, StatusCode::OK);
+    }
+
+    /// #4576: the index applies the allowlist to the identity a record claims
+    /// as well as to its filename, and hosted records are never filtered.
+    #[test]
+    fn merge_repodata_applies_the_allowlist_to_remote_records_only() {
+        let allowlist = crate::services::conda_allowlist::CondaAllowlist {
+            enabled: true,
+            entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                name: "rich".into(),
+                version: None,
+                subdirs: vec![],
+            }],
+        }
+        .compile()
+        .unwrap();
+        let hosted = vec![hosted_record("internal-1.0-0.conda", "hosted")];
+        let mut doc = upstream_repodata("noarch", &["rich-13.0-0.conda", "numpy-2.0-0.conda"]);
+        // A record filed as rich that claims to be numpy is dropped.
+        let mut liar = upstream_record("noarch", "rich-13.1-0.conda");
+        liar["name"] = "numpy".into();
+        doc["packages.conda"]["rich-13.1-0.conda"] = liar;
+        // A legacy .tar.bz2 record is filtered too.
+        doc["packages"]["rich-12.0-0.tar.bz2"] = upstream_record("noarch", "rich-12.0-0.tar.bz2");
+        doc["packages"]["numpy-1.0-0.tar.bz2"] = upstream_record("noarch", "numpy-1.0-0.tar.bz2");
+        let remote = vec![virtual_merge::MemberDocument {
+            member: "remote".into(),
+            json: serde_json::to_vec(&doc).unwrap(),
+        }];
+        let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "noarch",
+            "/conda/v/noarch/",
+            &hosted,
+            &remote,
+            &Default::default(),
+            Some(&allowlist),
+            RepodataEncoding::Json,
+        );
+        let merged: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        assert!(failures.is_empty());
+        assert_eq!(
+            listed(&merged),
+            vec![
+                "internal-1.0-0.conda",
+                "rich-12.0-0.tar.bz2",
+                "rich-13.0-0.conda"
+            ]
+        );
+        assert_eq!(dropped.not_allowed, 3);
+        assert_eq!(dropped.owned, 0);
     }
 
     #[test]

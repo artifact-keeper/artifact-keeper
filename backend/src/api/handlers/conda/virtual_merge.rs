@@ -7,6 +7,11 @@
 //! names ([`super::virtual_hosted_owned_names`]): a remote member contributes
 //! no record under a name a hosted member has published.
 //!
+//! A virtual may also carry a package allowlist
+//! ([`crate::services::conda_allowlist`], #4576): when it is enabled, a remote
+//! record the list does not admit is dropped as well. Hosted records are never
+//! filtered by it.
+//!
 //! Remote members are fetched in their compressed encodings, never as the
 //! plain document: `repodata.json.zst`, then `.bz2`, then `.json`, each through
 //! the capped, budgeted proxy path with the same 128 MiB default ceiling the
@@ -28,6 +33,7 @@ use serde_json::value::RawValue;
 
 use crate::api::handlers::proxy_helpers;
 use crate::models::repository::{Repository, RepositoryType};
+use crate::services::conda_allowlist::CompiledAllowlist;
 use crate::services::proxy_service::ProxyService;
 
 /// Ceiling on the bytes read from one remote member for one document, as
@@ -435,6 +441,15 @@ struct RecordName<'a> {
     name: Option<std::borrow::Cow<'a, str>>,
 }
 
+/// The `name` and `version` a record claims for itself.
+#[derive(Deserialize)]
+struct RecordIdentity<'a> {
+    #[serde(default, borrow)]
+    name: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    version: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// The merged document. Field order is the serialized key order, which is the
 /// sorted order the hosted document uses.
 #[derive(Serialize)]
@@ -475,6 +490,42 @@ fn remote_record_is_owned(filename: &str, raw: &RawValue, owned: &HashSet<String
             .is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
 }
 
+/// Whether the allowlist admits a remote record: by the name and version its
+/// filename carries (what the download seam checks) AND by the `name` and
+/// `version` the record itself claims, when it carries them. A record whose
+/// own identity disagrees with an admitted filename is dropped; the filename
+/// is checked first so the common case (not admitted) never parses the record.
+fn remote_record_is_admitted(
+    subdir: &str,
+    filename: &str,
+    raw: &RawValue,
+    allowlist: &CompiledAllowlist,
+) -> bool {
+    let Some((file_name, file_version)) =
+        crate::services::conda_allowlist::split_conda_filename(filename)
+    else {
+        return false;
+    };
+    if !allowlist.admits(file_name, file_version, subdir) {
+        return false;
+    }
+    let Ok(id) = serde_json::from_str::<RecordIdentity<'_>>(raw.get()) else {
+        return false;
+    };
+    let name = id.name.as_deref().unwrap_or(file_name);
+    let version = id.version.as_deref().unwrap_or(file_version);
+    (name == file_name && version == file_version) || allowlist.admits(name, version, subdir)
+}
+
+/// Remote records a merge left out, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct MergeDrops {
+    /// Records under a name a hosted member owns.
+    pub owned: usize,
+    /// Records the virtual's allowlist does not admit.
+    pub not_allowed: usize,
+}
+
 /// Merge hosted records and remote member documents into one encoded
 /// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
 /// thread. A member document that does not parse is reported as that member's
@@ -485,8 +536,9 @@ pub(super) fn merge_repodata(
     hosted: &[HostedRecord],
     remote: &[MemberDocument],
     owned: &HashSet<String>,
+    allowlist: Option<&CompiledAllowlist>,
     encoding: super::RepodataEncoding,
-) -> (Result<Vec<u8>, Response>, Vec<MemberFailure>, usize) {
+) -> (Result<Vec<u8>, Response>, Vec<MemberFailure>, MergeDrops) {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
     let mut packages_conda: BTreeMap<&str, &RawValue> = BTreeMap::new();
     for h in hosted {
@@ -499,7 +551,7 @@ pub(super) fn merge_repodata(
     }
 
     let mut failures = Vec::new();
-    let mut dropped = 0usize;
+    let mut dropped = MergeDrops::default();
     let mut parsed: Vec<UpstreamRepodata<'_>> = Vec::with_capacity(remote.len());
     for doc in remote {
         match serde_json::from_slice::<UpstreamRepodata<'_>>(&doc.json) {
@@ -518,8 +570,14 @@ pub(super) fn merge_repodata(
         ] {
             for (filename, raw) in source {
                 if remote_record_is_owned(filename, raw, owned) {
-                    dropped += 1;
+                    dropped.owned += 1;
                     continue;
+                }
+                if let Some(allowlist) = allowlist {
+                    if !remote_record_is_admitted(subdir, filename, raw, allowlist) {
+                        dropped.not_allowed += 1;
+                        continue;
+                    }
                 }
                 target.entry(filename.as_str()).or_insert(*raw);
             }
@@ -554,17 +612,22 @@ struct MergedChanneldata<'a> {
 
 /// Merge hosted channeldata entries (name -> entry, already first-writer-wins
 /// across hosted members) with remote member documents into a pretty-printed
-/// `channeldata.json`. Remote entries for owned names are dropped.
+/// `channeldata.json`. Remote entries for owned names are dropped, and so are
+/// remote entries whose name the allowlist (when enabled) admits under no
+/// entry; channeldata is a per-name summary, so versions and subdirs do not
+/// enter into it. Returns the number of entries the allowlist dropped.
 pub(super) fn merge_channeldata(
     hosted: &[(String, Box<RawValue>)],
     remote: &[MemberDocument],
     owned: &HashSet<String>,
-) -> (serde_json::Result<Vec<u8>>, Vec<MemberFailure>) {
+    allowlist: Option<&CompiledAllowlist>,
+) -> (serde_json::Result<Vec<u8>>, Vec<MemberFailure>, usize) {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
     for (name, entry) in hosted {
         packages.entry(name.as_str()).or_insert(entry);
     }
     let mut failures = Vec::new();
+    let mut not_allowed = 0usize;
     let mut parsed = Vec::with_capacity(remote.len());
     for doc in remote {
         match serde_json::from_slice::<UpstreamChanneldata<'_>>(&doc.json) {
@@ -581,6 +644,10 @@ pub(super) fn merge_channeldata(
             if owned.contains(&name.to_ascii_lowercase()) {
                 continue;
             }
+            if allowlist.is_some_and(|a| !a.admits_name(name)) {
+                not_allowed += 1;
+                continue;
+            }
             packages.entry(name.as_str()).or_insert(*raw);
         }
     }
@@ -588,7 +655,7 @@ pub(super) fn merge_channeldata(
         channeldata_version: 1,
         packages,
     };
-    (serde_json::to_vec_pretty(&merged), failures)
+    (serde_json::to_vec_pretty(&merged), failures, not_allowed)
 }
 
 /// The 500 a failed merge task or serialization answers with.

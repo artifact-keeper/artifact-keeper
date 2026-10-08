@@ -146,6 +146,9 @@ pub enum AuditAction {
     /// An admin reconciled a repository's stored objects with its artifact
     /// rows (#1570), registering ghost objects.
     StorageReindexRun,
+    /// A repository admin set, changed or removed the package allowlist of a
+    /// virtual conda channel (#4576). Appended at the END of the enum.
+    RepositoryAllowlistChanged,
 }
 
 impl AuditAction {
@@ -210,6 +213,7 @@ impl AuditAction {
             AuditAction::CiOidcGroupBindingReconciled => "CI_OIDC_GROUP_BINDING_RECONCILED",
             AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
             AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
+            AuditAction::RepositoryAllowlistChanged => "REPOSITORY_ALLOWLIST_CHANGED",
         }
     }
 }
