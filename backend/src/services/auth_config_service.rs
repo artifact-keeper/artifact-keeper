@@ -12,7 +12,20 @@ use uuid::Uuid;
 
 use crate::api::validation::validate_outbound_sso_url;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+
+/// A consumed download ticket: who minted it, what for, the path it is bound
+/// to, and the repository restriction of the minting credential.
+#[derive(Debug, Clone)]
+pub struct DownloadTicket {
+    pub user_id: Uuid,
+    pub purpose: String,
+    pub resource_path: Option<String>,
+    /// `None` for a ticket minted before its scope was recorded
+    /// (GHSA-2mfv-xg68-gq4p); redemption refuses those.
+    pub repo_scope: Option<AccessScope>,
+}
 
 /// Validate an OIDC `issuer_url` against the SSO outbound-URL SSRF guard
 /// before it is persisted. Uses the dedicated `SsoDiscovery` context
@@ -2060,13 +2073,19 @@ impl AuthConfigService {
 
     /// Create a short-lived download ticket for a user.
     /// Tickets expire after 30 seconds and are single-use.
+    ///
+    /// `repo_scope` is the repository restriction of the credential minting
+    /// the ticket. It is stored with the ticket and restored when the ticket
+    /// is redeemed, so a ticket never reads more than its minter could
+    /// (GHSA-2mfv-xg68-gq4p).
     pub async fn create_download_ticket(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
     ) -> Result<String> {
-        Self::insert_download_ticket(pool, user_id, purpose, resource_path, None).await
+        Self::insert_download_ticket(pool, user_id, repo_scope, purpose, resource_path, None).await
     }
 
     /// Like [`Self::create_download_ticket`] but with an explicit lifetime.
@@ -2080,16 +2099,26 @@ impl AuthConfigService {
     pub async fn create_download_ticket_with_ttl(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
         ttl_secs: i64,
     ) -> Result<String> {
-        Self::insert_download_ticket(pool, user_id, purpose, resource_path, Some(ttl_secs)).await
+        Self::insert_download_ticket(
+            pool,
+            user_id,
+            repo_scope,
+            purpose,
+            resource_path,
+            Some(ttl_secs),
+        )
+        .await
     }
 
     async fn insert_download_ticket(
         pool: &PgPool,
         user_id: Uuid,
+        repo_scope: &AccessScope,
         purpose: &str,
         resource_path: Option<&str>,
         ttl_secs: Option<i64>,
@@ -2101,17 +2130,22 @@ impl AuthConfigService {
         );
 
         // `NULL` for `$5` keeps the column's own 30-second default, so the
-        // historical call shape is byte-for-byte unchanged.
+        // historical call shape is byte-for-byte unchanged. `$6` is NULL for
+        // an unrestricted minter and its allowlist otherwise.
         sqlx::query(
-            r#"INSERT INTO download_tickets (ticket, user_id, purpose, resource_path, expires_at)
+            r#"INSERT INTO download_tickets
+                   (ticket, user_id, purpose, resource_path, expires_at,
+                    scope_recorded, allowed_repo_ids)
                VALUES ($1, $2, $3, $4,
-                       NOW() + make_interval(secs => COALESCE($5, 30)::double precision))"#,
+                       NOW() + make_interval(secs => COALESCE($5, 30)::double precision),
+                       true, $6)"#,
         )
         .bind(&ticket)
         .bind(user_id)
         .bind(purpose)
         .bind(resource_path)
         .bind(ttl_secs)
+        .bind(repo_scope.as_allowed_repo_ids())
         .execute(pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2120,15 +2154,17 @@ impl AuthConfigService {
     }
 
     /// Validate and consume a download ticket (single-use).
-    /// Returns (user_id, purpose, resource_path) if valid.
-    pub async fn validate_download_ticket(
-        pool: &PgPool,
-        ticket: &str,
-    ) -> Result<(Uuid, String, Option<String>)> {
-        let row: (Uuid, String, Option<String>) = sqlx::query_as(
+    pub async fn validate_download_ticket(pool: &PgPool, ticket: &str) -> Result<DownloadTicket> {
+        let (user_id, purpose, resource_path, scope_recorded, allowed_repo_ids): (
+            Uuid,
+            String,
+            Option<String>,
+            bool,
+            Option<Vec<Uuid>>,
+        ) = sqlx::query_as(
             r#"DELETE FROM download_tickets
                WHERE ticket = $1 AND expires_at > NOW()
-               RETURNING user_id, purpose, resource_path"#,
+               RETURNING user_id, purpose, resource_path, scope_recorded, allowed_repo_ids"#,
         )
         .bind(ticket)
         .fetch_optional(pool)
@@ -2136,7 +2172,12 @@ impl AuthConfigService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid or expired download ticket".into()))?;
 
-        Ok(row)
+        Ok(DownloadTicket {
+            user_id,
+            purpose,
+            resource_path,
+            repo_scope: scope_recorded.then(|| AccessScope::from(allowed_repo_ids)),
+        })
     }
 
     /// Clean up expired download tickets. Intended to be called periodically.

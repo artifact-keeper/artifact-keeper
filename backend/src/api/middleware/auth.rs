@@ -1342,7 +1342,8 @@ pub(crate) fn extract_ticket_from_query(query: Option<&str>) -> Option<String> {
 /// Tickets are minted for downloads/streams only. Any write operation
 /// (POST, PUT, PATCH, DELETE) authenticated by a ticket must be rejected
 /// even when the underlying user has write permission, because the ticket
-/// embeds no scope information and the calling client may be a browser
+/// carries no action scope (only the minter's repository restriction)
+/// and the calling client may be a browser
 /// `<a href>` or `EventSource` that the user did not consent to use for
 /// mutations.
 fn ticket_method_allowed(method: &Method) -> bool {
@@ -1381,14 +1382,14 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
-    let (user_id, _purpose, resource_path) =
+    let redeemed =
         crate::services::auth_config_service::AuthConfigService::validate_download_ticket(
             db, ticket,
         )
         .await
         .ok()?;
 
-    if !ticket_path_allowed(resource_path.as_deref(), request_path) {
+    if !ticket_path_allowed(redeemed.resource_path.as_deref(), request_path) {
         // Ticket has been consumed by validate_download_ticket; treat the
         // mismatch as an authentication failure so the client cannot reuse
         // the same ticket against a different path.
@@ -1407,31 +1408,28 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
+    // A ticket minted before its repository scope was recorded carries no
+    // restriction we could restore, so it authenticates nothing (fail
+    // closed, GHSA-2mfv-xg68-gq4p). Such tickets expire within minutes.
+    let repo_scope = redeemed.repo_scope?;
+
     // Load the owning user. We block deactivated users so a revoked account
     // cannot keep downloading via outstanding tickets, but we honour service
     // accounts and not-yet-rotated passwords because the ticket itself is
     // the proof of intent: the JWT session that minted it had whatever
     // rights the user had at mint time.
     //
-    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
-    // adding the ticket-consumer middleware does not require regenerating
-    // the offline SQLx query cache.
-    let user: User = sqlx::query_as::<_, User>(
-        r#"
-        SELECT
-            id, username, email, password_hash, display_name,
-            auth_provider, external_id, is_admin, is_active,
-            is_service_account, must_change_password,
-            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-            last_login_at, created_at, updated_at
-        FROM users
-        WHERE id = $1 AND is_active = true
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await
-    .ok()??;
+    // `SELECT *` rather than a hand-written column list: the list this
+    // replaced had drifted behind `User` (it lacked the lockout and
+    // password-change columns), so every decode failed and no ticket ever
+    // authenticated (GHSA-2mfv-xg68-gq4p). `query_as::<_, User>` rather than
+    // the `query_as!` macro keeps this out of the offline SQLx query cache.
+    let user: User =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1 AND is_active = true")
+            .bind(redeemed.user_id)
+            .fetch_optional(db)
+            .await
+            .ok()??;
 
     let mut ext = AuthExtension::from(user);
     // Tickets are read-only. Drop admin elevation so a ticket minted by an
@@ -1455,6 +1453,11 @@ async fn try_resolve_ticket_auth(
     // intentionally minted a download URL.
     ext.is_api_token = true;
     ext.scopes = Some(vec![]);
+    // The minting credential's repository restriction, not the owner's full
+    // reach: `From<User>` grants every repository the user can access, which
+    // would let a repository-restricted token mint its way out of its
+    // restriction (GHSA-2mfv-xg68-gq4p).
+    ext.allowed_repo_ids = repo_scope;
     Some(ext)
 }
 
@@ -1472,10 +1475,22 @@ struct TicketRequestParts {
 
 fn extract_ticket_request_parts(request: &Request) -> Option<TicketRequestParts> {
     let ticket = extract_ticket_from_query(request.uri().query())?;
+    // A ticket is bound to the path the client will request, which is the
+    // FULL path. Inside a nest (`/api/v1/repositories`, ...) axum has already
+    // stripped `request.uri()` down to a suffix, so compare against
+    // `OriginalUri` (populated by the outer router), falling back to the
+    // request URI for a flat router with no nest. Without this a path-bound
+    // ticket never matched on a nested route (GHSA-2mfv-xg68-gq4p follow-on:
+    // the web UI and Terraform mirror ticket flows).
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
     Some(TicketRequestParts {
         ticket,
         method: request.method().clone(),
-        path: request.uri().path().to_string(),
+        path,
     })
 }
 
@@ -7378,6 +7393,185 @@ mod tests {
                 repo_visibility_middleware,
             ));
         app.oneshot(request).await.unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-2mfv-xg68-gq4p: a download ticket carries the repository
+    // restriction of the credential that minted it, and a valid ticket
+    // actually redeems. Production router, real database.
+    // -----------------------------------------------------------------------
+
+    /// Mint a ticket bound to `path` with `bearer` through the production
+    /// router. Returns the status and, on 200, the ticket.
+    async fn mint_ticket_via_router(
+        state: &crate::api::SharedState,
+        bearer: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        let body = serde_json::json!({ "purpose": "download", "resource_path": path });
+        let mut req = tdh::post(
+            "/api/v1/auth/ticket".to_string(),
+            "application/json",
+            axum::body::Bytes::from(body.to_string()),
+        );
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        (
+            status,
+            json["ticket"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Redeem `ticket` on `path` with no other credential.
+    async fn redeem_ticket_via_router(
+        state: &crate::api::SharedState,
+        path: &str,
+        ticket: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        tdh::send(app, tdh::get(format!("{path}?ticket={ticket}"))).await
+    }
+
+    #[tokio::test]
+    async fn download_ticket_keeps_the_minting_credentials_repository_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // A second private repository the same user can also read.
+        let (other_id, other_key, other_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        tdh::grant_repo_access(&fx.pool, other_id, fx.user_id).await;
+        let seed = |id: Uuid, key: &str, dir: &std::path::Path, body: &'static [u8]| {
+            let info = tdh::make_repo_info(id, key, dir, "local", None);
+            let state = fx.state.clone();
+            let pool = fx.pool.clone();
+            let user = fx.user_id;
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "ticket/file.bin",
+                    "ticket/file.bin",
+                    "file.bin",
+                    "1",
+                    "application/octet-stream",
+                    axum::body::Bytes::from_static(body),
+                    user,
+                )
+                .await
+            }
+        };
+        seed(fx.repo_id, &fx.repo_key, &fx.storage_dir, b"allowed-bytes").await;
+        seed(other_id, &other_key, &other_dir, b"other-bytes").await;
+        let allowed_path = format!(
+            "/api/v1/repositories/{}/download/ticket/file.bin",
+            fx.repo_key
+        );
+        let other_path = format!("/api/v1/repositories/{other_key}/download/ticket/file.bin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(fx.user_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load user");
+        let bearer_with = |scopes: Option<Vec<String>>, repos: Option<Vec<Uuid>>| {
+            let pair = auth_service
+                .generate_tokens_with_scope(&user, scopes, repos)
+                .expect("mint access token");
+            format!("Bearer {}", pair.access_token)
+        };
+        // The advisory's credential: read:artifacts, restricted to one repository.
+        let restricted = bearer_with(
+            Some(vec!["read:artifacts".to_string()]),
+            Some(vec![fx.repo_id]),
+        );
+        let unrestricted = tdh::bearer_for(&fx.state, fx.user_id).await;
+
+        // Baseline: the restricted credential cannot read the other repository.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(other_path.clone());
+        req.headers_mut().insert(
+            "authorization",
+            restricted
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (direct, _) = tdh::send(app, req).await;
+
+        // 1) An unrestricted session's ticket redeems (the User lookup works).
+        let (minted, ticket) = mint_ticket_via_router(&fx.state, &unrestricted, &other_path).await;
+        let (session_ticket, session_body) =
+            redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 2) The restricted credential's ticket redeems inside its scope.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &allowed_path).await;
+        let (in_scope, in_scope_body) =
+            redeem_ticket_via_router(&fx.state, &allowed_path, &ticket).await;
+
+        // 3) ...and does NOT read the other repository.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &other_path).await;
+        let (out_of_scope, _) = redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 4) A credential without read:artifacts cannot mint a ticket.
+        let write_only = bearer_with(Some(vec!["write:artifacts".to_string()]), None);
+        let (write_only_mint, _) =
+            mint_ticket_via_router(&fx.state, &write_only, &allowed_path).await;
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_member_repo(&fx.pool, other_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: the token is restricted"
+        );
+        assert_eq!(
+            minted,
+            StatusCode::OK,
+            "an unrestricted session mints a ticket"
+        );
+        assert_eq!(
+            session_ticket,
+            StatusCode::OK,
+            "a valid ticket must redeem: {}",
+            String::from_utf8_lossy(&session_body)
+        );
+        assert_eq!(&session_body[..], b"other-bytes");
+        assert_eq!(
+            in_scope,
+            StatusCode::OK,
+            "a restricted credential's ticket must redeem inside its scope: {}",
+            String::from_utf8_lossy(&in_scope_body)
+        );
+        assert_eq!(&in_scope_body[..], b"allowed-bytes");
+        assert_eq!(
+            out_of_scope,
+            StatusCode::NOT_FOUND,
+            "a ticket must not read a repository its minting credential could not"
+        );
+        assert_eq!(
+            write_only_mint,
+            StatusCode::FORBIDDEN,
+            "minting a download ticket needs read:artifacts"
+        );
     }
 
     // -----------------------------------------------------------------------

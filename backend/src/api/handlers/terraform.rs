@@ -1950,14 +1950,17 @@ async fn mint_mirror_archive_tickets(
     platforms: &[(String, String)],
 ) -> std::collections::HashMap<(String, String), String> {
     let mut tickets = std::collections::HashMap::new();
-    let Some(user_id) = auth.map(|a| a.user_id) else {
+    let Some(auth) = auth else {
         return tickets;
     };
     for (os, arch) in platforms {
         let resource_path = coords.download_request_path(os, arch);
+        // The ticket carries the caller's repository restriction
+        // (GHSA-2mfv-xg68-gq4p).
         match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
             &state.db,
-            user_id,
+            auth.user_id,
+            &auth.allowed_repo_ids,
             "terraform-mirror-archive",
             Some(&resource_path),
             MIRROR_TICKET_TTL_SECS,
@@ -4028,8 +4031,16 @@ mod tests {
              (Terraform sends no credentials there), got {advertised:?}"
         );
 
-        let (ticket_user, purpose, bound_path) =
-            redeemed.expect("the advertised ticket must be a live, redeemable ticket");
+        let crate::services::auth_config_service::DownloadTicket {
+            user_id: ticket_user,
+            purpose,
+            resource_path: bound_path,
+            repo_scope,
+        } = redeemed.expect("the advertised ticket must be a live, redeemable ticket");
+        assert!(
+            repo_scope.is_some(),
+            "the ticket must record the caller's repository scope (GHSA-2mfv-xg68-gq4p)"
+        );
         assert_eq!(
             ticket_user, user_id,
             "the ticket must be user-specific: it authenticates as the caller \
