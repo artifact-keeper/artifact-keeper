@@ -872,7 +872,11 @@ async fn insert_promoted_artifact_row(
     artifact: &crate::models::artifact::Artifact,
     uploaded_by: Uuid,
     origin: Option<serde_json::Value>,
+    oci_image: Option<&crate::services::oci_promotion::PreparedOciImage>,
 ) -> std::result::Result<(), sqlx::Error> {
+    // The row, its metadata and (for a Docker/OCI manifest) the rows that make
+    // the image pullable commit together (#4578).
+    let mut tx = db.begin().await?;
     // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
     // gated the promotion; it is not an upload (#4166 scope).
     // NO-QUOTA-ADMISSION: a promotion copy, not a client publish; whether a
@@ -900,7 +904,7 @@ async fn insert_promoted_artifact_row(
         uploaded_by,
         origin
     )
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
 
     // Carry the format metadata document across (F9). The copy is a new
@@ -916,9 +920,15 @@ async fn insert_promoted_artifact_row(
     )
     .bind(new_artifact_id)
     .bind(artifact.id)
-    .execute(db)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+
+    if let Some(image) = oci_image {
+        image
+            .register_in_tx(&mut tx, target_repo_id, uploaded_by)
+            .await?;
+    }
+    tx.commit().await
 }
 
 /// One row of the promotion audit trail. A struct rather than a parameter list
@@ -1221,6 +1231,18 @@ pub async fn promote_artifact(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
 
+    // A Docker/OCI manifest needs its child manifests and blobs in the target
+    // too, and the rows a pull resolves through (#4578). `None` for every
+    // other artifact.
+    let oci_image = crate::services::oci_promotion::prepare(
+        &state.db,
+        &*source_storage,
+        &*target_storage,
+        source_repo.id,
+        &artifact.path,
+    )
+    .await?;
+
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
     // Carry the SOURCE artifact's origin onto the copy (#4152). Without an
@@ -1241,6 +1263,7 @@ pub async fn promote_artifact(
         &artifact,
         auth.user_id,
         source_origin,
+        oci_image.as_ref(),
     )
     .await
     .map_err(|e: sqlx::Error| {
@@ -1613,6 +1636,29 @@ pub async fn promote_artifacts_bulk(
             continue;
         }
 
+        // Same Docker/OCI content copy as the single-promote path (#4578).
+        let oci_image = match crate::services::oci_promotion::prepare(
+            &state.db,
+            &*source_storage,
+            &*target_storage,
+            source_repo.id,
+            &artifact.path,
+        )
+        .await
+        {
+            Ok(image) => image,
+            Err(e) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    crate::api::handlers::internal_err_message("Failed to copy artifact", &e)
+                        .to_string(),
+                ));
+                continue;
+            }
+        };
+
         let new_artifact_id = Uuid::new_v4();
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
         // Same origin carry-over as the single-promote path (#4152): the
@@ -1639,6 +1685,7 @@ pub async fn promote_artifacts_bulk(
             &artifact,
             auth.user_id,
             source_origin,
+            oci_image.as_ref(),
         )
         .await;
 
