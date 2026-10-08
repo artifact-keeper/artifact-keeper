@@ -1753,6 +1753,12 @@ async fn update_repo_security(
 ) -> Result<Json<ScanConfigResponse>> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    // Token action scope first, as on the sibling repository-configuration
+    // handlers (`set_cache_ttl`, `set_npm_scope_policy`, `invalidate_cache`,
+    // `set_egress_proxy`): a token minted read-only must not reconfigure
+    // scanning even when its owner is a repository admin
+    // (GHSA-gvhj-8vg9-358g). A session (`scopes: None`) passes.
+    auth.require_scope("write:repositories")?;
     // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
     // so enforce is_public + per-repo role-assignment membership here.
     let repo_service = RepositoryService::new(state.db.clone());
@@ -5037,6 +5043,77 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GHSA-gvhj-8vg9-358g: a user holding `repository:admin` who presents an
+    /// API token minted with only `read:artifacts` must NOT be able to change
+    /// the repository's scan configuration. The four sibling
+    /// repository-configuration handlers (`set_cache_ttl`,
+    /// `set_npm_scope_policy`, `invalidate_cache`, `set_egress_proxy`) all
+    /// refuse such a token at the `write:repositories` scope gate; this one
+    /// must too. The same user's `write:repositories` token still succeeds.
+    #[tokio::test]
+    async fn update_repo_security_requires_write_repositories_scope_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let token = |scope: &str| AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec![scope.to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_id]),
+            ..tdh::make_auth(user_id, &username)
+        };
+        let body = || UpsertScanConfigRequest {
+            scan_enabled: Some(false),
+            block_on_policy_violation: Some(false),
+            ..Default::default()
+        };
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused = update_repo_security(
+            State(state),
+            Extension(Some(token("read:artifacts"))),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        let persisted_after_refusal = ScanConfigService::new(pool.clone())
+            .get_config(repo_id)
+            .await
+            .expect("get_config");
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = update_repo_security(
+            State(state),
+            Extension(Some(token("write:repositories"))),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match refused {
+            Err(AppError::Authorization(msg)) => assert!(
+                msg.contains("scope"),
+                "the refusal must come from the scope gate: {msg}"
+            ),
+            other => panic!("a read:artifacts token must be refused (403), got: {other:?}"),
+        }
+        assert!(
+            persisted_after_refusal.is_none(),
+            "a refused update_repo_security must not persist a scan config"
+        );
+        assert!(
+            allowed.is_ok(),
+            "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
     }
 
     /// #3645: `proxy_scan_action = record_only` round-trips through the
