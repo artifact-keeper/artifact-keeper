@@ -136,7 +136,8 @@ impl AuditAction {
             | AuditAction::ProxyScanVerdictDeleted
             | AuditAction::CiOidcGroupBindingReconciled
             | AuditAction::StorageScrubRun
-            | AuditAction::StorageReindexRun => Outcome::Success,
+            | AuditAction::StorageReindexRun
+            | AuditAction::RepositoryAllowlistChanged => Outcome::Success,
         }
     }
 }
