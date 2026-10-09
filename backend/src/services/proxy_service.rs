@@ -248,6 +248,9 @@ pub(crate) struct UpstreamResponse {
     pub(crate) commit_sha: Option<String>,
     pub(crate) effective_url: String,
     pub(crate) link: Option<String>,
+    /// Upstream `X-Terraform-Get`, when it sent one: where a Terraform module
+    /// registry's `.../download` endpoint says the module source lives (#4590).
+    pub(crate) terraform_get: Option<String>,
 }
 
 /// Streaming response from an upstream registry fetch. Used by the
@@ -1850,6 +1853,24 @@ pub struct DirectUpstreamBody {
     pub link: Option<String>,
 }
 
+/// An upstream Terraform module registry's answer to
+/// `v1/modules/<ns>/<name>/<provider>/<version>/download` — the result of
+/// [`ProxyService::fetch_upstream_terraform_module_location`] (#4590).
+///
+/// The Module Registry Protocol puts the module's source address in the
+/// `X-Terraform-Get` header of a `204`, or (newer registries) in a JSON body
+/// `{"location": "..."}` of a `200`. Both are carried so the caller can apply
+/// the client's own precedence (header first).
+pub struct UpstreamModuleLocation {
+    /// The `X-Terraform-Get` response header, if present.
+    pub x_terraform_get: Option<String>,
+    /// The response body (empty for the usual `204`).
+    pub content: Bytes,
+    /// The URL that answered, after redirects: the base a relative location
+    /// resolves against, exactly as the Terraform client resolves it.
+    pub effective_url: String,
+}
+
 pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
     /// This deployment's proxy-cache scope (#3454). Only needed to recover the
@@ -3323,6 +3344,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let terraform_get = response
+            .headers()
+            .get("x-terraform-get")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         // Running-bounded accumulation: pull one body frame at a time and
         // reject the moment the total would exceed `max`. No un-bounded
         // full-body read (`response.bytes()`) is ever issued.
@@ -3367,6 +3394,7 @@ impl UpstreamClient {
             commit_sha,
             effective_url,
             link,
+            terraform_get,
         })
     }
 
@@ -5995,6 +6023,30 @@ impl ProxyService {
             content_type: resp.content_type,
             content_encoding: resp.content_encoding,
             link: resp.link,
+        })
+    }
+
+    /// Ask an upstream Terraform module registry where a module version's
+    /// source lives (#4590), uncached.
+    ///
+    /// The answer is a small location document (usually an empty `204` whose
+    /// `X-Terraform-Get` header carries the address), not the module itself, so
+    /// it is read directly rather than through the proxy cache: the cache
+    /// stores bodies, and the body here is empty. The location may also be a
+    /// short-lived signed URL, which must not be replayed from a cache.
+    pub async fn fetch_upstream_terraform_module_location(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<UpstreamModuleLocation> {
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self
+            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .await?;
+        Ok(UpstreamModuleLocation {
+            x_terraform_get: resp.terraform_get,
+            content: resp.content,
+            effective_url: resp.effective_url,
         })
     }
 
