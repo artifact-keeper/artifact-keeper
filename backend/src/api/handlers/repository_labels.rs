@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_action, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -80,6 +82,29 @@ pub struct AddLabelRequest {
 
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
+
+/// Resolve `key` and authorize a label WRITE on it.
+///
+/// Repository labels select repositories into sync policies, and therefore
+/// into replication to peers, so changing them is a repository
+/// configuration write (GHSA-mvmh-g8wm-r3cp). The caller needs the
+/// `write:repositories` token scope, the tenant gate (the /repositories nest
+/// bypasses repo_visibility_middleware, see #xtenant) and the deny-by-default
+/// repository `write` action. The tenant gate alone is a no-op on a public
+/// repository and admits a read-only member of a private one.
+async fn authorize_label_write(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+) -> Result<crate::models::repository::Repository> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:repositories")?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(key).await?;
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    Ok(repo)
 }
 
 fn label_to_response(label: RepositoryLabel) -> LabelResponse {
@@ -167,6 +192,7 @@ async fn list_labels(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Labels updated", body = LabelsListResponse),
+        (status = 403, description = "Caller lacks the repository write action, or the token lacks write:repositories"),
         (status = 404, description = "Repository not found")
     )
 )]
@@ -176,13 +202,7 @@ async fn set_labels(
     Path(key): Path<String>,
     Json(payload): Json<SetLabelsRequest>,
 ) -> Result<Json<LabelsListResponse>> {
-    let auth = require_auth(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
-    // so enforce is_public + role-assignment membership here (see #xtenant).
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = authorize_label_write(&state, auth, &key).await?;
 
     let entries: Vec<LabelEntry> = payload
         .labels
@@ -216,6 +236,7 @@ async fn set_labels(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Label added/updated", body = LabelResponse),
+        (status = 403, description = "Caller lacks the repository write action, or the token lacks write:repositories"),
         (status = 404, description = "Repository not found")
     )
 )]
@@ -225,13 +246,7 @@ async fn add_label(
     Path((key, label_key)): Path<(String, String)>,
     Json(payload): Json<AddLabelRequest>,
 ) -> Result<Json<LabelResponse>> {
-    let auth = require_auth(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
-    // so enforce is_public + role-assignment membership here (see #xtenant).
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = authorize_label_write(&state, auth, &key).await?;
 
     let label_service = RepositoryLabelService::new(state.db.clone());
     let label = label_service
@@ -257,6 +272,7 @@ async fn add_label(
     security(("bearer_auth" = [])),
     responses(
         (status = 204, description = "Label removed"),
+        (status = 403, description = "Caller lacks the repository write action, or the token lacks write:repositories"),
         (status = 404, description = "Repository or label not found")
     )
 )]
@@ -265,13 +281,7 @@ async fn delete_label(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, label_key)): Path<(String, String)>,
 ) -> Result<axum::http::StatusCode> {
-    let auth = require_auth(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
-    // so enforce is_public + role-assignment membership here (see #xtenant).
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = authorize_label_write(&state, auth, &key).await?;
 
     let label_service = RepositoryLabelService::new(state.db.clone());
     label_service.remove_label(repo.id, &label_key).await?;
@@ -303,9 +313,27 @@ mod tests {
             let rest = &source[start + marker.len()..];
             let end = rest.find("\nasync fn ").unwrap_or(rest.len());
             assert!(
-                rest[..end].contains("require_repo_write_access("),
-                "handler `{}` must call require_repo_write_access (xtenant)",
+                rest[..end].contains("authorize_label_write("),
+                "handler `{}` must authorize through authorize_label_write",
                 handler
+            );
+        }
+        // The shared gate carries the tenant gate AND the action gate
+        // (GHSA-mvmh-g8wm-r3cp): the tenant gate alone admits any session on
+        // a public repository.
+        let start = source
+            .find("async fn authorize_label_write(")
+            .expect("authorize_label_write");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        for gate in [
+            "require_scope(\"write:repositories\")",
+            "require_repo_write_access(",
+            r#"require_repo_action(&auth, repo.id, "write", &state.permission_service)"#,
+        ] {
+            assert!(
+                rest[..end].contains(gate),
+                "authorize_label_write must call {gate}"
             );
         }
         let start = source.find("async fn list_labels(").expect("list_labels");
@@ -625,5 +653,114 @@ mod tests {
         let roundtrip: LabelEntrySchema = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.key.len(), 128);
         assert_eq!(roundtrip.value.len(), 256);
+    }
+
+    /// GHSA-mvmh-g8wm-r3cp #2: repository labels select repositories into
+    /// sync policies, so writing them needs the repository `write` action
+    /// (and, for a token, the `write:repositories` scope). On a public
+    /// repository a signed-in user with no grant used to pass the tenant
+    /// gate alone (200 / 200 / 204); a private repository's read-only member
+    /// did too. Both are refused now, and a `developer` member still writes.
+    #[tokio::test]
+    async fn label_writes_require_the_repository_write_action_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        let state = || tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let session = tdh::make_auth(user_id, &username);
+        let set = |auth: AuthExtension| {
+            set_labels(
+                State(state()),
+                Extension(Some(auth)),
+                Path(key.clone()),
+                Json(SetLabelsRequest {
+                    labels: vec![LabelEntrySchema {
+                        key: "sync".to_string(),
+                        value: "peer-a".to_string(),
+                    }],
+                }),
+            )
+        };
+        let add = |auth: AuthExtension| {
+            add_label(
+                State(state()),
+                Extension(Some(auth)),
+                Path((key.clone(), "sync".to_string())),
+                Json(AddLabelRequest {
+                    value: "peer-b".to_string(),
+                }),
+            )
+        };
+        let del = |auth: AuthExtension| {
+            delete_label(
+                State(state()),
+                Extension(Some(auth)),
+                Path((key.clone(), "sync".to_string())),
+            )
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM repository_labels WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count labels")
+        };
+        fn forbidden<T>(r: &Result<T>) -> bool {
+            matches!(r, Err(AppError::Authorization(_)))
+        }
+
+        // 1) Public repository, no grant at all.
+        let r = set(session.clone()).await;
+        assert!(
+            forbidden(&r),
+            "set_labels without a grant: {:?}",
+            r.map(|_| ())
+        );
+        let r = add(session.clone()).await;
+        assert!(
+            forbidden(&r),
+            "add_label without a grant: {:?}",
+            r.map(|_| ())
+        );
+        let r = del(session.clone()).await;
+        assert!(forbidden(&r), "delete_label without a grant: {r:?}");
+        assert_eq!(count().await, 0, "a refused write must not store a label");
+
+        // 2) Read-only member.
+        tdh::grant_repo_role(&pool, repo_id, user_id, "reader").await;
+        let r = set(session.clone()).await;
+        assert!(forbidden(&r), "set_labels as a reader: {:?}", r.map(|_| ()));
+        assert_eq!(count().await, 0);
+
+        // 3) Write member: allowed for all three.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let r = set(session.clone()).await;
+        assert!(r.is_ok(), "set_labels as a developer: {:?}", r.map(|_| ()));
+        let r = add(session.clone()).await;
+        assert!(r.is_ok(), "add_label as a developer: {:?}", r.map(|_| ()));
+        assert_eq!(count().await, 1);
+
+        // 4) The same developer's read-only token is refused at the scope gate.
+        let read_token = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            ..session.clone()
+        };
+        let r = del(read_token).await;
+        assert!(forbidden(&r), "delete_label with a read token: {r:?}");
+        assert_eq!(count().await, 1);
+
+        let r = del(session.clone()).await;
+        assert!(r.is_ok(), "delete_label as a developer: {r:?}");
+        assert_eq!(count().await, 0);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

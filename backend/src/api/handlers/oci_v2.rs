@@ -18026,6 +18026,14 @@ mod remote_blob_streaming_fallback_tests {
 
         // With credentials configured (same-origin realm, so they are sent).
         let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        // The mock registry is this Remote's configured upstream, so the
+        // credentials belong there (GHSA-24rf-2gv2-j47c).
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("point the remote at the mock registry");
         crate::services::upstream_auth::save_upstream_auth(
             &pool,
             repo_id,

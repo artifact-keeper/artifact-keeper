@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::handlers::repositories::require_repo_write_access;
+use crate::api::handlers::repositories::{require_repo_admin, require_repo_write_access};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -192,11 +192,12 @@ fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 }
 
 /// Resolve a repository by key and fully authorize the caller for an
-/// email-subscription operation on it. Combines the three gates the handlers
+/// email-subscription operation on it. Combines the four gates the handlers
 /// share: write scope (`require_repo_write`), token repo-scope with
-/// existence-hiding 404 (`can_access_repo`), and the canonical tenant gate
+/// existence-hiding 404 (`can_access_repo`), the canonical tenant gate
 /// (`require_repo_write_access` = is_public + per-repo role-assignment
-/// membership). Returns the authorized principal and the resolved repository id.
+/// membership) and the repository `admin` action (`require_repo_admin`).
+/// Returns the authorized principal and the resolved repository id.
 ///
 /// The /repositories nest runs under `optional_auth_middleware` only, NOT
 /// `repo_visibility_middleware`, so this enforcement lives in-handler; factoring
@@ -216,6 +217,13 @@ async fn authorize_subscription_repo(
         )));
     }
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // The tenant gate above is a no-op on a public repository and admits any
+    // grantee of a private one. Subscriptions are repository administration:
+    // listing them discloses recipient addresses, creating one makes the
+    // instance mail arbitrary addresses, deleting one silences
+    // notifications. So all three need the repository `admin` action, like
+    // the other repository-configuration routes (GHSA-mvmh-g8wm-r3cp).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
     Ok((auth, repo.id))
 }
 
@@ -512,6 +520,10 @@ mod tests {
         assert!(
             helper[..helper_end].contains("require_repo_write_access("),
             "authorize_subscription_repo must call require_repo_write_access (xtenant)"
+        );
+        assert!(
+            helper[..helper_end].contains("require_repo_admin("),
+            "authorize_subscription_repo must call require_repo_admin (GHSA-mvmh-g8wm-r3cp)"
         );
     }
 
@@ -946,5 +958,96 @@ mod tests {
         let r: EmailSubscriptionResponse = row.into();
         assert_eq!(r.created_at, now);
         assert_eq!(r.updated_at, now);
+    }
+
+    /// GHSA-mvmh-g8wm-r3cp #4: email subscriptions are repository
+    /// administration. Listing them discloses recipient addresses, creating
+    /// one makes the instance mail arbitrary addresses and deleting one
+    /// silences notifications, so all three need the repository `admin`
+    /// action. A signed-in user with no grant on a public repository used
+    /// to create one (201) and list it (200).
+    #[tokio::test]
+    async fn email_subscriptions_require_repository_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        let state = || tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let session = tdh::make_auth(user_id, &username);
+        let create = |auth: AuthExtension| {
+            create_subscription(
+                State(state()),
+                Extension(Some(auth)),
+                Path(key.clone()),
+                Json(CreateEmailSubscriptionRequest {
+                    recipients: vec!["victim@example.com".to_string()],
+                    event_types: vec!["artifact.uploaded".to_string()],
+                    enabled: true,
+                }),
+            )
+        };
+        let list = |auth: AuthExtension| {
+            list_subscriptions(State(state()), Extension(Some(auth)), Path(key.clone()))
+        };
+        let remove = |auth: AuthExtension, id: Uuid| {
+            delete_subscription(
+                State(state()),
+                Extension(Some(auth)),
+                Path((key.clone(), id)),
+            )
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM email_subscriptions WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count subscriptions")
+        };
+        let forbidden = |e: &AppError| matches!(e, AppError::Authorization(_));
+
+        // A subscription someone else (an admin) set up.
+        let admin = tdh::admin_auth(user_id, &username);
+        let (_, Json(existing)) = create(admin.clone()).await.expect("admin creates");
+        assert_eq!(count().await, 1);
+
+        // 1) No grant, and 2) a developer (write) member: all three refused.
+        for grant in [None, Some("developer")] {
+            if let Some(role) = grant {
+                tdh::grant_repo_role(&pool, repo_id, user_id, role).await;
+            }
+            let Err(e) = create(session.clone()).await else {
+                panic!("create must be refused ({grant:?})")
+            };
+            assert!(forbidden(&e), "create ({grant:?}): {e:?}");
+            let Err(e) = list(session.clone()).await else {
+                panic!("list must be refused ({grant:?})")
+            };
+            assert!(forbidden(&e), "list ({grant:?}): {e:?}");
+            let Err(e) = remove(session.clone(), existing.id).await else {
+                panic!("delete must be refused ({grant:?})")
+            };
+            assert!(forbidden(&e), "delete ({grant:?}): {e:?}");
+            assert_eq!(count().await, 1, "a refusal must not change subscriptions");
+        }
+
+        // 3) Repository admin: all three allowed.
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let (status, Json(mine)) = create(session.clone()).await.expect("repo admin creates");
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(listed) = list(session.clone()).await.expect("repo admin lists");
+        assert_eq!(listed.subscriptions.len(), 2);
+        remove(session.clone(), mine.id)
+            .await
+            .expect("repo admin deletes");
+        remove(admin, existing.id).await.expect("admin deletes");
+        assert_eq!(count().await, 0);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

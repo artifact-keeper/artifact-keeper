@@ -66,6 +66,7 @@ object_store.workspace = true
 
 # HTTP types (presigned URL methods)
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 
 # TLS (explicit provider selection for rustls 0.23+)

@@ -1056,6 +1056,7 @@ fn validate_and_normalize_resource_path(input: &str) -> std::result::Result<Stri
         (status = 200, description = "Download ticket created", body = TicketResponse),
         (status = 400, description = "Invalid resource_path", body = super::super::openapi::ErrorResponse),
         (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+        (status = 403, description = "The token lacks read:artifacts", body = super::super::openapi::ErrorResponse),
     )
 )]
 pub async fn create_download_ticket(
@@ -1063,6 +1064,10 @@ pub async fn create_download_ticket(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateTicketRequest>,
 ) -> Result<Json<TicketResponse>> {
+    // A ticket is a read credential, so minting one needs the read scope
+    // (sessions, `scopes: None`, pass). GHSA-2mfv-xg68-gq4p.
+    auth.require_scope("read:artifacts")?;
+
     // Validate and canonicalize the bound path before storage. See
     // `validate_and_normalize_resource_path` for the full policy.
     let normalized_path = match payload.resource_path.as_deref() {
@@ -1070,9 +1075,12 @@ pub async fn create_download_ticket(
         None => None,
     };
 
+    // The ticket carries the minting credential's repository restriction,
+    // and redemption restores it (GHSA-2mfv-xg68-gq4p).
     let ticket = AuthConfigService::create_download_ticket(
         &state.db,
         auth.user_id,
+        &auth.allowed_repo_ids,
         &payload.purpose,
         normalized_path.as_deref(),
     )

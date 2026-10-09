@@ -264,6 +264,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "http-body",
  "http-body-util",
  "hyper-util",
  "jsonwebtoken 11.1.0",

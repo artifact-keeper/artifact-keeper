@@ -22,7 +22,6 @@ use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -464,11 +463,36 @@ fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
 // PUT /lfs/:repo_key/objects/:oid - Upload object
 // ---------------------------------------------------------------------------
 
+/// Largest Git LFS object accepted: the 2 GB the router has always allowed.
+/// The upload streams, so `DefaultBodyLimit` (which bounds buffering
+/// extractors) no longer applies to it and the cap is enforced here.
+const LFS_MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The upload body as a byte stream capped at `max` bytes. Errors are
+/// `multer` errors so the shared staging helper answers an over-size body with
+/// 413 and any other read failure with 400.
+fn capped_body_stream(
+    body: Body,
+    max: u64,
+) -> impl futures::Stream<Item = Result<Bytes, multer::Error>> {
+    use futures::StreamExt;
+    let mut seen: u64 = 0;
+    body.into_data_stream().map(move |chunk| {
+        let chunk = chunk.map_err(|e| multer::Error::StreamReadFailed(Box::new(e)))?;
+        seen = seen.saturating_add(chunk.len() as u64);
+        if seen > max {
+            return Err(multer::Error::StreamSizeExceeded { limit: max });
+        }
+        Ok(chunk)
+    })
+}
+
 async fn upload_object(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, oid)): Path<(String, String)>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
@@ -480,14 +504,34 @@ async fn upload_object(
 
     validate_oid(&oid)?;
 
-    if body.is_empty() {
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > LFS_MAX_OBJECT_BYTES) {
+        return Err(lfs_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("Object exceeds the maximum allowed size of {LFS_MAX_OBJECT_BYTES} bytes"),
+        ));
+    }
+
+    // GHSA-9f9r-c4w8-rjv9: stream the body to the upload scratch disk,
+    // hashing as it arrives, instead of buffering the whole object in memory
+    // before the handler runs. The router-wide progress deadline bounds a
+    // stalled body, and the per-principal admission cap bounds how many of
+    // these one caller can run at once.
+    let (staged, digests) = proxy_helpers::stage_stream_content_addressed(
+        &state,
+        capped_body_stream(body, LFS_MAX_OBJECT_BYTES),
+    )
+    .await?;
+
+    if staged.is_empty() {
         return Err(lfs_error_response(StatusCode::BAD_REQUEST, "Empty body"));
     }
 
     // Verify SHA-256 matches the OID
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    let computed_sha256 = digests.sha256;
 
     if computed_sha256 != oid {
         return Err(lfs_error_response(
@@ -522,27 +566,31 @@ async fn upload_object(
     }
 
     let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+    let size_bytes = staged.size_bytes();
     super::publish_quota::preflight_publish_quota(
         &state.db,
         repo.id,
         super::publish_quota::PublishAt::Path(&artifact_path),
-        body.len() as i64,
+        size_bytes,
     )
     .await?;
 
-    // Store the object
+    // Store the object, streaming it from the scratch file.
     let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-    })?;
-
-    let size_bytes = body.len() as i64;
+    let staged_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    storage
+        .put_stream(&storage_key, staged_stream)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::storage_err_message(&e),
+            )
+        })?;
+    drop(staged);
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -1171,6 +1219,7 @@ async fn delete_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     // -----------------------------------------------------------------------
     // extract_credentials
@@ -2370,7 +2419,8 @@ mod tests {
                     State(fx.state.clone()),
                     Extension(Some(fx.auth())),
                     Path((fx.repo_key.clone(), oid.clone())),
-                    Bytes::from(content),
+                    HeaderMap::new(),
+                    Body::from(content),
                 )
                 .await,
             )

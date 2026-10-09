@@ -64,6 +64,7 @@ with bounded memory):
   and then written to the backend, so each concurrent completion needs the full
   artifact size.
 - Incus/LXC image uploads (monolithic and chunked).
+- Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to 2 GB each.
 - Format-native publish routes that stream to staging: Ansible, Chef, Helm,
   JetBrains, Maven, NuGet, Pub, PyPI, Swift and Terraform.
 
@@ -79,9 +80,32 @@ scratch bytes ≈ (largest expected artifact) × (concurrent spooling uploads pe
 
 `MAX_UPLOAD_SIZE` (default 10 GiB) caps a single spooled body. A replica that
 accepts *N* concurrent spooling uploads of that size can need up to *N* ×
-`MAX_UPLOAD_SIZE` of free scratch space at once. Artifact Keeper does not cap
-upload concurrency itself; your ingress and clients do, so measure it from
-your traffic rather than assuming the worst case.
+`MAX_UPLOAD_SIZE` of free scratch space at once. Artifact Keeper caps upload
+concurrency per principal (below) and overall (`GLOBAL_MAX_CONCURRENCY`,
+default 512 requests of any kind), but most deployments run far below those
+caps, so measure concurrency from your traffic rather than assuming the worst
+case.
+
+## Limits on slow and concurrent uploads
+
+Upload and download routes are exempt from the router-wide
+`GLOBAL_REQUEST_TIMEOUT_SECS` wall-clock timeout, because that clock includes
+the time the client spends sending the body (#3263). Two other limits keep a
+slow or stalled upload from holding server capacity indefinitely
+(GHSA-9f9r-c4w8-rjv9):
+
+| Setting | Default | Effect |
+|---|---|---|
+| `UPLOAD_PROGRESS_WINDOW_SECS` | `60` | An upload body that delivers fewer than `UPLOAD_MIN_PROGRESS_BYTES` during one window spent waiting for data is aborted with `408 Request Timeout`, and its scratch file is removed. `0` disables the deadline. |
+| `UPLOAD_MIN_PROGRESS_BYTES` | `16384` | The bytes required per window (about 270 B/s at the default window). |
+| `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL` | `64` | Concurrent uploads one user, or one client address for an anonymous caller, may have in flight on the native-format routes, the repository artifact routes and `/api/v1/uploads`. Further uploads get `429 Too Many Requests` with `Retry-After`. `0` disables the cap. |
+
+Time the server spends on its own work (authentication, database lookups,
+writing to the storage backend) does not count against the progress window;
+only time spent waiting for the client to send does. Health and readiness
+probes (`/health`, `/healthz`, `/ready`, `/readyz`, `/livez`) are never refused
+by the `GLOBAL_MAX_CONCURRENCY` limit, so a replica saturated by uploads still
+reports itself alive.
 
 Practical guidance:
 

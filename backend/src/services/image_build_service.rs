@@ -345,7 +345,11 @@ fn image_ref_re() -> &'static Regex {
 fn pip_re() -> &'static Regex {
     re(
         &PIP_RE,
-        r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,\s-]+\])?(?:\s*(?:===|==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9._*+!-]+(?:\s*,\s*(?:===|==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9._*+!-]+)*)?$",
+        // Blanks are spaces and tabs only, never `\s`: `\s` also matches line
+        // terminators (\n, \r, VT, FF, NEL, U+2028), and a requirement is
+        // written into a `RUN pip install` line, where a newline would start
+        // a new Containerfile instruction (GHSA-59mx-6fq9-pp9p).
+        r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._, \t-]+\])?(?:[ \t]*(?:===|==|~=|!=|<=|>=|<|>)[ \t]*[A-Za-z0-9._*+!-]+(?:[ \t]*,[ \t]*(?:===|==|~=|!=|<=|>=|<|>)[ \t]*[A-Za-z0-9._*+!-]+)*)?$",
     )
 }
 fn apt_re() -> &'static Regex {
@@ -429,6 +433,16 @@ pub fn dockerfile_base_images(dockerfile: &str) -> Vec<String> {
 }
 
 fn validate_package(manager: PackageManager, p: &str) -> Result<()> {
+    // Every package spec lands inside one Containerfile `RUN` line, so no
+    // spec may carry a control character, whatever its manager's pattern
+    // says (GHSA-59mx-6fq9-pp9p). The per-manager patterns below are the
+    // primary check; this one does not depend on each of them getting it right.
+    if p.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(invalid(format!(
+            "{} package {p:?} contains a control character",
+            manager.as_str()
+        )));
+    }
     let ok = match manager {
         PackageManager::Apt => apt_re().is_match(p),
         PackageManager::Dnf | PackageManager::Microdnf | PackageManager::Yum => {
@@ -1309,6 +1323,68 @@ mod tests {
             manager,
             packages: pkgs.iter().map(|p| p.to_string()).collect(),
             channels: vec![],
+        }
+    }
+
+    /// GHSA-59mx-6fq9-pp9p: a pip requirement carrying a line terminator
+    /// (inside the extras bracket or around a comparator) must be refused.
+    /// The renderer writes each requirement into a `RUN pip install` line, and
+    /// the Containerfile parser ends an instruction at any unescaped newline,
+    /// so a newline in a requirement would start a new instruction (`RUN ...`)
+    /// even with `AK_IMAGE_BUILD_ALLOW_RUN=false`. Checked through both the
+    /// legacy `pip` field and a `packages` group.
+    #[test]
+    fn pip_requirement_with_a_line_terminator_is_refused() {
+        let mut permissive = settings();
+        permissive.base_allowlist.clear();
+        assert!(!permissive.allow_run);
+        let payloads = [
+            "foo[a\nRUN echo pwned]",
+            "foo[a,\nRUN echo pwned]",
+            "foo[a\r\nRUN echo pwned]",
+            "foo[a\rRUN echo pwned]",
+            "foo ==\n1.0",
+            "foo==1.0 ,\n>=0.9",
+            "foo[a\u{0b}RUN echo pwned]",
+            "foo[a\u{0c}RUN echo pwned]",
+        ];
+        for p in payloads {
+            let legacy = ImageBuildSpec {
+                base_image: "python:3.12".into(),
+                pip: vec![p.to_string()],
+                ..Default::default()
+            };
+            assert!(
+                validate_spec(&legacy, &permissive).is_err(),
+                "legacy pip field must refuse {p:?}"
+            );
+            let grouped = ImageBuildSpec {
+                base_image: "python:3.12".into(),
+                packages: vec![group(PackageManager::Pip, &[p])],
+                ..Default::default()
+            };
+            assert!(
+                validate_spec(&grouped, &permissive).is_err(),
+                "pip group must refuse {p:?}"
+            );
+        }
+        // The legitimate spellings the regex exists for still validate.
+        for ok in ["foo[a, b]", "foo >= 1.0, < 2", "foo[a]==1.0", " foo==1 "] {
+            let s = ImageBuildSpec {
+                base_image: "python:3.12".into(),
+                pip: vec![ok.to_string()],
+                ..Default::default()
+            };
+            assert!(validate_spec(&s, &permissive).is_ok(), "{ok:?}");
+        }
+        // Every other manager refuses a line terminator too.
+        for m in PackageManager::ALL {
+            let s = ImageBuildSpec {
+                base_image: "python:3.12".into(),
+                packages: vec![group(m, &["git\nRUN echo pwned"])],
+                ..Default::default()
+            };
+            assert!(validate_spec(&s, &permissive).is_err(), "{m:?}");
         }
     }
 

@@ -12,7 +12,9 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
-use crate::api::handlers::repositories::require_visible;
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -1715,7 +1717,8 @@ pub async fn promote_artifacts_bulk(
     request_body = RejectArtifactRequest,
     responses(
         (status = 200, description = "Artifact rejection result", body = RejectionResponse),
-        (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller is not an admin and holds no promote:artifacts token scope, or the repository is outside its tenant", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Artifact or repository not found, or the repository is not readable by the caller", body = crate::api::openapi::ErrorResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1728,6 +1731,17 @@ pub async fn reject_artifact(
 ) -> Result<Json<RejectionResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let source_repo = repo_service.get_by_key(&repo_key).await?;
+    // GHSA-mvmh-g8wm-r3cp: a rejection is the other half of the promotion
+    // decision and writes an attributed `promotion_history` row, so it needs
+    // the promotion capability (an admin, or a `promote:artifacts` token)
+    // and the tenant gate the promote routes apply. Visibility comes first so
+    // a caller who cannot read the repository gets its 404 for every
+    // artifact id, and the endpoint is not an existence oracle.
+    require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
+    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
+    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &source_repo)
+        .await?;
 
     if source_repo.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
@@ -2093,7 +2107,8 @@ fn linked_release_target(release_id: Uuid, key: String, readable: bool) -> Relea
     request_body = SetReleaseTargetRequest,
     responses(
         (status = 200, description = "Release target updated", body = ReleaseTargetResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller lacks the repository admin action on the staging repository, or the token lacks write:repositories", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found, or not readable by the caller", body = crate::api::openapi::ErrorResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -2104,10 +2119,16 @@ pub async fn set_release_target(
     Path(repo_key): Path<String>,
     Json(req): Json<SetReleaseTargetRequest>,
 ) -> Result<Json<ReleaseTargetResponse>> {
-    auth.require_scope("write")?;
-
     let repo_service = RepositoryService::new(state.db.clone());
     let staging_repo = repo_service.get_by_key(&repo_key).await?;
+    // GHSA-mvmh-g8wm-r3cp: the link decides where every release promotion
+    // without an explicit target lands, so changing it is repository
+    // administration of the staging repository. Visibility first, as on the
+    // GET (#4473), so a caller who cannot read the repository learns neither
+    // its existence nor its type; then the token scope, the tenant gate and
+    // the repository `admin` action, as on the other configuration routes.
+    let caller = Some(auth.clone());
+    require_visible(&staging_repo, &caller, &repo_service).await?;
 
     if staging_repo.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
@@ -2115,11 +2136,26 @@ pub async fn set_release_target(
         ));
     }
 
+    auth.require_scope("write:repositories")?;
+    require_repo_write_access(&auth, &staging_repo, &repo_service).await?;
+    require_repo_admin(&auth, staging_repo.id, &state.permission_service).await?;
+
     match req.release_repository_key {
         Some(release_key) => {
-            let release_repo = repo_service.get_by_key(&release_key).await.map_err(|_| {
-                AppError::Validation(format!("Release repository '{}' not found", release_key))
-            })?;
+            let not_found =
+                || AppError::Validation(format!("Release repository '{}' not found", release_key));
+            let release_repo = repo_service
+                .get_by_key(&release_key)
+                .await
+                .map_err(|_| not_found())?;
+            // A release repository the caller cannot read answers exactly
+            // like a missing one, so the link cannot probe for private keys.
+            require_visible(&release_repo, &caller, &repo_service)
+                .await
+                .map_err(|e| match e {
+                    AppError::NotFound(_) => not_found(),
+                    other => other,
+                })?;
 
             validate_release_target_link(&staging_repo, &release_repo)?;
 
@@ -5899,6 +5935,238 @@ mod tests {
                     String::from_utf8_lossy(&body)
                 );
             }
+            f.teardown().await;
+        }
+
+        // -------------------------------------------------------------------
+        // GHSA-mvmh-g8wm-r3cp findings #1 and #3: the release-target link and
+        // the reject endpoint are mutations and must pass the same visibility
+        // and capability gates as the rest of the promotion surface.
+        // -------------------------------------------------------------------
+
+        impl HistoryFixture {
+            async fn send_json(
+                &self,
+                method: &str,
+                uri: String,
+                body: serde_json::Value,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                let app = tdh::router_with_auth_ext(router(), self.state.clone(), auth);
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("request");
+                let (status, body) = tdh::send(app, req).await;
+                let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                (status, json)
+            }
+
+            async fn put_release_target(
+                &self,
+                key: &str,
+                release_key: Option<&str>,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.send_json(
+                    "PUT",
+                    format!("/repositories/{key}/release-target"),
+                    serde_json::json!({ "release_repository_key": release_key }),
+                    auth,
+                )
+                .await
+            }
+
+            async fn reject(
+                &self,
+                artifact: Uuid,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.send_json(
+                    "POST",
+                    format!(
+                        "/repositories/{}/artifacts/{artifact}/reject",
+                        self.staging.1
+                    ),
+                    serde_json::json!({ "reason": "ghsa-mvmh" }),
+                    auth,
+                )
+                .await
+            }
+
+            async fn staged_artifact(&self) -> Uuid {
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(self.staging.0)
+                    .fetch_one(&self.pool)
+                    .await
+                    .expect("staged artifact")
+            }
+
+            async fn linked_release(&self) -> Option<String> {
+                sqlx::query_scalar(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'release_repository_id'",
+                )
+                .bind(self.staging.0)
+                .fetch_optional(&self.pool)
+                .await
+                .expect("read link")
+            }
+
+            async fn rejections(&self) -> i64 {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM promotion_history \
+                     WHERE source_repo_id = $1 AND status = 'rejected'",
+                )
+                .bind(self.staging.0)
+                .fetch_one(&self.pool)
+                .await
+                .expect("count rejections")
+            }
+
+            /// A state with an empty permission cache, so a grant made after
+            /// an earlier denial is read from the database.
+            fn refresh_state(&mut self) {
+                self.state = tdh::build_state(self.pool.clone(), "/tmp/ph-mvmh-promotion");
+            }
+        }
+
+        /// GHSA-mvmh #1: relinking (or unlinking) a staging repository's
+        /// release target is repository administration. A caller who cannot
+        /// see the private staging repository gets its 404, a member without
+        /// the repository `admin` action gets 403, and a release repository
+        /// the caller cannot read answers like a missing one. None of the
+        /// refusals touches the stored link.
+        #[tokio::test]
+        async fn set_release_target_requires_staging_admin_and_a_readable_release() {
+            let Some(mut f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let before = f.linked_release().await;
+            assert!(
+                before.is_some(),
+                "precondition: the fixture links a release"
+            );
+
+            // 1) No grant on the private staging repository: 404, link kept.
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            let (status, json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert_eq!(
+                f.linked_release().await,
+                before,
+                "a refusal must not unlink"
+            );
+
+            // 2) Write membership on staging but no `admin` action: 403.
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(
+                f.linked_release().await,
+                before,
+                "a refusal must not unlink"
+            );
+
+            // 3) Staging admin, release repository private and unreadable:
+            //    the same answer a nonexistent key gets.
+            tdh::grant_repo_admin(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (hidden, hidden_json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            let (missing, missing_json) = f
+                .put_release_target(&f.staging.1, Some("ph-mvmh-no-such-repo"), f.member())
+                .await;
+            assert_eq!(hidden, missing, "{hidden_json} vs {missing_json}");
+            assert_ne!(hidden, StatusCode::OK, "{hidden_json}");
+            assert_eq!(
+                hidden_json["message"]
+                    .as_str()
+                    .map(|m| m.replace(&f.release.1, "K")),
+                missing_json["message"]
+                    .as_str()
+                    .map(|m| m.replace("ph-mvmh-no-such-repo", "K")),
+                "an unreadable release must be indistinguishable from a missing one"
+            );
+            assert_eq!(f.linked_release().await, before);
+
+            // 4) Staging admin who can read the release repository: allowed.
+            tdh::grant_repo_access(&f.pool, f.release.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.linked_release().await, None);
+            let (status, json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.linked_release().await, before);
+
+            // 5) A global admin is unaffected.
+            let (status, json) = f
+                .put_release_target(
+                    &f.staging.1,
+                    Some(&f.release.1),
+                    tdh::admin_auth(f.user, "root"),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            f.teardown().await;
+        }
+
+        /// GHSA-mvmh #3: rejecting a staged artifact needs the same
+        /// capability as promoting it (an admin, or a `promote:artifacts`
+        /// token), and a caller who cannot see the private staging
+        /// repository cannot use the endpoint as an existence oracle.
+        #[tokio::test]
+        async fn reject_artifact_requires_promotion_capability() {
+            let Some(mut f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let artifact = f.staged_artifact().await;
+
+            // 1) No grant on the private staging repository: the same 404 for
+            //    a real artifact and a random UUID, and nothing written.
+            let (real, real_json) = f.reject(artifact, f.member()).await;
+            let (random, random_json) = f.reject(Uuid::new_v4(), f.member()).await;
+            assert_eq!(real, StatusCode::NOT_FOUND, "{real_json}");
+            assert_eq!(random, StatusCode::NOT_FOUND, "{random_json}");
+            assert_eq!(f.rejections().await, 0);
+
+            // 2) A member who can see the repository but holds no promotion
+            //    capability: 403, nothing written.
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.reject(artifact, f.member()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(f.rejections().await, 0);
+
+            // 3) A `promote:artifacts` token of that member: allowed.
+            let promoter = AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["promote:artifacts".to_string()]),
+                ..f.member()
+            };
+            let (status, json) = f.reject(artifact, promoter).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.rejections().await, 1);
+
+            // 4) A global admin: allowed.
+            let (status, json) = f.reject(artifact, tdh::admin_auth(f.user, "root")).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.rejections().await, 2);
+
+            let _ = sqlx::query("DELETE FROM promotion_history WHERE source_repo_id = $1")
+                .bind(f.staging.0)
+                .execute(&f.pool)
+                .await;
             f.teardown().await;
         }
 
