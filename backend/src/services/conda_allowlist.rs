@@ -296,6 +296,30 @@ impl CompiledAllowlist {
         admitted
     }
 
+    /// Whether some entry admits EVERY version of `name` in `subdir`: an
+    /// entry without a version constraint whose name matches and whose
+    /// subdirs include `subdir`.
+    ///
+    /// A CEP-16 shard carries every version of its package and is addressed
+    /// by the hash of its bytes, so the sharded view of a virtual channel
+    /// (#4577) can admit a remote package only whole. A name admitted under a
+    /// version constraint is left out of the shard index and stays available
+    /// through `repodata.json`, where records are filtered one by one.
+    pub fn admits_all_versions(&self, name: &str, subdir: &str) -> bool {
+        if self.deny_all {
+            return false;
+        }
+        let name = fold(name);
+        let admitted = self.rules_for(&name).any(|r| {
+            r.admits_subdir(subdir)
+                && match &r.version {
+                    None => true,
+                    Some(spec) => matches!(spec, VersionSpec::Any),
+                }
+        });
+        admitted
+    }
+
     /// Whether the package file `filename` in `subdir` is admitted, by the
     /// name and version its filename carries. A filename without the conda
     /// `<name>-<version>-<build>.conda|.tar.bz2` shape is not.
@@ -685,6 +709,30 @@ mod tests {
             r#"{"enabled":true,"entries":[{"name":"numpy","build":"x"}]}"#
         )
         .is_err());
+    }
+
+    /// #4577: a shard is admitted whole or not at all, so only an entry
+    /// without a version constraint admits a name into the sharded view.
+    #[test]
+    fn admits_all_versions_requires_an_unconstrained_entry() {
+        let list = compiled(vec![
+            entry("tzdata", None, &[]),
+            entry("numpy", Some(">=2,<3"), &["linux-64"]),
+            entry("ri*", Some("*"), &[]),
+            entry("scipy", None, &["osx-arm64"]),
+        ]);
+        assert!(list.admits_all_versions("tzdata", "noarch"));
+        assert!(list.admits_all_versions("TZDATA", "linux-64"));
+        // `*` is no constraint.
+        assert!(list.admits_all_versions("rich", "noarch"));
+        // A version constraint admits records one by one, never the shard.
+        assert!(!list.admits_all_versions("numpy", "linux-64"));
+        assert!(list.admits("numpy", "2.2.3", "linux-64"));
+        // Subdirs still apply.
+        assert!(list.admits_all_versions("scipy", "osx-arm64"));
+        assert!(!list.admits_all_versions("scipy", "linux-64"));
+        assert!(!list.admits_all_versions("absent", "noarch"));
+        assert!(!CompiledAllowlist::deny_all().admits_all_versions("tzdata", "noarch"));
     }
 
     #[test]
