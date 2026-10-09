@@ -309,7 +309,7 @@ async fn batch(
     // deny-by-default action choke-point (#2603 G1) shared with the artifact
     // write handlers; the subsequent object `PUT` is independently write-gated
     // by the same middleware.
-    let auth_header = if request.operation == "upload" {
+    if request.operation == "upload" {
         let ext = require_auth_basic(auth, "git-lfs")?;
         require_repo_action(&ext, repo.id, "write", &state.permission_service)
             .await
@@ -325,14 +325,14 @@ async fn batch(
                     "You do not have permission to upload to this repository",
                 )
             })?;
-        // Pass auth header through to action hrefs
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
-    } else {
-        None
-    };
+    }
+
+    // The object GET/PUT and verify POST are auth-gated just like the batch
+    // POST, and every action is marked `authenticated: true`, which tells
+    // git-lfs not to send its own credentials. So the actions must carry the
+    // caller's Authorization header for downloads as well as uploads,
+    // otherwise `git lfs pull` from a private repository loops on 401 (#4570).
+    let action_header = action_auth_header(&headers);
 
     let base_url = build_base_url(request_base_url.as_str(), &repo_key);
     let mut response_objects = Vec::with_capacity(request.objects.len());
@@ -374,11 +374,6 @@ async fn batch(
             )
         })?;
 
-        let action_header = match &auth_header {
-            Some(auth) => serde_json::json!({ "Authorization": auth }),
-            None => serde_json::json!({}),
-        };
-
         let response_obj = match request.operation.as_str() {
             "download" => {
                 if existing.is_some() {
@@ -389,7 +384,7 @@ async fn batch(
                         actions: Some(BatchActions {
                             download: Some(BatchAction {
                                 href: format!("{}/objects/{}", base_url, obj.oid),
-                                header: action_header,
+                                header: action_header.clone(),
                                 expires_in: 3600,
                             }),
                             upload: None,
@@ -434,7 +429,7 @@ async fn batch(
                             }),
                             verify: Some(BatchAction {
                                 href: format!("{}/verify", base_url),
-                                header: action_header,
+                                header: action_header.clone(),
                                 expires_in: 3600,
                             }),
                         }),
@@ -454,6 +449,18 @@ async fn batch(
     };
 
     Ok(lfs_json_response(StatusCode::OK, &response))
+}
+
+/// Header map for batch actions: the caller's `Authorization` header, if any,
+/// so the client can reach the auth-gated object endpoints.
+fn action_auth_header(headers: &HeaderMap) -> serde_json::Value {
+    match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(auth) => serde_json::json!({ "Authorization": auth }),
+        None => serde_json::json!({}),
+    }
 }
 
 fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
@@ -1388,6 +1395,24 @@ mod tests {
         );
         assert_eq!(json["actions"]["download"]["expires_in"], 3600);
         assert!(json["actions"].get("upload").is_none());
+    }
+
+    #[test]
+    fn test_action_auth_header_echoes_authorization_4570() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        assert_eq!(
+            action_auth_header(&headers),
+            serde_json::json!({ "Authorization": "Basic dXNlcjpwYXNz" })
+        );
+    }
+
+    #[test]
+    fn test_action_auth_header_empty_without_authorization_4570() {
+        assert_eq!(action_auth_header(&HeaderMap::new()), serde_json::json!({}));
     }
 
     #[test]
