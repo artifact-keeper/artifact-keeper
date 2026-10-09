@@ -64,7 +64,7 @@ with bounded memory):
   and then written to the backend, so each concurrent completion needs the full
   artifact size.
 - Incus/LXC image uploads (monolithic and chunked).
-- Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to 2 GB each.
+- Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to `MAX_UPLOAD_SIZE` each.
 - Format-native publish routes that stream to staging: Ansible, Chef, Helm,
   JetBrains, Maven, NuGet, Pub, PyPI, Swift and Terraform.
 
