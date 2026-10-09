@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run all native client tests
 # Usage: ./run-all.sh [profile]
-# Profiles: smoke (default), all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, proxy, terraform-mirror, health-probes, curation
+# Profiles: smoke (default), all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, proxy, terraform-mirror, terraform-modules, health-probes, curation
 set -euo pipefail
 
 PROFILE="${1:-smoke}"
@@ -26,12 +26,12 @@ case "$PROFILE" in
     proxy)
         TESTS=("proxy-virtual")
         ;;
-    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|pacman|pub|proxy-virtual|pub-proxy|pub-virtual|terraform-mirror|health-probes|tag-replication|curation)
+    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|pacman|pub|proxy-virtual|pub-proxy|pub-virtual|terraform-mirror|terraform-modules|health-probes|tag-replication|curation)
         TESTS=("$PROFILE")
         ;;
     *)
         echo "ERROR: Unknown profile: $PROFILE"
-        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, pacman, pub, proxy, pub-proxy, pub-virtual, terraform-mirror, tag-replication, curation"
+        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, pacman, pub, proxy, pub-proxy, pub-virtual, terraform-mirror, terraform-modules, tag-replication, curation"
         exit 1
         ;;
 esac
