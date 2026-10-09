@@ -22367,13 +22367,16 @@ mod proxy_download_recording_tests {
     fn scan_on_proxy_capability_matches_the_gate() {
         const GATE_CALLS: &[&str] = &["serve_scanned_proxy_file(", "gate_proxy_scan_serve("];
 
-        // Handler key for a handler source file (see `RepositoryFormat::handler_key`).
-        fn handler_key(file: &str) -> String {
+        // Handler keys a handler source file serves (see
+        // `RepositoryFormat::handler_key`). `conda.rs` serves two: `conda`
+        // and `conda_native` are separate handler keys on one route (#4585).
+        fn handler_keys(file: &str) -> Vec<String> {
             match file {
-                "goproxy.rs" => "go".to_string(),
-                "oci_v2.rs" => "oci".to_string(),
-                "pub_registry.rs" => "pub".to_string(),
-                other => other.trim_end_matches(".rs").to_string(),
+                "goproxy.rs" => vec!["go".to_string()],
+                "oci_v2.rs" => vec!["oci".to_string()],
+                "pub_registry.rs" => vec!["pub".to_string()],
+                "conda.rs" => vec!["conda".to_string(), "conda_native".to_string()],
+                other => vec![other.trim_end_matches(".rs").to_string()],
             }
         }
 
@@ -22390,7 +22393,7 @@ mod proxy_download_recording_tests {
                 })
             });
             if reaches_gate {
-                gated.insert(handler_key(file));
+                gated.extend(handler_keys(file));
             }
         }
 
@@ -22552,6 +22555,45 @@ mod proxy_download_recording_tests {
                 "serve_scanned_nupkg(",
                 1,
             ),
+            // #4585: conda's direct Remote arm, the Virtual member walk, and
+            // the `.sigs` sidecar following its package's verdict. The `/t/`
+            // token routes delegate to `download_package`.
+            (
+                "conda.rs",
+                "download_package",
+                "serve_scanned_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "download_package",
+                "serve_scanned_virtual_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_scanned_virtual_conda_package",
+                "serve_scanned_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_scanned_conda_package",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_sidecar",
+                "sidecar_blocked_by_package_verdict(",
+                2,
+            ),
+            (
+                "conda.rs",
+                "download_package_with_token",
+                "download_package(",
+                1,
+            ),
             ("nuget.rs", "v2_download", "remote_scan_policy(", 1),
             ("nuget.rs", "v2_download", "proxy_v2_download(", 1),
             ("nuget.rs", "proxy_v2_download", "serve_scanned_nupkg(", 1),
@@ -22568,13 +22610,18 @@ mod proxy_download_recording_tests {
                 1,
             ),
         ];
-        // Body of the top-level `fn name(` (brace-matched from its first `{`).
+        // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
+        // from its first `{`).
         fn fn_body<'s>(src: &'s str, name: &str) -> Option<&'s str> {
-            let sig = format!("fn {name}(");
-            let at = src.match_indices(&sig).map(|(i, _)| i).find(|&i| {
-                let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                !src[line_start..i].trim_start().starts_with("//")
-            })?;
+            let (plain, generic) = (format!("fn {name}("), format!("fn {name}<"));
+            let at = src
+                .match_indices(&plain)
+                .chain(src.match_indices(&generic))
+                .map(|(i, _)| i)
+                .find(|&i| {
+                    let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    !src[line_start..i].trim_start().starts_with("//")
+                })?;
             let open = at + src[at..].find('{')?;
             let mut depth = 0usize;
             for (i, c) in src[open..].char_indices() {
@@ -22617,7 +22664,7 @@ mod proxy_download_recording_tests {
             assert!(
                 ROUTE_PINS
                     .iter()
-                    .any(|(file, ..)| handler_key(file) == *key),
+                    .any(|(file, ..)| handler_keys(file).contains(key)),
                 "#4099: `{key}` is declared enforced but has no ROUTE_PINS entry"
             );
         }
@@ -22659,6 +22706,7 @@ mod proxy_download_recording_tests {
                 "go" => "goproxy.rs".to_string(),
                 "oci" => "oci_v2.rs".to_string(),
                 "pub" => "pub_registry.rs".to_string(),
+                "conda_native" => "conda.rs".to_string(),
                 other => format!("{other}.rs"),
             }
         }

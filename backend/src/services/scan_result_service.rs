@@ -248,6 +248,9 @@ pub(crate) fn merge_packages_for_batch(packages: &[RawPackage]) -> Vec<RawPackag
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct ProxyBlockCandidate {
     pub checksum_sha256: String,
+    /// The serving repository's `repository_format` label; only a format
+    /// whose proxy path runs the gate can block (#4582).
+    pub format: String,
     pub max_severity: Option<String>,
     pub proxy_scan_action: String,
     pub block_on_policy_violation: bool,
@@ -258,10 +261,14 @@ pub(crate) struct ProxyBlockCandidate {
 /// refuses (#4380). Uses the gate's own severity rule
 /// ([`proxy_severity_gate_for_row`](crate::services::scan_config_service::proxy_severity_gate_for_row)),
 /// so record-only repositories and verdicts below an opted-in threshold are
-/// not counted as blocked.
+/// not counted as blocked, and the handlers' own format predicate
+/// ([`format_key_enforces_scan_on_proxy`](crate::formats::format_key_enforces_scan_on_proxy)),
+/// so a verdict on a format that stores `scan_on_proxy` but serves its
+/// proxied bytes unscanned is not counted either (#4582).
 pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
     let blocked: std::collections::HashSet<&str> = rows
         .iter()
+        .filter(|r| crate::formats::format_key_enforces_scan_on_proxy(&r.format))
         .filter(|r| {
             crate::services::scan_config_service::proxy_severity_gate_for_row(
                 r.block_on_policy_violation,
@@ -2551,9 +2558,9 @@ impl ScanResultService {
     /// * **hosted** artifacts whose quarantine workflow ended `rejected`, and
     /// * **proxied** content (any format; for OCI, the image manifest) with a
     ///   `vulnerable` verdict that the owning repository's proxy scan gate
-    ///   enforces: scan-on-proxy enabled, not `record_only`, and the verdict
-    ///   at or above the repository's severity threshold when one is opted
-    ///   into. Proxied bytes have no `artifacts` row (#1278), so they are found
+    ///   enforces: a format whose proxy path runs the gate (#4582),
+    ///   scan-on-proxy enabled, not `record_only`, and the verdict at or
+    ///   above the repository's severity threshold when one is opted into. Proxied bytes have no `artifacts` row (#1278), so they are found
     ///   through the repository's proxy cache catalog and its OCI manifest
     ///   edges, each distinct digest counted once.
     ///
@@ -2570,7 +2577,8 @@ impl ScanResultService {
 
         let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
             r#"
-            SELECT DISTINCT psr.checksum_sha256, psr.max_severity,
+            SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
+                   psr.max_severity,
                    sc.proxy_scan_action, sc.block_on_policy_violation,
                    sc.severity_threshold
             FROM scan_configs sc
@@ -2780,7 +2788,26 @@ mod tests {
         block_on_policy_violation: bool,
         threshold: &str,
     ) -> ProxyBlockCandidate {
+        format_block_candidate(
+            "pypi",
+            digest,
+            max_severity,
+            action,
+            block_on_policy_violation,
+            threshold,
+        )
+    }
+
+    fn format_block_candidate(
+        format: &str,
+        digest: &str,
+        max_severity: Option<&str>,
+        action: &str,
+        block_on_policy_violation: bool,
+        threshold: &str,
+    ) -> ProxyBlockCandidate {
         ProxyBlockCandidate {
+            format: format.to_string(),
             checksum_sha256: digest.to_string(),
             max_severity: max_severity.map(str::to_string),
             proxy_scan_action: action.to_string(),
@@ -2809,6 +2836,35 @@ mod tests {
         ];
         assert_eq!(count_blocked_proxy_digests(&rows), 3);
         assert_eq!(count_blocked_proxy_digests(&[]), 0);
+    }
+
+    /// #4582: a blocking verdict counts only where the format's proxy path
+    /// runs the gate. The same high verdict under the same policy is counted
+    /// on a conda remote (gated since #4585) and an OCI alias, and not on an
+    /// rpm or generic remote, which store `scan_on_proxy` but serve unscanned.
+    #[test]
+    fn test_count_blocked_proxy_digests_skips_ungated_formats_4582() {
+        let blocking = |format: &str, digest: &str| {
+            format_block_candidate(format, digest, Some("high"), "fail_open", true, "high")
+        };
+        assert_eq!(count_blocked_proxy_digests(&[blocking("rpm", "a")]), 0);
+        assert_eq!(count_blocked_proxy_digests(&[blocking("generic", "a")]), 0);
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("no-such-format", "a")]),
+            0
+        );
+        assert_eq!(count_blocked_proxy_digests(&[blocking("conda", "a")]), 1);
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("conda_native", "a")]),
+            1
+        );
+        assert_eq!(count_blocked_proxy_digests(&[blocking("helm_oci", "a")]), 1);
+        // A digest an ungated repository also caches is still one blocked
+        // digest when a gated repository refuses it.
+        assert_eq!(
+            count_blocked_proxy_digests(&[blocking("rpm", "a"), blocking("conda", "a")]),
+            1
+        );
     }
 
     #[test]

@@ -23,6 +23,10 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// `policy_violations_blocked` is one global count, so the tests that
+/// measure it as a delta must not run interleaved with each other.
+static BLOCKED_COUNT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use artifact_keeper_backend::models::security::{RawFinding, Severity};
 use artifact_keeper_backend::services::scan_result_service::ScanResultService;
 
@@ -303,6 +307,7 @@ async fn rescan_does_not_inflate_dashboard_finding_counts() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL; run with --ignored"]
 async fn proxied_image_blocked_by_policy_counts_on_dashboard() {
+    let _serial = BLOCKED_COUNT_LOCK.lock().await;
     let pool = connect_db().await;
     let svc = ScanResultService::new(pool.clone());
 
@@ -399,5 +404,100 @@ async fn proxied_image_blocked_by_policy_counts_on_dashboard() {
     assert_eq!(
         record_only, before,
         "a record-only repository blocks nothing"
+    );
+}
+
+/// #4582: a proxied verdict counts as blocked only on a format whose proxy
+/// path runs the gate. The same high verdict, cached by an rpm Remote and a
+/// conda Remote with identical blocking settings (scan-on-proxy, threshold
+/// `high`), adds one to `policy_violations_blocked` through the conda remote
+/// (gated since #4585) and nothing through the rpm remote, which stores
+/// `scan_on_proxy` but serves the package unscanned.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn proxied_verdict_counts_only_on_a_gated_format_4582() {
+    let _serial = BLOCKED_COUNT_LOCK.lock().await;
+    let pool = connect_db().await;
+    let svc = ScanResultService::new(pool.clone());
+
+    async fn remote_with_cached(pool: &PgPool, format: &str, digest: &str) -> Uuid {
+        let repo_id = Uuid::new_v4();
+        let key = format!("scan-agg-4582-{}", repo_id.as_simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url)
+             VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, 'https://upstream.invalid')",
+        )
+        .bind(repo_id)
+        .bind(&key)
+        .bind(format!("/tmp/test-artifacts/{repo_id}"))
+        .bind(format)
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+                 block_on_policy_violation, severity_threshold, proxy_scan_action)
+             VALUES ($1, true, false, true, true, 'high', 'fail_open')",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("insert scan config");
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key,
+                 size_bytes, checksum_sha256)
+             VALUES ($1, 'noarch/pkg-1.0-0.conda', 'k', 'm', 1, $2)",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("insert proxy cache row");
+        repo_id
+    }
+
+    let digest = format!("{:0>64}", Uuid::new_v4().as_simple());
+    sqlx::query(
+        "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict,
+             findings_count, high_count, max_severity, scanner_version)
+         VALUES ($1, 'grype', 'vulnerable', 1, 1, 'high', 'grype-test')",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .expect("insert verdict");
+
+    let count = || async {
+        svc.get_dashboard_summary()
+            .await
+            .expect("dashboard")
+            .policy_violations_blocked
+    };
+    let before = count().await;
+    let rpm = remote_with_cached(&pool, "rpm", &digest).await;
+    let ungated = count().await;
+    let conda = remote_with_cached(&pool, "conda", &digest).await;
+    let gated = count().await;
+
+    let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+        .bind(&digest)
+        .execute(&pool)
+        .await;
+    for repo_id in [rpm, conda] {
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, repo_id).await;
+    }
+
+    assert_eq!(
+        ungated, before,
+        "an rpm remote serves the package unscanned, so it is not blocked"
+    );
+    assert_eq!(
+        gated - before,
+        1,
+        "the conda remote refuses the package, so the dashboard counts it"
     );
 }

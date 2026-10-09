@@ -274,8 +274,8 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 
 /// Core handler keys whose Remote/Virtual download path enforces the inline
 /// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
-/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Maven, npm,
-/// NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Conda, Maven,
+/// npm, NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
 /// repositories, and `nuget` serves `chocolatey` and `powershell`) or,
 /// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
 ///
@@ -303,18 +303,47 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
 /// they are scanned as raw files, not unpacked (#4100). NuGet scans every
 /// proxied flat-container and V2 package file except the `.nuspec` manifest
-/// (#4102).
+/// (#4102). Conda scans `.conda` and `.tar.bz2` package downloads; the
+/// channel indexes (repodata in every encoding, channeldata, shards) are not
+/// gated, and a `.sigs` sidecar follows its package's stored verdict (#4585).
+/// `conda` and `conda_native` are two handler keys served by the one conda
+/// route, so both are listed.
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
-    "cargo", // #4101
-    "maven", // #4100 (also serves gradle)
-    "nuget", // #4102 (also serves chocolatey and powershell)
-    "sbt",   // #4100
-    "npm", "oci", "pypi", "vscode",
+    "cargo",        // #4101
+    "conda",        // #4585
+    "conda_native", // #4585 (the same conda route)
+    "maven",        // #4100 (also serves gradle)
+    "nuget",        // #4102 (also serves chocolatey and powershell)
+    "sbt",          // #4100
+    "npm",
+    "oci",
+    "pypi",
+    "vscode",
 ];
 
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
 pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
     SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&handler_key)
+}
+
+/// Does a repository of `format` run the scan-on-proxy gate on its proxied
+/// downloads? The per-repository-format form of
+/// [`handler_enforces_scan_on_proxy`], aliases resolved through
+/// [`RepositoryFormat::handler_key`]. Everything that has to agree with the
+/// gate asks this: the generic download route's refusal (#4442) and the
+/// dashboard's `policy_violations_blocked` count (#4582), which must not call
+/// a verdict blocked on a format that serves it anyway.
+pub fn format_enforces_scan_on_proxy(format: &RepositoryFormat) -> bool {
+    handler_enforces_scan_on_proxy(format.handler_key())
+}
+
+/// [`format_enforces_scan_on_proxy`] for a `repository_format` database label
+/// (`"conda"`, `"docker"`, ...). An unknown label is not enforced.
+pub fn format_key_enforces_scan_on_proxy(format_key: &str) -> bool {
+    RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == format_key)
+        .is_some_and(format_enforces_scan_on_proxy)
 }
 
 /// Presentation metadata for a core handler key.
