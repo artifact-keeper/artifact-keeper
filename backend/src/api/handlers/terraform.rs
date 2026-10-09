@@ -34,12 +34,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
-// `Bytes` and the `sha2` digest types are now only referenced by the unit
-// tests: the upload handlers stream the body and take their digests from the
-// shared staging primitive (#2517), so gate these imports to test builds to
-// keep the production build free of unused-import warnings.
-#[cfg(test)]
 use bytes::Bytes;
+// The `sha2` digest types are now only referenced by the unit tests: the
+// upload handlers stream the body and take their digests from the shared
+// staging primitive (#2517), so gate this import to test builds to keep the
+// production build free of unused-import warnings.
+use futures::StreamExt;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -284,6 +284,12 @@ async fn download_module(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let module_name = build_module_name(&namespace, &name, &provider);
+    let coords = ModuleCoords {
+        namespace: &namespace,
+        name: &name,
+        provider: &provider,
+        version: &version,
+    };
 
     let artifact = sqlx::query!(
         r#"
@@ -320,38 +326,20 @@ async fn download_module(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path = format!(
-                        "v1/modules/{}/{}/{}/{}/download",
-                        namespace, name, provider, version
-                    );
-                    // #1608 Phase 4: stream the terraform module archive to the
-                    // client while teeing to the proxy cache, instead of
-                    // buffering the whole module in memory. Single-flight via
-                    // the merged coordinator (#1609).
-                    let response = proxy_helpers::proxy_fetch_streaming(
-                        proxy,
-                        repo.id,
-                        &repo_key,
+                    // #4590: answer with the protocol's own `204` +
+                    // `X-Terraform-Get`, pointing at this server's `/archive`
+                    // (which streams the upstream archive through the proxy
+                    // cache) with the archive-type hint the client needs.
+                    // This used to stream the upstream `/download` response
+                    // body back as a `200`, which no client can use: a
+                    // registry answers with an empty `204` whose location is
+                    // in a header that was dropped.
+                    let remote = RemoteModuleUpstream {
+                        repo: &repo,
                         upstream_url,
-                        &upstream_path,
-                        "application/octet-stream",
-                    )
-                    .await?;
-                    // #3649: count the proxied serve. The streaming helper answers a warm
-                    // cache HIT from storage and a cold MISS from upstream through the same
-                    // call, so recording once it resolves counts both -- the cache hit #3649
-                    // reported as invisible included -- while a 404/502 still counts nothing.
-                    // Keyed on the proxy-cache path this fetch commits under, so the count
-                    // lines up with the catalog row the artifact listing renders.
-                    proxy_helpers::record_proxy_download(
-                        &state,
-                        repo.id,
-                        &repo_key,
-                        &upstream_path,
-                        &ctx,
-                    )
-                    .await;
-                    return Ok(response);
+                        proxy,
+                    };
+                    return remote_module_download(&remote, &coords).await;
                 }
             }
             // Virtual repo: try each member in priority order
@@ -399,8 +387,10 @@ async fn download_module(
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     // Return 204 with X-Terraform-Get header pointing to the archive download
-    // URL served by `download_module_archive`.
-    let download_url = build_module_archive_url(&repo_key, &namespace, &name, &provider, &version);
+    // URL served by `download_module_archive`, carrying the archive-type hint
+    // go-getter needs to unpack it (#4590).
+    let archive = hosted_module_archive_type(&state, &repo, artifact.id, &coords).await;
+    let download_url = coords.archive_url(&repo_key, archive, None);
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -416,21 +406,46 @@ async fn download_module(
 /// The location [`download_module`] advertises in `X-Terraform-Get`. Built here
 /// (rather than inline) so the advertised URL and the registered route are
 /// derived from one shared definition.
+///
+/// #4590: the URL always carries go-getter's `archive=<type>` hint. Terraform
+/// and OpenTofu hand this location to go-getter, which only unpacks a plain
+/// HTTP URL as an archive when the URL names the archive type (that query
+/// parameter, or a file extension); without it go-getter fetches the URL as an
+/// HTML page looking for a `terraform-get` meta tag and fails on the archive
+/// bytes. `subdir` is go-getter's `//<subdir>` component, placed before the
+/// query exactly as go-getter splits it back off.
 fn build_module_archive_url(
     repo_key: &str,
     namespace: &str,
     name: &str,
     provider: &str,
     version: &str,
+    archive: ModuleArchiveType,
+    subdir: Option<&str>,
 ) -> String {
+    let subdir = subdir
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("//{s}"))
+        .unwrap_or_default();
     format!(
-        "{}/{}/v1/modules/{}/{}/{}/{}/archive",
-        MOUNT_PREFIX, repo_key, namespace, name, provider, version
+        "{}/{}/v1/modules/{}/{}/{}/{}/archive{}?archive={}",
+        MOUNT_PREFIX,
+        repo_key,
+        namespace,
+        name,
+        provider,
+        version,
+        subdir,
+        archive.getter_hint()
     )
 }
 
-/// Stream a hosted module's stored archive — the bytes `X-Terraform-Get`
-/// points a client at.
+/// Stream a module's archive — the bytes `X-Terraform-Get` points a client at.
+///
+/// Hosted: the stored upload. Remote: the archive the upstream registry names,
+/// fetched through the proxy cache (#4590). The `?archive=` hint on the
+/// advertised URL is for the client's getter and is ignored here; the served
+/// file's name and `Content-Type` follow the bytes themselves.
 async fn download_module_archive(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name, provider, version)): Path<(
@@ -443,14 +458,32 @@ async fn download_module_archive(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
+    let coords = ModuleCoords {
+        namespace: &namespace,
+        name: &name,
+        provider: &provider,
+        version: &version,
+    };
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let remote = RemoteModuleUpstream {
+                repo: &repo,
+                upstream_url,
+                proxy,
+            };
+            return remote_module_archive(&state, &remote, &coords, &ctx).await;
+        }
+    }
 
     let result = proxy_helpers::local_fetch_by_path(
         &state.db,
         &state,
         repo.id,
         &repo.storage_location(),
-        &artifact_path,
+        &coords.artifact_path(),
     )
     .await?;
 
@@ -459,8 +492,661 @@ async fn download_module_archive(
     // `block_unscanned` / `block_on_fail` / `max_severity` should have blocked.
     proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, &ctx).await?;
 
-    let filename = format!("{}-{}-{}-{}.tar.gz", namespace, name, provider, version);
-    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(&filename))
+    serve_module_archive(result, &coords).await
+}
+
+// ---------------------------------------------------------------------------
+// Module archive types (#4590)
+// ---------------------------------------------------------------------------
+
+/// A module version's registry coordinate, grouped so the archive helpers
+/// below take one argument instead of four.
+struct ModuleCoords<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    provider: &'a str,
+    version: &'a str,
+}
+
+impl ModuleCoords<'_> {
+    fn artifact_path(&self) -> String {
+        build_module_artifact_path(self.namespace, self.name, self.provider, self.version)
+    }
+
+    /// The upstream registry's download endpoint for this version.
+    fn upstream_download_path(&self) -> String {
+        format!(
+            "v1/modules/{}/{}/{}/{}/download",
+            self.namespace, self.name, self.provider, self.version
+        )
+    }
+
+    /// Proxy-cache path a remote module's archive is stored under: derived
+    /// from the coordinate, never from the upstream archive URL, which may be
+    /// absolute or signed (the #1998 lesson).
+    fn archive_cache_path(&self) -> String {
+        format!(
+            "v1/modules/{}/{}/{}/{}/archive",
+            self.namespace, self.name, self.provider, self.version
+        )
+    }
+
+    fn archive_url(
+        &self,
+        repo_key: &str,
+        archive: ModuleArchiveType,
+        subdir: Option<&str>,
+    ) -> String {
+        build_module_archive_url(
+            repo_key,
+            self.namespace,
+            self.name,
+            self.provider,
+            self.version,
+            archive,
+            subdir,
+        )
+    }
+
+    /// Attachment filename for the served archive.
+    fn filename(&self, archive: Option<ModuleArchiveType>) -> String {
+        let stem = format!(
+            "{}-{}-{}-{}",
+            self.namespace, self.name, self.provider, self.version
+        );
+        match archive {
+            Some(a) => format!("{stem}.{}", a.extension()),
+            None => stem,
+        }
+    }
+}
+
+/// The archive formats a module archive is recognised as.
+///
+/// Detected from the bytes, never from the upload's name or `Content-Type`, so
+/// the hint `X-Terraform-Get` advertises always matches what is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleArchiveType {
+    /// `PK\x03\x04` — a ZIP local file header.
+    Zip,
+    /// `\x1f\x8b` — gzip; a module tarball.
+    TarGz,
+    /// `ustar` at offset 257 — an uncompressed POSIX tar. Recognised so it can
+    /// be named precisely, but neither Terraform nor OpenTofu can install one:
+    /// their module getter registers no plain-`tar` decompressor, so
+    /// `?archive=tar` falls back to the same HTML-page parse as no hint at all.
+    /// New uploads are therefore refused (see [`classify_module_upload`]).
+    Tar,
+}
+
+/// The type assumed for a stored module whose bytes cannot be read or are not
+/// recognised: every module was labelled a gzip tarball before #4590, so this
+/// keeps such an artifact exactly as it was advertised.
+const LEGACY_MODULE_ARCHIVE_TYPE: ModuleArchiveType = ModuleArchiveType::TarGz;
+
+/// `artifact_metadata.metadata` key the detected type is recorded under.
+const MODULE_ARCHIVE_METADATA_KEY: &str = "archive_type";
+
+/// Leading bytes needed to tell the types apart: a tar header's `ustar` magic
+/// spans offsets 257..262.
+const MODULE_ARCHIVE_SNIFF_LEN: usize = 262;
+
+impl ModuleArchiveType {
+    /// Identify an archive from its leading bytes (at least
+    /// [`MODULE_ARCHIVE_SNIFF_LEN`] of them for a plain tar to be recognised).
+    fn sniff(head: &[u8]) -> Option<Self> {
+        if head.starts_with(b"PK\x03\x04") {
+            Some(Self::Zip)
+        } else if head.starts_with(&[0x1f, 0x8b]) {
+            Some(Self::TarGz)
+        } else if head.get(257..MODULE_ARCHIVE_SNIFF_LEN) == Some(&b"ustar"[..]) {
+            Some(Self::Tar)
+        } else {
+            None
+        }
+    }
+
+    /// go-getter's name for the type: the `archive=` query value.
+    fn getter_hint(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::TarGz => "tar.gz",
+            Self::Tar => "tar",
+        }
+    }
+
+    /// File extension of the served archive.
+    fn extension(self) -> &'static str {
+        self.getter_hint()
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Zip => "application/zip",
+            Self::TarGz => "application/gzip",
+            Self::Tar => "application/x-tar",
+        }
+    }
+
+    /// Parse a go-getter `archive=` value (also the recorded metadata value).
+    fn from_getter_hint(hint: &str) -> Option<Self> {
+        match hint.to_ascii_lowercase().as_str() {
+            "zip" => Some(Self::Zip),
+            "tar.gz" | "tgz" => Some(Self::TarGz),
+            "tar" => Some(Self::Tar),
+            _ => None,
+        }
+    }
+
+    /// The type recorded in a module's `artifact_metadata` at upload.
+    fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        metadata
+            .get(MODULE_ARCHIVE_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(Self::from_getter_hint)
+    }
+}
+
+/// What a URL path's extension tells go-getter about the archive behind it.
+#[derive(Debug, PartialEq, Eq)]
+enum GetterExtension {
+    /// An archive type this server serves and hints.
+    Known(ModuleArchiveType),
+    /// An archive go-getter unpacks that is not one of ours (`.tar.xz`,
+    /// `.tar.bz2`, ...): left for the client's getter to handle itself.
+    Foreign,
+    /// No archive extension.
+    None,
+}
+
+/// go-getter's own extension match, in its order (longest suffixes first).
+fn getter_extension(path: &str) -> GetterExtension {
+    let path = path.to_ascii_lowercase();
+    for (ext, archive) in [
+        (".tar.gz", Some(ModuleArchiveType::TarGz)),
+        (".tgz", Some(ModuleArchiveType::TarGz)),
+        (".zip", Some(ModuleArchiveType::Zip)),
+        (".tar.bz2", None),
+        (".tar.tbz2", None),
+        (".tbz2", None),
+        (".tar.xz", None),
+        (".txz", None),
+        (".tar.zst", None),
+        (".tzst", None),
+        (".bz2", None),
+        (".gz", None),
+        (".xz", None),
+        (".zst", None),
+    ] {
+        if path.ends_with(ext) {
+            return match archive {
+                Some(a) => GetterExtension::Known(a),
+                None => GetterExtension::Foreign,
+            };
+        }
+    }
+    GetterExtension::None
+}
+
+/// Decide whether an uploaded module archive is accepted, from its leading
+/// bytes. ZIP and gzip-compressed tar are what `terraform init` / `tofu init`
+/// can install; anything else is refused with the reason.
+fn classify_module_upload(head: &[u8]) -> Result<ModuleArchiveType, &'static str> {
+    match ModuleArchiveType::sniff(head) {
+        Some(ModuleArchiveType::Tar) => Err(
+            "Module archive is an uncompressed tar, which terraform/tofu cannot install \
+             (their module getter has no plain-tar support); upload it gzip-compressed \
+             (.tar.gz) or as a .zip",
+        ),
+        Some(archive) => Ok(archive),
+        None => Err(
+            "Module archive is not a ZIP or gzip-compressed tar (.tar.gz); \
+             terraform/tofu modules must be uploaded in one of those formats",
+        ),
+    }
+}
+
+/// Read the leading bytes of a staged upload and classify it, mapping a
+/// refusal to `400 Bad Request`.
+#[allow(clippy::result_large_err)]
+async fn sniff_staged_module_archive(
+    path: &std::path::Path,
+) -> Result<ModuleArchiveType, Response> {
+    use tokio::io::AsyncReadExt;
+
+    // #3718: the IO error text names the scratch path; keep it in the log.
+    let read_failed = |e: std::io::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to read staged module archive", &e),
+        )
+            .into_response()
+    };
+    let mut head = Vec::with_capacity(MODULE_ARCHIVE_SNIFF_LEN);
+    tokio::fs::File::open(path)
+        .await
+        .map_err(read_failed)?
+        .take(MODULE_ARCHIVE_SNIFF_LEN as u64)
+        .read_to_end(&mut head)
+        .await
+        .map_err(read_failed)?;
+    classify_module_upload(&head).map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())
+}
+
+type ByteStream = futures::stream::BoxStream<'static, crate::error::Result<Bytes>>;
+
+/// Read just enough of `body` to identify the archive, returning the type and
+/// a stream that replays those bytes followed by the rest — so the caller can
+/// still serve the whole body. A stream error is replayed in place, not
+/// swallowed.
+async fn peek_module_archive(mut body: ByteStream) -> (Option<ModuleArchiveType>, ByteStream) {
+    let mut head = Vec::with_capacity(MODULE_ARCHIVE_SNIFF_LEN);
+    let mut replay = Vec::new();
+    let mut finished = false;
+    while head.len() < MODULE_ARCHIVE_SNIFF_LEN {
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                head.extend_from_slice(&chunk);
+                replay.push(Ok(chunk));
+            }
+            Some(Err(e)) => {
+                replay.push(Err(e));
+                finished = true;
+                break;
+            }
+            None => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    let rest = if finished {
+        futures::stream::empty().boxed()
+    } else {
+        body
+    };
+    (
+        ModuleArchiveType::sniff(&head),
+        futures::stream::iter(replay).chain(rest).boxed(),
+    )
+}
+
+/// Serve a module archive with the filename and `Content-Type` its bytes call
+/// for (a stored module used to be named `.tar.gz` whatever it held).
+async fn serve_module_archive(
+    mut result: crate::services::proxy_service::StreamingFetchResult,
+    coords: &ModuleCoords<'_>,
+) -> Result<Response, Response> {
+    let body = std::mem::replace(&mut result.body, futures::stream::empty().boxed());
+    let (archive, body) = peek_module_archive(body).await;
+    result.body = body;
+    if let Some(a) = archive {
+        result.content_type = Some(a.content_type().to_string());
+    }
+    proxy_helpers::stream_fetch_result(
+        result,
+        "application/octet-stream",
+        Some(&coords.filename(archive)),
+    )
+}
+
+/// The archive type of a hosted module version: the type recorded at upload,
+/// or — for a module uploaded before #4590 recorded one — the type of its
+/// stored bytes. Falls back to [`LEGACY_MODULE_ARCHIVE_TYPE`] when the bytes
+/// cannot be read (e.g. a quarantined artifact, which `/archive` refuses
+/// anyway) or are not recognised.
+async fn hosted_module_archive_type(
+    state: &SharedState,
+    repo: &RepoInfo,
+    artifact_id: uuid::Uuid,
+    coords: &ModuleCoords<'_>,
+) -> ModuleArchiveType {
+    let recorded: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if let Some(archive) = recorded.as_ref().and_then(ModuleArchiveType::from_metadata) {
+        return archive;
+    }
+
+    match proxy_helpers::local_fetch_by_path(
+        &state.db,
+        state,
+        repo.id,
+        &repo.storage_location(),
+        &coords.artifact_path(),
+    )
+    .await
+    {
+        Ok(result) => peek_module_archive(result.body)
+            .await
+            .0
+            .unwrap_or(LEGACY_MODULE_ARCHIVE_TYPE),
+        Err(_) => LEGACY_MODULE_ARCHIVE_TYPE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote modules (#4590)
+// ---------------------------------------------------------------------------
+
+/// A remote Terraform repository together with its upstream and proxy.
+struct RemoteModuleUpstream<'a> {
+    repo: &'a RepoInfo,
+    upstream_url: &'a str,
+    proxy: &'a crate::services::proxy_service::ProxyService,
+}
+
+/// Where an upstream registry says a module version's source lives.
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamModuleSource {
+    /// A plain HTTP(S) URL this server fetches through its proxy cache and
+    /// serves back under `/archive`.
+    Http {
+        /// The URL to fetch: absolute, with go-getter's `archive=` parameter
+        /// removed (the client's getter strips it before fetching too).
+        fetch_url: String,
+        /// go-getter `//<subdir>` component, if any.
+        subdir: Option<String>,
+        /// The type the location names, if it names one.
+        archive: Option<ModuleArchiveType>,
+        /// The location as an absolute address, for handing to the client
+        /// unchanged when the archive turns out not to be one we serve.
+        absolute: String,
+    },
+    /// A source this server does not proxy — a forced getter (`git::`,
+    /// `s3::`, ...), a non-HTTP scheme, or an archive format go-getter knows
+    /// and we do not — handed to the client as an absolute address.
+    Passthrough(String),
+}
+
+/// go-getter's `SourceDirSubdir`: split a `//<subdir>` component off a source
+/// address (ignoring the scheme's own `//`), keeping any query on the source.
+fn split_getter_subdir(src: &str) -> (String, Option<String>) {
+    let stop = src.find('?').unwrap_or(src.len());
+    let offset = src[..stop].find("://").map_or(0, |i| i + 3);
+    let Some(idx) = src[offset..stop].find("//") else {
+        return (src.to_string(), None);
+    };
+    let idx = idx + offset;
+    let mut source = src[..idx].to_string();
+    let mut subdir = src[idx + 2..].to_string();
+    if let Some(q) = subdir.find('?') {
+        source.push_str(&subdir[q..]);
+        subdir.truncate(q);
+    }
+    (source, Some(subdir).filter(|s| !s.is_empty()))
+}
+
+/// Classify the location an upstream registry returned for a module version.
+///
+/// Mirrors the Terraform client: a location starting with `/`, `./` or `../`
+/// is a URL relative to `base_url` (the URL that answered); anything else is a
+/// go-getter source address taken as written (`git::...`, `github.com/...`,
+/// an absolute URL).
+fn classify_upstream_module_location(location: &str, base_url: &str) -> UpstreamModuleSource {
+    let location = location.trim();
+    let relative = ["/", "./", "../"].iter().any(|p| location.starts_with(p));
+    let resolve = |source: &str| -> Option<reqwest::Url> {
+        if relative {
+            reqwest::Url::parse(base_url).ok()?.join(source).ok()
+        } else {
+            reqwest::Url::parse(source).ok()
+        }
+    };
+    let absolute = resolve(location)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| location.to_string());
+
+    // A forced getter (`git::https://...`) names its own protocol.
+    if let Some(forced) = location.find("::") {
+        if location.find("://").is_none_or(|scheme| forced < scheme) {
+            return UpstreamModuleSource::Passthrough(location.to_string());
+        }
+    }
+
+    let (source, subdir) = split_getter_subdir(location);
+    let Some(mut url) = resolve(&source) else {
+        return UpstreamModuleSource::Passthrough(absolute);
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return UpstreamModuleSource::Passthrough(absolute);
+    }
+
+    let mut hint = None;
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, v)| {
+            if k == "archive" {
+                hint = Some(v.to_string());
+                false
+            } else {
+                true
+            }
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let archive = match hint {
+        Some(hint) => {
+            // Only rewrite the query when there is a hint to drop, so a signed
+            // URL's query string otherwise reaches upstream byte for byte.
+            url.set_query(None);
+            if !kept.is_empty() {
+                url.query_pairs_mut().extend_pairs(kept);
+            }
+            match ModuleArchiveType::from_getter_hint(&hint) {
+                Some(ModuleArchiveType::Tar) | None => {
+                    return UpstreamModuleSource::Passthrough(absolute)
+                }
+                Some(archive) => Some(archive),
+            }
+        }
+        None => match getter_extension(url.path()) {
+            GetterExtension::Known(archive) => Some(archive),
+            GetterExtension::Foreign => return UpstreamModuleSource::Passthrough(absolute),
+            GetterExtension::None => None,
+        },
+    };
+
+    UpstreamModuleSource::Http {
+        fetch_url: url.to_string(),
+        subdir,
+        archive,
+        absolute,
+    }
+}
+
+/// Pull the module location out of an upstream registry's download answer:
+/// the `X-Terraform-Get` header, else a `{"location": ...}` JSON body — the
+/// Terraform client's own precedence.
+fn upstream_module_location_value(header: Option<&str>, body: &[u8]) -> Option<String> {
+    header
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_slice::<serde_json::Value>(body)
+                .ok()?
+                .get("location")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .filter(|l| !l.is_empty())
+}
+
+/// Ask the upstream registry where a module version lives and classify it.
+async fn resolve_upstream_module_source(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+) -> Result<UpstreamModuleSource, Response> {
+    let answer = proxy_helpers::proxy_fetch_terraform_module_location(
+        remote.proxy,
+        remote.repo.id,
+        &remote.repo.key,
+        remote.upstream_url,
+        &coords.upstream_download_path(),
+    )
+    .await?;
+    let location =
+        upstream_module_location_value(answer.x_terraform_get.as_deref(), &answer.content)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream registry returned no module location",
+                )
+                    .into_response()
+            })?;
+    Ok(classify_upstream_module_location(
+        &location,
+        &answer.effective_url,
+    ))
+}
+
+/// Whether two URLs share scheme, host and port.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
+/// Apply the outbound-URL (anti-SSRF) policy to an upstream-named archive URL
+/// before fetching it. A URL on the configured upstream's own origin is as
+/// trusted as the upstream itself and is exempt, so a registry on a private
+/// network can still serve its archives from relative locations; any other
+/// host is checked like the mirror's `download_url`.
+#[allow(clippy::result_large_err)]
+fn check_upstream_archive_url(
+    remote: &RemoteModuleUpstream<'_>,
+    fetch_url: &str,
+) -> Result<(), Response> {
+    if same_origin(fetch_url, remote.upstream_url) {
+        return Ok(());
+    }
+    validate_outbound_url(fetch_url, "Terraform upstream module archive URL").map_err(|e| {
+        // The URL is registry-controlled and may be signed; `e` names the
+        // blocked host without echoing it.
+        tracing::warn!(
+            "SSRF check rejected upstream module archive URL for repo {}: {}",
+            remote.repo.key,
+            e
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream registry returned a disallowed module location: {e}"),
+        )
+            .into_response()
+    })
+}
+
+/// Fetch an upstream module archive through the proxy cache.
+async fn fetch_upstream_module_archive(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    fetch_url: &str,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    check_upstream_archive_url(remote, fetch_url)?;
+    proxy_helpers::proxy_fetch_streaming_with_cache_key(
+        remote.proxy,
+        remote.repo.id,
+        &remote.repo.key,
+        remote.upstream_url,
+        fetch_url,
+        &coords.archive_cache_path(),
+        RepositoryFormat::Terraform,
+    )
+    .await
+}
+
+/// Identify an upstream archive whose location names no type by reading its
+/// bytes. The archive is read to the end, through the proxy cache, so the
+/// client's `/archive` request that follows is served from the cache rather
+/// than abandoning a half-written cache entry here. Any failure is `None`:
+/// the caller then hands the client the upstream location unchanged.
+async fn sniff_upstream_module_archive(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    fetch_url: &str,
+) -> Option<ModuleArchiveType> {
+    let result = fetch_upstream_module_archive(remote, coords, fetch_url)
+        .await
+        .ok()?;
+    let (archive, mut body) = peek_module_archive(result.body).await;
+    while let Some(chunk) = body.next().await {
+        chunk.ok()?;
+    }
+    archive
+}
+
+/// `GET .../download` on a remote repository: the `204` + `X-Terraform-Get`
+/// answer, pointing at this server's `/archive` with the archive hint when the
+/// upstream archive is one we serve, or at the upstream's own location when
+/// it is not.
+async fn remote_module_download(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+) -> Result<Response, Response> {
+    let location = match resolve_upstream_module_source(remote, coords).await? {
+        UpstreamModuleSource::Passthrough(location) => location,
+        UpstreamModuleSource::Http {
+            fetch_url,
+            subdir,
+            archive,
+            absolute,
+        } => {
+            let archive = match archive {
+                Some(archive) => Some(archive),
+                None => sniff_upstream_module_archive(remote, coords, &fetch_url).await,
+            };
+            match archive {
+                Some(archive) if archive != ModuleArchiveType::Tar => {
+                    coords.archive_url(&remote.repo.key, archive, subdir.as_deref())
+                }
+                _ => absolute,
+            }
+        }
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("X-Terraform-Get", location)
+        .body(Body::empty())
+        .unwrap())
+}
+
+/// `GET .../archive` on a remote repository: stream the upstream archive
+/// through the proxy cache.
+async fn remote_module_archive(
+    state: &SharedState,
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let UpstreamModuleSource::Http { fetch_url, .. } =
+        resolve_upstream_module_source(remote, coords).await?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "The upstream registry serves this module from a source this \
+             repository does not proxy; use the location its download endpoint returns",
+        )
+            .into_response());
+    };
+    let result = fetch_upstream_module_archive(remote, coords, &fetch_url).await?;
+    // #3649: count the proxied serve, keyed on the cache path it commits under.
+    proxy_helpers::record_proxy_download(
+        state,
+        remote.repo.id,
+        &remote.repo.key,
+        &coords.archive_cache_path(),
+        ctx,
+    )
+    .await;
+    serve_module_archive(result, coords).await
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +1342,10 @@ async fn upload_module(
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
+    // #4590: the archive type decides the hint `X-Terraform-Get` advertises,
+    // so it is detected from the bytes now and recorded with the artifact.
+    let archive = sniff_staged_module_archive(staged.path()).await?;
+
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
 
@@ -694,7 +1384,7 @@ async fn upload_module(
         version,
         size_bytes,
         checksum,
-        "application/gzip",
+        archive.content_type(),
         storage_key,
         user_id,
     )
@@ -714,7 +1404,7 @@ async fn upload_module(
     .await;
 
     // Store metadata
-    let metadata = build_module_metadata(&namespace, &name, &provider, &version);
+    let metadata = build_module_metadata(&namespace, &name, &provider, &version, archive);
 
     let _ = sqlx::query!(
         r#"
@@ -2215,11 +2905,15 @@ fn build_provider_storage_key(
 }
 
 /// Build module metadata JSON.
+///
+/// `archive_type` records the detected archive format (#4590) as its go-getter
+/// hint (`zip` / `tar.gz`), which is what `download_module` advertises.
 fn build_module_metadata(
     namespace: &str,
     name: &str,
     provider: &str,
     version: &str,
+    archive: ModuleArchiveType,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "module",
@@ -2227,6 +2921,7 @@ fn build_module_metadata(
         "name": name,
         "provider": provider,
         "version": version,
+        MODULE_ARCHIVE_METADATA_KEY: archive.getter_hint(),
     })
 }
 
@@ -2304,8 +2999,13 @@ fn build_search_pattern(query: &str) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// Remote module chain as a client walks it (#4590, replacing the #1608
+    /// test that pinned the old body-streaming `/download`): the upstream
+    /// registry answers `/download` with `204` + a relative `X-Terraform-Get`;
+    /// AK answers with its own `/archive?archive=zip`, and that streams the
+    /// upstream archive (#1608 Phase 4 streaming, through the proxy cache).
     #[tokio::test]
-    async fn test_remote_module_download_streams_upstream_blob_1608() {
+    async fn test_remote_module_download_advertises_hinted_archive_4590() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2314,34 +3014,147 @@ mod tests {
             return;
         };
         let server = MockServer::start().await;
-        // A small deterministic body stands in for a large artifact; the point
-        // is to exercise the streaming pull-through branch (proxy_fetch_streaming)
-        // added in #1608 Phase 4, not the body size.
-        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        let blob: &[u8] = b"PK\x03\x04 #4590 remote module zip bytes";
         Mock::given(method("GET"))
             .and(path("/v1/modules/hashicorp/consul/aws/1.2.3/download"))
+            .respond_with(
+                ResponseTemplate::new(204).insert_header("X-Terraform-Get", "/files/consul-1.2.3"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/consul-1.2.3"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
             .mount(&server)
             .await;
 
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
-        let app = tdh::router_anon(super::router(), state);
-        let (status, body) = tdh::send(
-            app,
+        let (doc_status, _, doc_headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
             tdh::get(format!(
                 "/{key}/v1/modules/hashicorp/consul/aws/1.2.3/download",
                 key = fx.repo_key
             )),
         )
         .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        // The router under test is not mounted at the prefix.
+        let archive_path = advertised
+            .strip_prefix(MOUNT_PREFIX)
+            .unwrap_or(&advertised)
+            .to_string();
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(archive_path),
+        )
+        .await;
+        fx.teardown().await;
 
-        let teardown = || async { fx.teardown().await };
-        if status != axum::http::StatusCode::OK {
-            teardown().await;
-            panic!("expected 200 from streamed remote download, got {status}");
-        }
+        assert_eq!(doc_status, axum::http::StatusCode::NO_CONTENT);
+        // The location named no type, so the bytes decided it.
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/hashicorp/consul/aws/1.2.3/archive?archive=zip",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
-        teardown().await;
+        assert_eq!(headers["content-type"], "application/zip");
+    }
+
+    /// #4590: the hint comes from the upstream location when it names one (a
+    /// JSON `location` body here, the newer protocol form), and a `//subdir`
+    /// survives onto AK's location.
+    #[tokio::test]
+    async fn test_remote_module_hint_from_upstream_location_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/net/aws/2.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "./blob//modules/vpc?archive=tar.gz"
+            })))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/2.0.0/download",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            headers["X-Terraform-Get"],
+            format!(
+                "/terraform/{}/v1/modules/acme/net/aws/2.0.0/archive//modules/vpc?archive=tar.gz",
+                fx.repo_key
+            )
+            .as_str()
+        );
+        // A named type needs no sniffing fetch of the archive.
+        assert_eq!(requests.len(), 1, "only the location document is fetched");
+    }
+
+    /// #4590: a source AK does not proxy (a `git::` address) goes to the client
+    /// as the upstream wrote it, and `/archive` refuses it rather than guess.
+    #[tokio::test]
+    async fn test_remote_module_git_source_passes_through_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "terraform").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let git = "git::https://github.com/acme/terraform-aws-net?ref=v3.0.0";
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/net/aws/3.0.0/download"))
+            .respond_with(ResponseTemplate::new(204).insert_header("X-Terraform-Get", git))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/3.0.0/download",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        let (archive_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{key}/v1/modules/acme/net/aws/3.0.0/archive?archive=zip",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(headers["X-Terraform-Get"], git);
+        assert_eq!(archive_status, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2811,8 +3624,412 @@ mod tests {
 
     #[test]
     fn test_build_module_archive_url() {
-        let url = build_module_archive_url("repo", "ns", "name", "prov", "1.0.0");
-        assert_eq!(url, "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive");
+        // #4590: the hint is what makes go-getter unpack the location as an
+        // archive instead of parsing it as an HTML page.
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=zip"
+        );
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::TarGz,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=tar.gz"
+        );
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Tar,
+            None,
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=tar"
+        );
+    }
+
+    #[test]
+    fn test_build_module_archive_url_with_subdir_4590() {
+        // go-getter splits `//subdir` off before the query and moves the query
+        // back onto the source, so the subdir must sit between path and query.
+        let url = build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            Some("modules/vpc"),
+        );
+        assert_eq!(
+            url,
+            "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive//modules/vpc?archive=zip"
+        );
+        assert_eq!(
+            split_getter_subdir(&url),
+            (
+                "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive?archive=zip".to_string(),
+                Some("modules/vpc".to_string())
+            )
+        );
+        // An empty subdir is no subdir.
+        assert!(!build_module_archive_url(
+            "repo",
+            "ns",
+            "name",
+            "prov",
+            "1.0.0",
+            ModuleArchiveType::Zip,
+            Some("")
+        )
+        .contains("//"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4590: module archive sniffing, upload classification, upstream hints
+    // -----------------------------------------------------------------------
+
+    /// A 512-byte POSIX tar header block with the `ustar` magic at 257.
+    fn tar_header() -> Vec<u8> {
+        let mut block = vec![0u8; 512];
+        block[..7].copy_from_slice(b"main.tf");
+        block[257..263].copy_from_slice(b"ustar\0");
+        block
+    }
+
+    #[test]
+    fn test_module_archive_sniff_4590() {
+        assert_eq!(
+            ModuleArchiveType::sniff(b"PK\x03\x04rest-of-zip"),
+            Some(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            ModuleArchiveType::sniff(&[0x1f, 0x8b, 0x08, 0x00]),
+            Some(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(
+            ModuleArchiveType::sniff(&tar_header()),
+            Some(ModuleArchiveType::Tar)
+        );
+        // A tar header cut short of the magic is not recognised.
+        assert_eq!(ModuleArchiveType::sniff(&tar_header()[..260]), None);
+        // Empty-archive ZIP marker, HTML, plain text, empty: none of ours.
+        assert_eq!(ModuleArchiveType::sniff(b"PK\x05\x06"), None);
+        assert_eq!(ModuleArchiveType::sniff(b"<html><head>"), None);
+        assert_eq!(ModuleArchiveType::sniff(b"module-archive-bytes"), None);
+        assert_eq!(ModuleArchiveType::sniff(b""), None);
+        assert_eq!(ModuleArchiveType::sniff(&[0x1f]), None);
+    }
+
+    #[test]
+    fn test_module_archive_type_names_4590() {
+        for (archive, hint, ct) in [
+            (ModuleArchiveType::Zip, "zip", "application/zip"),
+            (ModuleArchiveType::TarGz, "tar.gz", "application/gzip"),
+            (ModuleArchiveType::Tar, "tar", "application/x-tar"),
+        ] {
+            assert_eq!(archive.getter_hint(), hint);
+            assert_eq!(archive.extension(), hint);
+            assert_eq!(archive.content_type(), ct);
+            assert_eq!(ModuleArchiveType::from_getter_hint(hint), Some(archive));
+            assert_eq!(
+                ModuleArchiveType::from_metadata(&serde_json::json!({ "archive_type": hint })),
+                Some(archive)
+            );
+        }
+        assert_eq!(
+            ModuleArchiveType::from_getter_hint("TGZ"),
+            Some(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(ModuleArchiveType::from_getter_hint("tar.xz"), None);
+        assert_eq!(ModuleArchiveType::from_getter_hint("false"), None);
+        // A module uploaded before #4590 has no recorded type.
+        assert_eq!(
+            ModuleArchiveType::from_metadata(&serde_json::json!({ "kind": "module" })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_module_upload_4590() {
+        assert_eq!(
+            classify_module_upload(b"PK\x03\x04..."),
+            Ok(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            classify_module_upload(&[0x1f, 0x8b, 0x08]),
+            Ok(ModuleArchiveType::TarGz)
+        );
+        let tar = classify_module_upload(&tar_header()).unwrap_err();
+        assert!(tar.contains("uncompressed tar"), "{tar}");
+        let junk = classify_module_upload(b"module-archive-bytes").unwrap_err();
+        assert!(junk.contains("not a ZIP or gzip-compressed tar"), "{junk}");
+        assert!(classify_module_upload(b"").is_err());
+    }
+
+    #[test]
+    fn test_module_coords_filename_follows_type_4590() {
+        let c = ModuleCoords {
+            namespace: "acme",
+            name: "demo",
+            provider: "aws",
+            version: "1.0.0",
+        };
+        assert_eq!(
+            c.filename(Some(ModuleArchiveType::Zip)),
+            "acme-demo-aws-1.0.0.zip"
+        );
+        assert_eq!(
+            c.filename(Some(ModuleArchiveType::TarGz)),
+            "acme-demo-aws-1.0.0.tar.gz"
+        );
+        assert_eq!(c.filename(None), "acme-demo-aws-1.0.0");
+        assert_eq!(
+            c.archive_cache_path(),
+            "v1/modules/acme/demo/aws/1.0.0/archive"
+        );
+        assert_eq!(
+            c.upstream_download_path(),
+            "v1/modules/acme/demo/aws/1.0.0/download"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peek_module_archive_replays_every_byte_4590() {
+        use futures::StreamExt;
+        // The magic arrives split across chunks and the body continues past
+        // the sniff window: the type is still found and nothing is lost.
+        let mut tar = tar_header();
+        tar.extend_from_slice(b"trailing body bytes");
+        let chunks: Vec<crate::error::Result<Bytes>> = tar
+            .chunks(100)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let (archive, body) = peek_module_archive(futures::stream::iter(chunks).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::Tar));
+        let replayed: Vec<u8> = body
+            .map(|c| c.unwrap().to_vec())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(replayed, tar);
+
+        // A body shorter than the window ends cleanly.
+        let short: Vec<crate::error::Result<Bytes>> = vec![Ok(Bytes::from_static(b"PK\x03\x04z"))];
+        let (archive, body) = peek_module_archive(futures::stream::iter(short).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::Zip));
+        assert_eq!(body.collect::<Vec<_>>().await.len(), 1);
+
+        // A stream error is replayed, not swallowed.
+        let failing: Vec<crate::error::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(&[0x1f, 0x8b])),
+            Err(crate::error::AppError::BadGateway("cut".into())),
+        ];
+        let (archive, body) = peek_module_archive(futures::stream::iter(failing).boxed()).await;
+        assert_eq!(archive, Some(ModuleArchiveType::TarGz));
+        let items = body.collect::<Vec<_>>().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[1].is_err());
+    }
+
+    #[test]
+    fn test_split_getter_subdir_4590() {
+        assert_eq!(
+            split_getter_subdir("https://h/a.zip"),
+            ("https://h/a.zip".to_string(), None)
+        );
+        assert_eq!(
+            split_getter_subdir("https://h/a.zip//sub/dir?archive=zip"),
+            (
+                "https://h/a.zip?archive=zip".to_string(),
+                Some("sub/dir".to_string())
+            )
+        );
+        assert_eq!(
+            split_getter_subdir("/rel/a.tgz//mod"),
+            ("/rel/a.tgz".to_string(), Some("mod".to_string()))
+        );
+        // A `//` inside the query is not a subdir.
+        assert_eq!(
+            split_getter_subdir("https://h/a?u=https://x"),
+            ("https://h/a?u=https://x".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_getter_extension_4590() {
+        assert_eq!(
+            getter_extension("/m/x.ZIP"),
+            GetterExtension::Known(ModuleArchiveType::Zip)
+        );
+        assert_eq!(
+            getter_extension("/m/x.tar.gz"),
+            GetterExtension::Known(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(
+            getter_extension("/m/x.tgz"),
+            GetterExtension::Known(ModuleArchiveType::TarGz)
+        );
+        assert_eq!(getter_extension("/m/x.tar.xz"), GetterExtension::Foreign);
+        assert_eq!(getter_extension("/m/x.tar.bz2"), GetterExtension::Foreign);
+        assert_eq!(getter_extension("/m/archive"), GetterExtension::None);
+        // Plain `.tar` is not a go-getter extension at all.
+        assert_eq!(getter_extension("/m/x.tar"), GetterExtension::None);
+    }
+
+    #[test]
+    fn test_classify_upstream_module_location_4590() {
+        let base = "https://reg.example/v1/modules/acme/demo/aws/1.0.0/download";
+
+        // Relative location with an extension: resolved against the answering
+        // URL, typed from the extension.
+        assert_eq!(
+            classify_upstream_module_location("/files/demo.zip", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://reg.example/files/demo.zip".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::Zip),
+                absolute: "https://reg.example/files/demo.zip".into(),
+            }
+        );
+
+        // `archive=` wins over the extension, is stripped from the fetch URL,
+        // and other query parameters (a signature) survive.
+        assert_eq!(
+            classify_upstream_module_location(
+                "https://cdn.example/blob?sig=abc&archive=tar.gz",
+                base
+            ),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/blob?sig=abc".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::TarGz),
+                absolute: "https://cdn.example/blob?sig=abc&archive=tar.gz".into(),
+            }
+        );
+
+        // A query without a hint is left exactly as the upstream sent it.
+        assert_eq!(
+            classify_upstream_module_location(
+                "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb",
+                base
+            ),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb".into(),
+                subdir: None,
+                archive: Some(ModuleArchiveType::TarGz),
+                absolute: "https://cdn.example/m.tgz?X-Amz-Signature=a%2Fb".into(),
+            }
+        );
+
+        // Subdir is carried separately.
+        assert_eq!(
+            classify_upstream_module_location("https://cdn.example/m.zip//modules/vpc", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/m.zip".into(),
+                subdir: Some("modules/vpc".into()),
+                archive: Some(ModuleArchiveType::Zip),
+                absolute: "https://cdn.example/m.zip//modules/vpc".into(),
+            }
+        );
+
+        // No type named: the bytes will decide.
+        assert_eq!(
+            classify_upstream_module_location("https://cdn.example/latest", base),
+            UpstreamModuleSource::Http {
+                fetch_url: "https://cdn.example/latest".into(),
+                subdir: None,
+                archive: None,
+                absolute: "https://cdn.example/latest".into(),
+            }
+        );
+
+        // Forced getters, other schemes, foreign archive types, an explicit
+        // `archive=false` and plain tar go to the client unchanged (absolute).
+        for (loc, want) in [
+            (
+                "git::https://github.com/acme/demo?ref=v1.0.0",
+                "git::https://github.com/acme/demo?ref=v1.0.0",
+            ),
+            (
+                "s3::https://s3.amazonaws.com/b/m.zip",
+                "s3::https://s3.amazonaws.com/b/m.zip",
+            ),
+            ("github.com/acme/demo", "github.com/acme/demo"),
+            ("ftp://files.example/m.zip", "ftp://files.example/m.zip"),
+            (
+                "https://cdn.example/m.tar.xz",
+                "https://cdn.example/m.tar.xz",
+            ),
+            (
+                "https://cdn.example/m?archive=false",
+                "https://cdn.example/m?archive=false",
+            ),
+            (
+                "https://cdn.example/m?archive=tar",
+                "https://cdn.example/m?archive=tar",
+            ),
+            ("/m.tar.bz2", "https://reg.example/m.tar.bz2"),
+        ] {
+            assert_eq!(
+                classify_upstream_module_location(loc, base),
+                UpstreamModuleSource::Passthrough(want.into()),
+                "{loc}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_module_location_value_4590() {
+        assert_eq!(
+            upstream_module_location_value(Some(" /a.zip "), b""),
+            Some("/a.zip".into())
+        );
+        // Header wins over a JSON body.
+        assert_eq!(
+            upstream_module_location_value(Some("/h.zip"), br#"{"location":"/b.zip"}"#),
+            Some("/h.zip".into())
+        );
+        assert_eq!(
+            upstream_module_location_value(None, br#"{"location":"/b.zip"}"#),
+            Some("/b.zip".into())
+        );
+        assert_eq!(upstream_module_location_value(Some(""), b""), None);
+        assert_eq!(upstream_module_location_value(None, b"not json"), None);
+        assert_eq!(
+            upstream_module_location_value(None, br#"{"location":""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_same_origin_4590() {
+        assert!(same_origin(
+            "https://r.example/a",
+            "https://r.example:443/b"
+        ));
+        assert!(!same_origin("https://r.example/a", "http://r.example/a"));
+        assert!(!same_origin("https://r.example/a", "https://cdn.example/a"));
+        assert!(!same_origin("not a url", "https://r.example"));
     }
 
     #[test]
@@ -2922,7 +4139,14 @@ mod tests {
 
     #[test]
     fn test_build_module_metadata() {
-        let meta = build_module_metadata("hashicorp", "consul", "aws", "0.1.0");
+        let meta = build_module_metadata(
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+            ModuleArchiveType::Zip,
+        );
+        assert_eq!(meta["archive_type"], "zip");
         assert_eq!(meta["kind"], "module");
         assert_eq!(meta["namespace"], "hashicorp");
         assert_eq!(meta["name"], "consul");
@@ -4184,6 +5408,244 @@ mod tests {
         );
     }
 
+    /// Publish a module through the real upload handler, returning the status
+    /// and response body.
+    async fn publish_module(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        coord: &str,
+        bytes: Vec<u8>,
+    ) -> (axum::http::StatusCode, Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!("{}/{}/v1/modules/{coord}", MOUNT_PREFIX, fx.repo_key),
+                Bytes::from(bytes),
+            ),
+        )
+        .await
+    }
+
+    /// Walk what `tofu init` walks for a module version: `.../download`, then
+    /// the advertised `X-Terraform-Get`. Returns the advertised location and
+    /// the archive response (status, body, headers).
+    async fn fetch_module_like_client(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        coord: &str,
+    ) -> (
+        axum::http::StatusCode,
+        String,
+        axum::http::StatusCode,
+        Bytes,
+        axum::http::HeaderMap,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let doc_path = format!(
+            "{}/{}/v1/modules/{coord}/download",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (doc_status, _, doc_headers) =
+            tdh::send_with_headers(fx.router_anon(mounted_router()), tdh::get(doc_path.clone()))
+                .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let path = resolve_advertised(&format!("http://ak.test{doc_path}"), &advertised);
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_anon(mounted_router()), tdh::get(path)).await;
+        (doc_status, advertised, status, body, headers)
+    }
+
+    /// A small real ZIP module (one `main.tf`).
+    fn zip_module() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("main.tf", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"output \"x\" { value = 1 }\n").unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A small real tar.gz module (one `main.tf`).
+    fn tar_gz_module() -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let content = b"output \"x\" { value = 1 }\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "main.tf", &content[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// #4590: a ZIP upload and a tar.gz upload each advertise the matching
+    /// go-getter hint, and the archive is served under the matching name and
+    /// type. Before the fix the location had no hint (go-getter parsed the
+    /// ZIP as HTML) and every module was served as `.tar.gz`.
+    #[tokio::test]
+    async fn test_module_archive_hint_follows_upload_type_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip = zip_module();
+        let tgz = tar_gz_module();
+        let (zip_pub, _) = publish_module(&fx, "acme/zipmod/aws/1.0.0", zip.clone()).await;
+        let (tgz_pub, _) = publish_module(&fx, "acme/tgzmod/aws/1.0.0", tgz.clone()).await;
+        let zip_dl = fetch_module_like_client(&fx, "acme/zipmod/aws/1.0.0").await;
+        let tgz_dl = fetch_module_like_client(&fx, "acme/tgzmod/aws/1.0.0").await;
+        let recorded: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT a.name, m.metadata->>'archive_type', a.content_type
+               FROM artifacts a LEFT JOIN artifact_metadata m ON m.artifact_id = a.id
+              WHERE a.repository_id = $1 ORDER BY a.name",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        fx.teardown().await;
+
+        assert_eq!(zip_pub, axum::http::StatusCode::CREATED);
+        assert_eq!(tgz_pub, axum::http::StatusCode::CREATED);
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    "acme/tgzmod/aws".to_string(),
+                    Some("tar.gz".to_string()),
+                    "application/gzip".to_string()
+                ),
+                (
+                    "acme/zipmod/aws".to_string(),
+                    Some("zip".to_string()),
+                    "application/zip".to_string()
+                ),
+            ]
+        );
+
+        for ((doc, advertised, status, body, headers), coord, hint, ct, ext, bytes) in [
+            (zip_dl, "zipmod", "zip", "application/zip", "zip", &zip),
+            (
+                tgz_dl,
+                "tgzmod",
+                "tar.gz",
+                "application/gzip",
+                "tar.gz",
+                &tgz,
+            ),
+        ] {
+            assert_eq!(doc, axum::http::StatusCode::NO_CONTENT, "{coord}");
+            assert!(
+                advertised.ends_with(&format!(
+                    "/v1/modules/acme/{coord}/aws/1.0.0/archive?archive={hint}"
+                )),
+                "{coord}: X-Terraform-Get must carry the {hint} hint, got {advertised}"
+            );
+            assert_eq!(status, axum::http::StatusCode::OK, "{coord}");
+            assert_eq!(&body[..], &bytes[..], "{coord}: archive bytes");
+            assert_eq!(headers["content-type"], ct, "{coord}");
+            let disposition = headers["content-disposition"].to_str().unwrap();
+            assert!(
+                disposition.contains(&format!("acme-{coord}-aws-1.0.0.{ext}")),
+                "{coord}: {disposition}"
+            );
+        }
+    }
+
+    /// #4590: a body that is not a ZIP or tar.gz is refused at upload with the
+    /// reason, and nothing is stored. Plain tar is refused too: neither client
+    /// can install it.
+    #[tokio::test]
+    async fn test_module_upload_rejects_non_archive_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let (junk, junk_body) = publish_module(
+            &fx,
+            "acme/junk/aws/1.0.0",
+            b"<html>not an archive</html>".to_vec(),
+        )
+        .await;
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        header.set_size(1);
+        header.set_cksum();
+        tar.append_data(&mut header, "main.tf", &b"x"[..]).unwrap();
+        let (plain_tar, tar_body) =
+            publish_module(&fx, "acme/plain/aws/1.0.0", tar.into_inner().unwrap()).await;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        assert_eq!(junk, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&junk_body).contains("not a ZIP or gzip-compressed tar"),
+            "{}",
+            String::from_utf8_lossy(&junk_body)
+        );
+        assert_eq!(plain_tar, axum::http::StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&tar_body).contains("uncompressed tar"));
+        assert_eq!(stored, 0, "a refused upload must store nothing");
+    }
+
+    /// #4590: a module uploaded before the type was recorded (no
+    /// `archive_type` in its metadata, `.tar.gz` content type whatever it
+    /// holds) gets its hint from its stored bytes.
+    #[tokio::test]
+    async fn test_module_without_recorded_type_is_sniffed_4590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip = zip_module();
+        let (published, _) = publish_module(&fx, "acme/legacy/aws/1.0.0", zip.clone()).await;
+        // Make it look exactly like a pre-#4590 upload.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata - 'archive_type'
+              WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET content_type = 'application/gzip' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let (doc, advertised, status, body, headers) =
+            fetch_module_like_client(&fx, "acme/legacy/aws/1.0.0").await;
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED);
+        assert_eq!(doc, axum::http::StatusCode::NO_CONTENT);
+        assert!(advertised.ends_with("/archive?archive=zip"), "{advertised}");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], &zip[..]);
+        assert_eq!(headers["content-type"], "application/zip");
+    }
+
     // -----------------------------------------------------------------------
     // Hosted network mirror
     // -----------------------------------------------------------------------
@@ -4639,7 +6101,8 @@ mod catalog_registration_tests {
                     super::MOUNT_PREFIX,
                     fx.repo_key
                 ),
-                bytes::Bytes::from_static(b"module-archive-bytes"),
+                // #4590: a module upload must be a real archive type.
+                bytes::Bytes::from_static(b"PK\x03\x04module-archive-bytes"),
             ),
         )
         .await;

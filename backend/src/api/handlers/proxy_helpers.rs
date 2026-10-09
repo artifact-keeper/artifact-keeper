@@ -2458,6 +2458,24 @@ pub async fn proxy_fetch_uncached_with_link(
     .await
 }
 
+/// Ask a remote Terraform repository's upstream registry where a module
+/// version's source lives (#4590). Uncached; see
+/// [`ProxyService::fetch_upstream_terraform_module_location`].
+pub async fn proxy_fetch_terraform_module_location(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<crate::services::proxy_service::UpstreamModuleLocation, Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_terraform_module_location(&repo, path)
+            .await
+    })
+    .await
+}
+
 /// Strategy for fetching an artifact from a single virtual member.
 ///
 /// Exposed for unit testing the branching logic in

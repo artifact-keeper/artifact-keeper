@@ -137,7 +137,7 @@ services:
       retries: 30
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "terraform-mirror", "redteam", "tag-replication", "curation", "cache-correctness"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "terraform-mirror", "terraform-modules", "redteam", "tag-replication", "curation", "cache-correctness"]
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
@@ -171,7 +171,7 @@ services:
       retries: 20
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "terraform-modules", "redteam", "tag-replication", "curation", "cache-correctness"]
 
   # ==========================================================================
   # SMOKE TEST SERVICES (pypi, npm, cargo)
@@ -469,6 +469,36 @@ services:
     networks:
       - e2e-test-network
     profiles: ["terraform-mirror"]
+
+  # ==========================================================================
+  # TERRAFORM / OPENTOFU HOSTED MODULE INSTALL TESTS (#4590)
+  # ==========================================================================
+
+  terraform-modules-test:
+    image: hashicorp/terraform:1.16.0
+    container_name: e2e-test-terraform-modules
+    depends_on:
+      setup:
+        condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      TF_CLI_BIN: terraform
+      CADDY_BIN: caddy
+      RUN_TF_CLI: "1"
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # caddy fronts the backend with the host-level discovery rewrite the
+    # module source address needs; no upstream registry access is required.
+    command: ["apk add --no-cache bash curl jq coreutils tar gzip zip caddy >/dev/null 2>&1 && bash /scripts/test-terraform-modules.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["terraform-modules"]
 
   # ==========================================================================
   # PROXY + VIRTUAL REPOSITORY TESTS
