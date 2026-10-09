@@ -886,13 +886,37 @@ pub struct Config {
     /// uploads and downloads turns a duration cap into an effective size cap —
     /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
     /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
-    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
-    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE`, their
+    /// concurrency by `GLOBAL_MAX_CONCURRENCY` and
+    /// `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`, and a stalled upload body by
+    /// `UPLOAD_PROGRESS_WINDOW_SECS` (GHSA-9f9r-c4w8-rjv9).
     ///
     /// This value therefore only has to exceed the slowest legitimate
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+
+    /// Progress window, in seconds, for artifact upload bodies on the
+    /// byte-transfer routes that `global_request_timeout_secs` exempts
+    /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
+    /// `upload_min_progress_bytes` during one window spent waiting for data is
+    /// aborted with 408, so a stalled or trickling client cannot hold a global
+    /// request permit indefinitely. Env var: `UPLOAD_PROGRESS_WINDOW_SECS`.
+    /// Default 60. Set to 0 to disable the deadline.
+    pub upload_progress_window_secs: u64,
+
+    /// Bytes an upload body must deliver per `upload_progress_window_secs`.
+    /// The default (16 KiB per 60 s, about 270 B/s) is far below any real
+    /// link. Env var: `UPLOAD_MIN_PROGRESS_BYTES`. Default 16384.
+    pub upload_min_progress_bytes: u64,
+
+    /// Concurrent artifact uploads one principal (an authenticated user, or a
+    /// client address for an anonymous caller) may have in flight on the
+    /// byte-transfer routes; further ones get 429 with `Retry-After`, so one
+    /// credential cannot hold the whole `global_max_concurrency` pool
+    /// (GHSA-9f9r-c4w8-rjv9). Env var: `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`.
+    /// Default 64. Set to 0 to disable the cap.
+    pub upload_max_in_flight_per_principal: usize,
 
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
@@ -1338,6 +1362,9 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show upload_progress_window_secs,
+    show upload_min_progress_bytes,
+    show upload_max_in_flight_per_principal,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -1484,6 +1511,9 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
@@ -1819,6 +1849,12 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
+            upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
+            upload_max_in_flight_per_principal: env_parse(
+                "UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL",
+                64_usize,
+            ),
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),

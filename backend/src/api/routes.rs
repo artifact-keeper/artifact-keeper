@@ -1,16 +1,15 @@
 //! Route definitions for the API.
 
 use axum::{
-    error_handling::HandleErrorLayer,
     extract::{DefaultBodyLimit, Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
-    BoxError, Router,
+    Router,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tower::{limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, ServiceBuilder};
+use tokio::sync::Semaphore;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::AppError;
@@ -30,6 +29,9 @@ use super::middleware::rate_limit::{
 };
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
+use super::middleware::upload_guard::{
+    per_principal_upload_admission, upload_progress_deadline, ProgressPolicy, UploadAdmission,
+};
 use super::SharedState;
 use crate::services::auth_service::AuthService;
 
@@ -64,6 +66,10 @@ pub fn create_router(state: SharedState) -> Router {
     // The upload body limit is read from config (MAX_UPLOAD_SIZE env var,
     // default 10 GB). A value of 0 disables the limit entirely.
     let upload_limit = state.config.max_upload_size_bytes;
+
+    // One in-flight upload budget per principal, shared by every upload
+    // surface below (GHSA-9f9r-c4w8-rjv9).
+    let upload_admission = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
 
     let format_routes = Router::new()
         .nest("/general", handlers::general::router())
@@ -129,6 +135,12 @@ pub fn create_router(state: SharedState) -> Router {
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
         .nest("/ext", handlers::wasm_proxy::router())
+        // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
+        // inside the visibility middleware so it sees the caller's identity.
+        .layer(middleware::from_fn_with_state(
+            upload_admission.clone(),
+            per_principal_upload_admission,
+        ))
         .layer(middleware::from_fn_with_state(
             vis_state,
             repo_visibility_middleware,
@@ -190,6 +202,7 @@ pub fn create_router(state: SharedState) -> Router {
                 rate_limit_exemptions,
                 rate_limit_trusted_proxies.clone(),
                 login_rate_limit_state.clone(),
+                upload_admission,
             ),
         )
         // Docker Registry V2 API (OCI Distribution Spec)
@@ -293,18 +306,67 @@ pub fn create_router(state: SharedState) -> Router {
     // any real work.
     let max_concurrency = state.config.global_max_concurrency;
     let request_timeout_secs = state.config.global_request_timeout_secs;
+    let progress = ProgressPolicy::from_config(&state.config);
     apply_global_backstop(
-        router.with_state(state),
+        apply_upload_progress_deadline(router.with_state(state), progress),
         max_concurrency,
         request_timeout_secs,
     )
 }
 
-/// Map a backstop layer error (load-shed `Overloaded` or timeout `Elapsed`)
-/// onto a 503 so clients back off and retry, mirroring the auth-semaphore
-/// shed policy. `Retry-After` is attached by `AppError`'s `IntoResponse`.
-async fn handle_backstop_error(err: BoxError) -> AppError {
-    AppError::ServiceUnavailable(format!("Server overloaded, please retry: {err}"))
+/// Give every byte-transfer upload body a progress deadline
+/// (GHSA-9f9r-c4w8-rjv9). These routes are exempt from the wall-clock
+/// request timeout (#3263), so without it a client that stops sending holds
+/// its global permit for as long as it keeps the socket open. `None` (window
+/// 0) leaves the router unchanged.
+fn apply_upload_progress_deadline(router: Router, policy: Option<ProgressPolicy>) -> Router {
+    match policy {
+        Some(policy) => router.layer(middleware::from_fn_with_state(
+            policy,
+            upload_progress_deadline,
+        )),
+        None => router,
+    }
+}
+
+/// The 503 the global concurrency backstop sheds with: byte-for-byte what the
+/// `tower` `LoadShedLayer` + `HandleErrorLayer` pair it replaced produced, so
+/// clients and dashboards keying off the message do not break.
+/// `Retry-After` is attached by `AppError`'s `IntoResponse`.
+fn overloaded_response() -> Response {
+    AppError::ServiceUnavailable("Server overloaded, please retry: service overloaded".to_string())
+        .into_response()
+}
+
+/// Liveness and readiness probes. They do no work beyond what their handlers
+/// bound themselves, and an orchestrator that cannot reach them restarts or
+/// drains a replica that is merely busy, so they are never shed by the
+/// global concurrency backstop (GHSA-9f9r-c4w8-rjv9).
+const PROBE_PATHS: &[&str] = &["/health", "/healthz", "/ready", "/readyz", "/livez"];
+
+fn is_probe_path(path: &str) -> bool {
+    PROBE_PATHS.contains(&path)
+}
+
+/// Router-wide load-shed concurrency limit: hold one permit from `permits`
+/// for the life of the request, and answer 503 at once when none is free
+/// (no queueing). Health and readiness probes bypass it.
+///
+/// Replaces `tower`'s `LoadShedLayer` + `GlobalConcurrencyLimitLayer`, which
+/// cannot exempt a route: with every permit held (for instance by slow
+/// uploads, GHSA-9f9r-c4w8-rjv9) they refused the probes as well.
+async fn global_concurrency_backstop(
+    State(permits): State<Arc<Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_probe_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    match permits.try_acquire_owned() {
+        Ok(_permit) => next.run(req).await,
+        Err(_) => overloaded_response(),
+    }
 }
 
 /// Native-protocol path prefixes whose own routers already declare that they
@@ -333,6 +395,10 @@ const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
 /// the load-shed + `GLOBAL_MAX_CONCURRENCY` limiter still bounds how many may run
 /// at once — so the "no path can pin every worker" backstop is preserved for the
 /// paths it was written for (bcrypt, decompression, and other server-side work).
+/// What the timeout used to bound for them, a client that stops sending, is
+/// bounded instead by the upload progress deadline and the per-principal
+/// in-flight cap in [`crate::api::middleware::upload_guard`]
+/// (GHSA-9f9r-c4w8-rjv9).
 ///
 /// Pure (`&str` in, `bool` out) so the whole route table is unit-testable
 /// without a router, a server, or a clock.
@@ -404,10 +470,11 @@ async fn conditional_request_timeout(
 /// applied only when its config value is non-zero (`0` disables it), so the
 /// behaviour is identical to the unpatched router when both are disabled.
 ///
-/// The load-shed + concurrency limiter stays the outermost `tower` stack (a shed
-/// must happen before any work). The request timeout is applied just inside it
-/// as an axum middleware rather than a `TimeoutLayer` so it can skip artifact
-/// byte transfers — see [`is_byte_transfer_path`] and #3263.
+/// The load-shed + concurrency limiter stays the outermost layer (a shed must
+/// happen before any work), and health and readiness probes bypass it
+/// (GHSA-9f9r-c4w8-rjv9). The request timeout is applied just inside it as an
+/// axum middleware rather than a `TimeoutLayer` so it can skip artifact byte
+/// transfers — see [`is_byte_transfer_path`] and #3263.
 fn apply_global_backstop(
     router: Router,
     max_concurrency: usize,
@@ -426,12 +493,10 @@ fn apply_global_backstop(
         return router;
     }
 
-    router.layer(
-        ServiceBuilder::new()
-            .layer(HandleErrorLayer::new(handle_backstop_error))
-            .layer(LoadShedLayer::new())
-            .layer(GlobalConcurrencyLimitLayer::new(max_concurrency)),
-    )
+    router.layer(middleware::from_fn_with_state(
+        Arc::new(Semaphore::new(max_concurrency)),
+        global_concurrency_backstop,
+    ))
 }
 
 /// Construct the login rate-limit state shared by `/api/v1/auth/login` and
@@ -549,6 +614,7 @@ fn api_v1_routes(
     exemptions: Arc<RateLimitExemptions>,
     trusted_proxies: Arc<Vec<CidrRange>>,
     login_rate_limit_state: LoginRateLimitState,
+    upload_admission: Arc<UploadAdmission>,
 ) -> Router<SharedState> {
     // Create an AuthService for middleware use
     let auth_service = Arc::new(AuthService::new(
@@ -791,6 +857,12 @@ fn api_v1_routes(
                         presign_rate_limit_state,
                         rate_limit_by_ip_middleware,
                     ),
+                ))
+                // Inside the auth layer below, so it sees the caller
+                // (GHSA-9f9r-c4w8-rjv9).
+                .layer(middleware::from_fn_with_state(
+                    upload_admission.clone(),
+                    per_principal_upload_admission,
                 ))
                 .layer(if upload_limit == 0 {
                     DefaultBodyLimit::disable()
@@ -1288,10 +1360,17 @@ fn api_v1_routes(
         // Chunked/resumable upload routes with auth middleware
         .nest(
             "/uploads",
-            handlers::upload::router().layer(middleware::from_fn_with_state(
-                auth_service,
-                auth_middleware,
-            )),
+            handlers::upload::router()
+                // Inside the auth layer, so it sees the caller
+                // (GHSA-9f9r-c4w8-rjv9).
+                .layer(middleware::from_fn_with_state(
+                    upload_admission,
+                    per_principal_upload_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service,
+                    auth_middleware,
+                )),
         )
         // Web-UI CSRF contract (#3065): a state-changing request authenticated
         // by the session cookie must carry the `X-Requested-With` header the
@@ -1635,6 +1714,222 @@ mod tests {
                 "{path} must stay under the global request timeout"
             );
         }
+    }
+
+    /// GHSA-9f9r-c4w8-rjv9: health and readiness must answer while every
+    /// global request permit is held. Slow uploads used to be able to hold all
+    /// of them, after which the load-shed layer refused `/health` and
+    /// `/ready` with 503 too and an orchestrator restarted a healthy replica.
+    /// Other routes are still shed while the pool is full.
+    #[tokio::test]
+    async fn health_and_readiness_answer_while_the_global_pool_is_full() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (hold, held) = (release.clone(), entered.clone());
+        let router = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/ready", get(|| async { "ok" }))
+            .route("/readyz", get(|| async { "ok" }))
+            .route("/livez", get(|| async { "ok" }))
+            .route("/other", get(|| async { "other" }))
+            .route(
+                "/slow",
+                get(move || {
+                    let (hold, held) = (hold.clone(), held.clone());
+                    async move {
+                        held.notify_one();
+                        hold.notified().await;
+                        "slow"
+                    }
+                }),
+            );
+        let app = super::apply_global_backstop(router, 1, 120);
+        let get_req = |p: &str| {
+            axum::http::Request::builder()
+                .uri(p)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Hold the only permit.
+        let holder = tokio::spawn(app.clone().oneshot(get_req("/slow")));
+        entered.notified().await;
+
+        for probe in ["/health", "/healthz", "/ready", "/readyz", "/livez"] {
+            let resp = app.clone().oneshot(get_req(probe)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{probe} while the pool is full"
+            );
+        }
+        let shed = app.clone().oneshot(get_req("/other")).await.unwrap();
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "other routes are still shed while the pool is full"
+        );
+
+        release.notify_one();
+        let held = holder.await.unwrap().unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        let after = app.oneshot(get_req("/other")).await.unwrap();
+        assert_eq!(after.status(), StatusCode::OK, "the permit is released");
+    }
+
+    /// GHSA-9f9r-c4w8-rjv9 end to end, through the production router and a
+    /// real database: a repository writer opens Git LFS uploads that send one
+    /// byte and then nothing, the advisory's attack.
+    ///
+    /// * the writer's uploads beyond its per-principal cap get 429 at once;
+    /// * `/health` and `/ready` keep answering 200 while they are held;
+    /// * each stalled upload ends with 408 once its progress window passes,
+    ///   instead of holding its global permit for as long as the socket stays
+    ///   open;
+    /// * a normal upload by the same writer then succeeds, streamed through
+    ///   the scratch disk, and the object is stored with the right digest.
+    #[tokio::test]
+    async fn stalled_lfs_uploads_are_bounded_and_health_stays_up() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::StatusCode;
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
+        let (user_id, _name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), |c| {
+            c.upload_progress_window_secs = 2;
+            c.upload_min_progress_bytes = 1024;
+            c.upload_max_in_flight_per_principal = 2;
+            c.global_max_concurrency = 8;
+        });
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+        let put = |oid: String, body: Body| {
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/lfs/{repo_key}/objects/{oid}"))
+                .header("authorization", bearer.as_str())
+                .header("content-type", "application/octet-stream")
+                .body(body)
+                .unwrap()
+        };
+        let stalled_body = || {
+            Body::from_stream(
+                futures::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))
+                })
+                .chain(futures::stream::pending()),
+            )
+        };
+        let oid = |n: u8| format!("{n:064x}");
+        let started = tokio::time::Instant::now();
+
+        // Two stalled uploads take the writer's two slots.
+        let held: Vec<_> = (1..=2)
+            .map(|n| tokio::spawn(app.clone().oneshot(put(oid(n), stalled_body()))))
+            .collect();
+
+        // A third is refused at once. Poll until both are admitted (they pass
+        // authentication first), well inside the 2 s window.
+        let mut third = StatusCode::OK;
+        while started.elapsed() < std::time::Duration::from_millis(1500) {
+            let resp = app
+                .clone()
+                .oneshot(put(oid(3), Body::from("y")))
+                .await
+                .unwrap();
+            third = resp.status();
+            if third == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let health = app
+            .clone()
+            .oneshot(tdh::get("/health".into()))
+            .await
+            .unwrap();
+        let ready = app
+            .clone()
+            .oneshot(tdh::get("/ready".into()))
+            .await
+            .unwrap();
+
+        // The stalled uploads end on their own.
+        let mut stalled = Vec::new();
+        for h in held {
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), h)
+                .await
+                .expect("a stalled upload must not be held indefinitely")
+                .unwrap()
+                .unwrap();
+            stalled.push(resp.status());
+        }
+
+        // A real upload by the same writer now succeeds.
+        let content = vec![42u8; 300 * 1024];
+        let real_oid = format!("{:x}", Sha256::digest(&content));
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = content
+            .chunks(64 * 1024)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let real = app
+            .clone()
+            .oneshot(put(
+                real_oid.clone(),
+                Body::from_stream(futures::stream::iter(chunks)),
+            ))
+            .await
+            .unwrap();
+        let real_status = real.status();
+        let stored: Option<(i64, String)> = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(format!("lfs/objects/{}/{}", &real_oid[..2], real_oid))
+        .fetch_optional(&pool)
+        .await
+        .expect("read the stored object");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            third,
+            StatusCode::TOO_MANY_REQUESTS,
+            "upload beyond the cap"
+        );
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "/health while uploads are held"
+        );
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready while uploads are held"
+        );
+        assert_eq!(
+            stalled,
+            vec![StatusCode::REQUEST_TIMEOUT, StatusCode::REQUEST_TIMEOUT],
+            "stalled uploads end with 408"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(real_status, StatusCode::OK, "a real upload still works");
+        assert_eq!(stored, Some((300 * 1024, real_oid)));
     }
 
     /// Regression guard on the mechanism, not just the predicate: a

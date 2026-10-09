@@ -516,12 +516,15 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// moved from `body: Bytes` to `body: Body` and holds no plugin on the heap on
 /// either the multipart or the raw (`X-Plugin-Name`) path. The jetbrains.rs row
 /// is removed.
+///
+/// GHSA-9f9r-c4w8-rjv9: Git LFS `upload_object` now streams through
+/// `stage_stream_content_addressed` + `put_stream`, so the gitlfs.rs row is
+/// removed.
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
     ("src/api/handlers/conan.rs", 2),
     ("src/api/handlers/debian.rs", 1),
-    ("src/api/handlers/gitlfs.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
