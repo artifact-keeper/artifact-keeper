@@ -10,6 +10,47 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
+/// How the SMTP connection is secured (`SMTP_TLS_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpTlsMode {
+    /// `tls`: TLS from the first byte (SMTPS, usually port 465).
+    Implicit,
+    /// `starttls` (default): connect in plaintext and upgrade with STARTTLS;
+    /// fail when the server does not advertise it.
+    StartTls,
+    /// `starttls-opportunistic`: upgrade with STARTTLS when the server
+    /// advertises it, otherwise carry on unencrypted. This is what Forgejo's
+    /// `smtp+starttls` and JavaMail's `mail.smtp.starttls.enable` (Nexus) do.
+    /// A STARTTLS that is offered but fails (an untrusted certificate, say)
+    /// is still an error, never a silent downgrade.
+    StartTlsOpportunistic,
+    /// `none`: plaintext only, STARTTLS is never attempted.
+    None,
+}
+
+impl SmtpTlsMode {
+    /// Map a validated `SMTP_TLS_MODE` value. Unknown values are already
+    /// rewritten to "starttls" by `Config::from_env`.
+    pub fn from_config(value: &str) -> Self {
+        match value {
+            "tls" => Self::Implicit,
+            "none" => Self::None,
+            "starttls-opportunistic" => Self::StartTlsOpportunistic,
+            _ => Self::StartTls,
+        }
+    }
+
+    /// The `SMTP_TLS_MODE` spelling of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "tls",
+            Self::StartTls => "starttls",
+            Self::StartTlsOpportunistic => "starttls-opportunistic",
+            Self::None => "none",
+        }
+    }
+}
+
 /// SMTP email delivery service.
 ///
 /// Wraps an optional `AsyncSmtpTransport`. When the transport is `None`
@@ -34,11 +75,11 @@ impl SmtpService {
         let transport = match &config.smtp_host {
             Some(host) => {
                 let tls_parameters = build_tls_parameters(host, config)?;
-                let tls = match config.smtp_tls_mode.as_str() {
-                    "tls" => Tls::Wrapper(tls_parameters),
-                    "none" => Tls::None,
-                    // "starttls" is the default
-                    _ => Tls::Required(tls_parameters),
+                let tls = match SmtpTlsMode::from_config(&config.smtp_tls_mode) {
+                    SmtpTlsMode::Implicit => Tls::Wrapper(tls_parameters),
+                    SmtpTlsMode::StartTls => Tls::Required(tls_parameters),
+                    SmtpTlsMode::StartTlsOpportunistic => Tls::Opportunistic(tls_parameters),
+                    SmtpTlsMode::None => Tls::None,
                 };
 
                 let builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
@@ -550,5 +591,40 @@ mod tests {
             assert!(SmtpService::new(&config).unwrap().is_configured());
         }
         assert!(!config_with(&[]).smtp_tls_skip_verify, "default is false");
+    }
+
+    #[test]
+    fn test_tls_mode_values_round_trip() {
+        for mode in [
+            SmtpTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+            SmtpTlsMode::StartTlsOpportunistic,
+            SmtpTlsMode::None,
+        ] {
+            assert_eq!(SmtpTlsMode::from_config(mode.as_str()), mode);
+        }
+        assert_eq!(SmtpTlsMode::from_config("garbage"), SmtpTlsMode::StartTls);
+    }
+
+    #[tokio::test]
+    async fn test_opportunistic_mode_is_accepted_by_config() {
+        for raw in ["starttls-opportunistic", "STARTTLS-Opportunistic"] {
+            let config = config_with(&[("SMTP_TLS_MODE", raw)]);
+            assert_eq!(config.smtp_tls_mode, "starttls-opportunistic", "{raw}");
+            assert_eq!(
+                SmtpTlsMode::from_config(&config.smtp_tls_mode),
+                SmtpTlsMode::StartTlsOpportunistic
+            );
+            assert!(SmtpService::new(&config).unwrap().is_configured());
+        }
+    }
+
+    #[test]
+    fn test_strict_starttls_stays_the_default() {
+        let config = config_with(&[]);
+        assert_eq!(
+            SmtpTlsMode::from_config(&config.smtp_tls_mode),
+            SmtpTlsMode::StartTls
+        );
     }
 }

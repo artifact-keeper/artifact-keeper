@@ -1223,7 +1223,9 @@ pub struct Config {
     /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
     pub smtp_from_address: String,
 
-    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    /// TLS mode for the SMTP connection: "starttls" (default, STARTTLS
+    /// required), "starttls-opportunistic" (STARTTLS when the server offers
+    /// it, plaintext otherwise), "tls" (implicit TLS), or "none".
     pub smtp_tls_mode: String,
 
     /// Extra CA certificate(s) trusted for the SMTP server's TLS certificate,
@@ -2037,7 +2039,7 @@ impl Config {
                     .unwrap_or_else(|_| "starttls".into())
                     .to_lowercase();
                 match mode.as_str() {
-                    "starttls" | "tls" | "none" => mode,
+                    "starttls" | "starttls-opportunistic" | "tls" | "none" => mode,
                     _ => {
                         tracing::warn!(
                             value = %mode,
