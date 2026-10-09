@@ -6,6 +6,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::smtp_service::SmtpError;
 
 /// Create SMTP admin routes.
 pub fn router() -> Router<SharedState> {
@@ -54,6 +55,7 @@ pub struct SmtpTestResponse {
         (status = 200, description = "Test email sent successfully", body = SmtpTestResponse),
         (status = 400, description = "Invalid request (e.g. bad email address)"),
         (status = 403, description = "Admin privileges required"),
+        (status = 502, description = "The SMTP server refused or the connection failed; the message carries the server's reply, what it advertised, and a configuration hint"),
         (status = 503, description = "SMTP not configured"),
     )
 )]
@@ -78,10 +80,29 @@ pub async fn send_test_email(
         ));
     }
 
-    smtp.send_test_email(&req.to).await.map_err(|e| {
-        tracing::error!(error = %e, to = %req.to, "SMTP test email failed");
-        AppError::Internal(format!("SMTP test failed: {e}"))
-    })?;
+    match smtp.send_test_email(&req.to).await {
+        Ok(()) => {}
+        Err(SmtpError::Delivery(failure)) => {
+            // Probe EHLO separately so the message can say what the server
+            // offered (lettre's own error cannot name NTLM or GSSAPI).
+            let probe = smtp.probe().await;
+            let failure = match smtp.hint_context() {
+                Some(ctx) => failure.with_probe(ctx, &probe),
+                None => failure,
+            };
+            tracing::error!(error = %failure, to = %req.to, "SMTP test email failed");
+            // 502, not 500: the upstream mail server refused, and the message
+            // is meant for the administrator (500 bodies are redacted).
+            return Err(AppError::BadGateway(format!("SMTP test failed: {failure}")));
+        }
+        Err(SmtpError::Address(msg)) => {
+            return Err(AppError::Validation(msg));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, to = %req.to, "SMTP test email failed");
+            return Err(AppError::Internal(format!("SMTP test failed: {e}")));
+        }
+    }
 
     Ok(Json(SmtpTestResponse {
         success: true,

@@ -144,6 +144,15 @@ mod test_env {
 }
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
+/// `SMTP_TLS_CA_CERT` (path or inline PEM), falling back to the shared
+/// `CUSTOM_CA_CERT_PATH`. Returns the value and the variable it came from.
+fn smtp_tls_ca_cert_from_env() -> Option<(String, &'static str)> {
+    let non_empty = |k: &str| env::var(k).ok().filter(|v| !v.trim().is_empty());
+    non_empty("SMTP_TLS_CA_CERT")
+        .map(|v| (v, "SMTP_TLS_CA_CERT"))
+        .or_else(|| non_empty("CUSTOM_CA_CERT_PATH").map(|v| (v, "CUSTOM_CA_CERT_PATH")))
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
@@ -1214,8 +1223,25 @@ pub struct Config {
     /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
     pub smtp_from_address: String,
 
-    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    /// TLS mode for the SMTP connection: "starttls" (default, STARTTLS
+    /// required), "starttls-opportunistic" (STARTTLS when the server offers
+    /// it, plaintext otherwise), "tls" (implicit TLS), or "none".
     pub smtp_tls_mode: String,
+
+    /// Extra CA certificate(s) trusted for the SMTP server's TLS certificate,
+    /// added to the system trust store. Either a path to a PEM file or the
+    /// PEM text itself. `SMTP_TLS_CA_CERT` wins; when it is unset the shared
+    /// `CUSTOM_CA_CERT_PATH` (also used by the outbound HTTP clients) applies.
+    pub smtp_tls_ca_cert: Option<String>,
+
+    /// Where `smtp_tls_ca_cert` came from: `SMTP_TLS_CA_CERT` or
+    /// `CUSTOM_CA_CERT_PATH`. Used for log and error messages only.
+    pub smtp_tls_ca_cert_source: Option<&'static str>,
+
+    /// Skip verification of the SMTP server's certificate and hostname
+    /// (`SMTP_TLS_SKIP_VERIFY`, default false). Testing only: it lets anyone
+    /// on the path read the SMTP credentials.
+    pub smtp_tls_skip_verify: bool,
 
     // -- npm computed-packument cache (#2162) --
     /// Whether the npm computed-packument response cache (with
@@ -1413,6 +1439,8 @@ redacted_debug!(Config {
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show smtp_tls_ca_cert_source,
+    show smtp_tls_skip_verify,
     show npm_packument_cache_enabled,
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
@@ -1565,6 +1593,9 @@ impl Default for Config {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
@@ -2008,7 +2039,7 @@ impl Config {
                     .unwrap_or_else(|_| "starttls".into())
                     .to_lowercase();
                 match mode.as_str() {
-                    "starttls" | "tls" | "none" => mode,
+                    "starttls" | "starttls-opportunistic" | "tls" | "none" => mode,
                     _ => {
                         tracing::warn!(
                             value = %mode,
@@ -2018,6 +2049,14 @@ impl Config {
                     }
                 }
             },
+            smtp_tls_ca_cert: smtp_tls_ca_cert_from_env().map(|(v, _)| v),
+            smtp_tls_ca_cert_source: smtp_tls_ca_cert_from_env().map(|(_, src)| src),
+            smtp_tls_skip_verify: env::var("SMTP_TLS_SKIP_VERIFY")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             // On by default; only an explicit, recognized negative disables
             // the npm computed-packument cache (#2162).
             npm_packument_cache_enabled: parse_opt_out_flag(

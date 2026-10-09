@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4591]
+---
+- **SMTP can trust a private CA, via `SMTP_TLS_CA_CERT` or the existing `CUSTOM_CA_CERT_PATH`, and `SMTP_TLS_SKIP_VERIFY` turns verification off for testing** (#4591). The SMTP transport verified the server certificate against the system trust store only, so `SMTP_TLS_MODE=starttls` or `tls` against a mail server with an internal-CA certificate (common for on-prem Exchange) failed with `tls error: ... certificate verify failed`, and the only workaround was to replace the container's CA bundle. `SMTP_TLS_CA_CERT` takes a PEM file path or the PEM text, and when it is unset the SMTP transport now also honours `CUSTOM_CA_CERT_PATH`, the CA setting the outbound HTTP clients already use. The certificates are added to the system store, not substituted for it. `SMTP_TLS_SKIP_VERIFY=true` (default `false`) accepts any certificate and hostname and logs a warning at startup. An unreadable or unparsable CA file disables email delivery with a startup warning that names the variable.
