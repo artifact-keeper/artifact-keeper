@@ -17730,6 +17730,195 @@ mod scan_on_proxy_tests {
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// The stored `(verdict, components_cataloged)` for `digest`, if any.
+    async fn stored_verdict(pool: &sqlx::PgPool, digest: &str) -> Option<(String, Option<i32>)> {
+        sqlx::query_as(
+            "SELECT verdict, components_cataloged FROM proxy_scan_results \
+             WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+        )
+        .bind(digest)
+        .fetch_optional(pool)
+        .await
+        .expect("read stored verdict")
+    }
+
+    /// Wait for the fail-open background scan to record a verdict.
+    async fn await_stored_verdict(
+        pool: &sqlx::PgPool,
+        digest: &str,
+    ) -> Option<(String, Option<i32>)> {
+        for _ in 0..100 {
+            if let Some(row) = stored_verdict(pool, digest).await {
+                return Some(row);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// #4594: a conda package the scanner ran over to completion and
+    /// cataloged nothing for (a data package such as `tzdata`, a compiled
+    /// library) with no findings is a `clean` verdict graded on file
+    /// contents, stored with `components_cataloged = 0` and reused. Under
+    /// fail-closed the first pull is scanned inline and served `clean`; under
+    /// fail-open it is served `pending`, the background scan records the same
+    /// verdict, and the next pull is `clean`. Either way the scanner runs
+    /// once. Before #4594 both stayed inconclusive: 423 forever, or `pending`
+    /// forever with nothing recorded.
+    #[tokio::test]
+    async fn remote_nothing_cataloged_is_clean_on_contents_4594() {
+        for (action, file, version) in [
+            ("fail_closed", "tzdata-2026c-h151e31d_0.conda", "2026c"),
+            ("fail_open", "tzdata-2026b-h151e31d_0.tar.bz2", "2026b"),
+        ] {
+            let bytes = if file.ends_with(".conda") {
+                conda_v2("tzdata", version)
+            } else {
+                conda_v1("tzdata", version)
+            };
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let (scanner, scans) = VersionedCveScanner::counting(
+                Some("grype-4594-test"),
+                MockCveRescan::CatalogedNothing,
+            );
+            let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await
+            else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, action, Some("high")).await;
+            let digest = digest_of(&bytes);
+
+            let (first, first_body, first_headers) = rig.get(&format!("noarch/{file}")).await;
+            let stored = await_stored_verdict(&rig.fx.pool, &digest).await;
+            let (second, second_body, second_headers) = rig.get(&format!("noarch/{file}")).await;
+            // The proxy-scans view reports the note on the cached path.
+            let view = proxy_scans_view(&rig, &format!("noarch/{file}")).await;
+            rig.teardown(std::slice::from_ref(&digest)).await;
+
+            assert_eq!(first, StatusCode::OK, "{action}: {first_body:?}");
+            let first_scan = if action == "fail_closed" {
+                "clean"
+            } else {
+                "pending"
+            };
+            assert_eq!(first_headers["X-AK-Scan"], first_scan, "{action}");
+            assert_eq!(&first_body[..], &bytes[..]);
+            assert_eq!(
+                stored,
+                Some(("clean".to_string(), Some(0))),
+                "{action}: the verdict is stored with its note"
+            );
+            assert_eq!(second, StatusCode::OK, "{action}");
+            assert_eq!(second_headers["X-AK-Scan"], "clean", "{action}");
+            assert_eq!(&second_body[..], &bytes[..]);
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{action}: the second pull reuses the stored verdict"
+            );
+            assert_eq!(view["state"], "clean", "{action}: {view}");
+            assert_eq!(view["components_cataloged"], 0, "{action}: {view}");
+        }
+    }
+
+    /// The proxy-scans view's entry for one cached path, read through the
+    /// handler as an admin.
+    async fn proxy_scans_view(rig: &RemoteRig, path: &str) -> serde_json::Value {
+        let app = tdh::router_with_auth(
+            crate::api::handlers::security::repo_security_router(),
+            rig.state.clone(),
+            tdh::admin_auth(rig.fx.user_id, "admin-4594"),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/security/proxy-scans?path={path}",
+                rig.fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("view JSON");
+        json["items"][0].clone()
+    }
+
+    /// #4594 leaves the scan-could-not-run case alone: a scanner error is
+    /// inconclusive, so fail-closed is `423` and fail-open serves `pending`,
+    /// and neither records a verdict.
+    #[tokio::test]
+    async fn remote_scan_error_stays_inconclusive_4594() {
+        for (action, file) in [
+            ("fail_closed", "tzdata-2026c-h151e31d_0.conda"),
+            ("fail_open", "tzdata-2026b-h151e31d_0.conda"),
+        ] {
+            let (_, version, _) = CondaNativeHandler::parse_package_filename(file).unwrap();
+            let bytes = conda_v2("tzdata", &version);
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let (scanner, scans) =
+                VersionedCveScanner::counting(Some("grype-4594-test"), MockCveRescan::Error);
+            let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await
+            else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, action, Some("high")).await;
+            let digest = digest_of(&bytes);
+
+            let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
+            // Let a fail-open background scan finish before reading the row.
+            for _ in 0..100 {
+                if scans.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let stored = stored_verdict(&rig.fx.pool, &digest).await;
+            rig.teardown(std::slice::from_ref(&digest)).await;
+
+            if action == "fail_closed" {
+                assert_eq!(status, StatusCode::LOCKED);
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"], "scan_pending");
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(headers["X-AK-Scan"], "pending");
+            }
+            assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(stored, None, "{action}: no verdict from a failed scan");
+        }
+    }
+
+    /// #4594 keeps the identity check: when the scanner DID catalog a
+    /// `name@version` and it is not the one the file name requests, the scan
+    /// is inconclusive (423 under fail-closed) and nothing is recorded.
+    #[tokio::test]
+    async fn remote_cataloged_mismatch_is_still_withheld_4594() {
+        let file = "tzdata-2026c-h151e31d_0.conda";
+        let bytes = conda_v2("tzdata", "2026c");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-4594-test"),
+            MockCveRescan::Cataloged("evil", "6.6.6"),
+        );
+        let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
+        let digest = digest_of(&bytes);
+        let (status, body, _) = rig.get(&format!("noarch/{file}")).await;
+        let stored = stored_verdict(&rig.fx.pool, &digest).await;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        assert_eq!(status, StatusCode::LOCKED);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stored, None);
+    }
+
     /// Repodata is not gated: a fail-closed scanning remote still serves its
     /// index, and a repository that does not scan still streams packages.
     #[tokio::test]

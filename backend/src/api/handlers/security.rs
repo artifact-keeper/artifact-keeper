@@ -2063,7 +2063,8 @@ fn proxy_scan_select() -> String {
         r#"
     SELECT pca.path, pca.checksum_sha256, pca.size_bytes, pca.cached_at,
            psr.verdict, psr.findings_count, psr.critical_count, psr.high_count,
-           psr.medium_count, psr.low_count, psr.max_severity, psr.scanned_at
+           psr.medium_count, psr.low_count, psr.max_severity, psr.scanned_at,
+           psr.components_cataloged
       FROM proxy_cache_artifacts pca
       LEFT JOIN proxy_scan_results psr
              ON psr.checksum_sha256 = pca.checksum_sha256
@@ -2089,6 +2090,7 @@ struct ProxyScanRow {
     low_count: Option<i32>,
     max_severity: Option<String>,
     scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+    components_cataloged: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -2135,6 +2137,14 @@ pub struct ProxyScanEntry {
     pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub cached_at: chrono::DateTime<chrono::Utc>,
     pub size_bytes: i64,
+    /// How many distinct components the CVE engine cataloged when it graded
+    /// this digest (#4594). Set only on a `clean` or `vulnerable` entry, and
+    /// `null` for a verdict whose engine reported no catalog (or one recorded
+    /// before 1.11.0). `0` means the verdict was graded on the file contents
+    /// only: the scan unpacked and read the package, recognised no component
+    /// (a conda compiled library or data package such as `tzdata`), and
+    /// matched no advisory.
+    pub components_cataloged: Option<i32>,
     /// The CVEs behind the counts (#3395), most severe first and bounded to
     /// [`MAX_PROXY_FINDINGS`].
     ///
@@ -2248,6 +2258,7 @@ impl ProxyScanEntry {
             },
             cached_at: row.cached_at,
             size_bytes: row.size_bytes,
+            components_cataloged: scored.then_some(row.components_cataloged).flatten(),
             findings: None,
         }
     }
@@ -3179,6 +3190,7 @@ mod tests {
             low_count: Some(0),
             max_severity: None,
             scanned_at: Some(chrono::Utc::now()),
+            components_cataloged: Some(3),
         }
     }
 
@@ -3284,6 +3296,26 @@ mod tests {
         assert_eq!(entry.critical_count, None);
         assert_eq!(entry.max_severity, None);
         assert_eq!(entry.scanned_at, None);
+        assert_eq!(entry.components_cataloged, None);
+    }
+
+    /// #4594: a verdict carries its cataloged-component count, `0` included
+    /// (graded on file contents only), and a legacy row's `null` stays `null`.
+    #[test]
+    fn proxy_scan_entry_carries_components_cataloged_with_a_verdict() {
+        for (stored, verdict) in [(Some(0), "clean"), (Some(4), "vulnerable"), (None, "clean")] {
+            let mut row = sample_proxy_row();
+            row.verdict = Some(verdict.to_string());
+            row.components_cataloged = stored;
+            let entry = ProxyScanEntry::from_row(row, true);
+            assert_eq!(entry.components_cataloged, stored, "{verdict}");
+            let json = serde_json::to_value(&entry).expect("serialize");
+            assert_eq!(
+                json["components_cataloged"],
+                serde_json::json!(stored),
+                "{verdict}"
+            );
+        }
     }
 
     #[test]

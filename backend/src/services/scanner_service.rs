@@ -4100,6 +4100,30 @@ pub enum ComponentEcosystem {
     Maven,
 }
 
+impl ComponentEcosystem {
+    /// Whether the CVE engine is expected to catalog a package of this
+    /// ecosystem AS ITSELF, so that an empty catalog means the engine could
+    /// not see the package (#4594).
+    ///
+    /// True for every ecosystem the engine has a cataloger for: the pin file
+    /// (npm, Python, RubyGems, Cargo, NuGet) or the archive's own metadata
+    /// (Maven) puts the package in the catalog, and an empty catalog means
+    /// the engine graded nothing, which is inconclusive.
+    ///
+    /// False for conda. No bundled engine catalogs a conda package as a conda
+    /// component (see [`ComponentEcosystem::Conda`]); what it catalogs is the
+    /// content the package installs (a `.dist-info`, a recognised binary).
+    /// For a compiled library or a data package (`tzdata`, `ca-certificates`)
+    /// there is nothing of that kind, and an empty catalog is the expected
+    /// result of a scan that ran to completion over the unpacked archive.
+    /// The inline gate grades such a scan on its findings, records
+    /// `components_cataloged = 0`, and still withholds a scan that could not
+    /// run or that cataloged a different `name@version`.
+    pub fn engine_catalogs_the_package(self) -> bool {
+        !matches!(self, ComponentEcosystem::Conda)
+    }
+}
+
 /// The identity a proxied artifact is being SERVED AS — derived from the
 /// request coordinate (route package name + filename version), never from
 /// bytes the upstream controls (#3003).
@@ -4283,6 +4307,15 @@ pub struct ProxyScanVerdict {
     /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
     /// the two must not be asserted equal.
     pub findings: Vec<ProxyFinding>,
+    /// How many distinct components the CVE-authoritative engine cataloged
+    /// for these bytes (#4594), or `None` when no engine reported a catalog.
+    /// Persisted on the verdict row as `components_cataloged` and shown in
+    /// the proxy-scans view. `Some(0)` on a `clean` verdict means the package
+    /// was graded on its file contents only: the engine unpacked and read it,
+    /// recognised no component, and matched no advisory (a conda package
+    /// with no Python or recognised binary content). Like `packages`, it is
+    /// attached after aggregation and never moves the counts.
+    pub components_cataloged: Option<i32>,
 }
 
 impl ProxyScanVerdict {
@@ -4559,6 +4592,7 @@ pub fn aggregate_proxy_verdict(
         packages: Vec::new(),
         scan_completeness: None,
         findings: Vec::new(),
+        components_cataloged: None,
     }
 }
 
@@ -4630,7 +4664,11 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
 ///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
-///    so an engine that ran but had nothing to grade reports "clean".
+///    so an engine that ran but had nothing to grade reports "clean". The one
+///    exception is an ecosystem the engine never catalogs as itself (conda,
+///    see [`ComponentEcosystem::engine_catalogs_the_package`], #4594): there
+///    an empty catalog from a completed scan is graded on its findings and
+///    recorded with `components_cataloged = 0`.
 /// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
 ///    some other identity says nothing about these bytes.
 ///
@@ -4749,7 +4787,23 @@ async fn run_inline_proxy_scanners_target(
     // skipping the gate as "no signal" — the designed semantics finally
     // firing for exactly the case the gate was built for.
     if let (Some(expected), Some(cataloged)) = (target.expected_component, cve_cataloged.as_ref()) {
-        if cataloged.is_empty() {
+        if cataloged.is_empty() && !expected.ecosystem.engine_catalogs_the_package() {
+            // #4594: the engine is not expected to catalog this package as
+            // itself (conda), and it completed `Ok` over the unpacked archive
+            // (an archive it cannot unpack is a scanner error, handled above).
+            // Nothing cataloged is then the normal result for a package with
+            // no Python or recognised binary content, so the verdict is graded
+            // on the findings alone and carries `components_cataloged = 0`.
+            // A catalog that names something else still falls to the
+            // mismatch branch below.
+            info!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                findings = findings.len(),
+                "inline proxy scan: CVE engine cataloged no components for a package \
+                 it does not catalog as itself; graded on file contents only"
+            );
+        } else if cataloged.is_empty() {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4762,8 +4816,7 @@ async fn run_inline_proxy_scanners_target(
                  not a clean verdict)"
                     .to_string(),
             ));
-        }
-        if !cataloged.iter().any(|c| expected.matches(c)) {
+        } else if !cataloged.iter().any(|c| expected.matches(c)) {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4853,6 +4906,16 @@ async fn run_inline_proxy_scanners_target(
     // Same contract as `packages`: attached after aggregation so the counts are
     // computed from the raw findings and this projection cannot move them.
     verdict.findings = retain_proxy_findings(&findings);
+    // #4594: what the engine cataloged, counted once per distinct
+    // `name@version`, so the stored verdict says whether it graded any
+    // component or only the file contents.
+    verdict.components_cataloged = cve_cataloged.as_ref().map(|c| {
+        let distinct: std::collections::HashSet<(&str, &str)> = c
+            .iter()
+            .map(|c| (c.name.as_str(), c.version.as_str()))
+            .collect();
+        i32::try_from(distinct.len()).unwrap_or(i32::MAX)
+    });
     Ok(verdict)
 }
 
@@ -9997,6 +10060,13 @@ pub(crate) mod test_helpers {
         Clean,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// The engine ran to completion, found nothing, and reported an EMPTY
+        /// catalog (#4594): what grype reports for a conda package with no
+        /// Python or recognised binary content.
+        CatalogedNothing,
+        /// The engine ran to completion, found nothing, and cataloged exactly
+        /// this `name@version` (#4594).
+        Cataloged(&'static str, &'static str),
         /// Re-scan never finishes inside the caller's `tokio::time::timeout`
         /// budget: sleeps for the given duration (longer than the budget
         /// under test) before completing. Proves the BudgetExceeded arm
@@ -10103,6 +10173,23 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::CatalogedNothing => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(Vec::new()),
+                        ..Default::default()
+                    })
+                }
+                MockCveRescan::Cataloged(name, version) => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(vec![
+                            crate::services::scanner_service::CatalogedComponent {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                            },
+                        ]),
+                        ..Default::default()
+                    })
+                }
                 MockCveRescan::Hang(d) => {
                     tokio::time::sleep(d).await;
                     Ok(crate::services::scanner_service::ScanOutput::default())
@@ -24290,6 +24377,199 @@ tonic-build = "0.12"
             .await
             .expect("an assessed, finding-free scan is a clean verdict");
         assert!(!verdict.is_vulnerable());
+    }
+
+    fn tzdata_expected() -> ExpectedComponent {
+        ExpectedComponent::new(ComponentEcosystem::Conda, "tzdata", "2026c")
+    }
+
+    /// The CVE engine as it behaves on a conda package (#4594): ran to
+    /// completion, cataloged `cataloged`, and reported `findings`.
+    struct CondaGradingCveScanner {
+        cataloged: Vec<CatalogedComponent>,
+        findings: Vec<RawFinding>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for CondaGradingCveScanner {
+        fn name(&self) -> &str {
+            "conda-grading-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput {
+                findings: self.findings.clone(),
+                packages: Vec::new(),
+                scan_completeness: ScanCompleteness::Complete,
+                cataloged: Some(self.cataloged.clone()),
+                vuln_db: None,
+            })
+        }
+    }
+
+    fn conda_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "tzdata-2026c-h151e31d_0.conda",
+            "application/octet-stream",
+            "noarch/tzdata-2026c-h151e31d_0.conda",
+        )
+    }
+
+    /// #4594: only conda is graded without cataloging itself; every
+    /// ecosystem with a pin file or a self-describing archive keeps the
+    /// empty-catalog-is-inconclusive rule.
+    #[test]
+    fn test_only_conda_is_graded_without_cataloging_itself() {
+        for eco in [
+            ComponentEcosystem::Npm,
+            ComponentEcosystem::Python,
+            ComponentEcosystem::RubyGems,
+            ComponentEcosystem::Cargo,
+            ComponentEcosystem::NuGet,
+            ComponentEcosystem::Maven,
+        ] {
+            assert!(eco.engine_catalogs_the_package(), "{eco:?}");
+        }
+        assert!(!ComponentEcosystem::Conda.engine_catalogs_the_package());
+    }
+
+    /// #4594: a conda package the engine scanned to completion and cataloged
+    /// nothing for is a clean verdict graded on file contents, with
+    /// `components_cataloged = 0`.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_is_clean_on_contents() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a completed conda scan that cataloged nothing is conclusive");
+        assert!(!verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert_eq!(verdict.components_cataloged, Some(0));
+        assert_eq!(verdict.findings_count, 0);
+    }
+
+    /// #4594: the same conda scan WITH findings is vulnerable; nothing
+    /// cataloged never hides a finding.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_with_findings_is_vulnerable() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: vec![RawFinding {
+                severity: Severity::High,
+                title: "CVE-2026-4594 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-4594".to_string()),
+                affected_component: Some("libfoo".to_string()),
+                affected_version: Some("1.0".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("findings make the scan conclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.high_count, 1);
+        assert_eq!(verdict.components_cataloged, Some(0));
+    }
+
+    /// #4594 keeps the identity check: a conda scan that cataloged a
+    /// DIFFERENT `name@version` than the file name is still inconclusive, and
+    /// a matching one is clean with its count.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_catalog_must_still_match() {
+        use std::sync::Arc;
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        for (name, version) in [("evil", "6.6.6"), ("tzdata", "2025a")] {
+            let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+                cataloged: vec![CatalogedComponent {
+                    name: name.into(),
+                    version: version.into(),
+                }],
+                findings: Vec::new(),
+            })];
+            assert!(
+                run_inline_proxy_scanners_target(
+                    &scanners,
+                    &expecting_target(&artifact, &expected),
+                    &Bytes::new(),
+                )
+                .await
+                .is_err(),
+                "{name}@{version} is not tzdata@2026c"
+            );
+        }
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: vec![
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+            ],
+            findings: Vec::new(),
+        })];
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a matching catalog is clean");
+        assert_eq!(verdict.components_cataloged, Some(1), "counted once");
+    }
+
+    /// #4594 does not reach the Python rule: a PyPI wheel the engine
+    /// cataloged nothing for stays inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_python_zero_catalog_stays_inconclusive() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = ExpectedComponent::new(ComponentEcosystem::Python, "pyyaml", "5.3.1");
+        assert!(run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .is_err());
     }
 
     /// Blast-radius control: a scanner that reports NO catalog signal

@@ -19444,6 +19444,66 @@ mod tests {
         );
     }
 
+    /// #4594 is conda-only: a PyPI wheel whose own METADATA agrees with the
+    /// file name, scanned to completion with NOTHING cataloged, is still
+    /// inconclusive. Fail-closed withholds it (423) and records no verdict.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_zero_catalog_wheel_stays_locked_4594() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "zerocat";
+        let filename = "zerocat-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] =
+            Box::leak(build_test_wheel("zerocat", "1.0.0").into_boxed_slice());
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0-test"),
+            MockCveRescan::CatalogedNothing,
+        );
+        let state = scan_state_with_live_scanner(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let status = match super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r.status(),
+        };
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT verdict FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(&digest)
+                .fetch_optional(&fx.pool)
+                .await
+                .expect("read verdict");
+        tdh::drop_proxy_verdicts(&fx.pool, std::slice::from_ref(&digest)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(stored, None, "an inconclusive scan records no verdict");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wheel was scanned (its identity is established), not skipped"
+        );
+    }
+
     /// #4019, blocked half: a recorded `vulnerable` verdict must 403 the next
     /// download straight from the row, with no second scan.
     #[tokio::test]

@@ -66,6 +66,31 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Packages the scanner does not catalog as themselves (conda).** For npm,
+PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
+(through the pin the gate writes, or the archive's own metadata), so a scan
+that catalogs nothing graded nothing and is inconclusive. No bundled scanner
+catalogs a conda package as a conda component: it catalogs what the package
+installs (a `.dist-info`, a binary it recognises). A compiled library or a
+data package (`tzdata`, `ca-certificates`) has nothing of that kind. For
+`conda` and `conda_native`, a scan that ran to completion over the unpacked
+archive and cataloged nothing is therefore graded on its findings: no
+findings is a `clean` verdict, and a finding is `vulnerable` as usual. The
+verdict is stored with `components_cataloged: 0` and reused like any other,
+so `fail_closed` serves it inline and `fail_open` records it for the next
+pull (#4594). The rule does not relax anything else:
+
+- a scan that could not run (archive not unpackable, scanner error, timeout,
+  over the byte cap) is still inconclusive;
+- a package whose `info/index.json` disagrees with its file name is still
+  withheld without a scan;
+- a scan that cataloged a `name@version` other than the one in the file name
+  is still inconclusive.
+
+`generic` does not run the gate, so the rule does not apply to it. If it
+adopts the gate, a generic file has no coordinate to pin and an empty catalog
+is already graded on its findings.
+
 **One decision per request.** Each enforced format derives the proxy-cache key
 and the "is this a package the gate must see" decision from the same
 normalized request path, so two spellings of one file (a trailing `/`, a
@@ -129,6 +154,13 @@ If either version string is unknown, a `fail_open` or `record_only`
 repository falls back to the 30-day window alone. A `fail_closed` repository
 reuses a `clean` verdict only when both versions are known and equal;
 otherwise it scans again, and an inconclusive result is `423`.
+
+Each verdict also records `components_cataloged`: how many distinct
+components the scanner cataloged when it graded the bytes (migration 287).
+`GET /api/v1/repositories/{key}/security/proxy-scans` returns it on every
+`clean` or `vulnerable` item. `0` means the verdict was graded on the file
+contents only (see the conda rule above); `null` means the scanner reported no
+catalog, or the verdict was recorded before 1.11.0.
 
 ## Virtual repositories
 
@@ -256,14 +288,18 @@ have no core proxy path to gate.
     digest instead of being scanned, and a stored `vulnerable` verdict for
     that digest refuses the pull (`403`);
   - and the row records no digest, the re-fetch goes through the gate.
-- **Conda packages the scanner cannot catalog.** The gate pins a conda
-  package's `name@version` (from the file name, checked against its
-  `info/index.json`), and a clean verdict counts only when the engine graded
-  that coordinate. Python packages are graded through the `.dist-info` they
-  install, and many compiled packages through the binaries they ship; a
-  package the engine catalogs nothing for, or catalogs under a different
-  name, is inconclusive: `423` under `fail_closed`, served `pending` (and not
-  recorded) under `fail_open`.
+- **Conda packages graded on file contents.** A conda package the scanner
+  catalogs nothing for is graded on its findings alone and recorded with
+  `components_cataloged: 0` (#4594). A clean result there means the scanner
+  read the unpacked files and matched no advisory; there was no component
+  identity to look up, so a vulnerable library the scanner does not recognise
+  is not found. The proxy-scans view shows the `0` so these verdicts can be
+  told apart from component-graded ones.
+- **Conda packages cataloged under a different name.** When the scanner does
+  catalog something for a conda package but not the `name@version` in the
+  file name (a binary it recognises under its upstream name or version), the
+  scan is still inconclusive: `423` under `fail_closed`, served `pending`
+  (and not recorded) under `fail_open`.
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

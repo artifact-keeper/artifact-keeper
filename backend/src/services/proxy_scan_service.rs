@@ -477,6 +477,9 @@ impl ProxyScanService {
 
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
+    /// Leaves `components_cataloged` as it was; the inline gate records through
+    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog),
+    /// which writes it with the verdict (#4594).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict(
         &self,
@@ -672,6 +675,71 @@ impl ProxyScanService {
         .bind(checksum_sha256)
         .bind(scan_type)
         .bind(scan_completeness)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// [`record_verdict`](Self::record_verdict) plus the number of components
+    /// the CVE engine cataloged (#4594), in ONE upsert, so a reader never
+    /// sees the new verdict with the previous scan's count. `Some(0)` on a
+    /// clean verdict means it was graded on file contents only; `None` means
+    /// the engine reported no catalog. The inline gate and the rescan
+    /// endpoint record through this. Runtime query (no macro) so this adds
+    /// no offline sqlx data.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_verdict_with_catalog(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_results (
+                checksum_sha256, scan_type, verdict,
+                findings_count, critical_count, high_count, medium_count, low_count,
+                max_severity, scanner_version, repository_id, components_cataloged,
+                scanned_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET
+                verdict = EXCLUDED.verdict,
+                findings_count = EXCLUDED.findings_count,
+                critical_count = EXCLUDED.critical_count,
+                high_count = EXCLUDED.high_count,
+                medium_count = EXCLUDED.medium_count,
+                low_count = EXCLUDED.low_count,
+                max_severity = EXCLUDED.max_severity,
+                scanner_version = EXCLUDED.scanner_version,
+                repository_id = EXCLUDED.repository_id,
+                components_cataloged = EXCLUDED.components_cataloged,
+                scanned_at = now()
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(verdict)
+        .bind(findings_count)
+        .bind(critical_count)
+        .bind(high_count)
+        .bind(medium_count)
+        .bind(low_count)
+        .bind(max_severity)
+        .bind(scanner_version)
+        .bind(repository_id)
+        .bind(components_cataloged)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
