@@ -7,6 +7,7 @@
 use crate::config::Config;
 use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 /// SMTP email delivery service.
@@ -32,18 +33,17 @@ impl SmtpService {
 
         let transport = match &config.smtp_host {
             Some(host) => {
-                let builder =
-                    match config.smtp_tls_mode.as_str() {
-                        "tls" => AsyncSmtpTransport::<Tokio1Executor>::relay(host)
-                            .map_err(|e| SmtpError::Config(format!("SMTP relay TLS error: {e}")))?,
-                        "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host),
-                        // "starttls" is the default
-                        _ => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host).map_err(
-                            |e| SmtpError::Config(format!("SMTP STARTTLS relay error: {e}")),
-                        )?,
-                    };
+                let tls_parameters = build_tls_parameters(host, config)?;
+                let tls = match config.smtp_tls_mode.as_str() {
+                    "tls" => Tls::Wrapper(tls_parameters),
+                    "none" => Tls::None,
+                    // "starttls" is the default
+                    _ => Tls::Required(tls_parameters),
+                };
 
-                let builder = builder.port(config.smtp_port);
+                let builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+                    .port(config.smtp_port)
+                    .tls(tls);
 
                 let builder = if let (Some(username), Some(password)) =
                     (&config.smtp_username, &config.smtp_password)
@@ -145,6 +145,72 @@ impl SmtpService {
     }
 }
 
+/// Build the TLS parameters used for implicit TLS and STARTTLS.
+///
+/// The system trust store is always used. `SMTP_TLS_CA_CERT` (a PEM path or
+/// the PEM text), or failing that the shared `CUSTOM_CA_CERT_PATH`, adds
+/// certificates on top of it, so a server whose certificate comes from a
+/// private CA can be verified. `SMTP_TLS_SKIP_VERIFY=true` turns verification
+/// off entirely and is logged as a warning at startup.
+fn build_tls_parameters(host: &str, config: &Config) -> Result<TlsParameters, SmtpError> {
+    let mut builder = TlsParameters::builder(host.to_owned());
+
+    if let Some(value) = &config.smtp_tls_ca_cert {
+        let source = config.smtp_tls_ca_cert_source.unwrap_or("SMTP_TLS_CA_CERT");
+        let (pem, origin) = if value.contains("-----BEGIN") {
+            (value.as_bytes().to_vec(), format!("{source} (inline PEM)"))
+        } else {
+            let bytes = std::fs::read(value).map_err(|e| {
+                SmtpError::Config(format!("cannot read {source} file {value}: {e}"))
+            })?;
+            (bytes, format!("{source} ({value})"))
+        };
+        let certs = parse_pem_bundle(&pem)
+            .map_err(|e| SmtpError::Config(format!("invalid certificate in {origin}: {e}")))?;
+        let count = certs.len();
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+        tracing::info!(source = %origin, count, "Loaded extra CA certificate(s) for SMTP");
+    }
+
+    if config.smtp_tls_skip_verify {
+        tracing::warn!(
+            host = %host,
+            "SMTP_TLS_SKIP_VERIFY=true: the SMTP server's TLS certificate and hostname are \
+             NOT verified. Anyone who can intercept the connection can read the SMTP \
+             password and every message. Use SMTP_TLS_CA_CERT instead outside of testing."
+        );
+        builder = builder
+            .dangerous_accept_invalid_certs(true)
+            .dangerous_accept_invalid_hostnames(true);
+    }
+
+    builder
+        .build()
+        .map_err(|e| SmtpError::Config(format!("SMTP TLS setup failed: {e}")))
+}
+
+/// Split a PEM bundle into certificates. The native-tls backend only reads
+/// the first certificate of a buffer, so each block is parsed on its own.
+fn parse_pem_bundle(pem: &[u8]) -> Result<Vec<Certificate>, String> {
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = String::from_utf8_lossy(pem);
+    let mut certs = Vec::new();
+    for block in text.split(END) {
+        let block = block.trim();
+        let Some(start) = block.find("-----BEGIN CERTIFICATE-----") else {
+            continue;
+        };
+        let one = format!("{}\n{END}\n", &block[start..]);
+        certs.push(Certificate::from_pem(one.as_bytes()).map_err(|e| e.to_string())?);
+    }
+    if certs.is_empty() {
+        return Err("no PEM certificate found".into());
+    }
+    Ok(certs)
+}
+
 /// Errors that can occur during SMTP operations.
 #[derive(Debug, thiserror::Error)]
 pub enum SmtpError {
@@ -210,6 +276,9 @@ mod tests {
         "SMTP_PASSWORD",
         "SMTP_FROM_ADDRESS",
         "SMTP_TLS_MODE",
+        "SMTP_TLS_CA_CERT",
+        "SMTP_TLS_SKIP_VERIFY",
+        "CUSTOM_CA_CERT_PATH",
     ];
 
     /// Build a minimal Config for testing. Sets only the required env vars
@@ -228,6 +297,9 @@ mod tests {
         env::remove_var("SMTP_PASSWORD");
         env::remove_var("SMTP_FROM_ADDRESS");
         env::remove_var("SMTP_TLS_MODE");
+        env::remove_var("SMTP_TLS_CA_CERT");
+        env::remove_var("SMTP_TLS_SKIP_VERIFY");
+        env::remove_var("CUSTOM_CA_CERT_PATH");
         Config::from_env().expect("test config should parse")
     }
 
@@ -245,6 +317,9 @@ mod tests {
         env::set_var("SMTP_PASSWORD", "hunter2");
         env::set_var("SMTP_FROM_ADDRESS", "noreply@example.com");
         env::set_var("SMTP_TLS_MODE", "tls");
+        env::remove_var("SMTP_TLS_CA_CERT");
+        env::remove_var("SMTP_TLS_SKIP_VERIFY");
+        env::remove_var("CUSTOM_CA_CERT_PATH");
         Config::from_env().expect("test config should parse")
     }
 
@@ -352,5 +427,128 @@ mod tests {
 
         let service = SmtpService::new(&config).expect("should build with dangerous mode");
         assert!(service.is_configured());
+    }
+
+    // Two throwaway self-signed CA certificates (no keys kept), used to check
+    // that SMTP_TLS_CA_CERT / CUSTOM_CA_CERT_PATH are parsed and applied.
+    const TEST_CA_A: &str = "-----BEGIN CERTIFICATE-----\nMIIBijCCAS+gAwIBAgIUVCPWRFTpkEFlta+XSyCPmrxww2cwCgYIKoZIzj0EAwIw\nGTEXMBUGA1UEAwwOc210cCB0ZXN0IGNhIGEwIBcNMjYxMDA5MDIxMjM4WhgPMjEy\nNjA5MTUwMjEyMzhaMBkxFzAVBgNVBAMMDnNtdHAgdGVzdCBjYSBhMFkwEwYHKoZI\nzj0CAQYIKoZIzj0DAQcDQgAEvjCjWA8hyylibNSO1N57nwSLqBEM8ckpSXPXq5sK\nWFHL4nwBbCVyM3P7suBYWxXtKr/+oHhn1WE4Q90tPQqz8qNTMFEwHQYDVR0OBBYE\nFLSn8P2abCkNi5btOXsg33opcVMhMB8GA1UdIwQYMBaAFLSn8P2abCkNi5btOXsg\n33opcVMhMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhANBaZnuQ\nmZZM/VKC8YW+6FD707CP/l4ZRu7c6AEj5529AiEAzKBcxPOGaIJYTKWnwt/RkAv0\ng8f8B7MU/xcOpRnM7wI=\n-----END CERTIFICATE-----\n";
+    const TEST_CA_B: &str = "-----BEGIN CERTIFICATE-----\nMIIBiDCCAS+gAwIBAgIUB/mk3bg5D90amYUKXtUD94QB8okwCgYIKoZIzj0EAwIw\nGTEXMBUGA1UEAwwOc210cCB0ZXN0IGNhIGIwIBcNMjYxMDA5MDIxMjM4WhgPMjEy\nNjA5MTUwMjEyMzhaMBkxFzAVBgNVBAMMDnNtdHAgdGVzdCBjYSBiMFkwEwYHKoZI\nzj0CAQYIKoZIzj0DAQcDQgAEgUUDmueefW+CsKCHydAkUgnSPcR61yYVRES/q1IC\nBi2Pr32vjyZa7fmyv1uCKc0kAz8P1rR+fwHgxADRXN7y/6NTMFEwHQYDVR0OBBYE\nFKynQs2FvBv5moM2GFhRuDO41R+EMB8GA1UdIwQYMBaAFKynQs2FvBv5moM2GFhR\nuDO41R+EMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgTwlIuuSh\ndIl7GHaZUjsXY5DFwtaOmS2naPR4ey1TjksCIHuH8WA8uB2Kkn1RL6n2Li3sXKZ4\nFauL8Xribi2ZhYkV\n-----END CERTIFICATE-----\n";
+
+    /// Build a Config with SMTP pointed at localhost and the given extra
+    /// environment applied on top. Every SMTP variable not listed is cleared.
+    fn config_with(vars: &[(&str, &str)]) -> Config {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
+        for k in SMTP_ENV_KEYS {
+            env::remove_var(k);
+        }
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
+        env::set_var("SMTP_HOST", "localhost");
+        for (k, v) in vars {
+            env::set_var(k, v);
+        }
+        Config::from_env().expect("test config should parse")
+    }
+
+    fn write_temp_pem(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(contents.as_bytes()).expect("write pem");
+        f
+    }
+
+    #[test]
+    fn test_parse_pem_bundle_reads_every_certificate() {
+        let bundle = format!("{TEST_CA_A}{TEST_CA_B}");
+        let certs = parse_pem_bundle(bundle.as_bytes()).expect("bundle parses");
+        assert_eq!(certs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pem_bundle_rejects_non_pem() {
+        assert!(parse_pem_bundle(b"not a certificate").is_err());
+        assert!(parse_pem_bundle(b"").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ca_cert_inline_pem_is_accepted() {
+        let config = config_with(&[("SMTP_TLS_CA_CERT", TEST_CA_A)]);
+        assert_eq!(config.smtp_tls_ca_cert_source, Some("SMTP_TLS_CA_CERT"));
+        let service = SmtpService::new(&config).expect("inline CA builds");
+        assert!(service.is_configured());
+    }
+
+    #[tokio::test]
+    async fn test_ca_cert_path_is_accepted() {
+        let file = write_temp_pem(&format!("{TEST_CA_A}{TEST_CA_B}"));
+        let path = file.path().to_str().unwrap();
+        let config = config_with(&[("SMTP_TLS_CA_CERT", path)]);
+        let service = SmtpService::new(&config).expect("CA file builds");
+        assert!(service.is_configured());
+    }
+
+    #[test]
+    fn test_custom_ca_cert_path_is_the_fallback() {
+        let config = config_with(&[("CUSTOM_CA_CERT_PATH", "/etc/pki/custom.pem")]);
+        assert_eq!(
+            config.smtp_tls_ca_cert.as_deref(),
+            Some("/etc/pki/custom.pem")
+        );
+        assert_eq!(config.smtp_tls_ca_cert_source, Some("CUSTOM_CA_CERT_PATH"));
+    }
+
+    #[test]
+    fn test_smtp_tls_ca_cert_overrides_custom_ca_cert_path() {
+        let config = config_with(&[
+            ("CUSTOM_CA_CERT_PATH", "/etc/pki/custom.pem"),
+            ("SMTP_TLS_CA_CERT", "/etc/pki/smtp.pem"),
+        ]);
+        assert_eq!(
+            config.smtp_tls_ca_cert.as_deref(),
+            Some("/etc/pki/smtp.pem")
+        );
+        assert_eq!(config.smtp_tls_ca_cert_source, Some("SMTP_TLS_CA_CERT"));
+    }
+
+    #[test]
+    fn test_ca_cert_missing_file_is_a_config_error() {
+        let config = config_with(&[("SMTP_TLS_CA_CERT", "/nonexistent/aksmtp-ca.pem")]);
+        let err = SmtpService::new(&config)
+            .err()
+            .expect("missing file errors");
+        assert!(matches!(err, SmtpError::Config(_)), "{err}");
+        assert!(err.to_string().contains("SMTP_TLS_CA_CERT"), "{err}");
+    }
+
+    #[test]
+    fn test_ca_cert_garbage_is_a_config_error() {
+        let file = write_temp_pem("hello, not a cert");
+        let path = file.path().to_str().unwrap();
+        let config = config_with(&[("CUSTOM_CA_CERT_PATH", path)]);
+        let err = SmtpService::new(&config).err().expect("garbage errors");
+        assert!(err.to_string().contains("CUSTOM_CA_CERT_PATH"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_skip_verify_parses_and_builds() {
+        for (raw, want) in [
+            ("true", true),
+            ("1", true),
+            ("TRUE", true),
+            ("false", false),
+            ("yes", false),
+        ] {
+            let config = config_with(&[("SMTP_TLS_SKIP_VERIFY", raw)]);
+            assert_eq!(
+                config.smtp_tls_skip_verify, want,
+                "SMTP_TLS_SKIP_VERIFY={raw}"
+            );
+            assert!(SmtpService::new(&config).unwrap().is_configured());
+        }
+        assert!(!config_with(&[]).smtp_tls_skip_verify, "default is false");
     }
 }
