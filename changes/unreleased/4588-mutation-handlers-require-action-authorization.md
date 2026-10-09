@@ -1,8 +1,8 @@
 ---
 section: Security
-issues: [#0000]
+issues: [#4588]
 ---
-- **Eight REST mutation endpoints now check the caller's action on the repository, not only that it can see or reach it** (#0000, GHSA-mvmh-g8wm-r3cp). Each of these stopped at a gate that does not authorize an interactive session: a token scope check (which a session always passes), the tenant gate (a no-op on a public repository, and satisfied by any grant on a private one, read-only included), or authentication alone. Any signed-in user could therefore make these changes on a public repository, and so could a read-only member of a private one:
+- **Eight REST mutation endpoints now check the caller's action on the repository, not only that it can see or reach it** (#4588, GHSA-mvmh-g8wm-r3cp). Each of these stopped at a gate that does not authorize an interactive session: a token scope check (which a session always passes), the tenant gate (a no-op on a public repository, and satisfied by any grant on a private one, read-only included), or authentication alone. Any signed-in user could therefore make these changes on a public repository, and so could a read-only member of a private one:
   - `PUT /api/v1/promotion/repositories/{key}/release-target` (relink or unlink where release promotions land) now needs read access to the staging repository, the `write:repositories` token scope and the repository `admin` action on it, and a release repository the caller cannot read is answered like a missing one. It previously checked nothing beyond a token scope, on private staging repositories too.
   - `POST /api/v1/promotion/repositories/{key}/artifacts/{id}/reject` now needs the promotion capability (an administrator, or a `promote:artifacts` token) and the promotion tenant gate. A caller who cannot read the staging repository gets 404 for every artifact id, so the endpoint is no longer an existence oracle. It previously checked nothing.
   - `PUT /api/v1/repositories/{key}/labels` and `POST`/`DELETE .../labels/{label_key}` (labels select repositories into sync policies) now need the repository `write` action and the `write:repositories` token scope.
