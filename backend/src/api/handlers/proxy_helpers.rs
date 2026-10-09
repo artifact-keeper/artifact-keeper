@@ -8682,8 +8682,11 @@ pub(crate) async fn proxy_scan_and_record(
     };
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    // #4594: the cataloged-component count is written with the verdict, so
+    // the proxy-scans view can say when a verdict was graded on file
+    // contents only.
     if let Err(e) = pss
-        .record_verdict(
+        .record_verdict_with_catalog(
             digest,
             PROXY_SCAN_TYPE,
             verdict.verdict_token(),
@@ -8695,6 +8698,7 @@ pub(crate) async fn proxy_scan_and_record(
             verdict.max_severity_token(),
             verdict.scanner_version.as_deref(),
             Some(repo_id),
+            verdict.components_cataloged,
         )
         .await
     {
