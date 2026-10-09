@@ -243,10 +243,14 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // -- PyPI family ----------------------------------------------------
         // The simple index (`simple/`, `simple/<pkg>/`) is mutable; the wheels
         // and sdists it points at are immutable.
-        RepositoryFormat::Pypi
-        | RepositoryFormat::Poetry
-        | RepositoryFormat::Conda
-        | RepositoryFormat::Jupyter => classify_pypi(&lower, speaks_pep658(format)),
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            classify_pypi(&lower, speaks_pep658(format))
+        }
+
+        // -- conda ----------------------------------------------------------
+        // Packages and CEP-16 shards (content-addressed) are immutable;
+        // repodata and the shard index are rewritten in place.
+        RepositoryFormat::Conda => classify_conda(&lower),
 
         // -- npm family -----------------------------------------------------
         // The packument (the metadata JSON at `<pkg>` / `@scope/<pkg>`) is
@@ -544,6 +548,25 @@ fn classify_pypi(lower: &str, pep658: bool) -> Mutability {
     // `packages/`, `pypi/<pkg>/json` (JSON API) and anything unrecognized are
     // mutable-by-default.
     Mutability::mutable_default()
+}
+
+/// conda: `.conda` / `.tar.bz2` packages are immutable (they share the PyPI
+/// package-file rule, without the PEP 658 sidecar protocol, #3356), and so is
+/// a CEP-16 shard, `<sha256>.msgpack.zst`, which is addressed by the hash of
+/// its bytes (#4577). `repodata.json`, the shard index
+/// (`repodata_shards.msgpack.zst`) and every other channel document are
+/// rewritten in place and stay mutable.
+fn classify_conda(lower: &str) -> Mutability {
+    if is_conda_shard_file(leaf(lower)) {
+        return Mutability::Immutable;
+    }
+    classify_pypi(lower, false)
+}
+
+/// Whether a (lower-cased) leaf is a CEP-16 shard file name.
+fn is_conda_shard_file(leaf: &str) -> bool {
+    leaf.strip_suffix(".msgpack.zst")
+        .is_some_and(|stem| stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// npm §2.1: packument metadata is mutable; tarballs are immutable.
@@ -1121,6 +1144,22 @@ mod tests {
             (Conda, "linux-64/repodata.json", false),
             (Conda, "linux-64/numpy-1.26.4-py312.conda.metadata", false),
             (Conda, "linux-64/numpy-1.26.4-py312.tar.bz2.metadata", false),
+            // CEP-16 (#4577): a shard is content-addressed and immutable in
+            // both published layouts (`shards/` as prefix.dev serves it, and
+            // beside the index as conda.anaconda.org does); the shard index
+            // is rewritten in place.
+            (
+                Conda,
+                "noarch/shards/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (
+                Conda,
+                "noarch/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (Conda, "noarch/repodata_shards.msgpack.zst", false),
+            (Conda, "noarch/shards/not-a-hash.msgpack.zst", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
             (Npm, "@types/node", false),

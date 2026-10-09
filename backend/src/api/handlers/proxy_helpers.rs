@@ -2235,6 +2235,32 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_capped_with_cache_key_encoded`]
+/// (#4577). The synthesized repository carries the caller's REAL format, so
+/// `cache_classifier::classify` reaches its per-format arm for `cache_path`
+/// and a content-addressed coordinate is cached as immutable instead of
+/// falling to the `Generic` 5-minute default; see
+/// [`proxy_fetch_streaming_with_format`] for the reading a new call site owes
+/// before it passes a format. The conda CEP-16 shard proxy passes `Conda` for
+/// `{subdir}/shards/<sha256>.msgpack.zst`.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
+}
+
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key_and_accept`]
 /// (#1608 Phase 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
 #[allow(clippy::too_many_arguments)]

@@ -48,7 +48,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::auth_service::AuthService;
 use crate::services::conda_identity::{
     self, CondaArchiveType, CondaIdentity, CondaIdentityInput, NoarchKind,
@@ -1016,16 +1016,19 @@ async fn patch_instructions_json_with_token(
 
 async fn sharded_repodata_index_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    sharded_repodata_index(state, Path((repo_key, subdir))).await
+    sharded_repodata_index(state, auth, headers, Path((repo_key, subdir))).await
 }
 
 async fn sharded_repodata_shard_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     Path((_token, repo_key, subdir, shard_hash)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    sharded_repodata_shard(state, Path((repo_key, subdir, shard_hash))).await
+    sharded_repodata_shard(state, auth, Path((repo_key, subdir, shard_hash))).await
 }
 
 async fn download_package_with_token(
@@ -2403,96 +2406,80 @@ fn group_artifacts_by_name<'a>(
     by_name
 }
 
-/// CEP-16 sharded repodata is only built from artifacts already present in
-/// our own DB, scoped to *this* repository's id (see [`list_conda_artifacts`]) -
-/// it never proxies an upstream's real shard index and never aggregates
-/// members. For a Local repo that's exactly right: our DB is the source of
-/// truth. For anything else it isn't, and the failure mode is the same in every
-/// case - a syntactically valid but semantically empty (or incomplete) shard
-/// index served with 200, which a CEP-16-aware client treats as authoritative
-/// and will NOT fall back from, silently hiding every package:
-///
-///   * **Remote**: an upstream like conda-forge that has not yet been mirrored
-///     into our DB has no rows here at all.
-///   * **Virtual** (#2915): `list_conda_artifacts` is scoped to the virtual
-///     repo's own id, and a virtual repo owns no artifacts - its MEMBERS do. So
-///     a virtual conda repo always served an empty shard index, even though
-///     `repodata.json` for the same repo is correctly aggregated by
-///     [`build_virtual_repodata`].
-///   * **Staging / anything else**: a staging repo's own rows would in fact be
-///     authoritative, but 404ing is the conservative direction (the client
-///     falls back to `repodata.json`, which is complete for a hosted repo, so
-///     the only cost is the CEP-16 bandwidth saving). Failing closed also
-///     covers a `repo_type` this code does not know about — `RepoInfo::repo_type`
-///     is a raw string and `resolve_repo_by_key` yields an empty one when the
-///     column read fails.
-///
-/// Until sharded repodata is actually proxied/aggregated, only Local repos may
-/// answer here; everyone else 404s so clients (pixi, conda) take the documented
-/// fallback to `repodata.json`.
+// ---------------------------------------------------------------------------
+// CEP-16 sharded repodata
+// ---------------------------------------------------------------------------
+//
+// A hosted repository (local or staging) builds its shards from its own rows.
+// A remote repository proxies its upstream's shard index and shards (#4577),
+// and a virtual channel merges its members' shard indexes under the rules of
+// [`build_virtual_repodata`]: hosted members first, then remote members in
+// priority order, a name a hosted member owns never taken from a remote, and
+// the allowlist (#4576) applied per package name. Shards are content-addressed
+// (`<sha256>.msgpack.zst`), so a virtual lists each member's shard hash
+// unchanged and a shard fetch resolves to whichever member publishes it.
+//
+// Two things follow from content addressing and keep the sharded view honest:
+//
+//   * a remote NAME is listed once, from the highest-priority member that
+//     publishes it. Shards cannot be merged per filename the way the monolithic
+//     index is (a merged shard would not have the hash the index advertises),
+//     so where two remote members publish the same name the sharded view
+//     carries the first member's records only;
+//   * a remote name the allowlist admits under a version constraint is left
+//     out: a shard carries every version of its package, and it can be
+//     admitted whole or not at all
+//     ([`crate::services::conda_allowlist::CompiledAllowlist::admits_all_versions`]).
+//     Such a package stays available through `repodata.json`, where records
+//     are filtered one by one.
+//
+// A virtual whose remote member publishes no shard index answers 404 for its
+// own, so CEP-16 clients take the documented fallback to `repodata.json`; a
+// member whose index FETCH fails is handled under the virtual's member-failure
+// policy, exactly like the monolithic merge (#4192). A proxied shard is
+// verified against its address before it is served, and a shard fetched
+// through a virtual is served only when every record in it names a package the
+// virtual admits from a remote, so a hash a client did not learn from the
+// merged index cannot leak a hosted-owned or non-admitted package's metadata.
+
+/// Content type of the CEP-16 documents. The zstd frame is part of each
+/// document, never a transfer coding (see [`shard_response`]).
+const CEP16_CONTENT_TYPE: &str = "application/x-msgpack";
+
+/// The shard index file name within a subdir.
+const SHARD_INDEX_FILE: &str = "repodata_shards.msgpack.zst";
+
+/// Where this registry serves shards, relative to the subdir.
+const SHARDS_BASE_URL: &str = "./shards/";
+
+/// Ceiling on one CEP-16 document read from an upstream (the shard index or
+/// one shard), as served. conda-forge's largest subdir index is about 1 MiB
+/// and its largest shards a few hundred KiB; the 8 MiB default metadata tier
+/// leaves an order of magnitude of headroom while keeping the reservation
+/// against the shared buffered-metadata budget (#2684) small, since a solve
+/// fetches a few hundred shards.
+const CEP16_UPSTREAM_MAX_BYTES: usize = proxy_helpers::DEFAULT_METADATA_MAX_BYTES;
+
+/// Ceiling on an upstream CEP-16 document after undoing the zstd frame (and
+/// any transfer coding), so a crafted frame stops at the cap instead of at the
+/// allocator. conda-forge's largest subdir index decodes to a few MiB.
+const CEP16_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// The CEP-15 base URL of a channel subdir served by this registry.
+fn conda_base_url(repo_key: &str, subdir: &str) -> String {
+    format!("/conda/{repo_key}/{subdir}/")
+}
+
+/// The address of a shard: the SHA-256 of its encoded bytes.
+fn shard_address(shard: &[u8]) -> [u8; 32] {
+    Sha256::digest(shard).into()
+}
+
+/// The shard address a `shards/{hash}.msgpack.zst` request names: 64 hex
+/// characters, lower-cased. Checked before the repository is resolved, so a
+/// malformed address is a 400 whatever the repository.
 #[allow(clippy::result_large_err)]
-fn reject_unsupported_sharding_repo_type(repo: &RepoInfo) -> Result<(), Response> {
-    if repo.repo_type != RepositoryType::Local {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Sharded repodata (CEP-16) is only available for local/hosted conda repositories; \
-             use repodata.json",
-        )
-            .into_response());
-    }
-    Ok(())
-}
-
-async fn sharded_repodata_index(
-    State(state): State<SharedState>,
-    Path((repo_key, subdir)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    reject_unsupported_sharding_repo_type(&repo)?;
-    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
-    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
-    let by_name = group_artifacts_by_name(&subdir_artifacts);
-
-    // Build shard for each package name and compute content hash
-    let mut shards_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for (pkg_name, artifacts) in &by_name {
-        let shard = build_shard(&subdir, artifacts);
-        let shard_compressed = encode_shard(&shard)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&shard_compressed);
-        let hash_bytes: Vec<u8> = hasher.finalize().to_vec();
-
-        shards_map.insert(pkg_name.clone(), hash_bytes);
-    }
-
-    // Build the index
-    let base_url = format!("/conda/{}/{}/", repo_key, subdir);
-    let index = build_sharded_index(&subdir, &base_url, &shards_map);
-
-    let compressed = serialize_msgpack_zst(&index)?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        // The `.msgpack.zst` file IS the resource: the zstd frame is part of
-        // the document, not a transfer coding. Declaring `Content-Encoding:
-        // zstd` invites an HTTP client to strip the frame before the CEP-16
-        // reader, which expects it, ever sees the bytes.
-        .header(CONTENT_TYPE, "application/x-msgpack")
-        .header(CONTENT_LENGTH, compressed.len().to_string())
-        .header("Cache-Control", "public, max-age=60")
-        .body(Body::from(compressed))
-        .unwrap())
-}
-
-/// CEP-16 individual shard: all metadata for one package name.
-///
-/// Shards are content-addressed (filename = SHA256 of content), so they
-/// can be cached indefinitely.
-async fn sharded_repodata_shard(
-    State(state): State<SharedState>,
-    Path((repo_key, subdir, shard_hash)): Path<(String, String, String)>,
-) -> Result<Response, Response> {
+fn parse_shard_hash(shard_hash: &str) -> Result<String, Response> {
     let hash_hex = shard_hash.trim_end_matches(".msgpack.zst");
     if hash_hex.len() != 64 || !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err((
@@ -2501,34 +2488,855 @@ async fn sharded_repodata_shard(
         )
             .into_response());
     }
+    Ok(hash_hex.to_ascii_lowercase())
+}
 
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    reject_unsupported_sharding_repo_type(&repo)?;
-    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
-    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
-    let by_name = group_artifacts_by_name(&subdir_artifacts);
+/// The response for one shard. Content-addressed, so cacheable indefinitely.
+fn shard_response(body: impl Into<Bytes>) -> Response {
+    let body: Bytes = body.into();
+    Response::builder()
+        .status(StatusCode::OK)
+        // The `.msgpack.zst` file IS the resource: the zstd frame is part of
+        // the document, not a transfer coding. Declaring `Content-Encoding:
+        // zstd` invites an HTTP client to strip the frame before the CEP-16
+        // reader, which expects it, ever sees the bytes.
+        .header(CONTENT_TYPE, CEP16_CONTENT_TYPE)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .body(Body::from(body))
+        .unwrap()
+}
 
-    // Find the shard matching the requested hash
-    for artifacts in by_name.values() {
-        let shard = build_shard(&subdir, artifacts);
-        let shard_compressed = encode_shard(&shard)?;
+fn shard_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "Shard not found").into_response()
+}
 
-        let mut hasher = Sha256::new();
-        hasher.update(&shard_compressed);
-        let computed_hash = format!("{:x}", hasher.finalize());
-
-        if computed_hash == hash_hex {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/x-msgpack")
-                .header(CONTENT_LENGTH, shard_compressed.len().to_string())
-                .header("Cache-Control", "public, max-age=31536000, immutable")
-                .body(Body::from(shard_compressed))
-                .unwrap());
+/// The CEP-16 shards of the hosted repositories `repo_ids` for `subdir`:
+/// package name to the encoded `.msgpack.zst` shard, whose SHA-256 is the
+/// shard's address. Several repositories (the hosted members of a virtual)
+/// merge in order, first-writer-wins per filename, the rule
+/// [`build_virtual_repodata`] applies to hosted members, so a name two hosted
+/// members publish gets one shard holding both members' records.
+async fn hosted_shards(
+    db: &sqlx::PgPool,
+    repo_ids: &[uuid::Uuid],
+    subdir: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, Response> {
+    let mut lists = Vec::with_capacity(repo_ids.len());
+    for repo_id in repo_ids {
+        lists.push(list_conda_artifacts(db, *repo_id).await?);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<&CondaArtifact> = Vec::new();
+    for artifacts in &lists {
+        for artifact in artifacts_for_subdir(artifacts, subdir) {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if is_conda_package(filename) && seen.insert(filename) {
+                merged.push(artifact);
+            }
         }
     }
+    let mut shards = BTreeMap::new();
+    for (name, artifacts) in group_artifacts_by_name(&merged) {
+        shards.insert(name, encode_shard(&build_shard(subdir, &artifacts))?);
+    }
+    Ok(shards)
+}
 
-    Err((StatusCode::NOT_FOUND, "Shard not found").into_response())
+/// The hosted shard with address `hash_hex`, if any.
+fn find_hosted_shard(shards: BTreeMap<String, Vec<u8>>, hash_hex: &str) -> Option<Vec<u8>> {
+    shards
+        .into_values()
+        .find(|shard| hex::encode(shard_address(shard)) == hash_hex)
+}
+
+/// Encode the shard index of a hosted repository (or the hosted part of a
+/// virtual) from its shards' addresses.
+#[allow(clippy::result_large_err)]
+fn encode_hosted_shard_index(
+    repo_key: &str,
+    subdir: &str,
+    shards: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>, Response> {
+    let addresses: BTreeMap<String, Vec<u8>> = shards
+        .iter()
+        .map(|(name, shard)| (name.clone(), shard_address(shard).to_vec()))
+        .collect();
+    let base_url = conda_base_url(repo_key, subdir);
+    serialize_msgpack_zst(&build_sharded_index(subdir, &base_url, &addresses))
+}
+
+/// Only the `info` block of an upstream shard index; the shard map is skipped
+/// rather than materialised when a request needs just the shards' location.
+#[derive(serde::Deserialize)]
+struct UpstreamShardIndexInfo {
+    info: rattler_conda_types::ShardedSubdirInfo,
+}
+
+/// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
+/// repository's upstream through the proxy cache (capped and budgeted, like a
+/// virtual member's repodata). `Ok(None)`: the upstream answers 404, i.e. it
+/// does not publish CEP-16 for this subdir (negative-cached by the proxy). Any
+/// other failure is reported as that repository's
+/// [`virtual_merge::MemberFailure`], so the virtual merge can apply its
+/// member-failure policy to it.
+async fn fetch_upstream_shard_document<T>(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+) -> Result<Option<T>, virtual_merge::MemberFailure>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let fail = |kind: &'static str, reason: String| virtual_merge::MemberFailure {
+        member: repo_key.to_string(),
+        kind,
+        reason,
+    };
+    let path = format!("{subdir}/{SHARD_INDEX_FILE}");
+    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &path,
+        CEP16_UPSTREAM_MAX_BYTES,
+    )
+    .await;
+    let (content, content_encoding, budget_permit) = match fetched {
+        Ok(proxy_helpers::CappedMetadataGet::Buffered {
+            content,
+            content_encoding,
+            budget_permit,
+            ..
+        }) => (content, content_encoding, budget_permit),
+        Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
+            return Err(fail(
+                "cap",
+                format!("{path} exceeds the {CEP16_UPSTREAM_MAX_BYTES}-byte ceiling"),
+            ));
+        }
+        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) => {
+            return Err(fail(
+                "fetch",
+                format!("{path}: upstream fetch failed with {}", response.status()),
+            ));
+        }
+    };
+    let decoded = tokio::task::spawn_blocking(move || {
+        // Held until the compressed buffer is decoded and dropped.
+        let _budget_permit = budget_permit;
+        let msgpack = virtual_merge::decode_member_document(
+            &content,
+            content_encoding.as_deref(),
+            virtual_merge::FileCodec::Zstd,
+            CEP16_MAX_DECODED_BYTES,
+        )?;
+        rmp_serde::from_slice::<T>(&msgpack).map_err(|e| format!("shard index does not parse: {e}"))
+    })
+    .await
+    .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?
+    .map_err(|e| fail("decode", format!("{path}: {e}")))?;
+    Ok(Some(decoded))
+}
+
+/// The full upstream shard index of a remote repository. `Ok(None)`: the
+/// upstream publishes none for `subdir`. An index whose shards cannot be
+/// located (`shards_base_url` does not resolve) is a decode failure here
+/// rather than a shard fetch that can never succeed later.
+async fn fetch_upstream_shard_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+) -> Result<Option<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure> {
+    let Some(index) = fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        subdir,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    resolve_shards_base(upstream_url, subdir, &index.info.shards_base_url).map_err(|reason| {
+        virtual_merge::MemberFailure {
+            member: repo_key.to_string(),
+            kind: "decode",
+            reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
+        }
+    })?;
+    Ok(Some(index))
+}
+
+/// Where a remote repository's upstream keeps its shards, from the `info`
+/// block of its shard index alone. `Ok(None)`: the upstream publishes none.
+async fn fetch_upstream_shards_base(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+) -> Result<Option<url::Url>, virtual_merge::MemberFailure> {
+    let Some(UpstreamShardIndexInfo { info }) = fetch_upstream_shard_document::<
+        UpstreamShardIndexInfo,
+    >(
+        proxy, repo_id, repo_key, upstream_url, subdir
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    resolve_shards_base(upstream_url, subdir, &info.shards_base_url)
+        .map(Some)
+        .map_err(|reason| virtual_merge::MemberFailure {
+            member: repo_key.to_string(),
+            kind: "decode",
+            reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
+        })
+}
+
+/// Where an upstream keeps its shards: `shards_base_url` resolved against the
+/// subdir URL, as rattler resolves it. conda.anaconda.org publishes `""`
+/// (shards beside the index), prefix.dev `"./shards/"`; an absolute URL on
+/// another host is honoured too. The result always ends in `/` so a shard
+/// file name joins onto it.
+fn resolve_shards_base(
+    upstream_url: &str,
+    subdir: &str,
+    shards_base_url: &str,
+) -> Result<url::Url, String> {
+    let subdir_url = url::Url::parse(&format!("{}/{subdir}/", upstream_url.trim_end_matches('/')))
+        .map_err(|e| format!("upstream URL does not parse: {e}"))?;
+    let mut base = subdir_url
+        .join(shards_base_url)
+        .map_err(|e| format!("shards_base_url {shards_base_url:?} does not resolve: {e}"))?;
+    base.set_query(None);
+    base.set_fragment(None);
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    Ok(base)
+}
+
+/// Fetch one shard of a remote repository's upstream by address through the
+/// proxy cache (immutable: the address is the hash of the bytes) and verify
+/// it. `Ok(None)`: the upstream has no such shard.
+async fn fetch_upstream_shard(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+    shards_base: &url::Url,
+    hash_hex: &str,
+) -> Result<Option<Bytes>, Response> {
+    let file = format!("{hash_hex}.msgpack.zst");
+    let shard_url = shards_base.join(&file).map_err(|e| {
+        tracing::error!(repo = %repo_key, error = %e, "conda shard URL does not resolve");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+    // A shard on the upstream's own origin is fetched by path, which is what
+    // the upstream filter and the proxy cache key are written against; a
+    // shard host elsewhere is fetched by absolute URL.
+    let fetch_path = match shard_url
+        .as_str()
+        .strip_prefix(upstream_url.trim_end_matches('/'))
+    {
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_string(),
+        _ => shard_url.into(),
+    };
+    let cache_path = format!("{subdir}/shards/{file}");
+    // Reserved for the whole fetch-decode-verify span, like every buffered
+    // metadata read (#2684); released when this returns.
+    let _budget_permit = proxy_helpers::proxy_metadata_budget()
+        .reserve(CEP16_UPSTREAM_MAX_BYTES)
+        .await;
+    let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &fetch_path,
+        &cache_path,
+        CEP16_UPSTREAM_MAX_BYTES,
+        RepositoryFormat::Conda,
+    )
+    .await;
+    let (content, _content_type, content_encoding) = match fetched {
+        Ok(fetched) => fetched,
+        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) => return Err(response),
+    };
+    // The proxy's HTTP client does not undo an upstream transfer coding; a
+    // shard that arrived coded has to be decoded before it can be verified.
+    let shard = match content_encoding
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
+    {
+        None => content,
+        Some(coding) => tokio::task::spawn_blocking(move || {
+            virtual_merge::decode_member_document(
+                &content,
+                Some(&coding),
+                virtual_merge::FileCodec::Plain,
+                CEP16_MAX_DECODED_BYTES,
+            )
+        })
+        .await
+        .map_err(virtual_merge::internal_error)?
+        .map(Bytes::from)
+        .map_err(|e| {
+            tracing::warn!(repo = %repo_key, hash = hash_hex, error = %e, "upstream conda shard could not be decoded");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream shard could not be decoded",
+            )
+                .into_response()
+        })?,
+    };
+    if hex::encode(shard_address(&shard)) != hash_hex {
+        tracing::warn!(
+            repo = %repo_key,
+            hash = hash_hex,
+            "upstream conda shard does not match its content address; refusing to serve it"
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Upstream shard does not match its content address",
+        )
+            .into_response());
+    }
+    Ok(Some(shard))
+}
+
+/// The proxy service and upstream URL a remote conda repository fetches
+/// through, or the 404 CEP-16 clients fall back from when it has neither.
+#[allow(clippy::result_large_err)]
+fn remote_upstream<'a>(
+    state: &'a SharedState,
+    repo: &'a RepoInfo,
+) -> Result<(&'a crate::services::proxy_service::ProxyService, &'a str), Response> {
+    match (state.proxy_service.as_deref(), repo.upstream_url.as_deref()) {
+        (Some(proxy), Some(upstream_url)) => Ok((proxy, upstream_url)),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "Remote conda repository has no upstream to proxy sharded repodata from; \
+             use repodata.json",
+        )
+            .into_response()),
+    }
+}
+
+/// The 502 a remote repository's own upstream failure answers with. (A
+/// virtual member's failure goes through the member-failure policy instead.)
+fn upstream_failure_response(
+    repo_key: &str,
+    document: &str,
+    failure: &virtual_merge::MemberFailure,
+) -> Response {
+    tracing::warn!(
+        repo = %repo_key,
+        document,
+        kind = failure.kind,
+        reason = %failure.reason,
+        "conda upstream could not serve a CEP-16 document"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "Remote conda repository '{repo_key}' cannot serve {document}: {}",
+            failure.reason
+        ),
+    )
+        .into_response()
+}
+
+/// The 404 a client falls back to `repodata.json` from when an upstream
+/// publishes no CEP-16 shard index for the subdir.
+fn no_upstream_shard_index(repo_key: &str, subdir: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Upstream of conda repository '{repo_key}' publishes no CEP-16 shard index for \
+             {subdir}; use repodata.json"
+        ),
+    )
+        .into_response()
+}
+
+/// Serve a remote repository's shard index: the upstream's, rewritten onto
+/// this channel. Packages and shards must resolve against the registry URL
+/// the client is already using, never the upstream's: a client sent straight
+/// to the upstream would bypass the proxy cache and every policy the registry
+/// enforces on the way through. Everything else in `info` (`created_at`,
+/// repodata revisions, CEP-42 channel relations) is kept.
+async fn serve_remote_shard_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+    subdir: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let (proxy, upstream_url) = remote_upstream(state, repo)?;
+    let document = format!("{subdir}/{SHARD_INDEX_FILE}");
+    let upstream =
+        match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir).await {
+            Ok(Some(upstream)) => upstream,
+            Ok(None) => return Err(no_upstream_shard_index(&repo.key, subdir)),
+            Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
+        };
+    let base_url = conda_base_url(&repo.key, subdir);
+    let index = build_sharded_index_with_info(
+        shard_index_info(subdir, &base_url, Some(&upstream.info)),
+        upstream
+            .shards
+            .iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_slice())),
+    );
+    let body = serialize_msgpack_zst(&index)?;
+    Ok(cacheable_response(body, CEP16_CONTENT_TYPE, headers).await)
+}
+
+/// Serve one shard of a remote repository: the upstream's, by address.
+async fn serve_remote_shard(
+    state: &SharedState,
+    repo: &RepoInfo,
+    subdir: &str,
+    hash_hex: &str,
+) -> Result<Response, Response> {
+    let (proxy, upstream_url) = remote_upstream(state, repo)?;
+    let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
+    let shards_base =
+        match fetch_upstream_shards_base(proxy, repo.id, &repo.key, upstream_url, subdir).await {
+            Ok(Some(base)) => base,
+            Ok(None) => return Err(shard_not_found()),
+            Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
+        };
+    match fetch_upstream_shard(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        subdir,
+        &shards_base,
+        hash_hex,
+    )
+    .await?
+    {
+        Some(shard) => Ok(shard_response(shard)),
+        None => Err(shard_not_found()),
+    }
+}
+
+/// The merged shard index of a virtual channel, or the member that keeps it
+/// from existing.
+enum VirtualShardIndex {
+    Merged {
+        /// Package name to shard address.
+        shards: BTreeMap<String, Vec<u8>>,
+        failed: Vec<virtual_merge::MemberFailure>,
+        /// Remote names the allowlist left out; `None` when none is enforced.
+        allowlist_dropped: Option<usize>,
+    },
+    /// A remote member publishes no shard index for the subdir, so the
+    /// virtual cannot either.
+    MemberWithoutShards(String),
+}
+
+/// Merge the shard indexes of a virtual's members. Hosted members first, as
+/// one set of shards built from their rows; then each remote member's index
+/// in priority order, first-writer-wins per NAME, skipping names a hosted
+/// member owns and names the allowlist does not admit whole.
+async fn build_virtual_shard_index(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    subdir: &str,
+) -> Result<VirtualShardIndex, Response> {
+    // Caller-authorized member walk (#3323), as for repodata.json.
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
+    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
+    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
+
+    let hosted_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    let mut shards: BTreeMap<String, Vec<u8>> = hosted_shards(&state.db, &hosted_ids, subdir)
+        .await?
+        .into_iter()
+        .map(|(name, shard)| (name, shard_address(&shard).to_vec()))
+        .collect();
+
+    let mut failed = Vec::new();
+    let mut dropped = virtual_merge::MergeDrops::default();
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+    {
+        let (Some(proxy), Some(upstream_url)) = (
+            state.proxy_service.as_deref(),
+            member.upstream_url.as_deref(),
+        ) else {
+            failed.push(virtual_merge::MemberFailure {
+                member: member.key.clone(),
+                kind: "fetch",
+                reason: "remote member has no upstream URL or the proxy service is not available"
+                    .to_string(),
+            });
+            continue;
+        };
+        let upstream =
+            match fetch_upstream_shard_index(proxy, member.id, &member.key, upstream_url, subdir)
+                .await
+            {
+                Ok(Some(upstream)) => upstream,
+                Ok(None) => return Ok(VirtualShardIndex::MemberWithoutShards(member.key.clone())),
+                Err(failure) => {
+                    failed.push(failure);
+                    continue;
+                }
+            };
+        for (name, hash) in &upstream.shards {
+            if owned.contains(&name.to_ascii_lowercase()) {
+                dropped.owned += 1;
+                continue;
+            }
+            if allowlist
+                .as_deref()
+                .is_some_and(|a| !a.admits_all_versions(name, subdir))
+            {
+                dropped.not_allowed += 1;
+                continue;
+            }
+            shards
+                .entry(name.clone())
+                .or_insert_with(|| hash.as_slice().to_vec());
+        }
+    }
+    if dropped.owned > 0 {
+        tracing::info!(
+            virtual_repo = %virtual_repo_key,
+            subdir,
+            dropped = dropped.owned,
+            "excluded remote conda shards whose names a hosted member owns"
+        );
+    }
+    if allowlist.is_some() {
+        tracing::info!(
+            virtual_repo = %virtual_repo_key,
+            subdir,
+            dropped = dropped.not_allowed,
+            "excluded remote conda shards the virtual's allowlist does not admit whole"
+        );
+    }
+    Ok(VirtualShardIndex::Merged {
+        shards,
+        failed,
+        allowlist_dropped: allowlist.is_some().then_some(dropped.not_allowed),
+    })
+}
+
+/// Serve a virtual channel's merged shard index under its member-failure
+/// policy (#4192), with the allowlist report header (#4576) as for
+/// `repodata.json`.
+async fn serve_virtual_shard_index(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    subdir: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let document = format!("{subdir}/{SHARD_INDEX_FILE}");
+    match build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await? {
+        VirtualShardIndex::MemberWithoutShards(member) => {
+            tracing::info!(
+                virtual_repo = %repo.key,
+                member = %member,
+                subdir,
+                "member publishes no CEP-16 shard index; the virtual serves none so clients \
+                 use repodata.json"
+            );
+            Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Member '{member}' of virtual conda channel '{}' publishes no CEP-16 shard \
+                     index for {subdir}; use repodata.json",
+                    repo.key
+                ),
+            )
+                .into_response())
+        }
+        VirtualShardIndex::Merged {
+            shards,
+            failed,
+            allowlist_dropped,
+        } => {
+            let base_url = conda_base_url(&repo.key, subdir);
+            let body = serialize_msgpack_zst(&build_sharded_index(subdir, &base_url, &shards))?;
+            serve_virtual_merge(
+                &state.db,
+                repo.id,
+                &repo.key,
+                &document,
+                VirtualMerge {
+                    body,
+                    failed,
+                    allowlist_dropped,
+                },
+                CEP16_CONTENT_TYPE,
+                headers,
+            )
+            .await
+        }
+    }
+}
+
+/// The package names a shard's records carry. Only `name` is read; a record
+/// without one falls back to its filename.
+#[derive(serde::Deserialize)]
+struct ShardNames {
+    #[serde(default)]
+    packages: BTreeMap<String, ShardRecordName>,
+    #[serde(default, rename = "packages.conda")]
+    packages_conda: BTreeMap<String, ShardRecordName>,
+    #[serde(default)]
+    v3: Option<ShardV3Names>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ShardV3Names {
+    #[serde(default, rename = "tar.bz2")]
+    tar_bz2: BTreeMap<String, ShardRecordName>,
+    #[serde(default)]
+    conda: BTreeMap<String, ShardRecordName>,
+}
+
+#[derive(serde::Deserialize)]
+struct ShardRecordName {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl ShardNames {
+    /// Every package name in the shard, lower-cased; `None` for a record
+    /// whose name cannot be determined (not admitted, fail closed).
+    fn names(&self) -> Vec<Option<String>> {
+        let v3 = self.v3.as_ref();
+        self.packages
+            .iter()
+            .chain(&self.packages_conda)
+            .chain(v3.map(|v| &v.tar_bz2).into_iter().flatten())
+            .chain(v3.map(|v| &v.conda).into_iter().flatten())
+            .map(|(filename, record)| {
+                record
+                    .name
+                    .as_deref()
+                    .or_else(|| conda_name_from_filename(filename))
+                    .map(|n| n.to_ascii_lowercase())
+            })
+            .collect()
+    }
+}
+
+/// Whether every record in a remote shard names a package the virtual admits
+/// from a remote member: no hosted member owns it, and the allowlist (when
+/// enforced) admits it whole. Decoded on a blocking thread; a shard that does
+/// not decode, or has no records, is not admitted.
+async fn shard_admitted(
+    shard: &Bytes,
+    subdir: &str,
+    owned: &std::collections::HashSet<String>,
+    allowlist: Option<&crate::services::conda_allowlist::CompiledAllowlist>,
+) -> Result<bool, Response> {
+    let bytes = shard.clone();
+    let names = tokio::task::spawn_blocking(move || -> Result<Vec<Option<String>>, String> {
+        let msgpack = virtual_merge::decode_member_document(
+            &bytes,
+            None,
+            virtual_merge::FileCodec::Zstd,
+            CEP16_MAX_DECODED_BYTES,
+        )?;
+        let decoded: ShardNames =
+            rmp_serde::from_slice(&msgpack).map_err(|e| format!("shard does not parse: {e}"))?;
+        Ok(decoded.names())
+    })
+    .await
+    .map_err(virtual_merge::internal_error)?;
+    let names = match names {
+        Ok(names) => names,
+        Err(reason) => {
+            tracing::warn!(reason = %reason, "refusing a remote conda shard that does not decode");
+            return Ok(false);
+        }
+    };
+    Ok(!names.is_empty()
+        && names.iter().all(|name| {
+            name.as_deref().is_some_and(|name| {
+                !owned.contains(name)
+                    && allowlist.is_none_or(|a| a.admits_all_versions(name, subdir))
+            })
+        }))
+}
+
+/// Serve one shard through a virtual channel: a hosted member's shard by
+/// address, else the first remote member's (in priority order) that publishes
+/// it, provided every record in it is one the virtual admits from a remote.
+async fn serve_virtual_shard(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    subdir: &str,
+    hash_hex: &str,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let hosted_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if let Some(shard) = find_hosted_shard(
+        hosted_shards(&state.db, &hosted_ids, subdir).await?,
+        hash_hex,
+    ) {
+        return Ok(shard_response(shard));
+    }
+    let owned = virtual_hosted_owned_names(&state.db, repo.id).await?;
+    let allowlist = virtual_allowlist(&state.db, repo.id).await?;
+    let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
+    let mut failed = Vec::new();
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+    {
+        let fail = |reason: String| virtual_merge::MemberFailure {
+            member: member.key.clone(),
+            kind: "fetch",
+            reason,
+        };
+        let (Some(proxy), Some(upstream_url)) = (
+            state.proxy_service.as_deref(),
+            member.upstream_url.as_deref(),
+        ) else {
+            failed.push(fail(
+                "remote member has no upstream URL or the proxy service is not available"
+                    .to_string(),
+            ));
+            continue;
+        };
+        let shards_base =
+            match fetch_upstream_shards_base(proxy, member.id, &member.key, upstream_url, subdir)
+                .await
+            {
+                Ok(Some(base)) => base,
+                Ok(None) => continue,
+                Err(failure) => {
+                    failed.push(failure);
+                    continue;
+                }
+            };
+        let shard = match fetch_upstream_shard(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            subdir,
+            &shards_base,
+            hash_hex,
+        )
+        .await
+        {
+            Ok(Some(shard)) => shard,
+            Ok(None) => continue,
+            Err(response) => {
+                failed.push(fail(format!(
+                    "{document}: upstream fetch failed with {}",
+                    response.status()
+                )));
+                continue;
+            }
+        };
+        if shard_admitted(&shard, subdir, &owned, allowlist.as_deref()).await? {
+            return Ok(shard_response(shard));
+        }
+        // The address is the content: another member publishing the same
+        // hash publishes the same records, with the same verdict.
+        tracing::info!(
+            virtual_repo = %repo.key,
+            member = %member.key,
+            hash = hash_hex,
+            "refused a remote conda shard the virtual does not admit"
+        );
+        return Err(shard_not_found());
+    }
+    if !failed.is_empty() {
+        virtual_merge::apply_failure_policy(
+            virtual_merge::FailurePolicy::Strict,
+            &repo.key,
+            &document,
+            &failed,
+        )?;
+    }
+    Err(shard_not_found())
+}
+
+/// CEP-16 shard index: `GET /conda/{repo_key}/{subdir}/repodata_shards.msgpack.zst`.
+async fn sharded_repodata_index(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    validate_read_subdir(&subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    check_read_access(&state.db, auth.clone(), &repo).await?;
+    if repo.repo_type == RepositoryType::Virtual {
+        return serve_virtual_shard_index(&state, auth.as_ref(), &repo, &subdir, &headers).await;
+    }
+    if repo.repo_type == RepositoryType::Remote {
+        return serve_remote_shard_index(&state, &repo, &subdir, &headers).await;
+    }
+    // Hosted: built from the repository's own rows, which are authoritative.
+    let shards = hosted_shards(&state.db, &[repo.id], &subdir).await?;
+    let body = encode_hosted_shard_index(&repo_key, &subdir, &shards)?;
+    Ok(cacheable_response(body, CEP16_CONTENT_TYPE, &headers).await)
+}
+
+/// CEP-16 shard: `GET /conda/{repo_key}/{subdir}/shards/{sha256}.msgpack.zst`.
+async fn sharded_repodata_shard(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, subdir, shard_hash)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let hash_hex = parse_shard_hash(&shard_hash)?;
+    validate_read_subdir(&subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    check_read_access(&state.db, auth.clone(), &repo).await?;
+    if repo.repo_type == RepositoryType::Virtual {
+        return serve_virtual_shard(&state, auth.as_ref(), &repo, &subdir, &hash_hex).await;
+    }
+    if repo.repo_type == RepositoryType::Remote {
+        return serve_remote_shard(&state, &repo, &subdir, &hash_hex).await;
+    }
+    match find_hosted_shard(
+        hosted_shards(&state.db, &[repo.id], &subdir).await?,
+        &hash_hex,
+    ) {
+        Some(shard) => Ok(shard_response(shard)),
+        None => Err(shard_not_found()),
+    }
 }
 
 /// Extract a repodata entry JSON object from an artifact's metadata.
@@ -2654,32 +3462,61 @@ impl serde::Serialize for WireDigest<'_> {
 /// SHA-256 of that package's `.msgpack.zst` shard, as raw bytes.
 #[derive(serde::Serialize)]
 struct ShardedIndex<'a> {
-    info: ShardedIndexInfo<'a>,
+    /// rattler's own type, so a proxied upstream index keeps every field it
+    /// carried (`created_at`, repodata revisions, CEP-42 channel relations).
+    info: rattler_conda_types::ShardedSubdirInfo,
     shards: BTreeMap<&'a str, WireDigest<'a>>,
 }
 
-#[derive(serde::Serialize)]
-struct ShardedIndexInfo<'a> {
-    base_url: &'a str,
-    shards_base_url: &'static str,
-    subdir: &'a str,
+/// The `info` block of an index this registry serves for `subdir`, on top of
+/// an upstream's when proxying one: packages and shards resolve against the
+/// channel URL the client is already using.
+fn shard_index_info(
+    subdir: &str,
+    base_url: &str,
+    upstream: Option<&rattler_conda_types::ShardedSubdirInfo>,
+) -> rattler_conda_types::ShardedSubdirInfo {
+    let mut info = upstream
+        .cloned()
+        .unwrap_or_else(|| rattler_conda_types::ShardedSubdirInfo {
+            subdir: String::new(),
+            base_url: String::new(),
+            shards_base_url: String::new(),
+            created_at: None,
+            repodata_revisions: Default::default(),
+            channel_relations: None,
+        });
+    info.subdir = subdir.to_string();
+    info.base_url = base_url.to_string();
+    info.shards_base_url = SHARDS_BASE_URL.to_string();
+    info
 }
 
-/// Build the CEP-16 shard index.
+/// Build the CEP-16 shard index of a hosted repository, or the merged index
+/// of a virtual channel, from package name to shard address.
 fn build_sharded_index<'a>(
-    subdir: &'a str,
-    base_url: &'a str,
+    subdir: &str,
+    base_url: &str,
     shards: &'a BTreeMap<String, Vec<u8>>,
 ) -> ShardedIndex<'a> {
-    ShardedIndex {
-        info: ShardedIndexInfo {
-            base_url,
-            shards_base_url: "./shards/",
-            subdir,
-        },
-        shards: shards
+    build_sharded_index_with_info(
+        shard_index_info(subdir, base_url, None),
+        shards
             .iter()
-            .map(|(name, hash)| (name.as_str(), WireDigest(hash)))
+            .map(|(name, hash)| (name.as_str(), hash.as_slice())),
+    )
+}
+
+/// Build a CEP-16 shard index with a given `info` block.
+fn build_sharded_index_with_info<'a>(
+    info: rattler_conda_types::ShardedSubdirInfo,
+    shards: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> ShardedIndex<'a> {
+    ShardedIndex {
+        info,
+        shards: shards
+            .into_iter()
+            .map(|(name, hash)| (name, WireDigest(hash)))
             .collect(),
     }
 }
@@ -11319,7 +12156,7 @@ mod tests {
 
     /// Insert a Remote conda repo pointing at `upstream_url`, marked public so
     /// anonymous test requests pass `check_read_access`. Returns its id/key.
-    async fn insert_public_remote_conda_repo(
+    pub(super) async fn insert_public_remote_conda_repo(
         pool: &sqlx::PgPool,
         upstream_url: &str,
     ) -> (uuid::Uuid, String, std::path::PathBuf) {
@@ -11334,7 +12171,7 @@ mod tests {
         (repo_id, repo_key, storage_dir)
     }
 
-    async fn cleanup_conda_repo(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+    pub(super) async fn cleanup_conda_repo(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
             .execute(pool)
@@ -11765,42 +12602,42 @@ mod tests {
         );
     }
 
-    // CEP-16 sharded repodata is only ever built from artifacts already in our
-    // own DB (never proxied from upstream). For a Remote repo with nothing
-    // cached yet, the old code served a syntactically valid but semantically
-    // empty shard index with 200 -- which a CEP-16-aware client treats as
-    // authoritative and will NOT fall back from, hiding every upstream
-    // package. The endpoint must 404 for Remote repos instead, so clients
-    // take the documented fallback to repodata.json.
+    // #4577: a Remote repo proxies its upstream's CEP-16 index. When the
+    // upstream publishes none (404), the registry answers 404 too, so clients
+    // take the documented fallback to repodata.json -- never a syntactically
+    // valid but empty shard index with 200, which a CEP-16-aware client treats
+    // as authoritative and will NOT fall back from, hiding every package.
     #[tokio::test]
-    async fn remote_repo_sharded_index_404s_instead_of_empty_200() {
+    async fn remote_repo_sharded_index_404s_when_upstream_publishes_none() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("conda-shard-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("tmp");
-        let root = tmp.to_str().unwrap();
-        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
-        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
-        let (repo_id, repo_key, _dir) =
-            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+        // wiremock answers 404 for anything not mounted: an upstream without
+        // sharded repodata.
+        let server = wiremock::MockServer::start().await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
 
         let app = tdh::router_anon(router(), state);
-        let (status, _body) = tdh::send(
+        let (status, body) = tdh::send(
             app,
             tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
         )
         .await;
 
         cleanup_conda_repo(&pool, repo_id).await;
-        let _ = std::fs::remove_dir_all(&tmp);
 
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
-            "sharded repodata for a Remote conda repo must 404, not serve an empty 200"
+            "a Remote conda repo whose upstream has no shard index must 404, not serve an empty 200"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("repodata.json"),
+            "the 404 must point the client at the monolithic fallback: {:?}",
+            String::from_utf8_lossy(&body)
         );
     }
 
@@ -12097,7 +12934,9 @@ mod tests {
     /// Wire a `SharedState` whose proxy cache lives in a fresh temp dir. The
     /// returned `TempDir` must outlive the request (dropping it deletes the
     /// cache the proxy is writing through).
-    fn state_with_proxy_cache(pool: &sqlx::PgPool) -> (crate::api::SharedState, tempfile::TempDir) {
+    pub(super) fn state_with_proxy_cache(
+        pool: &sqlx::PgPool,
+    ) -> (crate::api::SharedState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("proxy cache tempdir");
         let root = dir.path().to_str().expect("utf8 tempdir path");
         let proxy =
@@ -12114,7 +12953,7 @@ mod tests {
     /// `sharded_repodata_shard` validates the hash FORMAT before it resolves the
     /// repository, so a malformed hash 400s and never reaches the repo-type
     /// guard under test.
-    fn well_formed_shard_hash() -> String {
+    pub(super) fn well_formed_shard_hash() -> String {
         "ab".repeat(32)
     }
 
@@ -12277,47 +13116,52 @@ mod tests {
         );
     }
 
-    // #2915 (5): the shard ENDPOINT needs the same repo-type guard the index
-    // endpoint got -- a Remote repo has no shard rows of its own, so without the
-    // guard it answers 404 "Shard not found" for a reason that has nothing to do
-    // with the repository being unsupported, and the index/shard pair disagree
-    // about whether CEP-16 exists here.
+    // #2915 (5) / #4577: the shard endpoint agrees with the index endpoint
+    // about whether CEP-16 exists here -- an upstream without a shard index
+    // has no shards to proxy either, so a shard fetch 404s the same way.
     #[tokio::test]
-    async fn remote_repo_sharded_shard_404s() {
+    async fn remote_repo_sharded_shard_404s_when_upstream_publishes_none() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        let server = wiremock::MockServer::start().await;
         let (state, _cache) = state_with_proxy_cache(&pool);
-        let (repo_id, repo_key, _dir) =
-            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
 
         let app = tdh::router_anon(router(), state);
         let hash = well_formed_shard_hash();
-        let (status, body) = tdh::send(
+        let (status, _body) = tdh::send(
             app,
             tdh::get(format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst")),
         )
         .await;
+        let shard_requested_upstream = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().contains(&hash));
 
         cleanup_conda_repo(&pool, repo_id).await;
 
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
-            "a CEP-16 shard fetch against a Remote conda repo must 404"
+            "a CEP-16 shard fetch against a Remote conda repo without upstream shards must 404"
         );
         assert!(
-            String::from_utf8_lossy(&body).contains("local/hosted"),
-            "the 404 must come from the repo-type guard, not the shard lookup; got {:?}",
-            String::from_utf8_lossy(&body),
+            !shard_requested_upstream,
+            "without an upstream index there is nowhere to fetch a shard from"
         );
     }
 
     // The Local counterpart: a hosted repo's own DB rows ARE authoritative, so a
     // shard whose content hash the client asks for is still served with 200 and
-    // the exact shard bytes.
+    // the exact shard bytes. The fixture repo is private, so the request is
+    // made as its reader: since #4577 the sharded endpoints follow the
+    // repository's read access like every other channel document.
     #[tokio::test]
     async fn local_repo_sharded_shard_still_returns_200() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -12357,7 +13201,7 @@ mod tests {
             hasher.update(&shard_compressed);
             let hash = format!("{:x}", hasher.finalize());
 
-            let app = fx.router_anon(router());
+            let app = fx.router_with_auth(router());
             let (status, body) = tdh::send(
                 app,
                 tdh::get(format!(
@@ -12383,15 +13227,15 @@ mod tests {
         fx.teardown().await;
     }
 
-    // #2915 (5): a Virtual conda repo owns no artifacts -- its MEMBERS do -- and
-    // both sharded endpoints plus the JLAP endpoint are built from
-    // `list_conda_artifacts(repo.id)` / `build_repodata(repo.id)`, i.e. from the
-    // virtual repo's own (always empty) rows. `repodata.json` is correctly
-    // aggregated by `build_virtual_repodata`, so all three of these must 404 and
-    // send the client there instead of serving an authoritative-looking empty
-    // index (CEP-16) or an unmatchable `latest` hash (JLAP).
+    // #2915 (5): a Virtual conda repo owns no artifacts -- its MEMBERS do. The
+    // JLAP endpoint is still built from `build_repodata(repo.id)`, i.e. from
+    // the virtual repo's own (always empty) rows, so it must 404 rather than
+    // advertise an unmatchable `latest` hash. The sharded endpoints merge the
+    // members since #4577: a virtual WITHOUT members serves the same empty
+    // document its `repodata.json` does (an index with no shards), and a
+    // shard nobody publishes is 404.
     #[tokio::test]
-    async fn virtual_repo_404s_on_sharded_and_jlap_endpoints() {
+    async fn virtual_repo_without_members_serves_empty_index_and_404s_jlap() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -12414,18 +13258,26 @@ mod tests {
         let mut results = Vec::new();
         for uri in &endpoints {
             let app = tdh::router_anon(router(), state.clone());
-            let (status, _body) = tdh::send(app, tdh::get(uri.clone())).await;
-            results.push((uri.clone(), status));
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            results.push((uri.clone(), status, body));
         }
 
         cleanup_conda_repo(&pool, repo_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
 
-        for (uri, status) in results {
+        let (index_uri, index_status, index_body) = &results[0];
+        assert_eq!(*index_status, StatusCode::OK, "{index_uri}");
+        let index: rattler_conda_types::ShardedRepodata =
+            rmp_serde::from_slice(&zstd::decode_all(&index_body[..]).unwrap()).unwrap();
+        assert!(
+            index.shards.is_empty(),
+            "a virtual without members has no shards to list"
+        );
+        for (uri, status, _) in &results[1..] {
             assert_eq!(
-                status,
+                *status,
                 StatusCode::NOT_FOUND,
-                "{uri} must 404 for a Virtual conda repo instead of serving an empty document"
+                "{uri} must 404 for a Virtual conda repo without members"
             );
         }
     }
@@ -16855,7 +17707,7 @@ mod virtual_channel_tests {
         assert_eq!(h_doc["info"]["subdir"], "unknown");
     }
 
-    async fn set_allowlist(rig: &VirtualRig, list: serde_json::Value) {
+    pub(super) async fn set_allowlist(rig: &VirtualRig, list: serde_json::Value) {
         let list: crate::services::conda_allowlist::CondaAllowlist =
             serde_json::from_value(list).expect("allowlist fixture");
         crate::services::conda_allowlist::save_allowlist(&rig.pool, rig.virtual_id, &list)
@@ -17972,5 +18824,609 @@ mod serve_key_4365_tests {
             assert_eq!(key.cache_key, format!("{subdir}/{file}"));
             assert_eq!(key.scannable, scannable, "{file}");
         }
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod cep16_proxy_tests {
+    //! CEP-16 sharded repodata for remote and virtual conda channels (#4577):
+    //! the upstream index is proxied rewritten onto the channel, shards are
+    //! proxied by address and verified, and a virtual merges its members'
+    //! indexes under the rules of the monolithic merge.
+    use super::tests::{
+        cleanup_conda_repo, insert_public_remote_conda_repo, state_with_proxy_cache,
+        well_formed_shard_hash,
+    };
+    use super::virtual_channel_tests::{
+        seed_hosted_record, set_allowlist, upstream_record, upstream_repodata, VirtualRig,
+    };
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const INDEX: &str = "/noarch/repodata_shards.msgpack.zst";
+
+    /// An upstream shard holding `filenames` (one package) in `subdir`,
+    /// encoded, with its address.
+    fn upstream_shard(subdir: &str, filenames: &[&str]) -> (Vec<u8>, String) {
+        let mut conda = serde_json::Map::new();
+        for f in filenames {
+            conda.insert(f.to_string(), upstream_record(subdir, f));
+        }
+        let shard = encode_shard(&serde_json::json!({
+            "packages": {},
+            "packages.conda": conda,
+            "removed": [],
+        }))
+        .expect("encode fixture shard");
+        let hash = hex::encode(shard_address(&shard));
+        (shard, hash)
+    }
+
+    /// An upstream shard index in the layout `shards_base_url` describes,
+    /// pointing packages at the upstream's own base URL.
+    fn upstream_index(subdir: &str, shards_base_url: &str, shards: &[(&str, &str)]) -> Vec<u8> {
+        let info = rattler_conda_types::ShardedSubdirInfo {
+            subdir: subdir.to_string(),
+            base_url: format!("https://upstream.example/channel/{subdir}/"),
+            shards_base_url: shards_base_url.to_string(),
+            created_at: None,
+            repodata_revisions: Default::default(),
+            channel_relations: None,
+        };
+        let digests: Vec<(String, Vec<u8>)> = shards
+            .iter()
+            .map(|(name, hash)| (name.to_string(), hex::decode(hash).unwrap()))
+            .collect();
+        serialize_msgpack_zst(&build_sharded_index_with_info(
+            info,
+            digests.iter().map(|(n, h)| (n.as_str(), h.as_slice())),
+        ))
+        .expect("encode fixture index")
+    }
+
+    async fn mount_bytes(server: &MockServer, path: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(wm_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn decode_index(body: &[u8]) -> rattler_conda_types::ShardedRepodata {
+        rmp_serde::from_slice(&zstd::decode_all(body).expect("zstd frame")).expect("CEP-16 index")
+    }
+
+    fn index_names(index: &rattler_conda_types::ShardedRepodata) -> Vec<String> {
+        let mut names: Vec<String> = index.shards.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn shard_uri(repo_key: &str, hash: &str) -> String {
+        format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst")
+    }
+
+    async fn upstream_hits(server: &MockServer, suffix: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with(suffix))
+            .count()
+    }
+
+    /// A remote repository serves its upstream's shard index rewritten onto
+    /// the channel and proxies shards by address, in both published layouts:
+    /// shards beside the index (`shards_base_url: ""`, conda.anaconda.org)
+    /// and under `shards/` (prefix.dev). A shard is verified against its
+    /// address, cached as immutable, and the usual 400/404s apply.
+    #[tokio::test]
+    async fn remote_repo_proxies_upstream_shard_index_and_shards_4577() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for (shards_base_url, shard_dir) in [("", "/noarch/"), ("./shards/", "/noarch/shards/")] {
+            let server = MockServer::start().await;
+            let (tz_shard, tz_hash) = upstream_shard(
+                "noarch",
+                &[
+                    "tzdata-2025b-h78e105d_0.conda",
+                    "tzdata-2025a-h78e105d_0.conda",
+                ],
+            );
+            let (rich_shard, rich_hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+            let (_, bogus_hash) = upstream_shard("noarch", &["bogus-1.0-0.conda"]);
+            mount_bytes(
+                &server,
+                INDEX,
+                upstream_index(
+                    "noarch",
+                    shards_base_url,
+                    &[
+                        ("tzdata", &tz_hash),
+                        ("rich", &rich_hash),
+                        ("bogus", &bogus_hash),
+                    ],
+                ),
+            )
+            .await;
+            mount_bytes(
+                &server,
+                &format!("{shard_dir}{tz_hash}.msgpack.zst"),
+                tz_shard.clone(),
+            )
+            .await;
+            mount_bytes(
+                &server,
+                &format!("{shard_dir}{rich_hash}.msgpack.zst"),
+                rich_shard.clone(),
+            )
+            .await;
+            // The wrong bytes under an address: must never be served.
+            mount_bytes(
+                &server,
+                &format!("{shard_dir}{bogus_hash}.msgpack.zst"),
+                tz_shard.clone(),
+            )
+            .await;
+
+            let (state, cache_dir) = state_with_proxy_cache(&pool);
+            let (repo_id, repo_key, _dir) =
+                insert_public_remote_conda_repo(&pool, &server.uri()).await;
+            let get = |uri: String| {
+                let app = tdh::router_anon(router(), state.clone());
+                async move { tdh::send_with_headers(app, tdh::get(uri)).await }
+            };
+
+            let (idx_status, idx_body, idx_headers) = get(format!("/{repo_key}{INDEX}")).await;
+            let (tz_status, tz_body, tz_headers) = get(shard_uri(&repo_key, &tz_hash)).await;
+            let (tz_again_status, tz_again_body, _) = get(shard_uri(&repo_key, &tz_hash)).await;
+            let (rich_status, rich_body, _) = get(shard_uri(&repo_key, &rich_hash)).await;
+            let (bogus_status, bogus_body, _) = get(shard_uri(&repo_key, &bogus_hash)).await;
+            let (missing_status, _, _) = get(shard_uri(&repo_key, &well_formed_shard_hash())).await;
+            let (malformed_status, _, _) = get(shard_uri(&repo_key, "nothex")).await;
+            let (linux_status, _, _) =
+                get(format!("/{repo_key}/linux-64/repodata_shards.msgpack.zst")).await;
+            let (linux_shard_status, _, _) =
+                get(format!("/{repo_key}/linux-64/shards/{tz_hash}.msgpack.zst")).await;
+            let tz_upstream_hits = upstream_hits(&server, &format!("{tz_hash}.msgpack.zst")).await;
+            let cached_ttl = tdh::written_proxy_ttl_secs(
+                cache_dir.path(),
+                &repo_key,
+                &format!("noarch/shards/{tz_hash}.msgpack.zst"),
+            )
+            .await;
+            cleanup_conda_repo(&pool, repo_id).await;
+
+            let layout = format!("shards_base_url {shards_base_url:?}");
+            assert_eq!(idx_status, StatusCode::OK, "{layout}");
+            assert_eq!(
+                idx_headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/x-msgpack")
+            );
+            assert!(
+                idx_headers.get(CONTENT_ENCODING).is_none(),
+                "the zstd frame is the document, not a transfer coding"
+            );
+            let index = decode_index(&idx_body);
+            assert_eq!(index.info.subdir, "noarch");
+            assert_eq!(
+                index.info.base_url,
+                format!("/conda/{repo_key}/noarch/"),
+                "packages must resolve against the registry, not the upstream"
+            );
+            assert_eq!(index.info.shards_base_url, "./shards/");
+            assert_eq!(index_names(&index), vec!["bogus", "rich", "tzdata"]);
+            assert_eq!(hex::encode(index.shards["tzdata"]), tz_hash);
+            assert_eq!(hex::encode(index.shards["rich"]), rich_hash);
+
+            assert_eq!(tz_status, StatusCode::OK, "{layout}");
+            assert_eq!(&tz_body[..], &tz_shard[..], "the shard is served verbatim");
+            assert!(
+                tz_headers
+                    .get(CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("immutable")),
+                "a content-addressed shard is immutable"
+            );
+            assert_eq!(tz_again_status, StatusCode::OK);
+            assert_eq!(&tz_again_body[..], &tz_shard[..]);
+            assert_eq!(
+                tz_upstream_hits, 1,
+                "the second fetch of a shard is served from the proxy cache"
+            );
+            assert!(
+                cached_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+                "a proxied shard must be cached as immutable, got {cached_ttl}s"
+            );
+            assert_eq!(rich_status, StatusCode::OK);
+            assert_eq!(&rich_body[..], &rich_shard[..]);
+            assert_eq!(
+                bogus_status,
+                StatusCode::BAD_GATEWAY,
+                "a shard that does not hash to its address is never served: {}",
+                String::from_utf8_lossy(&bogus_body)
+            );
+            assert_eq!(missing_status, StatusCode::NOT_FOUND);
+            assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                linux_status,
+                StatusCode::NOT_FOUND,
+                "a subdir the upstream publishes no shards for falls back to repodata.json"
+            );
+            assert_eq!(linux_shard_status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// A remote whose upstream fails (not 404) for the index answers 502,
+    /// never an empty 200 and never a 404 that would hide the failure behind
+    /// the monolithic fallback.
+    #[tokio::test]
+    async fn remote_repo_shard_index_reports_an_upstream_failure_4577() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(INDEX))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(format!("/{repo_key}{INDEX}")),
+        )
+        .await;
+        let (shard_status, _) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(shard_uri(&repo_key, &well_formed_shard_hash())),
+        )
+        .await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(String::from_utf8_lossy(&body).contains(&repo_key));
+        assert_eq!(shard_status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// The merged index of a virtual: hosted shards first, then the remote's
+    /// minus the names a hosted member owns and the names the allowlist does
+    /// not admit whole; a shard fetch resolves to the member that publishes it
+    /// and refuses what the index would not list.
+    #[tokio::test]
+    async fn virtual_shard_index_merges_members_under_the_repodata_rules_4577() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let (impostor_shard, impostor_hash) = upstream_shard("noarch", &["acme-core-99.0-0.conda"]);
+        let (rich_shard, rich_hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        let (tz_shard, tz_hash) = upstream_shard(
+            "noarch",
+            &[
+                "tzdata-2025b-h78e105d_0.conda",
+                "tzdata-2025a-h78e105d_0.conda",
+            ],
+        );
+        let (numpy_shard, numpy_hash) = upstream_shard("noarch", &["numpy-2.2.3-py_0.conda"]);
+        let (colorama_shard, colorama_hash) =
+            upstream_shard("noarch", &["colorama-0.4.6-pyhd8ed1ab_1.conda"]);
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index(
+                "noarch",
+                "./shards/",
+                &[
+                    ("acme-core", &impostor_hash),
+                    ("rich", &rich_hash),
+                    ("tzdata", &tz_hash),
+                    ("numpy", &numpy_hash),
+                    ("colorama", &colorama_hash),
+                ],
+            ),
+        )
+        .await;
+        for (hash, shard) in [
+            (&impostor_hash, &impostor_shard),
+            (&rich_hash, &rich_shard),
+            (&tz_hash, &tz_shard),
+            (&numpy_hash, &numpy_shard),
+            (&colorama_hash, &colorama_shard),
+        ] {
+            mount_bytes(
+                &server,
+                &format!("/noarch/shards/{hash}.msgpack.zst"),
+                shard.clone(),
+            )
+            .await;
+        }
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let v = rig.virtual_key.clone();
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": [
+                {"name": "tzdata", "version": "2025b"},
+                {"name": "numpy", "subdirs": ["linux-64"]},
+                {"name": "ri*"},
+            ]}),
+        )
+        .await;
+        let hosted = hosted_shards(&rig.pool, &[rig.hosted_id], "noarch")
+            .await
+            .expect("hosted shards");
+        let acme_shard = hosted["acme-core"].clone();
+        let acme_hash = hex::encode(shard_address(&acme_shard));
+
+        let (idx_status, idx_body, idx_headers) = rig.get(format!("/{v}{INDEX}")).await;
+        let (acme_status, acme_body, _) = rig.get(shard_uri(&v, &acme_hash)).await;
+        let (rich_status, rich_body, _) = rig.get(shard_uri(&v, &rich_hash)).await;
+        let (impostor_status, _, _) = rig.get(shard_uri(&v, &impostor_hash)).await;
+        let (tz_status, _, _) = rig.get(shard_uri(&v, &tz_hash)).await;
+        let (numpy_status, _, _) = rig.get(shard_uri(&v, &numpy_hash)).await;
+        let (colorama_status, _, _) = rig.get(shard_uri(&v, &colorama_hash)).await;
+        let (missing_status, _, _) = rig.get(shard_uri(&v, &well_formed_shard_hash())).await;
+
+        // Allowlist off: everything but the owned name comes back.
+        set_allowlist(&rig, serde_json::json!({"enabled": false, "entries": []})).await;
+        let (off_status, off_body, off_headers) = rig.get(format!("/{v}{INDEX}")).await;
+        let (off_tz_status, off_tz_body, _) = rig.get(shard_uri(&v, &tz_hash)).await;
+        let (off_impostor_status, _, _) = rig.get(shard_uri(&v, &impostor_hash)).await;
+        rig.cleanup().await;
+
+        assert_eq!(idx_status, StatusCode::OK);
+        let index = decode_index(&idx_body);
+        assert_eq!(index.info.base_url, format!("/conda/{v}/noarch/"));
+        assert_eq!(index.info.shards_base_url, "./shards/");
+        assert_eq!(
+            index_names(&index),
+            vec!["acme-core", "rich"],
+            "hosted names, plus remote names admitted whole; never an owned name"
+        );
+        assert_eq!(
+            hex::encode(index.shards["acme-core"]),
+            acme_hash,
+            "an owned name carries the hosted shard, not the upstream's"
+        );
+        assert_eq!(hex::encode(index.shards["rich"]), rich_hash);
+        assert_eq!(
+            idx_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("3"),
+            "tzdata (version-constrained), numpy (other subdir), colorama (absent)"
+        );
+
+        assert_eq!(acme_status, StatusCode::OK);
+        assert_eq!(&acme_body[..], &acme_shard[..]);
+        assert_eq!(rich_status, StatusCode::OK);
+        assert_eq!(&rich_body[..], &rich_shard[..]);
+        assert_eq!(
+            impostor_status,
+            StatusCode::NOT_FOUND,
+            "the upstream's shard for a hosted-owned name is refused even by address"
+        );
+        assert_eq!(tz_status, StatusCode::NOT_FOUND);
+        assert_eq!(numpy_status, StatusCode::NOT_FOUND);
+        assert_eq!(colorama_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
+        assert_eq!(off_status, StatusCode::OK);
+        assert_eq!(
+            index_names(&decode_index(&off_body)),
+            vec!["acme-core", "colorama", "numpy", "rich", "tzdata"]
+        );
+        assert!(off_headers.get(ALLOWLIST_DROPPED_HEADER).is_none());
+        assert_eq!(off_tz_status, StatusCode::OK);
+        assert_eq!(&off_tz_body[..], &tz_shard[..]);
+        assert_eq!(off_impostor_status, StatusCode::NOT_FOUND);
+    }
+
+    /// A remote member that publishes no shard index takes the whole virtual
+    /// off CEP-16 for that subdir (404, so clients fall back), while the
+    /// monolithic merge keeps working.
+    #[tokio::test]
+    async fn virtual_without_a_sharded_member_falls_back_to_repodata_4577() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let v = rig.virtual_key.clone();
+        let (idx_status, idx_body, _) = rig.get(format!("/{v}{INDEX}")).await;
+        let (shard_status, _, _) = rig.get(shard_uri(&v, &well_formed_shard_hash())).await;
+        let (repodata_status, repodata) = rig.repodata("noarch").await;
+        rig.cleanup().await;
+
+        assert_eq!(idx_status, StatusCode::NOT_FOUND);
+        assert!(
+            String::from_utf8_lossy(&idx_body).contains("repodata.json"),
+            "{}",
+            String::from_utf8_lossy(&idx_body)
+        );
+        assert_eq!(shard_status, StatusCode::NOT_FOUND);
+        assert_eq!(repodata_status, StatusCode::OK);
+        assert_eq!(
+            super::virtual_channel_tests::listed(&repodata),
+            vec!["acme-core-1.0-0.conda", "rich-13.0-pyh_0.conda"]
+        );
+    }
+
+    /// A member whose index FETCH fails is handled like a failed repodata
+    /// member (#4192): 502 naming it by default, a partial index marked as
+    /// such when the virtual opts in. Hosted shards stay served either way.
+    #[tokio::test]
+    async fn virtual_shard_index_applies_the_member_failure_policy_4577() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(INDEX))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let remote_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.remote_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let v = rig.virtual_key.clone();
+        let acme_hash = {
+            let hosted = hosted_shards(&rig.pool, &[rig.hosted_id], "noarch")
+                .await
+                .unwrap();
+            hex::encode(shard_address(&hosted["acme-core"]))
+        };
+
+        let (strict_status, strict_body, _) = rig.get(format!("/{v}{INDEX}")).await;
+        let (hosted_shard_status, _, _) = rig.get(shard_uri(&v, &acme_hash)).await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
+        )
+        .bind(rig.virtual_id)
+        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+        let (partial_status, partial_body, partial_headers) = rig.get(format!("/{v}{INDEX}")).await;
+        rig.cleanup().await;
+
+        assert_eq!(strict_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&strict_body).contains(&remote_key),
+            "{}",
+            String::from_utf8_lossy(&strict_body)
+        );
+        assert_eq!(hosted_shard_status, StatusCode::OK);
+        assert_eq!(partial_status, StatusCode::OK);
+        assert_eq!(
+            partial_headers
+                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some(remote_key.as_str())
+        );
+        assert_eq!(
+            partial_headers
+                .get(CACHE_CONTROL)
+                .and_then(|h| h.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(index_names(&decode_index(&partial_body)), vec!["acme-core"]);
+    }
+
+    /// The sharded endpoints follow the repository's read access like every
+    /// other channel document: a private hosted channel answers 401 to an
+    /// anonymous index or shard request and 200 to its reader.
+    #[tokio::test]
+    async fn sharded_endpoints_follow_read_access_on_a_private_channel() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let index = format!("/{}{INDEX}", fx.repo_key);
+        let shard = shard_uri(&fx.repo_key, &well_formed_shard_hash());
+        let (anon_index, _) = tdh::send(fx.router_anon(router()), tdh::get(index.clone())).await;
+        let (anon_shard, _) = tdh::send(fx.router_anon(router()), tdh::get(shard.clone())).await;
+        let (auth_index, _) = tdh::send(fx.router_with_auth(router()), tdh::get(index)).await;
+        let (auth_shard, _) = tdh::send(fx.router_with_auth(router()), tdh::get(shard)).await;
+        fx.teardown().await;
+        assert_eq!(anon_index, StatusCode::UNAUTHORIZED);
+        assert_eq!(anon_shard, StatusCode::UNAUTHORIZED);
+        assert_eq!(auth_index, StatusCode::OK);
+        assert_eq!(
+            auth_shard,
+            StatusCode::NOT_FOUND,
+            "no such shard, but the reader may ask"
+        );
+    }
+
+    #[test]
+    fn shards_base_resolves_both_published_layouts_and_absolute_hosts() {
+        let base = |u: &str, s: &str| resolve_shards_base(u, "noarch", s).unwrap().to_string();
+        // conda.anaconda.org: shards beside the index.
+        assert_eq!(
+            base("https://conda.anaconda.org/conda-forge", ""),
+            "https://conda.anaconda.org/conda-forge/noarch/"
+        );
+        // prefix.dev: under `shards/`.
+        assert_eq!(
+            base("https://fast.prefix.dev/conda-forge/", "./shards/"),
+            "https://fast.prefix.dev/conda-forge/noarch/shards/"
+        );
+        assert_eq!(
+            base("https://example.test/ch", "shards"),
+            "https://example.test/ch/noarch/shards/"
+        );
+        assert_eq!(
+            base(
+                "https://example.test/ch",
+                "https://cdn.example.test/shards?x=1#f"
+            ),
+            "https://cdn.example.test/shards/"
+        );
+        assert!(resolve_shards_base("not a url", "noarch", "").is_err());
+    }
+
+    #[test]
+    fn shard_hash_is_validated_before_anything_else() {
+        assert_eq!(
+            parse_shard_hash(&format!("{}.msgpack.zst", "AB".repeat(32))).unwrap(),
+            "ab".repeat(32)
+        );
+        assert_eq!(parse_shard_hash(&"ab".repeat(32)).unwrap(), "ab".repeat(32));
+        for bad in [
+            "",
+            "abc",
+            &"zz".repeat(32),
+            &format!("{}.conda", "ab".repeat(32)),
+        ] {
+            assert_eq!(
+                parse_shard_hash(bad).unwrap_err().status(),
+                StatusCode::BAD_REQUEST,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shard_names_fall_back_to_the_filename_and_fail_closed() {
+        let names: ShardNames = serde_json::from_value(serde_json::json!({
+            "packages": {"old-1.0-0.tar.bz2": {"name": "Old", "version": "1.0"}},
+            "packages.conda": {"new-2.0-0.conda": {"version": "2.0"}},
+            "v3": {"conda": {"weird": {}}},
+            "removed": [],
+        }))
+        .unwrap();
+        assert_eq!(
+            names.names(),
+            vec![Some("old".to_string()), Some("new".to_string()), None]
+        );
     }
 }
