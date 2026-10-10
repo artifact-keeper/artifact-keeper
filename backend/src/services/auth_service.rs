@@ -4378,6 +4378,7 @@ mod tests {
             guest_access_enabled: true,
             guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,

@@ -2,10 +2,14 @@
 //!
 //! Provides Kubernetes-style probes:
 //! - `/livez`   - lightweight liveness (process alive, no external deps)
-//! - `/readyz`  - readiness gate (DB + migrations reachable). Initial-setup
-//!   state (admin password change required) is reported as an informational
-//!   field but does NOT cause a 503. A 503 here would make Kubernetes restart
-//!   the pod and prevent operators from completing setup via `kubectl exec`.
+//! - `/readyz`  - readiness gate: "this replica can serve artifacts", i.e. the
+//!   database is reachable and migrations have applied. Initial-setup state
+//!   (admin password change required) is reported as an informational field
+//!   but does NOT cause a 503. A 503 here would make Kubernetes restart the
+//!   pod and prevent operators from completing setup via `kubectl exec`. The
+//!   other dependencies (OpenSearch, storage, scanner, LDAP) are reported in a
+//!   `dependencies` object without gating, except that
+//!   `READYZ_REQUIRE_SEARCH=true` makes an unhealthy OpenSearch a 503 (#4610).
 //! - `/health`  - rich status page for dashboards (all services + pool stats)
 //! - `/healthz` - alias for `/health`
 //!
@@ -93,6 +97,201 @@ pub struct LivezResponse {
 pub struct ReadyzResponse {
     pub status: String,
     pub checks: ReadyzChecks,
+    /// Every other dependency `/health` probes, always present, so a probe
+    /// reader sees degradation without `EXPOSE_DETAILED_HEALTH` (#4610).
+    /// Each says whether it gates readiness (`required`).
+    pub dependencies: ReadyzDependencies,
+    /// The checks or dependencies that made this replica not ready. Omitted
+    /// when ready.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing: Vec<String>,
+}
+
+/// Status of one dependency on `/readyz`.
+///
+/// `status` is `healthy`, `unhealthy` or `not_configured`; `required` says
+/// whether it gates readiness on this deployment. `message` (the probe's
+/// error text) is only included when `EXPOSE_DETAILED_HEALTH` is on, because
+/// it can name internal hosts.
+#[derive(Serialize, ToSchema, Clone, Debug)]
+pub struct DependencyStatus {
+    pub status: String,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The dependencies `/readyz` reports (#4610).
+#[derive(Serialize, ToSchema, Clone, Debug)]
+pub struct ReadyzDependencies {
+    pub opensearch: DependencyStatus,
+    pub storage: DependencyStatus,
+    pub scanner: DependencyStatus,
+    pub ldap: DependencyStatus,
+}
+
+/// Status string for an optional dependency this deployment does not use.
+const STATUS_NOT_CONFIGURED: &str = "not_configured";
+
+/// How long `/readyz` waits for any one dependency probe. Probes run
+/// concurrently and share the `/health` TTL caches, so a dead dependency
+/// costs the probe at most this long, once per cache window.
+const READYZ_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl DependencyStatus {
+    fn not_configured(required: bool) -> Self {
+        Self {
+            status: STATUS_NOT_CONFIGURED.to_string(),
+            required,
+            message: None,
+        }
+    }
+
+    /// Fold a probe result into the `/readyz` vocabulary: anything that is
+    /// not `healthy` (the probes also say `unavailable` or `unknown`) is
+    /// `unhealthy`.
+    fn from_check(check: CheckStatus, required: bool, detailed: bool) -> Self {
+        let healthy = check.status == STATUS_HEALTHY;
+        Self {
+            status: if healthy {
+                STATUS_HEALTHY
+            } else {
+                STATUS_UNHEALTHY
+            }
+            .to_string(),
+            required,
+            message: if detailed { check.message } else { None },
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.status == STATUS_HEALTHY
+    }
+}
+
+/// Run `probe` with the `/readyz` deadline; a timeout is an unhealthy result.
+async fn with_readyz_deadline<F>(name: &str, probe: F) -> CheckStatus
+where
+    F: std::future::Future<Output = CheckStatus>,
+{
+    match tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, probe).await {
+        Ok(check) => check,
+        Err(_) => CheckStatus {
+            status: STATUS_UNHEALTHY.to_string(),
+            message: Some(format!(
+                "{name} probe timed out ({}s)",
+                READYZ_DEPENDENCY_TIMEOUT.as_secs()
+            )),
+        },
+    }
+}
+
+/// Serve a `/readyz` dependency probe through its `/health` cache, with the
+/// deadline applied INSIDE the cached probe, so a hung dependency's timeout
+/// is cached for the TTL like any other result instead of costing every
+/// `/readyz` the full deadline. The outer deadline bounds the wait for the
+/// cache lock when a slower `/health` probe of the same dependency holds it.
+async fn readyz_cached<F, Fut>(
+    name: &str,
+    cache: &HealthCache,
+    ttl: Duration,
+    probe: F,
+) -> CheckStatus
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CheckStatus>,
+{
+    with_readyz_deadline(
+        name,
+        cached_check(cache, ttl, || with_readyz_deadline(name, probe())),
+    )
+    .await
+}
+
+/// Probe every dependency the detailed health knows about, concurrently, each
+/// through its `/health` cache and under [`READYZ_DEPENDENCY_TIMEOUT`].
+async fn probe_readyz_dependencies(state: &crate::api::AppState) -> ReadyzDependencies {
+    let detailed = state.config.expose_detailed_health;
+    let require_search = state.config.readyz_require_search;
+
+    let opensearch = async {
+        match &state.search_service {
+            Some(svc) => DependencyStatus::from_check(
+                readyz_cached(
+                    "OpenSearch",
+                    &OPENSEARCH_HEALTH_CACHE,
+                    DEPENDENCY_HEALTH_TTL,
+                    || probe_opensearch_health(svc),
+                )
+                .await,
+                require_search,
+                detailed,
+            ),
+            // OPENSEARCH_URL is set but startup could not reach the cluster,
+            // so the server runs without search until it restarts. That is
+            // an unhealthy dependency, not an unconfigured one.
+            None if state.config.opensearch_url.is_some() => DependencyStatus::from_check(
+                CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some(
+                        "OpenSearch is configured but was unreachable at startup; \
+                         search stays disabled until the server restarts"
+                            .to_string(),
+                    ),
+                },
+                require_search,
+                detailed,
+            ),
+            None => DependencyStatus::not_configured(require_search),
+        }
+    };
+    let storage = async {
+        DependencyStatus::from_check(
+            readyz_cached("Storage", &STORAGE_HEALTH_CACHE, STORAGE_HEALTH_TTL, || {
+                probe_storage_health(&state.config, &state.storage)
+            })
+            .await,
+            false,
+            detailed,
+        )
+    };
+    let scanner = async {
+        match &state.config.trivy_url {
+            Some(url) => DependencyStatus::from_check(
+                readyz_cached(
+                    "Scanner",
+                    &SCANNER_HEALTH_CACHE,
+                    DEPENDENCY_HEALTH_TTL,
+                    || check_service_health(url, "/healthz", "Trivy"),
+                )
+                .await,
+                false,
+                detailed,
+            ),
+            None => DependencyStatus::not_configured(false),
+        }
+    };
+    let ldap = async {
+        if state.config.ldap_url.is_some() {
+            DependencyStatus::from_check(
+                readyz_cached("LDAP", &LDAP_HEALTH_CACHE, DEPENDENCY_HEALTH_TTL, || {
+                    probe_ldap_health(&state.db, &state.config)
+                })
+                .await,
+                false,
+                detailed,
+            )
+        } else {
+            DependencyStatus::not_configured(false)
+        }
+    };
+    let (opensearch, storage, scanner, ldap) = tokio::join!(opensearch, storage, scanner, ldap);
+    ReadyzDependencies {
+        opensearch,
+        storage,
+        scanner,
+        ldap,
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -324,8 +523,13 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 
 /// Readiness probe - is the service ready to accept traffic?
 ///
-/// Returns 200 once the database is reachable and migrations have applied
-/// successfully. Initial-setup state (whether the default admin password has
+/// Ready means "can serve artifacts": 200 once the database is reachable and
+/// migrations have applied successfully. OpenSearch, storage, the scanner and
+/// LDAP are probed too (concurrently, cached, at most
+/// [`READYZ_DEPENDENCY_TIMEOUT`] each) and reported under `dependencies`, but
+/// do not gate readiness: artifact serving works without them. With
+/// `READYZ_REQUIRE_SEARCH=true` an unhealthy or unconfigured OpenSearch makes
+/// this a 503 that names it under `failing` (#4610). Initial-setup state (whether the default admin password has
 /// been changed) is reported as an informational field on the response but
 /// does NOT influence the status code: a 503 here would make Kubernetes
 /// restart the pod, terminating any `kubectl exec` session an operator is
@@ -379,7 +583,12 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     let setup_required = state
         .setup_required
         .load(std::sync::atomic::Ordering::Relaxed);
-    let (status_code, response) = build_readyz_response(db_check, migrations_check, setup_required);
+    let dependencies = probe_readyz_dependencies(&state).await;
+    let (status_code, response) =
+        build_readyz_response(db_check, migrations_check, setup_required, dependencies);
+    if !response.failing.is_empty() {
+        tracing::warn!(failing = ?response.failing, "/readyz: not ready");
+    }
 
     if setup_required {
         tracing::debug!("/readyz: setup incomplete (informational, not blocking readiness)");
@@ -401,10 +610,14 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
 /// changed" so dashboards and operators can see the condition, but it is
 /// intentionally excluded from the readiness gate (see #889 - restarting
 /// the pod here makes setup impossible via `kubectl exec`).
+///
+/// `dependencies` carries each dependency's `required` flag, so the
+/// `READYZ_REQUIRE_SEARCH` decision is made by the caller that built them.
 fn build_readyz_response(
     db_check: CheckStatus,
     migrations_check: CheckStatus,
     setup_required: bool,
+    dependencies: ReadyzDependencies,
 ) -> (StatusCode, ReadyzResponse) {
     let setup_check = if setup_required {
         CheckStatus {
@@ -418,7 +631,25 @@ fn build_readyz_response(
         }
     };
 
-    let ready = is_ready(&db_check, &migrations_check);
+    let mut failing = Vec::new();
+    if db_check.status != STATUS_HEALTHY {
+        failing.push("database".to_string());
+    }
+    if migrations_check.status != STATUS_HEALTHY {
+        failing.push("migrations".to_string());
+    }
+    for (name, dep) in [
+        ("opensearch", &dependencies.opensearch),
+        ("storage", &dependencies.storage),
+        ("scanner", &dependencies.scanner),
+        ("ldap", &dependencies.ldap),
+    ] {
+        if dep.required && !dep.is_healthy() {
+            failing.push(name.to_string());
+        }
+    }
+
+    let ready = is_ready(&db_check, &migrations_check) && failing.is_empty();
 
     let response = ReadyzResponse {
         status: if ready {
@@ -431,6 +662,8 @@ fn build_readyz_response(
             migrations: migrations_check,
             setup_complete: setup_check,
         },
+        dependencies,
+        failing,
     };
 
     let status_code = if ready {
@@ -966,7 +1199,9 @@ pub async fn memory_stats() -> impl IntoResponse {
         DbPoolStats,
         LivezResponse,
         ReadyzResponse,
-        ReadyzChecks
+        ReadyzChecks,
+        ReadyzDependencies,
+        DependencyStatus
     ))
 )]
 pub struct HealthApiDoc;
@@ -991,6 +1226,15 @@ mod tests {
     // rather than constructing a setup CheckStatus by hand, which avoids
     // the issue inside this module; the comment is here to warn anyone
     // adding new tests that bypass `build_readyz_response`.
+
+    fn no_dependencies() -> ReadyzDependencies {
+        ReadyzDependencies {
+            opensearch: DependencyStatus::not_configured(false),
+            storage: DependencyStatus::not_configured(false),
+            scanner: DependencyStatus::not_configured(false),
+            ldap: DependencyStatus::not_configured(false),
+        }
+    }
 
     fn healthy_check() -> CheckStatus {
         CheckStatus {
@@ -1355,6 +1599,8 @@ mod tests {
                 migrations: healthy_check(),
                 setup_complete: setup_complete_check(),
             },
+            dependencies: no_dependencies(),
+            failing: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"ready\""));
@@ -1373,6 +1619,8 @@ mod tests {
                 migrations: unhealthy_check("No successful migrations found"),
                 setup_complete: setup_complete_check(),
             },
+            dependencies: no_dependencies(),
+            failing: vec!["migrations".to_string()],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"not_ready\""));
@@ -1394,6 +1642,7 @@ mod tests {
             healthy_check(),
             healthy_check(),
             true, // setup_required
+            no_dependencies(),
         );
 
         // The actual handler decision: 200 OK, status="ready".
@@ -1420,6 +1669,7 @@ mod tests {
             healthy_check(),
             healthy_check(),
             false, // setup_required
+            no_dependencies(),
         );
 
         assert_eq!(status_code, StatusCode::OK);
@@ -1438,6 +1688,7 @@ mod tests {
                 unhealthy_check("Database unreachable: timeout"),
                 healthy_check(),
                 setup_required,
+                no_dependencies(),
             );
             assert_eq!(
                 status_code,
@@ -1458,6 +1709,7 @@ mod tests {
                 healthy_check(),
                 unhealthy_check("No successful migrations found"),
                 setup_required,
+                no_dependencies(),
             );
             assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(response.status, "not_ready");
@@ -2511,5 +2763,257 @@ mod tests {
         assert_eq!(trivy.reqs(), 0, "/livez must not probe the scanner");
         assert_eq!(opensearch.reqs(), 0, "/livez must not probe OpenSearch");
         assert_eq!(ldap.conns(), 0, "/livez must not bind to the directory");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4610: /readyz reports its dependencies and gates on search only when
+    // READYZ_REQUIRE_SEARCH is set. Driven through a router so the status
+    // code, body and handler are exercised together.
+    // -----------------------------------------------------------------------
+
+    /// A loopback port nothing listens on: bind, read the port, drop.
+    async fn dead_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn readyz_state(
+        pool: sqlx::PgPool,
+        dir: &std::path::Path,
+        opensearch_port: u16,
+        require_search: bool,
+    ) -> crate::api::SharedState {
+        let config = crate::config::Config {
+            storage_backend: "filesystem".to_string(),
+            storage_path: dir.to_string_lossy().into_owned(),
+            readyz_require_search: require_search,
+            ..crate::config::Config::test_config()
+        };
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(config.storage_path.clone()),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut state = crate::api::AppState::new(config, pool, storage, registry);
+        state.search_service = Some(Arc::new(
+            crate::services::opensearch_service::OpenSearchService::new(
+                &format!("http://127.0.0.1:{opensearch_port}"),
+                None,
+                None,
+                false,
+            )
+            .expect("opensearch client"),
+        ));
+        Arc::new(state)
+    }
+
+    /// GET /readyz through a router; returns status, parsed body, elapsed.
+    #[allow(clippy::disallowed_methods)]
+    async fn get_readyz(
+        state: crate::api::SharedState,
+    ) -> (StatusCode, serde_json::Value, Duration) {
+        use tower::ServiceExt as _;
+        let app = axum::Router::new()
+            .route("/readyz", axum::routing::get(readiness_check))
+            .with_state(state);
+        let started = Instant::now();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap(), elapsed)
+    }
+
+    /// A pool whose every query fails fast: nothing listens on port 1.
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn readyz_stays_ready_with_opensearch_down_and_reports_it() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), dead_port().await, false);
+
+        let (status, body, elapsed) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert_eq!(body["dependencies"]["opensearch"]["required"], false);
+        assert_eq!(body["dependencies"]["storage"]["status"], "healthy");
+        assert_eq!(body["dependencies"]["scanner"]["status"], "not_configured");
+        assert_eq!(body["dependencies"]["ldap"]["status"], "not_configured");
+        assert!(body.get("failing").is_none(), "{body}");
+        assert!(
+            body["dependencies"]["opensearch"].get("message").is_none(),
+            "probe errors name internal hosts; hidden without EXPOSE_DETAILED_HEALTH: {body}"
+        );
+        assert!(
+            elapsed < READYZ_DEPENDENCY_TIMEOUT + Duration::from_secs(1),
+            "readyz must stay fast: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_require_search_makes_dead_opensearch_a_503_naming_it() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), dead_port().await, true);
+
+        let (status, body, _) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["failing"], serde_json::json!(["opensearch"]));
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert_eq!(body["dependencies"]["opensearch"]["required"], true);
+        assert_eq!(body["checks"]["database"]["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn readyz_require_search_is_ready_when_opensearch_is_healthy() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"yellow\"}").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), opensearch.port, true);
+
+        let (status, body, _) = get_readyz(state).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "healthy");
+    }
+
+    /// OPENSEARCH_URL set, but startup could not reach the cluster and the
+    /// server carries on without search: that is unhealthy, not
+    /// "not configured", and gates readiness under the flag.
+    #[tokio::test]
+    async fn readyz_reports_search_that_failed_at_startup_as_unhealthy() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        for require_search in [false, true] {
+            reset_health_caches().await;
+            let dir = tempfile::tempdir().unwrap();
+            let config = crate::config::Config {
+                storage_backend: "filesystem".to_string(),
+                storage_path: dir.path().to_string_lossy().into_owned(),
+                opensearch_url: Some("http://127.0.0.1:1".to_string()),
+                readyz_require_search: require_search,
+                ..crate::config::Config::test_config()
+            };
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+                crate::storage::filesystem::FilesystemStorage::new(config.storage_path.clone()),
+            );
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            ));
+            let state = Arc::new(crate::api::AppState::new(
+                config,
+                pool.clone(),
+                storage,
+                registry,
+            ));
+            assert!(state.search_service.is_none());
+
+            let (status, body, _) = get_readyz(state).await;
+            assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+            let expected = if require_search {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(status, expected, "require_search={require_search}: {body}");
+        }
+    }
+
+    /// A dependency that accepts connections but never answers costs one
+    /// `/readyz` the deadline; the timed-out result is cached, so the next
+    /// probe within the TTL answers at once.
+    #[tokio::test]
+    async fn readyz_hung_opensearch_costs_the_deadline_once_per_ttl() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        // Accepts TCP, never replies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hold = tokio::spawn(async move {
+            let mut socks = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                socks.push(sock);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = readyz_state(pool, dir.path(), port, false);
+
+        let (status, body, first) = get_readyz(state.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert!(
+            first < READYZ_DEPENDENCY_TIMEOUT + Duration::from_secs(1),
+            "bounded by the deadline: {first:?}"
+        );
+        let (_, body, second) = get_readyz(state).await;
+        assert_eq!(body["dependencies"]["opensearch"]["status"], "unhealthy");
+        assert!(
+            second < Duration::from_millis(500),
+            "the timeout is cached, not paid again: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_database_down_is_503_regardless_of_search_flag() {
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        for require_search in [false, true] {
+            reset_health_caches().await;
+            let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = readyz_state(
+                unreachable_pool(),
+                dir.path(),
+                opensearch.port,
+                require_search,
+            );
+
+            let (status, body, _) = get_readyz(state).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "require_search={require_search}: {body}"
+            );
+            assert_eq!(body["status"], "not_ready");
+            let failing = body["failing"].as_array().cloned().unwrap_or_default();
+            assert!(failing.contains(&serde_json::json!("database")), "{body}");
+            assert!(body["dependencies"].is_object(), "always present: {body}");
+        }
     }
 }

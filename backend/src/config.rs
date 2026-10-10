@@ -578,6 +578,13 @@ pub struct Config {
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
 
+    /// When true, `/readyz` answers 503 while OpenSearch is unhealthy (or not
+    /// configured), naming it under `failing`. Default false: ready means
+    /// "can serve artifacts" (database + migrations), and search status is
+    /// only reported under `dependencies` (#4610). Set it where search is part
+    /// of what a replica must provide before it takes traffic.
+    pub readyz_require_search: bool,
+
     /// Optional operator-supplied instruction for retrieving the generated
     /// initial admin password, shown on the first-time-setup login screen. The
     /// default screen text assumes a Docker Compose deployment
@@ -1344,6 +1351,7 @@ redacted_debug!(Config {
     show guest_access_enabled,
     show guest_access_env_pinned,
     show expose_detailed_health,
+    show readyz_require_search,
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
@@ -1495,6 +1503,7 @@ impl Default for Config {
             guest_access_enabled: true,
             guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
@@ -1711,6 +1720,10 @@ impl Config {
             // operator explicitly opts in. Default OFF; only "true"/"1" enables.
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
+            ),
+            // #4610: OpenSearch gates /readyz only when an operator opts in.
+            readyz_require_search: parse_opt_in_flag(
+                env::var("READYZ_REQUIRE_SEARCH").ok().as_deref(),
             ),
             // Deployment-aware first-run instruction (#2802): the default
             // setup screen text assumes Docker Compose. Operators on
