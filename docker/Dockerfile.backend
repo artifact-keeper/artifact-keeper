@@ -341,7 +341,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # (services/image_build_service.rs). A static Go binary; the daemon it talks
 # to runs elsewhere (AK_BUILDKIT_ADDR), so nothing else from BuildKit is
 # needed in the runtime image.
-FROM docker.io/moby/buildkit:v0.33.0 AS buildkit-bin
+FROM docker.io/moby/buildkit:v0.33.1 AS buildkit-bin
 
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
