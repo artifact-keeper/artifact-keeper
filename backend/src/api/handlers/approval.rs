@@ -904,6 +904,17 @@ pub async fn approve_promotion(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to write promoted artifact: {}", e)))?;
 
+    // A Docker/OCI manifest also needs its child manifests, blobs and the
+    // rows a pull resolves through (#4578). `None` for every other artifact.
+    let oci_image = crate::services::oci_promotion::prepare(
+        &state.db,
+        &*source_storage,
+        &*target_storage,
+        source_repo.id,
+        &artifact.path,
+    )
+    .await?;
+
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
     // Carry the SOURCE artifact's origin onto the copy (#4152). The
@@ -918,6 +929,11 @@ pub async fn approve_promotion(
 
     // Insert artifact in target repo
     let new_artifact_id = Uuid::new_v4();
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     // NO-SCAN-ON-UPLOAD: an approved promotion copies an artifact whose own
     // scans gated the approval; it is not an upload (#4166 scope).
     // NO-QUOTA-ADMISSION: a promotion copy, not a client publish; whether a
@@ -945,7 +961,7 @@ pub async fn approve_promotion(
     .bind(&artifact.storage_key)
     .bind(auth.user_id)
     .bind(&source_origin)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("duplicate key") {
@@ -957,6 +973,15 @@ pub async fn approve_promotion(
             AppError::Database(e.to_string())
         }
     })?;
+    if let Some(image) = &oci_image {
+        image
+            .register_in_tx(&mut tx, target_repo.id, auth.user_id)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Record promotion history
     let promotion_id = Uuid::new_v4();

@@ -1812,3 +1812,323 @@ async fn test_validation_refusal_matches_its_published_status() {
     cleanup(&f.pool, &[&other], &[]).await;
     f.cleanup().await;
 }
+
+// ===========================================================================
+// 8. Docker/OCI images (#4578)
+// ===========================================================================
+
+/// Write one content-addressed OCI object into `repo`'s storage and return its
+/// `sha256:` digest.
+fn write_oci_object(repo: &Repo, prefix: &str, content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("sha256:{:x}", Sha256::digest(content));
+    let path = repo.object_path(&format!("{}{}", prefix, digest));
+    std::fs::create_dir_all(path.parent().expect("object path has a parent"))
+        .expect("create object dir");
+    std::fs::write(&path, content).expect("write object");
+    digest
+}
+
+/// Seed `repo` with what a `docker push` of a two-platform image index leaves
+/// behind: config and layer blobs (one layer shared by both platforms), two
+/// image manifests recorded by digest, and an index tagged `tag`. Returns the
+/// tag's `artifacts` row id, the index digest, the child digests and the blob
+/// digests.
+async fn seed_pushed_oci_index(
+    pool: &PgPool,
+    repo: &Repo,
+    image: &str,
+    tag: &str,
+) -> (Uuid, String, Vec<String>, Vec<String>) {
+    const IMAGE_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+    const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+
+    let shared_layer = b"shared layer bytes".to_vec();
+    let mut blobs = Vec::new();
+    let mut children = Vec::new();
+    for arch in ["amd64", "arm64"] {
+        let config = format!(r#"{{"architecture":"{}","os":"linux"}}"#, arch);
+        let own_layer = format!("{} layer bytes", arch);
+        let mut descriptors = Vec::new();
+        for content in [config.as_bytes(), own_layer.as_bytes(), &shared_layer] {
+            let digest = write_oci_object(repo, "oci-blobs/", content);
+            descriptors.push((digest.clone(), content.len()));
+            if !blobs.contains(&digest) {
+                blobs.push(digest.clone());
+                sqlx::query(
+                    "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(repo.id)
+                .bind(&digest)
+                .bind(content.len() as i64)
+                .bind(format!("oci-blobs/{}", digest))
+                .execute(pool)
+                .await
+                .expect("insert oci_blobs row");
+            }
+        }
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": descriptors[0].0, "size": descriptors[0].1
+            },
+            "layers": descriptors[1..].iter().map(|(d, s)| serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": d, "size": s
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        let digest = write_oci_object(repo, "oci-manifests/", manifest.as_bytes());
+        for (blob, kind) in [
+            (&descriptors[0].0, "config"),
+            (&descriptors[1].0, "layer"),
+            (&descriptors[2].0, "layer"),
+        ] {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&digest)
+            .bind(blob)
+            .bind(repo.id)
+            .bind(kind)
+            .execute(pool)
+            .await
+            .expect("insert manifest_blob_refs row");
+        }
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, $3, $3, $4)",
+        )
+        .bind(repo.id)
+        .bind(image)
+        .bind(&digest)
+        .bind(IMAGE_TYPE)
+        .execute(pool)
+        .await
+        .expect("insert child oci_tags row");
+        children.push((digest, manifest.len()));
+    }
+
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": INDEX_TYPE,
+        "manifests": children.iter().map(|(d, s)| serde_json::json!({
+            "mediaType": IMAGE_TYPE, "digest": d, "size": s
+        })).collect::<Vec<_>>()
+    })
+    .to_string();
+    let index_digest = write_oci_object(repo, "oci-manifests/", index.as_bytes());
+    for (child, _) in &children {
+        sqlx::query(
+            "INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&index_digest)
+        .bind(child)
+        .bind(repo.id)
+        .execute(pool)
+        .await
+        .expect("insert oci_manifest_refs row");
+    }
+    sqlx::query(
+        "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(repo.id)
+    .bind(image)
+    .bind(tag)
+    .bind(&index_digest)
+    .bind(INDEX_TYPE)
+    .execute(pool)
+    .await
+    .expect("insert tag oci_tags row");
+
+    let artifact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+                                checksum_sha256, content_type, storage_key, is_deleted) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, false)",
+    )
+    .bind(artifact_id)
+    .bind(repo.id)
+    .bind(format!("v2/{}/manifests/{}", image, tag))
+    .bind(format!("{}:{}", image, tag))
+    .bind(tag)
+    .bind(index_digest.trim_start_matches("sha256:"))
+    .bind(INDEX_TYPE)
+    .bind(format!("oci-manifests/{}", index_digest))
+    .execute(pool)
+    .await
+    .expect("insert tag artifact row");
+
+    let children = children.into_iter().map(|(d, _)| d).collect();
+    (artifact_id, index_digest, children, blobs)
+}
+
+/// #4578: promoting a Docker/OCI tag must leave it pullable from the target.
+/// Before the fix only the `artifacts` row and the index object were copied:
+/// the target had no `oci_tags` row (pull answered `MANIFEST_UNKNOWN`), no
+/// child manifests and no blobs.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_promoting_an_oci_index_makes_it_pullable_from_the_target() {
+    let pool = require_db_pool().await;
+    let source = create_repo(&pool, "local", "docker", "ocisrc").await;
+    let target = create_repo(&pool, "local", "docker", "ocidst").await;
+    let user = create_user(&pool, "oci", true).await;
+    grant_repo(&pool, user, None).await;
+
+    // The target only accepts promoted content, which is the setup this
+    // fix exists for: `docker push` into it is refused.
+    sqlx::query("UPDATE repositories SET promotion_only = true WHERE id = $1")
+        .bind(target.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (artifact_id, index_digest, children, blobs) =
+        seed_pushed_oci_index(&pool, &source, "probe", "1").await;
+
+    let state = build_state(&pool, &source.storage_path.to_string_lossy(), false);
+    let (status, body) = send(
+        &state,
+        "POST",
+        &promote_uri(&source.key, artifact_id),
+        principal(user, true),
+        Some(serde_json::json!({ "target_repository": target.key, "skip_policy_check": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "promotion failed: {}", body);
+    assert_eq!(body["promoted"], true, "body: {}", body);
+
+    // The tag resolves in the target, to the same digest.
+    let tagged: Option<String> = sqlx::query_scalar(
+        "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = 'probe' AND tag = '1'",
+    )
+    .bind(target.id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tagged.as_deref(), Some(index_digest.as_str()));
+
+    // Every manifest object is in the target's storage, and every child is
+    // known to the target by digest (tag row, refs, `artifacts` row).
+    for digest in std::iter::once(&index_digest).chain(&children) {
+        assert!(
+            target
+                .object_path(&format!("oci-manifests/{}", digest))
+                .exists(),
+            "manifest {} was not copied",
+            digest
+        );
+    }
+    for child in &children {
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_manifest_refs \
+             WHERE repository_id = $1 AND parent_digest = $2 AND child_digest = $3",
+        )
+        .bind(target.id)
+        .bind(&index_digest)
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edges, 1, "index -> {} edge missing in the target", child);
+        let blob_refs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(target.id)
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_refs, 3, "blob refs of {} missing in the target", child);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(target.id)
+        .bind(format!("v2/probe/manifests/{}", child))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 1,
+            "child manifest {} has no artifacts row in the target",
+            child
+        );
+    }
+
+    // Every blob is registered for the target and its bytes are there.
+    for blob in &blobs {
+        let registered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(target.id)
+        .bind(blob)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            registered, 1,
+            "blob {} is not registered for the target",
+            blob
+        );
+        assert_eq!(
+            std::fs::read(target.object_path(&format!("oci-blobs/{}", blob))).expect("blob copied"),
+            std::fs::read(source.object_path(&format!("oci-blobs/{}", blob))).unwrap(),
+        );
+    }
+
+    cleanup(&pool, &[&source, &target], &[user]).await;
+}
+
+/// #4578: a source image with a missing blob must not be promoted as if it
+/// were complete; the promotion fails and the target gets no tag.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_promoting_an_incomplete_oci_image_fails_without_a_tag() {
+    let pool = require_db_pool().await;
+    let source = create_repo(&pool, "local", "docker", "ocisrc").await;
+    let target = create_repo(&pool, "local", "docker", "ocidst").await;
+    let user = create_user(&pool, "oci", true).await;
+    grant_repo(&pool, user, None).await;
+
+    let (artifact_id, _, _, blobs) = seed_pushed_oci_index(&pool, &source, "probe", "1").await;
+    sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1 AND digest = $2")
+        .bind(source.id)
+        .bind(&blobs[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = build_state(&pool, &source.storage_path.to_string_lossy(), false);
+    let (status, body) = send(
+        &state,
+        "POST",
+        &promote_uri(&source.key, artifact_id),
+        principal(user, true),
+        Some(serde_json::json!({ "target_repository": target.key, "skip_policy_check": true })),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "an incomplete image was promoted: {}",
+        body
+    );
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1) \
+              + (SELECT COUNT(*) FROM artifacts WHERE repository_id = $1)",
+    )
+    .bind(target.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "a failed promotion left rows in the target");
+
+    cleanup(&pool, &[&source, &target], &[user]).await;
+}
