@@ -11183,7 +11183,7 @@ async fn handle_put_manifest(
     base_url: &str,
     image_name: &str,
     reference: &str,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
@@ -11232,6 +11232,15 @@ async fn handle_put_manifest(
             "Direct uploads are disabled for this repository; publish via promotion",
         );
     }
+    // #4568: read the body only after the caller is authenticated and allowed
+    // to write here, as the blob upload handlers do. Reading it first made an
+    // anonymous client buffer a full manifest before its 401, and a body that
+    // failed to arrive (crane re-sends a consumed body after the 401) turned
+    // the refusal into a 500.
+    let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     let repo_id = repo.id;
     let image = repo.image;
 
@@ -13167,12 +13176,6 @@ async fn catch_all(
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize)
-                .await
-            {
-                Ok(b) => b,
-                Err(resp) => return resp,
-            };
             handle_put_manifest(&state, &headers, base_url, &image_name, &r, body).await
         }
         ("DELETE", "manifests") => {
@@ -29277,6 +29280,48 @@ mod oci_write_authz_and_size_tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, member).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- manifest PUT authenticates before reading the body (#4568) -------
+
+    /// A manifest PUT without credentials must get the 401 push challenge
+    /// without the server reading the body first. The body here fails on the
+    /// first read, like the empty body crane re-sends after a 401 (it reuses
+    /// the consumed request). Reading it before auth turned that into a
+    /// `500 BLOB_UPLOAD_UNKNOWN`. Auth fails before any query, so a lazy pool
+    /// is enough.
+    #[tokio::test]
+    async fn anonymous_manifest_put_is_challenged_before_body_read_4568() {
+        let storage_dir = std::env::temp_dir().join(format!("oci-4568-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(tdh::lazy_pool(), storage_dir.to_str().unwrap());
+
+        let broken_body = Body::from_stream(futures::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client sent fewer bytes than Content-Length",
+            ))
+        }));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/public-repo/myimage/manifests/v2")
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .header(CONTENT_LENGTH, "948")
+            .body(broken_body)
+            .unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            challenge.contains("repository:public-repo/myimage:pull,push"),
+            "401 must carry the push-scope challenge, got {challenge:?}"
+        );
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
