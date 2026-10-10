@@ -2076,7 +2076,7 @@ async fn serve_repodata(
         }
     }
 
-    let repodata = build_repodata(&state.db, repo.id, repo_key, subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, subdir, false).await?;
     let body = encoding.encode(&repodata)?;
     Ok(cacheable_response(body, ct, headers).await)
 }
@@ -2140,7 +2140,7 @@ async fn repodata_json_sig(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
 
     // Use pretty-printed JSON to match what repodata_json() serves,
     // so clients can verify the signature against the downloaded repodata.
@@ -2241,7 +2241,7 @@ async fn repodata_json_jlap(
         )
             .into_response());
     }
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
 
     // Serialize repodata identically to how repodata_json serves it
     let json_bytes = serde_json::to_string_pretty(&repodata)
@@ -2370,7 +2370,7 @@ async fn current_repodata_json(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, true).await?;
+    let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
 
     let body = serde_json::to_string_pretty(&repodata)
         .unwrap()
@@ -2449,8 +2449,31 @@ const CEP16_CONTENT_TYPE: &str = "application/x-msgpack";
 /// The shard index file name within a subdir.
 const SHARD_INDEX_FILE: &str = "repodata_shards.msgpack.zst";
 
-/// Where this registry serves shards, relative to the subdir.
+/// Where this registry serves shards, relative to the shard index.
 const SHARDS_BASE_URL: &str = "./shards/";
+
+/// Where packages are, relative to the shard index: the subdir the index was
+/// served from (#4580). Relative on purpose, never a host-relative path and
+/// never an absolute URL built from the request:
+///
+/// - rattler resolves `base_url` against the channel's *canonical* subdir URL
+///   and only then applies a `[mirrors]` rewrite. `"/conda/<repo>/<subdir>/"`
+///   therefore became `https://conda.anaconda.org/conda/<repo>/...` for a
+///   client mirroring conda-forge onto this registry, while `"./"` becomes
+///   the canonical subdir, which the mirror maps back here.
+/// - A proxy in front of the registry (Nexus, a plain reverse proxy that sets
+///   no `X-Forwarded-*`) passes the document through unchanged; a relative
+///   value resolves against the URL the client used, an absolute one built
+///   from the registry's view of the request points past the proxy.
+/// - A token channel (`/conda/t/<token>/...`, `/t/<token>/conda/...`) keeps the
+///   token on every package URL without writing the token into the body.
+/// - The body stays independent of `Host`/`X-Forwarded-*`, so it is the same
+///   bytes, `ETag` included, for every client and cannot be poisoned in a
+///   shared cache through a forwarded header.
+///
+/// This is the value rattler's own indexer writes and what conda.anaconda.org
+/// means by its `""`.
+const PACKAGES_BASE_URL: &str = "./";
 
 /// Ceiling on one CEP-16 document read from an upstream (the shard index or
 /// one shard), as served. conda-forge's largest subdir index is about 1 MiB
@@ -2464,11 +2487,6 @@ const CEP16_UPSTREAM_MAX_BYTES: usize = proxy_helpers::DEFAULT_METADATA_MAX_BYTE
 /// any transfer coding), so a crafted frame stops at the cap instead of at the
 /// allocator. conda-forge's largest subdir index decodes to a few MiB.
 const CEP16_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
-
-/// The CEP-15 base URL of a channel subdir served by this registry.
-fn conda_base_url(repo_key: &str, subdir: &str) -> String {
-    format!("/conda/{repo_key}/{subdir}/")
-}
 
 /// The address of a shard: the SHA-256 of its encoded bytes.
 fn shard_address(shard: &[u8]) -> [u8; 32] {
@@ -2554,7 +2572,6 @@ fn find_hosted_shard(shards: BTreeMap<String, Vec<u8>>, hash_hex: &str) -> Optio
 /// virtual) from its shards' addresses.
 #[allow(clippy::result_large_err)]
 fn encode_hosted_shard_index(
-    repo_key: &str,
     subdir: &str,
     shards: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>, Response> {
@@ -2562,8 +2579,7 @@ fn encode_hosted_shard_index(
         .iter()
         .map(|(name, shard)| (name.clone(), shard_address(shard).to_vec()))
         .collect();
-    let base_url = conda_base_url(repo_key, subdir);
-    serialize_msgpack_zst(&build_sharded_index(subdir, &base_url, &addresses))
+    serialize_msgpack_zst(&build_sharded_index(subdir, &addresses))
 }
 
 /// Only the `info` block of an upstream shard index; the shard map is skipped
@@ -2892,9 +2908,8 @@ async fn serve_remote_shard_index(
             Ok(None) => return Err(no_upstream_shard_index(&repo.key, subdir)),
             Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
         };
-    let base_url = conda_base_url(&repo.key, subdir);
     let index = build_sharded_index_with_info(
-        shard_index_info(subdir, &base_url, Some(&upstream.info)),
+        shard_index_info(subdir, Some(&upstream.info)),
         upstream
             .shards
             .iter()
@@ -3082,8 +3097,7 @@ async fn serve_virtual_shard_index(
             failed,
             allowlist_dropped,
         } => {
-            let base_url = conda_base_url(&repo.key, subdir);
-            let body = serialize_msgpack_zst(&build_sharded_index(subdir, &base_url, &shards))?;
+            let body = serialize_msgpack_zst(&build_sharded_index(subdir, &shards))?;
             serve_virtual_merge(
                 &state.db,
                 repo.id,
@@ -3309,7 +3323,7 @@ async fn sharded_repodata_index(
     }
     // Hosted: built from the repository's own rows, which are authoritative.
     let shards = hosted_shards(&state.db, &[repo.id], &subdir).await?;
-    let body = encode_hosted_shard_index(&repo_key, &subdir, &shards)?;
+    let body = encode_hosted_shard_index(&subdir, &shards)?;
     Ok(cacheable_response(body, CEP16_CONTENT_TYPE, &headers).await)
 }
 
@@ -3470,10 +3484,9 @@ struct ShardedIndex<'a> {
 
 /// The `info` block of an index this registry serves for `subdir`, on top of
 /// an upstream's when proxying one: packages and shards resolve against the
-/// channel URL the client is already using.
+/// channel URL the client is already using ([`PACKAGES_BASE_URL`]).
 fn shard_index_info(
     subdir: &str,
-    base_url: &str,
     upstream: Option<&rattler_conda_types::ShardedSubdirInfo>,
 ) -> rattler_conda_types::ShardedSubdirInfo {
     let mut info = upstream
@@ -3487,7 +3500,7 @@ fn shard_index_info(
             channel_relations: None,
         });
     info.subdir = subdir.to_string();
-    info.base_url = base_url.to_string();
+    info.base_url = PACKAGES_BASE_URL.to_string();
     info.shards_base_url = SHARDS_BASE_URL.to_string();
     info
 }
@@ -3496,11 +3509,10 @@ fn shard_index_info(
 /// of a virtual channel, from package name to shard address.
 fn build_sharded_index<'a>(
     subdir: &str,
-    base_url: &str,
     shards: &'a BTreeMap<String, Vec<u8>>,
 ) -> ShardedIndex<'a> {
     build_sharded_index_with_info(
-        shard_index_info(subdir, base_url, None),
+        shard_index_info(subdir, None),
         shards
             .iter()
             .map(|(name, hash)| (name.as_str(), hash.as_slice())),
@@ -3673,13 +3685,11 @@ async fn list_removed_artifacts(
 /// When `latest_only` is true, only the most recent version of each package
 /// is included (for current_repodata.json).
 ///
-/// `repo_key` is included so we can set `base_url` in the `info` section
-/// per CEP-15, allowing clients to resolve package downloads from a
-/// separate CDN or mirror.
+/// No `base_url` is written: packages live beside the document, which is
+/// CEP-15's default (#4580, see [`build_repodata_envelope`]).
 async fn build_repodata(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
-    repo_key: &str,
     subdir: &str,
     latest_only: bool,
 ) -> Result<serde_json::Value, Response> {
@@ -3730,14 +3740,8 @@ async fn build_repodata(
     // Collect filenames of soft-deleted packages for the "removed" array
     let removed = list_removed_artifacts(db, repo_id, subdir).await?;
 
-    // CEP-15: base_url tells the client where to download packages from.
-    // This allows hosting packages on a separate CDN while serving repodata
-    // from the registry itself.
-    let base_url = format!("/conda/{}/{}/", repo_key, subdir);
-
     Ok(build_repodata_envelope(
         subdir,
-        &base_url,
         &packages,
         &packages_conda,
         &serde_json::json!(removed),
@@ -3933,13 +3937,11 @@ async fn build_virtual_repodata(
     )
     .await;
 
-    let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
     let subdir_owned = subdir.to_string();
     let enforced = allowlist.is_some();
     let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
         virtual_merge::merge_repodata(
             &subdir_owned,
-            &base_url,
             &hosted,
             &documents,
             &owned,
@@ -7396,10 +7398,16 @@ fn build_channeldata_json(
     })
 }
 
-/// Build the repodata.json envelope (CEP-15 `base_url` + `removed`).
+/// Build the repodata.json envelope (`info` + CEP-15 `removed`).
+///
+/// `info.base_url` is omitted (#4580): CEP-15's default is the directory the
+/// document was fetched from, which is where this registry serves the
+/// packages, for a direct channel URL, through a mirror rewrite, behind a
+/// proxy and under a `/t/<token>/` prefix alike. The host-relative
+/// `"/conda/<repo>/<subdir>/"` written before resolved against the proxy's
+/// host behind a proxy and dropped the token prefix from token channels.
 fn build_repodata_envelope(
     subdir: &str,
-    base_url: &str,
     packages: &serde_json::Map<String, serde_json::Value>,
     packages_conda: &serde_json::Map<String, serde_json::Value>,
     removed: &serde_json::Value,
@@ -7407,7 +7415,6 @@ fn build_repodata_envelope(
     serde_json::json!({
         "info": {
             "subdir": subdir,
-            "base_url": base_url,
         },
         "packages": packages,
         "packages.conda": packages_conda,
@@ -7757,7 +7764,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_repodata_envelope (production envelope; CEP-15 base_url + removed)
+    // build_repodata_envelope (production envelope; CEP-15 removed, no base_url)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -7766,13 +7773,15 @@ mod tests {
         let packages_conda = serde_json::Map::new();
         let rd = build_repodata_envelope(
             "linux-64",
-            "/conda/my-conda/linux-64/",
             &packages,
             &packages_conda,
             &serde_json::json!([]),
         );
         assert_eq!(rd["info"]["subdir"], "linux-64");
-        assert_eq!(rd["info"]["base_url"], "/conda/my-conda/linux-64/");
+        assert!(
+            rd["info"].get("base_url").is_none(),
+            "#4580: packages are beside the document, CEP-15's default"
+        );
         assert!(rd["packages"].as_object().unwrap().is_empty());
         assert!(rd["packages.conda"].as_object().unwrap().is_empty());
         assert!(rd["removed"].as_array().unwrap().is_empty());
@@ -7787,13 +7796,8 @@ mod tests {
         );
         let mut packages_conda = serde_json::Map::new();
         packages_conda.insert("new.conda".to_string(), serde_json::json!({"name": "new"}));
-        let rd = build_repodata_envelope(
-            "noarch",
-            "/conda/my-conda/noarch/",
-            &packages,
-            &packages_conda,
-            &serde_json::json!([]),
-        );
+        let rd =
+            build_repodata_envelope("noarch", &packages, &packages_conda, &serde_json::json!([]));
         assert_eq!(rd["packages"]["old.tar.bz2"]["name"], "old");
         assert_eq!(rd["packages.conda"]["new.conda"]["name"], "new");
     }
@@ -7804,7 +7808,6 @@ mod tests {
         let packages_conda = serde_json::Map::new();
         let rd = build_repodata_envelope(
             "osx-arm64",
-            "/conda/c/osx-arm64/",
             &packages,
             &packages_conda,
             &serde_json::json!(["gone-1.0-0.conda"]),
@@ -7819,7 +7822,6 @@ mod tests {
         let packages_conda = serde_json::Map::new();
         let rd = build_repodata_envelope(
             "linux-64",
-            "/conda/c/linux-64/",
             &packages,
             &packages_conda,
             &serde_json::json!([]),
@@ -10847,11 +10849,11 @@ mod tests {
         shards.insert("numpy".to_string(), vec![0xAB; 32]);
         shards.insert("scipy".to_string(), vec![0xCD; 32]);
 
-        let index = build_sharded_index("linux-64", "/conda/my-repo/linux-64/", &shards);
+        let index = build_sharded_index("linux-64", &shards);
         let decoded = decode_index_with_rattler(&serialize_msgpack_zst(&index).unwrap());
 
         assert_eq!(decoded.info.subdir, "linux-64");
-        assert_eq!(decoded.info.base_url, "/conda/my-repo/linux-64/");
+        assert_eq!(decoded.info.base_url, "./");
         assert_eq!(decoded.info.shards_base_url, "./shards/");
         assert_eq!(decoded.shards.len(), 2);
         assert_eq!(decoded.shards["numpy"].as_slice(), &[0xAB; 32]);
@@ -10861,7 +10863,7 @@ mod tests {
     #[test]
     fn test_sharded_index_empty_repo() {
         let shards = BTreeMap::new();
-        let index = build_sharded_index("noarch", "/conda/empty/noarch/", &shards);
+        let index = build_sharded_index("noarch", &shards);
         let decoded = decode_index_with_rattler(&serialize_msgpack_zst(&index).unwrap());
 
         assert_eq!(decoded.info.subdir, "noarch");
@@ -10956,7 +10958,7 @@ mod tests {
         let mut shards = BTreeMap::new();
         shards.insert("numpy".to_string(), vec![0xAB; 32]);
 
-        let index = build_sharded_index("linux-64", "/conda/test/linux-64/", &shards);
+        let index = build_sharded_index("linux-64", &shards);
         let msgpack = rmp_serde::to_vec_named(&index).unwrap();
         // bin8 marker (0xc4), length 32, then the raw digest.
         let mut bin = vec![0xc4, 32];
@@ -11009,14 +11011,14 @@ mod tests {
         for i in 0..10 {
             shards_small.insert(format!("pkg{}", i), vec![0xAA; 32]);
         }
-        let index_small = build_sharded_index("linux-64", "/test/", &shards_small);
+        let index_small = build_sharded_index("linux-64", &shards_small);
         let bytes_small = rmp_serde::to_vec_named(&index_small).unwrap();
 
         let mut shards_large = BTreeMap::new();
         for i in 0..100 {
             shards_large.insert(format!("pkg{}", i), vec![0xBB; 32]);
         }
-        let index_large = build_sharded_index("linux-64", "/test/", &shards_large);
+        let index_large = build_sharded_index("linux-64", &shards_large);
         let bytes_large = rmp_serde::to_vec_named(&index_large).unwrap();
 
         // 10x more packages should result in roughly 10x larger index (within 2x margin)
@@ -11159,35 +11161,18 @@ mod tests {
     }
 
     #[test]
-    fn test_repodata_base_url_in_info() {
-        // The build_repodata function adds base_url to the info section.
-        // Since we can't call the async function directly in unit tests,
-        // verify the test helper output matches expected structure.
-        let rd = build_repodata_json("linux-64", &serde_json::Map::new(), &serde_json::Map::new());
-
-        // The test helper doesn't include base_url (it's a simplified version),
-        // but the actual build_repodata does. Test the format of base_url
-        // that build_repodata produces.
-        let base_url = format!("/conda/{}/{}/", "my-repo", "linux-64");
-        assert_eq!(base_url, "/conda/my-repo/linux-64/");
-
-        // Verify the info.subdir is present
-        assert_eq!(rd["info"]["subdir"], "linux-64");
-    }
-
-    #[test]
-    fn test_base_url_format_for_various_repos() {
-        // CEP-15 base_url must be a relative path to the subdir
-        let cases = vec![
-            ("my-repo", "noarch", "/conda/my-repo/noarch/"),
-            ("internal", "linux-64", "/conda/internal/linux-64/"),
-            ("conda-forge", "osx-arm64", "/conda/conda-forge/osx-arm64/"),
-            ("ml-models", "win-64", "/conda/ml-models/win-64/"),
-        ];
-
-        for (repo_key, subdir, expected) in cases {
-            let base_url = format!("/conda/{}/{}/", repo_key, subdir);
-            assert_eq!(base_url, expected, "base_url for {}/{}", repo_key, subdir);
+    fn test_repodata_envelope_omits_base_url_4580() {
+        // #4580: a host-relative `base_url` ("/conda/<repo>/<subdir>/")
+        // resolved against a proxy's host and dropped a `/t/<token>/` prefix.
+        // Omitted, CEP-15's default (the document's own directory) applies.
+        for subdir in ["noarch", "linux-64", "osx-arm64", "win-64"] {
+            let rd = build_repodata_envelope(
+                subdir,
+                &serde_json::Map::new(),
+                &serde_json::Map::new(),
+                &serde_json::json!([]),
+            );
+            assert_eq!(rd["info"], serde_json::json!({ "subdir": subdir }));
         }
     }
 
@@ -16429,7 +16414,7 @@ mod attestation_verification_tests {
             "8ef972c8a32ae9895a41291a27819c5d87681024e8fd9c553bea38db5e0b93ec"
         );
         // repodata.json advertises the sidecar on the package's record.
-        let repodata = build_repodata(&fx.pool, fx.repo_id, &fx.repo_key, "noarch", false)
+        let repodata = build_repodata(&fx.pool, fx.repo_id, "noarch", false)
             .await
             .expect("repodata");
         assert_eq!(
@@ -16786,7 +16771,6 @@ mod repodata_byte_stability_tests {
     /// repodata bytes trips this test and must be justified in the PR.
     const GOLDEN_NOARCH: &str = r#"{
   "info": {
-    "base_url": "/conda/{key}/noarch/",
     "subdir": "noarch"
   },
   "packages": {
@@ -16815,7 +16799,6 @@ mod repodata_byte_stability_tests {
 
     const GOLDEN_LINUX64: &str = r#"{
   "info": {
-    "base_url": "/conda/{key}/linux-64/",
     "subdir": "linux-64"
   },
   "packages": {},
@@ -17430,7 +17413,6 @@ mod virtual_channel_tests {
         ];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
             "noarch",
-            "/conda/v/noarch/",
             &hosted,
             &remote,
             &owned,
@@ -17447,7 +17429,11 @@ mod virtual_channel_tests {
         assert_eq!(dropped.not_allowed, 0);
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].member, "remote-c");
-        assert_eq!(doc["info"]["base_url"], "/conda/v/noarch/");
+        assert_eq!(
+            doc["info"],
+            serde_json::json!({ "subdir": "noarch" }),
+            "#4580: no base_url"
+        );
         assert_eq!(doc["repodata_version"], 1);
     }
 
@@ -17957,7 +17943,6 @@ mod virtual_channel_tests {
         }];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
             "noarch",
-            "/conda/v/noarch/",
             &hosted,
             &remote,
             &Default::default(),
@@ -18176,6 +18161,52 @@ mod rattler_token_layout_tests {
             tdh::get(format!("/t/{token}/conda/{key}/noarch/{filename}")),
         )
         .await;
+        // #4580: the package URL a client derives from each token layout's
+        // repodata (no `base_url`, so the document's own directory) keeps the
+        // token, and the shard index's relative URLs do too.
+        let mut token_layouts = Vec::new();
+        for prefix in [
+            format!("/t/{token}/conda/{key}"),
+            format!("/conda/t/{token}/{key}"),
+        ] {
+            let (_, doc) = tdh::send(
+                app.clone(),
+                tdh::get(format!("{prefix}/noarch/repodata.json")),
+            )
+            .await;
+            let doc: serde_json::Value = serde_json::from_slice(&doc).unwrap_or_default();
+            let (_, index) = tdh::send(
+                app.clone(),
+                tdh::get(format!("{prefix}/noarch/repodata_shards.msgpack.zst")),
+            )
+            .await;
+            let index: rattler_conda_types::ShardedRepodata =
+                rmp_serde::from_slice(&zstd::decode_all(&index[..]).unwrap()).unwrap();
+            let subdir = url::Url::parse(&format!("https://ak.internal{prefix}/noarch/")).unwrap();
+            let package = subdir
+                .join(doc["info"]["base_url"].as_str().unwrap_or("./"))
+                .unwrap()
+                .join(filename)
+                .unwrap();
+            let shard = subdir
+                .join(&index.info.shards_base_url)
+                .unwrap()
+                .join(&format!("{}.msgpack.zst", hex::encode(index.shards["pkg"])))
+                .unwrap();
+            let (package_status, package_body) =
+                tdh::send(app.clone(), tdh::get(package.path().to_string())).await;
+            let (shard_status, _) =
+                tdh::send(app.clone(), tdh::get(shard.path().to_string())).await;
+            token_layouts.push((
+                prefix,
+                doc["info"].clone(),
+                index.info.base_url,
+                package.path().to_string(),
+                package_status,
+                package_body,
+                shard_status,
+            ));
+        }
         let (anon_status, _) = tdh::send(
             app.clone(),
             tdh::get(format!("/conda/{key}/noarch/repodata.json")),
@@ -18200,6 +18231,16 @@ mod rattler_token_layout_tests {
         assert_eq!(&dl_body[..], &content[..]);
         assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
         assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+        for (prefix, info, index_base, package_path, package_status, package_body, shard_status) in
+            token_layouts
+        {
+            assert_eq!(info, serde_json::json!({"subdir": "noarch"}), "{prefix}");
+            assert_eq!(index_base, "./", "{prefix}");
+            assert_eq!(package_path, format!("{prefix}/noarch/{filename}"));
+            assert_eq!(package_status, StatusCode::OK, "{package_path}");
+            assert_eq!(&package_body[..], &content[..]);
+            assert_eq!(shard_status, StatusCode::OK, "{prefix} shard");
+        }
     }
 }
 
@@ -19208,8 +19249,7 @@ mod cep16_proxy_tests {
             let index = decode_index(&idx_body);
             assert_eq!(index.info.subdir, "noarch");
             assert_eq!(
-                index.info.base_url,
-                format!("/conda/{repo_key}/noarch/"),
+                index.info.base_url, "./",
                 "packages must resolve against the registry, not the upstream"
             );
             assert_eq!(index.info.shards_base_url, "./shards/");
@@ -19381,7 +19421,7 @@ mod cep16_proxy_tests {
 
         assert_eq!(idx_status, StatusCode::OK);
         let index = decode_index(&idx_body);
-        assert_eq!(index.info.base_url, format!("/conda/{v}/noarch/"));
+        assert_eq!(index.info.base_url, "./");
         assert_eq!(index.info.shards_base_url, "./shards/");
         assert_eq!(
             index_names(&index),
@@ -19425,6 +19465,231 @@ mod cep16_proxy_tests {
         assert_eq!(off_tz_status, StatusCode::OK);
         assert_eq!(&off_tz_body[..], &tz_shard[..]);
         assert_eq!(off_impostor_status, StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------------
+    // #4580: packages and shards resolve against the URL that served the
+    // document, whatever that URL is.
+    // ---------------------------------------------------------------------
+
+    async fn remote_key(rig: &VirtualRig) -> String {
+        sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.remote_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Where rattler fetches a package from: the document's `base_url` joined
+    /// onto the channel's subdir URL (the canonical one when a mirror is
+    /// configured; the mirror rewrite is applied afterwards).
+    fn rattler_resolve(subdir_url: &str, base_url: &str, file: &str) -> String {
+        let subdir = url::Url::parse(subdir_url).unwrap();
+        let mut base = subdir.join(base_url).unwrap();
+        if !base.path().ends_with('/') {
+            let p = format!("{}/", base.path());
+            base.set_path(&p);
+        }
+        base.join(file).unwrap().to_string()
+    }
+
+    /// `[mirrors] "https://conda.anaconda.org/conda-forge" = [mirror]`.
+    fn apply_mirror(url: &str, mirror: &str) -> String {
+        match url.strip_prefix("https://conda.anaconda.org/conda-forge/") {
+            Some(rest) => format!("{mirror}/{rest}"),
+            None => url.to_string(),
+        }
+    }
+
+    #[test]
+    fn relative_base_url_resolves_to_the_host_that_served_the_document_4580() {
+        let file = "rich-13.0-pyh_0.conda";
+        // Direct channel, plain proxy (Nexus), rattler token layout, conda
+        // `.condarc` token layout: the package stays under the channel URL.
+        for subdir in [
+            "https://ak.internal/conda/conda-virtual/noarch/",
+            "https://nexus.example/repository/ak-conda/noarch/",
+            "https://ak.internal/t/TOKEN/conda/conda-virtual/noarch/",
+            "https://ak.internal/conda/t/TOKEN/conda-virtual/noarch/",
+        ] {
+            assert_eq!(
+                rattler_resolve(subdir, PACKAGES_BASE_URL, file),
+                format!("{subdir}{file}")
+            );
+            assert_eq!(
+                rattler_resolve(subdir, SHARDS_BASE_URL, "ab.msgpack.zst"),
+                format!("{subdir}shards/ab.msgpack.zst")
+            );
+        }
+        // Mirror-configured client: resolved against the canonical channel,
+        // then rewritten onto the registry.
+        let mirror = "https://ak.internal/conda/conda-forge";
+        let canonical = "https://conda.anaconda.org/conda-forge/linux-64/";
+        assert_eq!(
+            apply_mirror(&rattler_resolve(canonical, PACKAGES_BASE_URL, file), mirror),
+            format!("{mirror}/linux-64/{file}")
+        );
+        // The value #4580 replaced, for the record: the canonical host with
+        // the registry's path (`.../conda/conda/conda-forge/...`).
+        assert_eq!(
+            apply_mirror(
+                &rattler_resolve(canonical, "/conda/conda-forge/linux-64/", file),
+                mirror
+            ),
+            format!("https://conda.anaconda.org/conda/conda-forge/linux-64/{file}")
+        );
+    }
+
+    /// The conda read routes as mounted in production: direct, conda's
+    /// `/conda/t/<token>/` and rattler's `/t/<token>/conda/` layouts.
+    fn conda_app(state: &crate::api::SharedState) -> axum::Router {
+        tdh::router_anon(
+            axum::Router::new()
+                .nest("/conda", router())
+                .nest("/conda/t", token_router())
+                .nest("/t", rattler_token_router()),
+            state.clone(),
+        )
+    }
+
+    /// Hosted, remote and virtual `repodata.json` and shard indexes carry no
+    /// host or prefix: `repodata.json` has no `base_url` (CEP-15's default),
+    /// a shard index `base_url: "./"` and `shards_base_url: "./shards/"`. The
+    /// bytes are the same for a direct request, one carrying forwarded
+    /// headers (a proxy) and both token layouts, and a shard resolved from
+    /// each layout's index URL is served on that layout.
+    #[tokio::test]
+    async fn repodata_and_shard_indexes_resolve_against_the_serving_url_4580() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (rich_shard, rich_hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        let server = MockServer::start().await;
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index("noarch", "", &[("rich", &rich_hash)]),
+        )
+        .await;
+        mount_bytes(
+            &server,
+            &format!("/noarch/{rich_hash}.msgpack.zst"),
+            rich_shard.clone(),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let remote = remote_key(&rig).await;
+        let keys = [hosted_key, remote, rig.virtual_key.clone()];
+        let app = conda_app(&rig.state);
+
+        // (layout, path prefix of the channel, extra request headers)
+        type Layout = (
+            &'static str,
+            String,
+            &'static [(&'static str, &'static str)],
+        );
+        const FORWARDED: &[(&str, &str)] = &[
+            ("host", "ak.internal"),
+            ("x-forwarded-host", "nexus.example"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-prefix", "/repository/ak-conda"),
+            ("forwarded", "host=nexus.example;proto=https"),
+        ];
+        let layouts = |key: &str| -> Vec<Layout> {
+            vec![
+                ("direct", format!("/conda/{key}"), &[]),
+                ("forwarded", format!("/conda/{key}"), FORWARDED),
+                ("conda-token", format!("/conda/t/some-token/{key}"), &[]),
+                ("rattler-token", format!("/t/some-token/conda/{key}"), &[]),
+            ]
+        };
+        let fetch = |uri: String, headers: &'static [(&'static str, &'static str)]| {
+            let app = app.clone();
+            async move {
+                let mut req = axum::http::Request::builder().method("GET").uri(uri);
+                for (k, v) in headers {
+                    req = req.header(*k, *v);
+                }
+                tdh::send_with_headers(app, req.body(axum::body::Body::empty()).unwrap()).await
+            }
+        };
+
+        let mut failures = Vec::new();
+        for key in &keys {
+            let mut index_bodies = Vec::new();
+            let mut repodata_bodies = Vec::new();
+            for (layout, prefix, headers) in layouts(key) {
+                let what = format!("{key} via {layout}");
+                let (status, body, _) = fetch(
+                    format!("{prefix}/noarch/repodata_shards.msgpack.zst"),
+                    headers,
+                )
+                .await;
+                if status != StatusCode::OK {
+                    failures.push(format!("{what}: index {status}"));
+                    continue;
+                }
+                let index = decode_index(&body);
+                if index.info.base_url != "./" || index.info.shards_base_url != "./shards/" {
+                    failures.push(format!(
+                        "{what}: index info base_url={:?} shards_base_url={:?}",
+                        index.info.base_url, index.info.shards_base_url
+                    ));
+                }
+                // Resolve every shard from the index URL, as rattler does, and
+                // fetch it on the same layout.
+                let subdir_url = format!("https://ak.internal{prefix}/noarch/");
+                for hash in index.shards.values() {
+                    let file = format!("{}.msgpack.zst", hex::encode(hash));
+                    let resolved = rattler_resolve(&subdir_url, &index.info.shards_base_url, &file);
+                    let path = resolved
+                        .strip_prefix("https://ak.internal")
+                        .unwrap()
+                        .to_string();
+                    let (shard_status, shard_body, _) = fetch(path.clone(), headers).await;
+                    if shard_status != StatusCode::OK
+                        || hex::encode(shard_address(&shard_body)) != hex::encode(hash)
+                    {
+                        failures.push(format!("{what}: shard {path} {shard_status}"));
+                    }
+                }
+                index_bodies.push(body);
+
+                let (status, body, _) =
+                    fetch(format!("{prefix}/noarch/repodata.json"), headers).await;
+                if status != StatusCode::OK {
+                    failures.push(format!("{what}: repodata {status}"));
+                    continue;
+                }
+                let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if doc["info"].get("base_url").is_some() {
+                    failures.push(format!("{what}: repodata base_url {}", doc["info"]));
+                }
+                repodata_bodies.push(body);
+            }
+            if index_bodies.windows(2).any(|w| w[0] != w[1]) {
+                failures.push(format!("{key}: shard index bytes differ between layouts"));
+            }
+            if repodata_bodies.windows(2).any(|w| w[0] != w[1]) {
+                failures.push(format!("{key}: repodata bytes differ between layouts"));
+            }
+        }
+        rig.cleanup().await;
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// A remote member that publishes no shard index takes the whole virtual
