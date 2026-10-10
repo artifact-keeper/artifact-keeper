@@ -1277,6 +1277,35 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
     max: usize,
 ) -> Result<CappedMetadataGet, Response> {
     let budget_permit = proxy_metadata_budget().reserve(max).await;
+    proxy_fetch_capped_with_encoding_reserved(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        budget_permit,
+    )
+    .await
+}
+
+/// As [`proxy_fetch_capped_budgeted_with_encoding`], with the caller holding
+/// the buffered-metadata reservation for the fetch already (at least `max`
+/// bytes of [`proxy_metadata_budget`]). The permit rides along in
+/// [`CappedMetadataGet::Buffered`] exactly as if this helper had taken it.
+///
+/// For a caller that must bound how long it waits for the reservation, or
+/// account for it together with other memory it holds (the virtual conda
+/// merge, #4608), instead of queueing on the budget without limit.
+pub async fn proxy_fetch_capped_with_encoding_reserved(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    budget_permit: OwnedSemaphorePermit,
+) -> Result<CappedMetadataGet, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)

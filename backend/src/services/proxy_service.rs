@@ -4565,6 +4565,27 @@ impl ProxyService {
         self.storage.backend()
     }
 
+    /// Content validator of a FRESH proxy-cache entry: the SHA-256 of the
+    /// cached body when the entry exists, is a positive entry, and has not
+    /// expired under the repository's current TTL policy; `None` otherwise.
+    ///
+    /// Reads only the metadata sidecar (through the sidecar LRU), never the
+    /// body. A derived document built from cached entries (the merged index of
+    /// a virtual conda channel, #4608) records these validators when it is
+    /// built and is reused only while every one of them is unchanged, i.e.
+    /// exactly while a rebuild would read the same bytes out of the cache
+    /// without contacting the upstream.
+    pub async fn fresh_cache_validator(&self, repo_key: &str, path: &str) -> Option<String> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let metadata = self.load_cache_metadata(&keys.metadata).await.ok()??;
+        let now = Utc::now();
+        if metadata.negative_cached_until.is_some_and(|t| t > now) {
+            return None;
+        }
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        (metadata.expires_under(mutability) > now).then_some(metadata.checksum_sha256)
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller

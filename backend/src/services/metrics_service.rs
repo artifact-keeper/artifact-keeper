@@ -91,6 +91,43 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
     .increment(1);
 }
 
+/// Virtual conda merge pressure (#4608). `kind` is the merged document:
+/// `repodata`, `channeldata` or `shard_index`.
+///
+/// A cache hit is a request answered without running a merge of its own:
+/// `via="cache"` for a merged document kept from an earlier merge, and
+/// `via="singleflight"` for a request that waited on the merge another
+/// request for the same document was already running.
+pub fn record_conda_virtual_merge_cache_hit(kind: &'static str, via: &'static str) {
+    counter!("ak_conda_virtual_merge_cache_hits_total", "kind" => kind, "via" => via).increment(1);
+}
+
+/// A request that ran a merge (no usable cached document, none in flight).
+pub fn record_conda_virtual_merge_cache_miss(kind: &'static str) {
+    counter!("ak_conda_virtual_merge_cache_misses_total", "kind" => kind).increment(1);
+}
+
+/// A merge shed with 503 because it could not get a merge slot
+/// (`reason="queue"`) or its share of the buffered-metadata budget
+/// (`reason="budget"`) within `CONDA_VIRTUAL_MERGE_QUEUE_SECS`. Counted once
+/// per merge, not once per request sharing it.
+pub fn record_conda_virtual_merge_rejected(kind: &'static str, reason: &'static str) {
+    counter!("ak_conda_virtual_merge_rejected_total", "kind" => kind, "reason" => reason)
+        .increment(1);
+}
+
+/// Merges currently running (each holds one of
+/// `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` slots).
+pub fn set_conda_virtual_merge_inflight(merges: usize) {
+    gauge!("ak_conda_virtual_merge_inflight").set(merges as f64);
+}
+
+/// Bytes of the buffered-metadata budget currently reserved by virtual conda
+/// merges (fetch buffers, decoded member documents and merge output).
+pub fn set_conda_virtual_merge_bytes_reserved(bytes: usize) {
+    gauge!("ak_conda_virtual_merge_bytes_reserved").set(bytes as f64);
+}
+
 /// Record a lookup against the npm attestation negative cache (#3764),
 /// which memoises the `404`s that `npm audit signatures` provokes on the
 /// `/-/npm/v1/attestations/{pkg}@{ver}` proxy path.

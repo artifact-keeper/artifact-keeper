@@ -492,19 +492,30 @@ pub async fn enforced_allowlist(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<Option<Arc<CompiledAllowlist>>> {
+    Ok(enforced_allowlist_with_source(db, repo_id).await?.0)
+}
+
+/// [`enforced_allowlist`] plus the stored value it was compiled from (`None`
+/// when nothing is stored). The stored value is the list's generation: a
+/// document derived under the list (the merged index of a virtual, #4608)
+/// is reusable exactly while it is unchanged.
+pub async fn enforced_allowlist_with_source(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<(Option<Arc<CompiledAllowlist>>, Option<String>)> {
     let Some(raw) = load_raw(db, repo_id).await? else {
-        return Ok(None);
+        return Ok((None, None));
     };
     if let Some(hit) = COMPILED.get(&repo_id).await {
         if hit.0 == raw {
-            return Ok(hit.1.clone());
+            return Ok((hit.1.clone(), Some(raw)));
         }
     }
     let compiled = compile_for_enforcement(repo_id, &raw);
     COMPILED
-        .insert(repo_id, Arc::new((raw, compiled.clone())))
+        .insert(repo_id, Arc::new((raw.clone(), compiled.clone())))
         .await;
-    Ok(compiled)
+    Ok((compiled, Some(raw)))
 }
 
 #[cfg(ak_test_shard = "services-1")]
