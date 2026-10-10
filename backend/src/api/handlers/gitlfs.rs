@@ -53,6 +53,8 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/locks", post(create_lock).get(list_locks))
         .route("/:repo_key/locks/verify", post(verify_locks))
         .route("/:repo_key/locks/:lock_id/unlock", post(delete_lock))
+        // Bounds only the buffered JSON bodies (batch, verify, locks). Object
+        // uploads stream and are bounded by `MAX_UPLOAD_SIZE` (#4595).
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2 GB
 }
 
@@ -463,28 +465,17 @@ fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
 // PUT /lfs/:repo_key/objects/:oid - Upload object
 // ---------------------------------------------------------------------------
 
-/// Largest Git LFS object accepted: the 2 GB the router has always allowed.
-/// The upload streams, so `DefaultBodyLimit` (which bounds buffering
-/// extractors) no longer applies to it and the cap is enforced here.
-const LFS_MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The upload body as a byte stream capped at `max` bytes. Errors are
-/// `multer` errors so the shared staging helper answers an over-size body with
-/// 413 and any other read failure with 400.
-fn capped_body_stream(
-    body: Body,
-    max: u64,
-) -> impl futures::Stream<Item = Result<Bytes, multer::Error>> {
-    use futures::StreamExt;
-    let mut seen: u64 = 0;
-    body.into_data_stream().map(move |chunk| {
-        let chunk = chunk.map_err(|e| multer::Error::StreamReadFailed(Box::new(e)))?;
-        seen = seen.saturating_add(chunk.len() as u64);
-        if seen > max {
-            return Err(multer::Error::StreamSizeExceeded { limit: max });
-        }
-        Ok(chunk)
-    })
+/// Whether a declared `Content-Length` is already over `MAX_UPLOAD_SIZE`
+/// (`max`, where `0` means unlimited), so the upload can be refused before
+/// any of the body is read. The staging helper enforces the same limit on the
+/// bytes actually received, which also covers a missing or wrong header.
+fn declared_length_exceeds(headers: &HeaderMap, max: u64) -> bool {
+    max != 0
+        && headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > max)
 }
 
 async fn upload_object(
@@ -504,14 +495,13 @@ async fn upload_object(
 
     validate_oid(&oid)?;
 
-    let declared = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > LFS_MAX_OBJECT_BYTES) {
+    // #4595: LFS objects follow `MAX_UPLOAD_SIZE` like every other upload
+    // path. The body streams to disk, so there is no reason for a lower cap.
+    let max = state.config.max_upload_size_bytes;
+    if declared_length_exceeds(&headers, max) {
         return Err(lfs_error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
-            &format!("Object exceeds the maximum allowed size of {LFS_MAX_OBJECT_BYTES} bytes"),
+            &format!("Object exceeds the maximum allowed size of {max} bytes"),
         ));
     }
 
@@ -519,12 +509,10 @@ async fn upload_object(
     // hashing as it arrives, instead of buffering the whole object in memory
     // before the handler runs. The router-wide progress deadline bounds a
     // stalled body, and the per-principal admission cap bounds how many of
-    // these one caller can run at once.
-    let (staged, digests) = proxy_helpers::stage_stream_content_addressed(
-        &state,
-        capped_body_stream(body, LFS_MAX_OBJECT_BYTES),
-    )
-    .await?;
+    // these one caller can run at once. The stager enforces
+    // `MAX_UPLOAD_SIZE` on the bytes received (413 mid-stream).
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
 
     if staged.is_empty() {
         return Err(lfs_error_response(StatusCode::BAD_REQUEST, "Empty body"));
@@ -1222,6 +1210,41 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     // -----------------------------------------------------------------------
+    // #4595: the upload size limit is MAX_UPLOAD_SIZE, not a fixed 2 GiB
+    // -----------------------------------------------------------------------
+
+    fn content_length(n: u64) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, n.to_string().parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn declared_length_over_two_gib_is_allowed_under_max_upload_size_4595() {
+        let ten_gib = 10 * 1024 * 1024 * 1024;
+        let six_gb = 6_000_000_000;
+        assert!(!declared_length_exceeds(&content_length(six_gb), ten_gib));
+        assert!(!declared_length_exceeds(&content_length(ten_gib), ten_gib));
+        assert!(declared_length_exceeds(
+            &content_length(ten_gib + 1),
+            ten_gib
+        ));
+    }
+
+    #[test]
+    fn declared_length_zero_max_means_unlimited_4595() {
+        assert!(!declared_length_exceeds(&content_length(u64::MAX), 0));
+    }
+
+    #[test]
+    fn declared_length_missing_or_garbled_is_left_to_the_stager_4595() {
+        assert!(!declared_length_exceeds(&HeaderMap::new(), 1));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "lots".parse().unwrap());
+        assert!(!declared_length_exceeds(&headers, 1));
+    }
+
+    // -----------------------------------------------------------------------
     // extract_credentials
     // -----------------------------------------------------------------------
 
@@ -1724,11 +1747,17 @@ mod tests {
 
         /// Build the fixture, or `None` when no database is reachable.
         async fn fx() -> Option<Fx> {
+            fx_with(|_| {}).await
+        }
+
+        /// Like [`fx`], with the test `Config` adjusted before the state is built.
+        async fn fx_with(mutate: impl FnOnce(&mut crate::config::Config)) -> Option<Fx> {
             let pool = tdh::try_pool().await?;
             let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
             let (user_id, username) = tdh::create_user(&pool).await;
             let (other_id, other_name) = tdh::create_user(&pool).await;
-            let state = tdh::build_state(pool.clone(), storage_dir.to_string_lossy().as_ref());
+            let state =
+                tdh::build_state_with(pool.clone(), storage_dir.to_string_lossy().as_ref(), mutate);
             Some(Fx {
                 pool,
                 state,
@@ -2434,6 +2463,159 @@ mod tests {
             let path = format!("lfs/objects/{}/{}", &oid[..2], oid);
             let artifact_id = tdh::artifact_id_at(&fx.pool, fx.repo_id, &path).await;
             tdh::assert_one_artifact_uploaded_event(&mut events, fx.repo_id, artifact_id);
+            fx.cleanup().await;
+        }
+        // -------------------------------------------------------------------
+        // #4595: uploads are bounded by MAX_UPLOAD_SIZE and verified by oid
+        // -------------------------------------------------------------------
+
+        /// Small `MAX_UPLOAD_SIZE` the size tests run against.
+        const TEST_MAX_UPLOAD: u64 = 64;
+
+        async fn fx_small_limit() -> Option<Fx> {
+            fx_with(|cfg| cfg.max_upload_size_bytes = TEST_MAX_UPLOAD).await
+        }
+
+        fn oid_of(content: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(content))
+        }
+
+        async fn lfs_artifact_count(fx: &Fx) -> i64 {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts")
+        }
+
+        async fn put(
+            fx: &Fx,
+            oid: &str,
+            headers: HeaderMap,
+            content: Vec<u8>,
+        ) -> (StatusCode, Bytes) {
+            parts(
+                upload_object(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), oid.to_string())),
+                    headers,
+                    Body::from(content),
+                )
+                .await,
+            )
+            .await
+        }
+
+        /// An object of exactly `MAX_UPLOAD_SIZE` bytes is stored, and the
+        /// stored bytes are the uploaded ones.
+        #[tokio::test]
+        async fn upload_object_at_max_upload_size_is_stored_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize];
+            let oid = oid_of(&content);
+
+            let (status, body) = put(&fx, &oid, HeaderMap::new(), content.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let storage = fx
+                .state
+                .storage_for_repo(
+                    &resolve_lfs_repo(&fx.state.db, &fx.repo_key)
+                        .await
+                        .expect("repo")
+                        .storage_location(),
+                )
+                .expect("storage");
+            let stored = storage
+                .get(&format!("gitlfs/{}/{}", &oid[..2], oid))
+                .await
+                .expect("stored object");
+            assert_eq!(stored.as_ref(), content.as_slice());
+            assert_eq!(lfs_artifact_count(&fx).await, 1);
+            fx.cleanup().await;
+        }
+
+        /// A body over `MAX_UPLOAD_SIZE` with no `Content-Length` is cut off
+        /// while streaming with 413, and nothing is recorded.
+        #[tokio::test]
+        async fn upload_object_over_max_upload_size_is_413_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+            let oid = oid_of(&content);
+
+            let (status, _) = put(&fx, &oid, HeaderMap::new(), content).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            fx.cleanup().await;
+        }
+
+        /// A declared `Content-Length` over `MAX_UPLOAD_SIZE` is refused up
+        /// front with the LFS error envelope.
+        #[tokio::test]
+        async fn upload_object_declared_length_over_max_upload_size_is_413_4595() {
+            let Some(fx) = fx_small_limit().await else {
+                return;
+            };
+            let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+            let oid = oid_of(&content);
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, content.len().to_string().parse().unwrap());
+
+            let (status, body) = put(&fx, &oid, headers, content).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(
+                as_json(&body)["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&TEST_MAX_UPLOAD.to_string()),
+                "413 should name the configured limit"
+            );
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            fx.cleanup().await;
+        }
+
+        /// A body whose sha256 is not the oid in the URL is refused with 422
+        /// and neither stored nor recorded.
+        #[tokio::test]
+        async fn upload_object_hash_mismatch_is_rejected_4595() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let oid = oid_of(b"the object the client announced");
+            let content = b"different bytes".to_vec();
+
+            let (status, body) = put(&fx, &oid, HeaderMap::new(), content).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(as_json(&body)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SHA-256 mismatch"));
+            assert_eq!(lfs_artifact_count(&fx).await, 0);
+            let storage = fx
+                .state
+                .storage_for_repo(
+                    &resolve_lfs_repo(&fx.state.db, &fx.repo_key)
+                        .await
+                        .expect("repo")
+                        .storage_location(),
+                )
+                .expect("storage");
+            assert!(
+                storage
+                    .get(&format!("gitlfs/{}/{}", &oid[..2], oid))
+                    .await
+                    .is_err(),
+                "a mismatched body must not be stored under the oid"
+            );
             fx.cleanup().await;
         }
     }

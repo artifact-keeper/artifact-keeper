@@ -371,7 +371,8 @@ async fn global_concurrency_backstop(
 
 /// Native-protocol path prefixes whose own routers already declare that they
 /// carry artifact-sized bodies (`DefaultBodyLimit::disable()` for incus/lxc,
-/// a 2 GB limit for Git LFS). See [`is_byte_transfer_path`].
+/// streamed object uploads bounded by `MAX_UPLOAD_SIZE` for Git LFS). See
+/// [`is_byte_transfer_path`].
 const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
 
 /// Whether `path` is an artifact **byte transfer** — a request whose duration is
