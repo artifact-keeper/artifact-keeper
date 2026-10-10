@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
 
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
