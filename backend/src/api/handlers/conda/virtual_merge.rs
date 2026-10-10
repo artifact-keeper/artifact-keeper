@@ -464,7 +464,8 @@ struct MergedRepodata<'a> {
 
 #[derive(Serialize)]
 struct RepodataInfo<'a> {
-    base_url: &'a str,
+    // No `base_url`: packages are beside the document (CEP-15's default),
+    // see `super::build_repodata_envelope` (#4580).
     subdir: &'a str,
 }
 
@@ -532,7 +533,6 @@ pub(super) struct MergeDrops {
 /// failure; the others still merge.
 pub(super) fn merge_repodata(
     subdir: &str,
-    base_url: &str,
     hosted: &[HostedRecord],
     remote: &[MemberDocument],
     owned: &HashSet<String>,
@@ -585,7 +585,7 @@ pub(super) fn merge_repodata(
     }
 
     let merged = MergedRepodata {
-        info: RepodataInfo { base_url, subdir },
+        info: RepodataInfo { subdir },
         packages,
         packages_conda,
         removed: [],
