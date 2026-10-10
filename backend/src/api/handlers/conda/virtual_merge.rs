@@ -30,6 +30,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use sha2::Digest;
 
 use crate::api::handlers::proxy_helpers;
 use crate::models::repository::{Repository, RepositoryType};
@@ -242,6 +243,12 @@ pub(super) fn mark_partial(response: &mut Response, missing: &str) {
 pub(super) struct MemberDocument {
     pub member: String,
     pub json: Vec<u8>,
+    /// The proxy-cache entry the document was read from, by the checksum of
+    /// the bytes read (#4608). `None` when the read cannot be tied to a fresh
+    /// cache entry holding those bytes (an upstream that does not publish the
+    /// document, or an entry that changed or expired meanwhile): a merge built
+    /// from it is not kept.
+    pub validator: Option<super::merge_gate::MemberValidator>,
 }
 
 /// Undo the HTTP transfer coding (normally none: the proxy asks for identity)
@@ -288,16 +295,17 @@ pub(super) fn decode_member_document(
 /// Fetch one remote member's document, trying `candidates` in order and moving
 /// to the next only when the upstream answers 404 for the current one.
 ///
-/// Members are fetched one at a time by the caller, and each fetch releases
-/// its share of the shared buffered-metadata budget before returning, so a
-/// virtual request never holds one reservation while waiting for another (the
-/// hold-and-wait shape #4129 removed from the single-remote path).
+/// The fetch buffer and the decoded document are covered by the merge's own
+/// budget reservation (#4608) and tracked in `account`: the buffer until it is
+/// decoded, the document until the merge ends. Members are fetched one at a
+/// time, and nothing here waits for budget.
 pub(super) async fn fetch_member_document(
     proxy: &ProxyService,
     member: &Repository,
     candidates: &[(String, FileCodec)],
     limits: MemberLimits,
     missing_is_empty: bool,
+    account: &mut super::merge_gate::MergeAccount,
 ) -> Result<MemberDocument, MemberFailure> {
     let fail = |kind: &'static str, reason: String| MemberFailure {
         member: member.key.clone(),
@@ -312,13 +320,15 @@ pub(super) async fn fetch_member_document(
     };
     let mut last_status = None;
     for (path, codec) in candidates {
-        let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+        let permit = account.fetch_permit();
+        let fetched = proxy_helpers::proxy_fetch_capped_with_encoding_reserved(
             proxy,
             member.id,
             &member.key,
             upstream_url,
             path,
             limits.fetched,
+            permit,
         )
         .await;
         match fetched {
@@ -329,25 +339,44 @@ pub(super) async fn fetch_member_document(
                 ..
             }) => {
                 let codec = *codec;
-                let path = path.clone();
+                let fetched_len = content.len();
+                account.track(fetched_len);
                 let decoded = tokio::task::spawn_blocking(move || {
-                    // Held until the compressed buffer is decoded and dropped.
+                    // Dropped with the compressed buffer once it is decoded.
                     let _budget_permit = budget_permit;
+                    let checksum = hex::encode(sha2::Sha256::digest(&content));
                     decode_member_document(
                         &content,
                         content_encoding.as_deref(),
                         codec,
                         limits.decoded,
                     )
+                    .map(|json| (json, checksum))
                 })
-                .await
-                .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?;
-                return decoded
-                    .map(|json| MemberDocument {
+                .await;
+                account.release(fetched_len);
+                let (json, checksum) = match decoded {
+                    Ok(Ok(decoded)) => decoded,
+                    Ok(Err(e)) => return Err(fail("decode", format!("{path}: {e}"))),
+                    Err(e) => return Err(fail("decode", format!("decoder task failed: {e}"))),
+                };
+                account.track(json.len());
+                // The entry must still be fresh and hold the bytes just read;
+                // otherwise the merge is served but not kept.
+                let validator = proxy
+                    .fresh_cache_validator(&member.key, path)
+                    .await
+                    .filter(|current| *current == checksum)
+                    .map(|checksum| super::merge_gate::MemberValidator {
                         member: member.key.clone(),
-                        json,
-                    })
-                    .map_err(|e| fail("decode", format!("{path}: {e}")));
+                        path: path.clone(),
+                        checksum,
+                    });
+                return Ok(MemberDocument {
+                    member: member.key.clone(),
+                    json,
+                    validator,
+                });
             }
             Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
                 return Err(fail(
@@ -378,6 +407,7 @@ pub(super) async fn fetch_member_document(
         return Ok(MemberDocument {
             member: member.key.clone(),
             json: b"{}".to_vec(),
+            validator: None,
         });
     }
     Err(fail(
@@ -398,6 +428,7 @@ pub(super) async fn fetch_remote_members(
     candidates: &[(String, FileCodec)],
     limits: MemberLimits,
     missing_is_empty: bool,
+    account: &mut super::merge_gate::MergeAccount,
 ) -> (Vec<MemberDocument>, Vec<MemberFailure>) {
     let mut documents = Vec::new();
     let mut failures = Vec::new();
@@ -413,7 +444,9 @@ pub(super) async fn fetch_remote_members(
             });
             continue;
         };
-        match fetch_member_document(proxy, member, candidates, limits, missing_is_empty).await {
+        match fetch_member_document(proxy, member, candidates, limits, missing_is_empty, account)
+            .await
+        {
             Ok(doc) => documents.push(doc),
             Err(failure) => failures.push(failure),
         }

@@ -58,6 +58,7 @@ use crate::services::conda_identity::{
 use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
+mod merge_gate;
 mod virtual_merge;
 
 // ---------------------------------------------------------------------------
@@ -1358,7 +1359,7 @@ async fn channeldata_json(
 
     // Virtual repos: merge channeldata from all members
     if repo.repo_type == RepositoryType::Virtual {
-        let merged = build_virtual_channeldata(&state, auth.as_ref(), repo.id).await?;
+        let merged = build_virtual_channeldata(&state, auth.as_ref(), repo.id, &repo_key).await?;
         return serve_virtual_merge(
             &state.db,
             repo.id,
@@ -1787,20 +1788,38 @@ impl RepodataEncoding {
         }
     }
 
+    /// Serialize `repodata` in this encoding. The compressed encodings
+    /// serialize straight into the compressor, so the uncompressed document
+    /// (hundreds of MiB for a merged conda-forge subdir) is never held in
+    /// memory next to its compressed form (#4608).
     #[allow(clippy::result_large_err)]
     fn encode<T: serde::Serialize + ?Sized>(&self, repodata: &T) -> Result<Vec<u8>, Response> {
+        fn failed(e: impl std::fmt::Display) -> Response {
+            tracing::error!("repodata encoding error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        }
+        const BUF: usize = 256 * 1024;
         match self {
             Self::Json => Ok(serde_json::to_vec_pretty(repodata).unwrap()),
             Self::Bz2 => {
-                let json_bytes = serde_json::to_vec(repodata).unwrap();
-                Ok(bzip2_compress(&json_bytes))
+                let mut out = std::io::BufWriter::with_capacity(
+                    BUF,
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default()),
+                );
+                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
+                out.into_inner()
+                    .map_err(|e| failed(e.error()))?
+                    .finish()
+                    .map_err(failed)
             }
             Self::Zst => {
-                let json_bytes = serde_json::to_vec(repodata).unwrap();
-                zstd_compress(&json_bytes).map_err(|e| {
-                    tracing::error!("zstd compression error for repodata: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-                })
+                let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
+                let mut out = std::io::BufWriter::with_capacity(BUF, encoder);
+                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
+                out.into_inner()
+                    .map_err(|e| failed(e.error()))?
+                    .finish()
+                    .map_err(failed)
             }
         }
     }
@@ -2629,7 +2648,7 @@ async fn fetch_upstream_shard_document<T>(
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<T>, virtual_merge::MemberFailure>
+) -> Result<Option<CheckedShardDocument<T>>, virtual_merge::MemberFailure>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
@@ -2672,18 +2691,28 @@ where
     let decoded = tokio::task::spawn_blocking(move || {
         // Held until the compressed buffer is decoded and dropped.
         let _budget_permit = budget_permit;
+        let checksum = hex::encode(Sha256::digest(&content));
         let msgpack = virtual_merge::decode_member_document(
             &content,
             content_encoding.as_deref(),
             virtual_merge::FileCodec::Zstd,
             CEP16_MAX_DECODED_BYTES,
         )?;
-        rmp_serde::from_slice::<T>(&msgpack).map_err(|e| format!("shard index does not parse: {e}"))
+        rmp_serde::from_slice::<T>(&msgpack)
+            .map(|document| CheckedShardDocument { document, checksum })
+            .map_err(|e| format!("shard index does not parse: {e}"))
     })
     .await
     .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?
     .map_err(|e| fail("decode", format!("{path}: {e}")))?;
     Ok(Some(decoded))
+}
+
+/// An upstream CEP-16 document and the SHA-256 of the bytes it was decoded
+/// from, which ties a merge built from it to the proxy-cache entry (#4608).
+struct CheckedShardDocument<T> {
+    document: T,
+    checksum: String,
 }
 
 /// The full upstream shard index of a remote repository. `Ok(None)`: the
@@ -2697,6 +2726,24 @@ async fn fetch_upstream_shard_index(
     upstream_url: &str,
     subdir: &str,
 ) -> Result<Option<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure> {
+    Ok(
+        fetch_upstream_shard_index_checked(proxy, repo_id, repo_key, upstream_url, subdir)
+            .await?
+            .map(|checked| checked.document),
+    )
+}
+
+/// [`fetch_upstream_shard_index`] with the checksum of the bytes read.
+async fn fetch_upstream_shard_index_checked(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+) -> Result<
+    Option<CheckedShardDocument<rattler_conda_types::ShardedRepodata>>,
+    virtual_merge::MemberFailure,
+> {
     let Some(index) = fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
         proxy,
         repo_id,
@@ -2708,13 +2755,13 @@ async fn fetch_upstream_shard_index(
     else {
         return Ok(None);
     };
-    resolve_shards_base(upstream_url, subdir, &index.info.shards_base_url).map_err(|reason| {
-        virtual_merge::MemberFailure {
+    resolve_shards_base(upstream_url, subdir, &index.document.info.shards_base_url).map_err(
+        |reason| virtual_merge::MemberFailure {
             member: repo_key.to_string(),
             kind: "decode",
             reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
-        }
-    })?;
+        },
+    )?;
     Ok(Some(index))
 }
 
@@ -2727,10 +2774,15 @@ async fn fetch_upstream_shards_base(
     upstream_url: &str,
     subdir: &str,
 ) -> Result<Option<url::Url>, virtual_merge::MemberFailure> {
-    let Some(UpstreamShardIndexInfo { info }) = fetch_upstream_shard_document::<
-        UpstreamShardIndexInfo,
-    >(
-        proxy, repo_id, repo_key, upstream_url, subdir
+    let Some(CheckedShardDocument {
+        document: UpstreamShardIndexInfo { info },
+        ..
+    }) = fetch_upstream_shard_document::<UpstreamShardIndexInfo>(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        subdir,
     )
     .await?
     else {
@@ -3060,134 +3112,226 @@ enum VirtualShardIndex {
 ///
 /// Both the index and every shard request through the virtual are answered
 /// from this one merge, so the set of shards the virtual serves is exactly
-/// the set its index lists (#4607).
+/// the set its index lists (#4607). The merge goes through the merge gate
+/// (#4608): concurrent index and shard requests share one merge, and it is
+/// kept (with the encoded index and the shard routing) while its inputs and
+/// every remote member's proxy-cached index are unchanged, so a shard request
+/// does not re-read every member's index.
 async fn build_virtual_shard_index(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     subdir: &str,
-) -> Result<VirtualShardIndex, Response> {
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    let document = format!("{subdir}/{SHARD_INDEX_FILE}");
+    let kind = merge_gate::MergeKind::ShardIndex;
     // Caller-authorized member walk (#3323), as for repodata.json.
-    let members =
-        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
-    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
-    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
+    let VirtualMergeInputs {
+        members,
+        owned,
+        allowlist,
+        mut key,
+    } = virtual_merge_inputs(
+        state,
+        auth,
+        virtual_repo_id,
+        virtual_repo_key,
+        kind,
+        &document,
+    )
+    .await?;
 
     let hosted_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
         .map(|m| m.id)
         .collect();
-    let mut shards: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let mut sources: HashMap<String, VirtualShardSource> = HashMap::new();
-    for (name, shard) in hosted_shards(&state.db, &hosted_ids, subdir).await? {
-        shards.insert(name.clone(), shard_address(&shard).to_vec());
-        sources.insert(name, VirtualShardSource::Hosted(shard));
+    let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
+    // The hosted shards (by address) are the hosted generation.
+    key.part(&(hosted.len() as u64).to_le_bytes());
+    for (name, shard) in &hosted {
+        key.part(name.as_bytes()).part(&shard_address(shard));
     }
 
-    let mut merged = MergedShardIndex {
-        shards,
-        sources,
-        remotes: Vec::new(),
-        refused: HashSet::new(),
-        failed: Vec::new(),
-        allowlist_dropped: None,
-        owned,
-        allowlist,
-    };
-    let mut dropped = virtual_merge::MergeDrops::default();
-    for member in members
-        .iter()
-        .filter(|m| m.repo_type == RepositoryType::Remote)
-    {
-        let (Some(proxy), Some(upstream_url)) = (
-            state.proxy_service.as_deref(),
-            member.upstream_url.as_deref(),
-        ) else {
-            merged.failed.push(virtual_merge::MemberFailure {
-                member: member.key.clone(),
-                kind: "fetch",
-                reason: "remote member has no upstream URL or the proxy service is not available"
-                    .to_string(),
-            });
-            continue;
-        };
-        let upstream =
-            match fetch_upstream_shard_index(proxy, member.id, &member.key, upstream_url, subdir)
-                .await
-            {
-                Ok(Some(upstream)) => upstream,
-                Ok(None) => return Ok(VirtualShardIndex::MemberWithoutShards(member.key.clone())),
-                Err(failure) => {
-                    merged.failed.push(failure);
-                    continue;
+    let proxy = state.proxy_service.clone();
+    let validate_proxy = proxy.clone();
+    let subdir = subdir.to_string();
+    let virtual_repo_key = virtual_repo_key.to_string();
+    merge_gate::gate_for(virtual_repo_id)
+        .get_or_merge(
+            kind,
+            key.finish(),
+            // The index fetches reserve their own (small) budget.
+            None,
+            move |doc| merge_validators_fresh(validate_proxy, doc),
+            move |_account| async move {
+                let subdir = subdir.as_str();
+                let mut shards: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+                let mut sources: HashMap<String, VirtualShardSource> = HashMap::new();
+                for (name, shard) in hosted {
+                    shards.insert(name.clone(), shard_address(&shard).to_vec());
+                    sources.insert(name, VirtualShardSource::Hosted(shard));
                 }
-            };
-        let shards_base =
-            match resolve_shards_base(upstream_url, subdir, &upstream.info.shards_base_url) {
-                Ok(base) => base,
-                // `fetch_upstream_shard_index` already refused an index whose
-                // shards cannot be located; kept total rather than unwrapped.
-                Err(reason) => {
-                    merged.failed.push(virtual_merge::MemberFailure {
-                        member: member.key.clone(),
-                        kind: "decode",
-                        reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
+                let mut merged = MergedShardIndex {
+                    shards,
+                    sources,
+                    remotes: Vec::new(),
+                    refused: HashSet::new(),
+                    failed: Vec::new(),
+                    allowlist_dropped: None,
+                    owned,
+                    allowlist,
+                };
+                let mut validators = Vec::new();
+                let mut all_validated = true;
+                let mut dropped = virtual_merge::MergeDrops::default();
+                let index_path = format!("{subdir}/{SHARD_INDEX_FILE}");
+                for member in members
+                    .iter()
+                    .filter(|m| m.repo_type == RepositoryType::Remote)
+                {
+                    let (Some(proxy), Some(upstream_url)) =
+                        (proxy.as_deref(), member.upstream_url.as_deref())
+                    else {
+                        merged.failed.push(virtual_merge::MemberFailure {
+                            member: member.key.clone(),
+                            kind: "fetch",
+                            reason: "remote member has no upstream URL or the proxy service is \
+                                     not available"
+                                .to_string(),
+                        });
+                        continue;
+                    };
+                    let checked = match fetch_upstream_shard_index_checked(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        subdir,
+                    )
+                    .await
+                    {
+                        Ok(Some(checked)) => checked,
+                        Ok(None) => {
+                            // Not kept: the member's 404 carries no validator.
+                            return Ok(merge_gate::MergedDocument::new(
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                false,
+                                merge_gate::MergeStats::default(),
+                                false,
+                            )
+                            .with_shard_index(
+                                VirtualShardIndex::MemberWithoutShards(member.key.clone()),
+                            ));
+                        }
+                        Err(failure) => {
+                            merged.failed.push(failure);
+                            continue;
+                        }
+                    };
+                    // Kept only while the member's cache entry is fresh and
+                    // holds the bytes just read.
+                    match proxy.fresh_cache_validator(&member.key, &index_path).await {
+                        Some(current) if current == checked.checksum => {
+                            validators.push(merge_gate::MemberValidator {
+                                member: member.key.clone(),
+                                path: index_path.clone(),
+                                checksum: current,
+                            });
+                        }
+                        _ => all_validated = false,
+                    }
+                    let upstream = checked.document;
+                    let shards_base = match resolve_shards_base(
+                        upstream_url,
+                        subdir,
+                        &upstream.info.shards_base_url,
+                    ) {
+                        Ok(base) => base,
+                        // `fetch_upstream_shard_index_checked` already refused
+                        // an index whose shards cannot be located; kept total
+                        // rather than unwrapped.
+                        Err(reason) => {
+                            merged.failed.push(virtual_merge::MemberFailure {
+                                member: member.key.clone(),
+                                kind: "decode",
+                                reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
+                            });
+                            continue;
+                        }
+                    };
+                    let position = merged.remotes.len();
+                    merged.remotes.push(RemoteShardMember {
+                        id: member.id,
+                        key: member.key.clone(),
+                        upstream_url: upstream_url.to_string(),
+                        shards_base,
                     });
-                    continue;
+                    for (name, hash) in upstream.shards {
+                        if merged.owned.contains(&name.to_ascii_lowercase()) {
+                            dropped.owned += 1;
+                            merged.refused.insert(hash.to_vec());
+                            continue;
+                        }
+                        if merged
+                            .allowlist
+                            .as_deref()
+                            .is_some_and(|a| !a.admits_all_versions(&name, subdir))
+                        {
+                            dropped.not_allowed += 1;
+                            merged.refused.insert(hash.to_vec());
+                            continue;
+                        }
+                        if let std::collections::btree_map::Entry::Vacant(slot) =
+                            merged.shards.entry(name.clone())
+                        {
+                            slot.insert(hash.to_vec());
+                            merged
+                                .sources
+                                .insert(name, VirtualShardSource::Remote(position));
+                        }
+                    }
                 }
-            };
-        let position = merged.remotes.len();
-        merged.remotes.push(RemoteShardMember {
-            id: member.id,
-            key: member.key.clone(),
-            upstream_url: upstream_url.to_string(),
-            shards_base,
-        });
-        for (name, hash) in upstream.shards {
-            if merged.owned.contains(&name.to_ascii_lowercase()) {
-                dropped.owned += 1;
-                merged.refused.insert(hash.to_vec());
-                continue;
-            }
-            if merged
-                .allowlist
-                .as_deref()
-                .is_some_and(|a| !a.admits_all_versions(&name, subdir))
-            {
-                dropped.not_allowed += 1;
-                merged.refused.insert(hash.to_vec());
-                continue;
-            }
-            if let std::collections::btree_map::Entry::Vacant(slot) =
-                merged.shards.entry(name.clone())
-            {
-                slot.insert(hash.to_vec());
-                merged
-                    .sources
-                    .insert(name, VirtualShardSource::Remote(position));
-            }
-        }
-    }
-    if dropped.owned > 0 {
-        tracing::info!(
-            virtual_repo = %virtual_repo_key,
-            subdir,
-            dropped = dropped.owned,
-            "excluded remote conda shards whose names a hosted member owns"
-        );
-    }
-    if merged.allowlist.is_some() {
-        tracing::info!(
-            virtual_repo = %virtual_repo_key,
-            subdir,
-            dropped = dropped.not_allowed,
-            "excluded remote conda shards the virtual's allowlist does not admit whole"
-        );
-        merged.allowlist_dropped = Some(dropped.not_allowed);
-    }
-    Ok(VirtualShardIndex::Merged(Box::new(merged)))
+                if dropped.owned > 0 {
+                    tracing::info!(
+                        virtual_repo = %virtual_repo_key,
+                        subdir,
+                        dropped = dropped.owned,
+                        "excluded remote conda shards whose names a hosted member owns"
+                    );
+                }
+                if merged.allowlist.is_some() {
+                    tracing::info!(
+                        virtual_repo = %virtual_repo_key,
+                        subdir,
+                        dropped = dropped.not_allowed,
+                        "excluded remote conda shards the virtual's allowlist does not admit whole"
+                    );
+                    merged.allowlist_dropped = Some(dropped.not_allowed);
+                }
+                let body = serialize_msgpack_zst(&build_sharded_index(subdir, &merged.shards))?;
+                let stats = merge_gate::MergeStats {
+                    output_bytes: body.len(),
+                    ..Default::default()
+                };
+                Ok(merge_gate::MergedDocument::new(
+                    body,
+                    merged.failed.clone(),
+                    merged.allowlist_dropped,
+                    validators,
+                    all_validated,
+                    stats,
+                    false,
+                )
+                .with_shard_index(VirtualShardIndex::Merged(Box::new(merged))))
+            },
+        )
+        .await
+        .map_err(merge_gate::SharedResponse::into_response)
 }
 
 /// Serve a virtual channel's merged shard index under its member-failure
@@ -3201,8 +3345,9 @@ async fn serve_virtual_shard_index(
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
     let document = format!("{subdir}/{SHARD_INDEX_FILE}");
-    match build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await? {
-        VirtualShardIndex::MemberWithoutShards(member) => {
+    let doc = build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await?;
+    match &doc.shard_index {
+        Some(VirtualShardIndex::MemberWithoutShards(member)) => {
             tracing::info!(
                 virtual_repo = %repo.key,
                 member = %member,
@@ -3220,24 +3365,13 @@ async fn serve_virtual_shard_index(
             )
                 .into_response())
         }
-        VirtualShardIndex::Merged(merged) => {
-            let MergedShardIndex {
-                shards,
-                failed,
-                allowlist_dropped,
-                ..
-            } = *merged;
-            let body = serialize_msgpack_zst(&build_sharded_index(subdir, &shards))?;
+        _ => {
             serve_virtual_merge(
                 &state.db,
                 repo.id,
                 &repo.key,
                 &document,
-                VirtualMerge {
-                    body,
-                    failed,
-                    allowlist_dropped,
-                },
+                std::sync::Arc::clone(&doc),
                 CEP16_CONTENT_TYPE,
                 headers,
             )
@@ -3563,9 +3697,15 @@ async fn serve_virtual_shard(
     hash_hex: &str,
 ) -> Result<Response, Response> {
     let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
-    let merged = match build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await? {
-        VirtualShardIndex::Merged(merged) => merged,
-        VirtualShardIndex::MemberWithoutShards(member) => {
+    let doc = build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await?;
+    let merged = match &doc.shard_index {
+        Some(VirtualShardIndex::Merged(merged)) => merged,
+        None => {
+            return Err(virtual_merge::internal_error(
+                "shard index merge without a plan",
+            ))
+        }
+        Some(VirtualShardIndex::MemberWithoutShards(member)) => {
             tracing::debug!(
                 virtual_repo = %repo.key,
                 member = %member,
@@ -3671,7 +3811,7 @@ async fn serve_virtual_shard(
             ));
         }
     };
-    match check_shard_record_names(&shard, &name, subdir, &merged).await? {
+    match check_shard_record_names(&shard, &name, subdir, merged).await? {
         ShardNameCheck::Consistent => Ok(shard_response(shard)),
         ShardNameCheck::Refused(foreign) => {
             tracing::warn!(
@@ -4235,16 +4375,6 @@ fn build_channeldata_entry(
     entry
 }
 
-/// A merged virtual document plus the remote members that could not
-/// contribute to it.
-struct VirtualMerge {
-    body: Vec<u8>,
-    failed: Vec<virtual_merge::MemberFailure>,
-    /// Remote records (or channeldata entries) the virtual's allowlist left
-    /// out; `None` when no allowlist is enforced.
-    allowlist_dropped: Option<usize>,
-}
-
 /// Response header reporting how many remote records the virtual's allowlist
 /// (#4576) left out of a merged document. Present only when a list is
 /// enforced.
@@ -4257,7 +4387,23 @@ async fn virtual_allowlist(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
 ) -> Result<Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>, Response> {
-    crate::services::conda_allowlist::enforced_allowlist(db, virtual_repo_id)
+    Ok(virtual_allowlist_with_source(db, virtual_repo_id).await?.0)
+}
+
+/// [`virtual_allowlist`] plus the stored value it was compiled from, which
+/// keys the merged-document cache (#4608).
+#[allow(clippy::type_complexity)]
+async fn virtual_allowlist_with_source(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<
+    (
+        Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
+        Option<String>,
+    ),
+    Response,
+> {
+    crate::services::conda_allowlist::enforced_allowlist_with_source(db, virtual_repo_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -4269,7 +4415,99 @@ async fn virtual_allowlist(
         })
 }
 
-/// Build merged repodata for a virtual repository, encoded as `encoding`.
+/// What a virtual merge reads before it fetches any member, and the merge key
+/// those inputs determine so far (#4608).
+struct VirtualMergeInputs {
+    /// Caller-authorized members, in priority order (#3323).
+    members: Vec<crate::models::repository::Repository>,
+    /// Names hosted members own (the dependency-confusion guard).
+    owned: std::collections::HashSet<String>,
+    allowlist: Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
+    key: merge_gate::MergeKeyBuilder,
+}
+
+/// Load the inputs every virtual merge shares and start its key: the virtual
+/// the document, the member set the caller
+/// may read with each member's type and upstream, the owned names and the
+/// allowlist's stored value. The kind-specific hosted content is added by
+/// the caller.
+async fn virtual_merge_inputs(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    kind: merge_gate::MergeKind,
+    document: &str,
+) -> Result<VirtualMergeInputs, Response> {
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
+    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
+    let (allowlist, allowlist_source) =
+        virtual_allowlist_with_source(&state.db, virtual_repo_id).await?;
+
+    let mut key = merge_gate::MergeKeyBuilder::new(kind);
+    key.part(virtual_repo_id.as_bytes())
+        .part(virtual_repo_key.as_bytes())
+        .part(document.as_bytes());
+    key.part(&(members.len() as u64).to_le_bytes());
+    for member in &members {
+        key.part(member.id.as_bytes())
+            .part(member.key.as_bytes())
+            .part(format!("{:?}", member.repo_type).as_bytes())
+            .part(
+                member
+                    .upstream_url
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+    }
+    let mut names: Vec<&String> = owned.iter().collect();
+    names.sort();
+    key.part(&(names.len() as u64).to_le_bytes());
+    for name in names {
+        key.part(name.as_bytes());
+    }
+    match &allowlist_source {
+        Some(source) => key.part(b"allowlist").part(source.as_bytes()),
+        None => key.part(b"no-allowlist"),
+    };
+    Ok(VirtualMergeInputs {
+        members,
+        owned,
+        allowlist,
+        key,
+    })
+}
+
+/// Whether every member document a cached merge read is still what the
+/// member's proxy cache holds, fresh (#4608).
+async fn merge_validators_fresh(
+    proxy: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
+    doc: std::sync::Arc<merge_gate::MergedDocument>,
+) -> bool {
+    if doc.validators.is_empty() {
+        return true;
+    }
+    let Some(proxy) = proxy else {
+        return false;
+    };
+    for v in &doc.validators {
+        if proxy
+            .fresh_cache_validator(&v.member, &v.path)
+            .await
+            .as_deref()
+            != Some(v.checksum.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build merged repodata for a virtual repository, encoded as `encoding`, or
+/// reuse the merge already running or kept for the same inputs
+/// ([`merge_gate`], #4608).
 ///
 /// Hosted (local/staging) members are merged first, then remote members, each
 /// group in member priority order, first-writer-wins per filename; a remote
@@ -4284,17 +4522,26 @@ async fn build_virtual_repodata(
     virtual_repo_key: &str,
     subdir: &str,
     encoding: RepodataEncoding,
-) -> Result<VirtualMerge, Response> {
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
     validate_read_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
-    // Caller-authorized member walk (#3323): repodata is content, so a member
-    // this caller may not read directly contributes neither its packages nor
-    // its upstream's.
-    let members =
-        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
-    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
-    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
+    let document = format!("{subdir}/{}", encoding.upstream_filename());
+    let kind = merge_gate::MergeKind::Repodata;
+    let VirtualMergeInputs {
+        members,
+        owned,
+        allowlist,
+        mut key,
+    } = virtual_merge_inputs(
+        state,
+        auth,
+        virtual_repo_id,
+        virtual_repo_key,
+        kind,
+        &document,
+    )
+    .await?;
 
     let mut hosted = Vec::new();
     for member in members
@@ -4316,67 +4563,128 @@ async fn build_virtual_repodata(
             });
         }
     }
+    // The hosted records as merged ARE the hosted generation: an upload,
+    // delete, withdrawal or metadata edit changes them, and so the key.
+    key.part(&(hosted.len() as u64).to_le_bytes());
+    for h in &hosted {
+        key.part(h.filename.as_bytes())
+            .part(&[u8::from(h.is_v2)])
+            .part(h.record.get().as_bytes());
+    }
 
-    let (documents, mut failed) = virtual_merge::fetch_remote_members(
-        state.proxy_service.as_deref(),
-        &members,
-        &virtual_merge::repodata_candidates(subdir),
-        virtual_merge::MemberLimits::from_env(),
-        true,
-    )
-    .await;
-
-    let subdir_owned = subdir.to_string();
-    let enforced = allowlist.is_some();
-    let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
-        virtual_merge::merge_repodata(
-            &subdir_owned,
-            &hosted,
-            &documents,
-            &owned,
-            allowlist.as_deref(),
-            encoding,
+    let proxy = state.proxy_service.clone();
+    let validate_proxy = proxy.clone();
+    let subdir = subdir.to_string();
+    let virtual_repo_key = virtual_repo_key.to_string();
+    merge_gate::gate_for(virtual_repo_id)
+        .get_or_merge(
+            kind,
+            key.finish(),
+            Some(format!("{virtual_repo_id}/{document}")),
+            move |doc| merge_validators_fresh(validate_proxy, doc),
+            move |mut account| async move {
+                let (documents, mut failed) = virtual_merge::fetch_remote_members(
+                    proxy.as_deref(),
+                    &members,
+                    &virtual_merge::repodata_candidates(&subdir),
+                    virtual_merge::MemberLimits::from_env(),
+                    true,
+                    &mut account,
+                )
+                .await;
+                let decoded_bytes: usize = documents.iter().map(|d| d.json.len()).sum();
+                let plain_json = matches!(encoding, RepodataEncoding::Json);
+                account.track(merge_gate::merge_working_set(decoded_bytes, plain_json));
+                let all_validated = documents.iter().all(|d| d.validator.is_some());
+                let validators = documents
+                    .iter()
+                    .filter_map(|d| d.validator.clone())
+                    .collect();
+                let enforced = allowlist.is_some();
+                let merge_subdir = subdir.clone();
+                let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
+                    virtual_merge::merge_repodata(
+                        &merge_subdir,
+                        &hosted,
+                        &documents,
+                        &owned,
+                        allowlist.as_deref(),
+                        encoding,
+                    )
+                })
+                .await
+                .map_err(virtual_merge::internal_error)?;
+                if dropped.owned > 0 {
+                    tracing::info!(
+                        virtual_repo = %virtual_repo_key,
+                        subdir = %subdir,
+                        dropped = dropped.owned,
+                        "excluded remote conda records whose names a hosted member owns"
+                    );
+                }
+                if enforced {
+                    tracing::info!(
+                        virtual_repo = %virtual_repo_key,
+                        subdir = %subdir,
+                        dropped = dropped.not_allowed,
+                        "excluded remote conda records the virtual's allowlist does not admit"
+                    );
+                }
+                failed.extend(parse_failures);
+                let body = body?;
+                account.track(
+                    body.len()
+                        .saturating_sub(merge_gate::merge_output_allowance(
+                            decoded_bytes,
+                            plain_json,
+                        )),
+                );
+                let stats = merge_gate::MergeStats {
+                    decoded_bytes,
+                    output_bytes: body.len(),
+                    reserved: account.reserved(),
+                    peak_need: account.peak_need(),
+                };
+                Ok(merge_gate::MergedDocument::new(
+                    body,
+                    failed,
+                    enforced.then_some(dropped.not_allowed),
+                    validators,
+                    all_validated,
+                    stats,
+                    plain_json,
+                ))
+            },
         )
-    })
-    .await
-    .map_err(virtual_merge::internal_error)?;
-    if dropped.owned > 0 {
-        tracing::info!(
-            virtual_repo = %virtual_repo_key,
-            subdir,
-            dropped = dropped.owned,
-            "excluded remote conda records whose names a hosted member owns"
-        );
-    }
-    if enforced {
-        tracing::info!(
-            virtual_repo = %virtual_repo_key,
-            subdir,
-            dropped = dropped.not_allowed,
-            "excluded remote conda records the virtual's allowlist does not admit"
-        );
-    }
-    failed.extend(parse_failures);
-    Ok(VirtualMerge {
-        body: body?,
-        failed,
-        allowlist_dropped: enforced.then_some(dropped.not_allowed),
-    })
+        .await
+        .map_err(merge_gate::SharedResponse::into_response)
 }
 
 /// Build merged channeldata.json for a virtual repository: hosted members
 /// first, then remote members (fetched capped, one at a time), with remote
-/// entries for hosted-owned names excluded.
+/// entries for hosted-owned names excluded. Shared and kept like repodata
+/// ([`merge_gate`], #4608).
 async fn build_virtual_channeldata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
-) -> Result<VirtualMerge, Response> {
-    // Caller-authorized member walk (#3323).
-    let members =
-        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
-    let owned = virtual_hosted_owned_names(&state.db, virtual_repo_id).await?;
-    let allowlist = virtual_allowlist(&state.db, virtual_repo_id).await?;
+    virtual_repo_key: &str,
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    let kind = merge_gate::MergeKind::Channeldata;
+    let VirtualMergeInputs {
+        members,
+        owned,
+        allowlist,
+        mut key,
+    } = virtual_merge_inputs(
+        state,
+        auth,
+        virtual_repo_id,
+        virtual_repo_key,
+        kind,
+        "channeldata.json",
+    )
+    .await?;
 
     let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4407,49 +4715,100 @@ async fn build_virtual_channeldata(
             ));
         }
     }
-
-    let (documents, mut failed) = virtual_merge::fetch_remote_members(
-        state.proxy_service.as_deref(),
-        &members,
-        &virtual_merge::channeldata_candidates(),
-        virtual_merge::MemberLimits::from_env(),
-        false,
-    )
-    .await;
-    let enforced = allowlist.is_some();
-    let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
-        virtual_merge::merge_channeldata(&hosted, &documents, &owned, allowlist.as_deref())
-    })
-    .await
-    .map_err(virtual_merge::internal_error)?;
-    if enforced {
-        tracing::info!(
-            virtual_repo_id = %virtual_repo_id,
-            dropped = not_allowed,
-            "excluded remote conda channeldata entries the virtual's allowlist does not admit"
-        );
+    key.part(&(hosted.len() as u64).to_le_bytes());
+    for (name, entry) in &hosted {
+        key.part(name.as_bytes()).part(entry.get().as_bytes());
     }
-    failed.extend(parse_failures);
-    Ok(VirtualMerge {
-        body: body.map_err(virtual_merge::internal_error)?,
-        failed,
-        allowlist_dropped: enforced.then_some(not_allowed),
-    })
+
+    let proxy = state.proxy_service.clone();
+    let validate_proxy = proxy.clone();
+    merge_gate::gate_for(virtual_repo_id)
+        .get_or_merge(
+            kind,
+            key.finish(),
+            Some(format!("{virtual_repo_id}/channeldata.json")),
+            move |doc| merge_validators_fresh(validate_proxy, doc),
+            move |mut account| async move {
+                let (documents, mut failed) = virtual_merge::fetch_remote_members(
+                    proxy.as_deref(),
+                    &members,
+                    &virtual_merge::channeldata_candidates(),
+                    virtual_merge::MemberLimits::from_env(),
+                    false,
+                    &mut account,
+                )
+                .await;
+                let decoded_bytes: usize = documents.iter().map(|d| d.json.len()).sum();
+                account.track(merge_gate::merge_working_set(decoded_bytes, true));
+                let all_validated = documents.iter().all(|d| d.validator.is_some());
+                let validators = documents
+                    .iter()
+                    .filter_map(|d| d.validator.clone())
+                    .collect();
+                let enforced = allowlist.is_some();
+                let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
+                    virtual_merge::merge_channeldata(
+                        &hosted,
+                        &documents,
+                        &owned,
+                        allowlist.as_deref(),
+                    )
+                })
+                .await
+                .map_err(virtual_merge::internal_error)?;
+                if enforced {
+                    tracing::info!(
+                        virtual_repo_id = %virtual_repo_id,
+                        dropped = not_allowed,
+                        "excluded remote conda channeldata entries the virtual's allowlist does not admit"
+                    );
+                }
+                failed.extend(parse_failures);
+                let body = body.map_err(virtual_merge::internal_error)?;
+                account.track(
+                    body.len()
+                        .saturating_sub(merge_gate::merge_output_allowance(decoded_bytes, true)),
+                );
+                let stats = merge_gate::MergeStats {
+                    decoded_bytes,
+                    output_bytes: body.len(),
+                    reserved: account.reserved(),
+                    peak_need: account.peak_need(),
+                };
+                Ok(merge_gate::MergedDocument::new(
+                    body,
+                    failed,
+                    enforced.then_some(not_allowed),
+                    validators,
+                    all_validated,
+                    stats,
+                    true,
+                ))
+            },
+        )
+        .await
+        .map_err(merge_gate::SharedResponse::into_response)
 }
 
 /// Serve a virtual merge under the repository's member-failure policy
 /// (#4192): strict by default (502 naming the failed members), or a degraded
 /// document marked partial and uncacheable when the virtual opts in through
 /// `repository_config` key [`virtual_merge::PARTIAL_CONFIG_KEY`].
+///
+/// The body, its ETag and (for JSON) its gzip rendering come from the shared
+/// merged document, so every request a merge answers gets the same bytes and
+/// the same validator, and a revalidation is a 304 (#4608).
 async fn serve_virtual_merge(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     document: &str,
-    merged: VirtualMerge,
+    merged: std::sync::Arc<merge_gate::MergedDocument>,
     content_type: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    use crate::api::handlers::cache_headers;
+
     let policy = if merged.failed.is_empty() {
         virtual_merge::FailurePolicy::Strict
     } else {
@@ -4457,7 +4816,55 @@ async fn serve_virtual_merge(
     };
     let partial =
         virtual_merge::apply_failure_policy(policy, virtual_repo_key, document, &merged.failed)?;
-    let mut response = cacheable_response(merged.body, content_type, headers).await;
+
+    let not_modified = if partial.is_none() {
+        check_conditional_request(headers, &merged.etag)
+    } else {
+        None
+    };
+    let mut response = match not_modified {
+        Some(not_modified) => not_modified,
+        None => {
+            let gzip = if merged.json && accepts_gzip(headers) {
+                let body = merged.body.clone();
+                merged
+                    .gzip
+                    .get_or_try_init(|| async move {
+                        tokio::task::spawn_blocking(move || Bytes::from(gzip_compress(&body))).await
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "conda gzip offload failed; serving uncompressed body"
+                        );
+                    })
+                    .ok()
+                    .cloned()
+            } else {
+                None
+            };
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, content_type)
+                .header(ETAG, &merged.etag)
+                .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
+            if merged.json {
+                builder = builder.header("Vary", "Accept-Encoding");
+            }
+            let body = match gzip {
+                Some(gzip) => {
+                    builder = builder.header(CONTENT_ENCODING, "gzip");
+                    gzip
+                }
+                None => merged.body.clone(),
+            };
+            builder
+                .header(CONTENT_LENGTH, body.len().to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+    };
     if let Some(missing) = partial {
         virtual_merge::mark_partial(&mut response, &missing);
     }
@@ -7714,6 +8121,7 @@ fn serialize_msgpack_zst<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Resp
 }
 
 /// Compress data using bzip2.
+#[cfg(test)]
 fn bzip2_compress(data: &[u8]) -> Vec<u8> {
     let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     encoder.write_all(data).expect("bzip2 write failed");
@@ -17778,6 +18186,7 @@ mod virtual_channel_tests {
         virtual_merge::MemberDocument {
             member: member.to_string(),
             json: serde_json::to_vec(&doc).unwrap(),
+            validator: None,
         }
     }
 
@@ -17802,6 +18211,7 @@ mod virtual_channel_tests {
             virtual_merge::MemberDocument {
                 member: "remote-c".into(),
                 json: b"not json".to_vec(),
+                validator: None,
             },
         ];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
@@ -17926,6 +18336,12 @@ mod virtual_channel_tests {
                 decoded: 1024 * 1024,
             },
             true,
+            &mut merge_gate::MergeAccount::new(
+                merge_gate::MergeKind::Repodata,
+                proxy_helpers::proxy_metadata_budget(),
+                std::time::Duration::from_secs(30),
+                5,
+            ),
         )
         .await;
         rig.cleanup().await;
@@ -18333,6 +18749,7 @@ mod virtual_channel_tests {
         let remote = vec![virtual_merge::MemberDocument {
             member: "remote".into(),
             json: serde_json::to_vec(&doc).unwrap(),
+            validator: None,
         }];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
             "noarch",
@@ -18395,6 +18812,337 @@ mod virtual_channel_tests {
         assert_eq!(anon[CACHE_CONTROL], "public, max-age=60");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(authed[CACHE_CONTROL], "private, max-age=60");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4608: singleflight, cache, merge slots and budget accounting
+    // -----------------------------------------------------------------------
+
+    /// A gate of its own for one rig's virtual, so a test can count merges,
+    /// hold slots and shorten the queue deadline without touching the
+    /// process-wide gate other tests share.
+    pub(super) fn test_gate(
+        rig: &VirtualRig,
+        max_merges: usize,
+        queue_secs: u64,
+    ) -> std::sync::Arc<merge_gate::MergeGate> {
+        let gate = merge_gate::MergeGate::new(
+            merge_gate::GateConfig {
+                max_merges,
+                queue_wait: std::time::Duration::from_secs(queue_secs),
+                cache_ttl: std::time::Duration::from_secs(300),
+                cache_max_bytes: 64 * 1024 * 1024,
+            },
+            proxy_helpers::proxy_metadata_budget(),
+        );
+        merge_gate::install_test_gate(rig.virtual_id, std::sync::Arc::clone(&gate));
+        gate
+    }
+
+    /// Mount `/{subdir}/repodata.json` answering after `delay`, so concurrent
+    /// requests overlap the merge.
+    async fn mount_slow_repodata(
+        server: &MockServer,
+        subdir: &str,
+        filenames: &[&str],
+        delay: std::time::Duration,
+    ) {
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{subdir}/repodata.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata(subdir, filenames))
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn upstream_gets(server: &MockServer, path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == path)
+            .count()
+    }
+
+    fn etag(headers: &HeaderMap) -> String {
+        headers
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("a merged document carries an ETag")
+            .to_string()
+    }
+
+    /// #4608: two concurrent requests for the same merged document run ONE
+    /// merge (one upstream fetch) and get the same ETag; a later request is
+    /// served from the kept merge without merging again, and revalidating
+    /// with that ETag is a 304. A different encoding is a different document;
+    /// channeldata shares the same way.
+    #[tokio::test]
+    async fn concurrent_identical_requests_share_one_merge_and_etag_4608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let delay = std::time::Duration::from_millis(600);
+        mount_slow_repodata(
+            &server,
+            "noarch",
+            &["rich-13.0-0.conda", "tzdata-2025b-0.conda"],
+            delay,
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "channeldata_version": 1,
+                        "packages": {"rich": {"subdirs": ["noarch"], "version": "13.0"}},
+                    }))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let gate = test_gate(&rig, 4, 30);
+        let v = rig.virtual_key.clone();
+        let uri = format!("/{v}/noarch/repodata.json.zst");
+
+        let (a, b) = tokio::join!(rig.get(uri.clone()), rig.get(uri.clone()));
+        let merges_after_pair = gate.merges_started();
+        let fetches_after_pair = upstream_gets(&server, "/noarch/repodata.json").await;
+        let (c_status, c_body, c_headers) = rig.get(uri.clone()).await;
+        let merges_after_third = gate.merges_started();
+
+        let mut conditional = tdh::get(uri.clone());
+        conditional.headers_mut().insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_str(&etag(&a.2)).unwrap(),
+        );
+        let app = tdh::router_anon(router(), rig.state.clone());
+        let (nm_status, nm_body, nm_headers) = tdh::send_with_headers(app, conditional).await;
+
+        let (json_status, json_body, _) = rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let merges_after_json = gate.merges_started();
+
+        let cd_uri = format!("/{v}/channeldata.json");
+        let (cd_a, cd_b) = tokio::join!(rig.get(cd_uri.clone()), rig.get(cd_uri.clone()));
+        let merges_after_channeldata = gate.merges_started();
+        let channeldata_fetches = upstream_gets(&server, "/channeldata.json").await;
+        rig.cleanup().await;
+
+        assert_eq!(a.0, StatusCode::OK, "{}", String::from_utf8_lossy(&a.1));
+        assert_eq!(b.0, StatusCode::OK, "{}", String::from_utf8_lossy(&b.1));
+        assert_eq!(merges_after_pair, 1, "two concurrent requests, one merge");
+        assert_eq!(fetches_after_pair, 1, "one merge, one member fetch");
+        assert_eq!(etag(&a.2), etag(&b.2), "both requests get the same ETag");
+        assert_eq!(a.1, b.1, "and the same bytes");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&a.1[..]).unwrap()).unwrap();
+        assert_eq!(
+            listed(&doc),
+            vec![
+                "acme-core-1.0-0.conda",
+                "rich-13.0-0.conda",
+                "tzdata-2025b-0.conda"
+            ]
+        );
+
+        assert_eq!(c_status, StatusCode::OK);
+        assert_eq!(
+            merges_after_third, 1,
+            "a later request reuses the kept merge"
+        );
+        assert_eq!(etag(&c_headers), etag(&a.2), "with a stable ETag");
+        assert_eq!(c_body, a.1);
+
+        assert_eq!(nm_status, StatusCode::NOT_MODIFIED);
+        assert!(nm_body.is_empty());
+        assert_eq!(etag(&nm_headers), etag(&a.2));
+
+        assert_eq!(json_status, StatusCode::OK);
+        assert_eq!(merges_after_json, 2, "another encoding is another document");
+        let json_doc: serde_json::Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(json_doc, doc, "every encoding carries the same merge");
+
+        assert_eq!(cd_a.0, StatusCode::OK);
+        assert_eq!(cd_b.0, StatusCode::OK);
+        assert_eq!(
+            merges_after_channeldata, 3,
+            "channeldata: one merge for two requests"
+        );
+        assert_eq!(channeldata_fetches, 1);
+        assert_eq!(etag(&cd_a.2), etag(&cd_b.2));
+    }
+
+    /// #4608: with every merge slot taken, a merge waits at most the queue
+    /// deadline and is then shed with 503 and `Retry-After`, naming the
+    /// setting; once a slot is free the same request merges.
+    #[tokio::test]
+    async fn merge_beyond_the_slot_cap_is_shed_with_retry_after_4608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_slow_repodata(
+            &server,
+            "noarch",
+            &["rich-13.0-0.conda"],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let gate = test_gate(&rig, 1, 1);
+        let uri = format!("/{}/noarch/repodata.json.zst", rig.virtual_key);
+
+        let busy = gate.hold_all_slots().await;
+        let started = std::time::Instant::now();
+        let (status, body, headers) = rig.get(uri.clone()).await;
+        let waited = started.elapsed();
+        drop(busy);
+        let (after_status, _, _) = rig.get(uri).await;
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            waited >= std::time::Duration::from_millis(900)
+                && waited < std::time::Duration::from_secs(5),
+            "shed at the 1 s deadline, took {waited:?}"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "Retry-After is capped by the queue deadline"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(merge_gate::MAX_CONCURRENT_MERGES_ENV),
+            "the body names the setting: {body}"
+        );
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(gate.merges_started(), 1, "the shed request never merged");
+    }
+
+    /// #4608: a change to the allowlist or to the hosted records (an upload)
+    /// is a different merge key, so the kept merge is not served; the member's
+    /// upstream document is still read from the proxy cache.
+    #[tokio::test]
+    async fn allowlist_change_and_hosted_upload_invalidate_the_merge_4608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_slow_repodata(
+            &server,
+            "noarch",
+            &["rich-13.0-0.conda", "tzdata-2025b-0.conda"],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let gate = test_gate(&rig, 4, 30);
+
+        let (_, first) = rig.repodata("noarch").await;
+        let (_, again) = rig.repodata("noarch").await;
+        let merges_cached = gate.merges_started();
+
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": [{"name": "rich"}]}),
+        )
+        .await;
+        let (_, filtered) = rig.repodata("noarch").await;
+        let merges_after_allowlist = gate.merges_started();
+
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (_, uploaded) = rig.repodata("noarch").await;
+        let merges_after_upload = gate.merges_started();
+        let fetches = upstream_gets(&server, "/noarch/repodata.json").await;
+        rig.cleanup().await;
+
+        assert_eq!(first, again);
+        assert_eq!(merges_cached, 1);
+        assert_eq!(merges_after_allowlist, 2, "an allowlist change re-merges");
+        assert_eq!(listed(&filtered), vec!["rich-13.0-0.conda"]);
+        assert_eq!(merges_after_upload, 3, "a hosted upload re-merges");
+        assert_eq!(
+            listed(&uploaded),
+            vec!["acme-core-1.0-0.conda", "rich-13.0-0.conda"]
+        );
+        assert_eq!(fetches, 1, "the member document came from the proxy cache");
+    }
+
+    /// #4608: a merge reserves its decoded member documents and its output
+    /// against the buffered-metadata budget, in every encoding: the first
+    /// merge of a document (size unknown) reserves the whole budget, and the
+    /// next merge of it reserves what the first one needed, which still
+    /// covers decoded + merged bytes.
+    #[tokio::test]
+    async fn merge_reservation_covers_decoded_and_merged_bytes_4608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let names: Vec<String> = (0..3000).map(|i| format!("pkg{i}-1.0-0.conda")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        mount_slow_repodata(&server, "noarch", &refs, std::time::Duration::ZERO).await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let _gate = test_gate(&rig, 4, 30);
+        let budget = proxy_helpers::proxy_metadata_budget().total_bytes();
+
+        let merge = |encoding: RepodataEncoding| {
+            let state = rig.state.clone();
+            let (id, key) = (rig.virtual_id, rig.virtual_key.clone());
+            async move {
+                build_virtual_repodata(&state, None, id, &key, "noarch", encoding)
+                    .await
+                    .unwrap_or_else(|_| panic!("merge {}", encoding.upstream_filename()))
+                    .stats
+            }
+        };
+        let encodings = [
+            RepodataEncoding::Json,
+            RepodataEncoding::Zst,
+            RepodataEncoding::Bz2,
+        ];
+        let mut first = Vec::new();
+        for encoding in encodings {
+            first.push((encoding.upstream_filename(), merge(encoding).await));
+        }
+        // A new allowlist generation: every document merges again.
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": [{"name": "pkg*"}]}),
+        )
+        .await;
+        let mut second = Vec::new();
+        for encoding in encodings {
+            second.push((encoding.upstream_filename(), merge(encoding).await));
+        }
+        rig.cleanup().await;
+
+        for (document, stats) in first {
+            assert!(stats.decoded_bytes > 500_000, "{document}: {stats:?}");
+            assert_eq!(stats.reserved, budget, "{document}: first merge: {stats:?}");
+        }
+        for (document, stats) in second {
+            assert!(
+                stats.reserved >= stats.decoded_bytes + stats.output_bytes,
+                "{document}: the reservation must cover decoded + merged bytes: {stats:?}"
+            );
+            assert!(
+                stats.reserved >= stats.peak_need,
+                "{document}: learned from the first merge: {stats:?}"
+            );
+            assert!(stats.reserved < budget, "{document}: {stats:?}");
+        }
     }
 }
 
@@ -19723,6 +20471,75 @@ mod cep16_proxy_tests {
         );
         assert!(String::from_utf8_lossy(&body).contains(&repo_key));
         assert_eq!(shard_status, StatusCode::BAD_GATEWAY);
+    }
+    /// #4608: the merged shard index is shared like the other merged
+    /// documents: two concurrent requests run one merge and get one ETag, a
+    /// later request reuses it, and shard requests through the virtual are
+    /// routed from the same kept merge instead of re-reading every member's
+    /// index (#4607).
+    #[tokio::test]
+    async fn virtual_shard_index_is_merged_once_for_concurrent_requests_4608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let (rich_shard, rich_hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        mount_bytes(
+            &server,
+            &format!("/noarch/shards/{rich_hash}.msgpack.zst"),
+            rich_shard.clone(),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(wm_path(INDEX))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(upstream_index(
+                        "noarch",
+                        "./shards/",
+                        &[("rich", &rich_hash)],
+                    ))
+                    .set_delay(std::time::Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let gate = super::virtual_channel_tests::test_gate(&rig, 4, 30);
+        let uri = format!("/{}{INDEX}", rig.virtual_key);
+
+        let (a, b) = tokio::join!(rig.get(uri.clone()), rig.get(uri.clone()));
+        let merges_after_pair = gate.merges_started();
+        let (c_status, _, c_headers) = rig.get(uri).await;
+        let merges_after_third = gate.merges_started();
+        let shard_uri = shard_uri(&rig.virtual_key, &rich_hash);
+        let (s1, s2) = tokio::join!(rig.get(shard_uri.clone()), rig.get(shard_uri.clone()));
+        let merges_after_shards = gate.merges_started();
+        let fetches = upstream_hits(&server, INDEX).await;
+        rig.cleanup().await;
+
+        assert_eq!(a.0, StatusCode::OK, "{}", String::from_utf8_lossy(&a.1));
+        assert_eq!(b.0, StatusCode::OK);
+        assert_eq!(merges_after_pair, 1);
+        assert_eq!(a.2[ETAG], b.2[ETAG]);
+        assert_eq!(index_names(&decode_index(&a.1)), vec!["rich"]);
+        assert_eq!(c_status, StatusCode::OK);
+        assert_eq!(
+            merges_after_third, 1,
+            "kept while the member index is fresh"
+        );
+        assert_eq!(c_headers[ETAG], a.2[ETAG]);
+        assert_eq!(s1.0, StatusCode::OK, "{}", String::from_utf8_lossy(&s1.1));
+        assert_eq!(s2.0, StatusCode::OK);
+        assert_eq!(&s1.1[..], &rich_shard[..]);
+        assert_eq!(
+            merges_after_shards, 1,
+            "shards are routed from the kept merge"
+        );
+        assert_eq!(
+            fetches, 1,
+            "one member index read for the index and both shards"
+        );
     }
 
     /// The merged index of a virtual: hosted shards first, then the remote's
