@@ -337,22 +337,35 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # go1.26.6 stdlib fixes #3352 floored on (go1.26.6 is 2026-08-13; go1.27.0 is
 # 2026-08-19). Keep the floor on the newest patch of whatever minor the FROM
 # line names, or this check goes inert again.
-# buildctl: the BuildKit client the image builder shells out to
-# (services/image_build_service.rs). A static Go binary; the daemon it talks
-# to runs elsewhere (AK_BUILDKIT_ADDR), so nothing else from BuildKit is
-# needed in the runtime image.
-FROM docker.io/moby/buildkit:v0.33.0 AS buildkit-bin
+#
+# 1.27.1 -> 1.27.2 on 2026-10-10, for Go's paired security release
+# (go1.27.2 / go1.26.9): CVE-2026-78667 (net/http, DoS via crafted Range
+# headers), CVE-2026-78669 (the bundled HTTP/2 stack, DoS via excessive
+# SETTINGS frames) and CVE-2026-97031 (crypto/tls, DoS via repeated ECH outer
+# extension references), all HIGH. The Docker Publish gate reported them on
+# main from a8fd2b47 (run 38087035953) against buildctl, built by Docker on
+# go1.26.8, and against the scanner adapter's trivy, NOT against grype: the
+# floating FROM had already resolved go1.27.2, so grype was stdlib-clean.
+# The bump turns that timing into a guarantee. buildctl is now built in the
+# buildkit-bin stage below on the same floor, which is how its half clears.
+#
+# The FROM stays floating on purpose, as the paragraph above argues: pinning
+# it to `golang:1.27.2-alpine` would make the floor redundant today and stale
+# the day go1.27.3 ships, and a stale pin fails no check.
 
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG GRYPE_VERSION=0.118.0
 ARG GRYPE_COMMIT=756eb9a24f7beeafb6871a24e943e8a3ae210695
-ARG GO_MIN_PATCH=1.27.1
-# The single declared divergence from upstream grype at this tag. See the
-# override block below the clone for the justification and removal condition.
+ARG GO_MIN_PATCH=1.27.2
+# The two declared divergences from upstream grype at this tag. See the
+# override blocks below the clone for the justification and removal condition
+# of each.
 ARG GRPC_FROM=v1.83.0
 ARG GRPC_TO=v1.83.2
+ARG XNET_FROM=v0.58.0
+ARG XNET_TO=v0.60.0
 
 RUN apk add --no-cache git ca-certificates
 
@@ -401,7 +414,9 @@ RUN set -eu; \
 # the gate only because it filters to CRITICAL,HIGH; if NVD scores either
 # HIGH this stage goes red on an unchanged binary, and anchore/grype main
 # still pins v0.55.0, so it will need the same override shape (tracked in
-# #3698).
+# #3698). [2026-10-10: no longer true. The x/net override after this block
+# moves x/crypto to v0.57.0 as an MVS consequence, which clears both. See
+# there.]
 #
 # THIS IS AN OVERRIDE, NOT A BUMP, and that distinction is the whole point.
 # The three levers this stage has, in order of preference:
@@ -510,6 +525,110 @@ RUN set -eu; \
     go mod verify; \
     echo "grype build: override applied — google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO}"
 
+# ---- Dependency override: golang.org/x/net ${XNET_FROM} -> ${XNET_TO} (2026-10-10)
+#
+# CVE-2026-78669 (HIGH; HTTP/2 denial of service via excessive SETTINGS
+# frames in golang.org/x/net/http2, fixed in x/net v0.60.0 alongside the same
+# fix to the standard library's bundled copy in go1.27.2 / go1.26.9) was
+# reported against `usr/local/bin/grype` at x/net v0.58.0 and failed Docker
+# Publish's `Security Scan` on main from a8fd2b47 (run 38087035953). It was
+# the ONLY finding against grype in that run: the stdlib half of the same
+# advisory did not appear, because the floating FROM had already resolved
+# go1.27.2 (GO_MIN_PATCH above now makes that a floor rather than luck).
+#
+# The three levers, in order, as the grpc block above explains them:
+#   1. Bump GRYPE_VERSION. Checked against the RELEASE, 2026-10-10: the newest
+#      anchore/grype release is v0.120.1 (2026-10-06) and its go.mod pins
+#      x/net v0.59.0, one minor short; `main` pins v0.59.0 too. No release
+#      reaches the fix, so a bump would move a lot (two minors of grype,
+#      matcher behaviour, DB code) and still leave this block in place. Not
+#      taken here, and see the note at the end of this block.
+#   2. GO_MIN_PATCH. Does not apply: x/net is a module, not the stdlib.
+#   3. Override. Only this one is left.
+#
+# This goes ONE STEP BEYOND the policy the grpc block quotes, the way #3465's
+# x/mod override did, and says so: upstream has NOT made this bump. x/net
+# v0.60.0 was tagged on 2026-10-08, two days before this change, and no
+# anchore/grype commit or PR moves to it yet. What stands in for "upstream
+# already made the bump" is that v0.60.0 is the Go team's own fix release
+# for this advisory, published as a pair with the go1.27.2 toolchain fix,
+# and that every module MVS drags along with it lands on EXACTLY the version
+# anchore/grype v0.120.1 already ships (below). The alternative is a
+# .trivyignore entry, and its header rules that out: a fixed version exists
+# and we can build against it.
+#
+# REACHABILITY: x/net/http2 IS linked into cmd/grype. `go mod why -m
+# golang.org/x/net` answers grype/internal/file -> hashicorp/go-getter ->
+# cloud.google.com/go/storage -> google.golang.org/api/transport/http ->
+# golang.org/x/net/http2, and `go list -deps ./cmd/grype` links 14 x/net
+# packages (measured on the v0.118.0 tree, 2026-10-10). We have not traced an
+# attack path through grype: it serves nothing, the advisory is a DoS in the
+# HTTP/2 framing code, and its only outbound HTTP (the DB fetch) is disabled
+# at runtime (GRYPE_DB_AUTO_UPDATE=false). That narrows the exposure; it does
+# not remove the vulnerable code, and the gate is not reachability-aware.
+#
+# MVS consequences, measured 2026-10-10 on the v0.118.0 tree after the grpc
+# override: `go get golang.org/x/net@v0.60.0` moves SEVEN golang.org/x
+# modules, because x/net v0.60.0's go.mod requires x/crypto v0.57.0, x/sys
+# v0.48.0, x/term v0.46.0 and x/text v0.42.0, and x/text v0.42.0 in turn
+# requires x/mod v0.41.0 and x/sync v0.23.0:
+#   x/crypto v0.55.0 -> v0.57.0    x/sys  v0.47.0 -> v0.48.0
+#   x/mod    v0.40.0 -> v0.41.0    x/term v0.45.0 -> v0.46.0
+#   x/net    v0.58.0 -> v0.60.0    x/text v0.41.0 -> v0.42.0
+#   x/sync   v0.22.0 -> v0.23.0
+# Apart from x/net itself, every one of those is the exact version
+# anchore/grype v0.120.1 pins in its own go.mod, so for these seven modules
+# we ship upstream's newest released choice plus one x/net minor, not
+# versions of our own invention. The x/crypto move also settles #3698: the
+# "next in line" x/crypto/ssh advisories (CVE-2026-56855 / CVE-2026-78662,
+# fixed in v0.56.0) the grpc block above warns about are cleared by it
+# before NVD ever scores them.
+# The assertion declares the seven-module set, so a resolution that moves
+# anything else fails the build.
+#
+# REMOVAL CONDITION: delete this block, and the XNET_FROM/XNET_TO ARGs, when
+# GRYPE_VERSION moves to a grype release whose go.mod pins golang.org/x/net
+# >= v0.60.0:
+#   git show <tag>:go.mod | grep golang.org/x/net
+# The guard fails the build when the pinned source no longer requires
+# ${XNET_FROM}, exactly as the grpc guard does, so the bump cannot ship with
+# this block still in place.
+#
+# A grype bump (v0.118.0 -> v0.120.1) is worth doing on its own soon after
+# this lands: it retires the grpc override above outright (v0.120.1 pins
+# grpc v1.83.2), leaving this block as the only divergence. It is left out of
+# this change because it is a scanner behaviour change, and this one only has
+# to clear a gate.
+RUN set -eu; \
+    xnet_pin() { sed -n 's|^[[:space:]]*golang\.org/x/net \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(xnet_pin)"; \
+    if [ "${have}" != "${XNET_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} pins golang.org/x/net ${have}, not ${XNET_FROM}." >&2; \
+      echo "       This override was written against ${XNET_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${XNET_TO}, DELETE the x/net override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    cp go.mod /tmp/go.mod.before-xnet; \
+    go get "golang.org/x/net@${XNET_TO}"; \
+    got="$(xnet_pin)"; \
+    if [ "${got}" != "${XNET_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins golang.org/x/net ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-xnet go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the x/net override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    echo "grype build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
+
 # ldflags mirror .goreleaser.yaml at this tag so the built binary reports the
 # same identity upstream's release does. buildDate is the commit timestamp
 # rather than "now": a wall-clock date would make every rebuild produce a
@@ -550,7 +669,174 @@ RUN set -eu; \
       echo "       The Trivy gate reads this build info; the override did not ship (#3655)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — google.golang.org/grpc ${recorded} across ${deps} deps"
+    xnet="$(printf '%s\n' "${info}" \
+            | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/net[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+            | head -n1)"; \
+    if [ "${xnet}" != "${XNET_TO}" ]; then \
+      echo "ERROR: compiled grype records golang.org/x/net '${xnet}', want ${XNET_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified — google.golang.org/grpc ${recorded}, golang.org/x/net ${xnet} across ${deps} deps"
+
+# ---------- Stage 5-bk: Build the buildctl client from source ----------
+# buildctl: the BuildKit client the image builder shells out to
+# (services/image_build_service.rs). A static Go binary; the daemon it talks
+# to runs elsewhere (AK_BUILDKIT_ADDR), so nothing else from BuildKit is
+# needed in the runtime image.
+#
+# BUILT FROM SOURCE at the pinned upstream tag (2026-10-10), for the reason
+# grype is (#3352) and with the same guards. It used to be copied out of
+# docker.io/moby/buildkit:v0.33.0, whose buildctl is compiled on go1.26.8 and
+# links golang.org/x/net v0.58.0. Docker Publish's gate failed on main from
+# a8fd2b47 (run 38087035953) with four HIGH, fixed findings against
+# usr/local/bin/buildctl:
+#   golang.org/x/net v0.58.0  CVE-2026-78669                  fixed in v0.60.0
+#   stdlib go1.26.8           CVE-2026-78667, -78669, -97031  fixed in 1.26.9 / 1.27.2
+#
+# No moby/buildkit release reaches either fix (checked 2026-10-10). v0.33.1
+# (2026-09-30) and v0.34.0 (2026-10-07, the newest) both ship a buildctl built
+# on go1.26.8 (measured with `go version -m` on the image's binary), and their
+# go.mod files pin x/net v0.58.0 and v0.59.0; master pins v0.59.0. So a tag
+# bump fixes nothing, and copying a prebuilt binary leaves no other lever: a
+# stdlib CVE belongs to whoever ran the compiler. Built here, the toolchain is
+# ours (GO_MIN_PATCH, same floor as grype-bin) and so is the module graph (the
+# x/net override below).
+#
+# That is why this is a build and not a .trivyignore entry. That file's bar is
+# "no fixed version we can BUILD AGAINST exists", and both fixes exist:
+# go1.27.2 is what golang:1.27-alpine serves and x/net v0.60.0 is on the module
+# proxy. buildctl has never been listed there and still is not.
+#
+# The source tag is UNCHANGED (v0.33.0 @ dddd5621), so this is a repackaging,
+# not an upgrade: the client speaks the same protocol to the same daemons it
+# did, and `buildctl --version` still prints
+# `buildctl github.com/moby/buildkit v0.33.0 dddd5621...`, because the ldflags
+# below are upstream's own (the `buildkit-version` stage of moby/buildkit's
+# Dockerfile at the tag). Upstream builds buildctl with CGO_ENABLED=0 and no
+# build tags, as here; -trimpath and the static check are ours.
+#
+# The x/net override follows the grype x/net block's reasoning and makes the
+# same policy exception, stated the same way: upstream has NOT made this bump
+# (master pins v0.59.0; x/net v0.60.0 was tagged 2026-10-08), and what stands
+# in for it is that v0.60.0 is the Go team's own fix release for this
+# advisory. REACHABILITY: x/net/http2 is linked (`go list -deps ./cmd/buildctl`
+# lists golang.org/x/net/http2 among 8 x/net packages); buildctl talks gRPC,
+# which is HTTP/2, to the daemon AK_BUILDKIT_ADDR names. That is a peer we
+# configure, so the exposure is narrow, but unlike grype this binary really
+# does speak HTTP/2 at runtime.
+#
+# MVS consequences, measured 2026-10-10 on the v0.33.0 tree: the same seven
+# golang.org/x modules move, from the same versions to the same versions, as
+# in grype-bin (x/crypto v0.57.0, x/mod v0.41.0, x/net v0.60.0, x/sync
+# v0.23.0, x/sys v0.48.0, x/term v0.46.0, x/text v0.42.0), because buildkit
+# v0.33.0 pins the same x/ versions grype v0.118.0 does. BuildKit VENDORS its
+# dependencies, so `go mod vendor` re-materializes vendor/ from the
+# checksum-verified graph after `go get`, and the build keeps upstream's
+# default -mod=vendor.
+#
+# REMOVAL CONDITION for the override: delete it, and the XNET_FROM/XNET_TO
+# ARGs, when BUILDKIT_VERSION moves to a release whose go.mod pins
+# golang.org/x/net >= v0.60.0:
+#   git show <tag>:go.mod | grep golang.org/x/net
+# The guard fails the build when the source stops pinning ${XNET_FROM}, as in
+# grype-bin. Going back to copying moby/buildkit's binary is NOT the removal
+# condition: the stdlib half of this finding is the half no tag bump can fix,
+# which is the whole lesson of #3352.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS buildkit-bin
+ARG TARGETOS
+ARG TARGETARCH
+ARG BUILDKIT_VERSION=0.33.0
+ARG BUILDKIT_COMMIT=dddd5621af04ea57823085c93a063383f71d3173
+ARG GO_MIN_PATCH=1.27.2
+# The one declared divergence from upstream buildkit at this tag.
+ARG XNET_FROM=v0.58.0
+ARG XNET_TO=v0.60.0
+
+RUN apk add --no-cache git ca-certificates
+
+RUN set -eu; \
+    have="$(go env GOVERSION | sed 's/^go//')"; \
+    oldest="$(printf '%s\n%s\n' "${have}" "${GO_MIN_PATCH}" | sort -V | head -n1)"; \
+    if [ "${have}" != "${GO_MIN_PATCH}" ] && [ "${oldest}" != "${GO_MIN_PATCH}" ]; then \
+      echo "ERROR: Go toolchain go${have} is older than the required go${GO_MIN_PATCH}." >&2; \
+      echo "       Building buildctl on it would ship known-vulnerable stdlib." >&2; \
+      exit 1; \
+    fi; \
+    echo "buildctl build: go${have} satisfies the go${GO_MIN_PATCH} floor"
+
+WORKDIR /src
+
+# Tag is mutable, commit is not; same check as grype-bin.
+RUN set -eu; \
+    git clone --depth 1 --branch "v${BUILDKIT_VERSION}" https://github.com/moby/buildkit.git .; \
+    actual="$(git rev-parse HEAD)"; \
+    if [ "${actual}" != "${BUILDKIT_COMMIT}" ]; then \
+      echo "ERROR: buildkit v${BUILDKIT_VERSION} resolved to ${actual}, expected ${BUILDKIT_COMMIT}" >&2; \
+      exit 1; \
+    fi
+
+RUN set -eu; \
+    xnet_pin() { sed -n 's|^[[:space:]]*golang\.org/x/net \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(xnet_pin)"; \
+    if [ "${have}" != "${XNET_FROM}" ]; then \
+      echo "ERROR: buildkit v${BUILDKIT_VERSION} pins golang.org/x/net ${have}, not ${XNET_FROM}." >&2; \
+      echo "       This override was written against ${XNET_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${XNET_TO}, DELETE the override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    go get "golang.org/x/net@${XNET_TO}"; \
+    got="$(xnet_pin)"; \
+    if [ "${got}" != "${XNET_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins golang.org/x/net ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --unified=0 go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the x/net override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    go mod vendor; \
+    echo "buildctl build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
+
+# ldflags are upstream's (moby/buildkit Dockerfile, `buildkit-version` stage),
+# with the version and revision the clean tag would have produced.
+RUN set -eu; \
+    pkg=github.com/moby/buildkit; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+      go build -trimpath -o /buildctl \
+        -ldflags "-X ${pkg}/version.Version=v${BUILDKIT_VERSION} \
+          -X ${pkg}/version.Revision=${BUILDKIT_COMMIT} \
+          -X ${pkg}/version.Package=${pkg}" \
+        ./cmd/buildctl; \
+    install -Dm644 LICENSE /licenses/buildkit/LICENSE
+
+# Prove the toolchain and the override reached the artifact: the Go build info
+# is exactly what the Trivy gate reads (same check as grype-bin).
+RUN set -eu; \
+    info="$(go version -m /buildctl)"; \
+    deps="$(printf '%s\n' "${info}" | grep -c '^[[:space:]]*dep[[:space:]]')"; \
+    if [ "${deps}" -lt 50 ]; then \
+      echo "ERROR: /buildctl reports only ${deps} dependency records; build info is" >&2; \
+      echo "       unreadable or implausible, so the override is unverified." >&2; \
+      exit 1; \
+    fi; \
+    xnet="$(printf '%s\n' "${info}" \
+            | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/net[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+            | head -n1)"; \
+    if [ "${xnet}" != "${XNET_TO}" ]; then \
+      echo "ERROR: compiled buildctl records golang.org/x/net '${xnet}', want ${XNET_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
+      exit 1; \
+    fi; \
+    echo "buildctl build: build info verified — $(printf '%s\n' "${info}" | head -n1 | sed 's|^/buildctl: ||'), golang.org/x/net ${xnet} across ${deps} deps"
 
 # ---------- Stage 5a: unsquashfs for the Incus scanner (#4469) ----------
 # incus_scanner.rs extracts SquashFS rootfs images with `unsquashfs`, on both
@@ -630,13 +916,15 @@ COPY --from=rootfs-builder /mnt/rootfs /
 # Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
 # deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=grype-bin /grype /usr/local/bin/
-COPY --from=buildkit-bin /usr/bin/buildctl /usr/local/bin/buildctl
+COPY --from=buildkit-bin /buildctl /usr/local/bin/buildctl
 
 # Apache-2.0 §4(a): grype is now built from source here rather than copied out
 # of an upstream image, so we are the ones distributing the binary and the
 # licence has to travel with it. Same arrangement the scanner-adapter uses for
 # its self-built trivy (/licenses/trivy).
 COPY --from=grype-bin /licenses/grype /licenses/grype
+# Same for buildctl (Apache-2.0), built from source here since 2026-10-10.
+COPY --from=buildkit-bin /licenses/buildkit /licenses/buildkit
 
 # unsquashfs for the Incus scanner's SquashFS extraction (#4469), with its
 # GPL-2.0 licence text and the corresponding source tarball (GPL-2.0 s.3(a)).
