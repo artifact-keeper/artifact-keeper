@@ -72,6 +72,37 @@ Other format-native publish routes (npm, Cargo, Debian, RubyGems and similar)
 read the request body into memory instead of onto disk, bounded by
 `MAX_UPLOAD_SIZE` per request; size replica memory for those, not scratch disk.
 
+The routes that open the package to validate it (conda, RubyGems, npm, Cargo,
+Composer, Hex, VS Code, Go modules, Alpine, Pacman, CRAN and RPM) receive the
+body into one buffer of exactly its declared size, charged to a process-wide
+budget, `UPLOAD_MEMORY_BUDGET_BYTES` (#4609). Unset, the budget is half the
+container's cgroup memory limit (no cap without a limit); `0` disables it. An
+upload that does not fit while others hold the budget is refused at once with
+`503` and `Retry-After`, and one larger than the whole budget with `413`, so
+concurrent large uploads are shed instead of getting the replica OOM-killed.
+Size the replica's memory limit at roughly twice the largest package you expect
+on these routes, plus the concurrency you want to admit.
+
+## When an upload cannot be received
+
+The server only parses a package after it has received the whole body. When it
+cannot, the response says why, so a client does not go debugging a package that
+was never the problem (#4609):
+
+| Situation | Response |
+|---|---|
+| The body ended before its `Content-Length`, or the connection broke | `408`, `{"code": "incomplete_body"}` |
+| The body made too little progress (see below) | `408` |
+| The in-memory upload budget is in use by other uploads, or the buffer could not be allocated | `503` + `Retry-After`, `{"code": "upload_capacity_exhausted"}` |
+| Reading the body failed for a reason that is not the client's | `503` + `Retry-After`, `{"code": "upload_receive_failed"}` |
+| The scratch or storage disk is full (or over quota) | `507` + `Retry-After`, `{"code": "insufficient_storage"}` |
+| The scratch file could not be written for another reason | `503` + `Retry-After`, `{"code": "upload_spool_failed"}` |
+| The body is larger than `MAX_UPLOAD_SIZE` | `413` |
+
+A `400` from a publish route therefore means the complete package was received
+and is itself invalid. The server-side cause of a `503` or `507` is logged at
+`error`; the response carries a fixed message.
+
 ## Sizing rule of thumb
 
 ```

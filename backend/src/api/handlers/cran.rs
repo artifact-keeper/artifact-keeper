@@ -10,6 +10,7 @@
 //!   GET  /cran/{repo_key}/bin/macosx/contrib/{rversion}/PACKAGES  - macOS binary index
 //!   PUT  /cran/{repo_key}/src/contrib/{filename}          - Upload package (auth required)
 
+use crate::api::handlers::upload_body::UploadBody;
 use std::io::Write as IoWrite;
 
 use axum::body::Body;
@@ -20,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
@@ -319,7 +319,7 @@ async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "cran", "write:artifacts")?.user_id;
@@ -513,6 +513,7 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flate2::read::GzDecoder;
     use std::io::Read;
 

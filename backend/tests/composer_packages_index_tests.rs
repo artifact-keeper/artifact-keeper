@@ -82,6 +82,7 @@ fn test_config(storage_path: &str) -> Config {
         guest_access_enabled: true,
         guest_access_env_pinned: false,
         expose_detailed_health: false,
+        readyz_require_search: false,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
         plugins_require_signed: true,

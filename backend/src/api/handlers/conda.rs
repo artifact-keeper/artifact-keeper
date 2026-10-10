@@ -40,6 +40,8 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+
+use super::upload_body::UploadBody;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -5217,7 +5219,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
@@ -5245,7 +5247,7 @@ async fn upload_post(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
@@ -5283,7 +5285,7 @@ async fn upload_package_put_with_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -5314,7 +5316,7 @@ async fn upload_post_with_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -7379,8 +7381,12 @@ async fn store_conda_package(
         .put(&storage_key, content.clone())
         .await
         .map_err(|e| {
-            tracing::error!("Storage error writing conda package: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+            // #4609: a full disk is the server's capacity, not a bad request
+            // and not an opaque 500: 507 + Retry-After, logged with the cause.
+            super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+                tracing::error!("Storage error writing conda package: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+            })
         })?;
 
     let size_bytes = content.len() as i64;
@@ -20573,5 +20579,254 @@ mod cep16_proxy_tests {
         assert!(shard_record_names(&not_a_map, 1 << 20).is_err());
         let truncated = zstd::encode_all(&b"\x81\xa8packages\x81"[..], 3).unwrap();
         assert!(shard_record_names(&truncated, 1 << 20).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4609: a body that did not arrive in full never reaches the .conda parser.
+//
+// Red-team S9 saw giant uploads under memory pressure answered `400 Invalid
+// .conda package`, pointing users at a package that was fine. These drive the
+// real conda router: an incomplete body is 408 `incomplete_body`, a server
+// that cannot hold the body is 503 + Retry-After, and only a complete body
+// that fails to parse is 400.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod upload_body_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::upload_body::UploadMemoryBudget;
+
+    const FILENAME: &str = "upbody-1.0-0.conda";
+
+    fn valid_package() -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": "upbody", "version": "1.0", "build": "0", "build_number": 0,
+            "depends": [], "license": "MIT", "subdir": "linux-64",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let mut tar_buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_buf);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(index_bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "info/index.json", &index_bytes[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let info = zstd::encode_all(std::io::Cursor::new(&tar_buf), 3).unwrap();
+        let mut zip_buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let o = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("metadata.json", o).unwrap();
+            std::io::Write::write_all(&mut w, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            w.start_file("info-upbody-1.0-0.tar.zst", o).unwrap();
+            std::io::Write::write_all(&mut w, &info).unwrap();
+            w.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    /// A PUT whose body is `frames`, declaring `content_length`.
+    fn put_frames(
+        repo_key: &str,
+        content_length: Option<u64>,
+        frames: Vec<Result<Bytes, std::io::Error>>,
+    ) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{repo_key}/linux-64/{FILENAME}"))
+            .header(CONTENT_TYPE, "application/octet-stream");
+        if let Some(n) = content_length {
+            b = b.header(CONTENT_LENGTH, n.to_string());
+        }
+        b.body(Body::from_stream(futures::stream::iter(frames)))
+            .unwrap()
+    }
+
+    async fn stored_rows(fx: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap()
+    }
+
+    fn json_code(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn body_shorter_than_content_length_is_408_and_never_parsed() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let pkg = valid_package();
+        let half = Bytes::copy_from_slice(&pkg[..pkg.len() / 2]);
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            put_frames(&fx.repo_key, Some(pkg.len() as u64), vec![Ok(half)]),
+        )
+        .await;
+        let rows = stored_rows(&fx).await;
+        fx.teardown().await;
+
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{text}");
+        assert_eq!(json_code(&body), "incomplete_body", "{text}");
+        assert!(
+            !text.contains("ZIP"),
+            "the parser must not have run: {text}"
+        );
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_reset_mid_body_is_408_not_invalid_zip() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let pkg = valid_package();
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            put_frames(
+                &fx.repo_key,
+                None,
+                vec![
+                    Ok(Bytes::copy_from_slice(&pkg[..10])),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "peer reset",
+                    )),
+                ],
+            ),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(json_code(&body), "incomplete_body");
+    }
+
+    #[tokio::test]
+    async fn server_side_read_failure_is_503_with_retry_after() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let (status, body, headers) = tdh::send_with_headers(
+            fx.router_with_auth(super::router()),
+            put_frames(
+                &fx.repo_key,
+                None,
+                vec![Err(std::io::Error::other("request decoder failed"))],
+            ),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(json_code(&body), "upload_receive_failed");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("decoder"),
+            "server-side cause stays in the log: {text}"
+        );
+    }
+
+    /// Injected allocation failure: the in-memory upload budget is held by
+    /// other uploads, so this one is shed with 503 + Retry-After instead of
+    /// being buffered (and OOM-killing the replica, red-team S9).
+    #[tokio::test]
+    async fn exhausted_memory_budget_is_503_with_retry_after() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let budget = UploadMemoryBudget::new(1024 * 1024);
+        let _other_uploads = budget.try_reserve(1024 * 1024).unwrap();
+        let pkg = valid_package();
+        let mut req = tdh::put(
+            format!("/{}/linux-64/{FILENAME}", fx.repo_key),
+            Bytes::from(pkg.clone()),
+        );
+        req.headers_mut()
+            .insert(CONTENT_LENGTH, pkg.len().to_string().parse().unwrap());
+        req.extensions_mut().insert(budget.clone());
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_with_auth(super::router()), req).await;
+        let rows = stored_rows(&fx).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(json_code(&body), "upload_capacity_exhausted");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn complete_but_corrupt_zip_is_still_400() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let junk = Bytes::from_static(b"PK\x03\x04 this is not a zip archive at all");
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(format!("/{}/linux-64/{FILENAME}", fx.repo_key), junk),
+        )
+        .await;
+        fx.teardown().await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(text.contains("not a valid ZIP archive"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn complete_valid_package_with_content_length_is_stored() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let pkg = valid_package();
+        let budget = UploadMemoryBudget::new(64 * 1024 * 1024);
+        let mut req = put_frames(
+            &fx.repo_key,
+            Some(pkg.len() as u64),
+            pkg.chunks(7)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect(),
+        );
+        req.extensions_mut().insert(budget.clone());
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        let rows = stored_rows(&fx).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows, 1);
+        assert_eq!(
+            budget.available_bytes(),
+            64 * 1024 * 1024,
+            "the body's budget is released once the request is done"
+        );
     }
 }

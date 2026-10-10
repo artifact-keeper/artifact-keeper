@@ -9,6 +9,7 @@
 //!   GET  /hex/{repo_key}/names                         - List all package names
 //!   GET  /hex/{repo_key}/versions                      - List all packages with versions
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
@@ -17,7 +18,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -827,7 +827,7 @@ async fn publish_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "hex", "write:artifacts")?.user_id;
@@ -1847,6 +1847,7 @@ fn build_hex_release_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     // -----------------------------------------------------------------------
     // #3718: the signed-registry 500s must not echo the service error

@@ -10,6 +10,7 @@
 //!   GET  /cargo/{repo_key}/api/v1/crates/{name}/{version}/download - Download crate
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
+use crate::api::handlers::upload_body::UploadBody;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -1819,7 +1820,7 @@ async fn publish(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
     // accepted for `cargo publish`. Enforce the write scope on the token

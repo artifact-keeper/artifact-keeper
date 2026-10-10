@@ -12,6 +12,7 @@
 //!   PUT  /npm/{repo_key}/{package}                    - Publish package
 //!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
@@ -5297,7 +5298,7 @@ async fn publish(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let package = validate_publish_package_name(&package)?;
     publish_package(&state, auth, &repo_key, &package, &headers, body).await
@@ -5308,7 +5309,7 @@ async fn publish_scoped(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let full_name = validate_scoped_publish_package_name(&scope, &package)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await

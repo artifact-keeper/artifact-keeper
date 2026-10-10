@@ -12,6 +12,7 @@
 //!   PUT  /composer/{repo_key}/api/packages                            - Upload/register package
 //!   POST /composer/{repo_key}/api/packages                            - Upload/register package
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -1633,7 +1634,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.

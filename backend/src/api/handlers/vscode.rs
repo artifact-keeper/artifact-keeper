@@ -13,6 +13,7 @@
 //! hosted VSIX publishing and its existing clients continue using the legacy
 //! surface.
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -4297,7 +4298,7 @@ async fn publish_extension(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "vscode", "write:artifacts")?.user_id;
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;

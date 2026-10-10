@@ -23,6 +23,7 @@
 //! Packages built for `any` architecture are listed in every architecture's
 //! database and downloadable under every `{arch}`, as on the official mirrors.
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -612,7 +613,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "pacman", "write:artifacts")?.user_id;

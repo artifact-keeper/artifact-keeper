@@ -11,6 +11,7 @@
 //!   PUT  /go/{repo_key}/*module/@v/{version}.zip     - Upload module zip
 //!   PUT  /go/{repo_key}/*module/@v/{version}.mod     - Upload go.mod
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -335,7 +336,7 @@ async fn handle_put(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: reject read-scoped API tokens on PUT.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
