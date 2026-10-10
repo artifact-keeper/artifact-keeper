@@ -6,6 +6,7 @@ use crate::services::audit_service::{
 use crate::services::guest_access_policy::{
     GuestAccessSource, ResolvedGuestAccess, GUEST_ACCESS_SETTING_KEY,
 };
+use crate::services::hidden_nav_items;
 use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy, TokenPolicySource};
 use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
@@ -1087,11 +1088,11 @@ pub async fn update_totp_policy(
 }
 
 // ---------------------------------------------------------------------------
-// Runtime system settings: guest access (#867)
+// Runtime system settings: guest access (#867), hidden navigation (#4574)
 // ---------------------------------------------------------------------------
 
-/// Runtime-managed system settings. Today only guest access; the shape leaves
-/// room for further runtime toggles under the same endpoint.
+/// Runtime-managed system settings: guest access and the web UI navigation
+/// entries hidden for every user.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RuntimeSettingsResponse {
     /// Whether anonymous (unauthenticated) access is allowed right now. This
@@ -1107,6 +1108,10 @@ pub struct RuntimeSettingsResponse {
     /// Whether a `PATCH` changes the effective value now. `false` while
     /// `AK_GUEST_ACCESS_ENABLED` pins it; the write is still stored.
     pub guest_access_editable: bool,
+    /// Web UI navigation entries hidden for every user (#4574). Display only:
+    /// a hidden page stays reachable by URL and keeps its permission checks.
+    /// Empty (the default) means every entry is shown.
+    pub hidden_nav_items: Vec<String>,
 }
 
 /// Request body for `PATCH /admin/settings/system`. Omitted fields are left
@@ -1116,18 +1121,67 @@ pub struct RuntimeSettingsResponse {
 pub struct UpdateRuntimeSettingsRequest {
     /// Allow (`true`) or refuse (`false`) anonymous access server-wide.
     pub guest_access_enabled: Option<bool>,
+    /// Replace the list of web UI navigation entries hidden for every user
+    /// (#4574). The identifiers are opaque to the server (the web UI sends
+    /// route paths such as `/peers`); each must be 1-128 characters of ASCII
+    /// letters, digits, `/`, `-`, `_` or `.`, at most 200 entries. An empty
+    /// list shows every entry again.
+    pub hidden_nav_items: Option<Vec<String>>,
 }
 
 fn runtime_settings_response(
     resolved: ResolvedGuestAccess,
     pinned: bool,
+    hidden_nav_items: Vec<String>,
 ) -> RuntimeSettingsResponse {
     RuntimeSettingsResponse {
         guest_access_enabled: resolved.enabled,
         guest_access_source: resolved.source,
         guest_access_stored: resolved.stored,
         guest_access_editable: !pinned,
+        hidden_nav_items,
     }
+}
+
+/// Write a `SETTING_CHANGED` audit entry for a runtime setting. The resource
+/// is the acting admin, as for every runtime-settings write.
+async fn audit_setting_changed(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+    details: serde_json::Value,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .resource_name(key)
+            .details(details),
+    )
+    .await;
+}
+
+/// Audit `details` for a hidden-navigation write (#4574).
+fn hidden_nav_items_audit_details(before: &[String], after: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "setting": hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY,
+        "from": before,
+        "to": after,
+    })
+}
+
+/// Fresh read of the hidden navigation entries for the admin endpoints. Like
+/// [`read_guest_access`], a database error is a 503 here: the admin form must
+/// not be seeded from a guessed value. (`/system/config` fails open instead.)
+async fn read_hidden_nav_items(db: &sqlx::PgPool) -> Result<Vec<String>> {
+    hidden_nav_items::try_load(db).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the hidden navigation items");
+        AppError::ServiceUnavailable(
+            "the navigation setting could not be read; retry shortly".to_string(),
+        )
+    })
 }
 
 /// Audit `details` for a guest-access write: old -> new effective value, the
@@ -1162,7 +1216,8 @@ async fn read_guest_access(
     })
 }
 
-/// Read the runtime system settings (guest access and its source).
+/// Read the runtime system settings (guest access and its source, hidden
+/// navigation entries).
 #[utoipa::path(
     get,
     path = "/settings/system",
@@ -1182,9 +1237,11 @@ pub async fn get_runtime_settings(
     // Bypass the cache: an operator checking the setting wants the database's
     // answer, not a cached or fallback one -- a read failure is a 503.
     let resolved = read_guest_access(policy).await?;
+    let hidden = read_hidden_nav_items(&state.db).await?;
     Ok(Json(runtime_settings_response(
         resolved,
         policy.is_env_pinned(),
+        hidden,
     )))
 }
 
@@ -1195,6 +1252,10 @@ pub async fn get_runtime_settings(
 /// `AK_GUEST_ACCESS_ENABLED`, when set explicitly, still wins (it is the
 /// break-glass): the value is stored but `guest_access_editable` is `false`
 /// and the effective value does not change until the env var is unset.
+///
+/// `hidden_nav_items` replaces the list of web UI navigation entries hidden
+/// for every user. It is validated before anything is written, so an invalid
+/// list leaves both settings untouched.
 #[utoipa::path(
     patch,
     path = "/settings/system",
@@ -1214,29 +1275,60 @@ pub async fn update_runtime_settings(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<UpdateRuntimeSettingsRequest>,
 ) -> Result<Json<RuntimeSettingsResponse>> {
-    let Some(enabled) = payload.guest_access_enabled else {
+    if payload.guest_access_enabled.is_none() && payload.hidden_nav_items.is_none() {
         return Err(AppError::Validation(
-            "no setting to update; supported fields: guest_access_enabled".to_string(),
+            "no setting to update; supported fields: guest_access_enabled, hidden_nav_items"
+                .to_string(),
         ));
-    };
-    let policy = &state.guest_access_policy;
-    let before = read_guest_access(policy).await?;
-    let after = policy.store(enabled, auth.user_id).await?;
+    }
+    let new_hidden = payload
+        .hidden_nav_items
+        .map(hidden_nav_items::normalize)
+        .transpose()
+        .map_err(AppError::Validation)?;
 
-    audit_fire_and_forget(
-        state.db.clone(),
-        AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
-            .user(auth.user_id)
-            .resource(auth.user_id)
-            .actor_name(&auth.username)
-            .resource_name(GUEST_ACCESS_SETTING_KEY)
-            .details(guest_access_audit_details(before, after)),
-    )
-    .await;
+    let policy = &state.guest_access_policy;
+    // Read both before writing either, so a failed read cannot leave one
+    // setting written and the request reported as failed.
+    let before = read_guest_access(policy).await?;
+    let hidden_before = read_hidden_nav_items(&state.db).await?;
+
+    let guest = match payload.guest_access_enabled {
+        Some(enabled) => {
+            let after = policy.store(enabled, auth.user_id).await?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                GUEST_ACCESS_SETTING_KEY,
+                guest_access_audit_details(before, after),
+            )
+            .await;
+            after
+        }
+        None => before,
+    };
+
+    let hidden = match new_hidden {
+        Some(items) => {
+            hidden_nav_items::store(&state.db, &items, auth.user_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY,
+                hidden_nav_items_audit_details(&hidden_before, &items),
+            )
+            .await;
+            items
+        }
+        None => hidden_before,
+    };
 
     Ok(Json(runtime_settings_response(
-        after,
+        guest,
         policy.is_env_pinned(),
+        hidden,
     )))
 }
 
@@ -4900,6 +4992,7 @@ mod tests {
         let r = runtime_settings_response(
             resolved(false, GuestAccessSource::Environment, Some(true)),
             true,
+            vec!["/peers".to_string()],
         );
         assert!(!r.guest_access_enabled);
         assert_eq!(r.guest_access_source, GuestAccessSource::Environment);
@@ -4908,11 +5001,93 @@ mod tests {
         let json = serde_json::to_value(runtime_settings_response(
             resolved(true, GuestAccessSource::Default, None),
             false,
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(json["guest_access_source"], "default");
         assert_eq!(json["guest_access_editable"], true);
         assert!(json["guest_access_stored"].is_null());
+        assert_eq!(json["hidden_nav_items"], serde_json::json!([]));
+        assert_eq!(r.hidden_nav_items, vec!["/peers".to_string()]);
+    }
+
+    #[test]
+    fn test_update_runtime_settings_accepts_hidden_nav_items() {
+        let r: UpdateRuntimeSettingsRequest =
+            serde_json::from_value(serde_json::json!({"hidden_nav_items": ["/peers"]})).unwrap();
+        assert_eq!(r.guest_access_enabled, None);
+        assert_eq!(r.hidden_nav_items, Some(vec!["/peers".to_string()]));
+    }
+
+    #[test]
+    fn test_hidden_nav_items_audit_details_record_the_change() {
+        let d = hidden_nav_items_audit_details(&[], &["/peers".to_string()]);
+        assert_eq!(d["setting"], hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY);
+        assert_eq!(d["from"], serde_json::json!([]));
+        assert_eq!(d["to"], serde_json::json!(["/peers"]));
+    }
+
+    /// #4574: an admin PATCH stores the hidden navigation entries (normalized),
+    /// GET reports them, an invalid list writes nothing, and the guest-access
+    /// setting is left alone when only the navigation list is sent.
+    #[tokio::test]
+    async fn test_runtime_hidden_nav_items_round_trip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-hidden-nav");
+        let auth = admin_auth(user_id, &username);
+        let before = hidden_nav_items::try_load(&pool).await.expect("read");
+        let patch = |items: Vec<&str>| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: None,
+                    hidden_nav_items: Some(items.into_iter().map(String::from).collect()),
+                }),
+            )
+        };
+
+        let Json(initial) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(set) = patch(vec!["/webhooks", "/peers", "/peers"])
+            .await
+            .expect("hide entries");
+        let Json(read) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let invalid = patch(vec!["/peers", "not allowed"]).await.err();
+        let Json(after_invalid) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(cleared) = patch(vec![]).await.expect("show everything");
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 2).await;
+
+        if before.is_empty() {
+            sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+                .execute(&pool)
+                .await
+                .expect("cleanup setting");
+        } else {
+            hidden_nav_items::store(&pool, &before, user_id)
+                .await
+                .expect("restore setting");
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let expected = vec!["/peers".to_string(), "/webhooks".to_string()];
+        assert_eq!(set.hidden_nav_items, expected);
+        assert_eq!(read.hidden_nav_items, expected);
+        assert!(
+            matches!(invalid, Some(AppError::Validation(_))),
+            "{invalid:?}"
+        );
+        assert_eq!(after_invalid.hidden_nav_items, expected);
+        assert!(cleared.hidden_nav_items.is_empty());
+        assert_eq!(set.guest_access_enabled, initial.guest_access_enabled);
+        assert_eq!(set.guest_access_source, initial.guest_access_source);
+        assert_eq!(audited, 2, "each navigation write must be audited");
     }
 
     #[test]
@@ -4999,6 +5174,7 @@ mod tests {
                 Extension(auth.clone()),
                 Json(UpdateRuntimeSettingsRequest {
                     guest_access_enabled: v,
+                    hidden_nav_items: None,
                 }),
             )
         };
@@ -5027,6 +5203,7 @@ mod tests {
             Extension(auth.clone()),
             Json(UpdateRuntimeSettingsRequest {
                 guest_access_enabled: Some(false),
+                hidden_nav_items: None,
             }),
         )
         .await
@@ -5061,6 +5238,7 @@ mod tests {
             Extension(auth.clone()),
             Json(UpdateRuntimeSettingsRequest {
                 guest_access_enabled: Some(false),
+                hidden_nav_items: None,
             }),
         )
         .await

@@ -45,6 +45,7 @@ pub mod federated_email;
 pub mod grype_scanner;
 pub mod guest_access_policy;
 pub mod helm_lint_checker;
+pub mod hidden_nav_items;
 pub mod http_client;
 pub mod image_build_service;
 pub mod image_scanner;
