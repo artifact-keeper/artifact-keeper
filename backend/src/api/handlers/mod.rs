@@ -409,6 +409,7 @@ pub mod transfer;
 pub mod trash;
 pub mod tree;
 pub mod upload;
+pub mod upload_body;
 pub mod users;
 pub mod vscode;
 pub mod wasm_proxy;
@@ -2361,11 +2362,6 @@ mod raw_error_body_class_tests {
         (
             "proxy_helpers.rs",
             "Failed to read metadata JSON",
-            "caller input",
-        ),
-        (
-            "proxy_helpers.rs",
-            "Failed to read upload body",
             "caller input",
         ),
         (

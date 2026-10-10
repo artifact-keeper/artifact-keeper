@@ -6925,10 +6925,10 @@ pub async fn put_artifact_bytes(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage
-        .put(storage_key, body)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    storage.put(storage_key, body).await.map_err(|e| {
+        // #4609: a full disk is 507 + Retry-After, not an opaque 500.
+        super::upload_body::disk_full_response(&e).unwrap_or_else(|| internal_error("Storage", e))
+    })?;
     Ok(())
 }
 
@@ -7013,7 +7013,7 @@ pub async fn stage_upload_field(
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| internal_error("Staging directory", e))?;
+            .map_err(|e| spool_error("Staging directory", &e))?;
     }
 
     // Arm the RAII cleanup before the first write so any early return below
@@ -7025,17 +7025,15 @@ pub async fn stage_upload_field(
 
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|e| internal_error("Staging file", e))?;
+        .map_err(|e| spool_error("Staging file", &e))?;
 
     let max = state.config.max_upload_size_bytes;
     let mut written: u64 = 0;
-    while let Some(chunk) = field.chunk().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read upload body: {e}"),
-        )
-            .into_response()
-    })? {
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| upload_body_error_response(&e, written, max))?
+    {
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err((
@@ -7046,15 +7044,15 @@ pub async fn stage_upload_field(
         }
         file.write_all(&chunk)
             .await
-            .map_err(|e| internal_error("Staging write", e))?;
+            .map_err(|e| spool_error("Staging write", &e))?;
     }
 
     file.flush()
         .await
-        .map_err(|e| internal_error("Staging flush", e))?;
+        .map_err(|e| spool_error("Staging flush", &e))?;
     file.sync_all()
         .await
-        .map_err(|e| internal_error("Staging sync", e))?;
+        .map_err(|e| spool_error("Staging sync", &e))?;
 
     staged.size_bytes = written as i64;
     Ok(staged)
@@ -7093,11 +7091,14 @@ pub async fn put_artifact_stream(
     // Sanitised text, not `internal_error`: the raw storage error names paths
     // and backends and must not reach the client (#3718).
     let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
+        // #4609: a full disk is 507 + Retry-After, not an opaque 500.
+        super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::storage_err_message(&e),
+            )
+                .into_response()
+        })
     })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
@@ -7115,7 +7116,7 @@ async fn open_staged_stream(
 
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| internal_error("Staging reopen", e))?;
+        .map_err(|e| spool_error("Staging reopen", &e))?;
     let reader = BufReader::with_capacity(STREAM_STAGE_CHUNK, file);
     let stream = ReaderStream::with_capacity(reader, STREAM_STAGE_CHUNK)
         .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("staged read: {e}"))));
@@ -7186,7 +7187,7 @@ pub async fn stage_stream_content_addressed<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>>,
-    E: std::fmt::Display + 'static,
+    E: std::error::Error + 'static,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -7195,7 +7196,7 @@ where
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| internal_error("Staging directory", e))?;
+            .map_err(|e| spool_error("Staging directory", &e))?;
     }
 
     // Arm the RAII cleanup before the first write so any early return below
@@ -7207,7 +7208,7 @@ where
 
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|e| internal_error("Staging file", e))?;
+        .map_err(|e| spool_error("Staging file", &e))?;
 
     let max = state.config.max_upload_size_bytes;
     let mut hasher = crate::services::artifact_service::MultiHasher::new();
@@ -7215,7 +7216,7 @@ where
 
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| upload_body_error_response(&e))?;
+        let chunk = chunk.map_err(|e| upload_body_error_response(&e, written, max))?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err(upload_too_large_response(max));
@@ -7223,15 +7224,15 @@ where
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
-            .map_err(|e| internal_error("Staging write", e))?;
+            .map_err(|e| spool_error("Staging write", &e))?;
     }
 
     file.flush()
         .await
-        .map_err(|e| internal_error("Staging flush", e))?;
+        .map_err(|e| spool_error("Staging flush", &e))?;
     file.sync_all()
         .await
-        .map_err(|e| internal_error("Staging sync", e))?;
+        .map_err(|e| spool_error("Staging sync", &e))?;
 
     staged.size_bytes = written as i64;
     Ok((staged, hasher.finalize()))
@@ -7268,17 +7269,29 @@ pub async fn open_staged_upload_stream(
     open_staged_stream(staged.path()).await
 }
 
-/// Map an upload-body read error to its response: 413 when a multipart
-/// stream hit its size cap, 400 for any other read failure.
-fn upload_body_error_response<E: std::fmt::Display + 'static>(e: &E) -> Response {
-    match (e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
-        Some(multer::Error::StreamSizeExceeded { limit }) => upload_too_large_response(*limit),
-        _ => (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read upload body: {e}"),
-        )
-            .into_response(),
+/// Map an upload-body read error to its response (#4609): 413 when a size
+/// cap was hit, 400 for a malformed multipart envelope, 408 `incomplete_body`
+/// when the body was cut short, and 503 + `Retry-After` for a read failure
+/// that is not the client's. Never a partial body handed on to a parser.
+fn upload_body_error_response<E: std::error::Error + 'static>(
+    e: &E,
+    received: u64,
+    max: u64,
+) -> Response {
+    match super::upload_body::classify_body_error(e, received, None, max) {
+        super::upload_body::UploadBodyError::TooLarge { limit, .. } => {
+            upload_too_large_response(limit)
+        }
+        other => other.into_response(),
     }
+}
+
+/// Map a failed scratch-file operation (#4609): a full disk or exhausted
+/// quota is `507` + `Retry-After`, any other I/O failure `503` +
+/// `Retry-After`, both logged at `error` with the cause. Previously a bare
+/// `500` that echoed the OS error (and the scratch path) to the client.
+fn spool_error(label: &str, e: &std::io::Error) -> Response {
+    super::upload_body::spool_write_error(label, e).into_response()
 }
 
 fn upload_too_large_response(max: u64) -> Response {
@@ -7444,7 +7457,7 @@ pub async fn stage_stream_on_backend<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
-    E: std::fmt::Display + 'static,
+    E: std::error::Error + 'static,
 {
     use crate::services::artifact_service::MultiHasher;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7488,7 +7501,10 @@ where
                 };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
-                    Err(e) => return refuse(upload_body_error_response(&e)),
+                    Err(e) => {
+                        let received = counted.load(Ordering::Relaxed);
+                        return refuse(upload_body_error_response(&e, received, max));
+                    }
                 };
                 let written = counted
                     .fetch_add(chunk.len() as u64, Ordering::Relaxed)
@@ -23412,5 +23428,82 @@ mod virtual_winner_recording_tests_3844 {
             "the resolver leaves the hosted winner to its caller"
         );
         assert_eq!(remote_rows, 0, "the losing Remote member is not counted");
+    }
+}
+
+// #4609: the shared spooling primitive never hands a partial body on. A body
+// cut short is 408 `incomplete_body`, a read failure that is not the client's
+// is 503, and a scratch file that cannot be written is 503/507, each with
+// `Retry-After` where retrying can help.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod spool_failure_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn stream_of(
+        items: Vec<std::result::Result<Bytes, std::io::Error>>,
+    ) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> {
+        futures::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_408_incomplete_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![
+                Ok(Bytes::from_static(b"partial")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before message completed",
+                )),
+            ]),
+        )
+        .await
+        .err()
+        .expect("a cut-short body must not be staged");
+        assert_eq!(err.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn server_side_read_failure_is_503_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![Err(std::io::Error::other("decoder failed"))]),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.headers().contains_key(axum::http::header::RETRY_AFTER));
+    }
+
+    /// Injected spool failure: the scratch directory cannot be created
+    /// (storage path is a regular file). 503 + Retry-After, not a bare 500
+    /// that echoes the OS error and path.
+    #[tokio::test]
+    async fn unwritable_scratch_is_503_with_retry_after() {
+        if std::env::var_os("AK_UPLOAD_STAGING_DIR").is_some()
+            || std::env::var_os("AK_INCUS_UPLOAD_TMP_DIR").is_some()
+        {
+            return; // staging is redirected; this layout cannot be forced
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("storage-is-a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), not_a_dir.to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![Ok(Bytes::from_static(b"body"))]),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.headers().contains_key(axum::http::header::RETRY_AFTER));
     }
 }

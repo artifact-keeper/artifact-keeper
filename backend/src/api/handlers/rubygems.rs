@@ -17,6 +17,7 @@
 //! gem name it owns (#4280). rubygems.org `specs.4.8.gz` is gzipped Marshal,
 //! not JSON: parsing it as JSON produced an empty ~24-byte index.
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -296,7 +297,7 @@ async fn push_gem(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.

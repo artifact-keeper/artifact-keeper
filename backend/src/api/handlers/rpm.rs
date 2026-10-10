@@ -14,6 +14,7 @@
 //!   PUT  /rpm/{repo_key}/packages/*path              - Upload RPM package
 //!   POST /rpm/{repo_key}/upload                      - Upload RPM (alternative)
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -2365,7 +2366,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, pkg_path)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
@@ -2393,7 +2394,7 @@ async fn upload_relative(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -2421,7 +2422,7 @@ async fn upload_package_post(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;

@@ -570,7 +570,7 @@ fn fn_body_span(masked: &str, sig_pos: usize) -> Option<(usize, usize)> {
 
 /// Byte offsets of every standalone `body: Bytes` parameter in masked code (any
 /// run of spaces between `body:` and `Bytes`, with both `body` and `Bytes` whole
-/// words).
+/// words), and of every `UploadBody(body): UploadBody` extractor.
 fn raw_body_bytes_positions(masked: &str) -> Vec<usize> {
     let b = masked.as_bytes();
     let mut out = Vec::new();
@@ -596,6 +596,19 @@ fn raw_body_bytes_positions(masked: &str) -> Vec<usize> {
             }
         }
     }
+    // `UploadBody(body): UploadBody` (#4609) is the same whole-body buffer
+    // with a memory budget and a length check; it is tracked like `body:
+    // Bytes`, so swapping the extractor is not mistaken for streaming.
+    let mut from = 0usize;
+    while let Some(rel) = masked[from..].find("UploadBody(body): UploadBody") {
+        let at = from + rel;
+        from = at + 1;
+        let prev_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        if prev_ok {
+            out.push(at);
+        }
+    }
+    out.sort_unstable();
     out
 }
 
