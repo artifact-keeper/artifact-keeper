@@ -37,11 +37,31 @@
 # a stale builder cache into a loud build failure instead of a silently
 # vulnerable stdlib. Raise GO_MIN_PATCH in lockstep with the backend
 # Dockerfiles when a new Go stdlib advisory lands.
+#
+# 1.26.6 -> 1.27.2 on 2026-10-10. Two reasons, and the first is the one that
+# matters for next time. (1) The floor had gone INERT: #3579 moved the
+# FROM from `golang:1.26-alpine` to `golang:1.27-alpine` and left the floor
+# on 1.26.6, and the check is a `sort -V`, so every 1.27.x passed it and no
+# lagging mirror could fail it. That is the exact bug #3655 fixed in the backend
+# Dockerfiles ("keep the floor on the newest patch of whatever minor the FROM
+# line names, or this check goes inert again"); this file missed that fix.
+# The "Go 1.26 toolchain" and "floating `1.26` tag" wording above is from
+# before #3579 as well: the FROM floats on 1.27. (2) go1.27.2 is Go's
+# 2026-10 security release (CVE-2026-78667 net/http, CVE-2026-78669 HTTP/2,
+# CVE-2026-97031 crypto/tls, all HIGH), raised in lockstep with the backend.
+# The adapter binary itself scanned CLEAN in the run that failed on those
+# CVEs (main, a8fd2b47, run 38087035953), because the floating FROM had
+# already served go1.27.2; the floor makes that a guarantee rather than a
+# coincidence of build timing. The adapter is still stdlib-only, so there is
+# no golang.org/x/net in it to bump: its go.mod has no require block and no
+# go.sum, and adding x/net would add a dependency nothing imports (`go mod
+# tidy` removes it again). The x/net findings in this image are in the
+# bundled trivy, below.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG GO_MIN_PATCH=1.26.6
+ARG GO_MIN_PATCH=1.27.2
 
 RUN set -eu; \
     have="$(go env GOVERSION | sed 's/^go//')"; \
@@ -117,11 +137,23 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so the override stays an override (artifact-keeper/trivy#14); the backend's
 # grype carries the same bump in Dockerfile.backend{,.alpine} (#3792).
 #
+# 0.74.0-r3 -> 0.74.0-r4 (2026-10-10) is Go's October security release, and
+# the first r-build that moves the toolchain and an override together. The r3
+# binary was compiled on go1.26.7 with golang.org/x/net v0.58.0 and failed
+# the gate on four HIGHs: CVE-2026-78669 against x/net (fixed in v0.60.0) and
+# CVE-2026-78667 / -78669 / -97031 against the stdlib (fixed in go1.26.9 /
+# go1.27.2). r4 builds on go1.26.9 and overrides x/net to v0.60.0, plus the
+# six golang.org/x modules MVS moves with it, all at the versions upstream
+# v0.75.0 already ships. Upstream has not bumped x/net anywhere yet, so that
+# entry is a declared exception to the trivy repo's "upstream already made
+# the bump" rule, and it says so in overrides.yaml. The backend's grype and
+# buildctl carry the same x/net override in docker/Dockerfile.backend.
+#
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r3 (note: no leading
+# This digest is the manifest-list digest of tag 0.74.0-r4 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -130,7 +162,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # probes the real version at startup (ProbeVersion). The upstream source tag
 # DID move this time — the bundled binary now reports `Version: 0.74.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:29a423b8a34a642b78c1c6d3677759cb41a8aa42df53fd542ba44d745d954410 AS trivy
+FROM ghcr.io/artifact-keeper/trivy@sha256:29f16523b5bb4cc61532eda0345968e4a0b449db6b20b1881a1133a4abd9c32b AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

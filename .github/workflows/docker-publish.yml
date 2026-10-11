@@ -610,7 +610,12 @@ jobs:
           # security input exactly like `dnf upgrade` is. Cached, it would keep
           # shipping the toolchain from whenever the layer was first built —
           # which is the failure mode #3352 exists to remove.
-          no-cache-filters: rootfs-builder,grype-bin,grype-db-seed,runtime
+          #
+          # `buildkit-bin` joined it on 2026-10-10 for the same reason: buildctl
+          # is now compiled from source on the floating `golang:1.27-alpine`
+          # too, instead of copied out of moby/buildkit (whose go1.26.8 build
+          # failed the Trivy gate on four HIGH stdlib/x-net findings).
+          no-cache-filters: rootfs-builder,grype-bin,buildkit-bin,grype-db-seed,runtime
           sbom: true
           provenance: mode=max
           build-args: |

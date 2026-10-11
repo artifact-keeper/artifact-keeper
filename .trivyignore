@@ -9,7 +9,9 @@
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
 #       backend images do NOT bundle trivy)
-#   Both are short-lived CLI subprocesses the services shell out to. They are
+#     - /usr/local/bin/buildctl  (moby/buildkit v0.33.0, BUILT FROM SOURCE in
+#       docker/Dockerfile.backend since 2026-10-10 — UBI backend image only)
+#   All are short-lived CLI subprocesses the services shell out to. They are
 #   NOT part of the network-reachable service surface (axum HTTP :8080 / gRPC
 #   :9090 / adapter HTTP :8080). The vulnerable code paths (docker client
 #   libs, OCI registry clients, sigstore verification, etc.) are not exercised
@@ -119,6 +121,18 @@
 # so grype makes no outbound HTTP at runtime) is still true and still not a
 # fix. It is deliberately not reproduced as a justification, because it is no
 # longer load-bearing: the vulnerable code is not linked in at all.
+#
+# ---------------------------------------------------------------------------
+# NOTHING ADDED for the 2026-10-10 Go security release, and that is the rule
+# working. Docker Publish failed on main from a8fd2b47 (run 38087035953) on
+# CVE-2026-78669 (golang.org/x/net v0.58.0, fixed v0.60.0) against grype,
+# buildctl and trivy, plus CVE-2026-78667 / -78669 / -97031 (stdlib, fixed in
+# go1.26.9 / go1.27.2) against buildctl (go1.26.8) and trivy (go1.26.7).
+# Every one had a version to build against, so: GO_MIN_PATCH 1.27.2 in every
+# Go build stage in this repo, an x/net override in grype-bin, buildctl moved
+# from a copied upstream binary to a source build with the same override, and
+# the trivy half in artifact-keeper/trivy (GO_VERSION 1.26.9, x/net override
+# in overrides.yaml). None of those tokens belongs in this file.
 #
 # ---------------------------------------------------------------------------
 # grype v0.118.0 binary — github.com/docker/docker @ v28.5.2+incompatible
