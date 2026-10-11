@@ -1808,8 +1808,12 @@ mod tests {
         let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
         let (user_id, _name) = tdh::create_user(&pool).await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        // The progress window starts when the handler first reads the body
+        // (`ProgressDeadlineBody`), so it only has to outlast the third
+        // request below, not the time the held uploads take to authenticate.
+        const WINDOW_SECS: u64 = 4;
         let state = tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), |c| {
-            c.upload_progress_window_secs = 2;
+            c.upload_progress_window_secs = WINDOW_SECS;
             c.upload_min_progress_bytes = 1024;
             c.upload_max_in_flight_per_principal = 2;
             c.global_max_concurrency = 8;
@@ -1825,9 +1829,16 @@ mod tests {
                 .body(body)
                 .unwrap()
         };
+        // A body that sends one byte and then nothing. Its first poll means
+        // the handler is reading it, i.e. the upload has passed the
+        // per-principal admission and holds a slot; it reports that on
+        // `entered`.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let stalled_body = || {
+            let entered = entered_tx.clone();
             Body::from_stream(
-                futures::stream::once(async {
+                futures::stream::once(async move {
+                    let _ = entered.send(());
                     Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))
                 })
                 .chain(futures::stream::pending()),
@@ -1841,21 +1852,24 @@ mod tests {
             .map(|n| tokio::spawn(app.clone().oneshot(put(oid(n), stalled_body()))))
             .collect();
 
-        // A third is refused at once. Poll until both are admitted (they pass
-        // authentication first), well inside the 2 s window.
-        let mut third = StatusCode::OK;
-        while started.elapsed() < std::time::Duration::from_millis(1500) {
-            let resp = app
-                .clone()
-                .oneshot(put(oid(3), Body::from("y")))
+        // Wait until both hold their slots (they authenticate first, which
+        // takes as long as the database does), then a third is refused at
+        // once. Waiting on the uploads themselves rather than on the clock
+        // keeps a slow runner from sending the third before the first two
+        // are admitted (it used to poll for a fixed 1.5 s and then got 422
+        // from the LFS handler instead of 429).
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
                 .await
-                .unwrap();
-            third = resp.status();
-            if third == StatusCode::TOO_MANY_REQUESTS {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                .expect("both stalled uploads must reach the handler")
+                .expect("the entered channel stays open");
         }
+        let third = app
+            .clone()
+            .oneshot(put(oid(3), Body::from("y")))
+            .await
+            .unwrap()
+            .status();
         let health = app
             .clone()
             .oneshot(tdh::get("/health".into()))
@@ -1927,7 +1941,7 @@ mod tests {
             vec![StatusCode::REQUEST_TIMEOUT, StatusCode::REQUEST_TIMEOUT],
             "stalled uploads end with 408"
         );
-        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(WINDOW_SECS));
         assert_eq!(real_status, StatusCode::OK, "a real upload still works");
         assert_eq!(stored, Some((300 * 1024, real_oid)));
     }

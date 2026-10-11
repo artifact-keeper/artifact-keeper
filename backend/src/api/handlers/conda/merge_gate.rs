@@ -272,6 +272,7 @@ impl SharedResponse {
         // Error bodies are a line of text, read under a 1 MiB bound; a failure
         // to read one still keeps the status.
         #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: replays one merge's own error response (a 502/503/404 line of text, capped at 1 MiB) to every request that shared the merge; never an artifact or metadata body (#4608)
         let body = axum::body::to_bytes(body, 1024 * 1024)
             .await
             .unwrap_or_default();

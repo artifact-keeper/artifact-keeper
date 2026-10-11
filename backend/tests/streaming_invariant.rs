@@ -94,7 +94,14 @@ use std::path::{Path, PathBuf};
 /// shape as the existing login-body peek (`LOGIN_BODY_PEEK_LIMIT`). A
 /// legitimate new metadata buffer site, not an artifact path: rate_limit.rs
 /// 1 -> 2, total 29 -> 30.
+///
+/// #4608: the virtual conda merge gate shares one merge between every request
+/// for the same document, and replays the merge's own error response (a 502,
+/// 503 or 404 line of text, read under a 1 MiB bound) to each of them. That
+/// replay reads the error body once; it never touches an artifact or a
+/// metadata document. New file conda/merge_gate.rs: 1, total 30 -> 31.
 const ALLOWLIST: &[(&str, usize)] = &[
+    ("src/api/handlers/conda/merge_gate.rs", 1),
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
@@ -458,13 +465,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 30,
-        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 31,
+        "expected 31 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
          + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494) \
-         + the /v2/token form peek (#4020, rate_limit.rs +1); \
+         + the /v2/token form peek (#4020, rate_limit.rs +1) \
+         + the virtual conda merge error replay (#4608, merge_gate.rs +1); \
          got {total}"
     );
 }
