@@ -1,5 +1,5 @@
 //! Admin artifact trash API (#2072): list soft-deleted artifacts that storage
-//! GC has not reclaimed yet, and restore one.
+//! GC has not reclaimed yet, restore one, or purge one permanently.
 //!
 //! Nested under `/api/v1/admin/trash`, inside the `/admin` block whose
 //! `admin_middleware` already requires an admin; the handlers re-check
@@ -11,7 +11,7 @@
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -24,18 +24,24 @@ use crate::error::Result;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
-use crate::services::trash_service::{TrashPage, TrashService, TrashedArtifact};
+use crate::services::trash_service::{PurgedArtifact, TrashPage, TrashService, TrashedArtifact};
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_trash, restore_trashed_artifact),
-    components(schemas(TrashPage, TrashedArtifact, crate::api::dto::Pagination))
+    paths(list_trash, restore_trashed_artifact, purge_trashed_artifact),
+    components(schemas(
+        TrashPage,
+        TrashedArtifact,
+        PurgedArtifact,
+        crate::api::dto::Pagination
+    ))
 )]
 pub struct TrashApiDoc;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_trash))
+        .route("/:id", delete(purge_trashed_artifact))
         .route("/:id/restore", post(restore_trashed_artifact))
 }
 
@@ -50,7 +56,7 @@ pub struct TrashListQuery {
     pub per_page: Option<u32>,
 }
 
-fn trash_service(state: &SharedState) -> TrashService {
+pub(crate) fn trash_service(state: &SharedState) -> TrashService {
     TrashService::new(
         state.db.clone(),
         state.storage_registry.clone(),
@@ -136,6 +142,61 @@ pub async fn restore_trashed_artifact(
     Ok(Json(restored))
 }
 
+/// DELETE /api/v1/admin/trash/{id}
+///
+/// Permanently delete a trashed artifact without waiting for storage GC,
+/// which frees its path for a re-upload. The stored object is kept when
+/// another artifact or revision still references it. Refused with 409 for
+/// OCI manifests and blobs.
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/admin/trash",
+    tag = "admin",
+    operation_id = "purge_trashed_artifact",
+    params(("id" = Uuid, Path, description = "Artifact ID")),
+    responses(
+        (status = 200, description = "Artifact purged", body = PurgedArtifact),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "Artifact not found or not in the trash"),
+        (status = 409, description = "OCI manifests and blobs cannot be purged individually"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn purge_trashed_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PurgedArtifact>> {
+    auth.require_admin()?;
+    let purged = trash_service(&state).purge(id).await?;
+    audit_purge(&state, &auth, &purged).await;
+    Ok(Json(purged))
+}
+
+/// Record an `ARTIFACT_PURGED` audit entry.
+pub(crate) async fn audit_purge(
+    state: &SharedState,
+    auth: &AuthExtension,
+    purged: &PurgedArtifact,
+) {
+    let entry = AuditEntry::new(AuditAction::ArtifactPurged, ResourceType::Artifact)
+        .user(auth.user_id)
+        .actor_name(&auth.username)
+        .resource(purged.id)
+        .resource_name(purged.path.clone())
+        .details_typed(crate::services::audit_export::details::ArtifactDetails {
+            repository_id: purged.repository_id,
+            path: purged.path.clone(),
+            name: purged.name.clone(),
+            version: purged.version.clone(),
+            size_bytes: u64::try_from(purged.size_bytes).ok(),
+            digest: Some(format!("sha256:{}", purged.checksum_sha256)),
+            uploaded_by: None,
+        });
+    audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
@@ -179,5 +240,27 @@ mod tests {
         let restored: serde_json::Value = serde_json::from_slice(&restore_body).unwrap();
         assert_eq!(restored["id"], id.to_string());
         assert_eq!(again_status, StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn purge_endpoint_is_admin_only_and_removes_the_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/api-purge-{}", Uuid::new_v4().simple());
+        let id = crate::services::trash_service::tests::seed_trashed(&fx, &path, true).await;
+        let uri = format!("/{id}");
+        let delete = |uri: &str| Request::delete(uri).body(Body::empty()).unwrap();
+
+        let (denied, _) = tdh::send(app(&fx, false), delete(&uri)).await;
+        let (status, body) = tdh::send(app(&fx, true), delete(&uri)).await;
+        let (again, _) = tdh::send(app(&fx, true), delete(&uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::OK);
+        let purged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(purged["id"], id.to_string());
+        assert_eq!(purged["storage_reclaimed"], true);
+        assert_eq!(again, StatusCode::NOT_FOUND);
     }
 }

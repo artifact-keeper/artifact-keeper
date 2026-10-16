@@ -11013,6 +11013,14 @@ pub(crate) fn replication_exemption_trusted(
     is_replication && (is_admin || is_service_account)
 }
 
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct DeleteArtifactQuery {
+    /// Admin only: also purge the artifact from the trash, so its path can be
+    /// re-uploaded at once. Not available for OCI repositories.
+    #[serde(default)]
+    pub permanent: bool,
+}
+
 /// Delete artifact
 #[utoipa::path(
     delete,
@@ -11022,25 +11030,39 @@ pub(crate) fn replication_exemption_trusted(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        DeleteArtifactQuery,
     ),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifact deleted"),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "`permanent=true` requires an admin"),
         (status = 404, description = "Artifact not found"),
-        (status = 409, description = "Artifact is immutable (released) and cannot be deleted"),
+        (status = 409, description = "Artifact is immutable (released) and cannot be deleted, or `permanent=true` on an OCI repository"),
     )
 )]
 pub async fn delete_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    Query(query): Query<DeleteArtifactQuery>,
     headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete:artifacts")?;
+    if query.permanent {
+        auth.require_admin()?;
+    }
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    // Refused before the soft delete so a request never ends half done.
+    if query.permanent
+        && crate::services::repository_service::format_handler_key(&repo.format) == "oci"
+    {
+        return Err(AppError::Conflict(
+            crate::services::trash_service::OCI_PURGE_BLOCKED_REASON.to_string(),
+        ));
+    }
     require_repo_write_access(&auth, &repo, &repo_service).await?;
     // Action gate (#2603 G1): the tenant gate above admits any grantee (incl. a
     // write-only or read-only one), collapsing write/delete. Route the `delete`
@@ -11234,6 +11256,13 @@ pub async fn delete_artifact(
             )
             .await;
         }
+    }
+
+    if query.permanent {
+        let purged = crate::api::handlers::trash::trash_service(&state)
+            .purge(artifact_id)
+            .await?;
+        crate::api::handlers::trash::audit_purge(&state, &auth, &purged).await;
     }
 
     Ok(())
@@ -18041,6 +18070,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -18081,6 +18111,105 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `?permanent=true` purges the tombstone, so an admin can re-upload
+    /// different bytes to a released coordinate at once. A non-admin is
+    /// refused before anything is deleted.
+    #[tokio::test]
+    async fn permanent_delete_allows_reupload_of_different_bytes_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let mut admin_ext = tdh::make_auth(user_id, &username);
+        admin_ext.is_admin = true;
+        let admin = Some(admin_ext);
+        let path = "app/1.0.0/app-1.0.0.bin".to_string();
+        let permanent = || Query(DeleteArtifactQuery { permanent: true });
+        let put = |auth: Option<AuthExtension>, bytes: &'static [u8]| {
+            upload_artifact(
+                State(state.clone()),
+                Extension(auth),
+                Path((key.clone(), path.clone())),
+                HeaderMap::new(),
+                Body::from(Bytes::from_static(bytes)),
+            )
+        };
+
+        let up = put(auth.clone(), b"ORIGINAL-RELEASE-BYTES").await;
+        assert!(up.is_ok(), "initial publish must succeed: {up:?}");
+
+        let denied = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            permanent(),
+            HeaderMap::new(),
+        )
+        .await;
+        let live_after_denied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false)",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let purged = delete_artifact(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path((key.clone(), path.clone())),
+            permanent(),
+            HeaderMap::new(),
+        )
+        .await;
+        let rows_after_purge: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let reupload = put(auth.clone(), b"REBUILT-RELEASE-BYTES").await;
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "permanent=true needs an admin: {denied:?}"
+        );
+        assert!(
+            live_after_denied,
+            "a refused permanent delete deletes nothing"
+        );
+        assert!(purged.is_ok(), "admin permanent delete: {purged:?}");
+        assert_eq!(rows_after_purge, 0, "no tombstone is left behind");
+        assert!(reupload.is_ok(), "re-upload after purge: {reupload:?}");
+        assert_eq!(
+            stored,
+            Some(ArtifactService::calculate_sha256(b"REBUILT-RELEASE-BYTES"))
+        );
     }
 
     /// PF-002 (#2519): the remote cached-artifact listing pages out of the
@@ -18394,6 +18523,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -18419,6 +18549,7 @@ mod tests {
             State(state.clone()),
             Extension(admin.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -18443,6 +18574,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path2.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -18489,6 +18621,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await
@@ -18521,6 +18654,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), meta.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await
@@ -20366,6 +20500,7 @@ mod tests {
             )),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -20387,6 +20522,7 @@ mod tests {
             )),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -20517,6 +20653,7 @@ mod tests {
                 )),
                 Extension(auth),
                 Path((self.key.clone(), path.to_string())),
+                Query(DeleteArtifactQuery::default()),
                 HeaderMap::new(),
             )
             .await
@@ -30505,6 +30642,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -30527,6 +30665,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
         )
         .await;
