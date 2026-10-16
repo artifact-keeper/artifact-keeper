@@ -49,6 +49,14 @@ pub const NEGATIVE_CACHE_TTL_SECS: i64 = 45;
 /// returning a hard error for a body we already hold.
 pub const STALE_IF_ERROR_GRACE_SECS: i64 = 3600;
 
+/// Upper bound for a configurable `stale-if-error` grace window (#4581):
+/// 30 days. The instance default is [`STALE_IF_ERROR_GRACE_SECS`]; a
+/// repository may override it down to `0` (which disables serving stale
+/// bodies entirely — an unreachable upstream then surfaces as a hard error).
+/// The ceiling bounds `now + grace` well inside chrono's representable range
+/// and keeps a fat-fingered override from pinning content forever.
+pub const STALE_IF_ERROR_GRACE_MAX_SECS: i64 = 2_592_000;
+
 /// The longest cache lifetime anything in the proxy cache is ever stamped with
 /// (~10 years). It is the "effectively forever" TTL written for
 /// [`Mutability::Immutable`] paths, and also the ceiling of a repository's

@@ -5135,7 +5135,8 @@ async fn npm_cached_tarball_source(
         .get_cached_artifact_by_path(member_key, package_name)
         .await
         .ok()
-        .flatten()?;
+        .flatten()?
+        .into_parts();
     let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
     npm_tarball_source_for_filename(&packument, filename, upstream_url)
 }

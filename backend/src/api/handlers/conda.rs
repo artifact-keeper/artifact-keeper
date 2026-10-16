@@ -2893,7 +2893,12 @@ async fn fetch_upstream_shard(
         RepositoryFormat::Conda,
     )
     .await;
-    let (content, _content_type, content_encoding) = match fetched {
+    let proxy_helpers::CachedBody {
+        content,
+        content_type: _,
+        content_encoding,
+        ..
+    } = match fetched {
         Ok(fetched) => fetched,
         Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
         Err(response) => return Err(response),

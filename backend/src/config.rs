@@ -1219,6 +1219,20 @@ pub struct Config {
     /// `HydrationCoordinator::from_env`); past the cap a replica fetches at once.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
+    // -- stale-if-error response marking (#4581) --
+    /// Instance-wide default for the RFC 5861 `stale-if-error` grace window,
+    /// in seconds: how long a cached body past its freshness TTL may still be
+    /// served when the upstream is unreachable (5xx / timeout / transport).
+    /// A repository may override it with
+    /// `PUT /api/v1/repositories/{key}/stale-if-error-grace`; this value is
+    /// used when no per-repository override is stored. Responses served under
+    /// the grace are marked with `Warning: 110 - "Response is stale"` and
+    /// `X-AK-Stale-Since` so clients and caches can tell a stale body from a
+    /// fresh one. Clamped to `[0, STALE_IF_ERROR_GRACE_MAX_SECS]`; `0` disables
+    /// serving stale bodies. Env `PROXY_STALE_IF_ERROR_GRACE_SECS`, default
+    /// 3600.
+    pub proxy_stale_if_error_grace_secs: i64,
+
     // -- OCI virtual-resolution negative cache (#1424) --
     /// Freshness window in milliseconds for negative OCI virtual-resolution
     /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
@@ -1471,6 +1485,7 @@ redacted_debug!(Config {
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
+    show proxy_stale_if_error_grace_secs,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
     show npm_virtual_negative_cache_ttl_ms,
@@ -1628,6 +1643,8 @@ impl Default for Config {
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            proxy_stale_if_error_grace_secs:
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
@@ -2060,6 +2077,19 @@ impl Config {
             proxy_singleflight_lock_wait_timeout_secs: env_parse(
                 "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
                 65,
+            ),
+            // Instance-wide default for the stale-if-error grace window (#4581).
+            // Clamped to the documented `[0, MAX]` range so a negative or
+            // absurd value can neither disable the bound silently by underflow
+            // nor pin stale content forever. A repository may still override it
+            // downward (including to 0) with the per-repository endpoint.
+            proxy_stale_if_error_grace_secs: env_parse(
+                "PROXY_STALE_IF_ERROR_GRACE_SECS",
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            )
+            .clamp(
+                0,
+                crate::services::cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
             ),
             // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
             // above) so a fat-fingered enormous value can't pin a 404 on a

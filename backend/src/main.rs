@@ -917,11 +917,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .to_string();
     match StorageService::proxy_cache_from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(
-                db_pool.clone(),
-                Arc::new(storage_svc),
-                proxy_cache_scope,
-            ));
+            let proxy_service = Arc::new(
+                ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs),
+            );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(
                 proxy_cache_backend = %proxy_cache_backend,

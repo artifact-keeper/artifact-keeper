@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, watch, Notify};
@@ -402,6 +403,11 @@ pub struct StreamHeaders {
     /// the body with the commit it actually came from rather than whatever a
     /// separately-cached metadata document happens to say.
     pub commit_sha: Option<String>,
+    /// #4581: set when the leader is serving a stale cached body under the
+    /// `stale-if-error` grace — the instant the body's freshness lapsed. `None`
+    /// on a fresh upstream open. Carried to every follower so all clients see
+    /// the same stale markers; see [`StreamingFetchResult::stale_since`].
+    pub stale_since: Option<DateTime<Utc>>,
 }
 
 /// One item on a per-key streaming broadcast channel.
@@ -1539,6 +1545,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(11),
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -1863,6 +1870,7 @@ mod tests {
                     content_type: None,
                     content_length: Some(0),
                     etag: None,
+                    stale_since: None,
                 },
                 cache_published: None,
             })

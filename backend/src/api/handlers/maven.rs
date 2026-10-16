@@ -563,6 +563,7 @@ async fn maven_local_fetch_snapshot(
         // maven-snapshot member download is recorded exactly once (#2260).
         artifact_id: Some(resolved.id),
         etag: None,
+        stale_since: None,
     })
 }
 
@@ -1607,7 +1608,12 @@ async fn download_root(
             // under the non-empty sentinel key "_root_" to satisfy the cache-
             // path validation that rejects empty strings.
             let remote = proxy_helpers::build_remote_repo(repo.id, &repo_key, upstream_url);
-            let (content, content_type, content_encoding) = proxy
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy
                 .fetch_artifact_with_cache_path(&remote, "", "_root_")
                 .await
                 .map_err(|e| e.into_response())?;
@@ -1615,6 +1621,7 @@ async fn download_root(
                 content,
                 content_type,
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -1632,7 +1639,12 @@ async fn download_root(
                 {
                     let remote =
                         proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
-                    if let Ok((content, content_type, content_encoding)) = proxy
+                    if let Ok(proxy_helpers::CachedBody {
+                        content,
+                        content_type,
+                        content_encoding,
+                        stale_since,
+                    }) = proxy
                         .fetch_artifact_with_cache_path(&remote, "", "_root_")
                         .await
                     {
@@ -1640,6 +1652,7 @@ async fn download_root(
                             content,
                             content_type,
                             content_encoding,
+                            stale_since,
                         ));
                     }
                 }
@@ -1668,8 +1681,15 @@ fn forward_root_verbatim(
     content: Bytes,
     content_type: Option<String>,
     content_encoding: Option<String>,
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Response {
-    proxy_helpers::forward_verbatim_metadata(content, content_type, "text/html", content_encoding)
+    proxy_helpers::forward_verbatim_metadata(
+        content,
+        content_type,
+        "text/html",
+        content_encoding,
+        stale_since,
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -351,21 +351,26 @@ async fn package_info(
             // upstream `Content-Encoding` is re-declared when present
             // (RFC 9110 §8.4, #3260) — nothing on this path decodes.
             let upstream_path = format!("packages/{}", name);
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -439,12 +444,13 @@ async fn package_info(
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
-                |content, content_type, content_encoding, _member_key| async move {
+                |content, content_type, content_encoding, stale_since, _member_key| async move {
                     Ok(proxy_helpers::forward_verbatim_metadata(
                         content,
                         content_type,
                         "application/json",
                         content_encoding,
+                        stale_since,
                     ))
                 },
             )
@@ -1142,21 +1148,26 @@ async fn list_names(
         {
             // Verbatim pass-through: re-declare the upstream
             // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "names",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "names",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }
@@ -1308,21 +1319,26 @@ async fn list_versions(
         {
             // Verbatim pass-through: re-declare the upstream
             // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
-            let (content, content_type, content_encoding) =
-                proxy_helpers::proxy_fetch_capped_encoded(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "versions",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = proxy_helpers::proxy_fetch_capped_encoded(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "versions",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
                 "application/json",
                 content_encoding,
+                stale_since,
             ));
         }
     }

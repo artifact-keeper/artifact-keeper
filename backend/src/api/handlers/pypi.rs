@@ -2166,7 +2166,12 @@ async fn serve_remote_metadata(
     //
     // A probe error counts as a miss, so a cache fault degrades to a refetch
     // rather than failing the request.
-    if let Ok(Some((content, _content_type, content_encoding))) = proxy
+    if let Ok(Some(proxy_helpers::CachedBody {
+        content,
+        content_type: _,
+        content_encoding,
+        stale_since,
+    })) = proxy
         .cached_metadata_if_servable(
             &proxy_helpers::build_remote_repo_with_format(
                 repo_id,
@@ -2181,6 +2186,7 @@ async fn serve_remote_metadata(
         return Ok(pep658_metadata_response(
             content,
             content_encoding.as_deref(),
+            stale_since,
         ));
     }
 
@@ -2217,9 +2223,15 @@ async fn serve_remote_metadata(
         )
         .await
     {
-        Ok((content, _content_type, content_encoding)) => Ok(pep658_metadata_response(
+        Ok(proxy_helpers::CachedBody {
+            content,
+            content_type: _,
+            content_encoding,
+            stale_since,
+        }) => Ok(pep658_metadata_response(
             content,
             content_encoding.as_deref(),
+            stale_since,
         )),
         // A missing sidecar falls back to the wheel. 403 counts as missing
         // here only (#3886): CloudFront/S3 answer an absent key with 403, and
@@ -2308,7 +2320,7 @@ async fn serve_remote_metadata(
                 AppError::NotFound("Metadata not available".to_string()).into_response()
             })?;
             // Extracted here, so the bytes are plain: no coding to declare.
-            Ok(pep658_metadata_response(Bytes::from(metadata), None))
+            Ok(pep658_metadata_response(Bytes::from(metadata), None, None))
         }
         Err(error) => Err(error.into_response()),
     }
@@ -2339,13 +2351,18 @@ fn wheel_matches_index_digest(wheel: &[u8], expected_sha256: Option<&str>) -> bo
 /// Shared by every arm that produces a sidecar (cache hit, upstream fetch,
 /// wheel extraction) so one resource carries identical headers whichever
 /// served it.
-fn pep658_metadata_response(content: Bytes, content_encoding: Option<&str>) -> Response {
+fn pep658_metadata_response(
+    content: Bytes,
+    content_encoding: Option<&str>,
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8");
     if let Some(enc) = content_encoding {
         builder = builder.header(CONTENT_ENCODING, enc);
     }
+    let builder = proxy_helpers::apply_stale_markers(builder, stale_since);
     builder.body(Body::from(content)).unwrap()
 }
 
@@ -10995,6 +11012,7 @@ mod tests {
             content_length: len,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -11112,6 +11130,7 @@ mod tests {
             content_length: Some(content.len() as u64),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -11677,6 +11696,7 @@ mod tests {
             content_length,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -17005,6 +17025,7 @@ mod tests {
             content_length: Some(data_len),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
@@ -20382,6 +20403,7 @@ mod content_encoding_forwarding_tests {
             etag: None,
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
+            stale_since: None,
         }
     }
 

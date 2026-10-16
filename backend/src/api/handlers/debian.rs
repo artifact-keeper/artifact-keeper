@@ -1840,7 +1840,7 @@ async fn resolve_pool_expected_checksum(
         if !is_matching_packages_index(&cache_path, component, &arch) {
             continue;
         }
-        let Ok(Some((bytes, _, _))) = proxy
+        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = proxy
             .get_cached_artifact_by_path(repo_key, &cache_path)
             .await
         else {
@@ -3277,7 +3277,7 @@ async fn resolve_flat_expected_checksum(
 ) -> crate::error::Result<Option<String>> {
     let dotted = format!("./{package_path}");
     for cache_path in flat_packages_index_candidates(package_path) {
-        let Ok(Some((bytes, _, _))) = proxy
+        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = proxy
             .get_cached_artifact_by_path(repo_key, &cache_path)
             .await
         else {

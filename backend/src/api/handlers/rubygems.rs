@@ -141,12 +141,13 @@ async fn gem_info(
             state.proxy_service.as_deref(),
             repo.id,
             &format!("api/v1/gems/{}.json", gem_name),
-            |bytes, content_type, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, stale_since, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
                     content_type,
                     "application/json",
                     content_encoding,
+                    stale_since,
                 ))
             },
         )
@@ -1209,12 +1210,13 @@ async fn quick_spec(
             state.proxy_service.as_deref(),
             repo.id,
             &format!("quick/Marshal.4.8/{}", spec_file),
-            |bytes, content_type, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, stale_since, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
                     content_type,
                     "application/octet-stream",
                     content_encoding,
+                    stale_since,
                 ))
             },
         )
