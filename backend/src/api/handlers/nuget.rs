@@ -2516,23 +2516,27 @@ async fn proxy_v3_flatcontainer(
         // rewritten). That makes it the one NuGet caller that has to forward the
         // upstream coding, hence the `_encoded` variant — surfaced by the #3184
         // widening of `fetch_artifact_with_cache_path_capped`.
-        let (content, content_type, content_encoding) =
-            proxy_helpers::proxy_fetch_capped_with_cache_key_encoded(
-                proxy,
-                fetch_repo_id,
-                fetch_repo_key,
-                upstream_url,
-                &fetch_url,
-                &cache_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await
-            .inspect_err(upstream_failure(
-                "flatcontainer_versions",
-                fetch_repo_key,
-                upstream_url,
-                &fetch_url,
-            ))?;
+        let proxy_helpers::CachedBody {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
+        } = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+            &cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await
+        .inspect_err(upstream_failure(
+            "flatcontainer_versions",
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+        ))?;
         let mut builder = Response::builder().status(StatusCode::OK).header(
             CONTENT_TYPE,
             content_type.unwrap_or_else(|| "application/json".to_string()),
@@ -2540,6 +2544,7 @@ async fn proxy_v3_flatcontainer(
         if let Some(enc) = content_encoding.as_deref() {
             builder = builder.header(CONTENT_ENCODING, enc);
         }
+        let builder = proxy_helpers::apply_stale_markers(builder, stale_since);
         Ok(builder.body(Body::from(content)).unwrap())
     }
 }

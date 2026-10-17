@@ -3,7 +3,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -17,6 +17,9 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
+/// Re-exported so format handlers can pattern-match the buffered proxy result
+/// (named fields since #4581) without a second import path.
+pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DirectUpstreamBody, ProxyService};
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
@@ -982,7 +985,7 @@ pub async fn proxy_fetch_capped_encoded(
     upstream_url: &str,
     path: &str,
     max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_artifact_capped_with_encoding(&repo, path, max)
@@ -1007,12 +1010,39 @@ pub async fn proxy_fetch_capped_encoded_with_format(
     path: &str,
     max: usize,
     format: RepositoryFormat,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     proxy_service
         .fetch_artifact_capped_with_encoding(&repo, path, max)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// The `Warning` header value marking a response whose body is being served
+/// under the RFC 5861 `stale-if-error` grace (#4581). This is the RFC 9111
+/// §5.5 `110 Response is stale` warning, in its minimal (`warn-code` +
+/// `warn-text`, no `warn-agent`/`warn-date`) form.
+pub const STALE_WARNING: &str = "110 - \"Response is stale\"";
+
+/// Response header carrying the instant a served body's freshness lapsed, set
+/// on a stale-if-error serve (#4581). Clients and side caches can key off it to
+/// tell a stale response from a fresh one even where they ignore `Warning`.
+pub const STALE_SINCE_HEADER: &str = "x-ak-stale-since";
+
+/// Apply the #4581 stale-response markers (`Warning: 110` + `X-AK-Stale-Since`)
+/// to a response builder when the body is being served under the
+/// `stale-if-error` grace. A `None` marker (a fresh or freshly revalidated
+/// serve) leaves `builder` untouched.
+pub(crate) fn apply_stale_markers(
+    mut builder: axum::http::response::Builder,
+    stale_since: Option<DateTime<Utc>>,
+) -> axum::http::response::Builder {
+    if let Some(since) = stale_since {
+        builder = builder
+            .header(axum::http::header::WARNING, STALE_WARNING)
+            .header(STALE_SINCE_HEADER, since.to_rfc3339());
+    }
+    builder
 }
 
 /// Build the 200 response for buffered upstream metadata that is forwarded
@@ -1034,18 +1064,21 @@ pub fn forward_verbatim_metadata(
     content_type: Option<String>,
     default_content_type: &str,
     content_encoding: Option<String>,
+    stale_since: Option<DateTime<Utc>>,
 ) -> Response {
     let ct = content_type.unwrap_or_else(|| default_content_type.to_string());
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, ct)
         .header(
             axum::http::header::CONTENT_LENGTH,
             content.len().to_string(),
         );
+    let mut builder = builder;
     if let Some(enc) = content_encoding {
         builder = builder.header(axum::http::header::CONTENT_ENCODING, enc);
     }
+    let builder = apply_stale_markers(builder, stale_since);
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
@@ -1251,6 +1284,10 @@ pub enum CappedMetadataGet {
         content: Bytes,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        /// #4581: set when the member/upstream body was served under the
+        /// `stale-if-error` grace, so the caller can mark its response (and a
+        /// virtual merge can decide how to represent the member's staleness).
+        stale_since: Option<DateTime<Utc>>,
         budget_permit: OwnedSemaphorePermit,
     },
     /// Upstream exceeded `max`; nothing past the ceiling was ever buffered,
@@ -1311,10 +1348,16 @@ pub async fn proxy_fetch_capped_with_encoding_reserved(
         .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
         .await
     {
-        Ok((content, content_type, content_encoding)) => Ok(CappedMetadataGet::Buffered {
+        Ok(CachedBody {
             content,
             content_type,
             content_encoding,
+            stale_since,
+        }) => Ok(CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
             budget_permit,
         }),
         Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
@@ -1684,6 +1727,8 @@ pub(crate) fn build_streaming_response_with_disposition(
     if let Some(fname) = filename {
         builder = builder.header("content-disposition", content_disposition_attachment(fname));
     }
+    // #4581: mark a stale-if-error serve.
+    let builder = apply_stale_markers(builder, result.stale_since);
     let body = axum::body::Body::from_stream(
         result
             .body
@@ -1798,9 +1843,13 @@ pub async fn proxy_fetch_or_redirect(
     // along and re-declared (RFC 9110 §8.4, #3273) — nothing on this path
     // decodes, and an adopter of this helper must not inherit the #3149
     // mislabeling silently.
-    let (content, content_type, content_encoding) =
-        proxy_fetch_with_cache_key(proxy_service, repo_id, repo_key, upstream_url, path, path)
-            .await?;
+    let CachedBody {
+        content,
+        content_type,
+        content_encoding,
+        stale_since,
+    } = proxy_fetch_with_cache_key(proxy_service, repo_id, repo_key, upstream_url, path, path)
+        .await?;
 
     // If presigned is configured, prefer redirecting to the just-populated
     // cache entry over streaming the buffered content back to the client.
@@ -1829,6 +1878,7 @@ pub async fn proxy_fetch_or_redirect(
         content_type,
         "application/octet-stream",
         content_encoding,
+        stale_since,
     ))
 }
 
@@ -1904,7 +1954,10 @@ pub async fn proxy_check_cache(
         .get_cached_artifact_by_path(repo_key, path)
         .await
     {
-        Ok(result) => result.map(|(content, content_type, _encoding)| (content, content_type)),
+        Ok(result) => result.map(|body| {
+            let (content, content_type, _encoding) = body.into_parts();
+            (content, content_type)
+        }),
         Err(e) => {
             tracing::debug!(
                 "Cache lookup failed for {}/{}, treating as miss: {}",
@@ -2150,7 +2203,7 @@ pub async fn proxy_fetch_with_cache_key(
     upstream_url: &str,
     fetch_path: &str,
     cache_path: &str,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -2181,7 +2234,7 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
     fetch_path: &str,
     cache_path: &str,
     accept: Option<&str>,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -2235,7 +2288,7 @@ pub async fn proxy_fetch_capped_with_cache_key(
     cache_path: &str,
     max: usize,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let (content, content_type, _encoding) = proxy_fetch_capped_with_cache_key_encoded(
+    let body = proxy_fetch_capped_with_cache_key_encoded(
         proxy_service,
         repo_id,
         repo_key,
@@ -2245,6 +2298,7 @@ pub async fn proxy_fetch_capped_with_cache_key(
         max,
     )
     .await?;
+    let (content, content_type, _encoding) = body.into_parts();
     Ok((content, content_type))
 }
 
@@ -2259,7 +2313,7 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded(
     fetch_path: &str,
     cache_path: &str,
     max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -2292,7 +2346,7 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
     cache_path: &str,
     max: usize,
     format: RepositoryFormat,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     proxy_service
         .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
@@ -2313,7 +2367,7 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept(
     accept: Option<&str>,
     max: usize,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let (content, content_type, _encoding) = proxy_fetch_capped_with_cache_key_and_accept_encoded(
+    let body = proxy_fetch_capped_with_cache_key_and_accept_encoded(
         proxy_service,
         repo_id,
         repo_key,
@@ -2324,6 +2378,7 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept(
         max,
     )
     .await?;
+    let (content, content_type, _encoding) = body.into_parts();
     Ok((content, content_type))
 }
 
@@ -2343,7 +2398,7 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_encoded(
     cache_path: &str,
     accept: Option<&str>,
     max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<crate::services::proxy_service::CachedBody, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -3589,7 +3644,7 @@ pub async fn resolve_virtual_metadata<F, Fut>(
     transform: F,
 ) -> Result<Response, Response>
 where
-    F: Fn(Bytes, Option<String>, Option<String>, String) -> Fut,
+    F: Fn(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
     let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
@@ -3618,8 +3673,21 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, ct, enc))) => {
-                    match transform(bytes, ct, enc, member.key.clone()).await {
+                Ok(Some(CachedBody {
+                    content,
+                    content_type,
+                    content_encoding,
+                    stale_since,
+                })) => {
+                    match transform(
+                        content,
+                        content_type,
+                        content_encoding,
+                        stale_since,
+                        member.key.clone(),
+                    )
+                    .await
+                    {
                         Ok(response) => (
                             MemberCacheClass::DefiniteHit,
                             Some(MemberResolveOutcome::Hit(response)),
@@ -3688,7 +3756,20 @@ where
                 }
             };
             match fetched {
-                Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
+                Ok(CachedBody {
+                    content,
+                    content_type,
+                    content_encoding,
+                    stale_since,
+                }) => match transform(
+                    content,
+                    content_type,
+                    content_encoding,
+                    stale_since,
+                    member.key.clone(),
+                )
+                .await
+                {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
                         tracing::warn!(
@@ -5522,6 +5603,7 @@ async fn read_local_stream(
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
         etag: None,
+        stale_since: None,
     })
 }
 
@@ -9759,7 +9841,12 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         req.fetch_base,
         req.format.clone(),
     );
-    let (bytes, content_type, content_encoding) = match proxy
+    let CachedBody {
+        content: bytes,
+        content_type,
+        content_encoding,
+        ..
+    } = match proxy
         .fetch_artifact_with_cache_path_capped(
             &remote,
             req.source_path,
@@ -10964,6 +11051,25 @@ mod scanned_proxy_file_tests {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[test]
+    fn apply_stale_markers_sets_warning_and_since_when_stale() {
+        let since = Utc::now();
+        let resp = apply_stale_markers(Response::builder(), Some(since))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(resp.headers()["warning"], STALE_WARNING);
+        assert_eq!(resp.headers()[STALE_SINCE_HEADER], since.to_rfc3339());
+    }
+
+    #[test]
+    fn apply_stale_markers_leaves_fresh_responses_untouched() {
+        let resp = apply_stale_markers(Response::builder(), None)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(resp.headers().get("warning").is_none());
+        assert!(resp.headers().get(STALE_SINCE_HEADER).is_none());
+    }
 
     // ── #3396: rescan of already-cached bytes ──
 
@@ -12486,6 +12592,7 @@ mod tests {
             content_length: Some(0),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         }
     }
 
@@ -15282,6 +15389,8 @@ mod tests {
                 proxy_singleflight_advisory_locks_enabled: false,
                 proxy_singleflight_lock_poll_interval_ms: 200,
                 proxy_singleflight_lock_wait_timeout_secs: 65,
+                proxy_stale_if_error_grace_secs:
+                    crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
                 oci_virtual_negative_cache_ttl_ms:
                     crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
                 npm_virtual_negative_cache_ttl_ms:
@@ -16618,6 +16727,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -16641,6 +16751,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -16666,6 +16777,7 @@ mod tests {
             content_length: Some(12345),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -16692,6 +16804,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -16712,6 +16825,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -16731,6 +16845,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -16755,6 +16870,7 @@ mod tests {
             content_length: Some(1234),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -16786,6 +16902,7 @@ mod tests {
             content_length: None,
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
@@ -19313,7 +19430,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
-                |_b, _ct, _ce, _u| async {
+                |_b, _ct, _ce, _st, _u| async {
                     Err::<Response, Response>(
                         (StatusCode::NOT_FOUND, "no metadata").into_response(),
                     )

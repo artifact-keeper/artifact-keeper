@@ -869,7 +869,12 @@ async fn resolve_gated_index_entry(
         return Err(unavailable());
     };
     let index_path = cargo_sparse_index_path_upstream(name_lower);
-    let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
+    let proxy_helpers::CachedBody {
+        content,
+        content_type: _,
+        content_encoding,
+        ..
+    } = proxy_helpers::proxy_fetch_capped_encoded(
         proxy,
         repo_id,
         repo_key,
@@ -1081,7 +1086,12 @@ async fn gated_member_index_contribution(
     let Some(proxy) = state.proxy_service.as_ref() else {
         return Ok(None);
     };
-    let Ok((content, _content_type, content_encoding)) = proxy_helpers::proxy_fetch_capped_encoded(
+    let Ok(proxy_helpers::CachedBody {
+        content,
+        content_type: _,
+        content_encoding,
+        ..
+    }) = proxy_helpers::proxy_fetch_capped_encoded(
         proxy,
         member.id,
         &member.key,
@@ -2992,7 +3002,12 @@ async fn try_remote_index(
     )
     .await;
 
-    let (content, content_type, content_encoding) = match result {
+    let proxy_helpers::CachedBody {
+        content,
+        content_type,
+        content_encoding,
+        ..
+    } = match result {
         Ok(fetched) => fetched,
         Err(e) => return Some(Err(e)),
     };
@@ -3199,16 +3214,20 @@ async fn try_virtual_index(
                 // (matching `gated_member_index_contribution` and npm's
                 // `remote_member_packument_value`) rather than failing the
                 // whole aggregate.
-                if let Ok((content, _content_type, content_encoding)) =
-                    proxy_helpers::proxy_fetch_capped_encoded(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        &base_url,
-                        &index_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                    )
-                    .await
+                if let Ok(proxy_helpers::CachedBody {
+                    content,
+                    content_type: _,
+                    content_encoding,
+                    ..
+                }) = proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    &base_url,
+                    &index_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
                 {
                     match decode_cargo_index_body(&content, content_encoding.as_deref()) {
                         Ok(decoded) => {

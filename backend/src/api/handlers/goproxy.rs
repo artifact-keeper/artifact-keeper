@@ -392,23 +392,28 @@ async fn try_proxy_go_metadata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok((content, content_type, content_encoding)) =
-                proxy_helpers::proxy_fetch_capped_encoded_with_format(
-                    proxy,
-                    repo.id,
-                    &repo.key,
-                    upstream_url,
-                    upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                    RepositoryFormat::Go,
-                )
-                .await
+            if let Ok(proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            }) = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                RepositoryFormat::Go,
+            )
+            .await
             {
                 return Ok(proxy_helpers::forward_verbatim_metadata(
                     content,
                     content_type,
                     default_content_type,
                     content_encoding,
+                    stale_since,
                 ));
             }
         }
@@ -426,7 +431,7 @@ async fn try_proxy_go_metadata(
             state.proxy_service.as_deref(),
             repo.id,
             upstream_path,
-            |bytes, content_type, content_encoding, _key| {
+            |bytes, content_type, content_encoding, stale_since, _key| {
                 let ct = ct.clone();
                 async move {
                     Ok(proxy_helpers::forward_verbatim_metadata(
@@ -434,6 +439,7 @@ async fn try_proxy_go_metadata(
                         content_type,
                         &ct,
                         content_encoding,
+                        stale_since,
                     ))
                 }
             },
@@ -491,23 +497,32 @@ async fn fetch_go_metadata_with_source(
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
-) -> Option<(uuid::Uuid, Bytes, Option<String>)> {
+) -> Option<(
+    uuid::Uuid,
+    Bytes,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)> {
     let proxy = state.proxy_service.as_ref()?;
     if repo.repo_type == RepositoryType::Remote {
         let upstream_url = repo.upstream_url.as_deref()?;
-        let (content, _content_type, content_encoding) =
-            proxy_helpers::proxy_fetch_capped_encoded_with_format(
-                proxy,
-                repo.id,
-                &repo.key,
-                upstream_url,
-                upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                RepositoryFormat::Go,
-            )
-            .await
-            .ok()?;
-        return Some((repo.id, content, content_encoding));
+        let proxy_helpers::CachedBody {
+            content,
+            content_type: _content_type,
+            content_encoding,
+            stale_since,
+        } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            RepositoryFormat::Go,
+        )
+        .await
+        .ok()?;
+        return Some((repo.id, content, content_encoding, stale_since));
     }
     if repo.repo_type == RepositoryType::Virtual {
         // Caller-authorized member walk (#3323): a Remote member may hold
@@ -524,19 +539,23 @@ async fn fetch_go_metadata_with_source(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
-            if let Ok((content, _content_type, content_encoding)) =
-                proxy_helpers::proxy_fetch_capped_encoded_with_format(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    upstream_url,
-                    upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                    RepositoryFormat::Go,
-                )
-                .await
+            if let Ok(proxy_helpers::CachedBody {
+                content,
+                content_type: _content_type,
+                content_encoding,
+                stale_since,
+            }) = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                RepositoryFormat::Go,
+            )
+            .await
             {
-                return Some((member.id, content, content_encoding));
+                return Some((member.id, content, content_encoding, stale_since));
             }
         }
     }
@@ -777,7 +796,7 @@ async fn list_versions(
 
     if body.is_empty() {
         let upstream_path = build_go_upstream_list_path(module);
-        if let Some((source_repo_id, content, content_encoding)) =
+        if let Some((source_repo_id, content, content_encoding, _stale_since)) =
             fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
         {
             // This arm REBUILDS the document (parse + age-gate filter), so a
@@ -942,25 +961,29 @@ async fn fetch_member_version_list(
 ) -> Option<String> {
     let proxy = state.proxy_service.as_ref()?;
     let upstream_url = member.upstream_url.as_deref()?;
-    let (content, _content_type, content_encoding) =
-        proxy_helpers::proxy_fetch_capped_encoded_with_format(
-            proxy,
-            member.id,
-            &member.key,
-            upstream_url,
-            upstream_path,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            RepositoryFormat::Go,
-        )
-        .await
-        .map_err(|_| {
-            tracing::debug!(
-                member_key = %member.key,
-                module = %module,
-                "@v/list upstream fetch miss for virtual member; skipping it"
-            );
-        })
-        .ok()?;
+    let proxy_helpers::CachedBody {
+        content,
+        content_type: _content_type,
+        content_encoding,
+        ..
+    } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Go,
+    )
+    .await
+    .map_err(|_| {
+        tracing::debug!(
+            member_key = %member.key,
+            module = %module,
+            "@v/list upstream fetch miss for virtual member; skipping it"
+        );
+    })
+    .ok()?;
     let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())
         .map_err(|_| {
             tracing::warn!(
@@ -1155,22 +1178,27 @@ async fn get_mod_file(
                     // upstream `Content-Encoding` must be re-declared when
                     // present (RFC 9110 §8.4, #3260).
                     let upstream_path = build_go_upstream_path(module, version, "mod");
-                    let (content, content_type, content_encoding) =
-                        proxy_helpers::proxy_fetch_capped_encoded_with_format(
-                            proxy,
-                            repo.id,
-                            &repo.key,
-                            upstream_url,
-                            &upstream_path,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                            RepositoryFormat::Go,
-                        )
-                        .await?;
+                    let proxy_helpers::CachedBody {
+                        content,
+                        content_type,
+                        content_encoding,
+                        stale_since,
+                    } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+                        proxy,
+                        repo.id,
+                        &repo.key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        RepositoryFormat::Go,
+                    )
+                    .await?;
                     return Ok(proxy_helpers::forward_verbatim_metadata(
                         content,
                         content_type,
                         "text/plain; charset=utf-8",
                         content_encoding,
+                        stale_since,
                     ));
                 }
             }
@@ -1471,7 +1499,7 @@ async fn latest_version(
         Ok(a) => a,
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
-            if let Some((source_repo_id, content, content_encoding)) =
+            if let Some((source_repo_id, content, content_encoding, stale_since)) =
                 fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
             {
                 // Parse a DECODED copy for the age gate (#3280): a coded
@@ -1513,6 +1541,7 @@ async fn latest_version(
                     None,
                     "application/json",
                     content_encoding,
+                    stale_since,
                 ));
             }
             return Err(not_found);

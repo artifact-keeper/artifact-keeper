@@ -36974,6 +36974,7 @@ mod content_encoding_forwarding_tests {
             etag: None,
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
+            stale_since: None,
         }
     }
 

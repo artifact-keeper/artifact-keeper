@@ -27,7 +27,9 @@ use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
-use crate::services::metrics_service::record_proxy_cache_lookup;
+use crate::services::metrics_service::{
+    record_proxy_cache_lookup, record_proxy_stale_if_error_response,
+};
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
@@ -310,6 +312,12 @@ pub struct StreamingFetchResult {
     /// from the sidecar on cache hits, so the header always describes the body it
     /// arrives with.
     pub commit_sha: Option<String>,
+    /// When this body is being served under the RFC 5861 `stale-if-error` grace
+    /// (#4581): the instant its freshness lapsed (the entry's effective
+    /// expiry). `None` on a fresh or revalidated serve. The response builders
+    /// turn this into `Warning: 110 - "Response is stale"` and
+    /// `X-AK-Stale-Since`.
+    pub stale_since: Option<DateTime<Utc>>,
 }
 
 impl From<StreamHandle> for StreamingFetchResult {
@@ -326,6 +334,7 @@ impl From<StreamHandle> for StreamingFetchResult {
             etag: handle.headers.etag,
             content_encoding: handle.headers.content_encoding,
             commit_sha: handle.headers.commit_sha,
+            stale_since: handle.headers.stale_since,
         }
     }
 }
@@ -1499,9 +1508,10 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
 /// the three actions the caller cares about: serve a body, return 404, or fetch
 /// upstream.
 enum CacheReadOutcome {
-    /// Serve this cached (or freshly revalidated) body, content type, and
-    /// content coding.
-    Hit(Bytes, Option<String>, Option<String>),
+    /// Serve this cached (or freshly revalidated) body, content type, content
+    /// coding, and — under `stale-if-error` (#4581) — the instant its freshness
+    /// lapsed (`Some`) or `None` for a fresh/revalidated serve.
+    Hit(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>),
     /// A negative-cached upstream 404 is still within its TTL: respond 404.
     NegativeHit,
     /// No usable entry; the caller must fetch from upstream.
@@ -1830,12 +1840,54 @@ impl CacheKeys {
 /// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
 /// for these operations, so reads and writes target the global default
 /// backend exactly as before (#1278).
-/// A buffered cache read: `(body, content_type, content_encoding)`.
+/// A buffered cache read.
+///
+/// Named fields, not a tuple: the value carries multiple `Option<String>`s that
+/// a positional destructure cannot tell apart (see [`DirectUpstreamBody`] for
+/// the #3193 cost of that shape), and #4581 adds [`Self::stale_since`] to the
+/// same value. A caller that only wants the `(body, content_type,
+/// content_encoding)` triple uses [`Self::into_parts`].
 ///
 /// `content_encoding` rides along because the proxy no longer decodes upstream
 /// bodies, so a cached body may be content coded and the coding has to be
 /// replayed to the client — see [`UpstreamResponse::content_encoding`].
-pub(crate) type CachedBody = (Bytes, Option<String>, Option<String>);
+#[derive(Debug, Clone)]
+pub struct CachedBody {
+    pub content: Bytes,
+    /// Upstream/content `Content-Type`.
+    pub content_type: Option<String>,
+    /// `Content-Encoding` of the bytes in `content`, when coded — see
+    /// [`UpstreamResponse::content_encoding`].
+    pub content_encoding: Option<String>,
+    /// #4581: when this body is served under the RFC 5861 `stale-if-error`
+    /// grace, the instant its freshness lapsed (the sidecar's stamped
+    /// `expires_at`). `None` on a fresh (or freshly revalidated) serve. The
+    /// response builders turn it into `Warning: 110` + `X-AK-Stale-Since`.
+    pub stale_since: Option<DateTime<Utc>>,
+}
+
+impl CachedBody {
+    /// A fresh (non-stale) cached body.
+    pub(crate) fn fresh(
+        content: Bytes,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+    ) -> Self {
+        Self {
+            content,
+            content_type,
+            content_encoding,
+            stale_since: None,
+        }
+    }
+
+    /// Split off the `(body, content_type, content_encoding)` triple, dropping
+    /// the staleness marker — for callers that parse or rewrite the body rather
+    /// than forwarding it to the client.
+    pub(crate) fn into_parts(self) -> (Bytes, Option<String>, Option<String>) {
+        (self.content, self.content_type, self.content_encoding)
+    }
+}
 
 /// An uncached, straight-from-upstream buffered read — the result of
 /// [`ProxyService::fetch_upstream_direct_with_link`].
@@ -2037,11 +2089,20 @@ impl CacheStore {
                     tracing::debug!(cache_key = %cache_key, "Proxy cache hit");
                     record_proxy_cache_lookup(repo_label, "hit");
                 }
-                Ok(Some((
+                // #4581: a stale read (`allow_stale`) is only ever reached from
+                // a stale-if-error serve site, so mark it with the entry's
+                // stamped expiry; a fresh read carries no marker.
+                let stale_since = if allow_stale {
+                    Some(metadata.expires_at)
+                } else {
+                    None
+                };
+                Ok(Some(CachedBody {
                     content,
-                    metadata.content_type,
-                    metadata.content_encoding,
-                )))
+                    content_type: metadata.content_type,
+                    content_encoding: metadata.content_encoding,
+                    stale_since,
+                }))
             }
             Err(AppError::NotFound(_)) => {
                 if !allow_stale {
@@ -4207,6 +4268,12 @@ pub struct ProxyService {
     /// under `cfg(test)`, clears it, for the cache-mechanics unit tests that
     /// run without a database.
     origin_policy_gate: bool,
+    /// Instance-wide default for the RFC 5861 `stale-if-error` grace window
+    /// (#4581), in seconds. Seeded from `Config::proxy_stale_if_error_grace_secs`
+    /// by [`Self::with_stale_if_error_grace_secs`]; a repository may override it
+    /// through [`Self::effective_stale_if_error_grace_secs`]. Tests keep the
+    /// [`cache_classifier::STALE_IF_ERROR_GRACE_SECS`] default.
+    stale_if_error_grace_secs: i64,
 }
 
 /// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
@@ -4224,9 +4291,19 @@ const TTL_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `(id, format)` of a repository by key for the key-only read paths. Without
 /// it the read-time TTL clamp would add a database round trip to every
 /// mutable cache hit.
+/// How long a repository keeps reporting `last_stale_served_at` after its last
+/// stale-if-error response (#4581).
+const LAST_STALE_SERVED_TTL: Duration = Duration::from_secs(24 * 3600);
+
 struct TtlPolicyCache {
     overrides: Cache<Uuid, Option<i64>>,
     repo_by_key: Cache<String, Option<(Uuid, RepositoryFormat)>>,
+    /// Per-repository `stale_if_error_grace_secs` override (#4581), same
+    /// short-TTL memoization as `overrides`. `None` means "no override".
+    stale_grace: Cache<Uuid, Option<i64>>,
+    /// When each repository last served a stale-if-error response (#4581),
+    /// per replica. Surfaced by the stale-if-error-grace API as a health signal.
+    last_stale_served: Cache<Uuid, DateTime<Utc>>,
 }
 
 impl TtlPolicyCache {
@@ -4241,6 +4318,14 @@ impl TtlPolicyCache {
             repo_by_key: Cache::builder()
                 .max_capacity(Self::CAPACITY)
                 .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            stale_grace: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            last_stale_served: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(LAST_STALE_SERVED_TTL)
                 .build(),
         }
     }
@@ -4322,7 +4407,19 @@ impl ProxyService {
                 .time_to_live(UNCACHED_SERVE_TTL)
                 .build(),
             origin_policy_gate: true,
+            stale_if_error_grace_secs: cache_classifier::STALE_IF_ERROR_GRACE_SECS,
         }
+    }
+
+    /// Seed the instance-wide `stale-if-error` grace window (#4581) from the
+    /// process [`crate::config::Config`]. Called on the production construction
+    /// path in `main.rs`; the struct default is
+    /// [`cache_classifier::STALE_IF_ERROR_GRACE_SECS`], so tests that do not
+    /// care keep the documented 3600 s.
+    pub fn with_stale_if_error_grace_secs(mut self, secs: i64) -> Self {
+        self.stale_if_error_grace_secs =
+            secs.clamp(0, cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS);
+        self
     }
 
     /// A service that skips the origin-policy gate (#4506), for unit tests of
@@ -4365,7 +4462,8 @@ impl ProxyService {
     ) -> Result<(Bytes, Option<String>)> {
         let (content, content_type, _encoding) = self
             .fetch_artifact_with_cache_path(repo, path, path)
-            .await?;
+            .await?
+            .into_parts();
         Ok((content, content_type))
     }
 
@@ -4383,7 +4481,8 @@ impl ProxyService {
     ) -> Result<(Bytes, Option<String>)> {
         let (content, content_type, _encoding) = self
             .fetch_artifact_capped_with_encoding(repo, path, max)
-            .await?;
+            .await?
+            .into_parts();
         Ok((content, content_type))
     }
 
@@ -4479,7 +4578,8 @@ impl ProxyService {
     ) -> Result<(Bytes, Option<String>)> {
         let (content, content_type, _encoding) = self
             .fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, accept, max)
-            .await?;
+            .await?
+            .into_parts();
         Ok((content, content_type))
     }
 
@@ -4536,7 +4636,8 @@ impl ProxyService {
     ) -> Result<(Bytes, Option<String>)> {
         let (content, content_type, _encoding) = self
             .fetch_artifact_with_cache_path_and_accept(repo, path, path, accept)
-            .await?;
+            .await?
+            .into_parts();
         Ok((content, content_type))
     }
 
@@ -4888,8 +4989,13 @@ impl ProxyService {
             )
             .await?
         {
-            CacheReadOutcome::Hit(content, content_type, content_encoding) => {
-                return Ok((content, content_type, content_encoding))
+            CacheReadOutcome::Hit(content, content_type, content_encoding, stale_since) => {
+                return Ok(CachedBody {
+                    content,
+                    content_type,
+                    content_encoding,
+                    stale_since,
+                })
             }
             CacheReadOutcome::NegativeHit => {
                 return Err(AppError::NotFound(format!(
@@ -5136,7 +5242,7 @@ impl ProxyService {
                         // the best-effort cache write above failed.
                         check_quarantine_until(quarantine_until)?;
 
-                        Ok((resp.content, resp.content_type, upstream_encoding))
+                        Ok(CachedBody::fresh(resp.content, resp.content_type, upstream_encoding))
                     }
                     Err(upstream_err) => {
                         // #1611 negative caching: a definitive upstream 404 is
@@ -5150,20 +5256,41 @@ impl ProxyService {
                             return Err(upstream_err);
                         }
                         // Transient error (5xx / timeout / transport): RFC 5861
-                        // stale-if-error — serve the stale body we already hold.
-                        if let Ok(Some((stale_content, stale_content_type, stale_content_encoding))) = self
+                        // stale-if-error — serve the stale body we already hold,
+                        // but only inside the repository's configured grace
+                        // window (#4581). Outside it, propagate the upstream
+                        // error rather than keep serving content that may be
+                        // arbitrarily old. The window is measured from the
+                        // entry's stamped expiry (`body.stale_since`), matching
+                        // `revalidate_verdict`.
+                        if let Ok(Some(body)) = self
                             .get_stale_cached_artifact(&cache_key, &metadata_key, None)
                             .await
                         {
+                            let stale_since = body.stale_since.unwrap_or_else(Utc::now);
+                            let grace = self.effective_stale_if_error_grace_secs(repo.id).await;
+                            if grace > 0
+                                && Utc::now() < stale_since + chrono::Duration::seconds(grace)
+                            {
+                                tracing::warn!(
+                                    "Upstream fetch failed for {}; serving stale cached copy \
+                                     within the {}-second stale-if-error grace (#4581): {}",
+                                    redact_url_for_diagnostics(&full_url),
+                                    grace,
+                                    upstream_err
+                                );
+                                self.note_stale_served(repo).await;
+                                return Ok(body);
+                            }
                             tracing::warn!(
-                                "Upstream fetch failed for {}; serving stale cached copy: {}",
+                                "Upstream fetch failed for {}; cached copy is past the \
+                                 {}-second stale-if-error grace, propagating error: {}",
                                 redact_url_for_diagnostics(&full_url),
+                                grace,
                                 upstream_err
                             );
-                            Ok((stale_content, stale_content_type, stale_content_encoding))
-                        } else {
-                            Err(upstream_err)
                         }
+                        Err(upstream_err)
                     }
                 }
             },
@@ -5629,21 +5756,30 @@ impl ProxyService {
             }
             cache_classifier::Freshness::Stale => {
                 let metadata = metadata.expect("stale implies metadata present");
-                match self
-                    // The streaming path performs no content negotiation
-                    // (no `Accept` is threaded to it), so there is no
-                    // selecting header to replay on the probe (#3290).
+                // The streaming path performs no content negotiation (no
+                // `Accept` is threaded to it), so there is no selecting header
+                // to replay on the probe (#3290).
+                let verdict = self
                     .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None)
-                    .await
-                {
+                    .await;
+                match verdict {
                     // 304 extended the TTL; stream the cached body.
                     RevalidationVerdict::ServeRevalidated
                     | RevalidationVerdict::ServeStaleIfError => {
                         // Package Age Policy (#1770): gate the revalidated /
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
+                        // #4581: a stale-if-error serve is marked with the
+                        // entry's stamped expiry; a 304 extended the TTL, so
+                        // that body is fresh again and carries no marker.
+                        let stale_since = matches!(verdict, RevalidationVerdict::ServeStaleIfError)
+                            .then_some(metadata.expires_at);
+                        if stale_since.is_some() {
+                            self.note_stale_served(repo).await;
+                        }
                         match self.open_cached_stream(cache_key, &metadata).await? {
-                            Some(result) => {
+                            Some(mut result) => {
+                                result.stale_since = stale_since;
                                 Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata)))
                             }
                             None => Ok(StreamingCacheReadOutcome::Miss),
@@ -5676,6 +5812,8 @@ impl ProxyService {
                 // compressed data labelled as identity.
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
+                // Fresh by default; the stale-if-error caller sets this (#4581).
+                stale_since: None,
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -5717,6 +5855,7 @@ impl ProxyService {
             Err(err) => {
                 return self
                     .handle_streaming_leader_upstream_error(
+                        repo,
                         cache_path,
                         &cache_key,
                         &metadata_key,
@@ -5772,6 +5911,8 @@ impl ProxyService {
             etag: upstream.etag.clone(),
             content_encoding: upstream.content_encoding.clone(),
             commit_sha: upstream.commit_sha.clone(),
+            // A fresh upstream open is never a stale serve (#4581).
+            stale_since: None,
         };
 
         // #2928: the streaming write path had no byte bound of any kind — the
@@ -5900,10 +6041,13 @@ impl ProxyService {
     ///   not-yet-published artifact does not hammer upstream, then propagate the
     ///   404. We never serve stale for a 404 (the object is gone / never existed).
     /// * **transient (5xx / timeout / transport)** -> RFC 5861 `stale-if-error`:
-    ///   stream the stale body we already hold (regardless of TTL — the entry was
-    ///   already past TTL or absent), else propagate the original error.
+    ///   stream the stale body we already hold, provided it is still inside the
+    ///   repository's configured grace window measured from the entry's stamped
+    ///   expiry (#4581); otherwise propagate the original error. The serve is
+    ///   marked via [`StreamHeaders::stale_since`].
     async fn handle_streaming_leader_upstream_error(
         &self,
+        repo: &Repository,
         path: &str,
         cache_key: &str,
         metadata_key: &str,
@@ -5978,18 +6122,42 @@ impl ProxyService {
         // out precisely because upstream happened to be unreachable.
         check_quarantine_until(metadata.quarantine_until)?;
 
+        // #4581: enforce the repository's configured stale-if-error grace
+        // window, measured from the entry's stamped expiry (matching
+        // `revalidate_verdict` and the buffered produce arm). Before #4581 this
+        // path served any expired body regardless of age; now a body past the
+        // window propagates the upstream error instead.
+        let grace = self.effective_stale_if_error_grace_secs(repo.id).await;
+        let within_grace =
+            grace > 0 && Utc::now() < metadata.expires_at + chrono::Duration::seconds(grace);
+        if !within_grace {
+            tracing::warn!(
+                cache_key = %cache_key,
+                error = %upstream_err,
+                grace_secs = grace,
+                "streaming upstream fetch failed and the cached object is past the \
+                 {}-second stale-if-error grace; propagating the error (#4581)",
+                grace
+            );
+            return Err(upstream_err);
+        }
+
         if let Ok(body) = self.storage.get_stream(cache_key).await {
             tracing::warn!(
                 cache_key = %cache_key,
                 error = %upstream_err,
                 "streaming upstream fetch failed; serving stale cached copy (stale-if-error)"
             );
+            self.note_stale_served(repo).await;
             let headers = StreamHeaders {
                 content_type: metadata.content_type.clone(),
                 content_length: Some(metadata.size_bytes as u64),
                 etag: metadata.upstream_etag.clone(),
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
+                // #4581: mark the stale serve so the response carries
+                // `Warning: 110` + `X-AK-Stale-Since`.
+                stale_since: Some(metadata.expires_at),
             };
             return Ok(StreamHandle {
                 body,
@@ -7144,6 +7312,70 @@ impl ProxyService {
         self.ttl_policy_cache.overrides.invalidate(&repo_id).await;
     }
 
+    /// Drop this process's cached `stale_if_error_grace_secs` override for
+    /// `repo_id` (#4581), so a change made through the API applies to the very
+    /// next read here (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
+    pub async fn invalidate_stale_if_error_grace_override(&self, repo_id: Uuid) {
+        self.ttl_policy_cache.stale_grace.invalidate(&repo_id).await;
+    }
+
+    /// Record that `repo` just served a stale-if-error response (#4581): bumps
+    /// `ak_proxy_stale_if_error_responses_total{repo}` and remembers the time
+    /// for [`Self::last_stale_served_at`].
+    async fn note_stale_served(&self, repo: &Repository) {
+        record_proxy_stale_if_error_response(&repo.key);
+        self.ttl_policy_cache
+            .last_stale_served
+            .insert(repo.id, Utc::now())
+            .await;
+    }
+
+    /// When this replica last served a stale-if-error response for `repo_id`
+    /// within the past day, or `None` (#4581).
+    pub async fn last_stale_served_at(&self, repo_id: Uuid) -> Option<DateTime<Utc>> {
+        self.ttl_policy_cache.last_stale_served.get(&repo_id).await
+    }
+
+    /// Read the optional repo-level `stale_if_error_grace_secs` override
+    /// (#4581). Returns `None` when unset/unparseable so callers fall back to
+    /// the instance default. Memoized like [`Self::get_cache_ttl_override`]; a
+    /// database error is not cached and degrades to "no override".
+    async fn get_stale_if_error_grace_override(&self, repo_id: Uuid) -> Option<i64> {
+        if let Some(hit) = self.ttl_policy_cache.stale_grace.get(&repo_id).await {
+            return hit;
+        }
+        let row = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT value FROM repository_config
+            WHERE repository_id = $1 AND key = 'stale_if_error_grace_secs'
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.db)
+        .await
+        .ok()?;
+        let parsed = row
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|secs| secs.clamp(0, cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS));
+        self.ttl_policy_cache
+            .stale_grace
+            .insert(repo_id, parsed)
+            .await;
+        parsed
+    }
+
+    /// The effective RFC 5861 `stale-if-error` grace window (seconds) for
+    /// `repo_id` (#4581): the repository override when set, else this
+    /// instance's default ([`Self::with_stale_if_error_grace_secs`], itself
+    /// seeded from `PROXY_STALE_IF_ERROR_GRACE_SECS`). `0` disables serving
+    /// stale bodies for the repository.
+    pub async fn effective_stale_if_error_grace_secs(&self, repo_id: Uuid) -> i64 {
+        self.get_stale_if_error_grace_override(repo_id)
+            .await
+            .unwrap_or(self.stale_if_error_grace_secs)
+    }
+
     /// Resolve the repository's configured `quota_bytes` (#2928).
     ///
     /// Every handler-driven proxy fetch synthesizes its [`Repository`] through
@@ -7687,10 +7919,11 @@ impl ProxyService {
                     .get_cached_artifact(cache_key, metadata_key, metadata.clone())
                     .await?
                 {
-                    Some((content, content_type, content_encoding)) => Ok(CacheReadOutcome::Hit(
-                        content,
-                        content_type,
-                        content_encoding,
+                    Some(body) => Ok(CacheReadOutcome::Hit(
+                        body.content,
+                        body.content_type,
+                        body.content_encoding,
+                        body.stale_since,
                     )),
                     None => Ok(CacheReadOutcome::Miss),
                 }
@@ -7797,12 +8030,15 @@ impl ProxyService {
                     .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
-                    Ok(Some((content, content_type, content_encoding))) => {
+                    Ok(Some(body)) => {
                         tracing::debug!(cache_key = %cache_key, "304 revalidation: extended TTL, serving cached body");
+                        // A 304 confirms the body is current: a fresh serve, so
+                        // any stale marker is dropped (the TTL was extended).
                         Ok(CacheReadOutcome::Hit(
-                            content,
-                            content_type,
-                            content_encoding,
+                            body.content,
+                            body.content_type,
+                            body.content_encoding,
+                            None,
                         ))
                     }
                     // Body vanished between probe and read: refill.
@@ -7810,14 +8046,20 @@ impl ProxyService {
                 }
             }
             RevalidationVerdict::ServeStaleIfError => {
-                if let Ok(Some((content, content_type, content_encoding))) = self
+                if let Ok(Some(body)) = self
                     .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        "revalidation failed; serving stale within stale-if-error grace (#4581)"
+                    );
+                    self.note_stale_served(repo).await;
                     return Ok(CacheReadOutcome::Hit(
-                        content,
-                        content_type,
-                        content_encoding,
+                        body.content,
+                        body.content_type,
+                        body.content_encoding,
+                        body.stale_since.or(Some(metadata.expires_at)),
                     ));
                 }
                 Ok(CacheReadOutcome::Miss)
@@ -7888,10 +8130,12 @@ impl ProxyService {
                 // not the #3832 effective one: it is an availability
                 // fallback, and before #3832 this body would have been served
                 // as fresh until that stamp anyway, so lowering a TTL must not
-                // make an outage fail harder than it did.
-                let within_grace = Utc::now()
-                    < metadata.expires_at
-                        + chrono::Duration::seconds(cache_classifier::STALE_IF_ERROR_GRACE_SECS);
+                // make an outage fail harder than it did. The window itself is
+                // the repository's configured grace (#4581), defaulting to the
+                // instance value.
+                let grace = self.effective_stale_if_error_grace_secs(repo.id).await;
+                let within_grace = grace > 0
+                    && Utc::now() < metadata.expires_at + chrono::Duration::seconds(grace);
                 if within_grace {
                     tracing::warn!(
                         metadata_key = %metadata_key,
@@ -12627,8 +12871,14 @@ mod tests {
         let content_key = format!("proxy-cache/npm-proxy/{slug}/__content__");
         let metadata_key = format!("proxy-cache/npm-proxy/{slug}/__cache_meta__.json");
         let proxy = build_proxy_service_with_storage(backend);
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "npm-proxy",
+            "https://registry.npmjs.org",
+        );
         match proxy
             .handle_streaming_leader_upstream_error(
+                &repo,
                 slug,
                 &content_key,
                 &metadata_key,
@@ -12660,6 +12910,67 @@ mod tests {
             size_bytes,
             checksum_sha256: "b".repeat(64),
         }
+    }
+
+    /// #4581: a stale-if-error serve inside the grace carries the marker, so
+    /// the response builders can emit `Warning: 110` + `X-AK-Stale-Since`.
+    #[tokio::test]
+    async fn test_stale_if_error_streaming_serve_is_marked_stale() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object("proxy-cache/npm-proxy/4581-marked/__content__", b"STALE")
+            .await;
+        let sidecar = stale_positive_sidecar(5);
+        let expires_at = sidecar.expires_at;
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4581-marked/__cache_meta__.json",
+                &sidecar,
+            )
+            .await;
+        let proxy = build_proxy_service_with_storage(backend);
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "npm-proxy",
+            "https://registry.npmjs.org",
+        );
+        let handle = proxy
+            .handle_streaming_leader_upstream_error(
+                &repo,
+                "4581-marked",
+                "proxy-cache/npm-proxy/4581-marked/__content__",
+                "proxy-cache/npm-proxy/4581-marked/__cache_meta__.json",
+                AppError::BadGateway("upstream 502".to_string()),
+            )
+            .await
+            .expect("inside the grace the stale body is served");
+        assert_eq!(handle.headers.stale_since, Some(expires_at));
+    }
+
+    /// #4581: past the grace window the upstream error propagates instead of
+    /// serving an arbitrarily old body.
+    #[tokio::test]
+    async fn test_stale_if_error_streaming_refuses_a_body_past_the_grace() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object("proxy-cache/npm-proxy/4581-past/__content__", b"ANCIENT")
+            .await;
+        let mut sidecar = stale_positive_sidecar(7);
+        sidecar.expires_at = Utc::now()
+            - chrono::Duration::seconds(cache_classifier::STALE_IF_ERROR_GRACE_SECS + 60);
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4581-past/__cache_meta__.json",
+                &sidecar,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "4581-past").await;
+
+        assert!(
+            matches!(served, Err(AppError::BadGateway(_))),
+            "a body past the grace must propagate the upstream error, got {served:?}"
+        );
     }
 
     /// #3147 reader 1, the reproduction: an object on the live content key
@@ -15920,6 +16231,7 @@ mod tests {
             content_length: Some(12345),
             artifact_id: None,
             etag: None,
+            stale_since: None,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
@@ -16397,7 +16709,7 @@ mod tests {
             .expect("prime cache from upstream");
         assert_eq!(&body[..], b"INDEX-BODY");
         match proxy.cached_metadata_if_servable(&repo, "index.json").await {
-            Ok(Some((bytes, _, _))) => assert_eq!(&bytes[..], b"INDEX-BODY"),
+            Ok(Some(CachedBody { content: bytes, .. })) => assert_eq!(&bytes[..], b"INDEX-BODY"),
             other => panic!("fresh cached entry must be servable, got {other:?}"),
         }
 
@@ -16750,14 +17062,16 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let (got, got_ct, _got_enc) = lookup.expect(
-            "cache_artifact MUST persist bytes that the very next call to \
+        let (got, got_ct, _got_enc) = lookup
+            .expect(
+                "cache_artifact MUST persist bytes that the very next call to \
              get_cached_artifact_by_path can read back. The reproducer in \
              #1445(A) (`cached artifacts should contain abbrev after npm \
              upstream fetch -- not present`) trips when this round-trip \
              fails: bytes are returned to the client but the cache is \
              empty next time.",
-        );
+            )
+            .into_parts();
         assert_eq!(&got[..], content.as_ref());
         assert_eq!(got_ct.as_deref(), Some("application/gzip"));
     }
@@ -16915,8 +17229,9 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let (cached_content, _, _) =
-            cached.expect("a matching content-addressed body MUST be cached");
+        let (cached_content, _, _) = cached
+            .expect("a matching content-addressed body MUST be cached")
+            .into_parts();
         assert_eq!(&cached_content[..], body.as_ref());
     }
 
@@ -17749,7 +18064,9 @@ mod tests {
             .get_cached(BODY_KEY, META_KEY, true, None)
             .await
             .unwrap();
-        let (content, ct, _enc) = out.expect("stale read must serve an expired entry");
+        let (content, ct, _enc) = out
+            .expect("stale read must serve an expired entry")
+            .into_parts();
         assert_eq!(&content[..], body);
         assert_eq!(ct.as_deref(), Some("application/octet-stream"));
     }
@@ -17878,7 +18195,8 @@ mod tests {
         let (content, _ct, _enc) = svc
             .fetch_artifact_with_cache_path(&repo, &cache_path, &cache_path)
             .await
-            .expect("a fresh immutable cache hit must serve without upstream");
+            .expect("a fresh immutable cache hit must serve without upstream")
+            .into_parts();
         assert_eq!(content, body);
 
         let requested = storage.requested.lock().unwrap();
@@ -20367,7 +20685,8 @@ mod tests {
         let (b1, ct1, _enc1) = proxy
             .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
             .await
-            .expect("first fetch hits upstream and caches");
+            .expect("first fetch hits upstream and caches")
+            .into_parts();
         assert_eq!(&b1[..], b"tarball");
         assert_eq!(ct1.as_deref(), Some("application/gzip"));
 
@@ -20376,7 +20695,8 @@ mod tests {
         let (b2, _ct2, _enc2) = proxy
             .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
             .await
-            .expect("second fetch must be served from the proxy cache");
+            .expect("second fetch must be served from the proxy cache")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
     }
@@ -20604,7 +20924,7 @@ mod tests {
                 .fetch_artifact_with_cache_path(repo, asset, asset)
                 .await
                 .unwrap()
-                .0
+                .content
         }
     }
 
@@ -20855,7 +21175,7 @@ mod tests {
             cached_at + chrono::Duration::seconds(300),
             "the reported expiry must be the one the read path enforces"
         );
-        assert_eq!(&fresh_body.0[..], body);
+        assert_eq!(&fresh_body.content[..], body);
         assert!(
             !fresh_after_lowering,
             "presign probe must not hand out an entry the lowered TTL expired"
@@ -20864,9 +21184,9 @@ mod tests {
             by_path_after_lowering.is_none(),
             "key-only read must treat the entry as expired under the lowered TTL"
         );
-        assert_eq!(&revalidated.0[..], body);
+        assert_eq!(&revalidated.content[..], body);
         assert!(fresh_after_304, "the 304 must re-anchor the entry");
-        assert_eq!(&again.0[..], body);
+        assert_eq!(&again.content[..], body);
     }
 
     #[tokio::test]
@@ -20903,7 +21223,8 @@ mod tests {
         let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
-            .expect("304 revalidation must serve the cached body");
+            .expect("304 revalidation must serve the cached body")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&body[..], b"cached-index", "304 must serve cached bytes");
     }
@@ -20949,7 +21270,8 @@ mod tests {
         let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
-            .expect("changed upstream must refill");
+            .expect("changed upstream must refill")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
             &body[..],
@@ -21025,7 +21347,8 @@ mod tests {
         let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
-            .expect("stale-if-error must serve the stale body when upstream is down");
+            .expect("stale-if-error must serve the stale body when upstream is down")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&body[..], b"stale-but-served");
     }
@@ -21086,11 +21409,13 @@ mod tests {
             .await;
         let sidecar_after = std::fs::read(&sidecar_path);
         let _ = std::fs::remove_dir_all(&tmp);
-        let (body, _ct, _enc) = result.unwrap_or_else(|e| {
-            panic!(
+        let (body, _ct, _enc) = result
+            .unwrap_or_else(|e| {
+                panic!(
                 "a {probe_status} on the conditional HEAD must serve the stale body (#3571): {e:?}"
             )
-        });
+            })
+            .into_parts();
         assert_eq!(
             &body[..],
             b"stale-but-good",
@@ -21165,9 +21490,11 @@ mod tests {
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await;
         let _ = std::fs::remove_dir_all(&tmp);
-        let (body, _ct, _enc) = result.unwrap_or_else(|e| {
-            panic!("a {probe_status} on the conditional HEAD must still refill (#3571): {e:?}")
-        });
+        let (body, _ct, _enc) = result
+            .unwrap_or_else(|e| {
+                panic!("a {probe_status} on the conditional HEAD must still refill (#3571): {e:?}")
+            })
+            .into_parts();
         assert_eq!(
             &body[..],
             b"refilled",
@@ -21253,7 +21580,9 @@ mod tests {
         let sidecar_after = std::fs::read(&sidecar_path);
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let (body, _ct, _enc) = result.expect("a HEAD-only 403 must not block the refill (#3571)");
+        let (body, _ct, _enc) = result
+            .expect("a HEAD-only 403 must not block the refill (#3571)")
+            .into_parts();
         assert_eq!(
             &body[..],
             b"fresh-bytes-v2",
@@ -21313,7 +21642,8 @@ mod tests {
             .await;
         let _ = std::fs::remove_dir_all(&tmp);
         let (body, _ct, _enc) = result
-            .expect("a 403 on both probe and refill must still degrade to the stale copy (#3571)");
+            .expect("a 403 on both probe and refill must still degrade to the stale copy (#3571)")
+            .into_parts();
         assert_eq!(
             &body[..],
             b"stale-but-good",
@@ -21383,7 +21713,7 @@ mod tests {
             matches!(first, Err(AppError::NotFound(_))),
             "a {gone_status} on probe AND refill must surface as NotFound, never as the \
              stale body (#3749); got {:?}",
-            first.map(|(body, _, _)| String::from_utf8_lossy(&body).into_owned())
+            first.map(|body| String::from_utf8_lossy(&body.content).into_owned())
         );
         let sidecar: CacheMetadata =
             serde_json::from_slice(&sidecar_after.expect("the fetch must leave a sidecar behind"))
@@ -21474,7 +21804,8 @@ mod tests {
         let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
-            .expect("401 on the probe must fall through to a refill");
+            .expect("401 on the probe must fall through to a refill")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&body[..], b"refilled", "401 must still refill (#3571)");
     }
@@ -21519,14 +21850,16 @@ mod tests {
         let (b1, _, _) = proxy
             .fetch_artifact_with_cache_path(&repo, jar, jar)
             .await
-            .expect("first immutable fetch hits upstream and caches forever");
+            .expect("first immutable fetch hits upstream and caches forever")
+            .into_parts();
         assert_eq!(&b1[..], b"jar-bytes");
 
         // Second fetch must be served from cache with ZERO upstream contact.
         let (b2, _, _) = proxy
             .fetch_artifact_with_cache_path(&repo, jar, jar)
             .await
-            .expect("immutable hit must serve from cache without upstream");
+            .expect("immutable hit must serve from cache without upstream")
+            .into_parts();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&b2[..], b"jar-bytes");
     }
@@ -23506,7 +23839,7 @@ mod tests {
         assert!(
             seen_by_b.is_none(),
             "deployment B served deployment A's cached upstream bytes: {:?}",
-            seen_by_b.map(|(body, _, _)| String::from_utf8_lossy(&body).into_owned())
+            seen_by_b.map(|body| String::from_utf8_lossy(&body.content).into_owned())
         );
         assert!(
             !b.is_cache_fresh(REPO, PATH).await,
@@ -23522,7 +23855,8 @@ mod tests {
             .get_cached_artifact_by_path(REPO, PATH)
             .await
             .expect("cache read must not error")
-            .expect("deployment A must still hit its own warm cache");
+            .expect("deployment A must still hit its own warm cache")
+            .into_parts();
         assert_eq!(&body_a[..], b"ALPHA-from-deployment-a-upstream");
         assert!(a.is_cache_fresh(REPO, PATH).await);
 
@@ -23530,7 +23864,8 @@ mod tests {
             .get_cached_artifact_by_path(REPO, PATH)
             .await
             .expect("cache read must not error")
-            .expect("deployment B must hit its own warm cache");
+            .expect("deployment B must hit its own warm cache")
+            .into_parts();
         assert_eq!(&body_b[..], b"BRAVO-from-deployment-b-upstream");
     }
 
@@ -23556,7 +23891,8 @@ mod tests {
             .expect(
                 "fixture is broken: two unscoped services over one directory must share \
                  the key space, which is the defect #3454 describes",
-            );
+            )
+            .into_parts();
         assert_eq!(&body[..], b"ALPHA-from-deployment-a-upstream");
     }
 

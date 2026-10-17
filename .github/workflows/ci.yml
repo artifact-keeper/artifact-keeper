@@ -1240,6 +1240,7 @@ jobs:
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
+            --test proxy_stale_if_error_tests \
             --test pypi_proxy_upload_time_tests \
             --test rpm_generic_upload_metadata_tests \
             --test sbom_cached_artifact_not_analyzable_tests \
@@ -1320,6 +1321,7 @@ jobs:
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
+            --test proxy_stale_if_error_tests \
             --test pypi_proxy_upload_time_tests \
             --test rpm_generic_upload_metadata_tests \
             --test sbom_cached_artifact_not_analyzable_tests \

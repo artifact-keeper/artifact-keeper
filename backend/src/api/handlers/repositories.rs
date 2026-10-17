@@ -840,6 +840,11 @@ pub fn router() -> Router<SharedState> {
         .route("/:key/storage/tree", get(get_repository_storage_tree))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // stale-if-error grace window for proxy/remote repositories (#4581)
+        .route(
+            "/:key/stale-if-error-grace",
+            put(set_stale_if_error_grace).get(get_stale_if_error_grace),
+        )
         // npm scope policy for Remote members of npm virtual repositories (#2327)
         .route(
             "/:key/npm-scope-policy",
@@ -2274,6 +2279,24 @@ fn cache_ttl_range_error() -> String {
     )
 }
 
+/// Whether a caller-supplied `stale_if_error_grace_seconds` is in range
+/// (#4581). Unlike `cache_ttl`, `0` is valid and means "never serve a stale
+/// body": an unreachable upstream then surfaces as a hard error instead of a
+/// marked stale 200.
+fn validate_stale_if_error_grace(secs: i64) -> bool {
+    (0..=cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS).contains(&secs)
+}
+
+/// The 400 message for an out-of-range `stale_if_error_grace_seconds`.
+fn stale_if_error_grace_range_error() -> String {
+    format!(
+        "stale_if_error_grace_seconds must be between 0 and {} (30 days; the default is \
+         {} seconds, and 0 disables serving stale responses)",
+        cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
+        cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+    )
+}
+
 /// Clamp a caller-supplied `per_page` into the valid `[1, 100]` range.
 ///
 /// `per_page = 0` (or any value below 1) must NOT pass through: it would reach
@@ -2534,6 +2557,187 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetStaleIfErrorGraceRequest {
+    /// RFC 5861 `stale-if-error` grace window, in seconds, for this remote:
+    /// how long a cached body past its freshness TTL may still be served when
+    /// the upstream is unreachable (5xx / timeout / transport). `0`..=2592000
+    /// (30 days). `0` disables serving stale bodies entirely. Responses served
+    /// under the grace are marked with `Warning: 110 - "Response is stale"` and
+    /// `X-AK-Stale-Since`. Omit the override to use the instance default
+    /// (`PROXY_STALE_IF_ERROR_GRACE_SECS`, default 3600).
+    pub stale_if_error_grace_seconds: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StaleIfErrorGraceResponse {
+    pub repository_key: String,
+    /// The grace window the proxy actually applies for this repository: the
+    /// per-repository override when one is stored, else the instance default.
+    pub stale_if_error_grace_seconds: i64,
+    /// The per-repository override, or `null` when none is stored (the
+    /// instance default then applies).
+    pub override_seconds: Option<i64>,
+    /// When this replica last served a stale-if-error response for the
+    /// repository within the past 24 hours, or `null`. A non-null value means
+    /// the upstream was recently unreachable (#4581).
+    pub last_stale_served_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Set the `stale-if-error` grace window for a repository (#4581)
+#[utoipa::path(
+    put,
+    path = "/{key}/stale-if-error-grace",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetStaleIfErrorGraceRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Stale-if-error grace window updated", body = StaleIfErrorGraceResponse),
+        (status = 400, description = "Invalid grace value"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_stale_if_error_grace(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetStaleIfErrorGraceRequest>,
+) -> Result<Json<StaleIfErrorGraceResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:repositories")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &service).await?;
+
+    // Same administrative tier as `set_cache_ttl`: the grace window is a
+    // pull-through supply-chain control, so a tenant write grant is not enough.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to change the stale-if-error grace window of this \
+                 repository"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Only Remote (proxy) repositories consume the value; writing it elsewhere
+    // is dead state (mirrors `set_cache_ttl`).
+    is_cache_ttl_configurable(&repo.repo_type)?;
+
+    if !validate_stale_if_error_grace(payload.stale_if_error_grace_seconds) {
+        return Err(AppError::Validation(stale_if_error_grace_range_error()));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, 'stale_if_error_grace_secs', $2)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(payload.stale_if_error_grace_seconds.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service
+            .invalidate_stale_if_error_grace_override(repo.id)
+            .await;
+    }
+
+    let override_seconds = Some(payload.stale_if_error_grace_seconds);
+    let effective = match state.proxy_service.as_ref() {
+        Some(proxy_service) => {
+            proxy_service
+                .effective_stale_if_error_grace_secs(repo.id)
+                .await
+        }
+        None => payload.stale_if_error_grace_seconds,
+    };
+    let last_stale_served_at = match state.proxy_service.as_ref() {
+        Some(proxy_service) => proxy_service.last_stale_served_at(repo.id).await,
+        None => None,
+    };
+    Ok(Json(StaleIfErrorGraceResponse {
+        repository_key: key,
+        stale_if_error_grace_seconds: effective,
+        override_seconds,
+        last_stale_served_at,
+    }))
+}
+
+/// Get the `stale-if-error` grace window for a repository (#4581)
+#[utoipa::path(
+    get,
+    path = "/{key}/stale-if-error-grace",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Effective stale-if-error grace window", body = StaleIfErrorGraceResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+// GET stays permissive for any repo_type (mirrors `get_cache_ttl`): existing UI
+// probes call this for every repo type and expect a 200.
+pub async fn get_stale_if_error_grace(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<StaleIfErrorGraceResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = 'stale_if_error_grace_secs'
+        "#,
+    )
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let override_seconds = result
+        .and_then(|(v,)| v.parse::<i64>().ok())
+        .map(|secs| secs.clamp(0, cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS));
+    let effective = match state.proxy_service.as_ref() {
+        Some(proxy_service) => {
+            proxy_service
+                .effective_stale_if_error_grace_secs(repo.id)
+                .await
+        }
+        None => override_seconds.unwrap_or(cache_classifier::STALE_IF_ERROR_GRACE_SECS),
+    };
+
+    let last_stale_served_at = match state.proxy_service.as_ref() {
+        Some(proxy_service) => proxy_service.last_stale_served_at(repo.id).await,
+        None => None,
+    };
+    Ok(Json(StaleIfErrorGraceResponse {
+        repository_key: key,
+        stale_if_error_grace_seconds: effective,
+        override_seconds,
+        last_stale_served_at,
     }))
 }
 
@@ -12820,6 +13024,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         put_pypi_track,
         delete_pypi_track,
         get_cache_ttl,
+        set_stale_if_error_grace,
+        get_stale_if_error_grace,
         invalidate_cache,
         list_artifacts,
         get_artifact_metadata,
@@ -12860,6 +13066,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryStorageTreeResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        SetStaleIfErrorGraceRequest,
+        StaleIfErrorGraceResponse,
         SetNpmScopePolicyRequest,
         NpmScopePolicyResponse,
         InvalidateCacheQuery,
@@ -18881,6 +19089,79 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #4581: the grace window round-trips through the API, is range checked,
+    /// is refused on a non-Remote repository and without `repository:admin`.
+    #[tokio::test]
+    async fn stale_if_error_grace_api_round_trip_and_gates_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        for id in [repo_id, local_id] {
+            tdh::grant_repo_access(&pool, id, user_id).await;
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let user = tdh::make_auth(user_id, &username);
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let put = |ext: AuthExtension, key: &str, secs: i64| {
+            set_stale_if_error_grace(
+                State(state.clone()),
+                Extension(Some(ext)),
+                Path(key.to_string()),
+                Json(SetStaleIfErrorGraceRequest {
+                    stale_if_error_grace_seconds: secs,
+                }),
+            )
+        };
+
+        let before = get_stale_if_error_grace(State(state.clone()), Path(key.clone()))
+            .await
+            .expect("get default");
+        let denied = put(user, &key, 60).await;
+        let too_big = put(
+            admin.clone(),
+            &key,
+            cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS + 1,
+        )
+        .await;
+        let not_remote = put(admin.clone(), &local_key, 60).await;
+        let set = put(admin.clone(), &key, 0).await.expect("admin sets 0");
+        let after = get_stale_if_error_grace(State(state.clone()), Path(key.clone()))
+            .await
+            .expect("get override");
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, local_id, &local_dir).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(before.0.override_seconds, None);
+        assert_eq!(
+            before.0.stale_if_error_grace_seconds,
+            cache_classifier::STALE_IF_ERROR_GRACE_SECS
+        );
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "{denied:?}"
+        );
+        assert!(
+            matches!(too_big, Err(AppError::Validation(_))),
+            "{too_big:?}"
+        );
+        assert!(not_remote.is_err(), "grace is Remote only");
+        assert_eq!(set.0.override_seconds, Some(0));
+        assert_eq!(after.0.override_seconds, Some(0));
+        assert_eq!(after.0.stale_if_error_grace_seconds, 0);
+    }
+
     // -----------------------------------------------------------------------
     // npm scope policy handlers (#2327) — DB-backed
     // -----------------------------------------------------------------------
@@ -21193,6 +21474,7 @@ mod tests {
             "set_egress_proxy",
             "upload_artifact",
             "delete_artifact",
+            "set_stale_if_error_grace",
         ] {
             let marker = format!("pub async fn {}(", handler);
             let start = source
@@ -21720,6 +22002,20 @@ mod tests {
     // -----------------------------------------------------------------------
     // validate_cache_ttl
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_stale_if_error_grace_bounds() {
+        assert!(validate_stale_if_error_grace(0), "0 disables stale serving");
+        assert!(validate_stale_if_error_grace(3600));
+        assert!(validate_stale_if_error_grace(
+            cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS
+        ));
+        assert!(!validate_stale_if_error_grace(-1));
+        assert!(!validate_stale_if_error_grace(
+            cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS + 1
+        ));
+        assert!(stale_if_error_grace_range_error().contains("2592000"));
+    }
 
     #[test]
     fn test_validate_cache_ttl_valid_5_minutes() {
@@ -27286,7 +27582,7 @@ mod tests {
 
     #[test]
     fn repo_management_handlers_require_mintable_scopes() {
-        // The fourteen write-side handlers that gated on the un-mintable
+        // The write-side handlers that gated on the un-mintable
         // bare `write` parent now name `write:repositories`.
         for handler in [
             "create_repository",
@@ -27303,6 +27599,7 @@ mod tests {
             "set_egress_proxy",
             "set_routing_rules",
             "delete_routing_rules",
+            "set_stale_if_error_grace",
         ] {
             assert!(
                 repo_handler_body(handler).contains("require_scope(\"write:repositories\")"),

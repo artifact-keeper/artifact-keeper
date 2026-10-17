@@ -998,8 +998,13 @@ async fn proxy_pub_meta_get(
     )
     .await;
 
-    let (content, content_type, content_encoding) = match result {
-        Ok(triple) => triple,
+    let proxy_helpers::CachedBody {
+        content,
+        content_type,
+        content_encoding,
+        stale_since,
+    } = match result {
+        Ok(body) => body,
         Err(_) => return None,
     };
 
@@ -1015,6 +1020,7 @@ async fn proxy_pub_meta_get(
                 content_type,
                 "application/vnd.pub.v2+json",
                 content_encoding,
+                stale_since,
             ));
         }
     };

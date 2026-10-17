@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4581]
+---
+- **Responses served from a stale cache entry because a remote's upstream is unreachable are now marked, and the grace window is configurable** (#4581). Under the RFC 5861 `stale-if-error` grace the proxy served the cached body byte-identically to a fresh one, so neither clients, a proxy in front, nor operators could tell an upstream outage from normal operation. Such responses now carry `Warning: 110 - "Response is stale"` and `X-AK-Stale-Since` (the instant the entry's freshness lapsed), including virtual repository merges that include a stale member. The grace window, previously fixed at 3600 seconds, is set instance-wide with `PROXY_STALE_IF_ERROR_GRACE_SECS` (default 3600) and per repository with `PUT /api/v1/repositories/{key}/stale-if-error-grace` (`0` disables serving stale bodies; maximum 30 days). The streaming path now enforces the window as well instead of serving any expired body. Each stale response increments `ak_proxy_stale_if_error_responses_total{repo}`, and `GET /api/v1/repositories/{key}/stale-if-error-grace` reports `last_stale_served_at` for the repository.

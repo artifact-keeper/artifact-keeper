@@ -99,6 +99,19 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
     .increment(1);
 }
 
+/// A response served from a stale cache entry under the RFC 5861
+/// `stale-if-error` grace because the upstream was unreachable (#4581).
+///
+/// A sustained rate means a remote's upstream is down while clients keep
+/// getting 200s; alert on `rate(ak_proxy_stale_if_error_responses_total[5m]) > 0`.
+pub fn record_proxy_stale_if_error_response(repo_key: &str) {
+    counter!(
+        "ak_proxy_stale_if_error_responses_total",
+        "repo" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
 /// Virtual conda merge pressure (#4608). `kind` is the merged document:
 /// `repodata`, `channeldata` or `shard_index`.
 ///
@@ -460,6 +473,18 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, record);
         handle.render()
+    }
+
+    #[test]
+    fn test_stale_if_error_counter_is_labelled_by_repo() {
+        let out = render_with_production_recorder(|| {
+            record_proxy_stale_if_error_response("conda-forge");
+            record_proxy_stale_if_error_response("conda-forge");
+        });
+        assert!(
+            out.contains("ak_proxy_stale_if_error_responses_total{repo=\"conda-forge\"} 2"),
+            "unexpected exposition: {out}"
+        );
     }
 
     #[test]
