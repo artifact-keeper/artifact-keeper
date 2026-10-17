@@ -132,7 +132,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 
 # OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"] }
 # The HTTP/protobuf exporter must use the BLOCKING reqwest client, supplied by
 # opentelemetry-otlp's default `reqwest-blocking-client` feature. Do not add
 # `reqwest-client` here: when it is enabled the builder picks the async client
