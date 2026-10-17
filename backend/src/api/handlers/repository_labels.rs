@@ -150,6 +150,7 @@ async fn reevaluate_sync_policies(db: &sqlx::PgPool, repo_id: Uuid) {
 #[utoipa::path(
     get,
     operation_id = "list_repo_labels",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -186,6 +187,7 @@ async fn list_labels(
 #[utoipa::path(
     put,
     operation_id = "set_repo_labels",
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -229,6 +231,7 @@ async fn set_labels(
 #[utoipa::path(
     post,
     operation_id = "add_repo_label",
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -266,6 +269,7 @@ async fn add_label(
 #[utoipa::path(
     delete,
     operation_id = "delete_repo_label",
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -299,6 +303,7 @@ async fn delete_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Cross-tenant authz guard (xtenant-write-authz-systemic). The labels
     /// surface lives under the /repositories nest, which is NOT covered by
@@ -583,7 +588,7 @@ mod tests {
                 })
             })
             .collect();
-        let json = serde_json::json!({ "labels": labels });
+        let json = json!({ "labels": labels });
         let req: SetLabelsRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.labels.len(), 100);
         assert_eq!(req.labels[99].key, "label-99");
@@ -766,5 +771,388 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // IAM enforcement spike (#4214). Shadow-only
+    // plumbing probes; none of this affects handler responses.
+    // -----------------------------------------------------------------------
+    mod iam_spike {
+        use super::super::*;
+        use axum::{
+            body::Body,
+            extract::{MatchedPath, Request},
+            http::{Method, StatusCode},
+            middleware::{self, Next},
+            response::{IntoResponse, Response},
+        };
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        const PREFIX: &str = "/api/v1/repositories";
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Entry {
+            permission: String,
+            resource: String,
+        }
+
+        type Registry = HashMap<(Method, String), Entry>;
+
+        /// OpenAPI `{key}` -> Axum `:key`.
+        fn normalize(template: &str) -> String {
+            template
+                .split('/')
+                .map(
+                    |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                        Some(name) => format!(":{name}"),
+                        None => seg.to_string(),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("/")
+        }
+
+        /// Registry built from the merged `build_openapi()` document, keeping
+        /// only operations that declare `x-required-permission`.
+        fn build_registry() -> Registry {
+            let doc = serde_json::to_value(crate::api::openapi::build_openapi()).unwrap();
+            let mut reg = Registry::new();
+            for (path, item) in doc["paths"].as_object().unwrap() {
+                for (verb, op) in item.as_object().unwrap() {
+                    let Some(permission) = op.get("x-required-permission") else {
+                        continue;
+                    };
+                    let method = Method::from_bytes(verb.to_uppercase().as_bytes()).unwrap();
+                    reg.insert(
+                        (method, normalize(path)),
+                        Entry {
+                            permission: permission.as_str().unwrap().to_string(),
+                            resource: op["x-resource"].as_str().unwrap().to_string(),
+                        },
+                    );
+                }
+            }
+            reg
+        }
+
+        fn label_ops() -> Vec<(Method, &'static str, &'static str)> {
+            vec![
+                (
+                    Method::GET,
+                    "/api/v1/repositories/:key/labels",
+                    "repository.read",
+                ),
+                (
+                    Method::PUT,
+                    "/api/v1/repositories/:key/labels",
+                    "repository.update",
+                ),
+                (
+                    Method::POST,
+                    "/api/v1/repositories/:key/labels/:label_key",
+                    "repository.update",
+                ),
+                (
+                    Method::DELETE,
+                    "/api/v1/repositories/:key/labels/:label_key",
+                    "repository.update",
+                ),
+            ]
+        }
+
+        fn test_state() -> SharedState {
+            let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+                .expect("connect_lazy");
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+                crate::storage::filesystem::FilesystemStorage::new("/tmp/test-iam-spike"),
+            );
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                HashMap::new(),
+                "filesystem".to_string(),
+            ));
+            Arc::new(crate::api::AppState::new(
+                crate::config::Config::test_config(),
+                pool,
+                storage,
+                registry,
+            ))
+        }
+
+        fn spike_router() -> Router {
+            Router::new()
+                .nest(PREFIX, repo_labels_router())
+                .with_state(test_state())
+        }
+
+        // -- 1.1 ---------------------------------------------------------
+
+        #[test]
+        fn openapi_preserves_authz_extensions() {
+            let reg = build_registry();
+            for (method, path, perm) in label_ops() {
+                let e = reg
+                    .get(&(method.clone(), path.to_string()))
+                    .unwrap_or_else(|| panic!("missing {method} {path}"));
+                assert_eq!(e.permission, perm, "{method} {path}");
+                assert_eq!(e.resource, "repo:key", "{method} {path}");
+            }
+        }
+
+        // -- 1.2 ---------------------------------------------------------
+
+        #[test]
+        fn registry_resolves_only_known_operations() {
+            let reg = build_registry();
+            // Other modules carry no extension yet, so only the four label
+            // operations are present.
+            assert_eq!(reg.len(), 4, "registry: {reg:?}");
+            for (method, path, _) in label_ops() {
+                assert!(reg.contains_key(&(method, path.to_string())));
+            }
+            assert!(!reg.contains_key(&(
+                Method::PATCH,
+                "/api/v1/repositories/:key/labels".to_string()
+            )));
+            assert!(
+                !reg.contains_key(&(Method::POST, "/api/v1/repositories/:key/labels".to_string()))
+            );
+            assert!(!reg.contains_key(&(Method::GET, "/api/v1/repositories/:key".to_string())));
+            assert!(
+                !reg.contains_key(&(Method::GET, "/api/v1/repositories/{key}/labels".to_string()))
+            );
+        }
+
+        // -- 1.3 / 2.2 / 2.3 --------------------------------------------
+
+        #[derive(Clone)]
+        struct AuthzDenied;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Observation {
+            entry: Option<Entry>,
+            denied: bool,
+            status: StatusCode,
+        }
+
+        // Parent-layer shadow probe: resolves the registry entry from method
+        // + MatchedPath, records what it saw, and returns the inner response
+        // untouched.
+        async fn shadow_probe(
+            reg: Arc<Registry>,
+            log: Arc<Mutex<Vec<Observation>>>,
+            req: Request,
+            next: Next,
+        ) -> Response {
+            let key = req
+                .extensions()
+                .get::<MatchedPath>()
+                .map(|m| (req.method().clone(), m.as_str().to_string()));
+            let resp = next.run(req).await;
+            log.lock().unwrap().push(Observation {
+                entry: key.and_then(|k| reg.get(&k).cloned()),
+                denied: resp.extensions().get::<AuthzDenied>().is_some(),
+                status: resp.status(),
+            });
+            resp
+        }
+
+        fn with_probe(router: Router, log: Arc<Mutex<Vec<Observation>>>) -> Router {
+            let reg = Arc::new(build_registry());
+            router.layer(middleware::from_fn(move |req: Request, next: Next| {
+                shadow_probe(reg.clone(), log.clone(), req, next)
+            }))
+        }
+
+        async fn send(router: &Router, method: Method, uri: &str) -> Response {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn matched_path_resolves_same_entry_as_direct_lookup() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let router = with_probe(spike_router(), log.clone());
+            let reg = build_registry();
+
+            let cases = [
+                (
+                    Method::GET,
+                    "/api/v1/repositories/r1/labels",
+                    label_ops()[0].1,
+                ),
+                (
+                    Method::PUT,
+                    "/api/v1/repositories/r1/labels",
+                    label_ops()[1].1,
+                ),
+                (
+                    Method::POST,
+                    "/api/v1/repositories/r1/labels/env",
+                    label_ops()[2].1,
+                ),
+                (
+                    Method::DELETE,
+                    "/api/v1/repositories/r1/labels/env",
+                    label_ops()[3].1,
+                ),
+            ];
+            for (method, uri, template) in cases {
+                log.lock().unwrap().clear();
+                // Handlers reject/err without auth or DB; only the route match
+                // matters here, so the status is deliberately not asserted.
+                let _ = send(&router, method.clone(), uri).await;
+                let obs = log.lock().unwrap().clone();
+                assert_eq!(obs.len(), 1, "{method} {uri}");
+                let direct = reg.get(&(method.clone(), template.to_string())).cloned();
+                assert!(direct.is_some());
+                assert_eq!(obs[0].entry, direct, "{method} {uri}");
+            }
+
+            // Method mismatch and unknown path do not resolve.
+            for (method, uri) in [
+                (Method::PATCH, "/api/v1/repositories/r1/labels"),
+                (Method::GET, "/api/v1/repositories/r1/nothing"),
+            ] {
+                log.lock().unwrap().clear();
+                let _ = send(&router, method.clone(), uri).await;
+                let obs = log.lock().unwrap().clone();
+                assert!(
+                    obs.iter().all(|o| o.entry.is_none()),
+                    "{method} {uri}: {obs:?}"
+                );
+            }
+        }
+
+        // -- 2.2 ---------------------------------------------------------
+
+        #[tokio::test]
+        async fn authz_denied_marker_is_observed_and_unmarked_404_is_not() {
+            async fn denied() -> Response {
+                let mut r = StatusCode::FORBIDDEN.into_response();
+                r.extensions_mut().insert(AuthzDenied);
+                r
+            }
+            async fn plain_404() -> Response {
+                StatusCode::NOT_FOUND.into_response()
+            }
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let router = with_probe(
+                Router::new()
+                    .route("/probe/denied", axum::routing::get(denied))
+                    .route("/probe/missing", axum::routing::get(plain_404)),
+                log.clone(),
+            );
+
+            let r = send(&router, Method::GET, "/probe/denied").await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+            let r = send(&router, Method::GET, "/probe/missing").await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND);
+            // Router-level fallback 404 (no route at all).
+            let r = send(&router, Method::GET, "/probe/unrouted").await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+            let obs = log.lock().unwrap().clone();
+            assert_eq!(obs.len(), 3);
+            assert!(obs[0].denied);
+            assert!(!obs[1].denied);
+            assert!(!obs[2].denied);
+        }
+
+        // -- 2.3 ---------------------------------------------------------
+
+        #[tokio::test]
+        #[allow(clippy::disallowed_methods)] // to_bytes on a bounded in-memory test body
+        async fn shadow_probe_does_not_alter_responses() {
+            let bare = spike_router();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let probed = with_probe(spike_router(), log.clone());
+
+            for (method, uri) in [
+                (Method::GET, "/api/v1/repositories/r1/labels"),
+                (Method::PUT, "/api/v1/repositories/r1/labels"),
+                (Method::POST, "/api/v1/repositories/r1/labels/env"),
+                (Method::DELETE, "/api/v1/repositories/r1/labels/env"),
+                (Method::PATCH, "/api/v1/repositories/r1/labels"),
+                (Method::GET, "/api/v1/repositories/r1/nothing"),
+            ] {
+                let a = send(&bare, method.clone(), uri).await;
+                let b = send(&probed, method.clone(), uri).await;
+                assert_eq!(a.status(), b.status(), "{method} {uri}");
+                assert_eq!(a.headers(), b.headers(), "{method} {uri}");
+                let ab = axum::body::to_bytes(a.into_body(), 1 << 20).await.unwrap();
+                let bb = axum::body::to_bytes(b.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(ab, bb, "{method} {uri}");
+            }
+        }
+
+        // -- 2.1 ---------------------------------------------------------
+
+        /// Enumerate (method, path) pairs from the Axum 0.7 `Router` Debug
+        /// output. Debug output is not a stable API; this is pinned to 0.7.
+        fn enumerate_routes(router: &Router) -> BTreeSet<(String, String)> {
+            let dbg = format!("{router:?}");
+            // Only the primary path_router; the fallback router follows it.
+            let primary = &dbg[..dbg.find("fallback_router:").expect("fallback_router")];
+            let routes_at = primary.find("routes: {").expect("routes");
+            let node_at = primary.find("node: Node { paths: {").expect("node paths");
+            let routes = &primary[routes_at..node_at];
+            let paths = &primary[node_at..];
+
+            let mut path_by_id = HashMap::new();
+            for chunk in paths.split("RouteId(").skip(1) {
+                let (id, rest) = chunk.split_once("): \"").expect("id");
+                let (path, _) = rest.split_once('"').expect("path");
+                path_by_id.insert(id.to_string(), path.to_string());
+            }
+
+            let mut out = BTreeSet::new();
+            for chunk in routes.split("RouteId(").skip(1) {
+                let (id, rest) = chunk.split_once("): MethodRouter(").expect("mr");
+                // Stop before `fallback:` so it is not read as a verb.
+                let rest = &rest[..rest.find("fallback:").expect("fallback")];
+                for verb in [
+                    "get", "head", "delete", "options", "patch", "post", "put", "trace", "connect",
+                ] {
+                    let needle = format!("{verb}: ");
+                    let at = rest.find(&needle).unwrap_or_else(|| panic!("verb {verb}"));
+                    if !rest[at + needle.len()..].starts_with("None") {
+                        out.insert((verb.to_uppercase(), path_by_id[id].clone()));
+                    }
+                }
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn router_enumeration_matches_registry() {
+            let router = spike_router();
+            let routes = enumerate_routes(&router);
+            let registry: BTreeSet<(String, String)> = build_registry()
+                .into_keys()
+                .map(|(m, p)| (m.to_string(), p))
+                .collect();
+            assert_eq!(routes, registry);
+
+            // Negative control: a router with an extra route must diverge,
+            // so the comparison is not vacuously true.
+            let extra = Router::new()
+                .nest(
+                    PREFIX,
+                    repo_labels_router().route("/:key/extra", get(|| async {})),
+                )
+                .with_state(test_state());
+            assert_ne!(enumerate_routes(&extra), registry);
+        }
     }
 }
