@@ -132,8 +132,8 @@ pub struct CatalogPrune {
 /// `is_deleted`, and a restore must bring the catalog row back. Removing the
 /// row there would make a restore unrecoverable, so soft deletes are handled
 /// by the read-path filter ([`live_package_predicate`]) instead and only the
-/// storage GC's hard delete — the single reaper of soft-deleted `artifacts`
-/// rows — prunes.
+/// hard deletes of soft-deleted `artifacts` rows — storage GC and a trash
+/// purge — prune.
 ///
 /// The version row is kept while ANY `artifacts` row (live or soft-deleted)
 /// still carries the checksum, so purging one of several peers leaves the

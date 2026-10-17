@@ -16356,6 +16356,9 @@ mod db_cov_tests {
                 member_key.clone(),
                 "delpkg/1.0.0/delpkg-1.0.0.tgz".to_string(),
             )),
+            axum::extract::Query(
+                crate::api::handlers::repositories::DeleteArtifactQuery::default(),
+            ),
             HeaderMap::new(),
         )
         .await;

@@ -1380,9 +1380,9 @@ impl StorageGcService {
         // the point of skipping only the delete rather than excluding
         // the key from the candidate scan: the row is a redundant
         // second reference to an object the proxy catalog owns, and
-        // leaving it behind would make these rows unreclaimable — the
-        // hard-delete here is the only reaper of soft-deleted
-        // `artifacts` rows in the codebase.
+        // leaving it behind would make these rows unreclaimable — apart
+        // from an explicit trash purge, the hard-delete here is the only
+        // reaper of soft-deleted `artifacts` rows.
         //
         // It never mattered before because the delete was issued
         // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
@@ -1438,10 +1438,10 @@ impl StorageGcService {
         }
 
         // Hard-delete artifact records (cascades to child tables).
-        // `RETURNING` feeds the catalog prune below: this is the only
-        // reaper of soft-deleted `artifacts` rows, so it is the only
-        // place a `packages` / `package_versions` row may be removed
-        // (#3660) — a soft delete must stay restorable.
+        // `RETURNING` feeds the catalog prune below: this and a trash
+        // purge are the only reapers of soft-deleted `artifacts` rows, so
+        // they are the only places a `packages` / `package_versions` row
+        // may be removed (#3660) — a soft delete must stay restorable.
         //
         // Both deletes are scoped exactly like `is_still_orphan`'s lock and
         // re-check (same backend; same `storage_path` on filesystem). Keys are
@@ -3637,11 +3637,12 @@ impl OciCleanupKeyFamily {
 /// Delete the row-less checksum sidecars of a reclaimed Maven storage key and
 /// drop the attribution rows of the key + its sidecars (#2668).
 ///
-/// Called by the main orphan sweep inside the per-key transaction, after the
-/// base object has been deleted and the `artifacts` rows hard-deleted. Maven
-/// checksum sidecars (`.md5`, `.sha1`, `.sha256`, `.sha512`) are row-less
-/// puts, so they are never orphan candidates themselves; deriving them from
-/// the base key at reclaim time is what keeps them from leaking on storage.
+/// Called inside the reclaiming transaction (the orphan sweep's per-key
+/// transaction, or a trash purge), after the base object has been deleted and
+/// the `artifacts` rows hard-deleted. Maven checksum sidecars (`.md5`,
+/// `.sha1`, `.sha256`, `.sha512`) are row-less puts, so they are never orphan
+/// candidates themselves; deriving them from the base key at reclaim time is
+/// what keeps them from leaking on storage.
 ///
 /// Safety:
 /// - No-op for non-Maven keys.
@@ -3650,9 +3651,9 @@ impl OciCleanupKeyFamily {
 ///   sweep, never blind-deleted here.
 /// - Sidecars inherit their base object's owner by construction
 ///   (`maven_flat_attribution::strip_checksum_suffix` resolution + the
-///   flat-key write guard), so once the base key is provably orphan — the
-///   caller has just re-verified `ORPHAN_PREDICATE_SQL` under row locks — no
-///   other repository can legitimately serve these sidecars.
+///   flat-key write guard), so once the base key is provably unreferenced —
+///   the caller has just re-verified that under row locks — no other
+///   repository can legitimately serve these sidecars.
 /// - Storage deletes tolerate absent objects (NotFound => Ok); most bases
 ///   have fewer than four sidecars.
 /// - The attribution-row cleanup keeps a hard-deleted key from staying
@@ -3661,7 +3662,7 @@ impl OciCleanupKeyFamily {
 ///
 /// Any error propagates so the caller rolls back and retries the whole key
 /// on the next pass (the base storage delete is idempotent).
-async fn reclaim_maven_sidecars(
+pub(crate) async fn reclaim_maven_sidecars(
     tx: &mut Transaction<'_, Postgres>,
     storage: &dyn StorageBackend,
     storage_key: &str,
@@ -4525,11 +4526,11 @@ mod tests {
     /// delete actually land — before, it addressed a key nothing had written.
     ///
     /// Skipping the *object* rather than excluding the *key* from the
-    /// candidate scan is load-bearing: this hard-delete is the only reaper of
-    /// soft-deleted `artifacts` rows in the codebase (the only other
-    /// production `DELETE FROM artifacts` is the path-specific re-upload
-    /// tombstone in `handlers/mod.rs`), so excluding the key would leave these
-    /// rows unreclaimable forever.
+    /// candidate scan is load-bearing: this hard-delete is the only automatic
+    /// reaper of soft-deleted `artifacts` rows (the other production
+    /// `DELETE FROM artifacts` are the path-specific re-upload tombstone in
+    /// `handlers/mod.rs` and an explicit trash purge), so excluding the key
+    /// would leave these rows unreclaimable forever.
     ///
     /// FAILS ON MAIN: the object is deleted.
     #[tokio::test]
