@@ -80,6 +80,23 @@ struct ResolvedRepoFilter {
     report_key: Option<String>,
 }
 
+impl ResolvedRepoFilter {
+    fn empty() -> Self {
+        Self {
+            repo_ids: Some(Vec::new()),
+            report_key: None,
+        }
+    }
+
+    fn visibility(&self, auth: Option<&AuthExtension>) -> RepoVisibility {
+        if self.report_key.is_some() {
+            RepoVisibility::Ids(self.repo_ids.clone().unwrap_or_default())
+        } else {
+            repo_visibility_for(auth)
+        }
+    }
+}
+
 /// Resolve the `repository_key` filter into the concrete repository ids whose
 /// packages should be listed, plus the key to report on each row.
 ///
@@ -93,6 +110,7 @@ struct ResolvedRepoFilter {
 async fn resolve_package_filter(
     db: &sqlx::PgPool,
     repository_key: Option<&str>,
+    auth: Option<&AuthExtension>,
 ) -> Result<ResolvedRepoFilter> {
     let Some(key) = repository_key else {
         return Ok(ResolvedRepoFilter {
@@ -101,36 +119,31 @@ async fn resolve_package_filter(
         });
     };
 
-    // Single indexed lookup: the repo id plus whether it is a virtual repo
-    // (i.e. appears as a `virtual_repo_members.virtual_repo_id`).
-    let repo: Option<(Uuid, bool)> = sqlx::query_as::<_, (Uuid, bool)>(
-        r#"
-        SELECT r.id,
-               EXISTS(
-                   SELECT 1 FROM virtual_repo_members vrm WHERE vrm.virtual_repo_id = r.id
-               ) AS is_virtual
-        FROM repositories r
-        WHERE r.key = $1
-        "#,
-    )
-    .bind(key)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let Some((id, is_virtual)) = repo else {
-        // Unknown key: no repository, therefore no packages.
-        return Ok(ResolvedRepoFilter {
-            repo_ids: Some(Vec::new()),
-            report_key: None,
-        });
+    // Single indexed lookup: the repository supplies its own type and ACL,
+    // including an empty virtual repository with no membership edges.
+    let service = crate::services::repository_service::RepositoryService::new(db.clone());
+    let repo = match service.get_by_key(key).await {
+        Ok(repo) => repo,
+        Err(AppError::NotFound(_)) => {
+            // Unknown key: no repository, therefore no packages.
+            return Ok(ResolvedRepoFilter::empty());
+        }
+        Err(error) => return Err(error),
     };
 
-    if !is_virtual {
+    if repo.repo_type != crate::models::repository::RepositoryType::Virtual {
         return Ok(ResolvedRepoFilter {
-            repo_ids: Some(vec![id]),
+            repo_ids: Some(vec![repo.id]),
             report_key: None,
         });
+    }
+    match super::repositories::require_visible(&repo, &auth.cloned(), &service).await {
+        Ok(()) => {}
+        Err(AppError::NotFound(_)) => return Ok(ResolvedRepoFilter::empty()),
+        Err(error) => return Err(error),
+    }
+    if auth.is_some_and(|a| !a.has_scope("read:artifacts")) {
+        return Ok(ResolvedRepoFilter::empty());
     }
 
     // Expand the virtual repo to its leaf members through the same recursive
@@ -139,51 +152,19 @@ async fn resolve_package_filter(
     // hosted members their pushed artifacts. The walk's resolution order
     // (depth-first pre-order priority) keeps the listing stable and
     // deterministic.
-    let member_ids: Vec<Uuid> =
-        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, id)
-            .await
-            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
+    let members = super::proxy_helpers::fetch_virtual_members(db, repo.id)
+        .await
+        .map_err(|resp| super::proxy_helpers::member_walk_app_error(&resp))?;
+    let members = super::proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members)
+        .await
+        .map_err(|resp| super::proxy_helpers::member_walk_app_error(&resp))?;
 
     // Aggregated rows are reported under the virtual repo's key, not the
     // member's, so the whole page reads as the virtual repo.
     Ok(ResolvedRepoFilter {
-        repo_ids: Some(member_ids),
+        repo_ids: Some(members.into_iter().map(|member| member.id).collect()),
         report_key: Some(key.to_string()),
     })
-}
-
-/// True when the package is owned by a member of the virtual repository named
-/// `virtual_key`. Used by the by-id detail lookup to report the virtual key
-/// when the caller is viewing the package through that virtual repo, keeping
-/// the detail view consistent with the virtual repo's listing.
-async fn package_in_virtual_repo(
-    db: &sqlx::PgPool,
-    package_id: Uuid,
-    virtual_key: &str,
-) -> Result<bool> {
-    let virtual_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'")
-            .bind(virtual_key)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some(virtual_id) = virtual_id else {
-        return Ok(false);
-    };
-    // Same recursive member walk as the listing paths (#3840): a package
-    // owned by a leaf of a NESTED virtual still reports the top virtual's key.
-    let member_ids =
-        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
-            .await
-            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
-    )
-    .bind(package_id)
-    .bind(&member_ids)
-    .fetch_one(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Create package routes
@@ -278,7 +259,6 @@ pub async fn list_packages(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListPackagesQuery>,
 ) -> Result<Json<PackageListResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(24).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -307,7 +287,9 @@ pub async fn list_packages(
     // A `repository_key` naming a virtual repo expands to its members' ids so
     // the aggregated Packages page shows the packages each member actually
     // owns. `None` means "no repository filter".
-    let filter = resolve_package_filter(&state.db, query.repository_key.as_deref()).await?;
+    let filter =
+        resolve_package_filter(&state.db, query.repository_key.as_deref(), auth.as_ref()).await?;
+    let visibility = filter.visibility(auth.as_ref());
 
     // Per-user repository visibility. The page query binds the visibility
     // parameter at $6 (after repo ids/format/search/offset/limit); the
@@ -437,16 +419,21 @@ pub async fn get_package(
     Path(id): Path<Uuid>,
     Query(detail_query): Query<PackageDetailQuery>,
 ) -> Result<Json<PackageResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
-
     let table_exists = packages_table_exists(&state.db).await;
 
     if !table_exists {
         return Err(AppError::NotFound("Package not found".to_string()));
     }
+    let filter = resolve_package_filter(
+        &state.db,
+        detail_query.repository_key.as_deref(),
+        auth.as_ref(),
+    )
+    .await?;
+    let visibility = filter.visibility(auth.as_ref());
 
-    // The visibility parameter is bound at $2 (after the package id at $1).
-    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    // The visibility parameter is bound at $3, after the package id and context.
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 3);
     let (user_id, ids) = split_visibility_bind(bind);
 
     // #3660: the detail view must agree with the listing — a ghost row is a
@@ -461,12 +448,15 @@ pub async fn get_package(
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE p.id = $1
+          AND ($2::uuid[] IS NULL OR r.id = ANY($2))
           AND ({clause})
           AND {live_packages}
         "#
     );
-    let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql)).bind(id);
-    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql))
+        .bind(id)
+        .bind(filter.repo_ids);
+    // $3 shape depends on the visibility variant (single uuid vs uuid[]).
     let query = match &ids {
         Some(ids) => query.bind(ids.clone()),
         None => query.bind(user_id),
@@ -480,10 +470,8 @@ pub async fn get_package(
     // A virtual-repo context (`?repository_key=<virtual>`) reports the virtual
     // key so the detail view matches the aggregated listing. Without it (or
     // for a non-virtual key) the owning member's key is reported.
-    if let Some(key) = detail_query.repository_key.as_deref() {
-        if package_in_virtual_repo(&state.db, package.id, key).await? {
-            package.repository_key = key.to_string();
-        }
+    if let Some(key) = filter.report_key {
+        package.repository_key = key;
     }
 
     Ok(Json(PackageResponse::from(package)))
@@ -531,7 +519,8 @@ pub struct PackageVersionsResponse {
     context_path = "/api/v1/packages",
     tag = "packages",
     params(
-        ("id" = Uuid, Path, description = "Package ID")
+        ("id" = Uuid, Path, description = "Package ID"),
+        PackageDetailQuery,
     ),
     responses(
         (status = 200, description = "List of package versions", body = PackageVersionsResponse),
@@ -544,18 +533,20 @@ pub async fn get_package_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
+    Query(context): Query<PackageDetailQuery>,
 ) -> Result<Json<PackageVersionsResponse>> {
-    let visibility = repo_visibility_for(auth.as_ref());
-
     let table_exists = packages_table_exists(&state.db).await;
 
     if !table_exists {
         return Err(AppError::NotFound("Package not found".to_string()));
     }
 
+    let filter =
+        resolve_package_filter(&state.db, context.repository_key.as_deref(), auth.as_ref()).await?;
+    let visibility = filter.visibility(auth.as_ref());
     // Verify the package exists and belongs to a repository visible to the
-    // caller. The visibility parameter is bound at $2 (after the id at $1).
-    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
+    // caller. The visibility parameter is bound at $3, after id and context.
+    let (clause, bind) = build_visibility_clause_for(&visibility, "r", 3);
     let (user_id, ids) = split_visibility_bind(bind);
 
     let live_packages = live_package_predicate();
@@ -566,13 +557,16 @@ pub async fn get_package_versions(
             SELECT 1 FROM packages p
             JOIN repositories r ON r.id = p.repository_id
             WHERE p.id = $1
+              AND ($2::uuid[] IS NULL OR r.id = ANY($2))
               AND ({clause})
               AND {live_packages}
         )
         "#
     );
-    let exists_query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*exists_sql)).bind(id);
-    // $2 shape depends on the visibility variant (single uuid vs uuid[]).
+    let exists_query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*exists_sql))
+        .bind(id)
+        .bind(filter.repo_ids);
+    // $3 shape depends on the visibility variant (single uuid vs uuid[]).
     let exists_query = match &ids {
         Some(ids) => exists_query.bind(ids.clone()),
         None => exists_query.bind(user_id),
@@ -649,6 +643,43 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json;
+
+    /// True when the package is owned by a member of the virtual repository named
+    /// `virtual_key`. Used by the by-id detail lookup to report the virtual key
+    /// when the caller is viewing the package through that virtual repo, keeping
+    /// the detail view consistent with the virtual repo's listing.
+    async fn package_in_virtual_repo(
+        db: &sqlx::PgPool,
+        package_id: Uuid,
+        virtual_key: &str,
+    ) -> Result<bool> {
+        let virtual_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'",
+        )
+        .bind(virtual_key)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some(virtual_id) = virtual_id else {
+            return Ok(false);
+        };
+        // Same recursive member walk as the listing paths (#3840): a package
+        // owned by a leaf of a NESTED virtual still reports the top virtual's key.
+        let member_ids =
+            crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
+                .await
+                .map_err(|resp| {
+                    crate::api::handlers::proxy_helpers::member_walk_app_error(&resp)
+                })?;
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
+        )
+        .bind(package_id)
+        .bind(&member_ids)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
 
     fn make_package_row() -> PackageRow {
         let now = Utc::now();
@@ -1042,6 +1073,361 @@ mod tests {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::http::StatusCode;
 
+        struct VirtualCatalog {
+            fixture: tdh::Fixture,
+            member_id: Uuid,
+            member_key: String,
+            member_dir: std::path::PathBuf,
+            package_id: Uuid,
+        }
+
+        impl VirtualCatalog {
+            async fn setup() -> Option<Self> {
+                Self::setup_with("local", "docker").await
+            }
+
+            async fn setup_with(member_type: &str, format: &str) -> Option<Self> {
+                let fixture = tdh::Fixture::setup("virtual", format).await?;
+                let (member_id, member_key, member_dir) =
+                    tdh::create_repo(&fixture.pool, member_type, format).await;
+                tdh::link_virtual_member(&fixture.pool, fixture.repo_id, member_id, 1).await;
+                tdh::grant_repo_access(&fixture.pool, member_id, fixture.user_id).await;
+                let package_id = seed_package(&fixture.pool, member_id).await;
+                Some(Self {
+                    fixture,
+                    member_id,
+                    member_key,
+                    member_dir,
+                    package_id,
+                })
+            }
+
+            fn auth(&self) -> AuthExtension {
+                make_auth(
+                    self.fixture.user_id,
+                    false,
+                    Some(vec![self.fixture.repo_id]),
+                )
+            }
+
+            async fn request(&self, path: String) -> (StatusCode, serde_json::Value) {
+                let (status, body) =
+                    tdh::send(app_for(&self.fixture, Some(self.auth())), tdh::get(path)).await;
+                (
+                    status,
+                    serde_json::from_slice(&body).expect("catalog response"),
+                )
+            }
+
+            async fn teardown(self) {
+                tdh::cleanup_member_repo(&self.fixture.pool, self.member_id, &self.member_dir)
+                    .await;
+                self.fixture.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_listing_uses_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 1, "{body}");
+            assert_eq!(body["items"][0]["id"], f.package_id.to_string());
+            assert_eq!(body["items"][0]["repository_key"], f.fixture.repo_key);
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_detail_uses_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!(
+                    "/{}?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["repository_key"], f.fixture.repo_key);
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_versions_use_the_parent_token_scope() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let (status, body) = f
+                .request(format!(
+                    "/{}/versions?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["versions"][0]["version"], "1.0.0");
+            assert!(!f.auth().can_access_repo(f.member_id));
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_does_not_authorize_direct_or_unrelated_reads() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            for path in [
+                format!("/{}", f.package_id),
+                format!("/{}/versions", f.package_id),
+                format!("/{}?repository_key={}", f.package_id, f.member_key),
+                format!("/{}?repository_key=unknown-virtual", f.package_id),
+                format!("/{}/versions?repository_key=unknown-virtual", f.package_id),
+            ] {
+                let (status, body) = f.request(path.clone()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+            }
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.member_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 0);
+            let (other_id, other_key, other_dir) =
+                tdh::create_repo(&f.fixture.pool, "local", "docker").await;
+            tdh::grant_repo_access(&f.fixture.pool, other_id, f.fixture.user_id).await;
+            let other_package = seed_package(&f.fixture.pool, other_id).await;
+            for suffix in ["", "/versions"] {
+                let (status, body) = f
+                    .request(format!(
+                        "/{other_package}{suffix}?repository_key={}",
+                        f.fixture.repo_key
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            }
+            assert!(!f.auth().can_access_repo(other_id));
+            let _ = other_key;
+            tdh::cleanup_member_repo(&f.fixture.pool, other_id, &other_dir).await;
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_requires_read_access_to_the_parent_and_member() {
+            for revoke_parent in [false, true] {
+                let Some(f) = VirtualCatalog::setup().await else {
+                    return;
+                };
+                sqlx::query(
+                    "DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2",
+                )
+                .bind(f.fixture.user_id)
+                .bind(if revoke_parent {
+                    f.fixture.repo_id
+                } else {
+                    f.member_id
+                })
+                .execute(&f.fixture.pool)
+                .await
+                .expect("revoke fixture grant");
+                let (status, body) = f
+                    .request(format!("/?repository_key={}", f.fixture.repo_key))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["pagination"]["total"], 0, "{body}");
+                for suffix in ["", "/versions"] {
+                    let (status, body) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={}",
+                            f.package_id, f.fixture.repo_key
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+                }
+                f.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_nested_members_and_remote_catalog_rows_are_readable() {
+            for member_type in ["local", "remote"] {
+                let Some(f) = VirtualCatalog::setup_with(member_type, "docker").await else {
+                    return;
+                };
+                let (nested_id, nested_key, nested_dir) =
+                    tdh::create_repo(&f.fixture.pool, "virtual", "docker").await;
+                sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2")
+                    .bind(f.fixture.repo_id).bind(f.member_id).execute(&f.fixture.pool).await.unwrap();
+                tdh::link_virtual_member(&f.fixture.pool, f.fixture.repo_id, nested_id, 1).await;
+                tdh::link_virtual_member(&f.fixture.pool, nested_id, f.member_id, 1).await;
+                let (status, body) = f
+                    .request(format!("/?repository_key={}", f.fixture.repo_key))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["pagination"]["total"], 1);
+                for suffix in ["", "/versions"] {
+                    let (status, body) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={}",
+                            f.package_id, f.fixture.repo_key
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    let (status, _) = f
+                        .request(format!(
+                            "/{}{suffix}?repository_key={nested_key}",
+                            f.package_id
+                        ))
+                        .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                }
+                tdh::cleanup_member_repo(&f.fixture.pool, nested_id, &nested_dir).await;
+                f.teardown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn virtual_context_does_not_disclose_an_unreadable_parent_to_a_member_reader() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.fixture.repo_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let auth = make_auth(f.fixture.user_id, false, None);
+            let (status, _) = tdh::send(
+                app_for(&f.fixture, Some(auth.clone())),
+                tdh::get(format!("/{}", f.package_id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            for context in [&f.fixture.repo_key[..], "unknown-virtual"] {
+                let (status, body) = tdh::send(
+                    app_for(&f.fixture, Some(auth.clone())),
+                    tdh::get(format!("/?repository_key={context}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["pagination"]["total"], 0);
+                for suffix in ["", "/versions"] {
+                    let (status, body) = tdh::send(
+                        app_for(&f.fixture, Some(auth.clone())),
+                        tdh::get(format!(
+                            "/{}{suffix}?repository_key={context}",
+                            f.package_id
+                        )),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["message"],
+                        "Package not found"
+                    );
+                }
+            }
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_keeps_token_action_ceilings_and_denies_write_only_member_grants() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            let mut auth = f.auth();
+            auth.scopes = Some(vec!["write:artifacts".to_string()]);
+            for suffix in ["", "/versions"] {
+                let (status, _) = tdh::send(
+                    app_for(&f.fixture, Some(auth.clone())),
+                    tdh::get(format!(
+                        "/{}{suffix}?repository_key={}",
+                        f.package_id, f.fixture.repo_key
+                    )),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            tdh::grant_repo_actions(&f.fixture.pool, f.member_id, f.fixture.user_id, &["write"])
+                .await;
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 0, "{body}");
+            let (status, _) = f
+                .request(format!(
+                    "/{}?repository_key={}",
+                    f.package_id, f.fixture.repo_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn virtual_context_anonymous_and_internal_member_baselines_are_preserved() {
+            let Some(f) = VirtualCatalog::setup().await else {
+                return;
+            };
+            sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1 OR id = $2")
+                .bind(f.fixture.repo_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let (status, body) = tdh::send(
+                app_for(&f.fixture, None),
+                tdh::get(format!("/?repository_key={}", f.fixture.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pagination"]["total"],
+                1
+            );
+            sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.fixture.user_id)
+                .bind(f.member_id)
+                .execute(&f.fixture.pool)
+                .await
+                .unwrap();
+            let (status, body) = f
+                .request(format!("/?repository_key={}", f.fixture.repo_key))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["pagination"]["total"], 1);
+            let (status, _) = f.request(format!("/{}", f.package_id)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, body) = tdh::send(
+                app_for(&f.fixture, None),
+                tdh::get(format!("/?repository_key={}", f.fixture.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pagination"]["total"],
+                0
+            );
+            f.teardown().await;
+        }
+
         /// Insert a minimal `packages` row in `repo_id` and return its id.
         ///
         /// The row is backed by a live `artifacts` row and a matching
@@ -1194,7 +1580,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, None)
+            let result = resolve_package_filter(&f.pool, None, None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1210,7 +1596,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, Some("definitely-not-a-key"))
+            let result = resolve_package_filter(&f.pool, Some("definitely-not-a-key"), None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1227,7 +1613,7 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "docker").await else {
                 return;
             };
-            let result = resolve_package_filter(&f.pool, Some(&f.repo_key))
+            let result = resolve_package_filter(&f.pool, Some(&f.repo_key), None)
                 .await
                 .expect("resolve");
             assert_eq!(
@@ -1259,9 +1645,14 @@ mod tests {
             .await
             .expect("link member into virtual repo");
 
-            let result = resolve_package_filter(&member.pool, Some(&virtual_key))
-                .await
-                .expect("resolve");
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
+            let result = resolve_package_filter(
+                &member.pool,
+                Some(&virtual_key),
+                Some(&make_auth(member.user_id, false, None)),
+            )
+            .await
+            .expect("resolve");
             assert_eq!(
                 result.repo_ids,
                 Some(vec![member.repo_id]),
@@ -1307,6 +1698,7 @@ mod tests {
             .expect("link member into virtual repo");
 
             seed_package(&member.pool, member.repo_id).await;
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
 
             // The fixture user holds a grant on the member, so the aggregated
             // listing (visibility applied to the member repo) surfaces it.
@@ -1409,6 +1801,7 @@ mod tests {
             .expect("link member into virtual repo");
 
             let pkg = seed_package(&member.pool, member.repo_id).await;
+            tdh::grant_repo_access(&member.pool, virtual_id, member.user_id).await;
             let auth = || Some(make_auth(member.user_id, false, None));
 
             // Without context: reports the owning member's key.
