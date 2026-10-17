@@ -10,9 +10,13 @@ use axum::{
 use utoipa::OpenApi;
 use uuid::Uuid;
 
+use crate::api::handlers::sso::{
+    ensure_federated_group, federated_group_name_rejection, GroupNameRejection,
+    MAX_GROUP_NAME_CHARS,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::services::auth_config_service::{
     AuthConfigService, CreateLdapConfigRequest, CreateOidcConfigRequest, CreateSamlConfigRequest,
     LdapConfigResponse, LdapTestResult, OidcConfigResponse, SamlConfigResponse, SsoProviderInfo,
@@ -29,6 +33,7 @@ pub fn router() -> Router<SharedState> {
             get(get_oidc).put(update_oidc).delete(delete_oidc),
         )
         .route("/oidc/:id/toggle", patch(toggle_oidc))
+        .route("/oidc/:provider_id/groups", post(preprovision_oidc_group))
         // LDAP config CRUD
         .route("/ldap", get(list_ldap).post(create_ldap))
         .route(
@@ -202,6 +207,88 @@ pub async fn toggle_oidc(
     auth.require_admin()?;
     AuthConfigService::toggle_oidc(&state.db, id, req).await?;
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct PreprovisionOidcGroupRequest {
+    pub name: String,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct OidcManagedGroupResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub external_source: String,
+    pub external_provider_id: Uuid,
+}
+
+/// Pre-provision an OIDC-managed group without creating membership.
+#[utoipa::path(
+    post,
+    path = "/oidc/{provider_id}/groups",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("provider_id" = Uuid, Path, description = "OIDC configuration ID")
+    ),
+    request_body = PreprovisionOidcGroupRequest,
+    responses(
+        (status = 200, description = "OIDC-managed group provisioned", body = OidcManagedGroupResponse),
+        (status = 400, description = "Invalid group name or group mapping disabled", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "OIDC configuration not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Group name is owned by another namespace", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn preprovision_oidc_group(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(provider_id): Path<Uuid>,
+    Json(req): Json<PreprovisionOidcGroupRequest>,
+) -> Result<Json<OidcManagedGroupResponse>> {
+    auth.require_admin()?;
+
+    let provider = AuthConfigService::get_oidc(&state.db, provider_id).await?;
+    if !provider.map_groups_to_groups {
+        return Err(AppError::Validation(
+            "OIDC group-to-group mapping is disabled for this provider".to_string(),
+        ));
+    }
+
+    match federated_group_name_rejection(&req.name) {
+        None => {}
+        Some(GroupNameRejection::Empty) => {
+            return Err(AppError::Validation(
+                "OIDC group name must not be empty".to_string(),
+            ));
+        }
+        Some(GroupNameRejection::TooLong { chars }) => {
+            return Err(AppError::Validation(format!(
+                "OIDC group name is {chars} characters; maximum is {MAX_GROUP_NAME_CHARS}"
+            )));
+        }
+    }
+
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let group_id = ensure_federated_group(&mut conn, provider_id, "oidc", &req.name).await?;
+    let Some(group_id) = group_id else {
+        return Err(AppError::Conflict(format!(
+            "Group name '{}' is already owned outside OIDC provider {provider_id}",
+            req.name
+        )));
+    };
+
+    Ok(Json(OidcManagedGroupResponse {
+        id: group_id,
+        name: req.name,
+        external_source: "oidc".to_string(),
+        external_provider_id: provider_id,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +668,7 @@ pub async fn list_providers(
         update_oidc,
         delete_oidc,
         toggle_oidc,
+        preprovision_oidc_group,
         list_ldap,
         get_ldap,
         create_ldap,
@@ -609,6 +697,8 @@ pub async fn list_providers(
         ToggleRequest,
         LdapTestResult,
         SsoProviderInfo,
+        PreprovisionOidcGroupRequest,
+        OidcManagedGroupResponse,
     ))
 )]
 pub struct SsoAdminApiDoc;
@@ -757,6 +847,17 @@ mod tests {
                 Extension(auth.clone()),
                 Path(id),
                 Json(serde_json::from_value(json!({"enabled": true})).unwrap()),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            preprovision_oidc_group(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(PreprovisionOidcGroupRequest {
+                    name: "/code".to_string(),
+                }),
             )
             .await,
         );
@@ -1182,5 +1283,270 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert!(!json["success"].as_bool().unwrap());
         assert!(json["message"].as_str().unwrap().contains("timed out"));
+    }
+
+    mod preprovision_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        async fn insert_oidc_provider(pool: &sqlx::PgPool, map_groups_to_groups: bool) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO oidc_configs (
+                    id, name, issuer_url, client_id, client_secret_encrypted,
+                    scopes, attribute_mapping, is_enabled, auto_create_users,
+                    pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys
+                )
+                VALUES (
+                    $1, $2, $3, $4, '00',
+                    ARRAY['openid']::TEXT[], '{}'::JSONB, false, true,
+                    true, $5, false
+                )
+                "#,
+            )
+            .bind(id)
+            .bind(format!("preprovision-oidc-{id}"))
+            .bind(format!("https://issuer-{id}.example.com"))
+            .bind(format!("client-{id}"))
+            .bind(map_groups_to_groups)
+            .execute(pool)
+            .await
+            .expect("insert OIDC provider");
+            id
+        }
+
+        fn admin_auth() -> AuthExtension {
+            AuthExtension {
+                user_id: Uuid::new_v4(),
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
+            }
+        }
+
+        async fn provision(
+            state: &SharedState,
+            auth: &AuthExtension,
+            provider_id: Uuid,
+            name: &str,
+        ) -> crate::error::Result<OidcManagedGroupResponse> {
+            let Json(group) = preprovision_oidc_group(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(provider_id),
+                Json(PreprovisionOidcGroupRequest {
+                    name: name.to_string(),
+                }),
+            )
+            .await?;
+            Ok(group)
+        }
+
+        #[tokio::test]
+        async fn preprovision_oidc_group_contract_and_login_reuse() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+
+            let provider_a = insert_oidc_provider(&pool, true).await;
+            let provider_b = insert_oidc_provider(&pool, true).await;
+            let provider_disabled = insert_oidc_provider(&pool, false).await;
+            let dir = std::env::temp_dir().join(format!("ph-sso-preprovision-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+            let auth = admin_auth();
+
+            // 1. New OIDC-owned group is materialized with the requested owner.
+            let name = format!("/code-{}", Uuid::new_v4());
+            let created = provision(&state, &auth, provider_a, &name)
+                .await
+                .expect("preprovision group");
+            assert_eq!(created.name, name);
+            assert_eq!(created.external_source, "oidc");
+            assert_eq!(created.external_provider_id, provider_a);
+
+            let stored: (Uuid, String, Option<String>, Option<Uuid>) = sqlx::query_as(
+                "SELECT id, name, external_source, external_provider_id FROM groups WHERE id = $1",
+            )
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("load provisioned group");
+            assert_eq!(stored.0, created.id);
+            assert_eq!(stored.1, name);
+            assert_eq!(stored.2.as_deref(), Some("oidc"));
+            assert_eq!(stored.3, Some(provider_a));
+            let initial_members: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE group_id = $1")
+                    .bind(created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count initial group membership");
+            assert_eq!(initial_members, 0);
+
+            // 2. Repeating the same provider/name is idempotent.
+            let repeated = provision(&state, &auth, provider_a, &name)
+                .await
+                .expect("repeat preprovision");
+            assert_eq!(repeated.id, created.id);
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .expect("count provisioned groups");
+            assert_eq!(count, 1);
+
+            // 3. A local/operator group is never taken over.
+            let (local_id, local_name) = tdh::create_group(&pool).await;
+            let err = provision(&state, &auth, provider_a, &local_name)
+                .await
+                .expect_err("local group must conflict");
+            assert!(matches!(err, AppError::Conflict(_)));
+            let local_owner: (Uuid, Option<String>, Option<Uuid>) = sqlx::query_as(
+                "SELECT id, external_source, external_provider_id FROM groups WHERE name = $1",
+            )
+            .bind(&local_name)
+            .fetch_one(&pool)
+            .await
+            .expect("load local group");
+            assert_eq!(local_owner, (local_id, None, None));
+
+            // 4. A same-named group owned by another OIDC provider is not taken over.
+            let foreign_name = format!("/foreign-{}", Uuid::new_v4());
+            let foreign = provision(&state, &auth, provider_b, &foreign_name)
+                .await
+                .expect("preprovision foreign-provider group");
+            let err = provision(&state, &auth, provider_a, &foreign_name)
+                .await
+                .expect_err("foreign provider group must conflict");
+            assert!(matches!(err, AppError::Conflict(_)));
+            let foreign_owner: (Uuid, Option<String>, Option<Uuid>) = sqlx::query_as(
+                "SELECT id, external_source, external_provider_id FROM groups WHERE name = $1",
+            )
+            .bind(&foreign_name)
+            .fetch_one(&pool)
+            .await
+            .expect("load foreign group");
+            assert_eq!(foreign_owner.0, foreign.id);
+            assert_eq!(foreign_owner.1.as_deref(), Some("oidc"));
+            assert_eq!(foreign_owner.2, Some(provider_b));
+
+            // A same-named group owned by another federated source is not taken over.
+            let foreign_source_id = Uuid::new_v4();
+            let foreign_source_name = format!("/saml-{}", Uuid::new_v4());
+            sqlx::query(
+                "INSERT INTO groups (id, name, external_source, external_provider_id) \
+     VALUES ($1, $2, 'saml', $3)",
+            )
+            .bind(foreign_source_id)
+            .bind(&foreign_source_name)
+            .bind(provider_a)
+            .execute(&pool)
+            .await
+            .expect("insert SAML-owned group");
+
+            let err = provision(&state, &auth, provider_a, &foreign_source_name)
+                .await
+                .expect_err("different-source group must conflict");
+            assert!(matches!(err, AppError::Conflict(_)));
+
+            let foreign_source_owner: (Uuid, Option<String>, Option<Uuid>) = sqlx::query_as(
+                "SELECT id, external_source, external_provider_id FROM groups WHERE name = $1",
+            )
+            .bind(&foreign_source_name)
+            .fetch_one(&pool)
+            .await
+            .expect("load different-source group");
+
+            assert_eq!(foreign_source_owner.0, foreign_source_id);
+            assert_eq!(foreign_source_owner.1.as_deref(), Some("saml"));
+            assert_eq!(foreign_source_owner.2, Some(provider_a));
+
+            // The path must identify a real OIDC provider.
+            let missing_name = format!("/missing-{}", Uuid::new_v4());
+            let err = provision(&state, &auth, Uuid::new_v4(), &missing_name)
+                .await
+                .expect_err("missing provider must be rejected");
+            assert!(matches!(err, AppError::NotFound(_)));
+
+            // Mapping-disabled providers refuse pre-provisioning and create nothing.
+            let disabled_name = format!("/disabled-{}", Uuid::new_v4());
+            let err = provision(&state, &auth, provider_disabled, &disabled_name)
+                .await
+                .expect_err("mapping-disabled provider must be rejected");
+            assert!(matches!(err, AppError::Validation(_)));
+            let disabled_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE name = $1")
+                    .bind(&disabled_name)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count disabled-provider group");
+            assert_eq!(disabled_count, 0);
+
+            // 5. A real later OIDC sync reuses the pre-provisioned row and adds membership.
+            let (user_id, _) = tdh::create_user(&pool).await;
+            crate::api::handlers::sso::sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_a,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync OIDC groups");
+
+            let synced_group_id: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .expect("load synced group");
+            assert_eq!(synced_group_id, created.id);
+            let synced_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE name = $1")
+                    .bind(&name)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count synced groups");
+            assert_eq!(synced_count, 1);
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM user_group_members WHERE user_id = $1 AND group_id = $2)",
+            )
+            .bind(user_id)
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("check synced membership");
+            assert!(is_member);
+
+            // Keep the shared test database clean for neighboring tests.
+            sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete test membership");
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete test user");
+            for group_id in [created.id, local_id, foreign.id] {
+                sqlx::query("DELETE FROM groups WHERE id = $1")
+                    .bind(group_id)
+                    .execute(&pool)
+                    .await
+                    .expect("delete test group");
+            }
+            for provider_id in [provider_a, provider_b, provider_disabled] {
+                sqlx::query("DELETE FROM oidc_configs WHERE id = $1")
+                    .bind(provider_id)
+                    .execute(&pool)
+                    .await
+                    .expect("delete test OIDC provider");
+            }
+        }
     }
 }
