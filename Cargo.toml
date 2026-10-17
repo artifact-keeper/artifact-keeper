@@ -148,7 +148,7 @@ opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 # to re-enable `reqwest-client` on otlp. #835 pinned it for two coexisting
 # reqwest versions; otlp 0.32 resolves to the same reqwest 0.13 the app uses.
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 
 # Metrics
 metrics = "0.24"
