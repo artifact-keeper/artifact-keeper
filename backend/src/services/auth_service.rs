@@ -2884,68 +2884,60 @@ impl AuthService {
         // Fetch repository restrictions for this token.
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
-        let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
-            use crate::services::repo_selector_service::{
-                parse_token_selector_strict, RepoSelectorService,
-            };
-            match parse_token_selector_strict(selector_json) {
-                // Fail closed (#4226): a stored selector that does not parse,
-                // or that carries a key `RepoSelector` does not know, used to
-                // become an empty selector here, i.e. unrestricted. It now
-                // grants no repository at all.
-                Err(e) => {
-                    tracing::warn!(
-                        token_id = %stored_token.id,
-                        error = %e,
-                        "API token has an unparseable repo_selector; denying all repositories"
-                    );
-                    Some(vec![])
-                }
-                // An explicitly empty selector (`{}` or only empty criteria)
-                // keeps its legacy meaning of unrestricted. Every mint now
-                // refuses one, so only rows written before that carry it.
-                Ok(selector) if RepoSelectorService::is_empty(&selector) => None,
-                Ok(selector) => {
-                    let svc = RepoSelectorService::new(self.db.clone());
-                    let ids = svc.resolve_ids(&selector).await?;
-                    if ids.is_empty() {
-                        Some(vec![]) // selector matched nothing, deny all
-                    } else {
-                        Some(ids)
-                    }
-                }
-            }
-        } else {
-            let repo_rows = sqlx::query!(
+        use crate::services::repo_selector_service::{RepoSelectorService, TokenScopeError};
+        let explicit = if stored_token.repo_selector.is_none() {
+            sqlx::query!(
                 "SELECT repo_id FROM api_token_repositories WHERE token_id = $1",
                 stored_token.id
             )
             .fetch_all(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-            if repo_rows.is_empty() {
-                // #4228: the join rows are `ON DELETE CASCADE`, so an empty
-                // set has two meanings -- "never restricted" and "restricted
-                // at mint, every repository since deleted". The marker
-                // written at pin time tells them apart: a restricted token
-                // whose allow-list emptied out denies every repository
-                // (`Restricted(vec![])`, deny-by-default) instead of falling
-                // open to the whole instance. Deleting repositories can only
-                // ever narrow a token, never widen it.
-                if stored_token.repository_restricted {
-                    tracing::warn!(
-                        token_id = %stored_token.id,
-                        "API token's repository allow-list is empty (repositories deleted); denying all repositories"
-                    );
-                    Some(vec![])
-                } else {
-                    None // unrestricted
-                }
-            } else {
-                Some(repo_rows.into_iter().map(|r| r.repo_id).collect())
-            }
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|row| row.repo_id)
+            .collect()
+        } else {
+            Vec::new()
         };
+        // An explicitly empty selector (`{}` or only empty criteria)
+        // keeps its legacy meaning of unrestricted. Every mint now
+        // refuses one, so only rows written before that carry it.
+        let resolved = RepoSelectorService::new(self.db.clone())
+            .resolve_token_scope(
+                stored_token.repo_selector.as_ref(),
+                explicit,
+                stored_token.repository_restricted,
+            )
+            .await?;
+        match resolved.scope_error {
+            // Fail closed (#4226): a stored selector that does not parse,
+            // or that carries a key `RepoSelector` does not know, used to
+            // become an empty selector here, i.e. unrestricted. It now
+            // grants no repository at all.
+            Some(TokenScopeError::InvalidSelector) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    error = %resolved.selector_error.as_deref().unwrap_or("invalid selector"),
+                    "API token has an unparseable repo_selector; denying all repositories"
+                );
+            }
+            // #4228: the join rows are `ON DELETE CASCADE`, so an empty
+            // set has two meanings -- "never restricted" and "restricted
+            // at mint, every repository since deleted". The marker
+            // written at pin time tells them apart: a restricted token
+            // whose allow-list emptied out denies every repository
+            // (`Restricted(vec![])`, deny-by-default) instead of falling
+            // open to the whole instance. Deleting repositories can only
+            // ever narrow a token, never widen it.
+            Some(TokenScopeError::DeletedPinnedRepositories) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    "API token's repository allow-list is empty (repositories deleted); denying all repositories"
+                );
+            }
+            _ => {}
+        }
+        let allowed_repo_ids = resolved.allowed_repo_ids;
 
         let validation = ApiTokenValidation {
             user,

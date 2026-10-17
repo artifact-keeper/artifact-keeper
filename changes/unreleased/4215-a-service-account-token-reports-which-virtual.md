@@ -1,0 +1,9 @@
+---
+section: Added
+issues: [#4215]
+---
+- **Service-account token diagnostics explain missing virtual read entitlements and invalid repository restrictions** (#4215). `GET /api/v1/service-accounts/{id}/tokens/{token_id}/scope-analysis` returns unreachable leaf members and their reason, while the token list includes `unreachable_member_count`. Selector preview accepts an optional `service_account_id` and reports the same owner-specific entitlement problems before minting. A token naming the virtual parent satisfies member scope for reads through that parent (#4559); permitted members are no longer incorrectly reported as out of scope. Recursive traversal, public/internal baselines, parent visibility and member read-action checks use the existing read-path helpers, including cycle and depth guards.
+
+  Authentication and diagnostics share stored-scope resolution. Malformed or unknown-key selectors deny all and report `scope_error: invalid_selector`; a valid selector matching nothing reports `selector_matches_nothing`, and a restricted token whose pinned repositories disappeared reports `deleted_pinned_repositories`. These states are not treated as unrestricted or as an all-clear zero count. Legacy unrestricted tokens and explicitly empty legacy selectors retain their existing authentication behavior. Lookup failures are returned as errors instead of empty successful analysis. Traversal and entitlement work are shared across tokens naming the same virtual; work scales with distinct virtuals and members, not token count.
+
+  These admin-only diagnostics describe repository scope and owner read entitlements, not a guarantee that package admission/scanning, credential lifetime or action-scope policy will permit a download. They do not widen credentials, grant direct member access, or refuse token creation.

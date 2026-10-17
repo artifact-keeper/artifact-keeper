@@ -35,6 +35,21 @@ pub struct RepoSelector {
     pub match_repos: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenScopeError {
+    InvalidSelector,
+    SelectorMatchesNothing,
+    DeletedPinnedRepositories,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTokenScope {
+    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    pub scope_error: Option<TokenScopeError>,
+    pub selector_error: Option<String>,
+}
+
 /// A repository matched by a selector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchedRepo {
@@ -93,6 +108,43 @@ impl RepoSelectorService {
     pub async fn resolve_ids(&self, selector: &RepoSelector) -> Result<Vec<Uuid>> {
         let rows = self.resolve_rows(selector).await?;
         Ok(rows.into_iter().map(|r| r.id).collect())
+    }
+
+    pub async fn resolve_token_scope(
+        &self,
+        selector: Option<&serde_json::Value>,
+        explicit: Vec<Uuid>,
+        repository_restricted: bool,
+    ) -> Result<ResolvedTokenScope> {
+        let mut resolution = ResolvedTokenScope {
+            allowed_repo_ids: None, // unrestricted
+            scope_error: None,
+            selector_error: None,
+        };
+        if let Some(value) = selector {
+            match parse_token_selector_strict(value) {
+                Err(error) => {
+                    resolution.allowed_repo_ids = Some(Vec::new());
+                    resolution.scope_error = Some(TokenScopeError::InvalidSelector);
+                    resolution.selector_error = Some(error);
+                }
+                Ok(selector) if Self::is_empty(&selector) => {}
+                Ok(selector) => {
+                    let ids = self.resolve_ids(&selector).await?;
+                    if ids.is_empty() {
+                        // selector matched nothing, deny all
+                        resolution.scope_error = Some(TokenScopeError::SelectorMatchesNothing);
+                    }
+                    resolution.allowed_repo_ids = Some(ids);
+                }
+            }
+        } else if !explicit.is_empty() {
+            resolution.allowed_repo_ids = Some(explicit);
+        } else if repository_restricted {
+            resolution.allowed_repo_ids = Some(Vec::new());
+            resolution.scope_error = Some(TokenScopeError::DeletedPinnedRepositories);
+        }
+        Ok(resolution)
     }
 
     /// Core resolution logic.
@@ -311,6 +363,115 @@ pub fn sql_like_match(value: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stored_scope_resolution_preserves_restriction_states_and_precedence() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let svc = RepoSelectorService::new(f.pool.clone());
+        for invalid in [
+            serde_json::json!({"match_repoz": [f.repo_id]}),
+            serde_json::json!({"match_formats": 1}),
+            serde_json::json!([]),
+        ] {
+            let result = svc
+                .resolve_token_scope(Some(&invalid), vec![f.repo_id], false)
+                .await
+                .unwrap();
+            assert_eq!(result.allowed_repo_ids, Some(Vec::new()));
+            assert_eq!(result.scope_error, Some(TokenScopeError::InvalidSelector));
+        }
+        let deleted = svc
+            .resolve_token_scope(None, Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(deleted.allowed_repo_ids, Some(Vec::new()));
+        assert_eq!(
+            deleted.scope_error,
+            Some(TokenScopeError::DeletedPinnedRepositories)
+        );
+        let free = svc
+            .resolve_token_scope(None, Vec::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(free.allowed_repo_ids, None);
+        assert_eq!(free.scope_error, None);
+        let legacy = svc
+            .resolve_token_scope(Some(&serde_json::json!({})), vec![f.repo_id], true)
+            .await
+            .unwrap();
+        assert_eq!(legacy.allowed_repo_ids, None);
+        let unmatched = svc
+            .resolve_token_scope(
+                Some(&serde_json::json!({"match_repos": [Uuid::new_v4()]})),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmatched.allowed_repo_ids, Some(Vec::new()));
+        assert_eq!(
+            unmatched.scope_error,
+            Some(TokenScopeError::SelectorMatchesNothing)
+        );
+        let selected = svc
+            .resolve_token_scope(
+                Some(&serde_json::json!({"match_repos": [f.repo_id]})),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.allowed_repo_ids, Some(vec![f.repo_id]));
+        assert_eq!(selected.scope_error, None);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn authentication_and_diagnostics_share_stored_scope_resolution() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+        use crate::services::auth_service::AuthService;
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let auth = AuthService::new(f.pool.clone(), std::sync::Arc::new(f.state.config.clone()));
+        let svc = RepoSelectorService::new(f.pool.clone());
+        for (i, selector, restricted) in [
+            (
+                0,
+                Some(serde_json::json!({"match_repoz": [f.repo_id]})),
+                false,
+            ),
+            (1, None, true),
+            (
+                2,
+                Some(serde_json::json!({"match_repos": [Uuid::new_v4()]})),
+                false,
+            ),
+            (3, None, false),
+        ] {
+            let name = format!("scope-agreement-{i}");
+            let token = auth
+                .generate_api_token(f.user_id, &name, vec!["read:artifacts".to_string()], None)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE api_tokens SET repo_selector = $1, repository_restricted = $2 WHERE user_id = $3 AND name = $4")
+                .bind(&selector).bind(restricted).bind(f.user_id).bind(&name).execute(&f.pool).await.unwrap();
+            let actual = auth.validate_api_token(&token.0).await.unwrap();
+            let diagnostic = svc
+                .resolve_token_scope(selector.as_ref(), Vec::new(), restricted)
+                .await
+                .unwrap();
+            assert_eq!(
+                actual.allowed_repo_ids,
+                AccessScope::from(diagnostic.allowed_repo_ids)
+            );
+        }
+        f.teardown().await;
+    }
 
     fn glob_to_sql_pattern(glob: &str) -> String {
         glob.replace('*', "%")
