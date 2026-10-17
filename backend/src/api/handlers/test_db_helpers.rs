@@ -289,6 +289,27 @@ pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`hidden_nav_items_serial_lock`] (#4574).
+const HIDDEN_NAV_ITEMS_TEST_LOCK_KEY: i64 = 0x4e56_4574; // "NV" + issue #4574
+
+/// Cross-process serialization guard for the DB-backed tests that write the
+/// `ui.hidden_nav_items` row (#4574). It is ONE row in `system_settings`
+/// shared by the whole database, so two tests writing it under `cargo
+/// nextest` process-per-test parallelism would read each other's values.
+/// Mirrors [`token_policy_serial_lock`].
+pub struct HiddenNavItemsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the hidden-navigation-items test lock, blocking until it is free.
+/// Returns an inert guard when the database is unreachable, mirroring
+/// [`try_pool`].
+pub async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
+    HiddenNavItemsSerialGuard {
+        _conn: serial_lock_session(HIDDEN_NAV_ITEMS_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory

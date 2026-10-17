@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4574]
+---
+- **Admins can hide web UI navigation entries the instance does not use** (#4574). The web sidebar lists every feature, so teams that only host a few package types get a long menu full of entries nobody uses. `PATCH /api/v1/admin/settings/system` now accepts `hidden_nav_items`, a list of navigation entry identifiers (the web UI sends route paths such as `/peers`), and `GET` on the same endpoint returns it. The list is stored in `system_settings` under `ui.hidden_nav_items`, every change is written to the audit log as `SETTING_CHANGED`, and `GET /api/v1/system/config` publishes it to every caller, guests included, as `ui.hidden_nav_items`. The server treats the identifiers as opaque and only checks their shape (at most 200 entries of 1 to 128 characters from letters, digits, `/`, `-`, `_` and `.`); an invalid list is refused with 400 and nothing is written. This is navigation only: no request is allowed or refused because of it. Nothing is hidden by default, and an unreadable or malformed stored value reads as nothing hidden. Needs no migration.
