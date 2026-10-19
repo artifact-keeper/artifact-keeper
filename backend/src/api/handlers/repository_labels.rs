@@ -187,7 +187,7 @@ async fn list_labels(
 #[utoipa::path(
     put,
     operation_id = "set_repo_labels",
-    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
+    extensions(("x-required-permission" = json!("repository.label.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -231,7 +231,7 @@ async fn set_labels(
 #[utoipa::path(
     post,
     operation_id = "add_repo_label",
-    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
+    extensions(("x-required-permission" = json!("repository.label.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -269,7 +269,7 @@ async fn add_label(
 #[utoipa::path(
     delete,
     operation_id = "delete_repo_label",
-    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
+    extensions(("x-required-permission" = json!("repository.label.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -779,6 +779,9 @@ mod tests {
     // -----------------------------------------------------------------------
     mod iam_spike {
         use super::super::*;
+        use crate::api::authz::declaration::RouteRequirement;
+        use crate::api::authz::registry::RouteRegistry;
+        use crate::api::authz::route_inventory::enumerate_routes;
         use axum::{
             body::Body,
             extract::{MatchedPath, Request},
@@ -792,49 +795,9 @@ mod tests {
 
         const PREFIX: &str = "/api/v1/repositories";
 
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        struct Entry {
-            permission: String,
-            resource: String,
-        }
-
-        type Registry = HashMap<(Method, String), Entry>;
-
-        /// OpenAPI `{key}` -> Axum `:key`.
-        fn normalize(template: &str) -> String {
-            template
-                .split('/')
-                .map(
-                    |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                        Some(name) => format!(":{name}"),
-                        None => seg.to_string(),
-                    },
-                )
-                .collect::<Vec<_>>()
-                .join("/")
-        }
-
-        /// Registry built from the merged `build_openapi()` document, keeping
-        /// only operations that declare `x-required-permission`.
-        fn build_registry() -> Registry {
-            let doc = serde_json::to_value(crate::api::openapi::build_openapi()).unwrap();
-            let mut reg = Registry::new();
-            for (path, item) in doc["paths"].as_object().unwrap() {
-                for (verb, op) in item.as_object().unwrap() {
-                    let Some(permission) = op.get("x-required-permission") else {
-                        continue;
-                    };
-                    let method = Method::from_bytes(verb.to_uppercase().as_bytes()).unwrap();
-                    reg.insert(
-                        (method, normalize(path)),
-                        Entry {
-                            permission: permission.as_str().unwrap().to_string(),
-                            resource: op["x-resource"].as_str().unwrap().to_string(),
-                        },
-                    );
-                }
-            }
-            reg
+        fn build_registry() -> RouteRegistry {
+            RouteRegistry::from_api_doc(&crate::api::openapi::build_openapi())
+                .expect("valid authorization declarations")
         }
 
         fn label_ops() -> Vec<(Method, &'static str, &'static str)> {
@@ -847,17 +810,17 @@ mod tests {
                 (
                     Method::PUT,
                     "/api/v1/repositories/:key/labels",
-                    "repository.update",
+                    "repository.label.manage",
                 ),
                 (
                     Method::POST,
                     "/api/v1/repositories/:key/labels/:label_key",
-                    "repository.update",
+                    "repository.label.manage",
                 ),
                 (
                     Method::DELETE,
                     "/api/v1/repositories/:key/labels/:label_key",
-                    "repository.update",
+                    "repository.label.manage",
                 ),
             ]
         }
@@ -892,11 +855,15 @@ mod tests {
         fn openapi_preserves_authz_extensions() {
             let reg = build_registry();
             for (method, path, perm) in label_ops() {
-                let e = reg
-                    .get(&(method.clone(), path.to_string()))
-                    .unwrap_or_else(|| panic!("missing {method} {path}"));
-                assert_eq!(e.permission, perm, "{method} {path}");
-                assert_eq!(e.resource, "repo:key", "{method} {path}");
+                let Some(RouteRequirement::Permission {
+                    permission,
+                    resolver,
+                }) = reg.requirement(method.as_str(), path)
+                else {
+                    panic!("missing {method} {path}");
+                };
+                assert_eq!(permission.id(), perm, "{method} {path}");
+                assert_eq!(resolver.id, "repo:key", "{method} {path}");
             }
         }
 
@@ -907,21 +874,18 @@ mod tests {
             let reg = build_registry();
             // Other modules carry no extension yet, so only the four label
             // operations are present.
-            assert_eq!(reg.len(), 4, "registry: {reg:?}");
+            assert_eq!(reg.declared().count(), 4, "registry: {reg:?}");
             for (method, path, _) in label_ops() {
-                assert!(reg.contains_key(&(method, path.to_string())));
+                assert!(reg.requirement(method.as_str(), path).is_some());
             }
-            assert!(!reg.contains_key(&(
-                Method::PATCH,
-                "/api/v1/repositories/:key/labels".to_string()
-            )));
-            assert!(
-                !reg.contains_key(&(Method::POST, "/api/v1/repositories/:key/labels".to_string()))
-            );
-            assert!(!reg.contains_key(&(Method::GET, "/api/v1/repositories/:key".to_string())));
-            assert!(
-                !reg.contains_key(&(Method::GET, "/api/v1/repositories/{key}/labels".to_string()))
-            );
+            for (method, path) in [
+                ("PATCH", "/api/v1/repositories/:key/labels"),
+                ("POST", "/api/v1/repositories/:key/labels"),
+                ("GET", "/api/v1/repositories/:key"),
+                ("GET", "/api/v1/repositories/{key}/labels"),
+            ] {
+                assert!(reg.requirement(method, path).is_none(), "{method} {path}");
+            }
         }
 
         // -- 1.3 / 2.2 / 2.3 --------------------------------------------
@@ -931,7 +895,7 @@ mod tests {
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         struct Observation {
-            entry: Option<Entry>,
+            entry: Option<RouteRequirement>,
             denied: bool,
             status: StatusCode,
         }
@@ -940,7 +904,7 @@ mod tests {
         // + MatchedPath, records what it saw, and returns the inner response
         // untouched.
         async fn shadow_probe(
-            reg: Arc<Registry>,
+            reg: Arc<RouteRegistry>,
             log: Arc<Mutex<Vec<Observation>>>,
             req: Request,
             next: Next,
@@ -948,10 +912,10 @@ mod tests {
             let key = req
                 .extensions()
                 .get::<MatchedPath>()
-                .map(|m| (req.method().clone(), m.as_str().to_string()));
+                .map(|m| (req.method().as_str().to_string(), m.as_str().to_string()));
             let resp = next.run(req).await;
             log.lock().unwrap().push(Observation {
-                entry: key.and_then(|k| reg.get(&k).cloned()),
+                entry: key.and_then(|(m, p)| reg.requirement(&m, &p).copied()),
                 denied: resp.extensions().get::<AuthzDenied>().is_some(),
                 status: resp.status(),
             });
@@ -1014,7 +978,7 @@ mod tests {
                 let _ = send(&router, method.clone(), uri).await;
                 let obs = log.lock().unwrap().clone();
                 assert_eq!(obs.len(), 1, "{method} {uri}");
-                let direct = reg.get(&(method.clone(), template.to_string())).cloned();
+                let direct = reg.requirement(method.as_str(), template).copied();
                 assert!(direct.is_some());
                 assert_eq!(obs[0].entry, direct, "{method} {uri}");
             }
@@ -1098,55 +1062,16 @@ mod tests {
 
         // -- 2.1 ---------------------------------------------------------
 
-        /// Enumerate (method, path) pairs from the Axum 0.7 `Router` Debug
-        /// output. Debug output is not a stable API; this is pinned to 0.7.
-        fn enumerate_routes(router: &Router) -> BTreeSet<(String, String)> {
-            let dbg = format!("{router:?}");
-            // Only the primary path_router; the fallback router follows it.
-            let primary = &dbg[..dbg.find("fallback_router:").expect("fallback_router")];
-            let routes_at = primary.find("routes: {").expect("routes");
-            let node_at = primary.find("node: Node { paths: {").expect("node paths");
-            let routes = &primary[routes_at..node_at];
-            let paths = &primary[node_at..];
-
-            let mut path_by_id = HashMap::new();
-            for chunk in paths.split("RouteId(").skip(1) {
-                let (id, rest) = chunk.split_once("): \"").expect("id");
-                let (path, _) = rest.split_once('"').expect("path");
-                path_by_id.insert(id.to_string(), path.to_string());
-            }
-
-            let mut out = BTreeSet::new();
-            for chunk in routes.split("RouteId(").skip(1) {
-                let (id, rest) = chunk.split_once("): MethodRouter(").expect("mr");
-                // Stop before `fallback:` so it is not read as a verb.
-                let rest = &rest[..rest.find("fallback:").expect("fallback")];
-                for verb in [
-                    "get", "head", "delete", "options", "patch", "post", "put", "trace", "connect",
-                ] {
-                    let needle = format!("{verb}: ");
-                    let at = rest.find(&needle).unwrap_or_else(|| panic!("verb {verb}"));
-                    if !rest[at + needle.len()..].starts_with("None") {
-                        out.insert((verb.to_uppercase(), path_by_id[id].clone()));
-                    }
-                }
-            }
-            out
-        }
-
         #[tokio::test]
         async fn router_enumeration_matches_registry() {
             let router = spike_router();
             let routes = enumerate_routes(&router);
-            let registry: BTreeSet<(String, String)> = build_registry()
-                .into_keys()
-                .map(|(m, p)| (m.to_string(), p))
-                .collect();
+            let registry: BTreeSet<(String, String)> = build_registry().declared_keys();
             assert_eq!(routes, registry);
 
             // Negative control: a router with an extra route must diverge,
             // so the comparison is not vacuously true.
-            let extra = Router::new()
+            let extra: Router = Router::new()
                 .nest(
                     PREFIX,
                     repo_labels_router().route("/:key/extra", get(|| async {})),
