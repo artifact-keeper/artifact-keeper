@@ -590,12 +590,20 @@ pub struct LdapTestResult {
 // ---------------------------------------------------------------------------
 
 pub fn encryption_key() -> String {
-    std::env::var("SSO_ENCRYPTION_KEY")
-        .or_else(|_| std::env::var("JWT_SECRET"))
-        .expect(
-            "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set. \
-             At least one must be configured for SSO credential encryption.",
-        )
+    // #4142: either form may come from a mounted secret file. A
+    // configured-but-unusable file panics with the helper's message, the
+    // same way a missing key always has.
+    match crate::config::secret_or_env("SSO_ENCRYPTION_KEY").unwrap_or_else(|e| panic!("{e}")) {
+        Some(key) => key,
+        // An SSO_ENCRYPTION_KEY set but blank is used as-is (legacy
+        // behaviour preserved); only an unset one falls back to JWT_SECRET.
+        None => crate::config::secret_or_env("JWT_SECRET")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .expect(
+                "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set. \
+                 At least one must be configured for SSO credential encryption.",
+            ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2384,7 +2392,9 @@ mod tests {
         // assert this when both env vars are absent; in CI (where JWT_SECRET
         // is set so DB-backed SSO tests can encrypt credentials), the test
         // skips this branch.
-        if std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok() {
+        if crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+            || crate::config::secret_env_present("JWT_SECRET")
+        {
             return;
         }
         let result = std::panic::catch_unwind(encryption_key);
@@ -2405,7 +2415,9 @@ mod tests {
         // When JWT_SECRET is set, encryption_key() should return it as fallback
         // for SSO_ENCRYPTION_KEY. We just verify it returns a non-empty string.
         // (In CI, JWT_SECRET is typically set.)
-        if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+        if crate::config::secret_env_present("JWT_SECRET")
+            || crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+        {
             let key = encryption_key();
             assert!(!key.is_empty());
         }
@@ -3433,7 +3445,8 @@ mod tests {
         /// `test_encryption_key_panics_when_unset` invariant). The coverage
         /// CI job sets JWT_SECRET, so these tests run there.
         fn encryption_key_available() -> bool {
-            std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok()
+            crate::config::secret_env_present("SSO_ENCRYPTION_KEY")
+                || crate::config::secret_env_present("JWT_SECRET")
         }
 
         async fn cleanup_oidc(pool: &PgPool, id: Uuid) {

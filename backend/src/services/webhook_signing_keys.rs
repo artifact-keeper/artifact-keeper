@@ -86,6 +86,7 @@ pub enum SigningKeyError {
 fn classify_crypto_error(e: WebhookSecretError) -> SigningKeyError {
     match e {
         WebhookSecretError::KeyMissing
+        | WebhookSecretError::KeyFile(_)
         | WebhookSecretError::KeyNotBase64(_)
         | WebhookSecretError::KeyWrongLength(_) => SigningKeyError::EncryptionKeyUnavailable(e),
         WebhookSecretError::Crypto(_) | WebhookSecretError::NotUtf8 => {

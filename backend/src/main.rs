@@ -785,7 +785,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Initialize security scanner service
     let advisory_client = {
-        let mut client = AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok());
+        let mut client = AdvisoryClient::new(env_secret_or_log(
+            "GITHUB_TOKEN",
+            "continuing without a GitHub token",
+        ));
         // #4055: the client's answer cache is where new advisory data enters
         // the system; report detected changes so the leased scheduler tick
         // can re-evaluate stored environments against them.
@@ -1945,6 +1948,20 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a secret for a path where a broken `<NAME>_FILE` must not take the
+/// process down (#4142): log the error — naming the variable and the path,
+/// never the contents — and treat the secret as absent, exactly as if the
+/// variable were unset.
+fn env_secret_or_log(name: &str, on_error: &str) -> Option<String> {
+    match artifact_keeper_backend::config::secret_or_env(name) {
+        Ok(secret) => secret,
+        Err(e) => {
+            tracing::error!(error = %e, "{name}_FILE is set but unusable; {on_error}");
+            None
+        }
+    }
+}
+
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
 /// Returns None if any of the three required env vars are missing or empty.
 ///
@@ -1962,7 +1979,7 @@ fn build_oidc_bootstrap_request(
         name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
         client_id: std::env::var("OIDC_CLIENT_ID").ok(),
-        client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
+        client_secret: env_secret_or_log("OIDC_CLIENT_SECRET", "not bootstrapping OIDC"),
         scopes: std::env::var("OIDC_SCOPES").ok(),
         groups_claim: std::env::var("OIDC_GROUPS_CLAIM").ok(),
         admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
@@ -2061,7 +2078,7 @@ fn build_ldap_bootstrap_request(
         url: std::env::var("LDAP_URL").ok(),
         base_dn: std::env::var("LDAP_BASE_DN").ok(),
         bind_dn: std::env::var("LDAP_BIND_DN").ok(),
-        bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+        bind_password: env_secret_or_log("LDAP_BIND_PASSWORD", "not bootstrapping LDAP"),
         user_filter: std::env::var("LDAP_USER_FILTER").ok(),
         username_attr: std::env::var("LDAP_USERNAME_ATTR").ok(),
         email_attr: std::env::var("LDAP_EMAIL_ATTR").ok(),
@@ -2103,6 +2120,13 @@ async fn provision_admin_user(
         );
         return Ok(false);
     }
+
+    // #4142: ADMIN_PASSWORD may also come from a mounted secret file
+    // (ADMIN_PASSWORD_FILE). Resolve it once so every read below sees the
+    // same value; a configured-but-unusable file aborts startup rather than
+    // silently degrading to a generated password.
+    let admin_password = artifact_keeper_backend::config::secret_or_env("ADMIN_PASSWORD")
+        .map_err(artifact_keeper_backend::error::AppError::Config)?;
 
     // #2803: a password preset by the deployment (env var, or a mounted
     // secret file) is consulted ONLY on the create branch below, so a restart
@@ -2244,11 +2268,11 @@ async fn provision_admin_user(
         // It only seeds the admin on first boot, so editing it afterwards (a
         // quickstart user trying to "set" the password in .env) used to
         // change nothing and leave no trace of why the login kept failing.
-        admin_password_env_ignored(&mut tx, std::env::var("ADMIN_PASSWORD").ok()).await?;
+        admin_password_env_ignored(&mut tx, admin_password.clone()).await?;
 
         if !must_change && !demo_mode {
-            if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
-                if is_insecure_default_password(&env_pw) {
+            if let Some(env_pw) = admin_password.as_deref() {
+                if is_insecure_default_password(env_pw) {
                     tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
                     sqlx::query(
                         "UPDATE users SET must_change_password = true WHERE username = 'admin'",
@@ -2359,7 +2383,7 @@ async fn provision_admin_user(
         must_change,
         preset_from,
     } = match decide_initial_admin_credential(
-        std::env::var("ADMIN_PASSWORD").ok(),
+        admin_password.clone(),
         preset_password,
         demo_mode,
         policy,
@@ -2470,7 +2494,7 @@ async fn provision_admin_user(
         // password came from ADMIN_PASSWORD but matched an insecure default,
         // it was already supplied by the operator and is presumably logged
         // elsewhere; we still force a change but don't re-emit it.
-        let echo = std::env::var("ADMIN_PASSWORD").ok().is_none();
+        let echo = admin_password.is_none();
         log_admin_setup_banner(&password_file, echo.then_some(password.as_str()));
         Ok(true)
     } else {

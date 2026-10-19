@@ -114,7 +114,13 @@ impl LdapConfig {
             user_filter: std::env::var("LDAP_USER_FILTER")
                 .unwrap_or_else(|_| "(uid={username})".to_string()),
             bind_dn: std::env::var("LDAP_BIND_DN").ok(),
-            bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+            bind_password: match crate::config::secret_or_env("LDAP_BIND_PASSWORD") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "LDAP_BIND_PASSWORD_FILE is set but unusable; continuing without a bind password");
+                    None
+                }
+            },
             username_attr: std::env::var("LDAP_USERNAME_ATTR")
                 .unwrap_or_else(|_| "uid".to_string()),
             email_attr: std::env::var("LDAP_EMAIL_ATTR").unwrap_or_else(|_| "mail".to_string()),

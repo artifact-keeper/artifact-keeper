@@ -54,9 +54,9 @@ const FALLBACK_MIGRATION_ENCRYPTION_KEY: &str = "artifact-keeper-default-migrati
 /// and unit-test invocations work out of the box so `create_connection`
 /// no longer returns an unconditional 500 when the env var is unset.
 fn migration_encryption_key() -> Result<String> {
-    match std::env::var("MIGRATION_ENCRYPTION_KEY") {
-        Ok(v) if !v.is_empty() => Ok(v),
-        _ => {
+    match crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
+        Ok(Some(v)) if !v.is_empty() => Ok(v),
+        Ok(_) => {
             tracing::warn!(
                 "MIGRATION_ENCRYPTION_KEY is not set; using built-in fallback. \
                  Set this environment variable in production to protect stored \
@@ -64,6 +64,7 @@ fn migration_encryption_key() -> Result<String> {
             );
             Ok(FALLBACK_MIGRATION_ENCRYPTION_KEY.to_string())
         }
+        Err(e) => Err(AppError::Config(e.to_string())),
     }
 }
 use crate::services::migration_service::MigrationService;
@@ -2429,7 +2430,7 @@ mod tests {
     fn test_migration_encryption_key_returns_env_value() {
         // If the env var happens to be set, it should return its value
         // (non-empty values take precedence over the dev fallback).
-        if let Ok(val) = std::env::var("MIGRATION_ENCRYPTION_KEY") {
+        if let Ok(Some(val)) = crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
             if !val.is_empty() {
                 let result = migration_encryption_key();
                 assert!(result.is_ok());
@@ -2444,9 +2445,11 @@ mod tests {
         // making `POST /api/v1/migrations/connections` an unconditional 500
         // whenever `MIGRATION_ENCRYPTION_KEY` was not set. The fallback
         // keeps the handler working for dev/test deployments.
-        if std::env::var("MIGRATION_ENCRYPTION_KEY")
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
+        if crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .is_none()
         {
             let result = migration_encryption_key();
             assert!(
