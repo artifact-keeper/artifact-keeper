@@ -888,7 +888,10 @@ impl S3Config {
 
         // Dedicated signing credentials for presigned URLs (Option B)
         let presign_access_key = std::env::var("S3_PRESIGN_ACCESS_KEY_ID").ok();
-        let presign_secret_key = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
+        let presign_secret_key = crate::config::secret_or_env("S3_PRESIGN_SECRET_ACCESS_KEY")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty());
 
         let ca_cert_path = std::env::var("S3_CA_CERT_PATH").ok();
         let insecure_tls = std::env::var("S3_INSECURE_TLS")
@@ -1215,9 +1218,9 @@ async fn ec2_instance_profile_available() -> bool {
 fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) -> bool {
     let explicit_pair = (access_key.is_some() && secret_key.is_some())
         || (std::env::var("S3_ACCESS_KEY_ID").is_ok()
-            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            && crate::config::secret_env_present("S3_SECRET_ACCESS_KEY"))
         || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+            && crate::config::secret_env_present("AWS_SECRET_ACCESS_KEY"));
     explicit_pair || !anonymous_s3_enabled()
 }
 
@@ -1808,23 +1811,30 @@ impl S3Backend {
             );
         }
 
-        // Explicit credentials: function args > S3_* env vars > AWS_* env vars
+        // Explicit credentials: function args > S3_* env vars > AWS_* env vars.
+        // The secrets may come from a `<NAME>_FILE` mount (#4142); resolving
+        // them up front keeps the both-halts-of-the-pair fall-through of the
+        // original tuple patterns below, and a configured-but-unusable file is
+        // a hard error rather than a silent anonymous fallback.
+        let s3_secret =
+            crate::config::secret_or_env("S3_SECRET_ACCESS_KEY").map_err(AppError::Config)?;
+        let aws_secret =
+            crate::config::secret_or_env("AWS_SECRET_ACCESS_KEY").map_err(AppError::Config)?;
+        let aws_session_token =
+            crate::config::secret_or_env("AWS_SESSION_TOKEN").map_err(AppError::Config)?;
         if let Some(ak) = access_key {
             if let Some(sk) = secret_key {
                 builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
             }
-        } else if let (Ok(ak), Ok(sk)) = (
-            std::env::var("S3_ACCESS_KEY_ID"),
-            std::env::var("S3_SECRET_ACCESS_KEY"),
-        ) {
+        } else if let (Ok(ak), Some(sk)) = (std::env::var("S3_ACCESS_KEY_ID"), s3_secret) {
             tracing::info!("Using S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY for S3 credentials");
             builder = builder.with_access_key_id(&ak).with_secret_access_key(&sk);
-        } else if let (Ok(ak), Ok(sk)) = (
-            std::env::var("AWS_ACCESS_KEY_ID"),
-            std::env::var("AWS_SECRET_ACCESS_KEY"),
-        ) {
+        } else if let (Ok(ak), Some(sk)) = (std::env::var("AWS_ACCESS_KEY_ID"), aws_secret) {
             builder = builder.with_access_key_id(&ak).with_secret_access_key(&sk);
-            if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
+            // An empty token is not a token: the legacy `env::var` read
+            // passed a set-but-blank one through, which broke SigV4 against
+            // any STS-backed bucket.
+            if let Some(token) = aws_session_token.filter(|t| !t.is_empty()) {
                 builder = builder.with_token(token);
             }
         } else if anonymous_s3_enabled() {
@@ -1947,9 +1957,9 @@ impl S3Backend {
             return Ok(());
         }
         let has_static_creds = (std::env::var("S3_ACCESS_KEY_ID").is_ok()
-            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            && crate::config::secret_env_present("S3_SECRET_ACCESS_KEY"))
             || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+                && crate::config::secret_env_present("AWS_SECRET_ACCESS_KEY"));
         let has_cloud_chain = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
             || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok()
             || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok();

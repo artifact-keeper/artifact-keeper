@@ -160,6 +160,82 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Resolve a sensitive setting from the environment (#4142).
+///
+/// `<NAME>` holds the value directly; `<NAME>_FILE` holds a path to a file
+/// that contains the value (Docker/Kubernetes secret mounts, Vault agents,
+/// etc.). The direct value wins when both are set — the same precedence as the
+/// `DEPENDENCY_TRACK_API_KEY` handling (#2084) and `INITIAL_ADMIN_PASSWORD`
+/// (#2803), so operators can override a mounted secret with an env var
+/// without editing the mount.
+///
+/// File contents are trimmed of surrounding whitespace/newlines (a trailing
+/// newline from `echo secret > file` is the norm). The direct value is
+/// returned verbatim when it is set and non-empty after trimming (to preserve
+/// existing behaviour exactly). If the direct value is set but only contains
+/// whitespace, it falls through to the file form; if no file form is
+/// configured, the legacy value is preserved (potentially the whitespace-only
+/// string for certain call sites, or unset).
+///
+/// When `<NAME>_FILE` is set the file is authoritative: an unreadable or
+/// empty file is an error, not a silent fall-through to "unset". An operator
+/// who points at a broken mount must get a startup error naming the path
+/// (never the contents) rather than a backend that quietly starts with the
+/// secret missing.
+///
+/// Returns `Ok(None)` when neither form is set. Returns `Err(String)` when
+/// `<NAME>_FILE` is set to a path that cannot be read or is empty; the string
+/// message names the variable and path but never the contents.
+pub fn secret_or_env(name: &str) -> std::result::Result<Option<String>, String> {
+    let file_var = format!("{name}_FILE");
+    let path = env::var(&file_var).ok().filter(|p| !p.trim().is_empty());
+    let direct = env::var(name).ok();
+
+    let direct_usable = direct.as_deref().is_some_and(|v| !v.trim().is_empty());
+    if direct_usable {
+        return Ok(direct);
+    }
+
+    let Some(path) = path else {
+        return Ok(direct);
+    };
+
+    let path_trimmed = path.trim();
+    match std::fs::read_to_string(path_trimmed) {
+        Ok(contents) => {
+            let value = contents.trim().to_string();
+            if value.is_empty() {
+                Err(format!(
+                    "{file_var} points at {path_trimmed}, but the file is empty"
+                ))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(e) => Err(format!(
+            "{file_var} points at {path_trimmed}, but the file could not be read: {e}"
+        )),
+    }
+}
+
+/// Check whether a secret is configured via `<NAME>` or `<NAME>_FILE` (#4142)
+/// without reading the file contents. This is the cheap presence form of
+/// [`secret_or_env`], for call sites that only need to know *whether*
+/// credentials exist (e.g. whether S3 requests will be signed). A direct
+/// value counts as present even when blank, exactly like the `env::var(..)
+/// .is_ok()` checks this replaces — the store builder passes a blank value
+/// through unchanged, so the two stay in step. A `<NAME>_FILE` naming a file
+/// that turns out to be unreadable counts as present here too; reading it is
+/// the actual reader's job, and its failure is loud there.
+pub fn secret_env_present(name: &str) -> bool {
+    if env::var(name).is_ok() {
+        return true;
+    }
+    env::var(format!("{name}_FILE").as_str())
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Default for [`Config::http_header_read_timeout_secs`] (#4665).
 pub const DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS: u64 = 10;
 
@@ -1687,6 +1763,7 @@ impl Default for Config {
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
+
             dependency_track_url: None,
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
@@ -1827,8 +1904,9 @@ impl Config {
                 .as_deref(),
         );
         let config = Self {
-            database_url: env::var("DATABASE_URL")
-                .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
+            database_url: secret_or_env("DATABASE_URL")
+                .map_err(AppError::Config)?
+                .ok_or_else(|| AppError::Config("DATABASE_URL not set".into()))?,
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into()),
@@ -1845,8 +1923,9 @@ impl Config {
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
-            jwt_secret: env::var("JWT_SECRET")
-                .map_err(|_| AppError::Config("JWT_SECRET not set".into()))?,
+            jwt_secret: secret_or_env("JWT_SECRET")
+                .map_err(AppError::Config)?
+                .ok_or_else(|| AppError::Config("JWT_SECRET not set".into()))?,
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
@@ -1863,7 +1942,8 @@ impl Config {
             jwt_refresh_token_expiry_days: env_parse("JWT_REFRESH_TOKEN_EXPIRY_DAYS", 7),
             oidc_issuer: env::var("OIDC_ISSUER").ok(),
             oidc_client_id: env::var("OIDC_CLIENT_ID").ok(),
-            oidc_client_secret: env::var("OIDC_CLIENT_SECRET").ok(),
+            oidc_client_secret: secret_or_env("OIDC_CLIENT_SECRET").map_err(AppError::Config)?,
+
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
@@ -1881,7 +1961,8 @@ impl Config {
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
             opensearch_url: env::var("OPENSEARCH_URL").ok(),
             opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
-            opensearch_password: env::var("OPENSEARCH_PASSWORD").ok(),
+            opensearch_password: secret_or_env("OPENSEARCH_PASSWORD").map_err(AppError::Config)?,
+
             opensearch_allow_invalid_certs: matches!(
                 env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
                 Ok("true" | "1")
@@ -1963,14 +2044,16 @@ impl Config {
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
-            peer_api_key: env::var("PEER_API_KEY").unwrap_or_else(|_| {
-                let key = format!("{:032x}", rand::random::<u128>());
-                tracing::warn!(
-                    "PEER_API_KEY not set, generated random key. \
-                     Set PEER_API_KEY in your environment for stable peer authentication."
-                );
-                key
-            }),
+            peer_api_key: secret_or_env("PEER_API_KEY")
+                .map_err(AppError::Config)?
+                .unwrap_or_else(|| {
+                    let key = format!("{:032x}", rand::random::<u128>());
+                    tracing::warn!(
+                        "PEER_API_KEY not set, generated random key. \
+                         Set PEER_API_KEY in your environment for stable peer authentication."
+                    );
+                    key
+                }),
             dependency_track_url: env::var("DEPENDENCY_TRACK_URL").ok(),
             // Single source of truth for "DT is wired in". Defaults to false
             // when unset, so DT integration must be explicitly opted into.
@@ -2253,7 +2336,10 @@ impl Config {
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
-            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_password: secret_or_env("SMTP_PASSWORD")
+                .map_err(AppError::Config)?
+                .filter(|s| !s.is_empty()),
+
             smtp_from_address: env::var("SMTP_FROM_ADDRESS")
                 .unwrap_or_else(|_| "noreply@artifact-keeper.local".into()),
             smtp_tls_mode: {
@@ -3422,6 +3508,114 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // secret_or_env / secret_env_present (#4142)
+    // -----------------------------------------------------------------------
+
+    /// Write `contents` to a fresh temp file and hand its path to `f`.
+    fn with_secret_file(contents: &str, f: impl FnOnce(&str)) {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut file.as_file(), contents.as_bytes())
+            .expect("write secret file");
+        f(file.path().to_str().expect("utf-8 temp path"));
+    }
+
+    #[test]
+    fn secret_or_env_direct_value_wins_over_file() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", "from-env");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("from-env")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_falls_back_to_file_and_trims_newline() {
+        with_secret_file("s3cr3t\n", |path| {
+            env::remove_var("TEST_SECRET_4142");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("s3cr3t")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_blank_direct_value_falls_back_to_file() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", "   ");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some("from-file")
+            );
+        });
+    }
+
+    #[test]
+    fn secret_or_env_unset_returns_none() {
+        env::remove_var("TEST_SECRET_4142");
+        env::remove_var("TEST_SECRET_4142_FILE");
+        assert_eq!(secret_or_env("TEST_SECRET_4142").unwrap(), None);
+    }
+
+    #[test]
+    fn secret_or_env_empty_file_path_treated_as_unset() {
+        env::set_var("TEST_SECRET_4142", "");
+        env::set_var("TEST_SECRET_4142_FILE", "");
+        // Empty direct value with no usable file path: legacy behaviour
+        // preserved (Some("")).
+        assert_eq!(
+            secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn secret_or_env_missing_file_is_hard_error() {
+        env::remove_var("TEST_SECRET_4142");
+        env::set_var("TEST_SECRET_4142_FILE", "/nonexistent/secret-4142");
+        let err = secret_or_env("TEST_SECRET_4142").unwrap_err();
+        assert!(err.contains("TEST_SECRET_4142_FILE"));
+        assert!(err.contains("/nonexistent/secret-4142"));
+    }
+
+    #[test]
+    fn secret_or_env_empty_file_is_hard_error() {
+        with_secret_file("   \n", |path| {
+            env::remove_var("TEST_SECRET_4142");
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            let err = secret_or_env("TEST_SECRET_4142").unwrap_err();
+            assert!(err.contains("TEST_SECRET_4142_FILE"));
+            assert!(err.contains("empty"));
+        });
+    }
+
+    #[test]
+    fn secret_env_present_checks_both_forms() {
+        env::remove_var("TEST_SECRET_4142");
+        env::remove_var("TEST_SECRET_4142_FILE");
+        assert!(!secret_env_present("TEST_SECRET_4142"));
+
+        // A blank direct value still counts as set, matching the `.is_ok()`
+        // presence checks this replaces (the store builder passes a blank
+        // secret through unchanged, so presence must not disagree with it).
+        env::set_var("TEST_SECRET_4142", "");
+        assert!(secret_env_present("TEST_SECRET_4142"));
+
+        env::remove_var("TEST_SECRET_4142");
+        env::set_var("TEST_SECRET_4142_FILE", "/nonexistent/path");
+        assert!(secret_env_present("TEST_SECRET_4142"));
+
+        // An empty file path is unset, like any other empty `_FILE`.
+        env::set_var("TEST_SECRET_4142_FILE", "");
+        assert!(!secret_env_present("TEST_SECRET_4142"));
+    }
+
+    // -----------------------------------------------------------------------
     // Config::from_env
     // -----------------------------------------------------------------------
 
@@ -3472,6 +3666,77 @@ mod tests {
         if let Some(v) = saved_jwt {
             env::set_var("JWT_SECRET", v);
         }
+    }
+
+    #[test]
+    fn test_config_from_env_secrets_from_file_4142() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_db_file = env::var("DATABASE_URL_FILE").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_jwt_file = env::var("JWT_SECRET_FILE").ok();
+        let saved_oidc = env::var("OIDC_CLIENT_SECRET").ok();
+        let saved_oidc_file = env::var("OIDC_CLIENT_SECRET_FILE").ok();
+
+        let db_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut db_file.as_file(), b"postgresql://127.0.0.1:1/testdb\n")
+            .expect("write db url");
+        let jwt_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut jwt_file.as_file(), STRONG_SECRET.as_bytes())
+            .expect("write jwt secret");
+        let oidc_file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut oidc_file.as_file(), b"oidc-secret-from-file\n")
+            .expect("write oidc secret");
+
+        env::remove_var("DATABASE_URL");
+        env::remove_var("JWT_SECRET");
+        env::remove_var("OIDC_CLIENT_SECRET");
+        env::set_var(
+            "DATABASE_URL_FILE",
+            db_file.path().to_str().expect("utf-8 path"),
+        );
+        env::set_var(
+            "JWT_SECRET_FILE",
+            jwt_file.path().to_str().expect("utf-8 path"),
+        );
+        env::set_var(
+            "OIDC_CLIENT_SECRET_FILE",
+            oidc_file.path().to_str().expect("utf-8 path"),
+        );
+
+        let config = Config::from_env().expect("Config should load secrets from _FILE vars");
+        assert_eq!(config.database_url, "postgresql://127.0.0.1:1/testdb");
+        assert_eq!(config.jwt_secret, STRONG_SECRET);
+        assert_eq!(
+            config.oidc_client_secret.as_deref(),
+            Some("oidc-secret-from-file")
+        );
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("DATABASE_URL_FILE", saved_db_file);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("JWT_SECRET_FILE", saved_jwt_file);
+        restore_env("OIDC_CLIENT_SECRET", saved_oidc);
+        restore_env("OIDC_CLIENT_SECRET_FILE", saved_oidc_file);
+    }
+
+    #[test]
+    fn test_config_from_env_unreadable_secret_file_is_hard_error_4142() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_db_file = env::var("DATABASE_URL_FILE").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+
+        env::remove_var("DATABASE_URL");
+        env::set_var("DATABASE_URL_FILE", "/nonexistent/db-secret-4142");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(err.contains("DATABASE_URL_FILE"), "got: {err}");
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("DATABASE_URL_FILE", saved_db_file);
+        restore_env("JWT_SECRET", saved_jwt);
     }
 
     #[test]

@@ -120,7 +120,9 @@ impl AzureConfig {
         let container_name = std::env::var("AZURE_STORAGE_CONTAINER")
             .map_err(|_| AppError::Config("AZURE_STORAGE_CONTAINER not set".to_string()))?;
 
-        let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY").ok();
+        let access_key = crate::config::secret_or_env("AZURE_STORAGE_ACCESS_KEY")
+            .ok()
+            .flatten();
 
         let endpoint = std::env::var("AZURE_STORAGE_ENDPOINT").ok();
         let public_endpoint =
@@ -231,7 +233,9 @@ impl TokenCredentialProvider {
     fn from_env(client: &reqwest::Client) -> Result<Self> {
         let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
         let client_id = std::env::var("AZURE_CLIENT_ID").ok();
-        let client_secret = std::env::var("AZURE_CLIENT_SECRET").ok();
+        let client_secret = crate::config::secret_or_env("AZURE_CLIENT_SECRET")
+            .ok()
+            .flatten();
 
         let credential = match (tenant_id, client_id.clone(), client_secret) {
             (Some(t), Some(c), Some(s)) => {

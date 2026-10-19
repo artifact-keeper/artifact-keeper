@@ -237,16 +237,20 @@ impl MigrationService {
         // back to the dev passphrase if the env var is unset so we can
         // decrypt rows written by `migration::create_connection` under
         // the same fallback (see issue #1439 / Bug A).
-        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
+        let encryption_key = match crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
+            Ok(Some(v)) if !v.is_empty() => v,
+            Ok(_) => {
                 tracing::warn!(
                     "MIGRATION_ENCRYPTION_KEY is not set; using built-in fallback to \
                      decrypt source-connection credentials."
                 );
                 "artifact-keeper-default-migration-key-dev-only".to_string()
-            });
+            }
+            // A configured-but-unreadable file is a hard error (#4142):
+            // decrypting under the dev fallback would fail with a confusing
+            // "decryption failed" instead of naming the broken mount.
+            Err(e) => return Err(MigrationError::ConfigError(e)),
+        };
         let credentials_json =
             crate::services::encryption::decrypt_credentials(&credentials_enc, &encryption_key)
                 .map_err(|e| MigrationError::ConfigError(format!("Decryption failed: {}", e)))?;
