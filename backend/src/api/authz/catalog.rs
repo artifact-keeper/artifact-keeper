@@ -180,6 +180,13 @@ impl Permission {
     }
 }
 
+impl serde::Serialize for Permission {
+    /// Serialized as the stable identifier, not the variant name.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.id())
+    }
+}
+
 impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.id())
