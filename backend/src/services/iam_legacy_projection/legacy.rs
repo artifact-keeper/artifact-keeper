@@ -50,7 +50,12 @@ pub enum LegacyPrincipal {
     User(Uuid),
     ServiceAccount(Uuid),
     Group(Uuid),
-    Unknown { principal_type: String, id: Uuid },
+    /// `principal_type = 'anonymous'`: the IP-restrictable anonymous read grant.
+    Anonymous,
+    Unknown {
+        principal_type: String,
+        id: Uuid,
+    },
 }
 
 /// A row of `permissions`. `conditions` is the raw JSON column: it is parsed
@@ -71,7 +76,10 @@ pub struct LegacyRule {
 pub struct LegacyGroup {
     pub id: Uuid,
     pub name: String,
-    pub external_provider: Option<String>,
+    /// `groups.external_source` (`oidc`, `ldap`, `saml`, ...).
+    pub external_source: Option<String>,
+    /// `groups.external_provider_id`.
+    pub external_provider_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,34 +102,43 @@ pub struct LegacyProject {
 }
 
 /// An API token's authority-limiting fields. Never the secret or its hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LegacyToken {
     pub id: Uuid,
     pub user_id: Uuid,
     pub scopes: Vec<String>,
-    /// `None`: no repository restriction.
+    /// Explicit `api_token_repositories` rows; `None` when the token has none.
     pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// `api_tokens.repo_selector`, which takes precedence over the explicit
+    /// rows. Kept raw: a selector cannot be pinned to a fixed repository set.
+    pub repo_selector: Option<serde_json::Value>,
 }
 
-/// A CI mapping and the group(s) it places its principal in.
+/// A CI identity mapping (`ci_oidc_identity_mappings`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyCiMapping {
     pub id: Uuid,
-    pub service_account_id: Uuid,
-    pub group_ids: Vec<Uuid>,
+    pub provider_id: Uuid,
+    /// `ci_oidc_providers.provider_type` (`gitlab`, `github`, `generic`, `kubernetes`, ...).
+    pub provider_type: Option<String>,
+    /// The service account the mapping resolves to, if one exists yet.
+    pub service_account_id: Option<Uuid>,
+    /// `None`: the mapping makes no claim about memberships.
+    pub group_binding_ids: Option<Vec<Uuid>>,
     /// `None`: the mapping declares no repository ceiling.
     pub allowed_repo_ids: Option<Vec<Uuid>>,
-    pub kubernetes_provider: bool,
+    pub is_enabled: bool,
 }
 
-/// An administrator-group setting of one identity provider, or `None` when the
-/// setting could not be read (a missing source is a diagnostic, not "no admins").
+/// The administrator-group setting of one identity provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacySsoAdminConfig {
+    /// The provider kind, equal to `users.auth_provider` for its users
+    /// (`oidc`, `ldap`, `saml`).
     pub provider: String,
-    pub admin_group: Option<String>,
-    /// Group-to-role map entries whose role is `admin`.
-    pub admin_role_groups: Vec<String>,
+    /// Local group names that confer administrator on login. For LDAP these are
+    /// the configured DN and its common name.
+    pub admin_groups: Vec<String>,
 }
 
 /// Non-secret SSO configuration captured with the database snapshot.
@@ -130,6 +147,13 @@ pub struct LegacySsoConfig {
     pub providers: Vec<LegacySsoAdminConfig>,
     /// Providers that are configured but whose settings could not be loaded.
     pub unreadable_providers: Vec<String>,
+}
+
+/// A row of `user_roles`. It confers nothing in any decision path today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyUserRole {
+    pub user_id: Uuid,
+    pub role_id: Uuid,
 }
 
 /// One coherent snapshot of the legacy authorization state.
@@ -146,4 +170,8 @@ pub struct LegacyAuthorizationState {
     pub tokens: Vec<LegacyToken>,
     pub ci_mappings: Vec<LegacyCiMapping>,
     pub sso: LegacySsoConfig,
+    /// `user_roles` rows (non-authoritative; reported, never converted).
+    pub user_roles: Vec<LegacyUserRole>,
+    /// Ids of `permission_grants` rows (non-authoritative; reported, never converted).
+    pub permission_grants: Vec<Uuid>,
 }

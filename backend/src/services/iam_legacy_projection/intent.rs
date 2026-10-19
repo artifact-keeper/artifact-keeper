@@ -174,6 +174,17 @@ impl Cidr {
         })
     }
 
+    /// A range from its parts; host bits are cleared. `prefix_len` is clamped to
+    /// the address family's width.
+    pub fn from_parts(addr: IpAddr, prefix_len: u8) -> Cidr {
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix_len = prefix_len.min(max);
+        Cidr {
+            addr: mask(addr, prefix_len),
+            prefix_len,
+        }
+    }
+
     pub fn addr(&self) -> IpAddr {
         self.addr
     }
@@ -341,6 +352,11 @@ pub enum DiagnosticCategory {
     Dropped,
     /// The one permission widening the model makes: repository owners.
     OwnerWidening,
+    /// A conditional deny: a request without a verified client IP is refused
+    /// where the legacy fallback to the role would have allowed it.
+    UnknownIpTightening,
+    /// A token restriction that cannot be pinned to a fixed repository set.
+    UnsupportedCredentialRestriction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -357,13 +373,15 @@ impl DiagnosticCategory {
         match self {
             DiagnosticCategory::Dropped
             | DiagnosticCategory::UnknownTarget
-            | DiagnosticCategory::OwnerWidening => Severity::Informational,
+            | DiagnosticCategory::OwnerWidening
+            | DiagnosticCategory::UnknownIpTightening => Severity::Informational,
             DiagnosticCategory::AmbiguousSsoAdmin
             | DiagnosticCategory::UnknownPrincipal
             | DiagnosticCategory::UnsupportedAction
             | DiagnosticCategory::UnsupportedRole
             | DiagnosticCategory::InvalidCondition
             | DiagnosticCategory::MissingSourceConfig
+            | DiagnosticCategory::UnsupportedCredentialRestriction
             | DiagnosticCategory::RegionOverflow => Severity::Blocking,
         }
     }
@@ -663,6 +681,7 @@ mod tests {
             DiagnosticCategory::InvalidCondition,
             DiagnosticCategory::MissingSourceConfig,
             DiagnosticCategory::RegionOverflow,
+            DiagnosticCategory::UnsupportedCredentialRestriction,
         ] {
             assert_eq!(blocking.severity(), Severity::Blocking);
             let mut b = ProjectionBuilder::new();
@@ -673,6 +692,7 @@ mod tests {
             DiagnosticCategory::Dropped,
             DiagnosticCategory::UnknownTarget,
             DiagnosticCategory::OwnerWidening,
+            DiagnosticCategory::UnknownIpTightening,
         ] {
             assert_eq!(info.severity(), Severity::Informational);
         }
