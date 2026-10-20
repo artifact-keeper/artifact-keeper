@@ -910,7 +910,6 @@ USER 1001
 # (image scans go through the sidecar), but the directory exists and a derived
 # image that re-bundles trivy would otherwise write to an unreachable path.
 ENV RUST_LOG=info \
-    DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
     HOME=/home/artifact \

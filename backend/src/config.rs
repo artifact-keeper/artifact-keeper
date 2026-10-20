@@ -160,6 +160,18 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// The `DATABASE_URL` value backend images up to 1.11.x baked into their
+/// environment (`ENV DATABASE_URL=set-database-url-at-runtime`). The
+/// Dockerfiles no longer set it (#4819); an environment copied from an older
+/// container (`docker inspect`, a rendered pod spec) can still carry it, so
+/// it counts as unset rather than as a connection string. Scoped to
+/// `DATABASE_URL`: for any other setting it is an ordinary value.
+const LEGACY_DATABASE_URL_PLACEHOLDER: &str = "set-database-url-at-runtime";
+
+fn is_legacy_image_placeholder(name: &str, value: &str) -> bool {
+    name == "DATABASE_URL" && value.trim() == LEGACY_DATABASE_URL_PLACEHOLDER
+}
+
 /// Resolve a sensitive setting from the environment (#4142).
 ///
 /// `<NAME>` holds the value directly; `<NAME>_FILE` holds a path to a file
@@ -191,12 +203,22 @@ pub fn secret_or_env(name: &str) -> std::result::Result<Option<String>, String> 
     let path = env::var(&file_var).ok().filter(|p| !p.trim().is_empty());
     let direct = env::var(name).ok();
 
-    let direct_usable = direct.as_deref().is_some_and(|v| !v.trim().is_empty());
+    // Treat the placeholder baked into published images as unset so that
+    // <NAME>_FILE can take effect (#4819).
+    let is_placeholder = direct
+        .as_deref()
+        .is_some_and(|v| is_legacy_image_placeholder(name, v));
+    let direct_usable = direct
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty() && !is_placeholder);
     if direct_usable {
         return Ok(direct);
     }
 
     let Some(path) = path else {
+        if is_placeholder {
+            return Ok(None);
+        }
         return Ok(direct);
     };
 
@@ -3592,6 +3614,69 @@ mod tests {
             assert!(err.contains("TEST_SECRET_4142_FILE"));
             assert!(err.contains("empty"));
         });
+    }
+
+    /// #4819: the placeholder older images baked into `DATABASE_URL` must not
+    /// shadow `DATABASE_URL_FILE`; a real `DATABASE_URL` still wins over the
+    /// file (#4775 precedence), and the placeholder alone reads as unset, so
+    /// startup says "DATABASE_URL not set" instead of failing to parse it.
+    #[test]
+    fn secret_or_env_database_url_placeholder_yields_to_file_4819() {
+        let file_url = "postgresql://u:p@db:5432/from_file";
+        with_secret_file(&format!("{file_url}\n"), |path| {
+            env::set_var("DATABASE_URL", LEGACY_DATABASE_URL_PLACEHOLDER);
+            env::set_var("DATABASE_URL_FILE", path);
+            assert_eq!(
+                secret_or_env("DATABASE_URL").unwrap().as_deref(),
+                Some(file_url)
+            );
+
+            env::set_var("DATABASE_URL", "postgresql://u:p@db:5432/direct");
+            assert_eq!(
+                secret_or_env("DATABASE_URL").unwrap().as_deref(),
+                Some("postgresql://u:p@db:5432/direct")
+            );
+        });
+
+        env::set_var("DATABASE_URL", LEGACY_DATABASE_URL_PLACEHOLDER);
+        env::remove_var("DATABASE_URL_FILE");
+        assert_eq!(secret_or_env("DATABASE_URL").unwrap(), None);
+    }
+
+    /// The placeholder is special for `DATABASE_URL` only.
+    #[test]
+    fn secret_or_env_placeholder_is_a_plain_value_for_other_settings() {
+        with_secret_file("from-file", |path| {
+            env::set_var("TEST_SECRET_4142", LEGACY_DATABASE_URL_PLACEHOLDER);
+            env::set_var("TEST_SECRET_4142_FILE", path);
+            assert_eq!(
+                secret_or_env("TEST_SECRET_4142").unwrap().as_deref(),
+                Some(LEGACY_DATABASE_URL_PLACEHOLDER)
+            );
+        });
+    }
+
+    /// #4819: the shipped images must not bake a `DATABASE_URL` into their
+    /// environment at all; an image-level value is a direct value and would
+    /// win over `DATABASE_URL_FILE`.
+    #[test]
+    fn backend_images_do_not_bake_database_url_4819() {
+        for (name, dockerfile) in [
+            (
+                "Dockerfile.backend",
+                include_str!("../../docker/Dockerfile.backend"),
+            ),
+            (
+                "Dockerfile.backend.alpine",
+                include_str!("../../docker/Dockerfile.backend.alpine"),
+            ),
+        ] {
+            let baked = dockerfile.lines().map(str::trim_start).any(|l| {
+                !l.starts_with('#')
+                    && (l.starts_with("DATABASE_URL=") || l.starts_with("ENV DATABASE_URL"))
+            });
+            assert!(!baked, "{name} sets DATABASE_URL in the image environment");
+        }
     }
 
     #[test]

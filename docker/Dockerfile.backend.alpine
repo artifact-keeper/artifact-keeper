@@ -260,7 +260,6 @@ USER 1001
 # lifetime; refresh the DB by rebuilding the image. See artifact-keeper#1001
 # and PR #1002 (commit 23d9743) which added the seed stage.
 ENV RUST_LOG=info \
-    DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
     GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
