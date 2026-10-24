@@ -22,7 +22,7 @@
 //! suffix lookup the chart itself uses.
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -951,12 +951,24 @@ async fn download_chart(
 // POST /helm/{repo_key}/api/charts -- Upload chart (ChartMuseum-compatible)
 // ---------------------------------------------------------------------------
 
+/// Query parameters for the ChartMuseum-compatible upload route.
+///
+/// `force` is an `Option<String>` rather than `Option<bool>` because the
+/// `helm cm-push --force` plugin sends a bare `?force` key (no `=true` value),
+/// which `Option<bool>` would reject with a 400 "Failed to deserialize query
+/// string". Any present key — empty or valued — means "overwrite".
+#[derive(serde::Deserialize)]
+struct UploadChartQuery {
+    force: Option<String>,
+}
+
 #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_chart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<UploadChartQuery>,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -967,6 +979,10 @@ async fn upload_chart(
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
+
+    // ChartMuseum `--force` compatibility: when present, overwrite an existing
+    // version rather than 409ing on it.
+    let force = query.force.is_some();
 
     // Spool the .tgz straight to a bounded scratch file instead of buffering
     // the whole archive in memory. See proxy_helpers::stage_upload_field.
@@ -1032,6 +1048,12 @@ async fn upload_chart(
     // path verbatim; reject traversal at ingest.
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    // `?force` overwrite: tombstone any live chart (and provenance) rows at this
+    // name/version so the uniqueness check below passes and the existing
+    // `cleanup_soft_deleted_artifact` sweeps the tombstones before the INSERT.
+    if force {
+        soft_delete_chart_version(&state.db, repo.id, chart_name, chart_version).await?;
+    }
 
     let conflict_msg = format!(
         "Chart {} version {} already exists",
@@ -1268,6 +1290,31 @@ async fn upload_chart(
             serde_json::to_string(&upload_response_body(prov_stored)).unwrap(),
         ))
         .unwrap())
+}
+
+/// Soft-delete every live artifact row for a chart coordinate (`name`/`version`),
+/// including its `.prov` provenance row. Used by the `?force` overwrite path to
+/// mirror `delete_chart`'s tombstone semantics; the subsequent
+/// `ensure_unique_artifact_path` call hard-deletes the tombstone so the fresh
+/// INSERT does not violate `UNIQUE(repository_id, path)`.
+#[allow(clippy::result_large_err)]
+async fn soft_delete_chart_version(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+) -> Result<(), Response> {
+    sqlx::query(
+        "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .execute(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(())
 }
 
 /// Read the leading bytes of a staged provenance file for armor validation.
@@ -2553,6 +2600,22 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         f.teardown().await;
     }
 
+    /// POST a ChartMuseum multipart upload with `?force` (overwrite); returns
+    /// (status, body). Mirrors the bare `?force` key the `helm cm-push --force`
+    /// plugin sends.
+    async fn upload_parts_force(
+        f: &tdh::Fixture,
+        parts: &[(&str, &str, &[u8])],
+    ) -> (StatusCode, bytes::Bytes) {
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/charts?force", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart_body("BOUNDARY", parts),
+        );
+        tdh::send(app, req).await
+    }
+
     /// The core of #2635: a `.prov` uploaded next to its chart must be
     /// PERSISTED and served back byte-for-byte at the URL helm derives.
     #[tokio::test]
@@ -2958,6 +3021,100 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json, serde_json::json!({"saved": true}));
 
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/provchart-0.1.0.tgz.prov", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        f.teardown().await;
+    }
+
+    /// `?force` (ChartMuseum `helm cm-push --force`) replaces an existing
+    /// version instead of 409ing: the same name/version re-uploads and the
+    /// download serves the new bytes.
+    #[tokio::test]
+    async fn test_helm_upload_force_overwrites_existing_version() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let chart_a = build_tgz(
+            "mychart/Chart.yaml",
+            b"apiVersion: v2\nname: mychart\nversion: 1.0.0\ndescription: first\n",
+        );
+        let chart_b = build_tgz(
+            "mychart/Chart.yaml",
+            b"apiVersion: v2\nname: mychart\nversion: 1.0.0\ndescription: second\n",
+        );
+
+        let (status, _) = upload_parts(&f, &[("chart", "mychart-1.0.0.tgz", &chart_a)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _) = upload_parts_force(&f, &[("chart", "mychart-1.0.0.tgz", &chart_b)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let app = f.router_anon(super::router());
+        let (status, got) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/mychart-1.0.0.tgz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&got[..], &chart_b[..]);
+
+        f.teardown().await;
+    }
+
+    /// Without `?force`, re-uploading the same version still 409s.
+    #[tokio::test]
+    async fn test_helm_upload_duplicate_version_conflicts_without_force() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let chart = build_tgz(
+            "mychart/Chart.yaml",
+            b"apiVersion: v2\nname: mychart\nversion: 1.0.0\n",
+        );
+
+        let (status, _) = upload_parts(&f, &[("chart", "mychart-1.0.0.tgz", &chart)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = upload_parts(&f, &[("chart", "mychart-1.0.0.tgz", &chart)]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            String::from_utf8_lossy(&body).contains("already exists"),
+            "duplicate upload must 409 with a conflict message"
+        );
+
+        f.teardown().await;
+    }
+
+    /// A `?force` re-upload that drops provenance must not leave a stale `.prov`
+    /// behind: the old provenance is tombstoned with the chart it described.
+    #[tokio::test]
+    async fn test_helm_upload_force_removes_stale_provenance() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+
+        let (status, _) = upload_parts(
+            &f,
+            &[
+                ("chart", "provchart-0.1.0.tgz", &tgz),
+                ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Force re-upload the chart WITHOUT provenance.
+        let (status, _) = upload_parts_force(&f, &[("chart", "provchart-0.1.0.tgz", &tgz)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The stale provenance must now 404, not serve for the new chart.
         let app = f.router_anon(super::router());
         let (status, _) = tdh::send(
             app,
