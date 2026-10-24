@@ -627,6 +627,14 @@ fn extract_element_text(fragment: &str, tag: &str) -> Option<String> {
     }
 }
 
+/// Whether a `maven-metadata.xml` document is a group-level plugin-prefix
+/// mapping (`<plugins><plugin>...`) rather than an artifact-level version
+/// list. Unlike a version list, a peer cannot regenerate this document from
+/// the versioned artifacts it receives (#4916).
+pub fn is_plugin_prefix_metadata_document(xml: &str) -> bool {
+    xml.contains("<plugins")
+}
+
 /// Parse the `<plugins>` block of a group-level plugin-prefix
 /// maven-metadata.xml. Returns an empty Vec for documents without plugin
 /// entries (such as artifact-level metadata carrying a `<versions>` block).
