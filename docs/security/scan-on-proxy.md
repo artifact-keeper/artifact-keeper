@@ -356,6 +356,11 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
+- **One verdict per digest across coordinates.** Verdicts are stored per
+  content digest. A Conan archive carries no reference of its own and a
+  Composer dist usually declares no version, so byte-identical archives
+  requested under two references (or two versions of one package) share the
+  verdict of the first one graded.
 - **Conan references are graded by name and version only.** The Conan pin
   is the requested `name/version`; the user, channel and revisions are not
   part of what the engine grades, so two revisions of one version get the
