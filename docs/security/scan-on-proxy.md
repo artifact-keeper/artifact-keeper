@@ -400,7 +400,10 @@ have no core proxy path to gate.
   content digest. A Conan archive carries no reference of its own and a
   Composer dist usually declares no version, so byte-identical archives
   requested under two references (or two versions of one package) share the
-  verdict of the first one graded.
+  verdict of the first one graded. The same holds for an OS package file
+  published unchanged in two releases (an `Architecture: all` package in two
+  Debian suites): it carries the verdict of the release it was first graded
+  against.
 - **Conan references are graded by name and version only.** The Conan pin
   is the requested `name/version`; the user, channel and revisions are not
   part of what the engine grades, so two revisions of one version get the
@@ -419,10 +422,6 @@ have no core proxy path to gate.
   from `pool/` (`apt-get source` fails), and a scanning RPM Remote withholds
   every file that is not an `.rpm` and not repository metadata (`.drpm`
   deltas, installer trees under `images/` or `LiveOS/`).
-- **One verdict per digest across releases.** A verdict is stored per
-  content digest, so a package file published unchanged in two releases (an
-  `Architecture: all` package in two suites) carries the verdict of the
-  release it was first graded against.
 - **Debian and RPM rows in a Remote repository.** As for NuGet, an
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
