@@ -1,0 +1,195 @@
+name: Release CLI Caches
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WARM THE CLI BINARY BUILD CACHES ON MAIN  (#4927)
+#
+# release.yml builds the five CLI binaries on a TAG ref. A GitHub Actions cache
+# lookup only sees caches saved on the run's own ref or on the default branch,
+# so a cache release.yml saved on `refs/tags/vN` was invisible to `vN+1` and
+# every leg compiled cold (27 to 30 min on Linux and Windows, 54 to 57 min on
+# macOS, measured on v1.11.5 and v1.11.6). Nothing on main saved these keys,
+# because ci.yml only builds the native Linux target.
+#
+# This workflow runs the same `cargo auditable build` for the same five targets
+# on the commit about to be released, ON MAIN, so the caches it saves live in
+# main's scope where the tag run can restore them. It packages, signs and
+# uploads nothing; the only thing it leaves behind is the cache.
+#
+# WHO DISPATCHES IT
+#   release-candidate.yml's `warm-cli-caches` job, right after `resolve`, with
+#   `-f sha=<the candidate commit>`. It is a separate workflow rather than a job
+#   in the candidate on purpose: the candidate runs no code from the certified
+#   commit (RELEASING.md, "What runs from the certified commit"; pinned by
+#   scripts/ci/test-resolve-certified-ref.sh), and a cargo build of the commit
+#   runs its build scripts and proc macros. Here it runs under this workflow's
+#   own identity, with `contents: read` and no secrets, and the candidate's
+#   certification does not wait for it or depend on it. It can also be
+#   dispatched by hand:
+#     gh workflow run release-cli-caches.yml --ref main -f sha=<40-hex>
+#
+# THE KEY (Swatinem/rust-cache at the pinned commit, src/config.ts)
+#   `shared-key` replaces both `key` and the job id, so the key is the same in
+#   this workflow and in release.yml's `build-binaries`:
+#     primary  v0-rust-cli-<target>-<OS>-<arch>-<env hash>-<lock hash>
+#     restore  v0-rust-cli-<target>-<OS>-<arch>-<env hash>
+#   <env hash> covers the rustc version and every CARGO*, CC*, CFLAGS*, CXX*,
+#   CMAKE* and RUST* variable visible to the cache step, which is why the
+#   toolchain pin and the workflow-level CARGO_TERM_COLOR below must stay equal
+#   to release.yml's. <lock hash> covers Cargo.lock and the workspace manifests
+#   with package versions normalised to 0.0.0, so the release prep's version
+#   bump does not change it. Keep the steps up to `Cache Cargo` in step with
+#   release.yml's build-binaries job, or the tag run misses and builds cold.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit to build: a full 40-hex sha reachable from main or from a release/X.Y.x branch.'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-cli-caches-${{ inputs.sha }}
+  cancel-in-progress: false
+
+env:
+  # Same as release.yml. CARGO_* is part of rust-cache's environment hash.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve the commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      # The caches must land in main's scope, the only branch scope a tag run
+      # can read. A run on any other ref would save where no release looks.
+      - name: Refuse a dispatch that is not on main
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error title=Not dispatched on main::Release CLI Caches was dispatched on ${GITHUB_REF}. Its caches are only visible to a release tag when saved on main; dispatch it with --ref main."
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Only reviewed commits write to main's cache scope: the commit must be
+      # reachable from main or from a release/X.Y.x maintenance line.
+      - name: Resolve
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Not a full sha::'${INPUT_SHA}' is not a 40-character commit sha."
+            exit 1
+          fi
+          if ! git cat-file -e "${INPUT_SHA}^{commit}" 2>/dev/null; then
+            echo "::error title=Unknown commit::${INPUT_SHA} is not a commit in this repository."
+            exit 1
+          fi
+          line=""
+          for ref in refs/remotes/origin/main $(git for-each-ref --format='%(refname)' 'refs/remotes/origin/release/'); do
+            if git merge-base --is-ancestor "$INPUT_SHA" "$ref"; then
+              line="$ref"
+              break
+            fi
+          done
+          if [[ -z "$line" ]]; then
+            echo "::error title=Commit not on a release line::${INPUT_SHA} is reachable from neither main nor a release/X.Y.x branch."
+            exit 1
+          fi
+          echo "Warming the CLI build caches for ${INPUT_SHA} (${line#refs/remotes/})"
+          echo "sha=${INPUT_SHA}" >> "$GITHUB_OUTPUT"
+
+  warm:
+    name: Warm ${{ matrix.target }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Same targets and runners as release.yml's build-binaries. The runner
+      # OS and CPU architecture are part of the cache key.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get install -y mingw-w64
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      # Saves on main (the default `save-if`). release.yml restores this key
+      # and does not save.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: cli-${{ matrix.target }}
+
+      - name: Install SBOM tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+
+      # No "Set version from tag" step: the release prep PR already set
+      # Cargo.toml to the version being released, so the tag run's edit
+      # rewrites the same bytes and the dependency graph built here is the
+      # one the tag builds.
+      - name: Build
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo auditable build --release --target ${{ matrix.target }} --features vendored-openssl
