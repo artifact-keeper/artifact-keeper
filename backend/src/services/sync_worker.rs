@@ -1138,13 +1138,27 @@ async fn execute_transfer(
         .await;
     }
 
+    // #4916: a protobuf `_labels` row written before #4889 is an empty pointer
+    // with no stored document. Rebuild it from the label map in its metadata
+    // before deciding how to transfer it, otherwise the peer receives zero
+    // bytes (or nothing) and the initial sync fails.
+    let mut repaired_task: Option<Claimed<TaskRow>> = None;
+    if let Some(repaired) = repair_legacy_protobuf_label_index(db, &storage_registry, task).await {
+        repaired_task = Some(Claimed::from_claim_row(
+            repaired,
+            task.claim_token(),
+            task.claimed_by().to_string(),
+            task.claim_expires_at(),
+        ));
+    }
     // #4921: a protobuf commit row written before the fix carries the commit
     // digest in `checksum_sha256`, which the peer would reject as a checksum
     // mismatch. Repair it from the stored bytes and push the real sha256.
-    let repaired;
-    let task = match repair_legacy_protobuf_commit_checksum(db, &storage_registry, task).await {
-        Some(checksum) => {
-            repaired = Claimed::from_claim_row(
+    if repaired_task.is_none() {
+        if let Some(checksum) =
+            repair_legacy_protobuf_commit_checksum(db, &storage_registry, task).await
+        {
+            repaired_task = Some(Claimed::from_claim_row(
                 TaskRow {
                     checksum_sha256: checksum,
                     ..(**task).clone()
@@ -1152,11 +1166,10 @@ async fn execute_transfer(
                 task.claim_token(),
                 task.claimed_by().to_string(),
                 task.claim_expires_at(),
-            );
-            &repaired
+            ));
         }
-        None => task,
-    };
+    }
+    let task = repaired_task.as_ref().unwrap_or(task);
 
     // Push flow: decide between single-request upload and chunked transfer
     // based on the artifact size or the need to preserve metadata.
@@ -1191,7 +1204,7 @@ async fn execute_transfer(
     let bytes_len = file_bytes.len() as i64;
 
     // 3. PUT the artifact to the remote peer.
-    let url = build_transfer_url(peer_endpoint, &task.repository_key, &task.artifact_path);
+    let url = build_transfer_url_for_task(peer_endpoint, task);
 
     let request = replication_put_headers(task, peer_api_key)
         .into_iter()
@@ -2099,6 +2112,181 @@ pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> Failur
     }
 }
 
+/// True for a protobuf `_labels` row written before #4889: it has no stored
+/// document, only an inline label map in `artifact_metadata`.
+fn is_legacy_protobuf_label_index(task: &TaskRow) -> bool {
+    task.task_type == "push"
+        && task.artifact_metadata_format.as_deref() == Some("protobuf")
+        && task
+            .artifact_path
+            .trim_end_matches('/')
+            .ends_with("/_labels")
+        && (task.artifact_size == 0
+            || task.checksum_sha256.trim() == "none"
+            || task.storage_key == task.artifact_path)
+}
+
+/// Rebuild and persist the label document for a pre-#4889 `_labels` row.
+///
+/// The old row stored only `{"labels": {...}}` in `artifact_metadata`. Render
+/// it into content-addressed storage, stamp the #4916 revision if absent, and
+/// point the row at the bytes so the normal transfer can send them. Returns
+/// the repaired projection, or `None` when the row needs no repair or cannot
+/// be reconstructed (the transfer then runs unchanged).
+async fn repair_legacy_protobuf_label_index(
+    db: &PgPool,
+    storage_registry: &StorageRegistry,
+    task: &TaskRow,
+) -> Option<TaskRow> {
+    use sha2::{Digest, Sha256};
+
+    if !is_legacy_protobuf_label_index(task) {
+        return None;
+    }
+    let mut metadata = task.artifact_metadata.clone()?;
+    if metadata
+        .get("labels")
+        .and_then(serde_json::Value::as_object)
+        .is_none()
+    {
+        tracing::warn!(
+            "Cannot rebuild the label document of '{}' (task {}): metadata has no labels map",
+            task.artifact_path,
+            task.id
+        );
+        return None;
+    }
+    if metadata
+        .get("revision")
+        .and_then(serde_json::Value::as_i64)
+        .is_none()
+    {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("revision".to_string(), serde_json::json!(1));
+        }
+    }
+    let bytes = match serde_json::to_vec(&metadata) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot serialize the label document of '{}' (task {}): {e}",
+                task.artifact_path,
+                task.id
+            );
+            return None;
+        }
+    };
+    let size_bytes = bytes.len() as i64;
+    let checksum_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+        &checksum_sha256,
+    );
+    let storage = match storage_for_task(storage_registry, task) {
+        Ok(storage) => storage,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot resolve storage for the label document of '{}' (task {}): {e}",
+                task.artifact_path,
+                task.id
+            );
+            return None;
+        }
+    };
+    if let Err(e) = storage.put(&storage_key, bytes::Bytes::from(bytes)).await {
+        tracing::warn!(
+            "Cannot store the rebuilt label document of '{}' (task {}): {e}",
+            task.artifact_path,
+            task.id
+        );
+        return None;
+    }
+
+    let mut tx = match db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot start the label repair transaction for '{}' (task {}): {e}",
+                task.artifact_path,
+                task.id
+            );
+            return None;
+        }
+    };
+    let row_repaired = match sqlx::query(
+        "UPDATE artifacts \
+         SET size_bytes = $2, checksum_sha256 = $3, storage_key = $4, \
+             content_type = 'application/json' \
+         WHERE id = $1 \
+           AND (size_bytes = 0 OR checksum_sha256 = 'none' OR storage_key = path)",
+    )
+    .bind(task.artifact_id)
+    .bind(size_bytes)
+    .bind(&checksum_sha256)
+    .bind(&storage_key)
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(result) => result.rows_affected() == 1,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot point the label row '{}' at its rebuilt document (task {}): {e}",
+                task.artifact_path,
+                task.id
+            );
+            return None;
+        }
+    };
+    if !row_repaired {
+        // Another worker repaired or rewrote the row first; do not clobber its
+        // metadata with this projection. The next pass re-reads the row. The
+        // object is content-addressed and may already be the winner's, so it
+        // is not deleted here.
+        tracing::info!(
+            "Label row '{}' changed before its repair committed; leaving it to the next pass",
+            task.artifact_path
+        );
+        return None;
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'protobuf', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET \
+             format = EXCLUDED.format, metadata = EXCLUDED.metadata",
+    )
+    .bind(task.artifact_id)
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::warn!(
+            "Cannot store the rebuilt label metadata for '{}' (task {}): {e}",
+            task.artifact_path,
+            task.id
+        );
+        return None;
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(
+            "Cannot commit the label repair for '{}' (task {}): {e}",
+            task.artifact_path,
+            task.id
+        );
+        return None;
+    }
+    tracing::info!(
+        "Rebuilt the empty protobuf label index '{}' before push",
+        task.artifact_path
+    );
+    Some(TaskRow {
+        storage_key,
+        artifact_size: size_bytes,
+        checksum_sha256,
+        content_type: "application/json".to_string(),
+        artifact_metadata: Some(metadata),
+        ..task.clone()
+    })
+}
+
 /// True for a protobuf commit row written before #4921: its `checksum_sha256`
 /// holds the commit digest (also the row's `version`) instead of the sha256
 /// of the stored bundle.
@@ -2319,6 +2507,23 @@ pub(crate) fn build_transfer_url(
     )
 }
 
+/// Transfer URL for one task (#4916). A Maven plugin-prefix mapping must go
+/// through the Maven upload route, not the generic artifact route: only the
+/// Maven route recognises the `<plugins>` document and stores it at the
+/// path-based key the Maven download handler reads.
+fn build_transfer_url_for_task(peer_endpoint: &str, task: &TaskRow) -> String {
+    if is_maven_plugin_prefix_metadata_task(task) {
+        format!(
+            "{}/maven/{}/{}",
+            peer_endpoint.trim_end_matches('/'),
+            task.repository_key,
+            encode_artifact_path(&task.artifact_path)
+        )
+    } else {
+        build_transfer_url(peer_endpoint, &task.repository_key, &task.artifact_path)
+    }
+}
+
 /// Build the full URL for deleting an artifact from a remote peer.
 pub(crate) fn build_delete_url(
     peer_endpoint: &str,
@@ -2515,7 +2720,25 @@ fn task_has_replication_metadata(task: &TaskRow) -> bool {
         || task.package_metadata.is_some()
 }
 
+/// True for a Maven group-level plugin-prefix document (#4916). Unlike other
+/// metadata-carrying tasks it must travel through the receiver's Maven upload
+/// route as a single PUT: that route recognises the `<plugins>` document and
+/// stores it at the path-based key with a row, which the generic chunked
+/// completion cannot do.
+fn is_maven_plugin_prefix_metadata_task(task: &TaskRow) -> bool {
+    task.artifact_metadata_format.as_deref() == Some("maven")
+        && task
+            .artifact_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("pluginPrefixMetadata"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn should_use_chunked_transfer_for_task(task: &TaskRow, threshold: i64) -> bool {
+    if is_maven_plugin_prefix_metadata_task(task) {
+        return false;
+    }
     should_use_chunked_transfer(task.artifact_size, threshold)
         || task_has_replication_metadata(task)
 }
@@ -4451,6 +4674,37 @@ mod tests {
         ));
     }
 
+    /// #4916: a Maven plugin-prefix mapping must reach the receiver's Maven
+    /// upload route (single PUT), which recognises the document and gives it a
+    /// path-based row; the generic chunked completion cannot.
+    #[test]
+    fn test_plugin_prefix_metadata_uses_the_maven_single_put_4916() {
+        let mut task = test_task("filesystem");
+        task.artifact_size = 1024;
+        task.artifact_path = "org/example/plugins/maven-metadata.xml".to_string();
+        task.artifact_metadata_format = Some("maven".to_string());
+        task.artifact_metadata = Some(serde_json::json!({
+            "groupId": "org.example",
+            "pluginPrefixMetadata": true,
+        }));
+
+        assert!(!should_use_chunked_transfer_for_task(
+            &task,
+            100 * 1024 * 1024
+        ));
+        assert_eq!(
+            build_transfer_url_for_task("https://peer.example/", &task),
+            "https://peer.example/maven/repo/org/example/plugins/maven-metadata.xml",
+            "the plugin mapping must reach the Maven upload route"
+        );
+
+        task.artifact_metadata = Some(serde_json::json!({"groupId": "org.example"}));
+        assert!(
+            should_use_chunked_transfer_for_task(&task, 100 * 1024 * 1024),
+            "an artifact-level metadata document keeps the chunked metadata path"
+        );
+    }
+
     #[test]
     fn test_should_use_chunked_transfer_for_task_keeps_plain_small_fast_path() {
         let mut task = test_task("filesystem");
@@ -5249,6 +5503,84 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(status, "completed");
         assert_eq!(row_checksum.trim(), sha, "the legacy row is repaired");
+    }
+
+    /// #4916: a `_labels` row written before #4889 has no stored document.
+    /// The worker rebuilds it from the inline label map before pushing, so a
+    /// peer's initial sync does not fail on a zero-byte object.
+    #[tokio::test]
+    async fn legacy_protobuf_label_row_is_rebuilt_before_push_4916() {
+        use sha2::{Digest, Sha256};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT artifact_id FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("fixture artifact id");
+        let legacy_path = "modules/acme/legacy/_labels";
+        sqlx::query(
+            "UPDATE artifacts SET path = $2, name = 'acme/legacy', version = '_labels', \
+                 size_bytes = 0, checksum_sha256 = 'none', \
+                 content_type = 'application/json', storage_key = $2 \
+             WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .bind(legacy_path)
+        .execute(&f.pool)
+        .await
+        .expect("legacy label row");
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'protobuf', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET metadata = EXCLUDED.metadata",
+        )
+        .bind(artifact_id)
+        .bind(serde_json::json!({"labels": {"main": "commit-a"}}))
+        .execute(&f.pool)
+        .await
+        .expect("legacy label metadata");
+        let server = mock_upload_peer(200, "{}").await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let (declared, sent) = sent_session(&server).await;
+        let (status, size, checksum, storage_key, metadata): (
+            String,
+            i64,
+            String,
+            String,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT st.status::TEXT, a.size_bytes, a.checksum_sha256, a.storage_key, am.metadata \
+             FROM sync_tasks st JOIN artifacts a ON a.id = st.artifact_id \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE st.id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("repaired label row");
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(status, "completed");
+        let sent_json: serde_json::Value = serde_json::from_slice(&sent).expect("label JSON");
+        assert_eq!(sent_json["labels"]["main"], "commit-a");
+        assert_eq!(sent_json["revision"], 1);
+        assert_eq!(
+            declared,
+            format!("{:x}", Sha256::digest(&sent)),
+            "the declared checksum must be the sha256 of the rebuilt bytes"
+        );
+        assert!(size > 0, "the rebuilt label row must have bytes");
+        assert_eq!(checksum.trim(), declared);
+        assert_ne!(
+            storage_key, legacy_path,
+            "the row must point at a content-addressed object"
+        );
+        assert_eq!(metadata["revision"], 1);
     }
 
     /// #4921: a permanent rejection of one artifact (409 checksum mismatch)
