@@ -354,8 +354,8 @@ dependencies = [
  "x509-cert",
  "xz2",
  "zeroize",
- "zip 9.0.4",
- "zstd 0.14.2",
+ "zip 9.0.5",
+ "zstd 0.14.3",
  "zxcvbn",
 ]
 
@@ -6203,7 +6203,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
- "zip 9.0.4",
+ "zip 9.0.5",
  "zstd 0.13.3",
 ]
 
@@ -8625,9 +8625,9 @@ checksum = "537dd038a89878be9b64dd4bd1b260315c1bb94f4d784956b81e27a088d9a09e"
 
 [[package]]
 name = "unicode-normalization"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
@@ -10255,9 +10255,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.4"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "aes 0.9.3",
  "bzip2",
@@ -10278,7 +10278,7 @@ dependencies = [
  "typed-path 0.12.3",
  "zeroize",
  "zopfli",
- "zstd 0.14.2",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -10316,9 +10316,9 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.14.2"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "057cfd910cfac363a0ada849592624b4c9ff2e10bef504c3433810d78ed96f93"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe 8.2.0",
 ]
