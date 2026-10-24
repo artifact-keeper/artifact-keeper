@@ -795,10 +795,17 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      # Restore only (#4927). A cache saved here lands on the tag's own ref,
+      # which no later tag can read, so it was about 950 MB per target of
+      # wasted space. release-cli-caches.yml, dispatched by the Release
+      # Candidate for this commit, saves the same `shared-key` on main, where
+      # this step can restore it. `No cache found.` here means that run did
+      # not happen on main or its caches were evicted, and the build is cold.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: cli-${{ matrix.target }}
+          save-if: false
 
       # Same installer ci.yml uses for cargo-audit: prebuilt binaries, no
       # compile on the release path. All three tools are published for Linux,
