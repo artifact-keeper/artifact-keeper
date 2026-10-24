@@ -314,6 +314,15 @@ names the same commit.
    Publish already built for the commit, pinned by digest. Nothing is
    rebuilt and nothing gets a name.
 
+   The candidate also warms the CLI binary build caches on `main`: its
+   `warm-cli-caches` job dispatches `release-cli-caches.yml` on `main` for
+   the commit, which compiles the five release targets and saves the
+   `rust-cache` entries the tag run's `build-binaries` restores (#4927); let
+   that run finish before the promote. A tag run whose `Cache Cargo` step
+   logs `No cache found.` means the candidate for that sha was not run from
+   `main` or the caches were evicted (7-day GitHub retention), and the build
+   will be cold.
+
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
    predicate names the commit, the version, the run and every digest.
@@ -798,6 +807,10 @@ over the API, and the images themselves are pinned by digest. `resolve`'s
 about what the *promote* runs later at the tag, not about this run. A self-test
 (`scripts/ci/test-resolve-certified-ref.sh`) pins all of this structurally, so
 a future checkout of the certified sha fails CI.
+
+The CLI build cache warm-up does compile the commit, which is why it is its
+own workflow (`release-cli-caches.yml`, `contents: read`, no secrets) that the
+candidate only dispatches and never waits for (#4927).
 
 **Downstream of the tag is a different story, deliberately.** The promote
 dispatches `release.yml` and `docker-publish.yml` on the tag, which runs the

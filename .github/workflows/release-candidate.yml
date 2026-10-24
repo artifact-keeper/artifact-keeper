@@ -288,6 +288,36 @@ jobs:
             echo "workflow_blob=${WORKFLOW_BLOB}"
           } >> "$GITHUB_OUTPUT"
 
+  # ── warm the CLI binary build caches (#4927) ────────────────────────────────
+  # release.yml builds the CLI binaries on the tag ref, which cannot read a
+  # cache saved by an earlier tag, so every release compiled them cold (an
+  # hour on the macOS legs). This dispatches release-cli-caches.yml on main
+  # for the commit, which builds the same five targets with the same
+  # rust-cache key and saves the caches in main's scope, where the tag run
+  # restores them. It is a separate workflow because a cargo build runs the
+  # commit's build scripts, and this workflow runs no code from the certified
+  # commit (see "What runs from the certified commit" in RELEASING.md). It
+  # only DISPATCHES: nothing here waits for the build, nothing needs this
+  # job, and `continue-on-error` keeps a failed dispatch from failing the
+  # candidate. A missing cache costs build time at the tag, not correctness.
+  warm-cli-caches:
+    name: Dispatch the CLI build cache warm-up
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write   # gh workflow run
+    steps:
+      - name: Dispatch release-cli-caches.yml on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run release-cli-caches.yml --repo "${GITHUB_REPOSITORY}" --ref main -f "sha=${SHA}"
+          echo "Dispatched Release CLI Caches for ${SHA}. Let it finish before the promote, or the tag run builds cold."
+
   # ── Docker Publish must be green before anything reads its result ──────────
   # Its own job, ahead of BOTH consumers (#4372). `preflight` used to start
   # beside the wait, which lived inside `images`, and preflight check 3
