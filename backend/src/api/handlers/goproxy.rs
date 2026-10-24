@@ -1614,9 +1614,9 @@ impl crate::api::handlers::proxy_scan_archive::ArchiveKind for GoModuleZip<'_> {
 /// every file under `{module}@{version}/` (the `go` command refuses a zip
 /// that does not), and a module's own `go.mod`, when it has one, declares
 /// its path. A zip with an entry outside that prefix, or whose `go.mod`
-/// names another module, is not the module the request names. The scanner
-/// has no Go pin, so a zip that agrees is graded on its contents (the
-/// `go.mod` requirements and anything else the engine catalogs).
+/// names another module, is not the module the request names. A zip that
+/// agrees is pinned as `module@version` (#4952), so the scanner grades the
+/// requested module version itself as well as the `go.mod` requirements.
 fn go_zip_identity(
     module: &str,
     version: &str,
@@ -1635,11 +1635,18 @@ fn go_zip_identity(
     if let Some(stray) = names.iter().find(|n| !n.starts_with(&prefix)) {
         return ArchiveIdentity::Disagrees(format!("entry {stray:?} is not under {prefix}"));
     }
+    let pinned = || {
+        ArchiveIdentity::coordinate_pinned(
+            crate::services::scanner_service::ComponentEcosystem::Go,
+            module,
+            version,
+        )
+    };
     match read_zip_entry(bytes, &format!("{prefix}go.mod")) {
         Err(e) => ArchiveIdentity::Unreadable(e),
-        Ok(None) => ArchiveIdentity::ContentGraded,
+        Ok(None) => pinned(),
         Ok(Some(body)) => match go_mod_module_path(&body) {
-            Some(declared) if declared == module => ArchiveIdentity::ContentGraded,
+            Some(declared) if declared == module => pinned(),
             Some(declared) => {
                 ArchiveIdentity::Disagrees(format!("go.mod declares module {declared}"))
             }
@@ -4410,30 +4417,27 @@ mod scan_on_proxy_4103 {
     }
 
     #[test]
-    fn a_zip_that_is_the_requested_module_is_graded_on_its_contents() {
+    fn a_zip_that_is_the_requested_module_is_pinned_as_it() {
+        let pinned =
+            ArchiveIdentity::Pinned(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Go,
+                MODULE,
+                VERSION,
+            ));
         let zip = Bytes::from(module_zip(MODULE, VERSION, MODULE));
-        assert_eq!(
-            go_zip_identity(MODULE, VERSION, &zip),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(go_zip_identity(MODULE, VERSION, &zip), pinned);
         // A pre-modules zip has no go.mod; the prefix still has to hold.
         let legacy = Bytes::from(zip_of(&[(
             &format!("{MODULE}@{VERSION}/x.go"),
             "package x\n".to_string(),
         )]));
-        assert_eq!(
-            go_zip_identity(MODULE, VERSION, &legacy),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(go_zip_identity(MODULE, VERSION, &legacy), pinned);
         // A quoted module path with a trailing comment is the same module.
         let quoted = Bytes::from(zip_of(&[(
             &format!("{MODULE}@{VERSION}/go.mod"),
             format!("// header\nmodule \"{MODULE}\" // c\n"),
         )]));
-        assert_eq!(
-            go_zip_identity(MODULE, VERSION, &quoted),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(go_zip_identity(MODULE, VERSION, &quoted), pinned);
     }
 
     #[test]

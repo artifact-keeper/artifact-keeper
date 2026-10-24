@@ -1600,6 +1600,77 @@ impl ScanWorkspace {
             // agrees with the pin — is what the engine catalogs it from; see
             // [`ComponentEcosystem::Maven`].
             ComponentEcosystem::Maven => Ok(()),
+            // Go, Composer, Conan (#4952): the archive is graded on its
+            // contents as before (a shipped lockfile stays where it is), and
+            // the pin adds the requested coordinate itself, under
+            // [`SCAN_PIN_SUBDIR`] where no shipped file can displace it.
+            ComponentEcosystem::Go => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(GO_MOD_NAME),
+                    go_mod_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            ComponentEcosystem::Composer => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(COMPOSER_LOCK_NAME),
+                    composer_lock_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            ComponentEcosystem::Conan => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(CONAN_LOCK_NAME),
+                    conan_lock_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            // Debian, RPM, Alpine (#4111, #4112, #4113): the synthetic
+            // installed-package inventory. These paths are at the workspace
+            // root, where the engine looks for an installed system; the
+            // archive is unpacked under [`SCAN_ARCHIVE_SUBDIR`] (and an OS
+            // package is not unpacked at all), so nothing shipped can occupy
+            // them. A pin without its release is refused rather than written:
+            // it would catalog the package and grade nothing.
+            ComponentEcosystem::Debian | ComponentEcosystem::Rpm | ComponentEcosystem::Alpine => {
+                let os = pin.os.as_ref().ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "OS package pin {} {} carries no release to grade it against",
+                        pin.name, pin.version
+                    ))
+                })?;
+                Self::write_pin_file(
+                    workspace,
+                    Path::new(OS_RELEASE_PATH),
+                    os_release_pin(&os.release),
+                )
+                .await?;
+                match pin.ecosystem {
+                    ComponentEcosystem::Debian => {
+                        Self::write_pin_file(
+                            workspace,
+                            Path::new(DPKG_STATUS_PATH),
+                            dpkg_status_pin(&pin.name, &pin.version, os),
+                        )
+                        .await
+                    }
+                    ComponentEcosystem::Alpine => {
+                        Self::write_pin_file(
+                            workspace,
+                            Path::new(APK_INSTALLED_PATH),
+                            apk_installed_pin(&pin.name, &pin.version, os),
+                        )
+                        .await
+                    }
+                    // The `.rpm` itself is staged beside the pin and the
+                    // engine catalogs its header; see
+                    // [`ComponentEcosystem::Rpm`].
+                    _ => Ok(()),
+                }
+            }
         }
     }
 
@@ -2168,6 +2239,114 @@ pub(crate) const NPM_SHRINKWRAP_NAME: &str = "npm-shrinkwrap.json";
 /// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`]. One subdirectory per source
 /// location, since a root and a `package/` shrinkwrap can legitimately differ.
 pub(crate) const NPM_SHRINKWRAP_SUBDIR: &str = ".ak-scan-shrinkwrap";
+
+/// The Go module file the CVE engine catalogs `require` lines from (#4952).
+pub(crate) const GO_MOD_NAME: &str = "go.mod";
+
+/// The PHP lockfile the CVE engine catalogs from a directory (#4952).
+pub(crate) const COMPOSER_LOCK_NAME: &str = "composer.lock";
+
+/// The Conan lockfile the CVE engine catalogs from a directory (#4952).
+pub(crate) const CONAN_LOCK_NAME: &str = "conan.lock";
+
+/// Where the synthetic OS release is written (#4111): the path the engine
+/// reads the distribution of a scanned directory from.
+pub(crate) const OS_RELEASE_PATH: &str = "etc/os-release";
+
+/// Where the synthetic Debian installed-package inventory is written (#4111).
+pub(crate) const DPKG_STATUS_PATH: &str = "var/lib/dpkg/status";
+
+/// Where the synthetic Alpine installed-package inventory is written (#4113).
+pub(crate) const APK_INSTALLED_PATH: &str = "lib/apk/db/installed";
+
+/// Whether one field of a proxy pin (#4952, #4111) can be written into a pin
+/// file exactly: non-empty, bounded, and drawn from the characters the Go,
+/// Composer, Conan, Debian, RPM and Alpine coordinate grammars use. `/` only
+/// where the grammar has it (a Go module path, a Composer `vendor/package`).
+/// Nothing that could end a line, a JSON string or a `go.mod` token (space,
+/// quote, newline, `#`) is accepted, and a `..` segment never is.
+pub(crate) fn proxy_pin_token_is_safe(value: &str, slash_ok: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value != "."
+        && !value.split('/').any(|seg| seg.is_empty() || seg == "..")
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | '+' | '~' | ':' | '!')
+                || (slash_ok && c == '/')
+        })
+}
+
+/// The `go.mod` body that pins exactly one required module version (#4952).
+/// The engine catalogs every `require` of a `go.mod` it finds; the module
+/// line names a path no real module uses so the pin is never mistaken for
+/// the scanned module's own manifest.
+pub(crate) fn go_mod_pin(module: &str, version: &str) -> String {
+    format!("module ak-scan-pin.invalid/pin\n\ngo 1.21\n\nrequire {module} {version}\n")
+}
+
+/// The `composer.lock` body that pins exactly one installed package (#4952).
+pub(crate) fn composer_lock_pin(name: &str, version: &str) -> String {
+    serde_json::json!({
+        "_readme": ["Scan pin written by Artifact Keeper"],
+        "packages": [{ "name": name, "version": version, "type": "library" }],
+        "packages-dev": [],
+    })
+    .to_string()
+}
+
+/// The `conan.lock` (v2, `"version": "0.5"`) body that requires exactly one
+/// `name/version` reference (#4952).
+pub(crate) fn conan_lock_pin(name: &str, version: &str) -> String {
+    serde_json::json!({
+        "version": "0.5",
+        "requires": [format!("{name}/{version}")],
+        "build_requires": [],
+        "python_requires": [],
+    })
+    .to_string()
+}
+
+/// The `etc/os-release` naming the release an OS package pin is graded
+/// against (#4111). `ID` and `VERSION_ID` are what the engine reads; both are
+/// from the closed set [`OsRelease::new`] admits, so the values need no
+/// quoting.
+pub(crate) fn os_release_pin(release: &OsRelease) -> String {
+    format!(
+        "ID={}\nVERSION_ID={}\nPRETTY_NAME=\"Artifact Keeper scan pin ({})\"\n",
+        release.id(),
+        release.version_id(),
+        release.label()
+    )
+}
+
+/// The one-stanza `var/lib/dpkg/status` for a Debian package pin (#4111):
+/// the fields of the package's own `control` the engine grades with. `Source`
+/// is the source package NAME only (the serve path drops a `(version)`
+/// suffix), so the engine matches source advisories at the binary version.
+pub(crate) fn dpkg_status_pin(name: &str, version: &str, os: &OsPackageContext) -> String {
+    let mut stanza = format!(
+        "Package: {name}\nStatus: install ok installed\nArchitecture: {}\n",
+        os.arch
+    );
+    if let Some(source) = os.source.as_deref() {
+        stanza.push_str(&format!("Source: {source}\n"));
+    }
+    stanza.push_str(&format!("Version: {version}\n\n"));
+    stanza
+}
+
+/// The one-record `lib/apk/db/installed` for an Alpine package pin (#4113):
+/// `P` (pkgname), `V` (pkgver), `A` (arch) and `o` (origin) from the
+/// package's own `.PKGINFO`.
+pub(crate) fn apk_installed_pin(name: &str, version: &str, os: &OsPackageContext) -> String {
+    let mut record = format!("P:{name}\nV:{version}\nA:{}\n", os.arch);
+    if let Some(origin) = os.source.as_deref() {
+        record.push_str(&format!("o:{origin}\n"));
+    }
+    record.push('\n');
+    record
+}
 
 /// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
 /// installed npm package, so the CVE engine catalogs and grades it (#3003).
@@ -2781,6 +2960,16 @@ pub(crate) fn pin_agrees_with_content(
                     if g == group_id && a == artifact_id && pin_agrees_with(pin, &pin.name, &v)
             )
         }
+        // Proxy-only pins (#4952, #4111, #4112, #4113): built by the serve
+        // route after its own identity check of these exact bytes, never from
+        // a registry row, so there is no hosted cross-check to run and a
+        // hosted caller can never establish one.
+        ComponentEcosystem::Go
+        | ComponentEcosystem::Composer
+        | ComponentEcosystem::Conan
+        | ComponentEcosystem::Debian
+        | ComponentEcosystem::Rpm
+        | ComponentEcosystem::Alpine => false,
     }
 }
 
@@ -4317,6 +4506,121 @@ pub enum ComponentEcosystem {
     /// `groupId:artifactId`; catalog matching compares the `artifactId` half
     /// (see [`ExpectedComponent::normalize_name`]).
     Maven,
+    /// Go module zip served through a Go module proxy (#4952). A module zip
+    /// is not cataloged as itself (the engine reads only the `go.mod`
+    /// requirements it ships), so the pin is a one-line `go.mod` that
+    /// `require`s exactly the requested `module@version`.
+    Go,
+    /// Composer dist archive (#4952): pinned through a minimal
+    /// `composer.lock` naming exactly the requested `vendor/package` and
+    /// version, since a dist ships no lockfile of its own package.
+    Composer,
+    /// Conan recipe or package archive (#4952): pinned through a minimal
+    /// `conan.lock` requiring exactly `name/version`.
+    Conan,
+    /// Debian binary package (`.deb`, #4111). The engine grades an OS package
+    /// only against the advisory feed of a distribution release, and a lone
+    /// `.deb` carries none, so the pin carries an [`OsPackageContext`] and is
+    /// written as a synthetic installed-package inventory: an
+    /// `etc/os-release` naming the release and a one-stanza
+    /// `var/lib/dpkg/status` from the package's own `control` fields.
+    Debian,
+    /// RPM package (`.rpm`, #4112). The engine catalogs the archive's own
+    /// header (name, epoch, version, release, source RPM), so the only
+    /// synthetic file is the `etc/os-release` naming the release the
+    /// package is graded against.
+    Rpm,
+    /// Alpine package (`.apk`, #4113): an `etc/os-release` plus a
+    /// one-record `lib/apk/db/installed` from the package's own `.PKGINFO`
+    /// (`pkgname`, `pkgver`, `arch`, `origin`). The engine does not catalog a
+    /// bare `.apk` at all.
+    Alpine,
+}
+
+impl ComponentEcosystem {
+    /// Whether this ecosystem's pin names an operating-system package, which
+    /// the engine grades only together with a distribution release
+    /// ([`OsPackageContext`]).
+    pub fn is_os_package(self) -> bool {
+        matches!(
+            self,
+            ComponentEcosystem::Debian | ComponentEcosystem::Rpm | ComponentEcosystem::Alpine
+        )
+    }
+}
+
+/// The operating-system release an OS package pin is graded against
+/// (#4111, #4112, #4113), as the `ID` and `VERSION_ID` of the synthetic
+/// `etc/os-release`.
+///
+/// The CVE engine grades a Debian, RPM or Alpine package only against one
+/// distribution release's advisory feed (`debian:12`, `rhel:9`,
+/// `alpine:3.19`): with no release it catalogs the package and matches
+/// nothing, which reads as clean. A lone package file names no release, so
+/// the serve path determines one (from the remote's own `Release` metadata,
+/// the RPM dist tag, the Alpine branch) and refuses to scan when it cannot;
+/// see `docs/security/scan-on-proxy.md`. Only the families the bundled
+/// engine has a feed for are representable, so an unknown family can never
+/// produce a pin that grades nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsRelease {
+    id: &'static str,
+    version_id: String,
+}
+
+impl OsRelease {
+    /// The `os-release` `ID`s an [`OsRelease`] may carry: the distribution
+    /// families the bundled engine has an advisory feed for that the three
+    /// gated formats serve.
+    pub const KNOWN_IDS: &'static [&'static str] =
+        &["debian", "ubuntu", "rhel", "fedora", "amzn", "alpine"];
+
+    /// `None` for a family outside [`Self::KNOWN_IDS`] or a version that is
+    /// not dotted digits (`12`, `22.04`, `3.19`); Alpine also accepts `edge`.
+    pub fn new(id: &str, version_id: &str) -> Option<Self> {
+        let id = *Self::KNOWN_IDS.iter().find(|k| **k == id)?;
+        let version_id = version_id.trim();
+        let dotted = !version_id.is_empty()
+            && version_id.len() <= 16
+            && version_id
+                .split('.')
+                .all(|p| !p.is_empty() && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit()));
+        if !(dotted || (id == "alpine" && version_id == "edge")) {
+            return None;
+        }
+        Some(Self {
+            id,
+            version_id: version_id.to_string(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        self.id
+    }
+
+    pub fn version_id(&self) -> &str {
+        &self.version_id
+    }
+
+    /// `id:version_id`, e.g. `debian:12`.
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.id, self.version_id)
+    }
+}
+
+/// The OS-package half of an [`ExpectedComponent`] (#4111, #4112, #4113):
+/// the release it is graded against and the fields of the package's own
+/// metadata that the synthetic inventory carries besides name and version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsPackageContext {
+    pub release: OsRelease,
+    /// `Architecture` / `arch` from the package's own metadata.
+    pub arch: String,
+    /// The source package (`Source` for Debian, `origin` for Alpine), when
+    /// the package names one. The engine matches advisories by source
+    /// package as well as by binary name, so a binary built from `openssl`
+    /// (`libssl3`, `libcrypto3`) is graded as `openssl`.
+    pub source: Option<String>,
 }
 
 impl ComponentEcosystem {
@@ -4368,6 +4672,10 @@ pub struct ExpectedComponent {
     pub ecosystem: ComponentEcosystem,
     pub name: String,
     pub version: String,
+    /// The release and metadata an OS package pin is graded with; `Some`
+    /// exactly when [`ComponentEcosystem::is_os_package`] (only
+    /// [`ExpectedComponent::os_package`] builds one).
+    pub os: Option<OsPackageContext>,
 }
 
 /// One component the CVE-authoritative engine actually cataloged (and
@@ -4384,7 +4692,58 @@ impl ExpectedComponent {
             ecosystem,
             name: name.to_string(),
             version: version.to_string(),
+            os: None,
         }
+    }
+
+    /// A proxy pin for a Go module, a Composer package or a Conan reference
+    /// (#4952), from the REQUEST coordinate. `None` for another ecosystem or
+    /// a coordinate outside the grammar the pin file can carry
+    /// ([`proxy_pin_token_is_safe`]): a pin that cannot be written exactly is
+    /// not written at all.
+    pub fn coordinate_pin(
+        ecosystem: ComponentEcosystem,
+        name: &str,
+        version: &str,
+    ) -> Option<Self> {
+        let slash_ok = match ecosystem {
+            ComponentEcosystem::Go | ComponentEcosystem::Composer => true,
+            ComponentEcosystem::Conan => false,
+            _ => return None,
+        };
+        let (name, version) = (name.trim(), version.trim());
+        (proxy_pin_token_is_safe(name, slash_ok) && proxy_pin_token_is_safe(version, false))
+            .then(|| Self::new(ecosystem, name, version))
+    }
+
+    /// An OS package pin (#4111, #4112, #4113): `name` and `version` as the
+    /// package's own metadata declares them (the serve path has already
+    /// checked they agree with the requested file name), graded against
+    /// `context.release`. `None` for a non-OS ecosystem or a field outside the
+    /// package grammar of the three formats.
+    pub fn os_package(
+        ecosystem: ComponentEcosystem,
+        name: &str,
+        version: &str,
+        context: OsPackageContext,
+    ) -> Option<Self> {
+        if !ecosystem.is_os_package() {
+            return None;
+        }
+        let (name, version) = (name.trim(), version.trim());
+        let fields_ok = proxy_pin_token_is_safe(name, false)
+            && proxy_pin_token_is_safe(version, false)
+            && proxy_pin_token_is_safe(&context.arch, false)
+            && context
+                .source
+                .as_deref()
+                .is_none_or(|s| proxy_pin_token_is_safe(s, false));
+        fields_ok.then(|| Self {
+            ecosystem,
+            name: name.to_string(),
+            version: version.to_string(),
+            os: Some(context),
+        })
     }
 
     /// Ecosystem-aware name normalization for comparing our coordinate against
@@ -4425,7 +4784,16 @@ impl ExpectedComponent {
             ComponentEcosystem::Npm
             | ComponentEcosystem::RubyGems
             | ComponentEcosystem::NuGet
-            | ComponentEcosystem::Conda => lower,
+            | ComponentEcosystem::Conda
+            | ComponentEcosystem::Composer
+            | ComponentEcosystem::Conan
+            | ComponentEcosystem::Debian
+            | ComponentEcosystem::Rpm
+            | ComponentEcosystem::Alpine => lower,
+            // Go module paths are case-sensitive (`github.com/Foo/bar` and
+            // `github.com/foo/bar` are two modules; the proxy protocol
+            // escapes capitals as `!f`), so the path is compared as written.
+            ComponentEcosystem::Go => name.trim().to_string(),
             ComponentEcosystem::Cargo => lower.replace('_', "-"),
             ComponentEcosystem::Python => {
                 let mut out = String::with_capacity(lower.len());
@@ -4452,7 +4820,29 @@ impl ExpectedComponent {
     pub fn matches(&self, cataloged: &CatalogedComponent) -> bool {
         Self::normalize_name(self.ecosystem, &self.name)
             == Self::normalize_name(self.ecosystem, &cataloged.name)
-            && self.version.trim() == cataloged.version.trim()
+            && Self::comparable_version(self.ecosystem, &self.version)
+                == Self::comparable_version(self.ecosystem, &cataloged.version)
+    }
+
+    /// The part of a version the catalog check compares. Verbatim (trimmed)
+    /// except for the two OS formats whose versions carry an epoch
+    /// (`1:3.0.7-17.el9_2`): the engine prints the epoch it read from the
+    /// package header while a file name never carries one, so a leading
+    /// `<digits>:` is dropped on both sides. Name, version and release still
+    /// have to agree exactly.
+    fn comparable_version(ecosystem: ComponentEcosystem, version: &str) -> String {
+        let version = version.trim();
+        match ecosystem {
+            ComponentEcosystem::Rpm | ComponentEcosystem::Debian => match version.split_once(':') {
+                Some((epoch, rest))
+                    if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    rest.to_string()
+                }
+                _ => version.to_string(),
+            },
+            _ => version.to_string(),
+        }
     }
 
     /// A stable, comparable string identity for this pin, persisted on the
@@ -4478,13 +4868,25 @@ impl ExpectedComponent {
             ComponentEcosystem::NuGet => "nuget",
             ComponentEcosystem::Conda => "conda",
             ComponentEcosystem::Maven => "maven",
+            ComponentEcosystem::Go => "go",
+            ComponentEcosystem::Composer => "composer",
+            ComponentEcosystem::Conan => "conan",
+            ComponentEcosystem::Debian => "debian",
+            ComponentEcosystem::Rpm => "rpm",
+            ComponentEcosystem::Alpine => "alpine",
         };
-        format!(
+        let identity = format!(
             "{}|{}|{}",
             eco,
             Self::normalize_name(self.ecosystem, &self.name),
             self.version.trim()
-        )
+        );
+        // An OS package grades differently per release, so the release is
+        // part of what the verdict is a function of.
+        match &self.os {
+            Some(os) => format!("{identity}|{}", os.release.label()),
+            None => identity,
+        }
     }
 }
 
@@ -7066,7 +7468,13 @@ impl DependencyScanner {
             ComponentEcosystem::NuGet => "NuGet",
             // `groupId:artifactId`, which is exactly OSV's Maven package name.
             ComponentEcosystem::Maven => "Maven",
-            ComponentEcosystem::Conda => return None,
+            ComponentEcosystem::Go => "Go",
+            ComponentEcosystem::Composer => "Packagist",
+            ComponentEcosystem::Conda
+            | ComponentEcosystem::Conan
+            | ComponentEcosystem::Debian
+            | ComponentEcosystem::Rpm
+            | ComponentEcosystem::Alpine => return None,
         };
         let name = pin.name.trim();
         let version = pin.version.trim();
@@ -15338,6 +15746,350 @@ mod tests {
             .expect("deps.json pin must exist in its own directory");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["libraries"]["Newtonsoft.Json/12.0.1"]["type"], "package");
+    }
+
+    /// #4952: a proxied Go module zip, Composer dist or Conan archive is
+    /// pinned as the requested coordinate through the one lockfile shape the
+    /// engine catalogs for that ecosystem (measured with the bundled grype
+    /// 0.120.1: `golang.org/x/text v0.3.0` 5 matches, `guzzlehttp/guzzle
+    /// 6.5.0` 14, `openssl/1.1.1k` 49; each 0 without the pin). The archive
+    /// is still unpacked into its own namespace and graded on its contents.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_go_composer_and_conan_pins_4952() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zip = Bytes::from(build_zip(&[(
+            "golang.org/x/text@v0.3.0/go.mod",
+            b"module golang.org/x/text\n".to_vec(),
+        )]));
+
+        let go = ExpectedComponent::coordinate_pin(
+            ComponentEcosystem::Go,
+            "golang.org/x/text",
+            "v0.3.0",
+        )
+        .expect("a module path is pinnable");
+        let ws = pinned_workspace(&tmp.path().join("go"), "v0.3.0.zip", &zip, &go).await;
+        let body = tokio::fs::read_to_string(ws.join(SCAN_PIN_SUBDIR).join(GO_MOD_NAME))
+            .await
+            .expect("go.mod pin");
+        assert!(
+            body.contains("\nrequire golang.org/x/text v0.3.0\n"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("module golang.org/x/text"),
+            "the pin is never the scanned module's own manifest: {body}"
+        );
+        assert!(ws
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("golang.org/x/text@v0.3.0/go.mod")
+            .exists());
+
+        let composer = ExpectedComponent::coordinate_pin(
+            ComponentEcosystem::Composer,
+            "guzzlehttp/guzzle",
+            "6.5.0",
+        )
+        .expect("vendor/package is pinnable");
+        let ws =
+            pinned_workspace(&tmp.path().join("composer"), "guzzle.zip", &zip, &composer).await;
+        let lock: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(ws.join(SCAN_PIN_SUBDIR).join(COMPOSER_LOCK_NAME))
+                .await
+                .expect("composer.lock pin"),
+        )
+        .unwrap();
+        assert_eq!(lock["packages"][0]["name"], "guzzlehttp/guzzle");
+        assert_eq!(lock["packages"][0]["version"], "6.5.0");
+
+        let conan =
+            ExpectedComponent::coordinate_pin(ComponentEcosystem::Conan, "openssl", "1.1.1k")
+                .expect("name/version is pinnable");
+        let tgz = Bytes::from(build_tar_gz(&[("conanfile.txt", b"[requires]\n".to_vec())]));
+        let ws =
+            pinned_workspace(&tmp.path().join("conan"), "conan_package.tgz", &tgz, &conan).await;
+        let lock: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(ws.join(SCAN_PIN_SUBDIR).join(CONAN_LOCK_NAME))
+                .await
+                .expect("conan.lock pin"),
+        )
+        .unwrap();
+        assert_eq!(lock["version"], "0.5");
+        assert_eq!(lock["requires"][0], "openssl/1.1.1k");
+        assert!(ws.join(SCAN_ARCHIVE_SUBDIR).join("conanfile.txt").exists());
+    }
+
+    /// #4952: a coordinate the pin file could not carry exactly is never
+    /// pinned (and the serve path then refuses to grade the bytes as it).
+    #[test]
+    fn test_coordinate_pin_refuses_what_it_cannot_write_4952() {
+        use ComponentEcosystem::*;
+        for (eco, name, version) in [
+            (Go, "example.com/m", "v1.0.0 // x"),
+            (Go, "example.com/m\nrequire evil", "v1.0.0"),
+            (Go, "example.com/../m", "v1.0.0"),
+            (Composer, "vendor/pkg\"", "1.0.0"),
+            (Conan, "zlib/extra", "1.2.11"),
+            (Conan, "", "1.2.11"),
+            (Npm, "lodash", "4.17.11"),
+            (Debian, "openssl", "3.0.11-1"),
+        ] {
+            assert!(
+                ExpectedComponent::coordinate_pin(eco, name, version).is_none(),
+                "{eco:?} {name:?} {version:?}"
+            );
+        }
+        let pin = ExpectedComponent::coordinate_pin(Go, " github.com/BurntSushi/toml ", "v1.2.0")
+            .unwrap();
+        assert_eq!(pin.name, "github.com/BurntSushi/toml");
+        assert_eq!(pin.os, None);
+    }
+
+    fn os_context(id: &str, version: &str, arch: &str, source: Option<&str>) -> OsPackageContext {
+        OsPackageContext {
+            release: OsRelease::new(id, version).expect("known release"),
+            arch: arch.to_string(),
+            source: source.map(str::to_string),
+        }
+    }
+
+    /// #4111: a lone `.deb` names no release, so the pin is written as a
+    /// synthetic installed system: `etc/os-release` and a one-stanza dpkg
+    /// status at the workspace root (measured with the bundled grype 0.120.1:
+    /// `openssl 3.0.11-1~deb12u1` on debian 12 matches 50 advisories, and 0
+    /// with the same status but no os-release). The `.deb` itself is staged
+    /// unextracted in the archive namespace.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_debian_inventory_4111() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from_static(b"!<arch>\n(deb body)");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libssl3",
+            "3.0.11-1~deb12u1",
+            os_context("debian", "12", "amd64", Some("openssl")),
+        )
+        .expect("a control coordinate is pinnable");
+        let ws = pinned_workspace(
+            &tmp.path().join("ws"),
+            "libssl3_3.0.11-1~deb12u1_amd64.deb",
+            &content,
+            &pin,
+        )
+        .await;
+        let os_release = tokio::fs::read_to_string(ws.join(OS_RELEASE_PATH))
+            .await
+            .expect("os-release");
+        assert!(os_release.contains("ID=debian\n"), "{os_release}");
+        assert!(os_release.contains("VERSION_ID=12\n"), "{os_release}");
+        let status = tokio::fs::read_to_string(ws.join(DPKG_STATUS_PATH))
+            .await
+            .expect("dpkg status");
+        assert_eq!(
+            status,
+            "Package: libssl3\nStatus: install ok installed\nArchitecture: amd64\n\
+             Source: openssl\nVersion: 3.0.11-1~deb12u1\n\n"
+        );
+        assert!(!ws.join(APK_INSTALLED_PATH).exists());
+        assert!(ws
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("libssl3_3.0.11-1~deb12u1_amd64.deb")
+            .exists());
+    }
+
+    /// #4112: the engine catalogs an `.rpm`'s own header, so the synthetic
+    /// part is only the release (measured: `openssl-libs 1:3.0.7-17.el9_2`
+    /// matches 76 advisories with `ID=rhel VERSION_ID=9`, 0 without it).
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_rpm_release_only_4112() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from_static(b"\xed\xab\xee\xdb(rpm body)");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "1:3.0.7-17.el9_2",
+            os_context("rhel", "9", "x86_64", None),
+        )
+        .unwrap();
+        let ws = pinned_workspace(
+            &tmp.path().join("ws"),
+            "openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+            &content,
+            &pin,
+        )
+        .await;
+        let os_release = tokio::fs::read_to_string(ws.join(OS_RELEASE_PATH))
+            .await
+            .unwrap();
+        assert!(
+            os_release.contains("ID=rhel\nVERSION_ID=9\n"),
+            "{os_release}"
+        );
+        assert!(!ws.join(DPKG_STATUS_PATH).exists());
+        assert!(!ws.join(APK_INSTALLED_PATH).exists());
+        assert!(ws
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("openssl-libs-3.0.7-17.el9_2.x86_64.rpm")
+            .exists());
+    }
+
+    /// #4113: the engine does not catalog a bare `.apk`, so the pin is an
+    /// `etc/os-release` plus a one-record `lib/apk/db/installed` (measured:
+    /// `busybox 1.36.1-r15` on alpine 3.19 matches 7 advisories, 0 without
+    /// the release; `libcrypto3` matches through its `o:openssl` origin).
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_alpine_inventory_4113() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from_static(b"\x1f\x8b(apk body)");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "libcrypto3",
+            "3.1.4-r0",
+            os_context("alpine", "3.19", "x86_64", Some("openssl")),
+        )
+        .unwrap();
+        let ws = pinned_workspace(
+            &tmp.path().join("ws"),
+            "libcrypto3-3.1.4-r0.apk",
+            &content,
+            &pin,
+        )
+        .await;
+        let os_release = tokio::fs::read_to_string(ws.join(OS_RELEASE_PATH))
+            .await
+            .unwrap();
+        assert!(
+            os_release.contains("ID=alpine\nVERSION_ID=3.19\n"),
+            "{os_release}"
+        );
+        let installed = tokio::fs::read_to_string(ws.join(APK_INSTALLED_PATH))
+            .await
+            .unwrap();
+        assert_eq!(
+            installed,
+            "P:libcrypto3\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n"
+        );
+        assert!(!ws.join(DPKG_STATUS_PATH).exists());
+    }
+
+    /// An OS package pin with no release would catalog the package and grade
+    /// nothing, so it is refused before anything is scanned.
+    #[tokio::test]
+    async fn test_os_pin_without_a_release_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws");
+        let pin = ExpectedComponent::new(ComponentEcosystem::Debian, "openssl", "3.0.11-1");
+        let artifact = test_helpers::make_test_artifact(
+            "openssl_3.0.11-1_amd64.deb",
+            "application/octet-stream",
+            "openssl_3.0.11-1_amd64.deb",
+        );
+        let err = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &Bytes::from_static(b"deb"),
+            Some(&pin),
+        )
+        .await
+        .expect_err("no release, no scan");
+        assert!(err.to_string().contains("no release"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            left.iter().all(|e| std::fs::read_dir(e.path())
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)),
+            "the workspace is removed"
+        );
+    }
+
+    #[test]
+    fn test_os_release_admits_only_graded_families() {
+        assert_eq!(OsRelease::new("debian", "12").unwrap().label(), "debian:12");
+        assert_eq!(
+            OsRelease::new("ubuntu", "22.04").unwrap().label(),
+            "ubuntu:22.04"
+        );
+        assert_eq!(
+            OsRelease::new("alpine", "edge").unwrap().label(),
+            "alpine:edge"
+        );
+        for (id, version) in [
+            ("debian", ""),
+            ("debian", "bookworm"),
+            ("debian", "edge"),
+            ("rhel", "9 x"),
+            ("rhel", "9\nID=x"),
+            ("gentoo", "1"),
+            ("alpine", "3..19"),
+        ] {
+            assert!(OsRelease::new(id, version).is_none(), "{id:?} {version:?}");
+        }
+        // Every field of an OS pin is checked, not only name and version.
+        let ctx = |arch: &str, source: Option<&str>| OsPackageContext {
+            release: OsRelease::new("debian", "12").unwrap(),
+            arch: arch.to_string(),
+            source: source.map(str::to_string),
+        };
+        assert!(ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "openssl",
+            "3.0.11-1",
+            ctx("amd64\nPackage: x", None)
+        )
+        .is_none());
+        assert!(ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "openssl",
+            "3.0.11-1",
+            ctx("amd64", Some("openssl (3.0.11-1)"))
+        )
+        .is_none());
+        assert!(ExpectedComponent::os_package(
+            ComponentEcosystem::Go,
+            "openssl",
+            "3.0.11-1",
+            ctx("amd64", None)
+        )
+        .is_none());
+    }
+
+    /// The catalog check for an OS package: the engine prints the epoch it
+    /// read from the header, a file name never carries one; everything else
+    /// must agree exactly. The release is part of the pin's identity.
+    #[test]
+    fn test_os_pin_catalog_match_and_identity() {
+        let ctx = || OsPackageContext {
+            release: OsRelease::new("rhel", "9").unwrap(),
+            arch: "x86_64".to_string(),
+            source: None,
+        };
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "3.0.7-17.el9_2",
+            ctx(),
+        )
+        .unwrap();
+        let cat = |name: &str, version: &str| CatalogedComponent {
+            name: name.to_string(),
+            version: version.to_string(),
+        };
+        assert!(pin.matches(&cat("openssl-libs", "1:3.0.7-17.el9_2")));
+        assert!(pin.matches(&cat("openssl-libs", "3.0.7-17.el9_2")));
+        assert!(!pin.matches(&cat("openssl-libs", "1:3.0.7-18.el9_2")));
+        assert!(!pin.matches(&cat("openssl", "1:3.0.7-17.el9_2")));
+        assert_eq!(pin.pin_identity(), "rpm|openssl-libs|3.0.7-17.el9_2|rhel:9");
+
+        // Go module paths are case-sensitive.
+        let go = ExpectedComponent::new(ComponentEcosystem::Go, "github.com/Foo/bar", "v1.0.0");
+        assert!(go.matches(&cat("github.com/Foo/bar", "v1.0.0")));
+        assert!(!go.matches(&cat("github.com/foo/bar", "v1.0.0")));
+        // An epoch is stripped only for the two formats that have one.
+        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "x", "1:2");
+        assert!(!npm.matches(&cat("x", "2")));
     }
 
     /// #3603 (#3604 defect 2, widened): the pin is trusted from the registry
