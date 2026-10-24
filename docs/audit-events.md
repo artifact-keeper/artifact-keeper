@@ -206,6 +206,27 @@ Each ingest also logs an `INFO` line on the `security` target
 (`external findings ingested`) with the artifact, scan, scanner, acting user,
 finding and malicious counts and the new score.
 
+### Proxy scan refusals
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `PROXY_SCAN_BLOCKED` | `repository` (the repository the pull was made through) | The scan-on-proxy gate refuses a proxied download with `403 scan_blocked` (#4777). Outcome `denied`. | `repository`, `repository_id`, `path` (the file the 403 names), `checksum_sha256`, `verdict`, `max_severity`, `findings_count`, `scanned_at` (of the verdict), `principal` (the username, `null` for an anonymous pull), `anonymous`, `attempts`, `aggregated`, `window_seconds`. |
+
+The row's `user_id` is the authenticated principal (`null` for an anonymous
+pull) and `ip_address` the verified client IP, as for `LOGIN_FAILED`. A client
+retrying a blocked pull would otherwise write one row per retry, so refusals
+are aggregated per (digest, principal, repository) over a 60 second window on
+each replica: the first refusal writes a row at once with `attempts: 1`, and
+the repeats inside the window write one summary row when it closes, with
+`attempts` set to their count and `aggregated: true`. A retry loop therefore
+writes at most two rows a minute per replica. An anonymous principal is keyed
+by its client IP. The row does not carry the API token id; the principal is
+the token's user.
+
+To answer "who asked for this blocked package", filter the audit log on
+`PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against
+`GET /api/v1/security/proxy-blocked`.
+
 ## Compatibility policy
 
 Within `schema_version: 1`:

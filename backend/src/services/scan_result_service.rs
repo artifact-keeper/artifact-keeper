@@ -354,6 +354,7 @@ pub(crate) fn build_dashboard_summary(
         critical_findings,
         high_findings,
         policy_violations_blocked: 0,
+        proxy_blocked: 0,
         repos_grade_a,
         repos_grade_f,
     }
@@ -2529,7 +2530,10 @@ impl ScanResultService {
             repos_grade_a,
             repos_grade_f,
         );
-        out.policy_violations_blocked = self.count_policy_violations_blocked().await?;
+        let hosted = self.count_hosted_rejected().await?;
+        let proxy = self.count_proxy_blocked().await?;
+        out.policy_violations_blocked = hosted + proxy;
+        out.proxy_blocked = proxy;
         Ok(out)
     }
 
@@ -2551,14 +2555,25 @@ impl ScanResultService {
     /// A verdict older than the scan TTL is not counted: the gate re-scans it
     /// on the next pull rather than trusting it.
     pub async fn count_policy_violations_blocked(&self) -> Result<i64> {
-        let hosted: i64 = sqlx::query_scalar(
+        Ok(self.count_hosted_rejected().await? + self.count_proxy_blocked().await?)
+    }
+
+    /// Hosted artifacts whose quarantine workflow ended `rejected`: the
+    /// hosted half of `policy_violations_blocked` (#4380).
+    async fn count_hosted_rejected(&self) -> Result<i64> {
+        sqlx::query_scalar(
             "SELECT COUNT(*) FROM artifacts \
              WHERE quarantine_status = 'rejected' AND NOT is_deleted",
         )
         .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
 
+    /// The dashboard's `proxy_blocked` (#4777): distinct proxied digests at
+    /// least one repository's proxy scan gate refuses right now, the same
+    /// set the cross-repository blocked listing pages through.
+    pub async fn count_proxy_blocked(&self) -> Result<i64> {
         let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
             r#"
             SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
@@ -2592,7 +2607,40 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(hosted + count_blocked_proxy_digests(&rows))
+        Ok(count_blocked_proxy_digests(&rows))
+    }
+
+    /// The CVE ids recorded for each of `digests` (#4777), most severe
+    /// first, at most `per_digest` each: one statement for a whole page.
+    pub async fn proxy_cve_ids(
+        &self,
+        digests: &[String],
+        per_digest: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if digests.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            r#"
+            SELECT checksum_sha256,
+                   (ARRAY_AGG(cve_id ORDER BY
+                        CASE lower(severity)
+                            WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                        cve_id))[1:$3::int] AS cve_ids
+              FROM (SELECT DISTINCT checksum_sha256, cve_id, severity
+                      FROM proxy_scan_findings
+                     WHERE checksum_sha256 = ANY($1) AND scan_type = $2) f
+             GROUP BY checksum_sha256
+            "#,
+        )
+        .bind(digests)
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(per_digest)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Every proxied path a repository's proxy scan gate currently refuses

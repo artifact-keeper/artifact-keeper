@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4777, #4288]
+---
+- **The security dashboard can now show what scan-on-proxy blocked, and who asked for it** (#4777). `GET /api/v1/security/dashboard` gains `proxy_blocked`, the distinct proxied digests a repository's proxy scan gate refuses right now (`policy_violations_blocked` keeps its meaning). `GET /api/v1/security/proxy-blocked` lists them across repositories with path, digest, severity counts and CVE ids, filterable by repository and minimum severity (instance administrators only). Every refused proxied pull now writes a `PROXY_SCAN_BLOCKED` audit entry with the principal, client IP, repository, path, digest and verdict, aggregated per digest and principal per minute so a CI job retrying a blocked pull writes at most two rows a minute per replica. The download gate's listing decision is also exposed as a batched, cached service call for generated indexes (#4288), which conda repodata generation will use. See docs/security/scan-on-proxy.md and docs/audit-events.md.

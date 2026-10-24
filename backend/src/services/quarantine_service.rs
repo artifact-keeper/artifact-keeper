@@ -947,6 +947,151 @@ fn policy_gate_result(allowed: bool) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Listing decision (#4288 item 1): which artifacts an index must not advertise
+// ---------------------------------------------------------------------------
+
+/// One artifact an index (conda repodata, and any other generated listing)
+/// is about to advertise, with the quarantine fields the listing query
+/// already selected.
+#[derive(Debug, Clone, Copy)]
+pub struct ListingCandidate<'a> {
+    pub artifact_id: Uuid,
+    pub quarantine_status: Option<&'a str>,
+    pub quarantine_until: Option<DateTime<Utc>>,
+}
+
+/// How long one artifact's scan-policy listing decision is reused.
+const LISTING_DECISION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long "does any enabled scan policy apply to this repository" is reused.
+const LISTING_POLICY_PRESENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Policy evaluations one listing runs at once.
+const LISTING_EVAL_CONCURRENCY: usize = 8;
+
+fn listing_decision_cache() -> &'static moka::future::Cache<(Uuid, Uuid), bool> {
+    static CACHE: OnceLock<moka::future::Cache<(Uuid, Uuid), bool>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(200_000)
+            .time_to_live(LISTING_DECISION_TTL)
+            .build()
+    })
+}
+
+fn listing_policy_presence_cache() -> &'static moka::future::Cache<Uuid, bool> {
+    static CACHE: OnceLock<moka::future::Cache<Uuid, bool>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(LISTING_POLICY_PRESENCE_TTL)
+            .build()
+    })
+}
+
+/// Drop the cached listing decisions of every repository, after a change that
+/// can move them (a scan policy write, a scan completing). The TTLs bound the
+/// staleness for changes made elsewhere.
+pub fn invalidate_listing_decisions() {
+    listing_decision_cache().invalidate_all();
+    listing_policy_presence_cache().invalidate_all();
+}
+
+/// The artifacts of `candidates` that the download gate would refuse, so a
+/// generated index (conda `repodata.json` and its `removed` list) does not
+/// advertise a package whose download then answers 403 or 409 (#4288 item 1).
+///
+/// The same two halves as [`enforce_download_gate`], in the same order:
+///
+/// * quarantine, decided in process from the fields the listing query already
+///   holds (no statement);
+/// * scan policy, only when an enabled policy applies to `repository_id` at
+///   all (one cached statement per repository, [`LISTING_POLICY_PRESENCE_TTL`]),
+///   then `PolicyService::evaluate_artifact` per candidate, the function the
+///   gate itself calls, with a bounded number in flight and each decision
+///   cached for [`LISTING_DECISION_TTL`].
+///
+/// So a repository without a scan policy (the common case) costs one cached
+/// lookup per listing, and a repository with one costs one evaluation per
+/// artifact per minute however often its index is generated. A listing that
+/// is up to a minute behind a policy change only mis-lists; the download gate
+/// stays authoritative. An evaluation that fails is treated as a refusal
+/// (the package is left out of the listing), matching the fail-closed gate.
+pub async fn listing_refusals(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+) -> Result<std::collections::HashSet<Uuid>> {
+    use futures::StreamExt;
+    let now = Utc::now();
+    let mut refused = std::collections::HashSet::new();
+    let mut to_evaluate = Vec::new();
+    for c in candidates {
+        if check_download_allowed(c.quarantine_status, c.quarantine_until, now).is_err() {
+            refused.insert(c.artifact_id);
+        } else {
+            to_evaluate.push(c.artifact_id);
+        }
+    }
+    if to_evaluate.is_empty() {
+        return Ok(refused);
+    }
+
+    let presence = listing_policy_presence_cache();
+    let policy_applies = match presence.get(&repository_id).await {
+        Some(v) => v,
+        None => {
+            let v: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM scan_policies \
+                  WHERE is_enabled AND (repository_id = $1 OR repository_id IS NULL))",
+            )
+            .bind(repository_id)
+            .fetch_one(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            presence.insert(repository_id, v).await;
+            v
+        }
+    };
+    if !policy_applies {
+        return Ok(refused);
+    }
+
+    let decisions = listing_decision_cache();
+    let policy = crate::services::policy_service::PolicyService::new(db.clone());
+    let outcomes: Vec<(Uuid, bool)> = futures::stream::iter(to_evaluate)
+        .map(|artifact_id| {
+            let policy = &policy;
+            async move {
+                if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
+                    return (artifact_id, blocked);
+                }
+                let blocked = match policy.evaluate_artifact(artifact_id, repository_id).await {
+                    Ok(result) => !result.allowed,
+                    Err(e) => {
+                        tracing::warn!(
+                            artifact_id = %artifact_id, error = %e,
+                            "scan policy evaluation failed for a listing; leaving the package out"
+                        );
+                        return (artifact_id, true);
+                    }
+                };
+                decisions
+                    .insert((repository_id, artifact_id), blocked)
+                    .await;
+                (artifact_id, blocked)
+            }
+        })
+        .buffer_unordered(LISTING_EVAL_CONCURRENCY)
+        .collect()
+        .await;
+    refused.extend(
+        outcomes
+            .into_iter()
+            .filter_map(|(id, blocked)| blocked.then_some(id)),
+    );
+    Ok(refused)
+}
+
 /// Validate that a quarantine duration is at least 1 minute.
 pub fn validate_duration(minutes: i64) -> i64 {
     minutes.max(1)
@@ -2080,5 +2225,114 @@ mod hold_source_4510_tests {
             "scan_policy, admin, unrecorded-but-policy-refused, upload"
         );
         assert_eq!(status_of(&by_row), "403");
+    }
+}
+
+/// #4288 item 1: the batched listing decision G5's `build_repodata` filter
+/// calls, so repodata stops advertising a package a scan policy refuses.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod listing_refusals_4288_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers::{seed_artifact, Fixture};
+
+    async fn seed(fx: &Fixture, path: &str) -> Uuid {
+        seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            path,
+            path,
+            "pkg",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from(path.to_string()),
+            fx.user_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn listing_refuses_what_the_download_gate_refuses() {
+        let Some(fx) = Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let clean = seed(&fx, "linux-64/clean-1.0-0.conda").await;
+        let unscanned = seed(&fx, "linux-64/unscanned-1.0-0.conda").await;
+        let held = seed(&fx, "linux-64/held-1.0-0.conda").await;
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(clean)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("scan clean");
+        let candidates = |held_status: Option<&'static str>| {
+            vec![
+                ListingCandidate {
+                    artifact_id: clean,
+                    quarantine_status: None,
+                    quarantine_until: None,
+                },
+                ListingCandidate {
+                    artifact_id: unscanned,
+                    quarantine_status: None,
+                    quarantine_until: None,
+                },
+                ListingCandidate {
+                    artifact_id: held,
+                    quarantine_status: held_status,
+                    quarantine_until: None,
+                },
+            ]
+        };
+        invalidate_listing_decisions();
+        let no_policy = listing_refusals(&fx.pool, fx.repo_id, &candidates(Some("quarantined")))
+            .await
+            .expect("no policy");
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("listing-4288-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("policy");
+        invalidate_listing_decisions();
+        let with_policy = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("with policy");
+        // Cached: removing the policy does not move the decision until the
+        // caches are invalidated (or expire).
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("cached");
+        invalidate_listing_decisions();
+        let after = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("after");
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(no_policy, [held].into_iter().collect(), "quarantine only");
+        assert_eq!(
+            with_policy,
+            [unscanned, held].into_iter().collect(),
+            "block_unscanned refuses the unscanned and the (unscanned) held package"
+        );
+        assert_eq!(cached, with_policy);
+        assert!(after.is_empty(), "no policy, no hold: everything listed");
     }
 }

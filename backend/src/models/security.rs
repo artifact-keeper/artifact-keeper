@@ -734,6 +734,9 @@ pub struct DashboardSummary {
     pub critical_findings: i64,
     pub high_findings: i64,
     pub policy_violations_blocked: i64,
+    /// Distinct proxied digests a repository's proxy scan gate refuses right
+    /// now (#4777): the proxy half of `policy_violations_blocked`, on its own.
+    pub proxy_blocked: i64,
     pub repos_grade_a: i64,
     pub repos_grade_f: i64,
 }

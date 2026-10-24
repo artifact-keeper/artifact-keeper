@@ -9675,6 +9675,19 @@ pub(crate) async fn gate_proxy_scan_serve(
     )
     .await;
     record_proxy_scan_outcome(&outcome);
+    // #4777: a refused pull (403 scan_blocked) leaves an audit trail with
+    // who asked, from where, and for which digest; aggregated per minute.
+    if matches!(&outcome, ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN)
+    {
+        crate::services::audit_service::record_proxy_scan_blocked(
+            &state.db,
+            crate::services::audit_service::ProxyScanBlockEvent {
+                repository_id: repo_id,
+                path: filename.to_string(),
+                checksum_sha256: digest.to_string(),
+            },
+        );
+    }
     outcome
 }
 
@@ -10877,6 +10890,102 @@ mod scanned_proxy_file_tests {
         assert_eq!(file.after_fetch.load(Ordering::SeqCst), 1);
         assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
         fx.teardown().await;
+    }
+
+    /// #4777: a refused pull leaves one `PROXY_SCAN_BLOCKED` audit row naming
+    /// the principal, repository, path and digest; a retry burst inside the
+    /// aggregation window adds no further row (its count goes into the
+    /// window's summary row a minute later).
+    #[tokio::test]
+    async fn blocked_pull_is_audited_once_per_window_4777() {
+        let bytes = format!("fake-4777-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-4777-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let username = fx.username.clone();
+        let statuses =
+            crate::api::middleware::request_span::with_request_span(tracing::Span::none(), async {
+                crate::api::middleware::request_span::record_user(&username);
+                let mut out = Vec::new();
+                for _ in 0..5 {
+                    let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+                        .await
+                        .unwrap_err();
+                    out.push(resp.status());
+                }
+                out
+            })
+            .await;
+        let rows_for = |pool: PgPool, digest: String, repo: Uuid| async move {
+            sqlx::query_as::<_, (Option<Uuid>, serde_json::Value)>(
+                "SELECT user_id, details FROM audit_log \
+                  WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1 \
+                    AND details->>'checksum_sha256' = $2",
+            )
+            .bind(repo)
+            .bind(digest)
+            .fetch_all(&pool)
+            .await
+            .expect("audit rows")
+        };
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = rows_for(fx.pool.clone(), digest.clone(), fx.repo_id).await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Give a (wrong) second write the same chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let settled = rows_for(fx.pool.clone(), digest.clone(), fx.repo_id).await;
+        let _ = sqlx::query(
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await;
+        let user_id = fx.user_id;
+        let repo_key = fx.repo_key.clone();
+        fx.teardown().await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::FORBIDDEN),
+            "{statuses:?}"
+        );
+        assert_eq!(settled.len(), 1, "one row for the burst, got {settled:?}");
+        let (row_user, details) = &settled[0];
+        assert_eq!(*row_user, Some(user_id));
+        assert_eq!(details["principal"], serde_json::json!(username));
+        assert_eq!(details["repository"], serde_json::json!(repo_key));
+        assert_eq!(details["path"], "pkg-1.0.fake");
+        assert_eq!(details["verdict"], "vulnerable");
+        assert_eq!(details["max_severity"], "critical");
+        assert_eq!(details["attempts"], 1);
+        assert_eq!(details["aggregated"], false);
+        assert_eq!(rows.len(), 1);
     }
 
     /// A cached vulnerable verdict for the content digest blocks with the

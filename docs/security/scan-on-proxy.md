@@ -184,6 +184,32 @@ read, the pull fails with a retryable `503` on every enforced format's Remote
 arm, every Virtual walk and the generic download route. It is never treated
 as "scanning off" (#4365).
 
+## Seeing what was blocked
+
+- `GET /api/v1/security/dashboard` returns `proxy_blocked`: the distinct
+  proxied digests that a repository's proxy scan gate refuses right now.
+  `policy_violations_blocked` keeps its meaning (hosted rejections plus these).
+- `GET /api/v1/security/proxy-blocked` lists them across repositories:
+  repository, cached path, digest, highest severity and counts, CVE ids (most
+  severe first, at most 20), and when the verdict was recorded. Query:
+  `repository`, `min_severity`, `page`, `per_page`. Instance administrators
+  with an unrestricted credential only. An item is listed only where that
+  repository's own settings refuse it: a record-only repository, or one whose
+  threshold is above the verdict, does not list content it serves. Like the
+  gate, a verdict older than the 30-day window is not listed (the next pull
+  scans the bytes again).
+- `GET /api/v1/admin/holds/policy-blocks` shows the same proxied content next
+  to the hosted artifacts a scan policy refuses (see
+  [download holds](download-holds.md)).
+- Each refused pull writes a `PROXY_SCAN_BLOCKED` audit entry with the
+  principal, client IP, repository, path, digest and verdict, aggregated per
+  digest and principal per minute; see
+  [audit events](../audit-events.md#proxy-scan-refusals).
+
+Refusals answered outside the shared gate are not audited yet: a conda
+attestation sidecar of a blocked package, the NuGet digest-pinned row repair
+path, and OCI image pulls.
+
 ## Actions
 
 | `proxy_scan_action` | First pull of unknown bytes | Vulnerable | Inconclusive (over the byte cap, scan error, timeout, identity mismatch) |

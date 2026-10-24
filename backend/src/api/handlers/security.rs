@@ -51,6 +51,8 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Dashboard
         .route("/dashboard", get(get_dashboard))
+        // Cross-repository proxy-blocked content (#4777)
+        .route("/proxy-blocked", get(list_proxy_blocked))
         // Scores
         .route("/scores", get(get_all_scores))
         // Scan configs
@@ -101,6 +103,11 @@ pub struct DashboardResponse {
     pub critical_findings: i64,
     pub high_findings: i64,
     pub policy_violations_blocked: i64,
+    /// Distinct proxied digests that a repository's proxy scan gate refuses
+    /// right now (#4777). Also counted in `policy_violations_blocked`, which
+    /// keeps its meaning (hosted rejections plus these). The rows behind it
+    /// are `GET /api/v1/security/proxy-blocked`.
+    pub proxy_blocked: i64,
     pub repos_grade_a: i64,
     pub repos_grade_f: i64,
 }
@@ -876,8 +883,155 @@ async fn get_dashboard(
         critical_findings: summary.critical_findings,
         high_findings: summary.high_findings,
         policy_violations_blocked: summary.policy_violations_blocked,
+        proxy_blocked: summary.proxy_blocked,
         repos_grade_a: summary.repos_grade_a,
         repos_grade_f: summary.repos_grade_f,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-repository proxy-blocked content (#4777)
+// ---------------------------------------------------------------------------
+
+/// Most CVE ids returned per blocked item.
+const PROXY_BLOCKED_MAX_CVES: i64 = 20;
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct ProxyBlockedQuery {
+    /// Only this repository (key).
+    pub repository: Option<String>,
+    /// Only items whose highest severity is at least this
+    /// (`critical`, `high`, `medium`, `low`, `info`). An item whose verdict
+    /// recorded no severity is kept: the gate blocks it under every policy.
+    pub min_severity: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyBlockedItem {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    pub repository_format: String,
+    /// Cached logical path; `sha256:<digest>` for an OCI image manifest.
+    pub path: String,
+    /// The file name the path ends in.
+    pub name: String,
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    /// The recorded CVE ids, most severe first, at most 20. Empty for a
+    /// verdict recorded before per-CVE detail existed.
+    pub cve_ids: Vec<String>,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyBlockedResponse {
+    pub items: Vec<ProxyBlockedItem>,
+    pub pagination: crate::api::dto::Pagination,
+}
+
+/// Whether an item with this stored severity passes a `min_severity` filter.
+fn meets_min_severity(
+    max_severity: Option<&str>,
+    min: Option<crate::models::security::Severity>,
+) -> bool {
+    use crate::models::security::Severity;
+    match (min, max_severity.and_then(Severity::from_str_loose)) {
+        (None, _) => true,
+        // Ungraded: blocked under every gate, so never filtered away.
+        (Some(_), None) => true,
+        (Some(min), Some(s)) => s.meets_threshold(min),
+    }
+}
+
+/// Every proxied path a repository's proxy scan gate refuses right now,
+/// across repositories (#4777): the rows behind the dashboard's
+/// `proxy_blocked`. Who requested them is in the audit log
+/// (`PROXY_SCAN_BLOCKED`, keyed by repository and `checksum_sha256`).
+#[utoipa::path(
+    get,
+    path = "/proxy-blocked",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(ProxyBlockedQuery),
+    responses(
+        (status = 200, description = "Proxied content currently blocked by a scan gate", body = ProxyBlockedResponse),
+        (status = 400, description = "Invalid min_severity", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges (unrestricted credential) required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_proxy_blocked(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ProxyBlockedQuery>,
+) -> Result<Json<ProxyBlockedResponse>> {
+    // Every repository's blocked content: an instance administrator with an
+    // unrestricted credential, like the admin hold queues.
+    auth.require_unscoped_admin("the cross-repository proxy-blocked list")?;
+    let min = match query.min_severity.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(
+            crate::models::security::Severity::from_str_loose(raw).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "invalid min_severity '{raw}'; allowed values are critical, high, medium, low, info"
+                ))
+            })?,
+        ),
+    };
+    let (page, per_page, offset) =
+        crate::api::dto::Pagination::clamp_offset(query.page, query.per_page);
+    let svc = ScanResultService::new(state.db.clone());
+    let entries: Vec<_> = svc
+        .list_blocked_proxy_entries(query.repository.as_deref())
+        .await?
+        .into_iter()
+        .filter(|e| meets_min_severity(e.max_severity.as_deref(), min))
+        .collect();
+    let total = entries.len() as i64;
+    let page_entries: Vec<_> = entries
+        .into_iter()
+        .skip(offset.max(0) as usize)
+        .take(per_page as usize)
+        .collect();
+    let digests: Vec<String> = page_entries
+        .iter()
+        .map(|e| e.checksum_sha256.clone())
+        .collect();
+    let cves = svc.proxy_cve_ids(&digests, PROXY_BLOCKED_MAX_CVES).await?;
+    let items = page_entries
+        .into_iter()
+        .map(|e| ProxyBlockedItem {
+            name: e
+                .path
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&e.path)
+                .to_string(),
+            cve_ids: cves.get(&e.checksum_sha256).cloned().unwrap_or_default(),
+            repository_id: e.repository_id,
+            repository_key: e.repository_key,
+            repository_format: e.repository_format,
+            path: e.path,
+            checksum_sha256: e.checksum_sha256,
+            max_severity: e.max_severity,
+            findings_count: e.findings_count,
+            critical_count: e.critical_count,
+            high_count: e.high_count,
+            medium_count: e.medium_count,
+            low_count: e.low_count,
+            scanned_at: e.scanned_at,
+        })
+        .collect();
+    Ok(Json(ProxyBlockedResponse {
+        items,
+        pagination: crate::api::dto::Pagination::for_page(page, per_page, total),
     }))
 }
 
@@ -1754,6 +1908,8 @@ async fn create_policy(
             body.predicates,
         )
         .await?;
+    // #4288: generated listings stop (or resume) advertising what it decides.
+    crate::services::quarantine_service::invalidate_listing_decisions();
 
     Ok(Json(PolicyResponse::from(p)))
 }
@@ -1822,6 +1978,8 @@ async fn update_policy(
             body.predicates,
         )
         .await?;
+    // #4288: generated listings stop (or resume) advertising what it decides.
+    crate::services::quarantine_service::invalidate_listing_decisions();
 
     Ok(Json(PolicyResponse::from(p)))
 }
@@ -1848,6 +2006,7 @@ async fn delete_policy(
     auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     svc.delete_policy(id).await?;
+    crate::services::quarantine_service::invalidate_listing_decisions();
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -3196,9 +3355,13 @@ async fn rescan_proxy_cached_path(
         list_repo_scans,
         get_repo_proxy_scans,
         rescan_proxy_cached_path,
+        list_proxy_blocked,
     ),
     components(schemas(
         DashboardResponse,
+        ProxyBlockedQuery,
+        ProxyBlockedItem,
+        ProxyBlockedResponse,
         ScoreResponse,
         TriggerScanRequest,
         TriggerScanResponse,
@@ -5410,6 +5573,118 @@ mod tests {
         );
     }
 
+    /// #4777: the cross-repository proxy-blocked list names what each
+    /// repository's gate refuses, with its CVE ids most severe first; the
+    /// severity filter and the admin gate apply; the dashboard counts it in
+    /// `proxy_blocked` (and still in `policy_violations_blocked`).
+    #[tokio::test]
+    async fn proxy_blocked_list_and_dashboard_count_4777_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy, \
+                                       block_on_policy_violation, severity_threshold, \
+                                       proxy_scan_action) \
+             VALUES ($1, true, false, true, false, 'high', 'fail_open')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("scan config");
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+                                                size_bytes, checksum_sha256) \
+             VALUES ($1, 'evil/-/evil-1.0.0.tgz', 'k', 'm', 8, $2)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("cache row");
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             high_count, medium_count, max_severity) \
+             VALUES ($1, 'grype', 'vulnerable', 2, 1, 1, 'high')",
+        )
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("verdict");
+        for (cve, sev) in [("CVE-2026-0002", "medium"), ("CVE-2026-0001", "high")] {
+            sqlx::query(
+                "INSERT INTO proxy_scan_findings (checksum_sha256, scan_type, cve_id, severity) \
+                 VALUES ($1, 'grype', $2, $3)",
+            )
+            .bind(&digest)
+            .bind(cve)
+            .bind(sev)
+            .execute(&pool)
+            .await
+            .expect("finding");
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let list = |auth: AuthExtension, min: Option<&str>| {
+            let state = state.clone();
+            let key = key.clone();
+            let min = min.map(str::to_string);
+            async move {
+                list_proxy_blocked(
+                    State(state),
+                    Extension(auth),
+                    Query(ProxyBlockedQuery {
+                        repository: Some(key),
+                        min_severity: min,
+                        page: None,
+                        per_page: None,
+                    }),
+                )
+                .await
+            }
+        };
+        let all = list(admin.clone(), None).await.expect("list").0;
+        let critical_only = list(admin.clone(), Some("critical")).await.expect("crit").0;
+        let bad = list(admin.clone(), Some("severe")).await;
+        let non_admin = list(tdh::make_auth(user_id, &username), None).await;
+        let dashboard = get_dashboard(State(state.clone()), Extension(admin.clone()))
+            .await
+            .expect("dashboard")
+            .0;
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(all.pagination.total, 1);
+        let item = &all.items[0];
+        assert_eq!(item.repository_key, key);
+        assert_eq!(item.path, "evil/-/evil-1.0.0.tgz");
+        assert_eq!(item.name, "evil-1.0.0.tgz");
+        assert_eq!(item.checksum_sha256, digest);
+        assert_eq!(item.max_severity.as_deref(), Some("high"));
+        assert_eq!(item.cve_ids, vec!["CVE-2026-0001", "CVE-2026-0002"]);
+        assert!(
+            critical_only.items.is_empty(),
+            "a high verdict is below critical"
+        );
+        assert!(matches!(bad, Err(AppError::Validation(_))));
+        assert!(matches!(non_admin, Err(AppError::Authorization(_))));
+        assert!(dashboard.proxy_blocked >= 1);
+        assert!(dashboard.policy_violations_blocked >= dashboard.proxy_blocked);
+    }
+
     /// #4363: an instance administrator's write locks the repository's proxy
     /// scan policy. While locked, a repository administrator can tighten it
     /// but every weakening (record_only, fail_closed -> fail_open, scan off,
@@ -6369,6 +6644,7 @@ mod tests {
             critical_findings: 5,
             high_findings: 15,
             policy_violations_blocked: 3,
+            proxy_blocked: 0,
             repos_grade_a: 6,
             repos_grade_f: 1,
         };
@@ -6391,6 +6667,7 @@ mod tests {
             critical_findings: 0,
             high_findings: 0,
             policy_violations_blocked: 0,
+            proxy_blocked: 0,
             repos_grade_a: 0,
             repos_grade_f: 0,
         };
@@ -7152,6 +7429,7 @@ mod tests {
             critical_findings: 1,
             high_findings: 3,
             policy_violations_blocked: 0,
+            proxy_blocked: 0,
             repos_grade_a: 4,
             repos_grade_f: 0,
         };
