@@ -324,10 +324,12 @@ pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
     "conan",        // #4108
     "conda",        // #4585
     "conda_native", // #4585 (the same conda route)
+    "debian",       // #4111
     "go",           // #4103
     "maven",        // #4100 (also serves gradle)
     "nuget",        // #4102 (also serves chocolatey and powershell)
     "pub",          // #4107
+    "rpm",          // #4112
     "rubygems",     // #4104
     "sbt",          // #4100
     "swift",        // #4110

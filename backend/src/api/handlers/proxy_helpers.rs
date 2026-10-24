@@ -24040,6 +24040,60 @@ mod proxy_download_recording_tests {
                 "serve_scanned_proxy_file(",
                 1,
             ),
+            // #4111: Debian packages on the pool, `dists/` and flat routes,
+            // Remote and Virtual.
+            (
+                "debian.rs",
+                "pool_download",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "dists_proxy_catchall",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            ("debian.rs", "flat_remote", "serve_scanned_deb_download(", 1),
+            (
+                "debian.rs",
+                "flat_virtual",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "serve_scanned_deb_download",
+                "serve_scanned_deb(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "serve_scanned_deb",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4112: RPM packages on the `/packages/` route and the
+            // catch-all, Remote and Virtual.
+            (
+                "rpm.rs",
+                "download_package",
+                "serve_scanned_rpm_download(",
+                1,
+            ),
+            ("rpm.rs", "upstream_proxy", "serve_scanned_rpm_download(", 2),
+            (
+                "rpm.rs",
+                "serve_scanned_rpm_download",
+                "serve_scanned_rpm(",
+                1,
+            ),
+            (
+                "rpm.rs",
+                "serve_scanned_rpm",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
         ];
         // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
         // from its first `{`).

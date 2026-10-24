@@ -252,6 +252,8 @@ mod tests {
             "conan",
             "cocoapods",
             "swift",
+            "debian",
+            "rpm",
         ] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
@@ -259,7 +261,7 @@ mod tests {
                 "{key} gates its proxied downloads"
             );
         }
-        for key in ["helm", "generic", "rpm"] {
+        for key in ["helm", "generic", "cran"] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
                 Accepted,
