@@ -318,16 +318,19 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// archives and Swift source archives (#4109, #4110) are graded on their
 /// contents: the bundled scanner has no advisory data for either ecosystem.
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "alpine",       // #4113
     "cargo",        // #4101
     "cocoapods",    // #4109
     "composer",     // #4105
     "conan",        // #4108
     "conda",        // #4585
     "conda_native", // #4585 (the same conda route)
+    "debian",       // #4111
     "go",           // #4103
     "maven",        // #4100 (also serves gradle)
     "nuget",        // #4102 (also serves chocolatey and powershell)
     "pub",          // #4107
+    "rpm",          // #4112
     "rubygems",     // #4104
     "sbt",          // #4100
     "swift",        // #4110

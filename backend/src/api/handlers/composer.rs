@@ -1578,8 +1578,9 @@ impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ComposerDist<'_> 
 /// directory a VCS zipball wraps it in, must name the requested package, and
 /// a `version` it declares (most do not) must be the requested one. A
 /// nested `composer.json` (a vendored or test fixture package) is never
-/// consulted. The scanner has no Composer pin, so an archive that agrees is
-/// graded on its contents (a bundled `composer.lock`, a vendored package).
+/// consulted. An archive that agrees is pinned as the requested package and
+/// version (#4952), so the scanner grades that version itself as well as a
+/// bundled `composer.lock` or a vendored package.
 fn composer_dist_identity(
     full_name: &str,
     version: &str,
@@ -1623,7 +1624,11 @@ fn composer_dist_identity(
         Some(declared) if bare(declared) != bare(version) => {
             ArchiveIdentity::Disagrees(format!("composer.json declares version {declared}"))
         }
-        _ => ArchiveIdentity::ContentGraded,
+        _ => ArchiveIdentity::coordinate_pinned(
+            crate::services::scanner_service::ComponentEcosystem::Composer,
+            full_name,
+            version,
+        ),
     }
 }
 
@@ -5061,18 +5066,18 @@ mod scan_on_proxy_4105 {
     }
 
     #[test]
-    fn a_dist_that_names_the_requested_package_is_graded_on_its_contents() {
+    fn a_dist_that_names_the_requested_package_is_pinned_as_it() {
+        let pinned =
+            ArchiveIdentity::Pinned(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Composer,
+                NAME,
+                "1.0.0",
+            ));
         let wrapped = Bytes::from(zipball(NAME, None));
-        assert_eq!(
-            composer_dist_identity(NAME, "1.0.0", &wrapped),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(composer_dist_identity(NAME, "1.0.0", &wrapped), pinned);
         // Names compare ignoring case; a declared version may carry a `v`.
         let declared = Bytes::from(zipball("DTF/Scanned", Some("v1.0.0")));
-        assert_eq!(
-            composer_dist_identity(NAME, "1.0.0", &declared),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(composer_dist_identity(NAME, "1.0.0", &declared), pinned);
         // `composer archive` output: the manifest at the root, and a nested
         // fixture package that is never consulted.
         let root = Bytes::from(zip_of(&[
@@ -5082,10 +5087,12 @@ mod scan_on_proxy_4105 {
                 "{\"name\":\"other/pkg\"}".to_string(),
             ),
         ]));
-        assert_eq!(
-            composer_dist_identity(NAME, "1.0.0", &root),
-            ArchiveIdentity::ContentGraded
-        );
+        assert_eq!(composer_dist_identity(NAME, "1.0.0", &root), pinned);
+        // A coordinate a pin cannot carry exactly is not graded as anything.
+        assert!(matches!(
+            composer_dist_identity("dtf/a b", "1.0.0", &Bytes::from(zipball("dtf/a b", None))),
+            ArchiveIdentity::Unreadable(_)
+        ));
     }
 
     #[test]

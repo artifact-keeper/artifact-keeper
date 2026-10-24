@@ -1165,6 +1165,13 @@ async fn download_package(
     }
 
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
+    // #4365 item 3: on a proxying repository the branch, repository, arch and
+    // file name are the upstream path and the proxy-cache key, so an
+    // ambiguous one is a 400 before anything is fetched, scanned or not.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&branch, &repository, &arch, &filename],
+    )?;
 
     let artifact_path = build_alpine_artifact_path(&branch, &repository, &arch, &filename);
 
@@ -1188,6 +1195,19 @@ async fn download_package(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4113: scan-on-proxy, Remote and Virtual. `None` when nothing
+            // scans: the paths below are untouched.
+            if let Some(served) = serve_scanned_apk_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                (&branch, &repository, &arch, &filename),
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let Some(response) = try_proxy_apk(
                     &state,
@@ -1305,6 +1325,18 @@ async fn download_package(
                 e,
             );
             if repo.repo_type == RepositoryType::Remote {
+                // #4113: the re-fetch from upstream goes through the gate too.
+                if let Some(served) = serve_scanned_apk_download(
+                    &state,
+                    auth.as_ref(),
+                    &repo,
+                    (&branch, &repository, &arch, &filename),
+                    &ctx,
+                )
+                .await?
+                {
+                    return served;
+                }
                 if let Some(response) = try_proxy_apk(
                     &state,
                     &repo,
@@ -1327,6 +1359,167 @@ async fn download_package(
                 .into_response())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy (#4113)
+// ---------------------------------------------------------------------------
+
+const APK_CONTENT_TYPE: &str = "application/vnd.alpine.package";
+
+/// The `(cache_key, scannable)` decision for an Alpine package path (#4365
+/// item 1): every `.apk` on the package route is a package.
+fn apk_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(upstream_path)
+}
+
+/// The Alpine half of the generic gate (#4113): an `.apk` must be the
+/// `{pkgname}-{pkgver}.apk` its file name names, built for the requested
+/// architecture (or `noarch`), and is graded as that package of the release
+/// the requested branch names.
+struct ApkPackage<'a> {
+    arch: &'a str,
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ApkPackage<'_> {
+    const LABEL: &'static str = "alpine package";
+    const CONTENT_TYPE: &'static str = APK_CONTENT_TYPE;
+
+    fn requested(&self) -> String {
+        format!("the package file name's name and version for {}", self.arch)
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        apk_identity(filename, self.arch, bytes, self.release.clone())
+    }
+}
+
+/// What a proxied `.apk` says about itself (#4113): its own `.PKGINFO` must
+/// name exactly the requested `{pkgname}-{pkgver}.apk`, for the requested
+/// architecture or `noarch`. It is then pinned as that package of `release`
+/// (from the branch), with its `origin` as the source package.
+fn apk_identity(
+    filename: &str,
+    arch: &str,
+    bytes: &Bytes,
+    release: Option<crate::services::scanner_service::OsRelease>,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        os_package_identity, read_apk_pkginfo, ArchiveIdentity,
+    };
+    let info = match read_apk_pkginfo(bytes) {
+        Ok(info) => info,
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    if format!("{}-{}.apk", info.pkgname, info.pkgver) != filename
+        || (info.arch != arch && info.arch != "noarch")
+    {
+        return ArchiveIdentity::Disagrees(format!(
+            ".PKGINFO declares {}-{} for {}",
+            info.pkgname, info.pkgver, info.arch
+        ));
+    }
+    os_package_identity(
+        crate::services::scanner_service::ComponentEcosystem::Alpine,
+        &info.pkgname,
+        &info.pkgver,
+        &info.arch,
+        info.origin,
+        release,
+    )
+}
+
+/// Inline scan-and-block for one Alpine package from one Remote repository
+/// (#4113).
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_apk(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    cache_key: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    kind: ApkPackage<'_>,
+    disposition: Option<&str>,
+) -> Result<Response, Response> {
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Alpine,
+        source_path: cache_key,
+        cache_path: cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind,
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of an Alpine package download, Remote and Virtual
+/// (#4113): `Ok(None)` when nothing scans, so the caller keeps its untouched
+/// streaming path.
+async fn serve_scanned_apk_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    (branch, repository, arch, filename): (&str, &str, &str, &str),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let upstream_path = build_alpine_artifact_path(branch, repository, arch, filename);
+    let serve_key = apk_serve_key(&upstream_path);
+    if !serve_key.scannable {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let cache_key = serve_key.cache_key.as_str();
+    let route = ScannedRoute {
+        upstream_path: cache_key,
+        lookup: LocalLookup::ExactPath(&upstream_path),
+        default_content_type: APK_CONTENT_TYPE,
+        virtual_disposition: None,
+    };
+    let release = crate::api::handlers::proxy_scan_archive::alpine_release_from_branch(branch);
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream), policy, disposition| {
+            let release = release.clone();
+            async move {
+                serve_scanned_apk(
+                    state,
+                    proxy,
+                    (id, &key, &upstream),
+                    cache_key,
+                    policy,
+                    ctx,
+                    ApkPackage { arch, release },
+                    disposition.as_deref(),
+                )
+                .await
+            }
+        },
+    )
+    .await
 }
 
 /// Attempt to proxy-fetch an APK package from the upstream remote repository.
@@ -3846,5 +4039,148 @@ mod catalog_registration_tests {
         let row = row.expect("an alpine publish must write a packages row (#3659)");
         assert_eq!(row.version, "1.0-r0");
         assert_eq!(row.versions, vec!["1.0-r0".to_string()]);
+    }
+}
+
+/// #4113: scan-on-proxy for Alpine packages, Remote and Virtual. The shared
+/// archive scenarios, the identity rule and the 400 on an ambiguous segment.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4113 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{
+        apk_with_pkginfos, archive_scan_suite, ArchiveCase, Rig,
+    };
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const FILE: &str = "libdtf-1.0-r0.apk";
+    const DIR: &str = "v3.19/main/x86_64";
+
+    /// A real `.apk` for `FILE`; the random description keeps every
+    /// fixture's digest unique.
+    fn apk() -> Vec<u8> {
+        apk_with_pkginfos(&[&format!(
+            "pkgname = libdtf\npkgver = 1.0-r0\npkgdesc = {}\narch = x86_64\norigin = dtf\n",
+            uuid::Uuid::new_v4()
+        )])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = format!("{DIR}/{FILE}");
+        ArchiveCase {
+            format: "alpine",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{DIR}/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: apk(),
+            recorded_path: path,
+            file: FILE.to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/{DIR}/libdtf-1.0-r0%3F.apk"),
+                format!("/{key}/v3.19%23/main/x86_64/{FILE}"),
+                format!("/{key}/v3.19/main%3B/x86_64/{FILE}"),
+            ] {
+                let (status, _, _) = tdh::send_with_headers(
+                    tdh::router_anon(super::router(), rig.state.clone()),
+                    tdh::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn an_apk_that_is_the_requested_package_is_pinned_as_it() {
+        let release = crate::services::scanner_service::OsRelease::new("alpine", "3.19");
+        let ArchiveIdentity::Pinned(pin) =
+            apk_identity(FILE, "x86_64", &Bytes::from(apk()), release.clone())
+        else {
+            panic!("an .apk whose .PKGINFO agrees is pinned");
+        };
+        assert_eq!(
+            (pin.name.as_str(), pin.version.as_str()),
+            ("libdtf", "1.0-r0")
+        );
+        let os = pin.os.expect("an OS pin");
+        assert_eq!(os.release.label(), "alpine:3.19");
+        assert_eq!(os.source.as_deref(), Some("dtf"));
+        // A noarch package is served under every architecture directory.
+        let noarch = Bytes::from(apk_with_pkginfos(&[
+            "pkgname = libdtf\npkgver = 1.0-r0\narch = noarch\n",
+        ]));
+        assert!(matches!(
+            apk_identity(FILE, "aarch64", &noarch, release),
+            ArchiveIdentity::Pinned(_)
+        ));
+    }
+
+    #[test]
+    fn an_apk_that_is_not_the_requested_package_is_unestablished() {
+        let release = crate::services::scanner_service::OsRelease::new("alpine", "3.19");
+        let bytes = Bytes::from(apk());
+        for (file, arch) in [
+            ("other-1.0-r0.apk", "x86_64"),
+            ("libdtf-1.0-r1.apk", "x86_64"),
+            (FILE, "aarch64"),
+        ] {
+            assert!(
+                matches!(
+                    apk_identity(file, arch, &bytes, release.clone()),
+                    ArchiveIdentity::Disagrees(_)
+                ),
+                "{file} {arch}"
+            );
+        }
+        // A branch that names no release: not graded as anything.
+        assert!(matches!(
+            apk_identity(FILE, "x86_64", &bytes, None),
+            ArchiveIdentity::Unreadable(_)
+        ));
+        assert!(matches!(
+            apk_identity(FILE, "x86_64", &Bytes::from_static(b"not an apk"), release),
+            ArchiveIdentity::Unreadable(_)
+        ));
+    }
+}
+
+/// #4365 item 1: Alpine decides by route (every file on the package route
+/// is a `.apk`); the cache key is the streaming arm's upstream path.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn the_serve_key_is_the_streaming_cache_path() {
+        for path in [
+            "v3.19/main/x86_64/busybox-1.36.1-r15.apk",
+            "edge/community/aarch64/py3-dtf-1.0-r0.apk",
+        ] {
+            let key = apk_serve_key(path);
+            assert!(key.scannable, "{path}");
+            assert_eq!(key.cache_key, path);
+        }
     }
 }
