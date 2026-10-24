@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4952, #4097]
+---
+- **Scan-on-proxy now grades a proxied Go module, Composer package or Conan reference as the version requested, not only on what the archive bundles** (#4952, part of #4097). The bundled scanner does not catalog a Go module zip, a Composer dist or a Conan archive as itself, so an advisory against the requested coordinate (for example `golang.org/x/text v0.3.0` pulled as its own module zip) was not found and the pull read `clean` unless something inside the archive was vulnerable. Once the archive passes the identity check, the scan workspace now gets a pin for the request coordinate: a one-line `go.mod` that requires `{module} {version}`, a `composer.lock` naming the package and version, or a `conan.lock` requiring `name/version`. The scanner must catalog that coordinate before a `clean` verdict counts, and a coordinate the pin file cannot carry exactly is inconclusive (`423` under `fail_closed`) and not scanned. What the archive bundles is still graded too. Pub, CocoaPods and Swift are unchanged.

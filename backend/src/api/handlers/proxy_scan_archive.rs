@@ -11,16 +11,17 @@
 //! [`walk_scanned_archive_members`], on
 //! [`proxy_helpers::walk_virtual_members_with_scan`].
 //!
-//! **What the scan grades.** RubyGems has a component pin (`Gemfile.lock`,
-//! #3603), so a gem is graded as the gem the request names. The other archive
-//! formats have no pin in the scanner, and the bundled engine does not catalog
-//! a Go module zip, a Composer dist or a Hex tarball as itself: those files are
-//! graded on their CONTENTS (the `go.mod` requirements, a bundled lockfile, a
-//! vendored package), the same rule conda follows (#4594). The identity check
-//! still runs first: bytes whose own metadata names another coordinate than
-//! the request, or that are not a readable package of that kind, are
-//! inconclusive and never scanned (no verdict row), exactly like a Cargo crate
-//! whose `Cargo.toml` disagrees with its request.
+//! **What the scan grades.** RubyGems (`Gemfile.lock`, #3603) and, since
+//! #4952, Go (`go.mod` require), Composer (`composer.lock`) and Conan
+//! (`conan.lock`) have a component pin, so the file is graded as the
+//! coordinate the request names as well as on what it bundles. Pub, CocoaPods
+//! and Swift have no pin and are graded on their CONTENTS (Pub's
+//! `pubspec.yaml` is cataloged as the package itself), the same rule conda
+//! follows (#4594). The identity check still runs first: bytes whose own
+//! metadata names another coordinate than the request, or that are not a
+//! readable package of that kind, are inconclusive and never scanned (no
+//! verdict row), exactly like a Cargo crate whose `Cargo.toml` disagrees
+//! with its request.
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -68,6 +69,22 @@ pub(crate) enum ArchiveIdentity {
 }
 
 impl ArchiveIdentity {
+    /// The identity of an archive whose own metadata agreed with the request:
+    /// pinned as the REQUEST coordinate (#4952), so the scanner grades the
+    /// requested version itself and not only what the archive bundles.
+    /// `Unreadable` when the coordinate is outside what a pin can carry
+    /// exactly, the same refusal RubyGems makes.
+    pub(crate) fn coordinate_pinned(
+        ecosystem: crate::services::scanner_service::ComponentEcosystem,
+        name: &str,
+        version: &str,
+    ) -> Self {
+        match ExpectedComponent::coordinate_pin(ecosystem, name, version) {
+            Some(pin) => ArchiveIdentity::Pinned(pin),
+            None => ArchiveIdentity::Unreadable(format!("{name} {version} cannot be pinned")),
+        }
+    }
+
     /// The gate's view of this identity. Anything that does not establish the
     /// requested coordinate is [`ProxyScanIdentity::Unestablished`]:
     /// fail-closed withholds it (423) and fail-open serves it pending, both

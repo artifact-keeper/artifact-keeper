@@ -83,17 +83,25 @@ inconclusive and are not scanned, so no verdict is recorded for them:
 `423` under `fail_closed`, served `pending` under `fail_open` and
 `record_only`.
 
-What happens next differs from npm or Cargo. The scanner has no pin for
-these ecosystems, and the bundled engine does not catalog a module zip or a
-dist archive as itself, so it cannot look up the requested module's or
-package's own advisories. It grades what the archive contains instead: the
-requirements in a module's `go.mod`, a `composer.lock` or `installed.json`
-shipped in a dist, a `conanfile.txt` or `conan.lock` in a recipe's
-sources, a binary in a package, a vendored package of any ecosystem it
-recognises. A
-finding is `vulnerable` as usual. A scan that ran to completion and found
-nothing is `clean`, recorded with how many components were cataloged (often
-`0`) and reused like any other verdict. See [Known gaps](#known-gaps).
+The bundled engine does not catalog a module zip, a dist archive or a Conan
+archive as itself. For Go, Composer and Conan the gate therefore pins the
+requested coordinate, as it does for npm or Cargo: the scan workspace gets a
+one-line `go.mod` that requires `{module} {version}`, a `composer.lock`
+naming the requested package and version, or a `conan.lock` requiring the
+requested `name/version` (#4952). The engine grades that coordinate itself
+(an advisory against `golang.org/x/text v0.3.0`, pulled as its own module
+zip, blocks it), and it must catalog it before a `clean` verdict counts.
+A coordinate the pin file cannot carry exactly (a space, a quote, a newline)
+is inconclusive and not scanned.
+
+The archive is still graded on what it contains too: the requirements in a
+module's `go.mod`, a `composer.lock` or `installed.json` shipped in a dist,
+a `conanfile.txt` or `conan.lock` in a recipe's sources, a binary in a
+package, a vendored package of any ecosystem the engine recognises. CocoaPods
+and Swift have no pin and are graded on their contents alone: a scan that ran
+to completion and found nothing is `clean`, recorded with how many components
+were cataloged (often `0`) and reused like any other verdict. See
+[Known gaps](#known-gaps).
 
 **Pub.** A Pub archive's root `pubspec.yaml` must declare the requested
 name and version, or the archive is inconclusive and not scanned. The
@@ -263,20 +271,20 @@ have no core proxy path to gate.
 | `npm` | `npm`, `yarn`, `bower`, `pnpm` | enforced | Package tarballs, Remote and Virtual. |
 | `pypi` | `pypi`, `poetry`, `jupyter` | enforced | Package files (wheels and sdists), Remote and Virtual. |
 | `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned; against a V2 upstream, which has no separate manifest, the flat container answers only the `.nupkg` itself. |
-| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
+| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded as the requested `module@version` and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
 | `rubygems` | `rubygems` | enforced | `.gem` downloads, Remote and Virtual. The gem is graded as the `{name}-{version}` its file name names, which its gemspec must declare. Spec indexes and the JSON API are not gated. |
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
 | `helm` | `helm` | accepted | |
 | `rpm` | `rpm` | accepted | |
 | `debian` | `debian` | accepted | |
-| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
+| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded as the requested `name/version` and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
 | `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
-| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
+| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded as the requested package version and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
 | `cocoapods` | `cocoapods` | enforced | Pod archives on the `pods/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). The pod's own `.podspec.json` must declare the requested name and version. Specs and CDN index files are not gated. |
 | `swift` | `swift` | enforced | Source archives (`{scope}/{name}/{version}.zip`), Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Release metadata, release lists and `Package.swift` are not gated. |
@@ -348,13 +356,15 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
-- **Go modules, Composer packages and Conan references are not graded as
-  themselves.** A module zip, a dist archive or a Conan archive is graded on what it contains (see
-  [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
-  An advisory against the requested module or package itself (for example
-  `golang.org/x/text v0.3.0`, pulled as its own module zip) is not found, and
-  the pull is `clean` unless something inside the archive is vulnerable.
-  Grading the coordinate itself needs a scanner pin for these ecosystems.
+- **One verdict per digest across coordinates.** Verdicts are stored per
+  content digest. A Conan archive carries no reference of its own and a
+  Composer dist usually declares no version, so byte-identical archives
+  requested under two references (or two versions of one package) share the
+  verdict of the first one graded.
+- **Conan references are graded by name and version only.** The Conan pin
+  is the requested `name/version`; the user, channel and revisions are not
+  part of what the engine grades, so two revisions of one version get the
+  same advisories.
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

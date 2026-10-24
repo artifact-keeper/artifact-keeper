@@ -4233,16 +4233,24 @@ fn conan_file_serve_key(upstream_path: &str) -> crate::services::proxy_service::
 /// The Conan half of the generic gate (#4108). A Conan archive carries no
 /// identity of its own (the reference lives in the URL and in the separate
 /// `conaninfo.txt` / `conanfile.py`), so the rule is only that the bytes are
-/// a readable gzipped tar; they are graded on their contents (a bundled
-/// `conanfile.txt` or `conan.lock`, binaries the engine recognises).
-struct ConanArchive;
+/// a readable gzipped tar. They are pinned as the `name/version` of the
+/// requested reference (#4952), so the scanner grades that reference itself,
+/// and graded on their contents too (a bundled `conanfile.txt` or
+/// `conan.lock`, binaries the engine recognises).
+struct ConanArchive {
+    /// `(name, version)` of the requested reference, from the upstream path.
+    reference: Option<(String, String)>,
+}
 
 impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ConanArchive {
     const LABEL: &'static str = "conan archive";
     const CONTENT_TYPE: &'static str = "application/octet-stream";
 
     fn requested(&self) -> String {
-        "a conan archive".to_string()
+        match &self.reference {
+            Some((name, version)) => format!("conan archive of {name}/{version}"),
+            None => "a conan archive".to_string(),
+        }
     }
 
     fn identity(
@@ -4250,19 +4258,40 @@ impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ConanArchive {
         _filename: &str,
         bytes: &bytes::Bytes,
     ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
-        conan_archive_identity(bytes)
+        conan_archive_identity(self.reference.as_ref(), bytes)
     }
 }
 
+/// `(name, version)` of the reference a Conan v2 upstream path names
+/// (`v2/conans/{name}/{version}/{user}/{channel}/...`), or `None` for any
+/// other shape.
+fn conan_reference_from_upstream_path(upstream_path: &str) -> Option<(String, String)> {
+    let mut segments = upstream_path.trim_start_matches('/').split('/');
+    if (segments.next(), segments.next()) != (Some("v2"), Some("conans")) {
+        return None;
+    }
+    let name = segments.next().filter(|s| !s.is_empty())?;
+    let version = segments.next().filter(|s| !s.is_empty())?;
+    Some((name.to_string(), version.to_string()))
+}
+
 fn conan_archive_identity(
+    reference: Option<&(String, String)>,
     bytes: &bytes::Bytes,
 ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
     use crate::api::handlers::proxy_scan_archive::{read_tar_gz_entry, ArchiveIdentity};
     // No entry matches: a full header walk, which only a readable gzipped
     // tar survives.
-    match read_tar_gz_entry(bytes, |_| false) {
-        Ok(_) => ArchiveIdentity::ContentGraded,
-        Err(e) => ArchiveIdentity::Unreadable(e),
+    if let Err(e) = read_tar_gz_entry(bytes, |_| false) {
+        return ArchiveIdentity::Unreadable(e);
+    }
+    match reference {
+        Some((name, version)) => ArchiveIdentity::coordinate_pinned(
+            crate::services::scanner_service::ComponentEcosystem::Conan,
+            name,
+            version,
+        ),
+        None => ArchiveIdentity::Unreadable("the path names no conan reference".to_string()),
     }
 }
 
@@ -4291,7 +4320,9 @@ async fn serve_scanned_conan_archive(
     };
     let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
         proxy,
-        kind: ConanArchive,
+        kind: ConanArchive {
+            reference: conan_reference_from_upstream_path(cache_key),
+        },
         disposition: None,
     };
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
@@ -12556,12 +12587,50 @@ mod scan_on_proxy_4108 {
 
     #[test]
     fn only_a_readable_gzipped_tar_is_graded() {
+        let reference = ("dtfscan".to_string(), "1.0.0".to_string());
         let ok = Bytes::from(tar_gz(&[("conanfile.txt", "[requires]\n".to_string())]));
-        assert_eq!(conan_archive_identity(&ok), ArchiveIdentity::ContentGraded);
+        assert_eq!(
+            conan_archive_identity(Some(&reference), &ok),
+            ArchiveIdentity::Pinned(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Conan,
+                "dtfscan",
+                "1.0.0",
+            ))
+        );
         assert!(matches!(
-            conan_archive_identity(&Bytes::from_static(b"not a tarball")),
+            conan_archive_identity(Some(&reference), &Bytes::from_static(b"not a tarball")),
             ArchiveIdentity::Unreadable(_)
         ));
+        assert!(matches!(
+            conan_archive_identity(None, &ok),
+            ArchiveIdentity::Unreadable(_)
+        ));
+    }
+
+    /// #4952: the reference a pin is built from is the requested one.
+    #[test]
+    fn the_pinned_reference_comes_from_the_upstream_path() {
+        let path = build_package_upstream_path(
+            "zlib",
+            "1.2.11",
+            "_",
+            "_",
+            REV,
+            PKG,
+            REV,
+            "conan_package.tgz",
+        );
+        assert_eq!(
+            conan_reference_from_upstream_path(&path),
+            Some(("zlib".to_string(), "1.2.11".to_string()))
+        );
+        let recipe =
+            build_recipe_upstream_path("zlib", "1.2.11", "_", "_", REV, "conan_sources.tgz");
+        assert_eq!(
+            conan_reference_from_upstream_path(&recipe),
+            Some(("zlib".to_string(), "1.2.11".to_string()))
+        );
+        assert_eq!(conan_reference_from_upstream_path("v1/files/x.tgz"), None);
     }
 }
 
