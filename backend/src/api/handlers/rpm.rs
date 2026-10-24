@@ -2420,6 +2420,11 @@ async fn upstream_proxy(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    // #4365 item 3, as on the `/packages/` route.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&upstream_path],
+    )?;
     let depth = rpm_layout::depth(&state.db, repo.id)
         .await
         .map_err(IntoResponse::into_response)?;
@@ -2480,6 +2485,12 @@ async fn upstream_proxy(
     // Remote-member serve through a Virtual stays unrecorded (#1278), the same
     // as `/packages/`.
     if repo.repo_type == RepositoryType::Virtual {
+        // #4112: scan-on-proxy over the Virtual's members.
+        if let Some(served) =
+            serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx).await?
+        {
+            return served;
+        }
         if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
             &state,
             auth.as_ref(),
@@ -2547,6 +2558,13 @@ async fn upstream_proxy(
         ));
     }
 
+    // #4112: scan-on-proxy for the Remote's package files.
+    if let Some(served) =
+        serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx).await?
+    {
+        return served;
+    }
+
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
@@ -2583,6 +2601,194 @@ async fn upstream_proxy(
 }
 
 // ---------------------------------------------------------------------------
+// Scan-on-proxy (#4112)
+// ---------------------------------------------------------------------------
+
+/// Whether a proxied RPM path is repository metadata or signing material,
+/// which streams unscanned like the Maven POM control: anything under a
+/// `repodata/` directory, `repomd.xml` and its signature and key, the
+/// installer tree descriptors, and key and signature files. Every other
+/// file is gated: a package is graded as itself, and a file that is not an
+/// RPM package is inconclusive.
+fn rpm_path_is_metadata(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    let file = path.rsplit('/').next().unwrap_or(path);
+    path.split('/').any(|segment| segment == "repodata")
+        || matches!(
+            file,
+            "repomd.xml"
+                | "repomd.xml.asc"
+                | "repomd.xml.key"
+                | ".treeinfo"
+                | "treeinfo"
+                | "media.repo"
+                | "TRANS.TBL"
+        )
+        || file.starts_with("RPM-GPG-KEY")
+        || file.starts_with("GPG-KEY")
+        || [".asc", ".sig", ".gpg", ".key"]
+            .iter()
+            .any(|suffix| file.ends_with(suffix))
+}
+
+/// The `(cache_key, scannable)` decision for an RPM proxy path (#4365 item 1).
+fn rpm_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(upstream_path, |_| {
+        !rpm_path_is_metadata(upstream_path)
+    })
+}
+
+/// The RPM half of the generic gate (#4112): an `.rpm` must be the name,
+/// version, release and architecture its file name names, and is graded as
+/// that package of the release its dist tag names.
+struct RpmPackage;
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for RpmPackage {
+    const LABEL: &'static str = "rpm package";
+    const CONTENT_TYPE: &'static str = "application/x-rpm";
+
+    fn requested(&self) -> String {
+        "the package file name's name, version, release and architecture".to_string()
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        rpm_identity(filename, bytes)
+    }
+}
+
+/// What a proxied `.rpm` says about itself (#4112): its own header must name
+/// the name, version, release and architecture of the requested file name.
+/// It is then pinned as that package, at the header's
+/// `[epoch:]version-release`, of the release the dist tag in its release
+/// names (`el9_2` is RHEL 9); a package with no such tag is not graded as
+/// anything.
+fn rpm_identity(
+    filename: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        os_package_identity, read_rpm_identity, rpm_release_from_dist_tag, ArchiveIdentity,
+    };
+    let requested = filename
+        .ends_with(".rpm")
+        .then(|| RpmHandler::parse_rpm_filename(filename).ok())
+        .flatten();
+    let Some(requested) = requested else {
+        return ArchiveIdentity::Unreadable(format!("{filename} is not an RPM package name"));
+    };
+    let header = match read_rpm_identity(bytes) {
+        Ok(header) => header,
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    if requested.name.as_deref() != Some(header.name.as_str())
+        || requested.version.as_deref() != Some(header.version.as_str())
+        || requested.release.as_deref() != Some(header.release.as_str())
+        || requested.arch.as_deref() != Some(header.arch.as_str())
+    {
+        return ArchiveIdentity::Disagrees(format!(
+            "the header declares {}-{}.{}",
+            header.name,
+            header.evr(),
+            header.arch
+        ));
+    }
+    os_package_identity(
+        crate::services::scanner_service::ComponentEcosystem::Rpm,
+        &header.name,
+        &header.evr(),
+        &header.arch,
+        None,
+        rpm_release_from_dist_tag(&header.release),
+    )
+}
+
+/// Inline scan-and-block for one RPM proxy file from one Remote repository
+/// (#4112).
+async fn serve_scanned_rpm(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    cache_key: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    disposition: Option<&str>,
+) -> Result<Response, Response> {
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Rpm,
+        source_path: cache_key,
+        cache_path: cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: RpmPackage,
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of an RPM download, Remote and Virtual (#4112):
+/// `Ok(None)` for repository metadata, or when nothing scans, so the caller
+/// keeps its untouched path. A Virtual's hosted members are looked up by
+/// file name, as the unscanned walk looks them up.
+async fn serve_scanned_rpm_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    upstream_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let serve_key = rpm_serve_key(upstream_path);
+    if !serve_key.scannable {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let cache_key = serve_key.cache_key.as_str();
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let route = ScannedRoute {
+        upstream_path: cache_key,
+        lookup: LocalLookup::PathSuffix(filename),
+        default_content_type: "application/x-rpm",
+        virtual_disposition: Some(filename),
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream), policy, _disposition| async move {
+            serve_scanned_rpm(
+                state,
+                proxy,
+                (id, &key, &upstream),
+                cache_key,
+                policy,
+                ctx,
+                Some(filename),
+            )
+            .await
+        },
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // GET /rpm/{repo_key}/packages/*path — Download RPM package
 // ---------------------------------------------------------------------------
 
@@ -2593,6 +2799,13 @@ async fn download_package(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    // #4365 item 3: on a proxying repository the package path is the upstream
+    // path and the proxy-cache key, so an ambiguous one is a 400 before
+    // anything is fetched, scanned or not.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&pkg_path],
+    )?;
     let depth = rpm_layout::depth(&state.db, repo.id)
         .await
         .map_err(IntoResponse::into_response)?;
@@ -2615,6 +2828,14 @@ async fn download_package(
             Some(a) => a,
             None => {
                 let upstream_path = format!("packages/{}", pkg_path);
+                // #4112: scan-on-proxy, Remote and Virtual. `None` when
+                // nothing scans: the untouched path below serves.
+                if let Some(served) =
+                    serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx)
+                        .await?
+                {
+                    return served;
+                }
                 let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
                     ("application/x-rpm", Some(filename))
                 } else {
@@ -7982,5 +8203,209 @@ mod repodata_deps_tests {
         let retry_after = block["retry_after"].as_i64().expect("retryable marker");
         assert!(!needs_repodata_heal_at(a, retry_after - 1));
         assert!(needs_repodata_heal_at(a, retry_after), "retried once due");
+    }
+}
+
+/// #4112: scan-on-proxy for RPM packages, Remote and Virtual. The shared
+/// archive scenarios on the `/packages/` route and the catch-all, and the
+/// identity rule.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_4112 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{
+        self as ts, archive_scan_suite, minimal_rpm, ArchiveCase, Rig,
+    };
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const FILE: &str = "dtf-libs-1.0-1.el9_2.x86_64.rpm";
+
+    /// A minimal `.rpm` for `FILE`; the random payload byte keeps every
+    /// fixture's digest unique.
+    fn rpm() -> Vec<u8> {
+        let mut rpm = minimal_rpm("dtf-libs", Some(1), "1.0", "1.el9_2", "x86_64", &[]);
+        rpm.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        rpm
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = format!("packages/{FILE}");
+        ArchiveCase {
+            format: "rpm",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/packages/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: rpm(),
+            recorded_path: path,
+            file: FILE.to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// The yum layout dnf actually fetches, through the catch-all.
+    fn catchall_case(_mock: &str) -> ArchiveCase {
+        let path = format!("9/BaseOS/x86_64/os/Packages/d/{FILE}");
+        ArchiveCase {
+            format: "rpm",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/9/BaseOS/x86_64/os/Packages/d/{FILE}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: rpm(),
+            recorded_path: path,
+            file: FILE.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_package_on_the_catch_all_is_gated() {
+        ts::clean_is_served_and_the_verdict_reused(catchall_case).await;
+        ts::vulnerable_is_blocked(catchall_case).await;
+        ts::fail_closed_without_a_verdict_is_locked(catchall_case).await;
+        ts::fail_open_first_pull_is_served_pending(catchall_case).await;
+        ts::virtual_member_is_gated(catchall_case).await;
+        ts::without_scan_on_proxy_streams_unscanned(catchall_case).await;
+    }
+
+    /// Repository metadata on the catch-all still streams through a scanning
+    /// Remote: only package files are gated.
+    #[tokio::test]
+    async fn repository_metadata_is_not_gated() {
+        let Some(rig) = Rig::new(catchall_case, Some("fail_closed")).await else {
+            return;
+        };
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/9/BaseOS/x86_64/os/RPM-GPG-KEY-dtf",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("-----BEGIN PGP"))
+            .mount(&rig.server)
+            .await;
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!(
+                "/{}/9/BaseOS/x86_64/os/RPM-GPG-KEY-dtf",
+                rig.fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"-----BEGIN PGP");
+        assert!(headers.get("X-AK-Scan").is_none());
+        rig.teardown().await;
+    }
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched, on both routes.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused_on_every_route() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/packages/{FILE}%3F.xml"),
+                format!("/{key}/9/BaseOS/x86_64/os/Packages/d/{FILE}%23x"),
+                format!("/{key}/9/BaseOS/x86_64/os/repodata/repomd.xml%3Bx"),
+            ] {
+                let (status, _, _) = tdh::send_with_headers(
+                    tdh::router_anon(super::router(), rig.state.clone()),
+                    tdh::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn an_rpm_that_is_the_requested_package_is_pinned_as_it() {
+        let ArchiveIdentity::Pinned(pin) = rpm_identity(FILE, &Bytes::from(rpm())) else {
+            panic!("an .rpm whose header agrees is pinned");
+        };
+        assert_eq!(pin.name, "dtf-libs");
+        assert_eq!(pin.version, "1:1.0-1.el9_2");
+        let os = pin.os.expect("an OS pin");
+        assert_eq!(os.release.label(), "rhel:9");
+        assert_eq!(os.arch, "x86_64");
+    }
+
+    #[test]
+    fn an_rpm_that_is_not_the_requested_package_is_unestablished() {
+        let bytes = Bytes::from(rpm());
+        for requested in [
+            "other-1.0-1.el9_2.x86_64.rpm",
+            "dtf-libs-1.1-1.el9_2.x86_64.rpm",
+            "dtf-libs-1.0-2.el9_2.x86_64.rpm",
+            "dtf-libs-1.0-1.el9_2.aarch64.rpm",
+        ] {
+            assert!(
+                matches!(
+                    rpm_identity(requested, &bytes),
+                    ArchiveIdentity::Disagrees(_)
+                ),
+                "{requested}"
+            );
+        }
+        // No dist tag the scanner has a feed for: not graded as anything.
+        let untagged = Bytes::from(minimal_rpm("dtf", None, "1.0", "1", "noarch", &[]));
+        assert!(matches!(
+            rpm_identity("dtf-1.0-1.noarch.rpm", &untagged),
+            ArchiveIdentity::Unreadable(_)
+        ));
+        for (name, body) in [
+            ("dtf-libs-1.0-1.el9_2.x86_64.drpm", bytes.clone()),
+            ("install.img", bytes.clone()),
+            (FILE, Bytes::from_static(b"not an rpm")),
+        ] {
+            assert!(
+                matches!(rpm_identity(name, &body), ArchiveIdentity::Unreadable(_)),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// #4365 item 1: RPM decides by path: everything except repository metadata
+/// and signing material is gated; the cache key is the streaming arm's path.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn the_serve_key_is_the_streaming_cache_path_and_decides_by_path() {
+        for (path, scannable) in [
+            ("packages/openssl-libs-3.0.7-17.el9_2.x86_64.rpm", true),
+            (
+                "9/BaseOS/x86_64/os/Packages/o/openssl-3.0.7-17.el9_2.x86_64.rpm",
+                true,
+            ),
+            (
+                "9/BaseOS/x86_64/os/Packages/o/openssl-3.0.7-17.el9_2.x86_64.drpm",
+                true,
+            ),
+            ("9/BaseOS/x86_64/os/images/install.img", true),
+            ("9/BaseOS/x86_64/os/repodata/repomd.xml", false),
+            ("9/BaseOS/x86_64/os/repodata/abc-primary.xml.gz", false),
+            ("repodata/repomd.xml.asc", false),
+            ("9/BaseOS/x86_64/os/RPM-GPG-KEY-Rocky-9", false),
+            ("9/BaseOS/x86_64/os/.treeinfo", false),
+            ("9/BaseOS/x86_64/os/media.repo", false),
+            ("repodata/repomd.xml?x", true),
+        ] {
+            let key = rpm_serve_key(path);
+            assert_eq!(key.scannable, scannable, "{path}");
+            assert_eq!(key.cache_key, path, "{path}");
+        }
     }
 }

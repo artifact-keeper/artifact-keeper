@@ -2852,14 +2852,14 @@ mod tests {
 
     /// #4582: a blocking verdict counts only where the format's proxy path
     /// runs the gate. The same high verdict under the same policy is counted
-    /// on a conda remote (gated since #4585) and an OCI alias, and not on an
-    /// rpm or generic remote, which store `scan_on_proxy` but serve unscanned.
+    /// on a conda remote (gated since #4585) and an OCI alias, and not on a
+    /// helm or generic remote, which store `scan_on_proxy` but serve unscanned.
     #[test]
     fn test_count_blocked_proxy_digests_skips_ungated_formats_4582() {
         let blocking = |format: &str, digest: &str| {
             format_block_candidate(format, digest, Some("high"), "fail_open", true, "high")
         };
-        assert_eq!(count_blocked_proxy_digests(&[blocking("rpm", "a")]), 0);
+        assert_eq!(count_blocked_proxy_digests(&[blocking("helm", "a")]), 0);
         assert_eq!(count_blocked_proxy_digests(&[blocking("generic", "a")]), 0);
         assert_eq!(
             count_blocked_proxy_digests(&[blocking("no-such-format", "a")]),
@@ -2874,7 +2874,7 @@ mod tests {
         // A digest an ungated repository also caches is still one blocked
         // digest when a gated repository refuses it.
         assert_eq!(
-            count_blocked_proxy_digests(&[blocking("rpm", "a"), blocking("conda", "a")]),
+            count_blocked_proxy_digests(&[blocking("helm", "a"), blocking("conda", "a")]),
             1
         );
     }

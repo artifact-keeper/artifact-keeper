@@ -11,21 +11,22 @@
 //! [`walk_scanned_archive_members`], on
 //! [`proxy_helpers::walk_virtual_members_with_scan`].
 //!
-//! **What the scan grades.** RubyGems has a component pin (`Gemfile.lock`,
-//! #3603), so a gem is graded as the gem the request names. The other archive
-//! formats have no pin in the scanner, and the bundled engine does not catalog
-//! a Go module zip, a Composer dist or a Hex tarball as itself: those files are
-//! graded on their CONTENTS (the `go.mod` requirements, a bundled lockfile, a
-//! vendored package), the same rule conda follows (#4594). The identity check
-//! still runs first: bytes whose own metadata names another coordinate than
-//! the request, or that are not a readable package of that kind, are
-//! inconclusive and never scanned (no verdict row), exactly like a Cargo crate
-//! whose `Cargo.toml` disagrees with its request.
+//! **What the scan grades.** RubyGems (`Gemfile.lock`, #3603) and, since
+//! #4952, Go (`go.mod` require), Composer (`composer.lock`) and Conan
+//! (`conan.lock`) have a component pin, so the file is graded as the
+//! coordinate the request names as well as on what it bundles. Pub, CocoaPods
+//! and Swift have no pin and are graded on their CONTENTS (Pub's
+//! `pubspec.yaml` is cataloged as the package itself), the same rule conda
+//! follows (#4594). The identity check still runs first: bytes whose own
+//! metadata names another coordinate than the request, or that are not a
+//! readable package of that kind, are inconclusive and never scanned (no
+//! verdict row), exactly like a Cargo crate whose `Cargo.toml` disagrees
+//! with its request.
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
 use crate::api::handlers::proxy_helpers::{
@@ -68,6 +69,22 @@ pub(crate) enum ArchiveIdentity {
 }
 
 impl ArchiveIdentity {
+    /// The identity of an archive whose own metadata agreed with the request:
+    /// pinned as the REQUEST coordinate (#4952), so the scanner grades the
+    /// requested version itself and not only what the archive bundles.
+    /// `Unreadable` when the coordinate is outside what a pin can carry
+    /// exactly, the same refusal RubyGems makes.
+    pub(crate) fn coordinate_pinned(
+        ecosystem: crate::services::scanner_service::ComponentEcosystem,
+        name: &str,
+        version: &str,
+    ) -> Self {
+        match ExpectedComponent::coordinate_pin(ecosystem, name, version) {
+            Some(pin) => ArchiveIdentity::Pinned(pin),
+            None => ArchiveIdentity::Unreadable(format!("{name} {version} cannot be pinned")),
+        }
+    }
+
     /// The gate's view of this identity. Anything that does not establish the
     /// requested coordinate is [`ProxyScanIdentity::Unestablished`]:
     /// fail-closed withholds it (423) and fail-open serves it pending, both
@@ -109,6 +126,15 @@ pub(crate) trait ArchiveKind: Send + Sync {
     /// coordinate. Must come from the REQUEST coordinate and the archive's
     /// own metadata, never from an upstream index.
     fn identity(&self, filename: &str, bytes: &Bytes) -> ArchiveIdentity;
+
+    /// The SHA-256 an index the repository already verified records for
+    /// this file (Debian's `Packages` index, #2459 Tier B), when known. Bytes
+    /// that do not match are evicted from the proxy cache and refused with
+    /// `502`, never scanned or served, as Cargo refuses a crate that
+    /// disagrees with its index `cksum`.
+    fn expected_sha256(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// One proxied package file of an archive format, served through the generic
@@ -141,6 +167,45 @@ impl<K: ArchiveKind> proxy_helpers::ScannedProxyFile for ScannedArchive<'_, K> {
             digest,
             &self.kind.requested(),
         )
+    }
+
+    async fn after_buffered_fetch(
+        &self,
+        _state: &SharedState,
+        req: &ScannedProxyRequest<'_>,
+        _bytes: &Bytes,
+        digest: &str,
+    ) -> Result<(), Response> {
+        let Some(expected) = self
+            .kind
+            .expected_sha256()
+            .and_then(proxy_helpers::normalize_expected_sha256)
+        else {
+            return Ok(());
+        };
+        if expected == digest {
+            return Ok(());
+        }
+        tracing::warn!(
+            repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+            expected = %expected, format = %K::LABEL,
+            "proxied package disagrees with the verified index digest; evicting it and refusing the pull"
+        );
+        if let Err(e) = self
+            .proxy
+            .invalidate_cache_by_key(req.repo_key, req.cache_path)
+            .await
+        {
+            tracing::warn!(
+                repo_id = %req.repo_id, file = %req.filename, error = %e,
+                "failed to evict a digest-mismatched package from the proxy cache"
+            );
+        }
+        Err(crate::error::AppError::BadGateway(format!(
+            "upstream {} does not match the repository index checksum",
+            req.filename
+        ))
+        .into_response())
     }
 
     async fn serve_unscanned_stream(
@@ -328,6 +393,41 @@ where
     S: Fn(ScannedRemote, MemberScanPolicy, Option<String>) -> SFut,
     SFut: std::future::Future<Output = Result<Response, Response>>,
 {
+    serve_scanned_package_download_over(
+        state,
+        auth,
+        repo,
+        route,
+        suppress_upstream,
+        ctx,
+        |_| std::future::ready(true),
+        scanned,
+    )
+    .await
+}
+
+/// [`serve_scanned_package_download`] for a format that narrows a Virtual's
+/// members before the walk (Debian's per-member pool allowlist, #2727):
+/// `keep` is asked once per authorized member, in priority order, and a
+/// member it refuses is left out exactly as the format's unscanned resolver
+/// leaves it out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_scanned_package_download_over<K, KFut, S, SFut>(
+    state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    repo: &proxy_helpers::RepoInfo,
+    route: ScannedRoute<'_>,
+    suppress_upstream: bool,
+    ctx: &DownloadContext,
+    keep: K,
+    scanned: S,
+) -> Result<Option<Result<Response, Response>>, Response>
+where
+    K: Fn(&Repository) -> KFut,
+    KFut: std::future::Future<Output = bool>,
+    S: Fn(ScannedRemote, MemberScanPolicy, Option<String>) -> SFut,
+    SFut: std::future::Future<Output = Result<Response, Response>>,
+{
     use crate::models::repository::RepositoryType;
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
@@ -345,7 +445,13 @@ where
     if repo.repo_type != RepositoryType::Virtual || suppress_upstream {
         return Ok(None);
     }
-    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let authorized = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let mut members = Vec::with_capacity(authorized.len());
+    for member in authorized {
+        if keep(&member).await {
+            members.push(member);
+        }
+    }
     let lookup = route.lookup;
     let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| async move {
         match lookup {
@@ -435,6 +541,441 @@ pub(crate) fn read_tar_gz_entry(
         ARCHIVE_IDENTITY_MAX_ENTRY_BYTES,
     )
     .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Operating-system packages (#4111, #4112, #4113)
+// ---------------------------------------------------------------------------
+//
+// A Debian, RPM or Alpine package is graded through a synthetic installed
+// system (`scanner_service::ComponentEcosystem::Debian` and its siblings), so
+// what the scanner grades is what these readers read. Each reader therefore
+// refuses a package whose metadata it could read in more than one way: a
+// duplicated archive member or entry, a duplicated identity field. A package
+// that a reader and another tool would read differently is not graded as
+// anything (input validation, applied before the gate).
+
+/// Decoded-byte budget for an OS package's metadata stream (a `.deb`'s
+/// `control.tar`, an `.apk`'s control segment and the tar walk behind it).
+const OS_METADATA_MAX_DECODED: u64 =
+    crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as u64 * 8;
+
+/// Most `ar` members a `.deb` may carry: `debian-binary`, `control.tar*`,
+/// `data.tar*`, plus signature members (`_gpgorigin`, `_gpgbuilder`, ...).
+const DEB_MAX_AR_MEMBERS: usize = 16;
+
+/// The `control` fields of a Debian binary package that its pin carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DebControlFields {
+    pub package: String,
+    pub version: String,
+    pub architecture: String,
+    /// `Source`, as the control file has it (`openssl` or `openssl (3.0.11-1)`).
+    pub source: Option<String>,
+}
+
+/// Read a `.deb`'s own `control` file (#4111).
+///
+/// Refused (`Err`) unless the bytes are an `ar` archive whose first member is
+/// `debian-binary`, with exactly one `control.tar*` and one `data.tar*`
+/// member and no member name twice; the control tarball holds exactly one
+/// `control` entry (`./control` and `control` are the same entry); and the
+/// control file is one paragraph naming `Package`, `Version`, `Architecture`
+/// and `Source` at most once each.
+pub(crate) fn read_deb_control(bytes: &[u8]) -> Result<DebControlFields, String> {
+    const AR_MAGIC: &[u8] = b"!<arch>\n";
+    if !bytes.starts_with(AR_MAGIC) {
+        return Err("not an ar archive".to_string());
+    }
+    let mut members: Vec<(String, &[u8])> = Vec::new();
+    let mut offset = AR_MAGIC.len();
+    while offset < bytes.len() {
+        if bytes.len() - offset < 60 {
+            return Err("truncated ar member header".to_string());
+        }
+        let header = &bytes[offset..offset + 60];
+        if &header[58..60] != b"`\n" {
+            return Err("malformed ar member header".to_string());
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .map_err(|_| "ar member name is not text".to_string())?
+            .trim_end()
+            .trim_end_matches('/')
+            .to_string();
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| "malformed ar member size".to_string())?;
+        offset += 60;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "truncated ar member".to_string())?;
+        if members.iter().any(|(n, _)| *n == name) {
+            return Err(format!("ar member {name:?} appears twice"));
+        }
+        if members.len() == DEB_MAX_AR_MEMBERS {
+            return Err("too many ar members".to_string());
+        }
+        members.push((name, &bytes[offset..end]));
+        offset = end + (size % 2);
+    }
+    if members.first().map(|(n, _)| n.as_str()) != Some("debian-binary") {
+        return Err("the first ar member is not debian-binary".to_string());
+    }
+    let count = |prefix: &str| {
+        members
+            .iter()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .count()
+    };
+    if count("control.tar") != 1 || count("data.tar") != 1 {
+        return Err("a .deb has exactly one control.tar and one data.tar member".to_string());
+    }
+    let (control_name, control_tar) = members
+        .iter()
+        .find(|(n, _)| n.starts_with("control.tar"))
+        .map(|(n, d)| (n.as_str(), *d))
+        .expect("counted above");
+    let decoded: Box<dyn std::io::Read + '_> = match control_name {
+        "control.tar" => Box::new(control_tar),
+        "control.tar.gz" => Box::new(flate2::read::GzDecoder::new(control_tar)),
+        "control.tar.xz" => Box::new(xz2::read::XzDecoder::new(control_tar)),
+        "control.tar.zst" => Box::new(
+            zstd::stream::read::Decoder::new(control_tar)
+                .map_err(|e| format!("control.tar.zst: {e}"))?,
+        ),
+        other => return Err(format!("unsupported control member {other:?}")),
+    };
+    let entries = read_tar_entries_named(decoded, |path| path == "control")?;
+    let control = match entries.as_slice() {
+        [(_, body)] => body,
+        [] => return Err("control.tar holds no control file".to_string()),
+        _ => return Err("control.tar holds more than one control file".to_string()),
+    };
+    let text = std::str::from_utf8(control).map_err(|_| "control is not UTF-8".to_string())?;
+    check_single_paragraph_fields(text, &["package", "version", "architecture", "source"])?;
+    let parsed =
+        crate::formats::debian::DebianHandler::parse_control(text).map_err(|e| e.to_string())?;
+    Ok(DebControlFields {
+        package: parsed.package,
+        version: parsed.version,
+        architecture: parsed.architecture,
+        source: parsed.source,
+    })
+}
+
+/// Every entry of a tar stream whose normalized path (`./` prefixes removed)
+/// satisfies `wanted`, read in full, after walking the WHOLE stream under the
+/// identity caps. Returning all of them is the point: a caller that wants one
+/// entry can tell one from two, which a first-match reader cannot.
+fn read_tar_entries_named<R: std::io::Read>(
+    decoded: R,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let budgeted = crate::util::bounded_archive::budgeted_to(decoded, OS_METADATA_MAX_DECODED);
+    let mut archive = tar::Archive::new(budgeted);
+    // An `.apk` is several gzip members, each a tar segment; zero blocks
+    // between segments do not end the walk.
+    archive.set_ignore_zeros(true);
+    let mut found = Vec::new();
+    let mut seen: u64 = 0;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        seen += 1;
+        if seen > ARCHIVE_IDENTITY_MAX_ENTRIES {
+            return Err("too many archive entries".to_string());
+        }
+        let raw = entry
+            .path()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        let mut path = raw.as_str();
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest;
+        }
+        if wanted(path) {
+            let body = crate::util::bounded_archive::read_capped(
+                &mut entry,
+                ARCHIVE_IDENTITY_MAX_ENTRY_BYTES,
+                "package metadata entry",
+            )
+            .map_err(|e| e.to_string())?;
+            found.push((path.to_string(), body));
+        }
+    }
+    Ok(found)
+}
+
+/// Refuse a deb822 control file that is more than one paragraph, or names
+/// one of `keys` (lowercase) more than once: a reader that keeps the first
+/// and one that keeps the last would see two different packages.
+fn check_single_paragraph_fields(text: &str, keys: &[&str]) -> Result<(), String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut ended = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            ended = true;
+            continue;
+        }
+        if ended {
+            return Err("the control file has more than one paragraph".to_string());
+        }
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            if keys.contains(&key.as_str()) {
+                if seen.contains(&key) {
+                    return Err(format!("the control file names {key} twice"));
+                }
+                seen.push(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The source package NAME of a control `Source` field (`openssl` from
+/// `openssl (3.0.11-1)`).
+pub(crate) fn deb_source_name(source: &str) -> Option<String> {
+    let name = source.split(['(', ' ', '\t']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// A Debian version without its epoch (`1:2.3-4` -> `2.3-4`): the form a pool
+/// file name carries.
+pub(crate) fn strip_version_epoch(version: &str) -> &str {
+    match version.split_once(':') {
+        Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {
+            rest
+        }
+        _ => version,
+    }
+}
+
+/// The release an APT `Release` / `InRelease` document describes (#4111), for
+/// the Debian and Ubuntu archives the bundled engine has feeds for: `Origin`
+/// names the family, `Version` (major for Debian) or else the `Codename`
+/// (a `-security` / `-updates` / `-backports` suite suffix dropped) names the
+/// release. `None` for any other origin, for `sid`/`unstable`, or for a
+/// document that names no release: a package of a release the engine has no
+/// feed for is not graded as one that it has.
+pub(crate) fn os_release_from_apt_release(
+    text: &str,
+) -> Option<crate::services::scanner_service::OsRelease> {
+    use crate::services::scanner_service::OsRelease;
+    let field = |name: &str| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim().eq_ignore_ascii_case(name)).then(|| value.trim().to_string())
+        })
+    };
+    let origin = field("Origin")?.to_ascii_lowercase();
+    let family = if origin.starts_with("debian") {
+        "debian"
+    } else if origin == "ubuntu" {
+        "ubuntu"
+    } else {
+        return None;
+    };
+    if let Some(version) = field("Version").filter(|v| !v.is_empty()) {
+        let version = if family == "debian" {
+            version.split('.').next().unwrap_or("").to_string()
+        } else {
+            version
+        };
+        return OsRelease::new(family, &version);
+    }
+    let codename = field("Codename").or_else(|| field("Suite"))?;
+    let codename = codename
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let version = match (family, codename.as_str()) {
+        ("debian", "buster") => "10",
+        ("debian", "bullseye") => "11",
+        ("debian", "bookworm") => "12",
+        ("debian", "trixie") => "13",
+        ("debian", "forky") => "14",
+        ("ubuntu", "bionic") => "18.04",
+        ("ubuntu", "focal") => "20.04",
+        ("ubuntu", "jammy") => "22.04",
+        ("ubuntu", "noble") => "24.04",
+        ("ubuntu", "oracular") => "24.10",
+        ("ubuntu", "plucky") => "25.04",
+        ("ubuntu", "questing") => "25.10",
+        _ => return None,
+    };
+    OsRelease::new(family, version)
+}
+
+/// The Debian release a stable-update or backport version names, for when
+/// no `Release` document covers the package (#4111): `+deb12u1` / `~deb12u1`
+/// and `~bpo12+1` name Debian 12. `None` for every other version.
+pub(crate) fn debian_release_from_version(
+    version: &str,
+) -> Option<crate::services::scanner_service::OsRelease> {
+    let digits_after = |marker: &str| {
+        version.match_indices(marker).find_map(|(at, _)| {
+            let rest = &version[at + marker.len()..];
+            let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            (!n.is_empty() && n.len() <= 2).then_some(n)
+        })
+    };
+    let major = ["+deb", "~deb", "~bpo"]
+        .iter()
+        .find_map(|m| digits_after(m))?;
+    crate::services::scanner_service::OsRelease::new("debian", &major)
+}
+
+/// The identity fields of an RPM package header (#4112).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RpmHeaderFields {
+    pub name: String,
+    pub epoch: Option<u64>,
+    pub version: String,
+    pub release: String,
+    pub arch: String,
+}
+
+impl RpmHeaderFields {
+    /// `[epoch:]version-release`, the version the engine reports.
+    pub(crate) fn evr(&self) -> String {
+        match self.epoch {
+            Some(epoch) => format!("{epoch}:{}-{}", self.version, self.release),
+            None => format!("{}-{}", self.version, self.release),
+        }
+    }
+}
+
+/// The RPM header tags the identity is read from: NAME, VERSION, RELEASE,
+/// EPOCH, ARCH, SOURCERPM.
+const RPM_IDENTITY_TAGS: [u32; 6] = [1000, 1001, 1002, 1003, 1022, 1044];
+
+/// Read an `.rpm`'s own header identity (#4112), with the format's own
+/// bounded header parser. Refused (`Err`) when the bytes are not an RPM with
+/// a readable main header carrying name, version, release and arch, or when
+/// the main header lists one of the identity tags more than once.
+pub(crate) fn read_rpm_identity(bytes: &[u8]) -> Result<RpmHeaderFields, String> {
+    use crate::formats::rpm::RpmHandler;
+    let main = rpm_main_header_offset(bytes).ok_or_else(|| "not an RPM package".to_string())?;
+    rpm_reject_duplicate_identity_tags(&bytes[main..])?;
+    let header = RpmHandler::parse_rpm_header(bytes).map_err(|e| e.to_string())?;
+    let info = RpmHandler::parse_rpm_repodata_info(bytes).map_err(|e| e.to_string())?;
+    if [&header.name, &header.version, &header.release, &header.arch]
+        .iter()
+        .any(|f| f.is_empty())
+    {
+        return Err("the RPM header does not name the package".to_string());
+    }
+    Ok(RpmHeaderFields {
+        name: header.name,
+        epoch: info.epoch,
+        version: header.version,
+        release: header.release,
+        arch: header.arch,
+    })
+}
+
+/// Offset of the main header structure: past the 96-byte lead and the
+/// signature header, whose store is padded to 8 bytes. `None` unless both
+/// the lead and the signature header carry their magic and the main header
+/// magic is where they say.
+fn rpm_main_header_offset(bytes: &[u8]) -> Option<usize> {
+    const LEAD: usize = 96;
+    if bytes.len() < LEAD + 16 || bytes[..4] != [0xed, 0xab, 0xee, 0xdb] {
+        return None;
+    }
+    let sig = &bytes[LEAD..];
+    if sig[..3] != [0x8e, 0xad, 0xe8] {
+        return None;
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let end = LEAD
+        .checked_add(16)?
+        .checked_add(be(&sig[8..]).checked_mul(16)?)?
+        .checked_add(be(&sig[12..]))?;
+    let main = end.checked_add(7)? & !7;
+    (bytes.len() >= main.checked_add(16)? && bytes[main..main + 3] == [0x8e, 0xad, 0xe8])
+        .then_some(main)
+}
+
+fn rpm_reject_duplicate_identity_tags(header: &[u8]) -> Result<(), String> {
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let nindex = be(&header[8..]) as usize;
+    let index_end = nindex
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(16))
+        .filter(|end| *end <= header.len())
+        .ok_or_else(|| "RPM header truncated".to_string())?;
+    let mut counts = [0usize; RPM_IDENTITY_TAGS.len()];
+    for entry in header[16..index_end].as_chunks::<16>().0 {
+        if let Some(i) = RPM_IDENTITY_TAGS.iter().position(|t| *t == be(entry)) {
+            counts[i] += 1;
+            if counts[i] > 1 {
+                return Err(format!(
+                    "the RPM header lists tag {} twice",
+                    RPM_IDENTITY_TAGS[i]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The release an RPM's dist tag names (#4112): `el9` / `el9_2` (and a
+/// module build's `+el8.9.0+...`) is RHEL 9, `fc40` Fedora 40, `amzn2023` /
+/// `amzn2` Amazon Linux. RHEL rebuilds (Rocky, AlmaLinux, Oracle) carry the
+/// same `el` tag and are graded against the RHEL feed, as the engine itself
+/// grades them. `None` for a release with no dist tag the engine has a feed
+/// for (a third-party package built without one).
+pub(crate) fn rpm_release_from_dist_tag(
+    release: &str,
+) -> Option<crate::services::scanner_service::OsRelease> {
+    use crate::services::scanner_service::OsRelease;
+    release.split(['.', '+']).find_map(|token| {
+        let token = token.split('_').next().unwrap_or(token);
+        [("el", "rhel"), ("fc", "fedora"), ("amzn", "amzn")]
+            .iter()
+            .find_map(|(tag, id)| {
+                let n = token.strip_prefix(tag)?;
+                (!n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| OsRelease::new(id, n))
+                    .flatten()
+            })
+    })
+}
+
+/// An OS package's identity against its request (#4111, #4112, #4113):
+/// `Pinned` when the package's own metadata names the requested package
+/// and a release is known, `Unestablished` otherwise (via `Disagrees` /
+/// `Unreadable`).
+pub(crate) fn os_package_identity(
+    ecosystem: crate::services::scanner_service::ComponentEcosystem,
+    name: &str,
+    version: &str,
+    arch: &str,
+    source: Option<String>,
+    release: Option<crate::services::scanner_service::OsRelease>,
+) -> ArchiveIdentity {
+    let Some(release) = release else {
+        return ArchiveIdentity::Unreadable(format!(
+            "no distribution release the scanner grades could be determined for {name} {version}"
+        ));
+    };
+    let context = crate::services::scanner_service::OsPackageContext {
+        release,
+        arch: arch.to_string(),
+        source,
+    };
+    match ExpectedComponent::os_package(ecosystem, name, version, context) {
+        Some(pin) => ArchiveIdentity::Pinned(pin),
+        None => ArchiveIdentity::Unreadable(format!("{name} {version} cannot be pinned")),
+    }
 }
 
 /// Shared DB-backed scenarios for the archive formats' scan-on-proxy suites
@@ -798,6 +1339,112 @@ pub(crate) mod test_support {
         };
     }
     pub(crate) use archive_scan_suite;
+
+    /// A minimal `.rpm` (lead, empty signature header, main header) naming
+    /// `name-[epoch:]version-release.arch`, for the RPM identity tests.
+    /// `extra` appends more `(tag, string)` entries, e.g. a second NAME.
+    pub(crate) fn minimal_rpm(
+        name: &str,
+        epoch: Option<u32>,
+        version: &str,
+        release: &str,
+        arch: &str,
+        extra: &[(u32, &str)],
+    ) -> Vec<u8> {
+        let mut lead = vec![0u8; 96];
+        lead[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        lead[4] = 3;
+        lead[10..10 + name.len().min(65)].copy_from_slice(&name.as_bytes()[..name.len().min(65)]);
+        lead[78..80].copy_from_slice(&5u16.to_be_bytes());
+        let header = |entries: &[(u32, u32, Vec<u8>)]| {
+            let mut index = Vec::new();
+            let mut store = Vec::new();
+            for (tag, ty, data) in entries {
+                if *ty == 4 {
+                    while !store.len().is_multiple_of(4) {
+                        store.push(0);
+                    }
+                }
+                index.extend_from_slice(&tag.to_be_bytes());
+                index.extend_from_slice(&ty.to_be_bytes());
+                index.extend_from_slice(&(store.len() as u32).to_be_bytes());
+                index.extend_from_slice(&1u32.to_be_bytes());
+                store.extend_from_slice(data);
+            }
+            let mut out = vec![0x8e, 0xad, 0xe8, 0x01, 0, 0, 0, 0];
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            out.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            out.extend_from_slice(&index);
+            out.extend_from_slice(&store);
+            out
+        };
+        let s = |v: &str| {
+            let mut b = v.as_bytes().to_vec();
+            b.push(0);
+            b
+        };
+        let mut entries = vec![
+            (1000, 6, s(name)),
+            (1001, 6, s(version)),
+            (1002, 6, s(release)),
+            (1022, 6, s(arch)),
+        ];
+        if let Some(epoch) = epoch {
+            entries.push((1003, 4, epoch.to_be_bytes().to_vec()));
+        }
+        for (tag, value) in extra {
+            entries.push((*tag, 6, s(value)));
+        }
+        let mut rpm = lead;
+        let signature = header(&[]);
+        rpm.extend_from_slice(&signature);
+        while !rpm.len().is_multiple_of(8) {
+            rpm.push(0);
+        }
+        rpm.extend_from_slice(&header(&entries));
+        rpm.extend_from_slice(b"(payload)");
+        rpm
+    }
+
+    /// A minimal `.deb` with `control` as its control file, built from the
+    /// given `(ar member name, bytes)` list after `debian-binary`.
+    pub(crate) fn deb_with_members(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut deb = b"!<arch>\n".to_vec();
+        crate::api::handlers::debian::append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+        for (name, body) in members {
+            crate::api::handlers::debian::append_ar_member(&mut deb, name, body);
+        }
+        deb
+    }
+
+    /// A gzipped control tarball holding `entries` (`(path, body)`).
+    pub(crate) fn control_tar_gz_entries(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, body.as_bytes())
+                .unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A `.deb` whose control file is `control` (one `./control` entry).
+    pub(crate) fn deb_with_control(control: &str) -> Vec<u8> {
+        deb_with_members(&[
+            (
+                "control.tar.gz",
+                control_tar_gz_entries(&[("./control", control)]),
+            ),
+            ("data.tar.gz", control_tar_gz_entries(&[])),
+        ])
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -902,5 +1549,250 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("x-1.0.zip"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Operating-system package readers (#4111, #4112)
+    // -----------------------------------------------------------------------
+
+    use super::test_support::{
+        control_tar_gz_entries, deb_with_control, deb_with_members, minimal_rpm,
+    };
+
+    const CONTROL: &str = "Package: libssl3\nSource: openssl (3.0.11-1~deb12u2)\n\
+        Version: 3.0.11-1~deb12u2\nArchitecture: amd64\nDescription: x\n extended\n";
+
+    #[test]
+    fn a_deb_control_is_read_with_its_source() {
+        let fields = read_deb_control(&deb_with_control(CONTROL)).unwrap();
+        assert_eq!(fields.package, "libssl3");
+        assert_eq!(fields.version, "3.0.11-1~deb12u2");
+        assert_eq!(fields.architecture, "amd64");
+        assert_eq!(
+            fields
+                .source
+                .as_deref()
+                .and_then(deb_source_name)
+                .as_deref(),
+            Some("openssl")
+        );
+        // `control.tar` may be uncompressed, and the entry may lack `./`.
+        let plain = {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(CONTROL.len() as u64);
+            h.set_cksum();
+            tar.append_data(&mut h, "control", CONTROL.as_bytes())
+                .unwrap();
+            tar.into_inner().unwrap()
+        };
+        let deb = deb_with_members(&[
+            ("control.tar", plain),
+            ("data.tar.gz", control_tar_gz_entries(&[])),
+        ]);
+        assert_eq!(read_deb_control(&deb).unwrap().package, "libssl3");
+    }
+
+    /// Input validation: a `.deb` that could be read as two different
+    /// packages is not read as either.
+    #[test]
+    fn a_deb_with_duplicated_metadata_is_refused() {
+        let other = CONTROL.replace("libssl3", "other");
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "two control entries",
+                deb_with_members(&[
+                    (
+                        "control.tar.gz",
+                        control_tar_gz_entries(&[("./control", CONTROL), ("control", &other)]),
+                    ),
+                    ("data.tar.gz", control_tar_gz_entries(&[])),
+                ]),
+            ),
+            (
+                "two control.tar members",
+                deb_with_members(&[
+                    (
+                        "control.tar.gz",
+                        control_tar_gz_entries(&[("./control", CONTROL)]),
+                    ),
+                    (
+                        "control.tar.xz",
+                        control_tar_gz_entries(&[("./control", &other)]),
+                    ),
+                    ("data.tar.gz", control_tar_gz_entries(&[])),
+                ]),
+            ),
+            (
+                "one member twice",
+                deb_with_members(&[
+                    (
+                        "control.tar.gz",
+                        control_tar_gz_entries(&[("./control", CONTROL)]),
+                    ),
+                    (
+                        "control.tar.gz",
+                        control_tar_gz_entries(&[("./control", &other)]),
+                    ),
+                    ("data.tar.gz", control_tar_gz_entries(&[])),
+                ]),
+            ),
+            (
+                "a field twice",
+                deb_with_control(&format!("{CONTROL}Package: other\n")),
+            ),
+            (
+                "two paragraphs",
+                deb_with_control(&format!("{CONTROL}\nPackage: other\nVersion: 1\n")),
+            ),
+            (
+                "no data.tar",
+                deb_with_members(&[(
+                    "control.tar.gz",
+                    control_tar_gz_entries(&[("./control", CONTROL)]),
+                )]),
+            ),
+            ("not an ar archive", b"PK\x03\x04".to_vec()),
+        ];
+        for (what, deb) in cases {
+            assert!(read_deb_control(&deb).is_err(), "{what}");
+        }
+        // debian-binary must come first.
+        let mut swapped = b"!<arch>\n".to_vec();
+        crate::api::handlers::debian::append_ar_member(
+            &mut swapped,
+            "control.tar.gz",
+            &control_tar_gz_entries(&[("./control", CONTROL)]),
+        );
+        crate::api::handlers::debian::append_ar_member(&mut swapped, "debian-binary", b"2.0\n");
+        assert!(read_deb_control(&swapped).is_err());
+    }
+
+    #[test]
+    fn the_release_an_apt_release_document_names() {
+        let label = |text: &str| os_release_from_apt_release(text).map(|r| r.label());
+        assert_eq!(
+            label(
+                "Origin: Debian\nLabel: Debian\nSuite: stable\nVersion: 12.7\nCodename: bookworm\n"
+            ),
+            Some("debian:12".to_string())
+        );
+        assert_eq!(
+            label("Origin: Debian\nLabel: Debian-Security\nSuite: stable-security\nCodename: bookworm-security\n"),
+            Some("debian:12".to_string())
+        );
+        assert_eq!(
+            label("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Ubuntu\nSuite: jammy-updates\nVersion: 22.04\nCodename: jammy\n"),
+            Some("ubuntu:22.04".to_string())
+        );
+        assert_eq!(
+            label("Origin: Ubuntu\nCodename: noble-security\n"),
+            Some("ubuntu:24.04".to_string())
+        );
+        for text in [
+            "Origin: Debian\nSuite: unstable\nCodename: sid\n",
+            "Origin: Proxmox\nVersion: 8\nCodename: bookworm\n",
+            "Codename: bookworm\n",
+            "",
+        ] {
+            assert_eq!(label(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_release_a_debian_version_names() {
+        let label = |v: &str| debian_release_from_version(v).map(|r| r.label());
+        assert_eq!(label("3.0.11-1~deb12u2"), Some("debian:12".to_string()));
+        assert_eq!(label("1:9.2p1-2+deb12u3"), Some("debian:12".to_string()));
+        assert_eq!(label("5.10.0-1~bpo11+1"), Some("debian:11".to_string()));
+        assert_eq!(label("3.0.2-0ubuntu1.10"), None);
+        assert_eq!(label("2.10-3"), None);
+        assert_eq!(strip_version_epoch("1:2.3-4"), "2.3-4");
+        assert_eq!(strip_version_epoch("2.3-4"), "2.3-4");
+    }
+
+    #[test]
+    fn an_rpm_header_is_read_with_its_epoch() {
+        let rpm = minimal_rpm("openssl-libs", Some(1), "3.0.7", "17.el9_2", "x86_64", &[]);
+        let fields = read_rpm_identity(&rpm).unwrap();
+        assert_eq!(fields.name, "openssl-libs");
+        assert_eq!(fields.evr(), "1:3.0.7-17.el9_2");
+        assert_eq!(fields.arch, "x86_64");
+        let no_epoch = minimal_rpm("zlib", None, "1.2.11", "40.el9", "x86_64", &[]);
+        assert_eq!(read_rpm_identity(&no_epoch).unwrap().evr(), "1.2.11-40.el9");
+    }
+
+    /// Input validation: an RPM header listing an identity tag twice could
+    /// be read as two packages, so it is not read as either.
+    #[test]
+    fn an_rpm_with_a_duplicated_identity_tag_is_refused() {
+        for tag in [1000, 1001, 1002, 1022, 1044] {
+            let mut extra = vec![(tag, "other")];
+            if tag == 1044 {
+                extra.push((1044, "other.src.rpm"));
+            }
+            let rpm = minimal_rpm("zlib", None, "1.2.11", "40.el9", "x86_64", &extra);
+            assert!(read_rpm_identity(&rpm).is_err(), "tag {tag}");
+        }
+        assert!(read_rpm_identity(b"not an rpm at all, but long enough to have a lead............................................................................").is_err());
+    }
+
+    #[test]
+    fn the_release_an_rpm_dist_tag_names() {
+        let label = |r: &str| rpm_release_from_dist_tag(r).map(|o| o.label());
+        assert_eq!(label("17.el9_2"), Some("rhel:9".to_string()));
+        assert_eq!(label("18.el9"), Some("rhel:9".to_string()));
+        assert_eq!(
+            label("1.module+el8.9.0+19866+c66e6db2"),
+            Some("rhel:8".to_string())
+        );
+        assert_eq!(label("1.0.1.el9_2"), Some("rhel:9".to_string()));
+        assert_eq!(label("1.fc40"), Some("fedora:40".to_string()));
+        assert_eq!(label("1.amzn2023.0.2"), Some("amzn:2023".to_string()));
+        assert_eq!(label("2.amzn2"), Some("amzn:2".to_string()));
+        for release in ["1", "1.mga9", "1.elvish", "3.x86_64", ""] {
+            assert_eq!(label(release), None, "{release:?}");
+        }
+    }
+
+    #[test]
+    fn an_os_package_is_pinned_only_with_a_release() {
+        use crate::services::scanner_service::{ComponentEcosystem, OsRelease};
+        let release = OsRelease::new("debian", "12");
+        let pinned = os_package_identity(
+            ComponentEcosystem::Debian,
+            "libssl3",
+            "3.0.11-1~deb12u2",
+            "amd64",
+            Some("openssl".to_string()),
+            release,
+        );
+        let ArchiveIdentity::Pinned(pin) = pinned else {
+            panic!("pinned: {pinned:?}");
+        };
+        assert_eq!(pin.os.as_ref().unwrap().release.label(), "debian:12");
+        assert_eq!(pin.os.as_ref().unwrap().source.as_deref(), Some("openssl"));
+        assert!(matches!(
+            os_package_identity(
+                ComponentEcosystem::Debian,
+                "libssl3",
+                "3.0.11-1",
+                "amd64",
+                None,
+                None
+            ),
+            ArchiveIdentity::Unreadable(_)
+        ));
+        assert!(matches!(
+            os_package_identity(
+                ComponentEcosystem::Debian,
+                "libssl3",
+                "3.0 11",
+                "amd64",
+                None,
+                OsRelease::new("debian", "12")
+            ),
+            ArchiveIdentity::Unreadable(_)
+        ));
     }
 }

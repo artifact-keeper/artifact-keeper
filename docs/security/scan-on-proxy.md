@@ -83,22 +83,66 @@ inconclusive and are not scanned, so no verdict is recorded for them:
 `423` under `fail_closed`, served `pending` under `fail_open` and
 `record_only`.
 
-What happens next differs from npm or Cargo. The scanner has no pin for
-these ecosystems, and the bundled engine does not catalog a module zip or a
-dist archive as itself, so it cannot look up the requested module's or
-package's own advisories. It grades what the archive contains instead: the
-requirements in a module's `go.mod`, a `composer.lock` or `installed.json`
-shipped in a dist, a `conanfile.txt` or `conan.lock` in a recipe's
-sources, a binary in a package, a vendored package of any ecosystem it
-recognises. A
-finding is `vulnerable` as usual. A scan that ran to completion and found
-nothing is `clean`, recorded with how many components were cataloged (often
-`0`) and reused like any other verdict. See [Known gaps](#known-gaps).
+The bundled engine does not catalog a module zip, a dist archive or a Conan
+archive as itself. For Go, Composer and Conan the gate therefore pins the
+requested coordinate, as it does for npm or Cargo: the scan workspace gets a
+one-line `go.mod` that requires `{module} {version}`, a `composer.lock`
+naming the requested package and version, or a `conan.lock` requiring the
+requested `name/version` (#4952). The engine grades that coordinate itself
+(an advisory against `golang.org/x/text v0.3.0`, pulled as its own module
+zip, blocks it), and it must catalog it before a `clean` verdict counts.
+A coordinate the pin file cannot carry exactly (a space, a quote, a newline)
+is inconclusive and not scanned.
+
+The archive is still graded on what it contains too: the requirements in a
+module's `go.mod`, a `composer.lock` or `installed.json` shipped in a dist,
+a `conanfile.txt` or `conan.lock` in a recipe's sources, a binary in a
+package, a vendored package of any ecosystem the engine recognises. CocoaPods
+and Swift have no pin and are graded on their contents alone: a scan that ran
+to completion and found nothing is `clean`, recorded with how many components
+were cataloged (often `0`) and reused like any other verdict. See
+[Known gaps](#known-gaps).
 
 **Pub.** A Pub archive's root `pubspec.yaml` must declare the requested
 name and version, or the archive is inconclusive and not scanned. The
 bundled engine catalogs a `pubspec.yaml` as the package it declares, so an
 archive that agrees is graded as that package version.
+
+**Operating-system packages (Debian, RPM).** A Debian or RPM package is
+graded by the scanner only against the advisory feed of one distribution
+release (`debian:12`, `ubuntu:22.04`, `rhel:9`), and a lone package file
+names none. The gate therefore checks the package against the request,
+determines the release, and writes a synthetic installed system into the scan
+workspace: an `etc/os-release` naming the release, plus, for Debian, a
+one-entry `var/lib/dpkg/status` built from the package's own `control` (the
+scanner reads an RPM's own header). The package is graded as itself, through
+its source package too (`libssl3` is graded as `openssl`).
+
+- *Identity.* A `.deb`'s own `control` must name the package, version (a pool
+  file name carries no epoch) and architecture of the requested file name; an
+  `.rpm`'s own header must name its name, version, release and architecture.
+  Bytes that disagree, that are not a readable package, or whose metadata can
+  be read in more than one way (two `control.tar` members, two `control`
+  entries, a field or an RPM header tag given twice) are inconclusive and not
+  scanned.
+- *Release, Debian.* The release the remote's own cached `Release` /
+  `InRelease` names (`Origin` Debian or Ubuntu, then `Version` or
+  `Codename`), for the suite whose cached `Packages` index lists the file, or
+  else the one release every cached suite of the remote agrees on; failing
+  both, a stable-update or backport version (`+deb12u1`, `~bpo12+1`). The
+  remote's `Release` is cached by any `apt update` through it.
+- *Release, RPM.* The dist tag in the package's release: `el9` / `el9_2` is
+  RHEL 9 (RHEL rebuilds such as Rocky, AlmaLinux and Oracle Linux are graded
+  against the RHEL feed, as the scanner itself grades them), `fc40` Fedora 40,
+  `amzn2023` Amazon Linux 2023.
+- A package for which no release the scanner has a feed for can be
+  determined is inconclusive and not scanned: `423` under `fail_closed`,
+  served `pending` under `fail_open` and `record_only`. See
+  [Known gaps](#known-gaps).
+- *Debian `Packages` digest.* When a cached `Packages` index records the
+  file's SHA-256 (#2459), bytes that do not match it are evicted from the
+  proxy cache and refused with `502` before the gate, as before for the
+  unscanned path.
 
 **Packages the scanner does not catalog as themselves (conda).** For npm,
 PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
@@ -142,7 +186,11 @@ upstream request:
   sbt and NuGet routes, a client path containing any `?`,
   `#`, `;`, `\`, a control character or a `%` that is not a valid `%XX`
   escape is refused. The format routes also refuse raw spaces; the generic
-  route allows them, since stored file names may contain them.
+  route allows them, since stored file names may contain them. Since
+  1.12.0 the same check runs on every Remote and Virtual route of Go,
+  RubyGems, Composer, Pub, Conan, CocoaPods, Swift, Debian (pool, `dists/`
+  and flat layouts) and RPM (`/packages/` and the catch-all, metadata
+  included).
 - *The upstream path ProxyService builds.* Every relative upstream path a
   Remote fetch sends, for every format, is refused if its path part contains
   `#`, `;`, `\`, a control character, a stray `%` or a trailing space, or if
@@ -263,20 +311,20 @@ have no core proxy path to gate.
 | `npm` | `npm`, `yarn`, `bower`, `pnpm` | enforced | Package tarballs, Remote and Virtual. |
 | `pypi` | `pypi`, `poetry`, `jupyter` | enforced | Package files (wheels and sdists), Remote and Virtual. |
 | `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned; against a V2 upstream, which has no separate manifest, the flat container answers only the `.nupkg` itself. |
-| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
+| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded as the requested `module@version` and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
 | `rubygems` | `rubygems` | enforced | `.gem` downloads, Remote and Virtual. The gem is graded as the `{name}-{version}` its file name names, which its gemspec must declare. Spec indexes and the JSON API are not gated. |
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
 | `helm` | `helm` | accepted | |
-| `rpm` | `rpm` | accepted | |
-| `debian` | `debian` | accepted | |
-| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
+| `rpm` | `rpm` | enforced | Every file on the `/packages/` route and the catch-all, Remote and Virtual, except repository metadata and signing material (anything under `repodata/`, `repomd.xml` and its signature and key, `.treeinfo`, `media.repo`, `RPM-GPG-KEY*`, `.asc`/`.sig`/`.gpg`/`.key` files). An `.rpm` is graded as itself on the release its dist tag names (see [Operating-system packages](#what-the-gate-does)); any other file (a `.drpm`, an installer image) is inconclusive. A package of a published `@N` snapshot is served checksum-verified against the snapshot and is not gated. |
+| `debian` | `debian` | enforced | Every `pool/` file except `.dsc`, `.buildinfo` and `.changes`, and the `.deb`/`.udeb`/`.ddeb` packages of a `dists/` or flat layout, Remote and Virtual. A binary package is graded as itself on the release the remote's `Release` names (see [Operating-system packages](#what-the-gate-does)); a source tarball or diff is inconclusive. `Release`, `InRelease`, `Packages`, `Sources` and every other index are not gated. |
+| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded as the requested `name/version` and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
 | `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
-| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
+| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded as the requested package version and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
 | `cocoapods` | `cocoapods` | enforced | Pod archives on the `pods/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). The pod's own `.podspec.json` must declare the requested name and version. Specs and CDN index files are not gated. |
 | `swift` | `swift` | enforced | Source archives (`{scope}/{name}/{version}.zip`), Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Release metadata, release lists and `Package.swift` are not gated. |
@@ -348,13 +396,36 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
-- **Go modules, Composer packages and Conan references are not graded as
-  themselves.** A module zip, a dist archive or a Conan archive is graded on what it contains (see
-  [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
-  An advisory against the requested module or package itself (for example
-  `golang.org/x/text v0.3.0`, pulled as its own module zip) is not found, and
-  the pull is `clean` unless something inside the archive is vulnerable.
-  Grading the coordinate itself needs a scanner pin for these ecosystems.
+- **One verdict per digest across coordinates.** Verdicts are stored per
+  content digest. A Conan archive carries no reference of its own and a
+  Composer dist usually declares no version, so byte-identical archives
+  requested under two references (or two versions of one package) share the
+  verdict of the first one graded. The same holds for an OS package file
+  published unchanged in two releases (an `Architecture: all` package in two
+  Debian suites): it carries the verdict of the release it was first graded
+  against.
+- **Conan references are graded by name and version only.** The Conan pin
+  is the requested `name/version`; the user, channel and revisions are not
+  part of what the engine grades, so two revisions of one version get the
+  same advisories.
+- **OS packages need a release the scanner has a feed for.** A Debian
+  package from a remote whose `Release` names another origin (a vendor
+  repository built on Debian) and whose version names no Debian release, an
+  RPM without an `el`, `fc` or `amzn` dist tag (a third-party package), and a
+  package of a release the bundled scanner has no feed for (Debian `sid`) are
+  inconclusive: `423` under `fail_closed`, served `pending` and never given a
+  verdict under `fail_open`. A Debian Remote that has never served its
+  `Release` (no `apt update` through it) falls back to the version, so a
+  package of the base release (`2.10-3`) is inconclusive until one has.
+- **Debian source packages and RPM non-packages are inconclusive.** Under
+  `fail_closed` a scanning Debian Remote withholds source tarballs and diffs
+  from `pool/` (`apt-get source` fails), and a scanning RPM Remote withholds
+  every file that is not an `.rpm` and not repository metadata (`.drpm`
+  deltas, installer trees under `images/` or `LiveOS/`).
+- **Debian and RPM rows in a Remote repository.** As for NuGet, an
+  `artifacts` row a Remote repository holds for a package path (from
+  replication or a publish into the remote) is served from storage without
+  the gate.
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

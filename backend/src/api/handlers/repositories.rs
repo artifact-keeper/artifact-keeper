@@ -28057,7 +28057,7 @@ mod tests {
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
-        for format in [Generic, Github, Helm, Hex, Debian] {
+        for format in [Generic, Github, Helm, Hex, Cran] {
             assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
     }
