@@ -108,23 +108,27 @@ name and version, or the archive is inconclusive and not scanned. The
 bundled engine catalogs a `pubspec.yaml` as the package it declares, so an
 archive that agrees is graded as that package version.
 
-**Operating-system packages (Debian, RPM).** A Debian or RPM package is
-graded by the scanner only against the advisory feed of one distribution
-release (`debian:12`, `ubuntu:22.04`, `rhel:9`), and a lone package file
-names none. The gate therefore checks the package against the request,
-determines the release, and writes a synthetic installed system into the scan
-workspace: an `etc/os-release` naming the release, plus, for Debian, a
-one-entry `var/lib/dpkg/status` built from the package's own `control` (the
-scanner reads an RPM's own header). The package is graded as itself, through
-its source package too (`libssl3` is graded as `openssl`).
+**Operating-system packages (Debian, RPM, Alpine).** A Debian, RPM or Alpine
+package is graded by the scanner only against the advisory feed of one
+distribution release (`debian:12`, `ubuntu:22.04`, `rhel:9`, `alpine:3.19`),
+and a lone package file names none. The gate therefore checks the package
+against the request, determines the release, and writes a synthetic installed
+system into the scan workspace: an `etc/os-release` naming the release, plus,
+for Debian, a one-entry `var/lib/dpkg/status` built from the package's own
+`control`, and for Alpine a one-entry `lib/apk/db/installed` built from its
+own `.PKGINFO` (the scanner reads an RPM's own header). The package is graded
+as itself, through its source package too (`libssl3` is graded as `openssl`,
+and so is Alpine's `libcrypto3` through its `origin`).
 
 - *Identity.* A `.deb`'s own `control` must name the package, version (a pool
   file name carries no epoch) and architecture of the requested file name; an
-  `.rpm`'s own header must name its name, version, release and architecture.
+  `.rpm`'s own header must name its name, version, release and architecture;
+  an `.apk`'s own `.PKGINFO` must name exactly the requested
+  `{pkgname}-{pkgver}.apk`, for the requested architecture or `noarch`.
   Bytes that disagree, that are not a readable package, or whose metadata can
   be read in more than one way (two `control.tar` members, two `control`
-  entries, a field or an RPM header tag given twice) are inconclusive and not
-  scanned.
+  entries, two `.PKGINFO` entries, a field or an RPM header tag given twice)
+  are inconclusive and not scanned.
 - *Release, Debian.* The release the remote's own cached `Release` /
   `InRelease` names (`Origin` Debian or Ubuntu, then `Version` or
   `Codename`), for the suite whose cached `Packages` index lists the file, or
@@ -135,6 +139,8 @@ its source package too (`libssl3` is graded as `openssl`).
   RHEL 9 (RHEL rebuilds such as Rocky, AlmaLinux and Oracle Linux are graded
   against the RHEL feed, as the scanner itself grades them), `fc40` Fedora 40,
   `amzn2023` Amazon Linux 2023.
+- *Release, Alpine.* The requested branch: `v3.19` is Alpine 3.19, `edge`
+  is edge. A branch such as `latest-stable` names no fixed release.
 - A package for which no release the scanner has a feed for can be
   determined is inconclusive and not scanned: `423` under `fail_closed`,
   served `pending` under `fail_open` and `record_only`. See
@@ -189,8 +195,8 @@ upstream request:
   route allows them, since stored file names may contain them. Since
   1.12.0 the same check runs on every Remote and Virtual route of Go,
   RubyGems, Composer, Pub, Conan, CocoaPods, Swift, Debian (pool, `dists/`
-  and flat layouts) and RPM (`/packages/` and the catch-all, metadata
-  included).
+  and flat layouts), RPM (`/packages/` and the catch-all, metadata
+  included) and Alpine.
 - *The upstream path ProxyService builds.* Every relative upstream path a
   Remote fetch sends, for every format, is refused if its path part contains
   `#`, `;`, `\`, a control character, a stray `%` or a trailing space, or if
@@ -322,7 +328,7 @@ have no core proxy path to gate.
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
 | `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
-| `alpine` | `alpine` | accepted | |
+| `alpine` | `alpine` | enforced | `.apk` downloads on the `{branch}/{repository}/{arch}/` route, Remote and Virtual, graded as themselves on the release the branch names (see [Operating-system packages](#what-the-gate-does)). `APKINDEX.tar.gz` and the signing key are not gated. |
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
 | `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded as the requested package version and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
@@ -411,8 +417,10 @@ have no core proxy path to gate.
 - **OS packages need a release the scanner has a feed for.** A Debian
   package from a remote whose `Release` names another origin (a vendor
   repository built on Debian) and whose version names no Debian release, an
-  RPM without an `el`, `fc` or `amzn` dist tag (a third-party package), and a
-  package of a release the bundled scanner has no feed for (Debian `sid`) are
+  RPM without an `el`, `fc` or `amzn` dist tag (a third-party package), an Alpine
+  package requested through a branch that names no release (`latest-stable`),
+  and a package of a release the bundled scanner has no feed for (Debian
+  `sid`) are
   inconclusive: `423` under `fail_closed`, served `pending` and never given a
   verdict under `fail_open`. A Debian Remote that has never served its
   `Release` (no `apt update` through it) falls back to the version, so a

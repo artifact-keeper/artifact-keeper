@@ -24094,6 +24094,26 @@ mod proxy_download_recording_tests {
                 "serve_scanned_proxy_file(",
                 1,
             ),
+            // #4113: Alpine packages, Remote and Virtual, and the Remote's
+            // re-fetch when a cached row's blob is unreadable.
+            (
+                "alpine.rs",
+                "download_package",
+                "serve_scanned_apk_download(",
+                2,
+            ),
+            (
+                "alpine.rs",
+                "serve_scanned_apk_download",
+                "serve_scanned_apk(",
+                1,
+            ),
+            (
+                "alpine.rs",
+                "serve_scanned_apk",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
         ];
         // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
         // from its first `{`).

@@ -254,6 +254,7 @@ mod tests {
             "swift",
             "debian",
             "rpm",
+            "alpine",
         ] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
