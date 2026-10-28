@@ -3466,12 +3466,25 @@ async fn build_virtual_shard_index(
         .filter(|m| m.repo_type != RepositoryType::Remote)
         .map(|m| m.id)
         .collect();
+    let hosted_members: Vec<(uuid::Uuid, String)> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| (m.id, m.key.clone()))
+        .collect();
     let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
-    // The hosted shards (by address) are the hosted generation.
+    // The hosted shards (by address) are the hosted generation; the
+    // allowlist, whose stored value is in the key, filters them below.
     key.part(&(hosted.len() as u64).to_le_bytes());
     for (name, shard) in &hosted {
         key.part(name.as_bytes()).part(&shard_address(shard));
     }
+    let (hosted, hosted_not_allowed, hosted_dropped) =
+        match virtual_merge::hosted_allowlist(allowlist.as_deref()) {
+            Some(list) => {
+                admit_hosted_shards(&state.db, &hosted_members, subdir, list, hosted).await?
+            }
+            None => (hosted, 0, Vec::new()),
+        };
 
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
@@ -3488,6 +3501,11 @@ async fn build_virtual_shard_index(
                 let subdir = subdir.as_str();
                 let mut shards: BTreeMap<String, Vec<u8>> = BTreeMap::new();
                 let mut sources: HashMap<String, VirtualShardSource> = HashMap::new();
+                let mut dropped = virtual_merge::MergeDrops {
+                    not_allowed: hosted_not_allowed,
+                    ..Default::default()
+                };
+                count_hosted_allowlist_drops(&virtual_repo_key, hosted_dropped);
                 for (name, shard) in hosted {
                     shards.insert(name.clone(), shard_address(&shard).to_vec());
                     sources.insert(name, VirtualShardSource::Hosted(shard));
@@ -3504,7 +3522,6 @@ async fn build_virtual_shard_index(
                 };
                 let mut validators = Vec::new();
                 let mut all_validated = true;
-                let mut dropped = virtual_merge::MergeDrops::default();
                 let index_path = format!("{subdir}/{SHARD_INDEX_FILE}");
                 for member in members
                     .iter()
@@ -3658,6 +3675,72 @@ async fn build_virtual_shard_index(
         )
         .await
         .map_err(merge_gate::SharedResponse::into_response)
+}
+
+/// The hosted shards of a virtual under an allowlist that applies to hosted
+/// members (#5055). A name the list admits whole keeps its shard. Any other
+/// name is rebuilt from the members' rows, keeping only the records the list
+/// admits (the rule `repodata.json` applies): its shard is a new one, or
+/// none when no record is admitted. A hosted shard is ours to rebuild, unlike
+/// a remote one, which a virtual can only list whole or not at all. Returns
+/// the shards kept, the number of hosted names left out entirely, and one
+/// member key per hosted record dropped (for
+/// `ak_conda_allowlist_dropped_total`, counted when the merge runs).
+async fn admit_hosted_shards(
+    db: &sqlx::PgPool,
+    members: &[(uuid::Uuid, String)],
+    subdir: &str,
+    allowlist: &crate::services::conda_allowlist::CompiledAllowlist,
+    hosted: BTreeMap<String, Vec<u8>>,
+) -> Result<(BTreeMap<String, Vec<u8>>, usize, Vec<String>), Response> {
+    let mut kept = BTreeMap::new();
+    let mut rebuild: HashSet<String> = HashSet::new();
+    for (name, shard) in hosted {
+        if allowlist.admits_all_versions(&name, subdir) {
+            kept.insert(name, shard);
+        } else {
+            rebuild.insert(name);
+        }
+    }
+    if rebuild.is_empty() {
+        return Ok((kept, 0, Vec::new()));
+    }
+    let mut lists = Vec::with_capacity(members.len());
+    for (id, _) in members {
+        lists.push(list_conda_artifacts(db, *id).await?);
+    }
+    let mut seen = HashSet::new();
+    let mut admitted: Vec<&CondaArtifact> = Vec::new();
+    let mut dropped = Vec::new();
+    for ((_, member_key), artifacts) in members.iter().zip(&lists) {
+        for artifact in artifacts_for_subdir(artifacts, subdir) {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if !is_conda_package(filename) || !seen.insert(filename) {
+                continue;
+            }
+            let name = artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+                .unwrap_or(&artifact.name);
+            if !rebuild.contains(name) {
+                continue;
+            }
+            if hosted_artifact_is_admitted(allowlist, artifact, filename, subdir) {
+                admitted.push(artifact);
+            } else {
+                dropped.push(member_key.clone());
+            }
+        }
+    }
+    let mut not_allowed = rebuild.len();
+    for (name, artifacts) in group_artifacts_by_name(&admitted) {
+        if rebuild.contains(&name) {
+            kept.insert(name, encode_shard(&build_shard(subdir, &artifacts))?);
+            not_allowed -= 1;
+        }
+    }
+    Ok((kept, not_allowed, dropped))
 }
 
 /// Serve a virtual channel's merged shard index under its member-failure
@@ -4742,6 +4825,49 @@ async fn virtual_allowlist_with_source(
         })
 }
 
+/// Whether the allowlist admits a hosted row as a virtual serves it (#5055):
+/// by its filename and by the identity its repodata record carries (the
+/// metadata `name` and `version`, else the row's), the rule
+/// [`virtual_merge`] applies to every record.
+fn hosted_artifact_is_admitted(
+    allowlist: &crate::services::conda_allowlist::CompiledAllowlist,
+    artifact: &CondaArtifact,
+    filename: &str,
+    subdir: &str,
+) -> bool {
+    let meta = artifact.metadata.as_ref();
+    let name = meta
+        .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+        .unwrap_or(&artifact.name);
+    let version = meta
+        .and_then(|m| m.get("version").and_then(|v| v.as_str()))
+        .or(artifact.version.as_deref());
+    virtual_merge::identity_is_admitted(subdir, filename, Some(name), version, allowlist)
+}
+
+/// The subdir a hosted row belongs to: its metadata's `subdir`, else the
+/// first segment of its path (the rule [`artifacts_for_subdir`] applies).
+fn artifact_subdir(artifact: &CondaArtifact) -> &str {
+    artifact
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("subdir").and_then(|v| v.as_str()))
+        .unwrap_or_else(|| artifact.path.split('/').next().unwrap_or(""))
+}
+
+/// Count the hosted records (or names) a virtual's allowlist left out of one
+/// merge, per hosted member (#5055), in `ak_conda_allowlist_dropped_total`.
+/// `members` holds one member key per drop.
+fn count_hosted_allowlist_drops(virtual_repo_key: &str, members: Vec<String>) {
+    let mut per_member: BTreeMap<String, usize> = BTreeMap::new();
+    for member in members {
+        *per_member.entry(member).or_default() += 1;
+    }
+    for (member, count) in per_member {
+        virtual_merge::count_allowlist_drops(virtual_repo_key, &member, count);
+    }
+}
+
 /// What a virtual merge reads before it fetches any member, and the merge key
 /// those inputs determine so far (#4608).
 struct VirtualMergeInputs {
@@ -4974,7 +5100,9 @@ where
     )
     .await?;
 
+    let hosted_list = virtual_merge::hosted_allowlist(allowlist.as_deref());
     let mut hosted = Vec::new();
+    let mut hosted_dropped: Vec<String> = Vec::new();
     for member in members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
@@ -4985,8 +5113,19 @@ where
             if !is_conda_package(filename) {
                 continue;
             }
+            // #5055: the allowlist is applied to hosted records by the
+            // hosted row's identity (the repodata record's `name` and
+            // `version`), whichever document `entry` renders, so
+            // run_exports.json drops exactly what repodata.json drops.
+            if let Some(list) = hosted_list {
+                if !hosted_artifact_is_admitted(list, artifact, filename, subdir) {
+                    hosted_dropped.push(member.key.clone());
+                    continue;
+                }
+            }
             let record = entry(artifact, filename, subdir);
             hosted.push(virtual_merge::HostedRecord {
+                member: member.key.clone(),
                 filename: filename.to_string(),
                 is_v2: is_conda_v2(filename),
                 record: serde_json::value::to_raw_value(&record)
@@ -5033,7 +5172,9 @@ where
                 let enforced = allowlist.is_some();
                 let merge_subdir = subdir.clone();
                 let merge_virtual_key = virtual_repo_key.clone();
-                let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
+                let hosted_not_allowed = hosted_dropped.len();
+                count_hosted_allowlist_drops(&virtual_repo_key, hosted_dropped);
+                let (body, parse_failures, mut dropped) = tokio::task::spawn_blocking(move || {
                     merge(
                         &merge_virtual_key,
                         &merge_subdir,
@@ -5045,6 +5186,7 @@ where
                 })
                 .await
                 .map_err(virtual_merge::internal_error)?;
+                dropped.not_allowed += hosted_not_allowed;
                 if dropped.owned > 0 {
                     tracing::info!(
                         virtual_repo = %virtual_repo_key,
@@ -5060,7 +5202,8 @@ where
                         subdir = %subdir,
                         kind = kind.label(),
                         dropped = dropped.not_allowed,
-                        "excluded remote conda records the virtual's allowlist does not admit"
+                        hosted = hosted_not_allowed,
+                        "excluded conda records the virtual's allowlist does not admit"
                     );
                 }
                 failed.extend(parse_failures);
@@ -5202,6 +5345,12 @@ async fn build_virtual_channeldata(
     )
     .await?;
 
+    // #5055: with the allowlist applying to hosted members, a name's entry is
+    // built from its first hosted record the list admits, so a name with none
+    // is left out. Counted once per name, under the member that first
+    // offered it.
+    let hosted_list = virtual_merge::hosted_allowlist(allowlist.as_deref());
+    let mut refused: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for member in members
@@ -5220,9 +5369,19 @@ async fn build_virtual_channeldata(
                 .and_then(|m| m.get("name").and_then(|v| v.as_str()))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| artifact.name.clone());
-            if !seen.insert(pkg_name.clone()) {
+            if seen.contains(&pkg_name) {
                 continue;
             }
+            if let Some(list) = hosted_list {
+                if !hosted_artifact_is_admitted(list, artifact, filename, artifact_subdir(artifact))
+                {
+                    refused
+                        .entry(pkg_name)
+                        .or_insert_with(|| member.key.clone());
+                    continue;
+                }
+            }
+            seen.insert(pkg_name.clone());
             let entry =
                 build_channeldata_entry(artifact.version.as_deref(), artifact.metadata.as_ref());
             hosted.push((
@@ -5231,6 +5390,7 @@ async fn build_virtual_channeldata(
             ));
         }
     }
+    refused.retain(|name, _| !seen.contains(name));
     key.part(&(hosted.len() as u64).to_le_bytes());
     for (name, entry) in &hosted {
         key.part(name.as_bytes()).part(entry.get().as_bytes());
@@ -5265,24 +5425,29 @@ async fn build_virtual_channeldata(
                     .iter()
                     .filter_map(|d| d.validator.clone())
                     .collect();
+                let hosted_not_allowed = refused.len();
+                count_hosted_allowlist_drops(&virtual_repo_key, refused.into_values().collect());
                 let enforced = allowlist.is_some();
                 let merge_virtual_key = virtual_repo_key.clone();
-                let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
-                    virtual_merge::merge_channeldata(
-                        &merge_virtual_key,
-                        &hosted,
-                        &documents,
-                        &owned,
-                        allowlist.as_deref(),
-                    )
-                })
-                .await
-                .map_err(virtual_merge::internal_error)?;
+                let (body, parse_failures, remote_not_allowed) =
+                    tokio::task::spawn_blocking(move || {
+                        virtual_merge::merge_channeldata(
+                            &merge_virtual_key,
+                            &hosted,
+                            &documents,
+                            &owned,
+                            allowlist.as_deref(),
+                        )
+                    })
+                    .await
+                    .map_err(virtual_merge::internal_error)?;
+                let not_allowed = remote_not_allowed + hosted_not_allowed;
                 if enforced {
                     tracing::info!(
                         virtual_repo_id = %virtual_repo_id,
                         dropped = not_allowed,
-                        "excluded remote conda channeldata entries the virtual's allowlist does not admit"
+                        hosted = hosted_not_allowed,
+                        "excluded conda channeldata entries the virtual's allowlist does not admit"
                     );
                 }
                 failed.extend(parse_failures);
@@ -5626,15 +5791,28 @@ async fn download_package(
                     }
                     None => false,
                 };
-                // Allowlist (#4576): a remote member serves only what the
-                // virtual's allowlist admits, by the same name/version/subdir
-                // test the merged repodata applies, so a package the index
-                // does not list is not downloadable either. Hosted members are
-                // not filtered, so they still answer below.
-                let not_allowed = !hosted_owns_name
-                    && virtual_allowlist(&state.db, repo.id)
-                        .await?
-                        .is_some_and(|a| !a.admits_filename(&subdir, &filename));
+                // Allowlist (#4576): the virtual serves only what its
+                // allowlist admits, by the same name/version/subdir test the
+                // merged index applies, so a package the index does not list
+                // is not downloadable either. By default that holds for every
+                // member (#5055): a package the list does not admit is the
+                // same 404 as one no member has, before any member is asked.
+                // Scoped `remote_only`, only remote members are filtered and
+                // hosted members still answer below.
+                let allowlist = virtual_allowlist(&state.db, repo.id).await?;
+                let refused = allowlist
+                    .as_deref()
+                    .is_some_and(|a| !a.admits_filename(&subdir, &filename));
+                if refused && virtual_merge::hosted_allowlist(allowlist.as_deref()).is_some() {
+                    tracing::debug!(
+                        virtual_repo = %repo_key,
+                        subdir = %subdir,
+                        file = %filename,
+                        "conda package refused by the virtual's allowlist"
+                    );
+                    return Err(proxy_helpers::member_miss_response());
+                }
+                let not_allowed = !hosted_owns_name && refused;
                 let proxy_service = if hosted_owns_name || not_allowed {
                     None
                 } else {
@@ -8197,10 +8375,15 @@ async fn serve_sidecar(
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
         // A package the virtual's allowlist (#4576) does not admit has no
-        // sidecar through it from a remote member either.
-        let remote_admitted = virtual_allowlist(&state.db, repo.id)
-            .await?
+        // sidecar through it from a remote member either, nor from a hosted
+        // one unless the list is scoped `remote_only` (#5055).
+        let allowlist = virtual_allowlist(&state.db, repo.id).await?;
+        let remote_admitted = allowlist
+            .as_deref()
             .is_none_or(|a| a.admits_filename(subdir, request.package()));
+        if !remote_admitted && virtual_merge::hosted_allowlist(allowlist.as_deref()).is_some() {
+            return Err(not_found());
+        }
         // #4585: each Remote member's sidecar follows that member's verdict
         // on the package, under the stricter-of-two policy the package walk
         // uses; a refusal ends the walk, as it does for the package.
@@ -19631,6 +19814,7 @@ mod virtual_channel_tests {
         let mut rec = upstream_record("noarch", filename);
         rec["from"] = marker.into();
         virtual_merge::HostedRecord {
+            member: "hosted".to_string(),
             filename: filename.to_string(),
             is_v2: filename.ends_with(".conda"),
             record: serde_json::value::to_raw_value(&rec).unwrap(),
@@ -20039,7 +20223,9 @@ mod virtual_channel_tests {
 
     /// #4576: the allowlist of a virtual filters what its remote member
     /// contributes, in the merged repodata (all three encodings), in
-    /// channeldata, and on download, while every hosted record stays; a
+    /// channeldata, and on download, while every hosted record stays (the
+    /// list is scoped `remote_only`, #5055; the default is covered by
+    /// `virtual_allowlist_filters_hosted_members_5055`); a
     /// version-constrained entry admits matching builds only, an enabled empty
     /// list admits nothing from the remote, and disabling the list restores
     /// the full merge.
@@ -20101,7 +20287,7 @@ mod virtual_channel_tests {
         let v = rig.virtual_key.clone();
         set_allowlist(
             &rig,
-            serde_json::json!({"enabled": true, "entries": [
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": [
                 {"name": "tzdata", "version": "2025b"},
                 {"name": "numpy", "version": ">=2,<3", "subdirs": ["linux-64"]},
                 {"name": "ri*"},
@@ -20137,7 +20323,11 @@ mod virtual_channel_tests {
             .any(|r| r.url.path().contains("colorama-0.4.6"));
 
         // An enabled empty list admits nothing from the remote.
-        set_allowlist(&rig, serde_json::json!({"enabled": true, "entries": []})).await;
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": []}),
+        )
+        .await;
         let (_, empty) = rig.repodata("noarch").await;
 
         // Disabled: the full merge and the download come back.
@@ -20237,12 +20427,356 @@ mod virtual_channel_tests {
         assert_eq!(off_dl_status, StatusCode::OK);
     }
 
+    /// Store a hosted package `{subdir}/{filename}` in the rig's hosted member
+    /// (catalog row, metadata and bytes, the bytes being the filename), so it
+    /// downloads as well as indexes.
+    pub(super) async fn seed_hosted_bytes(rig: &VirtualRig, subdir: &str, filename: &str) {
+        use sqlx::Row;
+        seed_hosted_record(&rig.pool, rig.hosted_id, subdir, filename).await;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(rig.hosted_id)
+                .fetch_one(&rig.pool)
+                .await
+                .expect("repository");
+        let location = crate::storage::StorageLocation {
+            backend: row.get("storage_backend"),
+            path: row.get("storage_path"),
+        };
+        let path = format!("{subdir}/{filename}");
+        let storage_key = format!("conda-test/{}/{path}", rig.hosted_id);
+        let bytes = filename.as_bytes().to_vec();
+        rig.state
+            .storage_for_repo(&location)
+            .expect("storage")
+            .put(&storage_key, Bytes::from(bytes.clone()))
+            .await
+            .expect("store package");
+        sqlx::query(
+            "UPDATE artifacts SET size_bytes = $3, checksum_sha256 = $4 \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(rig.hosted_id)
+        .bind(&path)
+        .bind(bytes.len() as i64)
+        .bind(hex::encode(Sha256::digest(&bytes)))
+        .execute(&rig.pool)
+        .await
+        .expect("record package bytes");
+    }
+
+    /// #5055: by default a virtual's allowlist is the channel's boundary for
+    /// HOSTED members too. A hosted package the list does not admit is absent
+    /// from every index form the virtual serves (`repodata.json` plain, `.zst`
+    /// and `.bz2`, `current_repodata.json`, `run_exports.json`,
+    /// `channeldata.json`) and its download through the virtual is the 404 of
+    /// a package no member has; a listed hosted package (and only its admitted
+    /// versions) is served. The dropped hosted package still owns its name, so
+    /// the upstream's record of that name stays out. Reads of the hosted
+    /// repository itself are unchanged. A scope change (`remote_only`, the
+    /// opt-out, restores pass-through) and a list change are each a new merge,
+    /// never the kept one.
+    #[tokio::test]
+    async fn virtual_allowlist_filters_hosted_members_5055() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let upstream = [
+            "rich-13.0-pyh_0.conda",
+            "colorama-0.4.6-pyhd8ed1ab_1.conda",
+            "acme-core-99.0-0.conda",
+        ];
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_repodata("noarch", &upstream)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_channeldata(&[
+                    "acme-core",
+                    "colorama",
+                    "rich",
+                ])),
+            )
+            .mount(&server)
+            .await;
+        for file in upstream {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/noarch/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(file.as_bytes().to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let gate = test_gate(&rig, 4, 30);
+        for file in [
+            "acme-core-1.0-0.conda",
+            "internal-tool-2.0-0.conda",
+            "internal-tool-1.0-0.conda",
+        ] {
+            seed_hosted_bytes(&rig, "noarch", file).await;
+        }
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let v = rig.virtual_key.clone();
+        let entries = serde_json::json!([
+            {"name": "rich"},
+            {"name": "internal-tool", "version": ">=2"},
+        ]);
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": entries.clone()}),
+        )
+        .await;
+
+        let (json_status, json_body, json_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (_, zst_body, _) = rig.get(format!("/{v}/noarch/repodata.json.zst")).await;
+        let (_, bz2_body, _) = rig.get(format!("/{v}/noarch/repodata.json.bz2")).await;
+        let (cur_status, cur_body, _) = rig.get(format!("/{v}/noarch/current_repodata.json")).await;
+        let (re_status, re_body, _) = rig.get(format!("/{v}/noarch/run_exports.json")).await;
+        let (cd_status, cd_body, cd_headers) = rig.get(format!("/{v}/channeldata.json")).await;
+        let (acme_status, acme_body, _) =
+            rig.get(format!("/{v}/noarch/acme-core-1.0-0.conda")).await;
+        let (absent_status, absent_body, _) =
+            rig.get(format!("/{v}/noarch/nosuchpkg-1.0-0.conda")).await;
+        let (old_tool_status, _, _) = rig
+            .get(format!("/{v}/noarch/internal-tool-1.0-0.conda"))
+            .await;
+        let (tool_status, tool_body, _) = rig
+            .get(format!("/{v}/noarch/internal-tool-2.0-0.conda"))
+            .await;
+        let (rich_status, _, _) = rig.get(format!("/{v}/noarch/rich-13.0-pyh_0.conda")).await;
+        let (impostor_status, _, _) = rig.get(format!("/{v}/noarch/acme-core-99.0-0.conda")).await;
+        let (direct_status, direct_body, _) =
+            rig.get(format!("/{hosted_key}/noarch/repodata.json")).await;
+        let (direct_dl_status, direct_dl_body, _) = rig
+            .get(format!("/{hosted_key}/noarch/acme-core-1.0-0.conda"))
+            .await;
+        let merges_default = gate.merges_started();
+
+        // The opt-out: hosted members pass through again.
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": entries.clone()}),
+        )
+        .await;
+        let (_, opt_out) = rig.repodata("noarch").await;
+        let (opt_out_dl_status, opt_out_dl_body, _) =
+            rig.get(format!("/{v}/noarch/acme-core-1.0-0.conda")).await;
+        let merges_opt_out = gate.merges_started();
+
+        // A list change under the default scope admits the hosted package.
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "scope": "all_members", "entries": [
+                {"name": "rich"},
+                {"name": "internal-tool", "version": ">=2"},
+                {"name": "acme-core"},
+            ]}),
+        )
+        .await;
+        let (_, widened) = rig.repodata("noarch").await;
+        let merges_widened = gate.merges_started();
+        rig.cleanup().await;
+
+        assert_eq!(
+            json_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&json_body)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(
+            listed(&doc),
+            vec!["internal-tool-2.0-0.conda", "rich-13.0-pyh_0.conda"],
+            "hosted records are filtered like remote ones; the owned name stays owned"
+        );
+        assert_eq!(
+            json_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("3"),
+            "two hosted records and colorama"
+        );
+        let zst_doc: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&zst_body[..]).unwrap()).unwrap();
+        assert_eq!(zst_doc, doc, "repodata.json.zst is filtered the same way");
+        let mut bz2_json = Vec::new();
+        std::io::Read::read_to_end(
+            &mut bzip2::read::MultiBzDecoder::new(&bz2_body[..]),
+            &mut bz2_json,
+        )
+        .unwrap();
+        let bz2_doc: serde_json::Value = serde_json::from_slice(&bz2_json).unwrap();
+        assert_eq!(bz2_doc, doc, "repodata.json.bz2 is filtered the same way");
+
+        assert_eq!(cur_status, StatusCode::OK);
+        let current: serde_json::Value = serde_json::from_slice(&cur_body).unwrap();
+        assert_eq!(
+            listed(&current),
+            vec!["internal-tool-2.0-0.conda", "rich-13.0-pyh_0.conda"]
+        );
+        assert_eq!(re_status, StatusCode::OK);
+        let run_exports: serde_json::Value = serde_json::from_slice(&re_body).unwrap();
+        assert_eq!(
+            listed(&run_exports),
+            vec!["internal-tool-2.0-0.conda"],
+            "run_exports.json drops exactly what repodata.json drops"
+        );
+
+        assert_eq!(cd_status, StatusCode::OK);
+        let cd: serde_json::Value = serde_json::from_slice(&cd_body).unwrap();
+        let mut cd_names: Vec<&str> = cd["packages"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        cd_names.sort();
+        assert_eq!(cd_names, vec!["internal-tool", "rich"]);
+        assert_eq!(cd["packages"]["internal-tool"]["version"], "2.0");
+        assert_eq!(
+            cd_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("2"),
+            "the hosted acme-core and colorama"
+        );
+
+        assert_eq!(acme_status, StatusCode::NOT_FOUND);
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            acme_body, absent_body,
+            "a refused hosted package answers exactly like one no member has"
+        );
+        assert_eq!(old_tool_status, StatusCode::NOT_FOUND);
+        assert_eq!(tool_status, StatusCode::OK);
+        assert_eq!(&tool_body[..], b"internal-tool-2.0-0.conda");
+        assert_eq!(rich_status, StatusCode::OK);
+        assert_eq!(impostor_status, StatusCode::NOT_FOUND);
+
+        assert_eq!(direct_status, StatusCode::OK);
+        let direct: serde_json::Value = serde_json::from_slice(&direct_body).unwrap();
+        assert_eq!(
+            listed(&direct),
+            vec![
+                "acme-core-1.0-0.conda",
+                "internal-tool-1.0-0.conda",
+                "internal-tool-2.0-0.conda"
+            ],
+            "the hosted repository itself is not filtered"
+        );
+        assert_eq!(direct_dl_status, StatusCode::OK);
+        assert_eq!(&direct_dl_body[..], b"acme-core-1.0-0.conda");
+
+        assert_eq!(
+            listed(&opt_out),
+            vec![
+                "acme-core-1.0-0.conda",
+                "internal-tool-1.0-0.conda",
+                "internal-tool-2.0-0.conda",
+                "rich-13.0-pyh_0.conda"
+            ],
+            "remote_only restores hosted pass-through"
+        );
+        assert_eq!(opt_out_dl_status, StatusCode::OK);
+        assert_eq!(&opt_out_dl_body[..], b"acme-core-1.0-0.conda");
+        assert!(
+            merges_opt_out > merges_default,
+            "a scope change is a new merge: {merges_default} -> {merges_opt_out}"
+        );
+        assert_eq!(
+            listed(&widened),
+            vec![
+                "acme-core-1.0-0.conda",
+                "internal-tool-2.0-0.conda",
+                "rich-13.0-pyh_0.conda"
+            ]
+        );
+        assert!(
+            merges_widened > merges_opt_out,
+            "a list change is a new merge: {merges_opt_out} -> {merges_widened}"
+        );
+    }
+
+    /// #5055: the merge itself drops a hosted record the list does not admit
+    /// (by filename and by the identity the record claims) when the list
+    /// applies to every member, counts it, and keeps it when the list is
+    /// scoped `remote_only`.
+    #[test]
+    fn merge_repodata_filters_hosted_records_by_default_5055() {
+        let list = |scope| {
+            crate::services::conda_allowlist::CondaAllowlist {
+                enabled: true,
+                scope,
+                entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                    name: "rich".into(),
+                    version: None,
+                    subdirs: vec![],
+                }],
+            }
+            .compile()
+            .unwrap()
+        };
+        let mut liar = hosted_record("rich-14.0-0.conda", "hosted");
+        let mut rec: serde_json::Value = serde_json::from_str(liar.record.get()).unwrap();
+        rec["name"] = "numpy".into();
+        liar.record = serde_json::value::to_raw_value(&rec).unwrap();
+        let hosted = vec![
+            hosted_record("internal-1.0-0.conda", "hosted"),
+            hosted_record("rich-13.5-0.conda", "hosted"),
+            liar,
+        ];
+        let merge = |list: &crate::services::conda_allowlist::CompiledAllowlist| {
+            let (body, _, dropped) = virtual_merge::merge_repodata(
+                "virtual",
+                "noarch",
+                &hosted,
+                &[],
+                &Default::default(),
+                Some(list),
+            );
+            let merged: serde_json::Value =
+                serde_json::from_slice(&zstd::decode_all(&body.unwrap().bytes[..]).unwrap())
+                    .unwrap();
+            (listed(&merged), dropped.not_allowed)
+        };
+        assert_eq!(
+            merge(&list(None)),
+            (vec!["rich-13.5-0.conda".to_string()], 2)
+        );
+        assert_eq!(
+            merge(&list(Some(
+                crate::services::conda_allowlist::AllowlistScope::RemoteOnly
+            ))),
+            (
+                vec![
+                    "internal-1.0-0.conda".to_string(),
+                    "rich-13.5-0.conda".to_string(),
+                    "rich-14.0-0.conda".to_string()
+                ],
+                0
+            )
+        );
+    }
+
     /// #4576: the index applies the allowlist to the identity a record claims
     /// as well as to its filename, and hosted records are never filtered.
     #[test]
     fn merge_repodata_applies_the_allowlist_to_remote_records_only() {
         let allowlist = crate::services::conda_allowlist::CondaAllowlist {
             enabled: true,
+            scope: Some(crate::services::conda_allowlist::AllowlistScope::RemoteOnly),
             entries: vec![crate::services::conda_allowlist::AllowlistEntry {
                 name: "rich".into(),
                 version: None,
@@ -20294,6 +20828,7 @@ mod virtual_channel_tests {
     fn merge_repodata_counts_allowlist_drops_per_member_4711() {
         let allowlist = crate::services::conda_allowlist::CondaAllowlist {
             enabled: true,
+            scope: Some(crate::services::conda_allowlist::AllowlistScope::RemoteOnly),
             entries: vec![crate::services::conda_allowlist::AllowlistEntry {
                 name: "rich".into(),
                 version: None,
@@ -20347,6 +20882,7 @@ mod virtual_channel_tests {
     fn merge_channeldata_counts_allowlist_drops_per_member_4711() {
         let allowlist = crate::services::conda_allowlist::CondaAllowlist {
             enabled: true,
+            scope: Some(crate::services::conda_allowlist::AllowlistScope::RemoteOnly),
             entries: vec![crate::services::conda_allowlist::AllowlistEntry {
                 name: "rich".into(),
                 version: None,
@@ -20701,7 +21237,7 @@ mod virtual_channel_tests {
 
         set_allowlist(
             &rig,
-            serde_json::json!({"enabled": true, "entries": [{"name": "rich"}]}),
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": [{"name": "rich"}]}),
         )
         .await;
         let (_, filtered) = rig.repodata("noarch").await;
@@ -20814,8 +21350,8 @@ mod virtual_channel_tests {
     }
 
     /// A virtual over a hosted `acme-core 1.0` (which declares a run export)
-    /// and a remote serving [`SIBLING_UPSTREAM_NOARCH`], with an allowlist
-    /// admitting `ri*` only.
+    /// and a remote serving [`SIBLING_UPSTREAM_NOARCH`], with a `remote_only`
+    /// allowlist admitting `ri*` only.
     async fn sibling_rig(server: &MockServer) -> VirtualRig {
         Mock::given(method("GET"))
             .and(wm_path("/noarch/repodata.json"))
@@ -20846,7 +21382,7 @@ mod virtual_channel_tests {
         .expect("declare hosted run exports");
         set_allowlist(
             &rig,
-            serde_json::json!({"enabled": true, "entries": [{"name": "ri*"}]}),
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": [{"name": "ri*"}]}),
         )
         .await;
         rig
@@ -23102,6 +23638,114 @@ mod cep16_proxy_tests {
         );
     }
 
+    /// #5055: under an allowlist that applies to every member (the default),
+    /// a hosted name the list does not admit is not in the virtual's shard
+    /// index and its shard is not served by address; a hosted name admitted
+    /// under a version constraint is listed with a shard rebuilt from its
+    /// admitted records only; the dropped hosted name still keeps the
+    /// upstream's shard of that name out. `remote_only` restores the hosted
+    /// shards as stored.
+    #[tokio::test]
+    async fn virtual_shard_index_filters_hosted_members_5055() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let (impostor_shard, impostor_hash) = upstream_shard("noarch", &["acme-core-99.0-0.conda"]);
+        let (rich_shard, rich_hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index(
+                "noarch",
+                "./shards/",
+                &[("acme-core", &impostor_hash), ("rich", &rich_hash)],
+            ),
+        )
+        .await;
+        for (hash, shard) in [(&impostor_hash, &impostor_shard), (&rich_hash, &rich_shard)] {
+            mount_bytes(
+                &server,
+                &format!("/noarch/shards/{hash}.msgpack.zst"),
+                shard.clone(),
+            )
+            .await;
+        }
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        for file in [
+            "acme-core-1.0-0.conda",
+            "internal-tool-1.0-0.conda",
+            "internal-tool-2.0-0.conda",
+        ] {
+            seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", file).await;
+        }
+        let v = rig.virtual_key.clone();
+        let entries = serde_json::json!([
+            {"name": "rich"},
+            {"name": "internal-tool", "version": ">=2"},
+        ]);
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": entries.clone()}),
+        )
+        .await;
+        let hosted = hosted_shards(&rig.pool, &[rig.hosted_id], "noarch")
+            .await
+            .expect("hosted shards");
+        let acme_hash = hex::encode(shard_address(&hosted["acme-core"]));
+        let full_tool_hash = hex::encode(shard_address(&hosted["internal-tool"]));
+
+        let (idx_status, idx_body, idx_headers) = rig.get(format!("/{v}{INDEX}")).await;
+        let index = decode_index(&idx_body);
+        let tool_hash = hex::encode(index.shards["internal-tool"]);
+        let (tool_status, tool_body, _) = rig.get(shard_uri(&v, &tool_hash)).await;
+        let (acme_status, _, _) = rig.get(shard_uri(&v, &acme_hash)).await;
+        let (full_tool_status, _, _) = rig.get(shard_uri(&v, &full_tool_hash)).await;
+        let (impostor_status, _, _) = rig.get(shard_uri(&v, &impostor_hash)).await;
+
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": entries}),
+        )
+        .await;
+        let (off_status, off_body, _) = rig.get(format!("/{v}{INDEX}")).await;
+        let (off_acme_status, _, _) = rig.get(shard_uri(&v, &acme_hash)).await;
+        rig.cleanup().await;
+
+        assert_eq!(idx_status, StatusCode::OK);
+        assert_eq!(
+            index_names(&index),
+            vec!["internal-tool", "rich"],
+            "the hosted acme-core is not admitted; its upstream impostor stays owned out"
+        );
+        assert_eq!(
+            idx_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the hosted acme-core name"
+        );
+        assert_ne!(tool_hash, full_tool_hash, "the partial shard is rebuilt");
+        assert_eq!(tool_status, StatusCode::OK);
+        assert_eq!(hex::encode(shard_address(&tool_body)), tool_hash);
+        let shard: rattler_conda_types::Shard =
+            rmp_serde::from_slice(&zstd::decode_all(tool_body.as_ref()).unwrap()).unwrap();
+        let files: Vec<String> = shard.conda_packages.keys().map(|k| k.to_string()).collect();
+        assert_eq!(files, vec!["internal-tool-2.0-0.conda"]);
+        assert_eq!(acme_status, StatusCode::NOT_FOUND);
+        assert_eq!(full_tool_status, StatusCode::NOT_FOUND);
+        assert_eq!(impostor_status, StatusCode::NOT_FOUND);
+
+        assert_eq!(off_status, StatusCode::OK);
+        let off = decode_index(&off_body);
+        assert_eq!(
+            index_names(&off),
+            vec!["acme-core", "internal-tool", "rich"]
+        );
+        assert_eq!(hex::encode(off.shards["internal-tool"]), full_tool_hash);
+        assert_eq!(off_acme_status, StatusCode::OK);
+    }
+
     /// The merged index of a virtual: hosted shards first, then the remote's
     /// minus the names a hosted member owns and the names the allowlist does
     /// not admit whole; a shard fetch resolves to the member that publishes it
@@ -23160,7 +23804,7 @@ mod cep16_proxy_tests {
         let v = rig.virtual_key.clone();
         set_allowlist(
             &rig,
-            serde_json::json!({"enabled": true, "entries": [
+            serde_json::json!({"enabled": true, "scope": "remote_only", "entries": [
                 {"name": "tzdata", "version": "2025b"},
                 {"name": "numpy", "subdirs": ["linux-64"]},
                 {"name": "ri*"},

@@ -10,9 +10,11 @@
 //! no record under a name a hosted member has published.
 //!
 //! A virtual may also carry a package allowlist
-//! ([`crate::services::conda_allowlist`], #4576): when it is enabled, a remote
-//! record the list does not admit is dropped as well. Hosted records are never
-//! filtered by it.
+//! ([`crate::services::conda_allowlist`], #4576): when it is enabled, a record
+//! the list does not admit is dropped as well. By default that holds for
+//! hosted records too (#5055); a list scoped `remote_only` filters remote
+//! records only. A hosted record the list drops still owns its name, so the
+//! remote records of that name stay excluded.
 //!
 //! Remote members are fetched in their compressed encodings, never as the
 //! plain document: `repodata.json.zst`, then `.bz2`, then `.json`, each through
@@ -499,6 +501,9 @@ struct RepodataInfo<'a> {
 
 /// One hosted record, ready to merge.
 pub(super) struct HostedRecord {
+    /// Key of the hosted member the record comes from (the
+    /// `ak_conda_allowlist_dropped_total` `member` label).
+    pub member: String,
     pub filename: String,
     pub is_v2: bool,
     pub record: Box<RawValue>,
@@ -519,15 +524,42 @@ fn remote_record_is_owned(filename: &str, raw: &RawValue, owned: &HashSet<String
             .is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
 }
 
-/// Whether the allowlist admits a remote record: by the name and version its
+/// Whether the allowlist admits a record: by the name and version its
 /// filename carries (what the download seam checks) AND by the `name` and
 /// `version` the record itself claims, when it carries them. A record whose
 /// own identity disagrees with an admitted filename is dropped; the filename
 /// is checked first so the common case (not admitted) never parses the record.
-fn remote_record_is_admitted(
+fn record_is_admitted(
     subdir: &str,
     filename: &str,
     raw: &RawValue,
+    allowlist: &CompiledAllowlist,
+) -> bool {
+    if !allowlist.admits_filename(subdir, filename) {
+        return false;
+    }
+    let Ok(id) = serde_json::from_str::<RecordIdentity<'_>>(raw.get()) else {
+        return false;
+    };
+    identity_is_admitted(
+        subdir,
+        filename,
+        id.name.as_deref(),
+        id.version.as_deref(),
+        allowlist,
+    )
+}
+
+/// The identity half of [`record_is_admitted`], for a record whose filename
+/// the list admits: the `name`/`version` the record claims (absent: the
+/// filename's) must be the filename's or be admitted themselves. Shared with
+/// the hosted rows a virtual builds its shards and channeldata from, so every
+/// seam applies one rule.
+pub(super) fn identity_is_admitted(
+    subdir: &str,
+    filename: &str,
+    name: Option<&str>,
+    version: Option<&str>,
     allowlist: &CompiledAllowlist,
 ) -> bool {
     let Some((file_name, file_version)) =
@@ -538,20 +570,26 @@ fn remote_record_is_admitted(
     if !allowlist.admits(file_name, file_version, subdir) {
         return false;
     }
-    let Ok(id) = serde_json::from_str::<RecordIdentity<'_>>(raw.get()) else {
-        return false;
-    };
-    let name = id.name.as_deref().unwrap_or(file_name);
-    let version = id.version.as_deref().unwrap_or(file_version);
+    let name = name.unwrap_or(file_name);
+    let version = version.unwrap_or(file_version);
     (name == file_name && version == file_version) || allowlist.admits(name, version, subdir)
+}
+
+/// The allowlist as it applies to hosted members: `Some` only when one is
+/// enforced and its scope is every member (#5055).
+pub(super) fn hosted_allowlist(
+    allowlist: Option<&CompiledAllowlist>,
+) -> Option<&CompiledAllowlist> {
+    allowlist.filter(|a| a.applies_to_hosted())
 }
 
 /// Remote records a merge left out, by reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct MergeDrops {
-    /// Records under a name a hosted member owns.
+    /// Remote records under a name a hosted member owns.
     pub owned: usize,
-    /// Records the virtual's allowlist does not admit.
+    /// Records the virtual's allowlist does not admit, hosted (when the list
+    /// applies to every member) and remote.
     pub not_allowed: usize,
 }
 
@@ -563,8 +601,9 @@ type PackageMaps<'a> = (
 
 /// Merge hosted records and remote member package maps, first writer wins
 /// per filename: hosted records first, then each parsed remote document in
-/// member order, dropping remote records under a name a hosted member owns or
-/// that the allowlist does not admit. Shared by every per-package document a
+/// member order, dropping remote records under a name a hosted member owns,
+/// and records the allowlist does not admit (hosted ones too unless the list
+/// is scoped `remote_only`, #5055). Shared by every per-package document a
 /// virtual serves (`repodata.json`, `run_exports.json`, #4708), so the
 /// ownership and allowlist rules cannot drift between them. Allowlist drops
 /// are counted per member in `ak_conda_allowlist_dropped_total` under
@@ -580,13 +619,25 @@ fn merge_package_maps<'a>(
 ) -> PackageMaps<'a> {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
     let mut packages_conda: BTreeMap<&str, &RawValue> = BTreeMap::new();
+    let hosted_list = hosted_allowlist(allowlist);
+    let mut hosted_not_allowed: BTreeMap<&str, usize> = BTreeMap::new();
     for h in hosted {
+        if let Some(list) = hosted_list {
+            if !record_is_admitted(subdir, &h.filename, &h.record, list) {
+                *hosted_not_allowed.entry(h.member.as_str()).or_default() += 1;
+                continue;
+            }
+        }
         let target = if h.is_v2 {
             &mut packages_conda
         } else {
             &mut packages
         };
         target.entry(h.filename.as_str()).or_insert(&h.record);
+    }
+    for (member, count) in hosted_not_allowed {
+        dropped.not_allowed += count;
+        count_allowlist_drops(virtual_repo_key, member, count);
     }
     for (member, p) in parsed {
         let mut member_not_allowed = 0usize;
@@ -600,7 +651,7 @@ fn merge_package_maps<'a>(
                     continue;
                 }
                 if let Some(allowlist) = allowlist {
-                    if !remote_record_is_admitted(subdir, filename, raw, allowlist) {
+                    if !record_is_admitted(subdir, filename, raw, allowlist) {
                         member_not_allowed += 1;
                         continue;
                     }
@@ -768,12 +819,14 @@ struct MergedChanneldata<'a> {
 }
 
 /// Merge hosted channeldata entries (name -> entry, already first-writer-wins
-/// across hosted members) with remote member documents into a pretty-printed
-/// `channeldata.json`. Remote entries for owned names are dropped, and so are
-/// remote entries whose name the allowlist (when enabled) admits under no
-/// entry; channeldata is a per-name summary, so versions and subdirs do not
-/// enter into it. Returns the number of entries the allowlist dropped, which
-/// are also counted per member in `ak_conda_allowlist_dropped_total` (#4711).
+/// across hosted members, and already filtered by the allowlist when it
+/// applies to hosted members, #5055) with remote member documents into a
+/// pretty-printed `channeldata.json`. Remote entries for owned names are
+/// dropped, and so are remote entries whose name the allowlist (when enabled)
+/// admits under no entry; a remote channeldata entry is a per-name summary,
+/// so versions and subdirs do not enter into it. Returns the number of remote
+/// entries the allowlist dropped, which are also counted per member in
+/// `ak_conda_allowlist_dropped_total` (#4711).
 pub(super) fn merge_channeldata(
     virtual_repo_key: &str,
     hosted: &[(String, Box<RawValue>)],
