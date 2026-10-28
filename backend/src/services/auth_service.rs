@@ -107,6 +107,19 @@ pub(crate) const REGISTRY_REFRESH_TOKEN_TYPE: &str = "registry_refresh";
 /// (`NOW()` vs `consumed_at`) so replica clock skew cannot flip the verdict.
 const REFRESH_REPLAY_BENIGN_GRACE_SECS: i64 = 30;
 
+/// Refuse to renew a CI OIDC service account's session (#5054). See
+/// [`AuthService::load_refreshable_user`].
+fn refuse_ci_session_refresh(provider: AuthProvider) -> Result<()> {
+    if provider == AuthProvider::Ci {
+        return Err(AppError::Authentication(
+            "A CI OIDC session cannot be refreshed; exchange a fresh CI token at \
+             /api/v1/auth/ci/token instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Result of API token validation: the user plus the token's constraints.
 #[derive(Debug, Clone)]
 pub struct ApiTokenValidation {
@@ -2231,7 +2244,7 @@ impl AuthService {
                 // row insert and the parent's `superseded_by` link both run on
                 // the transaction, so the consume and the mint commit as one
                 // unit — a crash mid-rotation leaves the parent unconsumed.
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2328,7 +2341,7 @@ impl AuthService {
                 // presented family and record a fresh row so any future replay
                 // of the NEW token IS detected. Behaviour unchanged from the
                 // pre-fix legacy branch.
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2423,7 +2436,7 @@ impl AuthService {
         // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
         // open a new family so subsequent rotations get replay detection.
         // Still preserve the action-scope ceiling and repo allow-list (#2430).
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
         let tokens = self.generate_tokens_with_scope(
             &user,
             token_data.claims.scopes.clone(),
@@ -2515,7 +2528,7 @@ impl AuthService {
             }
         }
 
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
 
         // Mint a fresh short-lived access token under the presenting token's
         // repo allow-list and action-scope ceiling (#2430). The refresh JWT
@@ -2570,6 +2583,23 @@ impl AuthService {
         )?;
         self.persist_refresh_jti_from_pair(&pair, user.id).await?;
         Ok(pair.refresh_token)
+    }
+
+    /// [`AuthService::load_active_user`] for the two refresh paths
+    /// ([`AuthService::refresh_tokens`] and
+    /// [`AuthService::mint_access_from_registry_refresh`]), refusing a CI OIDC
+    /// service account (#5054).
+    ///
+    /// A CI exchange persists a refresh JTI (so the deactivation sweep can
+    /// revoke the session) but never hands the refresh JWT out. Its session
+    /// must end when the access token minted by the exchange expires, within
+    /// one hour; a pipeline that needs longer exchanges a fresh CI assertion.
+    /// Refusing here keeps that true even if a refresh JWT for such an
+    /// account were ever exposed.
+    async fn load_refreshable_user(&self, user_id: Uuid) -> Result<User> {
+        let user = self.load_active_user(user_id).await?;
+        refuse_ci_session_refresh(user.auth_provider)?;
+        Ok(user)
     }
 
     /// Fetch a user row by id, rejecting deactivated accounts. Shared by the

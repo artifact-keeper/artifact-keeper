@@ -167,9 +167,9 @@ permission cache on the replica that served it; other replicas are told to
 clear theirs through the database's cache-invalidation notifications, and a
 replica that has lost that connection falls back to the cache's 30-second
 expiry. A credential a pipeline had already been handed keeps working as a
-bearer token until it expires (default 15 minutes); what it can *do* with
-that token is re-evaluated on every request against the current binding, same
-as any other credential. There is no separate revocation list — shorten the
+bearer token until it expires (the access-token TTL, at most one hour); what
+it can *do* with that token is re-evaluated on every request against the
+current binding, same as any other credential. There is no separate revocation list — shorten the
 access-token TTL if you need a tighter bound.
 
 **A binding is enforced or nothing happens.** If a mapping write cannot
@@ -219,17 +219,68 @@ publish:
 - No body is needed: the provider is chosen from the token's own `iss`. A body
   `{"provider_id": "<uuid>"}` is accepted only to disambiguate two enabled
   providers on the same issuer.
-- The access token lives for the configured access-token TTL (15 minutes by
-  default), and never longer than the ID token that bought it. Docker does not
-  refresh credentials, so a job that runs longer must exchange again before
-  its next push. `expires_in` gives the real lifetime. An ID token that has
-  already expired is refused with 401, even inside the 60 s clock-skew leeway
-  its signature check allows, rather than exchanged for an access token that
-  is born expired (#4663).
+- The access token lives for the configured access-token TTL (see
+  [Token lifetime](#token-lifetime)). `expires_in` gives the real lifetime.
 
 GitHub Actions uses the same exchange. Request `permissions: id-token: write`,
 fetch the token from `$ACTIONS_ID_TOKEN_REQUEST_URL` with the provider's
 audience, and send it as above.
+
+### Token lifetime
+
+The ID token only has to be valid when it is exchanged. The access token the
+exchange returns lives for the configured access-token TTL
+(`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`), at most one hour, however long the ID
+token had left. GitHub Actions ID tokens, for example, expire about five
+minutes after they are issued; the access token exchanged from one still
+lasts the full TTL. This is how other relying parties of CI OIDC tokens behave
+too: AWS STS, GCP Workload Identity Federation, Azure, PyPI trusted publishing
+and Vault all issue their own credential with their own lifetime (#5054).
+From 1.12.0 the lifetime is set per provider (`token_ttl_secs`).
+
+Until 1.11.8 the access token was capped at the ID token's own `exp`, so a
+token exchanged in GitHub Actions stopped working after about five minutes
+whatever TTL was configured.
+
+What still holds:
+
+- An ID token that has already expired is refused with `401`, even inside the
+  60 s clock-skew leeway its signature check allows (#4663).
+- The exchange returns no refresh token, and a CI service account's session
+  cannot be refreshed. When the access token expires, the pipeline exchanges
+  again.
+- Using the access token elsewhere does not extend it: the Docker `/v2/token`
+  and Conan exchanges mint tokens that expire no later than the token
+  presented to them.
+- A `kubernetes` provider's pull-only credential still expires no later than
+  the ServiceAccount token it was exchanged for, because the kubelet caches it
+  on the node.
+
+**Jobs longer than the TTL.** Docker caches credentials and never refreshes
+them, so a job that runs longer than the TTL exchanges again before the steps
+that talk to Artifact Keeper. The CI platform hands out a fresh ID token
+whenever asked. In GitHub Actions:
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - name: Log in to Artifact Keeper
+    run: |
+      ID_TOKEN=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://artifacts.example.com" | jq -r .value)
+      RESPONSE=$(curl -sSf -X POST https://artifacts.example.com/api/v1/auth/ci/token \
+        -H "Authorization: Bearer $ID_TOKEN")
+      echo "$RESPONSE" | jq -r .access_token \
+        | docker login artifacts.example.com -u "$(echo "$RESPONSE" | jq -r .username)" --password-stdin
+  # ... steps that take less than the TTL ...
+  # Repeat the login step before the next block of pushes once the TTL may have passed.
+```
+
+`core.getIDToken()` in a JavaScript action returns a fresh ID token the same
+way. In GitLab, run the exchange again with the job's `id_tokens` value before
+the step that needs it; once that ID token has itself expired it can no longer
+be exchanged.
 
 ## Kubernetes: pulling images with a ServiceAccount token
 
@@ -246,7 +297,8 @@ changes three things about an exchange:
   the `read:artifacts` and `read:repositories` scopes, whatever the service
   account's groups would otherwise allow. A push with it, as the Docker
   password or through a bearer from `/v2/token`, is refused with `403`. The
-  mapping's `allowed_repo_ids` ceiling and the usual expiry cap still apply.
+  mapping's `allowed_repo_ids` ceiling still applies, and the credential
+  expires no later than the ServiceAccount token it was exchanged for.
 - **It cannot be renewed.** No refresh token is minted or stored, and the
   credential cannot mint an API token either: the token endpoints refuse every
   CI OIDC service account with `403`, whatever the provider type. The response
