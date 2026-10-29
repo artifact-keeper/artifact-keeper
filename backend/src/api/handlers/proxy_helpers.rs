@@ -888,7 +888,12 @@ fn map_proxy_error_classified(
                     e
                 );
             }
-            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+            let mut response =
+                (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
+            if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
+                response.extensions_mut().insert(UpstreamRefusal(status));
+            }
+            response
         }
     }
 }
@@ -902,6 +907,22 @@ pub(crate) struct UpstreamAuthFailure;
 /// Whether a proxy error `Response` is an upstream authentication failure.
 pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
     response.extensions().get::<UpstreamAuthFailure>().is_some()
+}
+
+/// Response extension carrying the upstream `401`/`403` that produced a
+/// generic 502 (#4929).
+///
+/// The error mapping deliberately renders every non-404 4xx as the opaque
+/// "Failed to fetch from upstream" 502, so a format handler that knows the
+/// resource is OPTIONAL (a compressed conda repodata candidate, a `.sig`) can
+/// no longer tell an absent key from a real failure. This extension preserves
+/// only the status classification, never the upstream URL or body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamRefusal(pub(crate) StatusCode);
+
+/// The upstream `401`/`403` behind a proxy error `Response`, if any.
+pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode> {
+    response.extensions().get::<UpstreamRefusal>().map(|r| r.0)
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
@@ -1895,6 +1916,52 @@ pub fn stream_fetch_result(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
+/// Presigned redirect to the fresh proxy-cache entry at `cache_path`, signed
+/// without reading the cached body (#1018). `Ok(None)` when presigned downloads
+/// are disabled, the request is a `HEAD` (#3209), the backend cannot presign or
+/// the entry is missing or stale: the caller then serves the request itself. A
+/// held (#2075) or origin-refused (#4506) entry is refused as on the fetch paths.
+pub(crate) async fn proxy_cache_fresh_redirect(
+    proxy_service: &ProxyService,
+    state: &AppState,
+    repo_key: &str,
+    cache_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Response>, Response> {
+    if !state.config.presigned_downloads_enabled || ctx.is_head {
+        return Ok(None);
+    }
+    // #1555: the freshness probe reads the cache-meta sidecar, so skip it when
+    // the proxy's own (no-prefix) backend cannot presign anyway.
+    let storage = proxy_service.cache_storage_backend();
+    if !storage.supports_redirect() || !proxy_service.is_cache_fresh(repo_key, cache_path).await {
+        return Ok(None);
+    }
+    let refused = |e| map_proxy_error(repo_key, cache_path, e);
+    proxy_service
+        .cache_quarantine_gate(repo_key, cache_path)
+        .await
+        .map_err(refused)?;
+    proxy_service
+        .cache_origin_policy_gate(repo_key)
+        .await
+        .map_err(refused)?;
+    // Proxy-cache content is stored without the global key prefix, so it is
+    // signed through that same no-prefix backend (#1555).
+    let cache_key =
+        ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, cache_path)
+            .map_err(refused)?;
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    Ok(try_proxy_cache_redirect(
+        storage.as_ref(),
+        &cache_key,
+        /* presigned_enabled = */ true,
+        expiry,
+        /* cache_is_fresh = */ true,
+    )
+    .await)
+}
+
 /// Fetch from upstream via the proxy service, returning a presigned redirect
 /// if the storage backend supports it and presigned downloads are enabled.
 ///
@@ -1933,49 +2000,12 @@ pub async fn proxy_fetch_or_redirect(
     // the next handler that adopts it from re-opening #3181/#3209.
     let presigned_enabled = state.config.presigned_downloads_enabled && !ctx.is_head;
 
-    // Fast path (#1018): if presigned downloads are enabled and the proxy
-    // cache is already fresh, redirect to the signed URL without ever
-    // pulling the cached body into the backend's memory. The freshness
-    // probe is metadata-only (HEAD-equivalent on cloud backends).
-    //
-    // #1555: resolve the no-prefix presign handle FIRST and skip the
-    // freshness probe entirely if we can't redirect (no handle, or the
-    // backend doesn't support redirects). The probe loads the cache-meta
-    // sidecar; on a backend that can't presign it would be a pure wasted
-    // S3 GET, since the slow path below re-reads the same sidecar anyway.
-    if presigned_enabled {
-        let storage = proxy_service.cache_storage_backend();
-        if storage.supports_redirect() && proxy_service.is_cache_fresh(repo_key, path).await {
-            // #2075: a fresh cache entry may still be inside its Package Age
-            // Policy hold window. The buffered/streaming fetch paths enforce
-            // that hold via check_quarantine_until; the presigned-redirect fast
-            // path must gate on it too, or a held object would be handed out as
-            // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
-            // surfaces as the same 409/403 (no redirect, no upstream refetch).
-            if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
-                return Err(map_proxy_error(repo_key, path, e));
-            }
-            // #4506: and on the Remote's origin policy, which the fetch paths
-            // enforce the same way.
-            if let Err(e) = proxy_service.cache_origin_policy_gate(repo_key).await {
-                return Err(map_proxy_error(repo_key, path, e));
-            }
-            // proxy-cache content is stored without the global key prefix,
-            // so it must be signed through the proxy's own (no-prefix)
-            // backend, not the prefixed repo handle, or the signed key
-            // 404s in the object store.
-            if let Some(redirect) = try_proxy_cache_redirect(
-                storage.as_ref(),
-                &cache_key,
-                presigned_enabled,
-                expiry,
-                /* cache_is_fresh = */ true,
-            )
-            .await
-            {
-                return Ok(redirect);
-            }
-        }
+    // Fast path (#1018): a fresh cache entry is redirected to without pulling
+    // its body into the backend.
+    if let Some(redirect) =
+        proxy_cache_fresh_redirect(proxy_service, state, repo_key, path, ctx).await?
+    {
+        return Ok(redirect);
     }
 
     // Slow path: cache miss / expired / presigned disabled. The fetch
@@ -2958,7 +2988,12 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
     name = "resolve_virtual_members",
     level = "info",
     skip_all,
-    fields(artifact_keeper.virtual.member_count = members.len())
+    // `usize` has no OpenTelemetry type and the tracing bridge exports it as
+    // a string, so keep the count numeric (#4931).
+    fields(
+        artifact_keeper.virtual.member_count =
+            i64::try_from(members.len()).unwrap_or(i64::MAX)
+    )
 )]
 pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
     members: &'a [Repository],
@@ -9683,8 +9718,12 @@ pub(crate) enum ProxyScanIdentity {
 ///   as for a first pull;
 /// * a request whose identity is not established cannot be scanned, so it
 ///   does not reuse a CLEAN verdict graded as such a pin (a clean grade on
-///   one release says nothing about an undetermined one); a blocking verdict
-///   still blocks it.
+///   one release says nothing about an undetermined one), nor a CLEAN
+///   verdict graded with no pin at all (an on-demand rescan in any
+///   repository, which may have cataloged an OS package with no release to
+///   grade it against; part of #3396). It reuses a clean verdict graded as
+///   a coordinate the bytes carry themselves (npm, PyPI and the like); a
+///   blocking verdict still blocks it.
 ///
 /// For every other established pin (npm, PyPI, RubyGems, Cargo, NuGet, conda,
 /// Maven) the stored pin need not match, but a CLEAN verdict recorded with no
@@ -9711,9 +9750,39 @@ pub(crate) fn stored_verdict_pertains(
         ProxyScanIdentity::NotApplicable => true,
         ProxyScanIdentity::Unestablished => {
             verdict_blocks(verdict)
-                || !stored_pin.is_some_and(ExpectedComponent::pin_identity_is_request_pinned)
+                || stored_pin
+                    .is_some_and(|pin| !ExpectedComponent::pin_identity_is_request_pinned(pin))
         }
     }
+}
+
+/// Whether a stored proxy verdict graded nothing: `clean` with no findings,
+/// recorded with no pin, and with no component cataloged (`components_cataloged`
+/// `0`, or `None` when the row predates that column or the writer reported no
+/// catalog). Part of #3396.
+///
+/// Verdicts are keyed per content digest and shared by every repository that
+/// serves those bytes. A row like this says only that a scan ran and saw
+/// nothing it could grade, for example an on-demand rescan run from a
+/// repository whose format does not catalog these bytes. Under fail-closed it
+/// is therefore not reused for ANY request identity
+/// ([`stored_verdict_pertains`] decides the identity question first): the
+/// gate scans as for a first pull, which grades an established coordinate,
+/// withholds an unestablished one (423), and scans a format without a
+/// coordinate. Fail-open and record-only keep reusing it, as before.
+///
+/// A pinned `clean` verdict is not affected even with an empty catalog: the
+/// inline gate recorded it after grading the request's coordinate (a conda
+/// package legitimately catalogs nothing).
+pub(crate) fn stored_clean_graded_nothing(
+    row: &crate::services::proxy_scan_service::ProxyScanRow,
+    stored_pin: Option<&str>,
+    components_cataloged: Option<i32>,
+) -> bool {
+    row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
+        && row.findings_count == 0
+        && components_cataloged.unwrap_or(0) <= 0
+        && stored_pin.is_none()
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -9937,13 +10006,15 @@ async fn decide_proxy_scan_serve(
 
     let pss = ProxyScanService::new(state.db.clone());
     // #4952: a verdict graded as another coordinate than this request's is
-    // not this request's verdict; see [`stored_verdict_pertains`].
+    // not this request's verdict; see [`stored_verdict_pertains`]. Under
+    // fail-closed a clean verdict that graded nothing is not reused for any
+    // identity either; see [`stored_clean_graded_nothing`] (part of #3396).
     let row = pss
         .lookup_verdict_with_pin(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
         .flatten()
-        .and_then(|(row, pin)| {
+        .and_then(|(row, pin, cataloged)| {
             let pertains = stored_verdict_pertains(pin.as_deref(), &row.verdict, &identity);
             if !pertains {
                 tracing::info!(
@@ -9951,8 +10022,20 @@ async fn decide_proxy_scan_serve(
                     stored_pin = ?pin,
                     "stored proxy verdict was graded as another coordinate; not reused"
                 );
+                return None;
             }
-            pertains.then_some(row)
+            if action.is_fail_closed()
+                && stored_clean_graded_nothing(&row, pin.as_deref(), cataloged)
+            {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    components_cataloged = ?cataloged,
+                    "stored clean proxy verdict graded no components and carries no pin; \
+                     not reused under fail-closed, scanning"
+                );
+                return None;
+            }
+            Some(row)
         });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
@@ -10314,7 +10397,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     file.after_buffered_fetch(state, req, &bytes, &digest)
         .await?;
 
-    let identity = file.identity(req, &bytes, &digest);
+    let identity = gate_identity(file, req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
         state,
@@ -10347,6 +10430,62 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
             Ok(resp)
         }
     }
+}
+
+/// The identity the gate acts on for `bytes`: the format's own
+/// [`ScannedProxyFile::identity`], unless the bytes are an archive with two
+/// entries at one path. The format readers take the first such entry and the
+/// scan extractor keeps the last, so neither copy can be vouched for: the
+/// identity is [`ProxyScanIdentity::Unestablished`], inconclusive exactly like
+/// an archive that does not read as its format (fail-closed withholds it,
+/// fail-open serves it `pending`, and nothing is scanned or recorded).
+pub(crate) fn gate_identity<F: ScannedProxyFile>(
+    file: &F,
+    req: &ScannedProxyRequest<'_>,
+    bytes: &Bytes,
+    digest: &str,
+) -> ProxyScanIdentity {
+    if let Some(entry) =
+        crate::services::archive_entry_paths::duplicated_entry_path(req.filename, bytes)
+    {
+        tracing::warn!(
+            repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+            entry = %entry, format = F::LABEL,
+            "proxied archive has more than one entry at the same path; its identity is not established"
+        );
+        return ProxyScanIdentity::Unestablished;
+    }
+    file.identity(req, bytes, digest)
+}
+
+/// Test seam for the per-format duplicate-entry suites: `file`'s own identity
+/// for `bytes` served as `filename`, and the one [`gate_identity`] acts on.
+#[cfg(test)]
+pub(crate) fn identities_for_test<F: ScannedProxyFile>(
+    file: &F,
+    format: RepositoryFormat,
+    filename: &str,
+    bytes: &[u8],
+) -> (ProxyScanIdentity, ProxyScanIdentity) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let bytes = Bytes::copy_from_slice(bytes);
+    let digest = sha256_hex(&bytes);
+    let req = ScannedProxyRequest {
+        repo_id: Uuid::nil(),
+        repo_key: "remote",
+        fetch_base: "http://upstream.invalid",
+        format,
+        source_path: filename,
+        cache_path: filename,
+        filename,
+        action: ProxyScanAction::FailClosed,
+        severity_gate: ProxySeverityGate::BlockOnAny,
+        ctx: None,
+    };
+    (
+        file.identity(&req, &bytes, &digest),
+        gate_identity(file, &req, &bytes, &digest),
+    )
 }
 
 /// The over-cap branch of [`serve_scanned_proxy_file`]: the object is too
@@ -12210,9 +12349,16 @@ mod tests {
             "vulnerable",
             &ProxyScanIdentity::Unestablished
         ));
-        assert!(stored_verdict_pertains(
+        // Part of #3396: an unestablished request does not reuse a clean
+        // verdict graded with no pin; a blocking one still blocks it.
+        assert!(!stored_verdict_pertains(
             None,
             "clean",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            None,
+            "vulnerable",
             &ProxyScanIdentity::Unestablished
         ));
         assert!(stored_verdict_pertains(
@@ -12274,6 +12420,59 @@ mod tests {
                 "{eco}"
             );
         }
+    }
+
+    /// Part of #3396: under fail-closed a stored verdict is not reused when it
+    /// is clean, has no findings, carries no pin and cataloged no component.
+    /// A pin, a non-empty catalog, a finding or a blocking verdict each keep
+    /// the row reusable.
+    #[test]
+    fn stored_clean_graded_nothing_requires_clean_unpinned_and_empty_3396() {
+        use crate::services::proxy_scan_service::ProxyScanRow;
+        let row = |verdict: &str, findings: i32| ProxyScanRow {
+            checksum_sha256: "d".repeat(64),
+            scan_type: PROXY_SCAN_TYPE.to_string(),
+            verdict: verdict.to_string(),
+            findings_count: findings,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: None,
+            scanner_version: Some("grype-test".to_string()),
+            scanned_at: Utc::now(),
+        };
+        let clean = row("clean", 0);
+        assert!(stored_clean_graded_nothing(&clean, None, Some(0)));
+        assert!(
+            stored_clean_graded_nothing(&clean, None, None),
+            "a row with no recorded catalog graded nothing either"
+        );
+        assert!(!stored_clean_graded_nothing(&clean, None, Some(1)));
+        assert!(
+            !stored_clean_graded_nothing(&clean, Some("conda|numpy|1.26.4"), Some(0)),
+            "a pinned clean verdict was graded as the request's coordinate"
+        );
+        assert!(!stored_clean_graded_nothing(
+            &clean,
+            Some("npm|lodash|4.17.21"),
+            None
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("clean", 2),
+            None,
+            Some(0)
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("vulnerable", 1),
+            None,
+            Some(0)
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("error", 0),
+            None,
+            Some(0)
+        ));
     }
 
     /// NoScanner arm: fail-closed still 423s and fail-open still serves
@@ -13169,6 +13368,32 @@ mod tests {
         vec![test_local_member("m0"), test_local_member("m1")]
     }
 
+    /// #4931: `member_count` must be an OTLP integer, not a string. The field
+    /// is a `usize`, which has no OpenTelemetry value type; converting it at
+    /// the span keeps dashboards able to aggregate it numerically.
+    #[tokio::test]
+    async fn resolve_virtual_members_exports_member_count_as_an_integer() {
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::DefiniteMiss, None) },
+            |_m| async move { MemberResolveOutcome::Miss },
+        )
+        .await;
+        assert!(out.is_none());
+
+        let span = exported.one("resolve_virtual_members");
+        assert_eq!(
+            attr(&span, "artifact_keeper.virtual.member_count"),
+            Some(opentelemetry::Value::I64(2)),
+            "member_count must reach the exporter as an integer"
+        );
+    }
+
     #[tokio::test]
     async fn two_phase_top_priority_cache_hit_skips_all_upstream() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13786,6 +14011,59 @@ mod tests {
             "generic redirect signed a non-scoped key (a revert to unscoped drops the \
              scope segment): {loc}"
         );
+    }
+
+    /// `proxy_cache_fresh_redirect` signs a fresh entry under the live scope,
+    /// and leaves a `HEAD`, a stale entry and a deployment without presigned
+    /// downloads to the caller.
+    #[tokio::test]
+    async fn proxy_cache_fresh_redirect_signs_only_fresh_presignable_gets() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::download_telemetry::DownloadContext;
+        const REPO_KEY: &str = "tf-proxy";
+        const PATH: &str = "ns/ty/1.0.0/linux/amd64/p.zip";
+        async fn redirect(
+            state: &crate::api::SharedState,
+            path: &str,
+            ctx: &DownloadContext,
+        ) -> Option<Response> {
+            let proxy = state.proxy_service.as_deref().unwrap();
+            proxy_cache_fresh_redirect(proxy, state, REPO_KEY, path, ctx)
+                .await
+                .unwrap()
+        }
+
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let content_key = ProxyService::cache_storage_key(&scope, REPO_KEY, PATH).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, REPO_KEY, PATH).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        let presigned = tdh::build_state_with_proxy_presigned(pool.clone(), dir, proxy.clone());
+        let unsigned = tdh::build_state_with_proxy(pool, dir, proxy);
+        let head = DownloadContext {
+            is_head: true,
+            ..get_ctx()
+        };
+
+        let signed = redirect(&presigned, PATH, &get_ctx())
+            .await
+            .expect("a fresh entry must be redirected to");
+        let loc = signed.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert!(loc.contains(&content_key), "signed the wrong key: {loc}");
+
+        assert!(redirect(&presigned, PATH, &head).await.is_none());
+        assert!(
+            redirect(&presigned, "ns/ty/2.0.0/linux/amd64/p.zip", &get_ctx())
+                .await
+                .is_none()
+        );
+        assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
     }
 
     /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
@@ -18772,6 +19050,7 @@ mod tests {
 
         for fn_name in [
             "pub async fn proxy_fetch_or_redirect(",
+            "pub(crate) async fn proxy_cache_fresh_redirect(",
             // The Virtual streaming resolver's presign moved into this helper
             // (#2069 two-phase refactor); it is where the no-prefix handle is used.
             "async fn try_member_cache_redirect(",
@@ -24653,12 +24932,12 @@ mod proxy_download_recording_tests {
             (
                 "composer.rs",
                 "download_archive",
-                "serve_scanned_virtual_composer_dist(",
+                "serve_virtual_composer_dist(",
                 1,
             ),
             (
                 "composer.rs",
-                "serve_scanned_virtual_composer_dist",
+                "serve_virtual_composer_dist",
                 "serve_scanned_composer_dist(",
                 1,
             ),

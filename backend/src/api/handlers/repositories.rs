@@ -1229,7 +1229,16 @@ pub struct UpdateRepositoryRequest {
     pub repodata_depth: Option<u32>,
     pub key: Option<String>,
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// Update or clear the description (#4729). Three-way semantics via
+    /// `Option<Option<String>>`: omit the field to leave the stored
+    /// description unchanged; send `null` to clear it (store NULL); send a
+    /// string to set it (the empty string is stored as-is, not as NULL).
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
     /// Replace the repository's upstream URL (#4467), e.g. to rotate
     /// credentials embedded as userinfo or to repoint a Remote. Validated
     /// exactly like `upstream_url` on create (anti-SSRF, scheme/host and the
@@ -1271,7 +1280,18 @@ pub struct UpdateRepositoryRequest {
     /// not need it again; send `false` to withdraw it. Accepting it is logged
     /// at WARN and recorded in the audit log.
     pub allow_public_with_upstream_credentials: Option<bool>,
-    pub quota_bytes: Option<i64>,
+    /// Update or clear the repository quota (#4729). Three-way semantics via
+    /// `Option<Option<i64>>`: omit the field to leave the stored quota
+    /// unchanged; send `null` to clear it (NULL means unlimited); send a
+    /// value in `0..=100 TiB` to set it (`0` is the legacy unlimited
+    /// sentinel, kept for compatibility). A negative or oversized value is a
+    /// 400.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<i64>)]
+    pub quota_bytes: Option<Option<i64>>,
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
     pub promotion_only: Option<bool>,
@@ -5248,8 +5268,9 @@ pub async fn update_repository(
         )?;
     }
 
-    // Validate quota_bytes is within a reasonable range (max 100 TiB)
-    if let Some(quota) = payload.quota_bytes {
+    // Validate quota_bytes is within a reasonable range (max 100 TiB).
+    // `Some(None)` is an explicit clear (#4729) and needs no validation.
+    if let Some(Some(quota)) = payload.quota_bytes {
         if !(0..=100 * 1024 * 1024 * 1024 * 1024).contains(&quota) {
             return Err(AppError::Validation(
                 "quota_bytes must be between 0 and 100 TiB".to_string(),
@@ -5404,10 +5425,14 @@ pub async fn update_repository(
             ServiceUpdateRepoReq {
                 key: payload.key,
                 name: payload.name,
+                // Three-way (#4729): omit = unchanged, Some(None) = clear,
+                // Some(Some(text)) = set.
                 description: payload.description,
                 visibility: effective_visibility,
                 is_public: effective_is_public,
-                quota_bytes: payload.quota_bytes.map(Some),
+                // Three-way (#4729): omit = unchanged, Some(None) = clear
+                // (unlimited), Some(Some(bytes)) = set.
+                quota_bytes: payload.quota_bytes,
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
@@ -13549,13 +13574,16 @@ pub struct CondaAllowlistResponse {
     /// stored list that can no longer be read is enforced as admit-nothing,
     /// so it reports `true` with `error` set and no entries.
     pub enabled: bool,
+    /// Which members the list applies to: `all_members` (the default) or
+    /// `remote_only` (#5055).
+    pub scope: conda_allowlist::AllowlistScope,
     /// The admitted packages.
     pub entries: Vec<conda_allowlist::AllowlistEntry>,
     /// `entries.len()`.
     pub entry_count: usize,
     /// Set when the stored list is unusable (only possible after a direct
-    /// database edit): nothing from remote members is admitted until a valid
-    /// list is saved or the list is deleted.
+    /// database edit): nothing is admitted from the members it applies to
+    /// until a valid list is saved or the list is deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -13563,14 +13591,16 @@ pub struct CondaAllowlistResponse {
 impl CondaAllowlistResponse {
     fn new(repository_key: String, stored: conda_allowlist::StoredAllowlist) -> Self {
         use conda_allowlist::StoredAllowlist as Stored;
+        let scope = stored.scope();
         let (enabled, entries, error) = match stored {
             Stored::None => (false, Vec::new(), None),
             Stored::Valid(list) => (list.enabled, list.entries, None),
-            Stored::Unusable(err) => (true, Vec::new(), Some(err)),
+            Stored::Unusable(err, _) => (true, Vec::new(), Some(err)),
         };
         Self {
             repository_key,
             enabled,
+            scope,
             entry_count: entries.len(),
             entries,
             error,
@@ -13627,13 +13657,15 @@ async fn audit_conda_allowlist_change(
         Stored::None => serde_json::Value::Null,
         Stored::Valid(list) => serde_json::json!({
             "enabled": list.enabled,
+            "scope": list.effective_scope(),
             "entry_count": list.entries.len(),
         }),
-        Stored::Unusable(_) => serde_json::json!({ "unusable": true }),
+        Stored::Unusable(_, _) => serde_json::json!({ "unusable": true }),
     };
     let current = current.map_or(serde_json::Value::Null, |list| {
         serde_json::json!({
             "enabled": list.enabled,
+            "scope": list.effective_scope(),
             "entry_count": list.entries.len(),
         })
     });
@@ -13686,12 +13718,16 @@ pub async fn get_conda_allowlist(
 
 /// Set the package allowlist of a virtual conda repository
 ///
-/// Restricts what the virtual's REMOTE members contribute. When `enabled`,
-/// a remote package record is listed in the virtual's `repodata.json` (every
-/// encoding) only if some entry admits it, `channeldata.json` keeps only
-/// admitted names, and a download through the virtual of a package the list
-/// does not admit is never served from a remote member (404, as the index
-/// implies). Hosted (local/staging) members are not filtered.
+/// Restricts what the virtual channel serves. When `enabled`, a package
+/// record is listed in the virtual's index (`repodata.json` in every
+/// encoding, the CEP-16 shard index, `current_repodata.json`,
+/// `run_exports.json`) only if some entry admits it, `channeldata.json` keeps
+/// only admitted names, and a download through the virtual of a package the
+/// list does not admit is a 404, as the index implies. `scope` selects the
+/// members filtered: `all_members` (the default: hosted and remote) or
+/// `remote_only` (hosted local/staging members pass through unfiltered, the
+/// behaviour before #5055). A request that omits `scope` keeps the scope
+/// already stored. Reads of a member repository itself are never filtered.
 ///
 /// An entry is `{"name": ..., "version": ..., "subdirs": [...]}`: `name` is an
 /// exact conda package name or a glob (`*`, `?`), case-insensitive; `version`
@@ -13700,8 +13736,9 @@ pub async fn get_conda_allowlist(
 /// not admitted by a constrained entry. `subdirs` optionally restricts the
 /// entry to platforms. A package is admitted when any entry admits it.
 ///
-/// `enabled` is required: an enabled empty list admits nothing from remotes;
-/// `enabled: false` keeps the entries but restores the unfiltered merge.
+/// `enabled` is required: an enabled empty list admits nothing from the
+/// members in scope; `enabled: false` keeps the entries but restores the
+/// unfiltered merge.
 /// Limits: 10,000 entries, names up to 128 bytes, version specs up to 256
 /// bytes, 32 subdirs per entry. Changes apply to the next request.
 #[utoipa::path(
@@ -13726,10 +13763,16 @@ pub async fn set_conda_allowlist(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<conda_allowlist::CondaAllowlist>,
+    Json(mut payload): Json<conda_allowlist::CondaAllowlist>,
 ) -> Result<Json<CondaAllowlistResponse>> {
     let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
     let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    // #5055: a request without `scope` (an older client) keeps the stored
+    // scope, so it cannot silently undo a `remote_only` opt-out. Stored
+    // explicitly once a list exists, so it no longer depends on the default.
+    if payload.scope.is_none() && !matches!(previous, conda_allowlist::StoredAllowlist::None) {
+        payload.scope = Some(previous.scope());
+    }
     conda_allowlist::save_allowlist(&state.db, repo.id, &payload).await?;
     audit_conda_allowlist_change(&state, &auth, &repo, &previous, Some(&payload)).await;
     Ok(Json(CondaAllowlistResponse::new(
@@ -30827,6 +30870,29 @@ mod tests {
     }
 
     #[test]
+    fn update_request_description_and_quota_are_three_way_4729() {
+        let parse = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize")
+        };
+
+        // Absent: leave both unchanged.
+        let absent = parse(serde_json::json!({}));
+        assert_eq!(absent.description, None);
+        assert_eq!(absent.quota_bytes, None);
+
+        // Explicit null: clear both. A bare `Option<_>` collapsed this into
+        // "absent", which is the bug this guards.
+        let cleared = parse(serde_json::json!({ "description": null, "quota_bytes": null }));
+        assert_eq!(cleared.description, Some(None));
+        assert_eq!(cleared.quota_bytes, Some(None));
+
+        // Values: set both.
+        let set = parse(serde_json::json!({ "description": "x", "quota_bytes": 1024 }));
+        assert_eq!(set.description, Some(Some("x".to_string())));
+        assert_eq!(set.quota_bytes, Some(Some(1024)));
+    }
+
+    #[test]
     fn project_assignment_change_ignores_omitted_and_unchanged_4026() {
         let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(project_assignment_change(Some(p), None), None);
@@ -31976,6 +32042,90 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4729: `PATCH` with `{"description": null}` or `{"quota_bytes": null}`
+    /// clears the column instead of answering 200 and changing nothing.
+    /// Omitting either field still leaves it alone, which is what a client
+    /// that does not manage it relies on.
+    ///
+    /// Fails on `main`: both were bare `Option<_>` request fields (so `null`
+    /// deserialized as "absent") and the service's `COALESCE` UPDATE read the
+    /// resulting NULL bind as "leave alone".
+    #[tokio::test]
+    async fn update_repository_clears_description_and_quota_4729_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        async fn stored(pool: &sqlx::PgPool, repo_id: Uuid) -> (Option<String>, Option<i64>) {
+            sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+                "SELECT description, quota_bytes FROM repositories WHERE id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read repository")
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let patch = |json: &str| {
+            update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(serde_json::from_str(json).expect("deserialize update payload")),
+            )
+        };
+
+        // Seed both fields through the same PATCH path.
+        let Json(seeded) = patch(r#"{"description":"keep me","quota_bytes":1048576}"#)
+            .await
+            .expect("seed description and quota");
+        assert_eq!(seeded.description.as_deref(), Some("keep me"));
+        assert_eq!(seeded.quota_bytes, Some(1_048_576));
+
+        // Omitting both leaves them alone: the behaviour that must not
+        // regress when `null` starts meaning "clear".
+        let Json(untouched) = patch(r#"{"name":"renamed"}"#)
+            .await
+            .expect("description- and quota-omitted PATCH");
+        assert_eq!(untouched.description.as_deref(), Some("keep me"));
+        assert_eq!(untouched.quota_bytes, Some(1_048_576));
+        assert_eq!(
+            stored(&pool, repo_id).await,
+            (Some("keep me".to_string()), Some(1_048_576))
+        );
+
+        // Explicit nulls clear both, in the response and in the row.
+        let Json(cleared) = patch(r#"{"description":null,"quota_bytes":null}"#)
+            .await
+            .expect("null clears description and quota");
+        assert_eq!(
+            cleared.description, None,
+            "response echoes the cleared description"
+        );
+        assert_eq!(
+            cleared.quota_bytes, None,
+            "response echoes the cleared quota"
+        );
+        assert_eq!(stored(&pool, repo_id).await, (None, None));
+
+        // Clearing again is an idempotent 200.
+        patch(r#"{"description":null,"quota_bytes":null}"#)
+            .await
+            .expect("clearing twice is idempotent");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 

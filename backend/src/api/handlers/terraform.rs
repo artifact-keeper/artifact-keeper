@@ -3450,25 +3450,50 @@ async fn mirror_download(
     let cache_path =
         mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
 
-    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+    serve_mirror_archive(&state, &remote, &repo_key, archive_url, &cache_path, &ctx).await
+}
+
+/// Serve a remote mirror's provider archive through the proxy cache: a
+/// presigned redirect to object storage when the cached copy is fresh and the
+/// backend can sign, else the archive streamed from the cache or, on a miss,
+/// from `archive_url` (cached under `cache_path`).
+async fn serve_mirror_archive(
+    state: &SharedState,
+    remote: &MirrorRemote<'_>,
+    repo_key: &str,
+    archive_url: &str,
+    cache_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let response = match proxy_helpers::proxy_cache_fresh_redirect(
         remote.proxy,
-        remote.repo.id,
-        &repo_key,
-        &remote.upstream_url,
-        archive_url,
-        &cache_path,
-        "application/zip",
-        RepositoryFormat::Terraform,
+        state,
+        repo_key,
+        cache_path,
+        ctx,
     )
-    .await?;
-    // #3649: count the proxied serve. The streaming helper answers a warm
-    // cache HIT from storage and a cold MISS from upstream through the same
-    // call, so recording once it resolves counts both -- the cache hit #3649
-    // reported as invisible included -- while a 404/502 still counts nothing.
-    // Keyed on `cache_path`, the scheme-less canonical key this fetch commits
-    // under, so the count lines up with the catalog row the listing renders.
-    proxy_helpers::record_proxy_download(&state, remote.repo.id, &repo_key, &cache_path, &ctx)
-        .await;
+    .await?
+    {
+        Some(redirect) => redirect,
+        None => {
+            proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+                remote.proxy,
+                remote.repo.id,
+                repo_key,
+                &remote.upstream_url,
+                archive_url,
+                cache_path,
+                "application/zip",
+                RepositoryFormat::Terraform,
+            )
+            .await?
+        }
+    };
+    // #3649: count the proxied serve, a redirect, a warm cache HIT and a cold
+    // MISS alike, while a 404/502 still counts nothing. Keyed on `cache_path`,
+    // the scheme-less canonical key the fetch commits under, so the count lines
+    // up with the catalog row the listing renders.
+    proxy_helpers::record_proxy_download(state, remote.repo.id, repo_key, cache_path, ctx).await;
     Ok(response)
 }
 
@@ -8129,5 +8154,80 @@ mod origin_registry_tests {
         let (status, _) = get_path(&fx, "1.0.0/SHA256SUMS.sig").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         fx.teardown().await;
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod mirror_archive_redirect {
+    use super::{serve_mirror_archive, MirrorRemote};
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::download_telemetry::DownloadContext;
+    use crate::services::proxy_cache_scope::ProxyCacheScope;
+    use crate::services::proxy_service::ProxyService;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    const REPO_KEY: &str = "tf-mirror";
+    const UPSTREAM: &str = "https://registry.invalid";
+    const CACHE_PATH: &str =
+        "hashicorp/null/3.2.3/linux/amd64/terraform-provider-null_3.2.3_linux_amd64.zip";
+
+    /// Serve a fresh cached archive from a presign-capable cache. The archive
+    /// URL does not resolve, so any upstream fetch would fail the request.
+    async fn serve(is_head: bool) -> Response {
+        let pool = tdh::lazy_pool();
+        let scope = ProxyCacheScope::unscoped();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        backend.seed_fresh_entry(
+            &ProxyService::cache_storage_key(&scope, REPO_KEY, CACHE_PATH).unwrap(),
+            &ProxyService::cache_metadata_key(&scope, REPO_KEY, CACHE_PATH).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let remote = MirrorRemote {
+            repo: tdh::make_repo_info(
+                uuid::Uuid::new_v4(),
+                REPO_KEY,
+                dir.path(),
+                "remote",
+                Some(UPSTREAM),
+            ),
+            upstream_url: UPSTREAM.to_string(),
+            proxy: proxy.as_ref(),
+        };
+        let ctx = DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head,
+        };
+        serve_mirror_archive(
+            &state,
+            &remote,
+            REPO_KEY,
+            &format!("{UPSTREAM}/p.zip"),
+            CACHE_PATH,
+            &ctx,
+        )
+        .await
+        .unwrap_or_else(|err| err)
+    }
+
+    #[tokio::test]
+    async fn cached_archive_is_redirected_to_object_storage() {
+        let resp = serve(false).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp.headers()[header::LOCATION].to_str().unwrap();
+        assert!(loc.contains(CACHE_PATH), "signed the wrong key: {loc}");
+    }
+
+    #[tokio::test]
+    async fn head_is_answered_from_the_cache_not_redirected() {
+        assert_eq!(serve(true).await.status(), StatusCode::OK);
     }
 }

@@ -18460,7 +18460,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -18472,6 +18472,12 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-0.99.0-test"),
                 Some(fx.repo_id),
+                // Graded as the coordinate the request names, as the inline
+                // gate records it: these bytes cannot establish an identity
+                // of their own, and an unestablished pull does not reuse a
+                // clean verdict recorded with no pin (part of #3396).
+                Some(1),
+                Some("npm|verified-widget|3.2.1"),
             )
             .await
             .expect("seed clean verdict");
@@ -19934,5 +19940,68 @@ mod unpublish_4025_tests {
             fx.teardown().await;
             assert_eq!(got, vec![want; 3], "{repo_type}");
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_tarball_with_two_package_json_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = NpmScannedTarball {
+            proxy: &proxy,
+            package_name: "left",
+        };
+        let good: &[u8] = br#"{"name":"left","version":"1.0.0"}"#;
+        let other: &[u8] = br#"{"name":"right","version":"9.9.9"}"#;
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Npm, "left-1.0.0.tgz", bytes);
+        for second in ["package/package.json", "./package/package.json"] {
+            let dup = tar_gz_with(&[
+                ("package/package.json", good),
+                ("package/index.js", b"1"),
+                (second, other),
+            ]);
+            let (own, gate) = check(&dup);
+            assert!(
+                established(&own),
+                "the reader takes the first copy ({second})"
+            );
+            assert!(unestablished(&gate), "{second}");
+        }
+        let single = tar_gz_with(&[("package/package.json", good), ("package/index.js", b"1")]);
+        assert!(established(&check(&single).1));
     }
 }

@@ -240,7 +240,11 @@ pub struct CreateRepositoryRequest {
 pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// When `Some`, sets the description; `None` leaves it unchanged. The
+    /// outer `Option` is the "field present" marker and the inner value is
+    /// what is stored: `Some(Some(text))` sets, `Some(None)` clears the
+    /// column to NULL (#4729).
+    pub description: Option<Option<String>>,
     /// Set the repository's audience outright. `None` leaves it unchanged.
     pub visibility: Option<crate::models::repository::RepositoryVisibility>,
     /// Legacy boolean. Only ever `Some(false)` from the handler, meaning "not
@@ -248,6 +252,10 @@ pub struct UpdateRepositoryRequest {
     /// database trigger narrow a `public` repository while leaving an
     /// `internal` one alone, which writing `visibility` directly would not.
     pub is_public: Option<bool>,
+    /// When `Some`, sets the repository quota; `None` leaves it unchanged.
+    /// The outer `Option` is the "field present" marker and the inner value is
+    /// what is stored: `Some(Some(bytes))` sets, `Some(None)` clears the
+    /// column to NULL (unlimited, #4729).
     pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<String>,
     /// When `Some`, sets the `promotion_only` flag; `None` leaves it unchanged.
@@ -1856,6 +1864,25 @@ impl RepositoryService {
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
+        // Clearing `description` / `quota_bytes` (#4729). Same reason and same
+        // shape as the project unassignment above: the main UPDATE's COALESCE
+        // reads a NULL bind as "leave alone", so an explicit `null` is a
+        // targeted write ahead of it, and the row it RETURNs already carries
+        // the cleared values.
+        if matches!(req.description, Some(None)) {
+            sqlx::query("UPDATE repositories SET description = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        if matches!(req.quota_bytes, Some(None)) {
+            sqlx::query("UPDATE repositories SET quota_bytes = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
         let repo = sqlx::query_as!(
             Repository,
             r#"
@@ -1895,7 +1922,7 @@ impl RepositoryService {
             id,
             req.key,
             req.name,
-            req.description,
+            req.description.flatten(),
             req.is_public,
             req.quota_bytes.flatten(),
             req.upstream_url,
@@ -3876,7 +3903,7 @@ mod tests {
                     repo_id,
                     UpdateRepositoryRequest {
                         name: Some("managed by terraform".to_string()),
-                        description: Some("tf".to_string()),
+                        description: Some(Some("tf".to_string())),
                         visibility: None,
                         is_public: Some(false),
                         quota_bytes: Some(Some(1024)),
@@ -4029,7 +4056,7 @@ mod tests {
             versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
-            description: Some("Updated Description".to_string()),
+            description: Some(Some("Updated Description".to_string())),
             is_public: Some(false),
             quota_bytes: Some(Some(2_000_000_000)),
             upstream_url: None,

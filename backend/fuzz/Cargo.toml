@@ -1,0 +1,25 @@
+# Coverage-guided fuzz targets for the backend's untrusted-input parsers
+# (cargo-fuzz, nightly only). Not a workspace member and not built by CI;
+# see README.md for how to run a campaign.
+[package]
+name = "artifact-keeper-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Its own workspace: the repository workspace builds `backend` only.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "iso_locate"
+path = "fuzz_targets/iso_locate.rs"
+test = false
+doc = false
+bench = false

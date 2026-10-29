@@ -12669,3 +12669,42 @@ mod serve_key_4365_tests {
         }
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn an_archive_with_a_repeated_entry_is_not_established() {
+        let kind = || ConanArchive {
+            reference: Some(("demo".to_string(), "1.0.0".to_string())),
+        };
+        let check =
+            |bytes: &[u8]| archive_identities(kind(), DupFormat::Conan, "conan_export.tgz", bytes);
+        let dup = tar_gz_with(&[
+            ("conanfile.py", b"a"),
+            ("conandata.yml", b""),
+            ("conanfile.py", b"b"),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(matches!(own, ProxyScanIdentity::Established(_)));
+        assert!(unestablished(&gate));
+        let single = tar_gz_with(&[("conanfile.py", b"a"), ("conandata.yml", b"")]);
+        assert!(matches!(
+            check(&single).1,
+            ProxyScanIdentity::Established(_)
+        ));
+    }
+}

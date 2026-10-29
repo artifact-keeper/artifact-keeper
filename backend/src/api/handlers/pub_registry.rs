@@ -2796,3 +2796,45 @@ mod serve_key_4365_tests {
         assert!(got.scannable);
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn an_archive_with_two_pubspec_entries_is_not_established() {
+        let kind = || PubArchive {
+            name: "demo",
+            version: "1.0.0",
+        };
+        let check =
+            |bytes: &[u8]| archive_identities(kind(), DupFormat::Pub, "demo-1.0.0.tar.gz", bytes);
+        let good: &[u8] = b"name: demo\nversion: 1.0.0\n";
+        let other: &[u8] = b"name: demo\nversion: 1.0.0\ndependencies:\n  other: any\n";
+        let dup = tar_gz_with(&[
+            ("pubspec.yaml", good),
+            ("lib/demo.dart", b""),
+            ("./pubspec.yaml", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::NotApplicable),
+            "graded on contents"
+        );
+        assert!(unestablished(&gate));
+        let single = tar_gz_with(&[("pubspec.yaml", good), ("lib/demo.dart", b"")]);
+        assert!(matches!(check(&single).1, ProxyScanIdentity::NotApplicable));
+    }
+}

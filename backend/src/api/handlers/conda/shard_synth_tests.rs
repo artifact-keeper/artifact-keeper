@@ -503,3 +503,53 @@ fn synthesis_peak_memory() {
     );
     let _ = shard_synth::PARTITIONS;
 }
+
+/// #4929: an upstream that answers 403 for every optional document it does
+/// not publish (an S3 bucket without list permission: the shard index, the
+/// `.zst` and the `.bz2`) and serves only the plain `repodata.json` still gets
+/// a synthesised shard index, built from that plain document, instead of a
+/// 502 on the index.
+#[tokio::test]
+async fn an_upstream_refusing_optional_documents_is_synthesised_from_plain_json_4929() {
+    let Some(pool) = tdh::try_pool().await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    for path in [
+        "/noarch/repodata_shards.msgpack.zst",
+        "/noarch/repodata.json.zst",
+        "/noarch/repodata.json.bz2",
+    ] {
+        Mock::given(method("GET"))
+            .and(wm_path(path))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+    }
+    let doc = repodata("noarch", &["s3-a-1.0-0.tar.bz2"], &["s3-b-1.0-0.conda"]);
+    mount(
+        &server,
+        "/noarch/repodata.json",
+        serde_json::to_vec(&doc).unwrap(),
+    )
+    .await;
+    let (state, _cache) = state_with_proxy_cache(&pool);
+    let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+    let app = tdh::router_anon(super::router(), state.clone());
+    let (status, body, _) = tdh::send_with_headers(
+        app,
+        tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
+    )
+    .await;
+    let plain_hits = hits(&server, "/noarch/repodata.json").await;
+    cleanup_conda_repo(&pool, repo_id).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 403 on optional documents means they are absent: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(names(&decode_index(&body)), ["s3-a", "s3-b"]);
+    assert_eq!(plain_hits, 1, "the plain document is the synthesis source");
+}

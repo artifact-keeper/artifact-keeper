@@ -144,7 +144,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// How [`run_extractor`] judged an extractor child that did not fail outright.
 #[derive(Debug, PartialEq, Eq)]
-enum ExtractorExit {
+pub(crate) enum ExtractorExit {
     /// The archive extracted with no errors.
     Clean,
     /// The archive extracted, but the tool skipped entries the non-root
@@ -211,7 +211,7 @@ async fn run_extractor(
 /// Exit 2 also covers a `symlink()` that failed, including on a full disk,
 /// so exit 2 whose stderr reports `ENOSPC` / `EDQUOT` is a failure: the tree
 /// may be short and the scan must not pass on it.
-fn classify_unsquashfs_exit(code: Option<i32>, stderr: &str) -> Option<ExtractorExit> {
+pub(crate) fn classify_unsquashfs_exit(code: Option<i32>, stderr: &str) -> Option<ExtractorExit> {
     match code {
         Some(0) => Some(ExtractorExit::Clean),
         Some(2) if !reports_out_of_space(stderr) => {
@@ -267,7 +267,7 @@ const SKIPPED_SUMMARY_LINE_CHARS: usize = 200;
 /// Condense an extractor's stderr into one log-friendly line: the first
 /// [`SKIPPED_SUMMARY_LINES`] non-empty lines, each cut at
 /// [`SKIPPED_SUMMARY_LINE_CHARS`], then a count of the rest.
-fn summarize_stderr(stderr: &str) -> String {
+pub(crate) fn summarize_stderr(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
@@ -402,6 +402,63 @@ async fn run_trivy_scan(
 
     serde_json::from_slice(&output.stdout)
         .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
+}
+
+/// Ceilings the post-extraction guard ([`guard_extracted_tree`]) enforces
+/// over an extracted tree, and the noun its errors use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TreeLimits {
+    pub max_bytes: u64,
+    pub max_entries: u64,
+    pub label: &'static str,
+    /// Refuse device nodes, FIFOs and sockets. The ISO rootfs path sets it:
+    /// a package database holds none, and an engine opening one could block
+    /// or read a device. The Incus path keeps a full rootfs, whose `/dev`
+    /// entries the non-root extractor already skips.
+    pub reject_special_files: bool,
+}
+
+impl TreeLimits {
+    /// The Incus rootfs ceilings ([`max_extracted_bytes`],
+    /// [`MAX_EXTRACTED_ENTRIES`]).
+    fn incus() -> Self {
+        Self {
+            max_bytes: max_extracted_bytes(),
+            max_entries: MAX_EXTRACTED_ENTRIES,
+            label: "Incus archive",
+            reject_special_files: false,
+        }
+    }
+}
+
+/// The post-extraction hardening guard, on a blocking thread: make the tree
+/// owner-traversable so the non-root scanner UID can walk it (#1492), reject
+/// any symlink that escapes `root`, and enforce `limits`. The Incus tarball
+/// and squashfs paths run it with the Incus ceilings; the ISO rootfs path
+/// (#1966) runs the same guard with the scan-workspace ceilings, so every
+/// image the scanner unpacks with an external tool is checked by one walk.
+pub(crate) async fn guard_extracted_tree(root: &Path, limits: TreeLimits) -> Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // Open the tree up to the owner first: a real OS rootfs ships
+        // restrictive modes (0700 dirs, 0600 files), and `--no-same-owner`
+        // extraction plus tar's implicitly-created parent dirs leave parts
+        // of the tree untraversable by the non-root scanner UID. Without
+        // this the symlink/bomb walk below (and later trivy) EACCES on the
+        // first locked dir. Done in-process (not `chmod -R`) so we never
+        // chase a symlink target out of the workspace (#1492).
+        IncusScanner::make_tree_owner_traversable(&root)?;
+        IncusScanner::enforce_tree_limits(&root, &limits)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
+}
+
+/// Make every directory and file under `root` owner-traversable, never
+/// following a symlink (see [`IncusScanner::make_tree_owner_traversable`]).
+/// Synchronous; for a caller already on a blocking thread.
+pub(crate) fn open_tree_for_owner(root: &Path) -> Result<()> {
+    IncusScanner::make_tree_owner_traversable(root)
 }
 
 /// Workspace prefix for Incus scans: jobs extract into
@@ -704,20 +761,7 @@ impl IncusScanner {
     ///   2. reject any symlink that escapes the workspace root (traversal),
     ///   3. enforce the uncompressed-size / entry-count bomb caps.
     async fn run_extraction_guard(root: &Path) -> Result<()> {
-        let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            // Open the tree up to the owner first: a real OS rootfs ships
-            // restrictive modes (0700 dirs, 0600 files), and `--no-same-owner`
-            // extraction plus tar's implicitly-created parent dirs leave parts
-            // of the tree untraversable by the non-root scanner UID. Without
-            // this the symlink/bomb walk below (and later trivy) EACCES on the
-            // first locked dir. Done in-process (not `chmod -R`) so we never
-            // chase a symlink target out of the workspace (#1492).
-            Self::make_tree_owner_traversable(&root)?;
-            Self::enforce_extraction_limits(&root)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
+        guard_extracted_tree(root, TreeLimits::incus()).await
     }
 
     /// Recursively add owner read/write/traverse bits (`u+rwX`) to every real
@@ -812,7 +856,14 @@ impl IncusScanner {
     /// is rejected when its resolved target is not inside `root`. Targets that
     /// don't yet exist (dangling) are resolved lexically against the link's
     /// parent so an `a -> ../../etc` style escape is still caught.
+    #[cfg(test)]
     fn enforce_extraction_limits(root: &Path) -> Result<()> {
+        Self::enforce_tree_limits(root, &TreeLimits::incus())
+    }
+
+    /// The tree walk behind the post-extraction guard, with caller-chosen
+    /// ceilings, so the ISO rootfs path ([`guard_extracted_tree`]) shares it.
+    fn enforce_tree_limits(root: &Path, limits: &TreeLimits) -> Result<()> {
         let canonical_root = std::fs::canonicalize(root).map_err(|e| {
             AppError::Internal(format!(
                 "Failed to canonicalize workspace root {}: {}",
@@ -821,7 +872,7 @@ impl IncusScanner {
             ))
         })?;
 
-        let max_bytes = max_extracted_bytes();
+        let max_bytes = limits.max_bytes;
         let mut total_bytes: u64 = 0;
         let mut total_entries: u64 = 0;
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -849,15 +900,15 @@ impl IncusScanner {
                 let file_type = meta.file_type();
 
                 total_entries += 1;
-                if total_entries > MAX_EXTRACTED_ENTRIES {
+                if total_entries > limits.max_entries {
                     return Err(AppError::Internal(format!(
-                        "Incus archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
-                        MAX_EXTRACTED_ENTRIES
+                        "{} contains too many entries (> {}); refusing to scan suspected decompression bomb",
+                        limits.label, limits.max_entries
                     )));
                 }
 
                 if file_type.is_symlink() {
-                    Self::reject_escaping_symlink(&path, &canonical_root)?;
+                    Self::reject_escaping_symlink(&path, &canonical_root, limits.label)?;
                     // Do not follow the link; nothing more to do for it.
                     continue;
                 }
@@ -868,10 +919,16 @@ impl IncusScanner {
                     total_bytes += meta.len();
                     if total_bytes > max_bytes {
                         return Err(AppError::Internal(format!(
-                            "Incus archive expands to more than {} bytes; refusing to scan suspected decompression bomb",
-                            max_bytes
+                            "{} expands to more than {} bytes; refusing to scan suspected decompression bomb",
+                            limits.label, max_bytes
                         )));
                     }
+                } else if limits.reject_special_files {
+                    return Err(AppError::Internal(format!(
+                        "{} contains {}, which is not a file, directory or symlink; refusing extraction",
+                        limits.label,
+                        path.display()
+                    )));
                 }
             }
         }
@@ -880,7 +937,7 @@ impl IncusScanner {
     }
 
     /// Reject a symlink at `link` whose target resolves outside `canonical_root`.
-    fn reject_escaping_symlink(link: &Path, canonical_root: &Path) -> Result<()> {
+    fn reject_escaping_symlink(link: &Path, canonical_root: &Path, label: &str) -> Result<()> {
         let target = std::fs::read_link(link).map_err(|e| {
             AppError::Internal(format!(
                 "Failed to read symlink {} during guard: {}",
@@ -931,7 +988,8 @@ impl IncusScanner {
 
         if !within {
             return Err(AppError::Internal(format!(
-                "Incus archive contains symlink {} -> {} escaping the workspace; refusing extraction (path traversal)",
+                "{} contains symlink {} -> {} escaping the workspace; refusing extraction (path traversal)",
+                label,
                 link.display(),
                 target.display()
             )));

@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#1966]
+---
+- **ISO live and installer media are scanned for the packages of their root filesystem** (#1966). An uploaded ISO9660 image, detected by its volume descriptor rather than its extension, used to be staged as one opaque file: nothing inside it was cataloged and the scan read as a clean grade A. The scanner now locates the embedded squashfs rootfs (`live/filesystem.squashfs`, `casper/filesystem.squashfs`, `LiveOS/squashfs.img`, `images/install.img`), extracts only its package databases (dpkg, rpm, apk) and release files with `unsquashfs` under the scan-workspace ceilings (`MAX_SCAN_EXTRACTED_BYTES`, 200,000 entries, checked against the declared sizes before anything is written), and grades and inventories them like a container image. An image whose rootfs cannot be read (none embedded, layered Ubuntu casper media, a corrupt or oversized squashfs, no package database) is recorded `not_cataloged` with `inventory_status = 'partial'` and flags the repository instead of reading clean. See `docs/iso-image-scanning.md`.

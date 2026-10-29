@@ -44,7 +44,8 @@ use crate::services::package_analysis_service::{
     record_install_scripts, Completeness, UnanalyzedScript,
 };
 use crate::services::rpm_layout;
-use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
+use crate::services::rpm_repodata_builder;
+use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint, StoredRepodata};
 use crate::services::signing_service::{openpgp_public_keyring, SigningService};
 
 #[cfg(ak_test_shard = "router")]
@@ -171,21 +172,13 @@ async fn depth_response(
         ) {
             return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
         }
-        let rendered = cached_repodata_at(state, auth, repo, root).await?;
-        let bytes = match file {
-            "repomd.xml" => rendered.repomd_xml.clone(),
-            "repomd.xml.asc" => return sign_repomd(state, repo, rendered.repomd_xml.clone()).await,
-            "primary.xml.gz" => rendered.primary_gz.clone(),
-            "filelists.xml.gz" => rendered.filelists_gz.clone(),
-            "other.xml.gz" => rendered.other_gz.clone(),
-            "updateinfo.xml.gz" => Bytes::from(gzip_bytes(generate_updateinfo_xml().as_bytes())),
-            _ => unreachable!(),
-        };
-        return Ok(Response::builder()
-            .header(CONTENT_TYPE, publication_content_type(file))
-            .header(CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
-            .unwrap());
+        if file == "updateinfo.xml.gz" {
+            return Ok(repodata_bytes_response(
+                file,
+                Bytes::from(gzip_bytes(generate_updateinfo_xml().as_bytes())),
+            ));
+        }
+        return repodata_document(state, auth, repo, root, file).await;
     }
     rpm_layout::validate_path(path, depth)
         .map_err(|_| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
@@ -1052,14 +1045,6 @@ async fn repodata_fingerprint(
 /// `auth` is the caller: a virtual repository's document describes only the
 /// members that caller may read (#4346), and the cache keys each render by
 /// that authorized member set.
-async fn cached_repodata(
-    state: &SharedState,
-    auth: Option<&AuthExtension>,
-    repo: &RepoInfo,
-) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
-    cached_repodata_at(state, auth, repo, "").await
-}
-
 async fn cached_repodata_at(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -1103,19 +1088,153 @@ async fn cached_repodata_at(
         .await
 }
 
+/// A root's repodata for one request (#4544).
+enum RepodataSet {
+    /// Rendered on request (through the in-process cache): virtual
+    /// repositories, `repodata_mode: on_request`, and roots not built yet.
+    Rendered(std::sync::Arc<RenderedRepodata>),
+    /// The revision the precomputed builder stored.
+    Stored(StoredRepodata),
+}
+
+impl RepodataSet {
+    fn repomd_xml(&self) -> Bytes {
+        match self {
+            Self::Rendered(r) => r.repomd_xml.clone(),
+            Self::Stored(s) => s.repomd_xml.clone(),
+        }
+    }
+}
+
+/// The repodata `root` of `repo` serves: the precomputed revision when the
+/// repository is a precomputed hosted one and the root has been built,
+/// otherwise the on-request render.
+async fn repodata_set_at(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    root: &str,
+) -> Result<RepodataSet, Response> {
+    if repo.repo_type == RepositoryType::Local {
+        let depth = rpm_layout::depth(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        rpm_layout::validate_root(root, depth).map_err(|_| {
+            (StatusCode::NOT_FOUND, "No repodata at this directory depth").into_response()
+        })?;
+        if let Some(stored) = rpm_repodata_builder::stored_revision(&state.db, repo.id, root)
+            .await
+            .map_err(IntoResponse::into_response)?
+        {
+            return Ok(RepodataSet::Stored(stored));
+        }
+    }
+    cached_repodata_at(state, auth, repo, root)
+        .await
+        .map(RepodataSet::Rendered)
+}
+
+/// One generated `repodata/` document of `root`: `repomd.xml`, its detached
+/// signature, or one of the three compressed indexes.
+async fn repodata_document(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    root: &str,
+    file: &str,
+) -> Result<Response, Response> {
+    let set = repodata_set_at(state, auth, repo, root).await?;
+    let rendered = match (&set, file) {
+        (_, "repomd.xml") => return Ok(repodata_bytes_response(file, set.repomd_xml())),
+        // Signed per request over the bytes `repomd.xml` serves, so a key
+        // rotation (#1329) applies at once to stored revisions too.
+        (_, "repomd.xml.asc") => return sign_repomd(state, repo, set.repomd_xml()).await,
+        (RepodataSet::Stored(stored), _) => {
+            return stored_repodata_response(state, auth, repo, root, stored, file).await
+        }
+        (RepodataSet::Rendered(rendered), _) => rendered,
+    };
+    let bytes = match file {
+        "primary.xml.gz" => rendered.primary_gz.clone(),
+        "filelists.xml.gz" => rendered.filelists_gz.clone(),
+        "other.xml.gz" => rendered.other_gz.clone(),
+        _ => return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response()),
+    };
+    Ok(repodata_bytes_response(file, bytes))
+}
+
+fn repodata_bytes_response(file: &str, bytes: Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, publication_content_type(file))
+        .header(CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// Stream a compressed document of a stored revision. A document missing
+/// from storage (removed by hand, or a storage reset) is rendered on request
+/// instead and the root is marked for a rebuild.
+async fn stored_repodata_response(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    root: &str,
+    stored: &StoredRepodata,
+    file: &str,
+) -> Result<Response, Response> {
+    if !matches!(file, "primary.xml.gz" | "filelists.xml.gz" | "other.xml.gz") {
+        return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
+    }
+    let storage = state.storage_for_repo_or_500(&stored.location)?;
+    match storage.get_stream(&stored.key(file)).await {
+        Ok(stream) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, publication_content_type(file));
+            if let Some(size) = stored.sizes.get(file) {
+                response = response.header(CONTENT_LENGTH, *size);
+            }
+            Ok(response.body(Body::from_stream(stream)).unwrap())
+        }
+        Err(crate::error::AppError::NotFound(_)) => {
+            warn!(
+                repo_id = %repo.id,
+                root,
+                revision = stored.revision,
+                file,
+                "stored RPM repodata document missing; rendering on request and rebuilding"
+            );
+            let _ = rpm_repodata_builder::mark_dirty(&state.db, repo.id, root).await;
+            let rendered = cached_repodata_at(state, auth, repo, root).await?;
+            let bytes = match file {
+                "primary.xml.gz" => rendered.primary_gz.clone(),
+                "filelists.xml.gz" => rendered.filelists_gz.clone(),
+                _ => rendered.other_gz.clone(),
+            };
+            Ok(repodata_bytes_response(file, bytes))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::storage_err_message(&e),
+        )
+            .into_response()),
+    }
+}
+
 /// Metadata JSON held in memory at once by a repodata render (#4544). Rows
 /// stream from one consistent snapshot and are rendered in batches of about
 /// this many bytes of metadata, so peak memory follows the batch, not the
 /// root: a root of 2,500 packages with 2.5 GB of file-list metadata used to
 /// load all of it (plus every uncompressed document) before the first byte
 /// was gzipped. A single package larger than the budget is its own batch.
-const RPM_REPODATA_RENDER_BATCH_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const RPM_REPODATA_RENDER_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
 /// What a streamed render did, for tests and the render log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct RenderStats {
+pub(crate) struct RenderStats {
     packages: usize,
-    batches: usize,
+    pub(crate) batches: usize,
     /// Largest batch by estimated metadata bytes.
     max_batch_bytes: usize,
     /// Most rows in one batch.
@@ -1123,27 +1242,96 @@ struct RenderStats {
 }
 
 /// Render the repodata set for the live `.rpm` rows of `repo_ids` under
-/// `prefix` without holding the whole catalogue in memory (#4544).
+/// `prefix` without holding the whole catalogue in memory (#4544): the
+/// on-request render, into memory, healing as it goes.
 ///
-/// One `REPEATABLE READ` read-only transaction gives the count (the
-/// `packages=` attribute every document opens with) and the row stream the
-/// same snapshot, so the documents agree with each other exactly as the
-/// single-query render did. Rows are accumulated until `batch_bytes` of
-/// metadata, then healed (#3801), appended to the three gzip streams off the
-/// async runtime and dropped. The bytes are identical to
-/// [`render_repodata_at`] over the same rows, and the uncompressed documents
-/// to the ones the whole-catalogue render built.
-///
-/// The transaction stays open for the whole render, heal included, so on a
-/// large root it holds back the vacuum horizon (its snapshot xmin) for that
-/// long, like any long-running read. It is read-only and takes no row locks;
-/// rows changed meanwhile are reclaimed by the first vacuum after it ends.
+/// The bytes are identical to [`render_repodata_at`] over the same rows, and
+/// the uncompressed documents to the ones the whole-catalogue render built.
+/// See [`render_repodata_snapshot`] for the snapshot and batching.
 async fn render_repodata_streamed(
     state: &SharedState,
     repo_ids: &[uuid::Uuid],
     prefix: &str,
     batch_bytes: usize,
 ) -> Result<(RenderedRepodata, RenderStats), Response> {
+    let render = render_repodata_snapshot(
+        state,
+        repo_ids,
+        prefix,
+        batch_bytes,
+        RPM_REPODATA_DOC_SPILL_BYTES,
+        [Vec::new(), Vec::new(), Vec::new()],
+        RenderHeal::InSnapshot,
+    )
+    .await?;
+    let docs = render.docs;
+    let rendered = RenderedRepodata {
+        repomd_xml: Bytes::from(docs.repomd_xml),
+        primary_gz: Bytes::from(docs.primary.sink),
+        filelists_gz: Bytes::from(docs.filelists.sink),
+        other_gz: Bytes::from(docs.other.sink),
+        // A render missing some packages' dependency data (transient heal
+        // failure) is served but not cached: the fingerprint would not move
+        // again, so caching it would pin the gap (#3801).
+        cacheable: render.heal_complete,
+        valid_until: render.valid_until,
+    };
+    Ok((rendered, render.stats))
+}
+
+/// Whether a snapshot render heals packages that lack a current repodata
+/// block (#3801) as it reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderHeal {
+    /// Heal inside the snapshot (the on-request render): one request does
+    /// everything, at the cost of holding the snapshot across storage reads.
+    InSnapshot,
+    /// The caller healed beforehand ([`heal_root`], the precomputed
+    /// builder); a package still lacking its block only marks the render
+    /// incomplete.
+    Before,
+}
+
+/// A finished [`render_repodata_snapshot`].
+pub(crate) struct SnapshotRender<W> {
+    pub(crate) docs: RepodataDocs<W>,
+    pub(crate) stats: RenderStats,
+    /// False when some package's dependency data is missing for a transient
+    /// reason (#3801).
+    pub(crate) heal_complete: bool,
+    /// The earliest heal retry deadline among the rendered packages.
+    pub(crate) valid_until: Option<std::time::Instant>,
+    /// Live `.rpm` count and latest `updated_at` of the rendered snapshot:
+    /// the same values [`repodata_fingerprint`] reads.
+    pub(crate) count: i64,
+    pub(crate) latest_update: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Render the repodata set for the live `.rpm` rows of `repo_ids` under
+/// `prefix` into `sinks` (primary, filelists, other) from one snapshot.
+///
+/// One `REPEATABLE READ` read-only transaction gives the count (the
+/// `packages=` attribute every document opens with) and the row stream the
+/// same snapshot, so the documents agree with each other exactly as the
+/// single-query render did. Rows are accumulated until `batch_bytes` of
+/// metadata, then (with [`RenderHeal::InSnapshot`]) healed (#3801), appended
+/// to the three gzip streams off the async runtime and dropped.
+///
+/// The transaction stays open for the whole render, so on a large root it
+/// holds back the vacuum horizon (its snapshot xmin) for that long, like any
+/// long-running read. It is read-only and takes no row locks; rows changed
+/// meanwhile are reclaimed by the first vacuum after it ends. With
+/// [`RenderHeal::InSnapshot`] that includes the heal's storage reads; the
+/// precomputed builder heals first and renders with [`RenderHeal::Before`].
+pub(crate) async fn render_repodata_snapshot<W: Write + Send + 'static>(
+    state: &SharedState,
+    repo_ids: &[uuid::Uuid],
+    prefix: &str,
+    batch_bytes: usize,
+    spill_bytes: usize,
+    sinks: [W; 3],
+    heal: RenderHeal,
+) -> Result<SnapshotRender<W>, Response> {
     use futures::TryStreamExt;
 
     let render_failed = |e: tokio::task::JoinError| {
@@ -1160,9 +1348,9 @@ async fn render_repodata_streamed(
         .execute(&mut *tx)
         .await
         .map_err(super::db_err)?;
-    let (count,): (i64,) = sqlx::query_as(
+    let (count, latest_update): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
         r#"
-        SELECT COUNT(*)
+        SELECT COUNT(*), MAX(a.updated_at)
         FROM artifacts a
         WHERE a.repository_id = ANY($1) AND a.is_deleted = false
           AND a.path LIKE '%.rpm'
@@ -1175,9 +1363,11 @@ async fn render_repodata_streamed(
     .await
     .map_err(super::db_err)?;
 
-    let mut writer = Some(RepodataWriter::new(
+    let mut writer = Some(RepodataWriter::with_sinks(
         usize::try_from(count).unwrap_or(0),
         prefix,
+        spill_bytes,
+        sinks,
     ));
     let mut stats = RenderStats::default();
     let mut heal_complete = true;
@@ -1209,7 +1399,10 @@ async fn render_repodata_streamed(
             stats.max_batch_bytes = stats.max_batch_bytes.max(held);
             stats.max_batch_rows = stats.max_batch_rows.max(rows_now.len());
             held = 0;
-            heal_complete &= heal_rpm_repodata_info(state, &mut rows_now).await;
+            heal_complete &= match heal {
+                RenderHeal::InSnapshot => heal_rpm_repodata_info(state, &mut rows_now).await,
+                RenderHeal::Before => !rows_now.iter().any(needs_repodata_heal),
+            };
             valid_until = match (valid_until, earliest_retry_deadline(&rows_now)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1247,15 +1440,82 @@ async fn render_repodata_streamed(
     }
 
     let w = writer.take().expect("writer present after the last batch");
-    let mut rendered = tokio::task::spawn_blocking(move || w.finish())
+    let docs = tokio::task::spawn_blocking(move || w.finish_docs())
         .await
-        .map_err(render_failed)?;
-    // A render missing some packages' dependency data (transient heal
-    // failure) is served but not cached: the fingerprint would not move
-    // again, so caching it would pin the gap (#3801).
-    rendered.cacheable = heal_complete;
-    rendered.valid_until = valid_until;
-    Ok((rendered, stats))
+        .map_err(render_failed)?
+        .map_err(|e| {
+            error!(error = %e, "RPM repodata render: writing a document failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to render repository metadata",
+            )
+                .into_response()
+        })?;
+    Ok(SnapshotRender {
+        docs,
+        stats,
+        heal_complete,
+        valid_until,
+        count,
+        latest_update,
+    })
+}
+
+/// Rows of `repo_id` under `prefix` that may lack a current repodata block,
+/// a page at a time in id order. A superset of [`needs_repodata_heal`]
+/// (which the heal rechecks), so only those rows' metadata is transferred.
+const HEAL_CANDIDATES_SQL: &str = r#"
+        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.storage_key, a.updated_at, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1 AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+          AND starts_with(a.path, $2)
+          AND a.id > $3
+          AND (am.metadata IS NULL
+               OR jsonb_typeof(am.metadata -> 'repodata') IS DISTINCT FROM 'object'
+               OR (am.metadata -> 'repodata' -> 'v') IS DISTINCT FROM to_jsonb(1)
+               OR (am.metadata -> 'repodata') ? 'retry_after')
+        ORDER BY a.id
+        LIMIT $4
+        "#;
+
+/// Rows healed per page by [`heal_root`].
+const HEAL_PAGE_ROWS: i64 = 256;
+
+/// Heal (#3801) every package of `repo_id` under `prefix` that lacks a
+/// current repodata block, outside any snapshot: plain reads, then the
+/// storage reads and the per-package writes, page by page (#4544). The
+/// precomputed builder runs this before it opens the snapshot it renders
+/// from, so the render does no storage reads and holds no second database
+/// connection. Returns `false` when some package could not be settled for a
+/// transient reason.
+pub(crate) async fn heal_root(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    prefix: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut after = uuid::Uuid::nil();
+    let mut complete = true;
+    loop {
+        let mut page: Vec<RpmArtifact> = sqlx::query_as(HEAL_CANDIDATES_SQL)
+            .bind(repo_id)
+            .bind(prefix)
+            .bind(after)
+            .bind(HEAL_PAGE_ROWS)
+            .fetch_all(&state.db)
+            .await?;
+        let Some(last) = page.last() else {
+            return Ok(complete);
+        };
+        after = last.id;
+        let full = page.len() as i64 == HEAL_PAGE_ROWS;
+        complete &= heal_rpm_repodata_info(state, &mut page).await;
+        if !full {
+            return Ok(complete);
+        }
+    }
 }
 
 /// Approximate in-memory weight of a metadata document: its string and key
@@ -1734,70 +1994,141 @@ fn render_repodata_at(artifacts: &[RpmArtifact], prefix: &str) -> RenderedRepoda
 /// depends on how its input is split, so a document that large gets new
 /// (still deterministic) compressed bytes, which only the repositories that
 /// could not render before reach.
-const RPM_REPODATA_DOC_SPILL_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const RPM_REPODATA_DOC_SPILL_BYTES: usize = 32 * 1024 * 1024;
+
+/// A [`Write`] that forwards to `inner` and keeps the SHA-256 and length of
+/// everything written, so a compressed document's `repomd.xml` checksum and
+/// size are known without holding the document (#4544).
+pub(crate) struct DigestSink<W> {
+    inner: W,
+    sha256: Sha256,
+    len: usize,
+}
+
+impl<W: Write> DigestSink<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            sha256: Sha256::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for DigestSink<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.sha256.update(&buf[..n]);
+        self.len += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// One compressed index document being written: the uncompressed bytes
 /// buffered so far (up to [`RPM_REPODATA_DOC_SPILL_BYTES`]) or the gzip
 /// stream they spilled into, plus the running checksum and size of the
 /// uncompressed (open) bytes. A render therefore never materialises a large
 /// uncompressed document (#4544).
-struct XmlDocStream {
+///
+/// The compressed bytes go to `W`: a `Vec<u8>` for the on-request render, a
+/// spool file for the precomputed builder. The gzip output depends only on
+/// how the input is split, never on the sink, so both produce the same bytes.
+/// The first write error is kept and returned by [`XmlDocStream::finish`].
+struct XmlDocStream<W: Write> {
     pending: Vec<u8>,
-    gz: Option<GzEncoder<Vec<u8>>>,
+    sink: Option<W>,
+    gz: Option<GzEncoder<DigestSink<W>>>,
     open_sha256: Sha256,
     open_size: usize,
     spill_bytes: usize,
+    error: Option<std::io::Error>,
 }
 
-/// A finished [`XmlDocStream`]: the gzipped bytes and the four values
-/// `repomd.xml` advertises for them.
-struct FinishedDoc {
-    gz: Vec<u8>,
+/// A finished [`XmlDocStream`]: the sink holding the gzipped bytes and the
+/// four values `repomd.xml` advertises for them.
+pub(crate) struct FinishedDoc<W> {
+    pub(crate) sink: W,
+    pub(crate) size: usize,
     sha256: String,
     open_sha256: String,
     open_size: usize,
 }
 
-impl XmlDocStream {
-    fn new(spill_bytes: usize) -> Self {
+impl<W: Write> XmlDocStream<W> {
+    fn new(sink: W, spill_bytes: usize) -> Self {
         Self {
             pending: Vec::new(),
+            sink: Some(sink),
             gz: None,
             open_sha256: Sha256::new(),
             open_size: 0,
             spill_bytes,
+            error: None,
         }
     }
 
     fn write(&mut self, xml: &str) {
+        if self.error.is_some() {
+            return;
+        }
         self.open_sha256.update(xml.as_bytes());
         self.open_size += xml.len();
-        match self.gz.as_mut() {
-            Some(gz) => gz.write_all(xml.as_bytes()).expect("gzip write failed"),
+        let result = match self.gz.as_mut() {
+            Some(gz) => gz.write_all(xml.as_bytes()),
             None => {
                 self.pending.extend_from_slice(xml.as_bytes());
                 if self.pending.len() > self.spill_bytes {
-                    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-                    gz.write_all(&self.pending).expect("gzip write failed");
+                    let sink = self.sink.take().expect("sink present before the spill");
+                    let mut gz = GzEncoder::new(DigestSink::new(sink), Compression::default());
+                    let result = gz.write_all(&self.pending);
                     self.pending = Vec::new();
                     self.gz = Some(gz);
+                    result
+                } else {
+                    Ok(())
                 }
             }
+        };
+        if let Err(e) = result {
+            self.error = Some(e);
         }
     }
 
-    fn finish(self) -> FinishedDoc {
-        let gz = match self.gz {
-            Some(gz) => gz.finish().expect("gzip finish failed"),
-            None => gzip_bytes(&self.pending),
+    fn finish(self) -> std::io::Result<FinishedDoc<W>> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let digest = match self.gz {
+            Some(gz) => gz.finish()?,
+            None => {
+                // One call, exactly as `gzip_bytes` compresses.
+                let sink = self.sink.expect("sink present without a spill");
+                let mut gz = GzEncoder::new(DigestSink::new(sink), Compression::default());
+                gz.write_all(&self.pending)?;
+                gz.finish()?
+            }
         };
-        FinishedDoc {
-            sha256: sha256_hex(&gz),
+        Ok(FinishedDoc {
+            size: digest.len,
+            sha256: format!("{:x}", digest.sha256.finalize()),
             open_sha256: format!("{:x}", self.open_sha256.finalize()),
             open_size: self.open_size,
-            gz,
-        }
+            sink: digest.inner,
+        })
     }
+}
+
+/// The documents of one finished render: `repomd.xml` and the sinks holding
+/// the compressed primary, filelists and other documents it describes.
+pub(crate) struct RepodataDocs<W> {
+    pub(crate) repomd_xml: String,
+    pub(crate) primary: FinishedDoc<W>,
+    pub(crate) filelists: FinishedDoc<W>,
+    pub(crate) other: FinishedDoc<W>,
 }
 
 /// Incremental writer for one repodata set (#4544). The package count is
@@ -1809,28 +2140,58 @@ impl XmlDocStream {
 /// pure function of the rows (#2636); the uncompressed documents are exactly
 /// what the whole-slice generators build, and a document under
 /// [`RPM_REPODATA_DOC_SPILL_BYTES`] compresses to exactly the same bytes.
-struct RepodataWriter {
+pub(crate) struct RepodataWriter<W: Write = Vec<u8>> {
     prefix: String,
-    primary: XmlDocStream,
-    filelists: XmlDocStream,
-    other: XmlDocStream,
+    primary: XmlDocStream<W>,
+    filelists: XmlDocStream<W>,
+    other: XmlDocStream<W>,
     /// Most recent `updated_at` seen: the metadata epoch (#2636).
     latest_update: Option<chrono::DateTime<chrono::Utc>>,
     /// Scratch buffer reused for each package's elements.
     scratch: String,
 }
 
-impl RepodataWriter {
+impl RepodataWriter<Vec<u8>> {
     fn new(packages: usize, prefix: &str) -> Self {
         Self::with_spill(packages, prefix, RPM_REPODATA_DOC_SPILL_BYTES)
     }
 
     fn with_spill(packages: usize, prefix: &str, spill_bytes: usize) -> Self {
+        Self::with_sinks(
+            packages,
+            prefix,
+            spill_bytes,
+            [Vec::new(), Vec::new(), Vec::new()],
+        )
+    }
+
+    fn finish(self) -> RenderedRepodata {
+        let docs = self.finish_docs().expect("in-memory repodata write failed");
+        RenderedRepodata {
+            repomd_xml: Bytes::from(docs.repomd_xml),
+            primary_gz: Bytes::from(docs.primary.sink),
+            filelists_gz: Bytes::from(docs.filelists.sink),
+            other_gz: Bytes::from(docs.other.sink),
+            cacheable: true,
+            valid_until: None,
+        }
+    }
+}
+
+impl<W: Write> RepodataWriter<W> {
+    /// A writer whose primary, filelists and other documents (in that order)
+    /// are compressed into `sinks`.
+    pub(crate) fn with_sinks(
+        packages: usize,
+        prefix: &str,
+        spill_bytes: usize,
+        [primary, filelists, other]: [W; 3],
+    ) -> Self {
         let mut writer = Self {
             prefix: prefix.to_string(),
-            primary: XmlDocStream::new(spill_bytes),
-            filelists: XmlDocStream::new(spill_bytes),
-            other: XmlDocStream::new(spill_bytes),
+            primary: XmlDocStream::new(primary, spill_bytes),
+            filelists: XmlDocStream::new(filelists, spill_bytes),
+            other: XmlDocStream::new(other, spill_bytes),
             latest_update: None,
             scratch: String::new(),
         };
@@ -1843,7 +2204,7 @@ impl RepodataWriter {
     /// Append `artifacts` (already in the render order) to all three
     /// documents. The stored repodata blocks are deserialized once per
     /// batch and shared by the three generators.
-    fn push_batch(&mut self, artifacts: &[RpmArtifact]) {
+    pub(crate) fn push_batch(&mut self, artifacts: &[RpmArtifact]) {
         let infos = repodata_infos(artifacts);
         for (artifact, info) in artifacts.iter().zip(&infos) {
             self.scratch.clear();
@@ -1860,19 +2221,15 @@ impl RepodataWriter {
             metadata_epoch_max(self.latest_update, artifacts.iter().map(|a| a.updated_at));
     }
 
-    fn finish(mut self) -> RenderedRepodata {
+    pub(crate) fn finish_docs(mut self) -> std::io::Result<RepodataDocs<W>> {
         self.primary.write("</metadata>\n");
         self.filelists.write("</filelists>\n");
         self.other.write("</otherdata>\n");
-        let primary = self.primary.finish();
-        let filelists = self.filelists.finish();
-        let other = self.other.finish();
+        let primary = self.primary.finish()?;
+        let filelists = self.filelists.finish()?;
+        let other = self.other.finish()?;
 
-        let updateinfo_xml = generate_updateinfo_xml();
-        let updateinfo_open_sha256 = sha256_hex(updateinfo_xml.as_bytes());
-        let updateinfo_open_size = updateinfo_xml.len();
-        let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
-        let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
+        let updateinfo = updateinfo_document();
 
         // #2636: the metadata epoch is derived from repository *state*, never
         // from the clock. `repomd.xml` and `repomd.xml.asc` render this
@@ -1880,37 +2237,50 @@ impl RepodataWriter {
         // the signature from the second render against the bytes of the
         // first. See the `metadata_epoch` module docs.
         let timestamp = metadata_epoch(self.latest_update).timestamp();
-        let repomd_xml = repomd_document(
-            timestamp,
-            [&primary, &filelists, &other],
-            &updateinfo_gz,
-            &updateinfo_sha256,
-            &updateinfo_open_sha256,
-            updateinfo_open_size,
-        );
-        let (primary_gz, filelists_gz, other_gz) = (primary.gz, filelists.gz, other.gz);
-        RenderedRepodata {
-            repomd_xml: Bytes::from(repomd_xml),
-            primary_gz: Bytes::from(primary_gz),
-            filelists_gz: Bytes::from(filelists_gz),
-            other_gz: Bytes::from(other_gz),
-            cacheable: true,
-            valid_until: None,
-        }
+        let repomd_xml = repomd_document(timestamp, [&primary, &filelists, &other], &updateinfo);
+        Ok(RepodataDocs {
+            repomd_xml,
+            primary,
+            filelists,
+            other,
+        })
+    }
+}
+
+/// `updateinfo.xml.gz` (an empty advisory list) and the values `repomd.xml`
+/// advertises for it. Constant, so it is rendered per request and never
+/// stored.
+struct UpdateinfoDoc {
+    gz: Vec<u8>,
+    sha256: String,
+    open_sha256: String,
+    open_size: usize,
+}
+
+fn updateinfo_document() -> UpdateinfoDoc {
+    let xml = generate_updateinfo_xml();
+    let gz = gzip_bytes(xml.as_bytes());
+    UpdateinfoDoc {
+        sha256: sha256_hex(&gz),
+        open_sha256: sha256_hex(xml.as_bytes()),
+        open_size: xml.len(),
+        gz,
     }
 }
 
 /// `repomd.xml` for one rendered set: the checksums and sizes of the
 /// primary, filelists and other documents (in that order) and of
 /// `updateinfo.xml.gz`.
-fn repomd_document(
+fn repomd_document<W>(
     timestamp: i64,
-    [primary, filelists, other]: [&FinishedDoc; 3],
-    updateinfo_gz: &[u8],
-    updateinfo_sha256: &str,
-    updateinfo_open_sha256: &str,
-    updateinfo_open_size: usize,
+    [primary, filelists, other]: [&FinishedDoc<W>; 3],
+    updateinfo: &UpdateinfoDoc,
 ) -> String {
+    let (updateinfo_sha256, updateinfo_open_sha256, updateinfo_open_size) = (
+        &updateinfo.sha256,
+        &updateinfo.open_sha256,
+        updateinfo.open_size,
+    );
     let (primary_sha256, primary_open_sha256, primary_open_size) =
         (&primary.sha256, &primary.open_sha256, primary.open_size);
     let (filelists_sha256, filelists_open_sha256, filelists_open_size) = (
@@ -1920,7 +2290,6 @@ fn repomd_document(
     );
     let (other_sha256, other_open_sha256, other_open_size) =
         (&other.sha256, &other.open_sha256, other.open_size);
-    let (primary_gz, filelists_gz, other_gz) = (&primary.gz, &filelists.gz, &other.gz);
     let repomd_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
@@ -1968,13 +2337,13 @@ fn repomd_document(
         updateinfo_sha256 = updateinfo_sha256,
         updateinfo_open_sha256 = updateinfo_open_sha256,
         timestamp = timestamp,
-        primary_size = primary_gz.len(),
+        primary_size = primary.size,
         primary_open_size = primary_open_size,
-        filelists_size = filelists_gz.len(),
+        filelists_size = filelists.size,
         filelists_open_size = filelists_open_size,
-        other_size = other_gz.len(),
+        other_size = other.size,
         other_open_size = other_open_size,
-        updateinfo_size = updateinfo_gz.len(),
+        updateinfo_size = updateinfo.gz.len(),
         updateinfo_open_size = updateinfo_open_size,
     );
 
@@ -2022,13 +2391,7 @@ async fn repomd_xml(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, auth, &repo).await?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml")
-        .body(Body::from(rendered.repomd_xml.clone()))
-        .unwrap())
+    repodata_document(&state, auth, &repo, "", "repomd.xml").await
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,14 +2425,11 @@ async fn repomd_xml_asc(
         return Ok(resp);
     }
 
-    // Sign the same cached bytes `repomd.xml` serves: the signature and the
+    // Sign the same bytes `repomd.xml` serves: the signature and the
     // document are two requests, and both must render identically from
-    // unchanged state (#2636). The shared cache entry makes that literal —
-    // one render, one byte sequence, two endpoints.
-    let rendered = cached_repodata(&state, auth, &repo).await?;
-    let repomd_content = rendered.repomd_xml.clone();
-
-    sign_repomd(&state, &repo, repomd_content).await
+    // unchanged state (#2636). The shared cache entry (or the stored
+    // revision, #4544) makes that literal: one byte sequence, two endpoints.
+    repodata_document(&state, auth, &repo, "", "repomd.xml.asc").await
 }
 
 async fn sign_repomd(
@@ -2271,15 +2631,7 @@ async fn primary_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, auth, &repo).await?;
-    let gz = rendered.primary_gz.clone();
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(CONTENT_LENGTH, gz.len().to_string())
-        .body(Body::from(gz))
-        .unwrap())
+    repodata_document(&state, auth, &repo, "", "primary.xml.gz").await
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,15 +2662,7 @@ async fn filelists_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, auth, &repo).await?;
-    let gz = rendered.filelists_gz.clone();
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(CONTENT_LENGTH, gz.len().to_string())
-        .body(Body::from(gz))
-        .unwrap())
+    repodata_document(&state, auth, &repo, "", "filelists.xml.gz").await
 }
 
 // ---------------------------------------------------------------------------
@@ -2343,15 +2687,7 @@ async fn other_xml_gz(
         return Ok(resp);
     }
 
-    let rendered = cached_repodata(&state, auth, &repo).await?;
-    let gz = rendered.other_gz.clone();
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(CONTENT_LENGTH, gz.len().to_string())
-        .body(Body::from(gz))
-        .unwrap())
+    repodata_document(&state, auth, &repo, "", "other.xml.gz").await
 }
 
 // ---------------------------------------------------------------------------

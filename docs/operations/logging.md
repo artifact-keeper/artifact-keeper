@@ -52,7 +52,10 @@ correlates with its trace in a backend such as Grafana Tempo. Events emitted
 outside any span carry no trace context. Only the event's own fields are
 exported, not those of the enclosing spans, and they carry the same redacted
 values stdout prints (upstream URLs without credentials, tokens removed from
-request URIs). Not exported: SQL text (`sqlx::query` events stay stdout-only,
+request URIs). The `Request completed` event therefore copies `method`, `uri`
+and `status` from the request itself, so a log backend that does not join
+records to traces can still identify the request (#4931). Not exported: SQL
+text (`sqlx::query` events stay stdout-only,
 #4455; slow statements still appear as `CLIENT` spans) and events of the
 export's own transport (`opentelemetry*`, `tonic`, `h2`, `hyper`,
 `hyper_util`, `tower`, `reqwest`), which would otherwise feed back into the
@@ -89,10 +92,10 @@ when it is full, metrics are pushed from a background thread, and an exporter
 that cannot be built (an unparseable endpoint) turns its signal off with a
 message on stderr (since 1.12.0 this includes the span exporter, which used
 to abort startup). On shutdown the pipelines flush what they hold at the same
-time, waiting at most about 5 s in all for the collector, inside the 10 s a
-container runtime grants before it kills the process (1.12.0; before, the
-signals flushed one after another and an unreachable collector held shutdown
-for about 15 s).
+time against one shared 5 s deadline, inside the 10 s a container runtime
+grants before it kills the process (1.12.0; before, the signals flushed one
+after another and an unreachable collector held shutdown for about 15 s,
+while 1.12.0's first pass gave each signal its own 5 s timeout).
 
 ## ANSI colour (`LOG_ANSI`)
 
@@ -106,7 +109,7 @@ value (`uri` `ESC[0m=` `/api/...`), so a plain string filter such as
   uncoloured with no setting needed.
 - `true` forces colour on, whatever stdout is (and overrides `NO_COLOR`); the
   formatter is the one earlier releases used, so the output matches theirs
-  apart from the fields 1.11.2 adds to the `Request completed` line.
+  apart from the fields added to the `Request completed` line since 1.11.2.
 - `false` forces colour off.
 
 Any other value is treated as `auto`. `LOG_ANSI` has no effect on the `json`
@@ -121,7 +124,7 @@ From 1.11.2 (#4674) each line also carries the request fields as **top-level
 keys**; target those in new detection rules.
 
 ```json
-{"timestamp":"2026-10-17T14:12:29.509037Z","level":"INFO","fields":{"message":"Request completed","correlation_id":"3d0f6a52-...","status":"200","user":"alice","ip":"203.0.113.7","latency_ms":42},"target":"artifact_keeper_backend::api::middleware::tracing","span":{"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","method":"GET","otel.kind":"server","uri":"/api/v1/repositories/npm-local/download/a.tgz","name":"http_request"},"spans":[{"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","method":"GET","otel.kind":"server","uri":"/api/v1/repositories/npm-local/download/a.tgz","name":"http_request"}],"method":"GET","uri":"/api/v1/repositories/npm-local/download/a.tgz","status":200,"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","user":"alice","ip":"203.0.113.7","latency_ms":42}
+{"timestamp":"2026-10-17T14:12:29.509037Z","level":"INFO","fields":{"message":"Request completed","correlation_id":"3d0f6a52-...","method":"GET","uri":"/api/v1/repositories/npm-local/download/a.tgz","status":"200","user":"alice","ip":"203.0.113.7","latency_ms":42},"target":"artifact_keeper_backend::api::middleware::tracing","span":{"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","method":"GET","otel.kind":"server","uri":"/api/v1/repositories/npm-local/download/a.tgz","name":"http_request"},"spans":[{"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","method":"GET","otel.kind":"server","uri":"/api/v1/repositories/npm-local/download/a.tgz","name":"http_request"}],"method":"GET","uri":"/api/v1/repositories/npm-local/download/a.tgz","status":200,"correlation_id":"3d0f6a52-...","http.route":"/api/v1/repositories/:key/download/*path","user":"alice","ip":"203.0.113.7","latency_ms":42}
 ```
 
 ### Top-level request fields (target these)
@@ -161,7 +164,7 @@ paths, logs the request without `user`.
 |---|---|---|
 | `timestamp` | string | RFC 3339, UTC, microseconds. |
 | `level` | string | `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`. |
-| `fields` | object | The event's own fields, including `message` (the human-readable text; do not parse it). On `Request completed` it also holds `correlation_id`, `status` (a string), and from 1.11.2 `user`, `ip`, `latency_ms`. |
+| `fields` | object | The event's own fields, including `message` (the human-readable text; do not parse it). On `Request completed` it also holds `correlation_id`, `method`, `uri`, `status` (a string), and from 1.11.2 `user`, `ip`, `latency_ms`. |
 | `target` | string | Rust module path that logged the event. |
 | `span` | object | The current (innermost) span: its `name` and recorded fields. Omitted outside any span. |
 | `spans` | array | The span stack, root first, each with its `name` and recorded fields. Omitted outside any span. |

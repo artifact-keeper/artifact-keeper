@@ -1723,9 +1723,11 @@ async fn serve_scanned_virtual_go_zip(
         )
         .await
     };
+    let no_fetch_urls = std::collections::HashMap::new();
     let runs = crate::api::handlers::proxy_scan_archive::UnscannedArchiveRuns {
         proxy,
         path: &zip.serve_key.cache_key,
+        member_fetch_urls: &no_fetch_urls,
         local_fetch,
         default_content_type: "application/zip",
         disposition: None,
@@ -4513,5 +4515,53 @@ mod serve_key_4365_tests {
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_module_zip_with_two_go_mod_entries_is_not_established() {
+        let module = "example.com/demo";
+        let kind = || GoModuleZip {
+            module,
+            version: "v1.0.0",
+        };
+        let check = |bytes: &[u8]| archive_identities(kind(), DupFormat::Go, "v1.0.0.zip", bytes);
+        let good: &[u8] = b"module example.com/demo\n";
+        let other: &[u8] = b"module example.com/demo\n\nrequire example.com/other v0.0.1\n";
+        let dup = zip_with(&[
+            ("example.com/demo@v1.0.0/go.mod", good),
+            ("example.com/demo@v1.0.0/a.go", b"package demo\n"),
+            ("example.com/demo@v1.0.0/./go.mod", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::Established(_)),
+            "the reader takes the first copy"
+        );
+        assert!(unestablished(&gate));
+        let single = zip_with(&[
+            ("example.com/demo@v1.0.0/go.mod", good),
+            ("example.com/demo@v1.0.0/a.go", b"package demo\n"),
+        ]);
+        assert!(matches!(
+            check(&single).1,
+            ProxyScanIdentity::Established(_)
+        ));
     }
 }

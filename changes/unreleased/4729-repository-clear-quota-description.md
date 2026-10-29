@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4729]
+---
+- **`PATCH /api/v1/repositories/{key}` can clear `description` and `quota_bytes` back to `null`** (#4729). Both fields were bare `Option<_>` request fields, so an explicit `null` deserialized exactly like an omitted field, and the service's `COALESCE($n, column)` UPDATE read the resulting NULL bind as "leave alone": `{"description": null}` or `{"quota_bytes": null}` answered 200 and changed nothing. Both now use the three-way `Option<Option<_>>` semantics `project_id` (#4026) and `trusted_gpg_key` (#2568) already use — omit to leave unchanged, `null` to clear, a value to set — and the service clears the column with a targeted write in the same transaction, ahead of the main UPDATE. Clearing a quota means unlimited; `0` remains the legacy unlimited sentinel. No first-party client sends `null` for these fields today: the web UI strips a null quota and sends `""` for a cleared description, and the generated SDKs type both as non-nullable optionals, so the behaviour change does not wipe values on an untouched form.

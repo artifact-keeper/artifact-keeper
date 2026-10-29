@@ -23,3 +23,5 @@ scripts/devops-agent*
 site/
 CLAUDE.md
 HOUSEKEEPING.md
+# cargo-fuzz targets: never part of the image (backend/fuzz/README.md).
+backend/fuzz/
