@@ -564,7 +564,7 @@ jobs:
       # group restores from the `refs/heads/main` entry (exact key or prefix
       # fallback). The repository sits at the 10 GiB cache limit, and
       # per-ref entries nobody restores are what push main's own entries out.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v2-rust
           shared-key: clippy
@@ -762,7 +762,7 @@ jobs:
       # only (see the note on check-rust's rust-cache step; a merge group's
       # ref is as unrestorable as a PR's) and from one leg only, so five legs
       # do not race to write the same key.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
           shared-key: unit-shard-instrumented
@@ -983,7 +983,7 @@ jobs:
       # were never considered fresh (jobs 35213124311 and 35213128071,
       # 2026-09-17). Here CARGO_HOME is the runner's ~/.cargo, the path
       # rust-cache is built for.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v2-rust
           shared-key: integration
