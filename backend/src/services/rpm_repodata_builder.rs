@@ -417,7 +417,9 @@ pub async fn build_waiting(
     let current: Option<(i64, i64)> = sqlx::query_as(
         "SELECT built_revision, built_count FROM rpm_repodata_roots \
           WHERE repository_id = $1 AND root = $2 AND dirty_since IS NULL \
-            AND retry_at IS NULL AND built_revision IS NOT NULL",
+            AND retry_at IS NULL AND built_revision IS NOT NULL \
+            AND NOT EXISTS (SELECT 1 FROM rpm_repodata_dirty d \
+                            WHERE d.repository_id = $1 AND d.root = $2)",
     )
     .bind(repo_id)
     .bind(root)
