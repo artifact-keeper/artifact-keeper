@@ -372,6 +372,19 @@ const SESSION_FAMILY_CACHE_MAX_ENTRIES: usize = 65_536;
 const SESSION_FAMILY_REVOKED_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(24 * 3600);
 
+/// Refuse to renew a CI OIDC service account's session (#5054). See
+/// [`AuthService::load_refreshable_user`].
+fn refuse_ci_session_refresh(provider: AuthProvider) -> Result<()> {
+    if provider == AuthProvider::Ci {
+        return Err(AppError::Authentication(
+            "A CI OIDC session cannot be refreshed; exchange a fresh CI token at \
+             /api/v1/auth/ci/token instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extra lifetime of a `session_family_revocations` row past the longest
 /// token of its family, for clock skew between replicas.
 const SESSION_FAMILY_REVOCATION_MARGIN_MINUTES: i64 = 60;
@@ -2005,6 +2018,31 @@ impl AuthService {
             scopes,
             "refresh",
             credential_exp,
+            None,
+        )
+    }
+
+    /// Like [`AuthService::generate_tokens_with_scope`], but the ACCESS token
+    /// lives exactly `access_ttl` instead of the configured
+    /// `jwt_access_token_expiry_minutes`.
+    ///
+    /// For a CI OIDC exchange (#5054), whose lifetime is set per provider and
+    /// bounded there. The caller owns the bound; this method applies no cap.
+    pub fn generate_tokens_with_scope_ttl(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        access_ttl: Duration,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            scopes,
+            "refresh",
+            None,
+            Some(access_ttl),
         )
     }
 
@@ -2054,12 +2092,16 @@ impl AuthService {
             scopes,
             refresh_token_type,
             None,
+            None,
         )
     }
 
     /// [`AuthService::generate_token_pair_typed`] with an optional exchange
     /// cap on the access token's expiry (see
-    /// [`AuthService::generate_tokens_with_scope_capped`]).
+    /// [`AuthService::generate_tokens_with_scope_capped`]) and an optional
+    /// access-token TTL replacing the configured one (see
+    /// [`AuthService::generate_tokens_with_scope_ttl`]).
+    #[allow(clippy::too_many_arguments)]
     fn generate_token_pair_capped(
         &self,
         user: &User,
@@ -2068,6 +2110,7 @@ impl AuthService {
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
+        access_ttl: Option<Duration>,
     ) -> Result<TokenPair> {
         // The refresh claims carry the same repository allow-list and
         // action-scope ceiling as the access token: `refresh_tokens` and
@@ -2081,6 +2124,7 @@ impl AuthService {
             allowed_repo_ids.clone(),
             scopes.clone(),
             credential_exp,
+            access_ttl,
             Some(family_id),
         )?;
         let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
@@ -2128,7 +2172,7 @@ impl AuthService {
         credential_exp: Option<DateTime<Utc>>,
     ) -> Result<AccessToken> {
         Ok(self
-            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp, None)?
+            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp, None, None)?
             .token)
     }
 
@@ -2144,6 +2188,7 @@ impl AuthService {
         allowed_repo_ids: Option<Vec<Uuid>>,
         scopes: Option<Vec<String>>,
         credential_exp: Option<DateTime<Utc>>,
+        access_ttl: Option<Duration>,
         family_id: Option<Uuid>,
     ) -> Result<MintedAccess> {
         let now = Utc::now();
@@ -2167,7 +2212,8 @@ impl AuthService {
         // ahead of the real millisecond stamp.
         let iat_secs = now_ms.div_euclid(1000);
         let access_exp = crate::services::token_expiry_policy::cap_access_expiry(
-            now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
+            now + access_ttl
+                .unwrap_or_else(|| Duration::minutes(self.config.jwt_access_token_expiry_minutes)),
             credential_exp,
         );
 
@@ -2548,7 +2594,7 @@ impl AuthService {
                 // row insert and the parent's `superseded_by` link both run on
                 // the transaction, so the consume and the mint commit as one
                 // unit — a crash mid-rotation leaves the parent unconsumed.
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2648,7 +2694,7 @@ impl AuthService {
                 // without any jti row (#4883) does not rotate.
                 self.reject_if_session_family_revoked(&token_data.claims)
                     .await?;
-                let user = self.load_active_user(token_data.claims.sub).await?;
+                let user = self.load_refreshable_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
                     family_id,
@@ -2761,7 +2807,7 @@ impl AuthService {
         // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
         // open a new family so subsequent rotations get replay detection.
         // Still preserve the action-scope ceiling and repo allow-list (#2430).
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
         let tokens = self.generate_tokens_with_scope(
             &user,
             token_data.claims.scopes.clone(),
@@ -2853,7 +2899,7 @@ impl AuthService {
             }
         }
 
-        let user = self.load_active_user(token_data.claims.sub).await?;
+        let user = self.load_refreshable_user(token_data.claims.sub).await?;
 
         // Mint a fresh short-lived access token under the presenting token's
         // repo allow-list and action-scope ceiling (#2430). The refresh JWT
@@ -2908,6 +2954,23 @@ impl AuthService {
         )?;
         self.persist_refresh_jti_from_pair(&pair, user.id).await?;
         Ok(pair.refresh_token)
+    }
+
+    /// [`AuthService::load_active_user`] for the two refresh paths
+    /// ([`AuthService::refresh_tokens`] and
+    /// [`AuthService::mint_access_from_registry_refresh`]), refusing a CI OIDC
+    /// service account (#5054).
+    ///
+    /// A CI exchange persists a refresh JTI (so logout and the deactivation
+    /// sweep can revoke the session) but never hands the refresh JWT out. Its
+    /// session must end when the access token minted by the exchange expires,
+    /// within the provider's `token_ttl_secs` (at most one hour); a pipeline
+    /// that needs longer exchanges a fresh CI assertion. Refusing here keeps
+    /// that true even if a refresh JWT for such an account were ever exposed.
+    async fn load_refreshable_user(&self, user_id: Uuid) -> Result<User> {
+        let user = self.load_active_user(user_id).await?;
+        refuse_ci_session_refresh(user.auth_provider)?;
+        Ok(user)
     }
 
     /// Fetch a user row by id, rejecting deactivated accounts. Shared by the

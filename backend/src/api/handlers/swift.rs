@@ -2822,3 +2822,47 @@ mod serve_key_4365_tests {
         assert!(got.scannable);
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_source_archive_with_two_manifests_is_not_established() {
+        let check = |bytes: &[u8]| {
+            archive_identities(
+                SwiftSourceArchive,
+                DupFormat::Swift,
+                "demo-1.0.0.zip",
+                bytes,
+            )
+        };
+        let good: &[u8] = b"// swift-tools-version:5.9\nimport PackageDescription\n";
+        let other: &[u8] = b"// swift-tools-version:5.9\nimport PackageDescription\n// other\n";
+        let dup = zip_with(&[
+            ("Package.swift", good),
+            ("Sources/A.swift", b""),
+            ("./Package.swift", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::NotApplicable),
+            "graded on contents"
+        );
+        assert!(unestablished(&gate));
+        let single = zip_with(&[("Package.swift", good), ("Sources/A.swift", b"")]);
+        assert!(matches!(check(&single).1, ProxyScanIdentity::NotApplicable));
+    }
+}

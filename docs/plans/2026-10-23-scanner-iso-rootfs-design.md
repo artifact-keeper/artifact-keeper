@@ -1,8 +1,10 @@
 # Scanner workspace: ISO9660 live media and the shared squashfs path (design note)
 
 **Date**: 2026-10-23
-**Status**: Proposed, for maintainer review before #1966 is implemented. Nothing
-here is decided; the open questions at the end need an answer first.
+**Status**: Implemented for 1.12.0 (#1966) along the recommendations below,
+with the differences listed under "Implementation notes" at the end. The
+open questions stay open for the maintainer; the implementation can switch
+either choice without changing its interface.
 **Issues**: #1966 (ISO rootfs inventory), #1429 (incus on the shared workspace lifecycle)
 **Depends on**: the `ScanWorkspace::prepare_with` extractor hook (#1429, PR #4925)
 
@@ -262,3 +264,39 @@ surface:
 - Moving incus to `backhand` or to selective extraction. Incus keeps its full
   extraction; the two paths share the lifecycle and the `unsquashfs`
   invocation, not the path list.
+
+## Implementation notes (1.12.0)
+
+What #1966 shipped, against the choices above. Operator-facing behaviour is
+in `docs/iso-image-scanning.md`.
+
+- **Reader and extractor**: the in-tree locator
+  (`services/iso_rootfs/locator.rs`) and the shipped `unsquashfs` with
+  selective extraction and the `-lls` pre-check, as recommended. The
+  extractor is reached through the `ScanWorkspace` staging step that Grype
+  and Trivy filesystem scans already use (`StagedArtifactExtractor`), so
+  every engine sees the package database at the workspace root, where its
+  distribution detection looks.
+- **Probe paths**: `images/install.img` (Fedora, RHEL, Rocky and Alma
+  installer media) is probed after the three live layouts.
+- **Budgets**: the declared-size pre-check and the post-extraction guard use
+  the scan-workspace ceilings (`MAX_SCAN_EXTRACTED_BYTES`, default 2 GiB, and
+  200,000 entries), not the Incus caps and not a separate 256 MiB cap: the
+  tree is the package database alone, and one setting operators already tune
+  is simpler than a new one. Each `unsquashfs` child also runs
+  single-threaded with 32 MiB queues, under wall-clock timeouts (120 s list,
+  300 s extract) and address-space (1 GiB), CPU-time (300 s) and file-size
+  (the byte ceiling) rlimits.
+- **Nesting**: the embedded file must start with the squashfs magic; a
+  nested ISO9660 image is refused, so the depth is fixed at two.
+- **Failure reporting**: every failure to produce a package database (no
+  probe path, layered media, corrupt squashfs, ceiling breach, escaping
+  symlink, no dpkg/rpm/apk database) leaves the workspace empty and is
+  recorded `not_cataloged` with `inventory_status = 'partial'`, rather than
+  some of them failing the scan. An ISO upload expects a catalog in any
+  repository format (`upload_expects_catalog`), so an empty catalog is never
+  a clean grade. #4336 can map that state to its `incomplete` grade status.
+- **Layered Ubuntu media** (open question 3): reported unsupported for now.
+- **Fuzzing**: `backend/fuzz` holds a cargo-fuzz target over
+  `locate_rootfs`, and bounded mutation runs over the locator and the
+  squashfs path run in every CI build of the services-1 shard.

@@ -59,9 +59,21 @@
 //! virtual cannot crowd every other root out of the cache. The mechanism
 //! (fingerprint check, single-flight, bounds, metrics) lives in the
 //! format-agnostic [`super::repo_metadata_revision_cache`] (#4174); this
-//! module keeps the RPM types and limits. Follow-ups tracked on #2521 and
-//! #4544: a durable cross-replica object store for prebuilt revisions and the
-//! same treatment for the PyPI/Helm/Composer root indexes.
+//! module keeps the RPM types and limits.
+//!
+//! Precomputed revisions (#4544): a hosted repository in the default
+//! `repodata_mode` (`precomputed`) does not render on request once a root has
+//! been built. The background builder
+//! ([`super::rpm_repodata_builder`]) renders each changed root once, stores
+//! the documents in the repository's storage under
+//! [`revision_prefix`], and records the revision in `rpm_repodata_roots`; a
+//! request then serves a [`StoredRepodata`] (`repomd.xml` from the database
+//! row, the compressed documents streamed from storage) on every replica,
+//! with no fingerprint query and no render. That trades read-your-writes for
+//! a bounded delay (the builder's debounce) and is why this in-process cache
+//! now only serves virtual repositories, `repodata_mode: on_request`
+//! repositories and roots that have not been built yet. The same treatment
+//! for the PyPI/Helm/Composer root indexes is tracked on #2521.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -161,6 +173,49 @@ impl CachedRender for RenderedRepodata {
 
     fn valid_until(&self) -> Option<Instant> {
         self.valid_until
+    }
+}
+
+/// File names of a stored revision, as served under `repodata/`.
+/// `updateinfo.xml.gz` is constant and rendered per request.
+pub const STORED_REPODATA_FILES: [&str; 4] = [
+    "repomd.xml",
+    "primary.xml.gz",
+    "filelists.xml.gz",
+    "other.xml.gz",
+];
+
+/// Storage key prefix of revision `revision` of `root` in `repo_id`:
+/// `repodata/<repo>/<root>/<rev>`, or `repodata/<repo>/<rev>` for the
+/// depth-zero root. The file name is always the last segment and the
+/// revision the one before it, so no root can alias another root's revision.
+pub fn revision_prefix(repo_id: Uuid, root: &str, revision: i64) -> String {
+    if root.is_empty() {
+        format!("repodata/{repo_id}/{revision}")
+    } else {
+        format!("repodata/{repo_id}/{root}/{revision}")
+    }
+}
+
+/// The revision a precomputed root currently serves (#4544).
+#[derive(Clone, Debug)]
+pub struct StoredRepodata {
+    pub revision: i64,
+    /// The revision's `repomd.xml`, kept on the database row so the most
+    /// polled document (and its detached signature) needs no storage read.
+    pub repomd_xml: Bytes,
+    /// Where the documents live: the repository's storage at build time.
+    pub location: crate::storage::StorageLocation,
+    /// [`revision_prefix`] of this revision.
+    pub key_prefix: String,
+    /// Byte sizes of the stored documents, by file name.
+    pub sizes: std::collections::HashMap<String, u64>,
+}
+
+impl StoredRepodata {
+    /// Storage key of `file` (one of [`STORED_REPODATA_FILES`]).
+    pub fn key(&self, file: &str) -> String {
+        format!("{}/{file}", self.key_prefix)
     }
 }
 
@@ -304,6 +359,24 @@ mod tests {
             repo_ids,
             live_rpm_count: count,
             latest_update: chrono::DateTime::from_timestamp(secs, 0),
+        }
+    }
+
+    #[test]
+    fn revision_keys_never_alias_across_roots_4544() {
+        let repo = Uuid::nil();
+        assert_eq!(revision_prefix(repo, "", 7), format!("repodata/{repo}/7"));
+        assert_eq!(
+            revision_prefix(repo, "el9/x86_64", 7),
+            format!("repodata/{repo}/el9/x86_64/7")
+        );
+        // A depth-one root named like a revision: the file name is always the
+        // last segment and the revision the one before it, so the keys differ.
+        for file in STORED_REPODATA_FILES {
+            assert_ne!(
+                format!("{}/{file}", revision_prefix(repo, "7", 1)),
+                format!("{}/{file}", revision_prefix(repo, "", 7))
+            );
         }
     }
 

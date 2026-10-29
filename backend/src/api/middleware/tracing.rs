@@ -545,6 +545,16 @@ async fn run_correlation_id(
     let is_probe = is_probe_path(request.uri().path());
     let correlation_id_for_scope = correlation_id.clone();
     let started = std::time::Instant::now();
+    // `method` and `uri` are also on the enclosing `http_request` span, but
+    // the OTLP log exporter only sends an event's own fields (#4931 item 5).
+    // Copy them onto the completion event, redacting the URI the same way the
+    // span does, so a log backend that does not join records to spans can
+    // still identify the request.
+    let method = request.method().as_str().to_owned();
+    let uri = {
+        let uri = request.uri();
+        crate::api::redact_sensitive_params(uri.path(), uri.query())
+    };
 
     // Scope the task-locals around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
@@ -562,16 +572,20 @@ async fn run_correlation_id(
             log_probe_requests(),
             response.status().is_success(),
         ) {
-            // `user`, `ip` and `latency_ms` make this line the one a SIEM
-            // rule can key on (#4674); `method` and `uri` come from the
-            // enclosing `http_request` span. `user` is omitted for an
-            // anonymous request, `ip` when no address resolved. `ip` is the
-            // best-effort grade (`RATE_LIMIT_TRUSTED_PROXY_CIDRS` policy).
+            // `method`, `uri`, `user`, `ip` and `latency_ms` make this line
+            // the one a SIEM rule or an OTLP log store can key on (#4674,
+            // #4931). `method` and `uri` are copied from the request itself
+            // because the log exporter does not inherit span fields; `user`
+            // is omitted for an anonymous request, `ip` when no address
+            // resolved. `ip` is the best-effort grade
+            // (`RATE_LIMIT_TRUSTED_PROXY_CIDRS` policy).
             let user = crate::api::middleware::request_span::recorded_user();
             let ip = crate::api::middleware::client_ip::current_client_ip();
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
                 correlation_id = %correlation_id,
+                method = method.as_str(),
+                uri = uri.as_str(),
                 status = %response.status().as_u16(),
                 user = user.as_deref(),
                 ip = ip.map(tracing::field::display),

@@ -754,7 +754,13 @@ async fn fetch_source(
                 )
                     .into_response());
             }
-            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // A compressed candidate the upstream refuses with 401/403 is
+            // absent, as on the plain `repodata.json` route (#4929); a refusal
+            // of the plain document is still the request's failure.
+            Err(response)
+                if response.status() == StatusCode::NOT_FOUND
+                    || (source != RepodataEncoding::Json
+                        && super::optional_probe_is_absent(&response)) => {}
             Err(response) => return Err(response),
         }
     }

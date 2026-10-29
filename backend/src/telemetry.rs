@@ -40,6 +40,8 @@ mod json_log;
 mod otel_logs;
 mod otel_metrics;
 
+use std::time::{Duration, Instant};
+
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
@@ -803,6 +805,14 @@ where
     }
 }
 
+/// The one deadline every OTLP signal shares during shutdown (#4931).
+///
+/// The SDK's batch processors use the same 5 s default one at a time. Starting
+/// all signals at this deadline, rather than letting each `shutdown()` apply
+/// its own default, keeps shutdown bounded by one 5 s window even if one
+/// provider is scheduled late. Docker's default stop grace is 10 s.
+const OTEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Guard that shuts the OTel providers down on drop, flushing any pending
 /// spans, log records and metric measurements.
 pub struct OtelGuard {
@@ -816,31 +826,37 @@ pub struct OtelGuard {
 }
 
 impl Drop for OtelGuard {
-    /// Shut the three providers down at the same time (#4931). Each flush waits
-    /// up to a few seconds for an unreachable collector; one after the other
-    /// they took about 15 s, longer than the 10 s a container runtime grants
-    /// before `SIGKILL`, so the final flush was lost. Concurrently the wait is
-    /// that of the slowest one.
+    /// Shut the three providers down at the same time, sharing one deadline
+    /// (#4931). Each flush waits up to a few seconds for an unreachable
+    /// collector; one after the other they took about 15 s, longer than the
+    /// 10 s a container runtime grants before `SIGKILL`, so the final flush
+    /// was lost. Concurrently the wait is that of the slowest one, bounded by
+    /// [`OTEL_SHUTDOWN_TIMEOUT`].
     fn drop(&mut self) {
+        let deadline = Instant::now() + OTEL_SHUTDOWN_TIMEOUT;
         let meter_provider = self._meter_provider.take();
         let provider = &self.provider;
         let logger_provider = self.logger_provider.as_ref();
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                if let Err(e) = provider.shutdown() {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if let Err(e) = provider.shutdown_with_timeout(timeout) {
                     eprintln!("Failed to shutdown OTel tracer provider: {e:?}");
                 }
             });
             if let Some(logger_provider) = logger_provider {
                 scope.spawn(move || {
-                    if let Err(e) = logger_provider.shutdown() {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    if let Err(e) = logger_provider.shutdown_with_timeout(timeout) {
                         eprintln!("Failed to shutdown OTel logger provider: {e:?}");
                     }
                 });
             }
             if let Some(meter_provider) = meter_provider {
-                // Dropping the guard shuts the meter provider down.
-                scope.spawn(move || drop(meter_provider));
+                scope.spawn(move || {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    meter_provider.shutdown(timeout);
+                });
             }
         });
     }
@@ -1325,6 +1341,91 @@ mod tests {
         assert!(stdout.contains("SELECT"), "stdout is unaffected: {stdout}");
     }
 
+    /// #4931 item 5: a log backend that only sees the exported record, and
+    /// not the enclosing span, can still identify the request. The production
+    /// middleware copies method and redacted URI onto the completion event.
+    #[tokio::test]
+    async fn exported_request_completed_record_carries_method_and_uri() {
+        use axum::{body::Body, routing::put, Router};
+        use opentelemetry::logs::{AnyValue, LoggerProvider as _};
+        use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+        use tower::ServiceExt;
+
+        let log_exporter = InMemoryLogExporter::default();
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(log_exporter.clone())
+            .build();
+        let exported = crate::testing::otel::ExportedSpans::default();
+        let subscriber = otel_path_subscriber(
+            subscriber_filters(
+                || EnvFilter::new(DEFAULT_RUST_LOG),
+                db_spans::DbQuerySpans::Log,
+            ),
+            build_fmt_layer_with_writer(LogFormat::Text, false, Capture::default()),
+            Some(otel_logs::OtelLogLayer::new(logger_provider.logger("test"))),
+            exported.tracer(),
+            None,
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        async fn authed() -> axum::http::StatusCode {
+            crate::api::middleware::request_span::record_user("alice");
+            axum::http::StatusCode::CREATED
+        }
+        let app = Router::new()
+            .route("/api/v1/things/:id", put(authed))
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::tracing::correlation_id_middleware,
+            ))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<Body>| {
+                        crate::api::middleware::tracing::make_http_request_span(request, &[])
+                    },
+                ),
+            );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/things/7?password=hunter2")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+        logger_provider.force_flush().expect("flush");
+        let records = log_exporter.get_emitted_logs().expect("emitted logs");
+        let done = records
+            .iter()
+            .find(|r| r.record.body() == Some(&AnyValue::from("Request completed".to_owned())))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no exported Request completed record in {:?}",
+                    records
+                        .iter()
+                        .filter_map(|r| r.record.body().cloned())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let attribute = |key: &str| {
+            done.record
+                .attributes_iter()
+                .find(|(name, _)| name.as_str() == key)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(attribute("method"), Some(&AnyValue::from("PUT".to_owned())));
+        assert_eq!(
+            attribute("uri"),
+            Some(&AnyValue::from(
+                "/api/v1/things/7?password=[REDACTED]".to_owned()
+            ))
+        );
+        assert_eq!(attribute("status"), Some(&AnyValue::from("201".to_owned())));
+        assert!(
+            done.record.trace_context().is_some(),
+            "the record still carries its trace context"
+        );
+    }
+
     /// A log record exported through the production subscriber carries the
     /// trace and span id of the span it was emitted under (the layer is not
     /// wrapped in an `Option`, see [`layer_or_identity`]).
@@ -1650,6 +1751,10 @@ mod tests {
         let uri = done["uri"].as_str().unwrap();
         assert!(uri.starts_with("/api/v1/things/7"), "{uri}");
         assert!(!uri.contains("hunter2"), "{uri}");
+        // #4931 item 5: the completion event itself carries these, not only
+        // the enclosing span, so the OTLP log exporter sends them.
+        assert_eq!(done["fields"]["method"], "PUT");
+        assert_eq!(done["fields"]["uri"], uri);
         assert_eq!(done["correlation_id"], "corr-e2e-4674");
         assert_eq!(done["http.route"], "/api/v1/things/:id");
         assert_eq!(done["status"], 201);
@@ -2107,6 +2212,10 @@ mod otlp_signal_tests {
         assert!(
             all_three < one_flush * 2,
             "three flushes took {all_three:?}, one alone {one_flush:?}: they ran one after another"
+        );
+        assert!(
+            all_three < OTEL_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+            "three flushes took {all_three:?}, past the shared {OTEL_SHUTDOWN_TIMEOUT:?} deadline"
         );
     }
 }

@@ -10,9 +10,11 @@
 //! no record under a name a hosted member has published.
 //!
 //! A virtual may also carry a package allowlist
-//! ([`crate::services::conda_allowlist`], #4576): when it is enabled, a remote
-//! record the list does not admit is dropped as well. Hosted records are never
-//! filtered by it.
+//! ([`crate::services::conda_allowlist`], #4576): when it is enabled, a record
+//! the list does not admit is dropped as well. By default that holds for
+//! hosted records too (#5055); a list scoped `remote_only` filters remote
+//! records only. A hosted record the list drops still owns its name, so the
+//! remote records of that name stay excluded.
 //!
 //! Remote members are fetched in their compressed encodings, never as the
 //! plain document: `repodata.json.zst`, then `.bz2`, then `.json`, each through
@@ -272,6 +274,26 @@ pub(super) fn decoding_reader<'a, R: Read + Send + 'a>(
     })
 }
 
+/// Why a member document could not be decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MemberDecodeError {
+    /// The bytes do not decode: empty, truncated, corrupt, or in a coding this
+    /// build cannot undo. A cached entry holding them is worth evicting so the
+    /// next request refetches it (#4929).
+    Corrupt(String),
+    /// The document decoded past the configured ceiling. The bytes are valid,
+    /// the cap is the problem, so the cache entry must not be evicted.
+    OverCap(String),
+}
+
+impl std::fmt::Display for MemberDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt(message) | Self::OverCap(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Undo the HTTP transfer coding and then the file compression, refusing to
 /// produce more than `cap` bytes.
 pub(super) fn decode_member_document(
@@ -279,22 +301,69 @@ pub(super) fn decode_member_document(
     transfer_coding: Option<&str>,
     codec: FileCodec,
     cap: usize,
-) -> Result<Vec<u8>, String> {
-    let file = decoding_reader(content, transfer_coding, codec)?;
+) -> Result<Vec<u8>, MemberDecodeError> {
+    let file =
+        decoding_reader(content, transfer_coding, codec).map_err(MemberDecodeError::Corrupt)?;
     let mut out = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| format!("decode failed: {e}"))?;
+        .map_err(|e| MemberDecodeError::Corrupt(format!("decode failed: {e}")))?;
     if out.len() > cap {
-        return Err(format!(
+        return Err(MemberDecodeError::OverCap(format!(
             "decoded document exceeds the {cap}-byte member ceiling ({MEMBER_MAX_DECODED_BYTES_ENV})"
-        ));
+        )));
     }
     Ok(out)
 }
 
+/// Drop a cached member document that does not decode (#4929), so the next
+/// request refetches it instead of failing on the same bytes until the entry
+/// expires. Best-effort: a failed eviction still fails this request, and the
+/// cache expiry is the backstop.
+async fn evict_undecodable_member(
+    proxy: &ProxyService,
+    member: &Repository,
+    path: &str,
+    reason: &str,
+) {
+    tracing::warn!(
+        member = %member.key,
+        path = %path,
+        reason = %reason,
+        "cached upstream conda member document does not decode; evicting it (#4929)"
+    );
+    if let Err(e) = proxy.invalidate_cache_by_key(&member.key, path).await {
+        tracing::warn!(
+            member = %member.key,
+            path = %path,
+            error = %e,
+            "evicting undecodable conda member document from the proxy cache failed"
+        );
+    }
+}
+
+/// Whether a failed candidate probe means "this upstream does not publish this
+/// encoding", so the next candidate is worth trying (#4929).
+///
+/// A compressed candidate is absent not only on 404: S3 buckets without list
+/// permission answer 403 for a key that does not exist (and some upstreams
+/// answer 401), so falling through to the plain `.json` keeps channels that
+/// publish only the plain document working. The upstream status survives the
+/// proxy-error mapping in the [`proxy_helpers::UpstreamRefusal`] response
+/// extension. The plain candidate is never treated this way: a 401/403 there
+/// is an access failure worth reporting, not a missing document.
+fn candidate_is_absent(response: &Response, codec: FileCodec) -> bool {
+    response.status() == StatusCode::NOT_FOUND
+        || (codec != FileCodec::Plain
+            && matches!(
+                proxy_helpers::upstream_refusal_status(response),
+                Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            ))
+}
+
 /// Fetch one remote member's document, trying `candidates` in order and moving
-/// to the next only when the upstream answers 404 for the current one.
+/// to the next when the upstream does not publish the current one (404, or a
+/// 401/403 for a compressed candidate; see [`candidate_is_absent`]).
 ///
 /// The fetch buffer and the decoded document are covered by the merge's own
 /// budget reservation (#4608) and tracked in `account`: the buffer until it is
@@ -358,9 +427,19 @@ pub(super) async fn fetch_member_document(
                 account.release(fetched_len);
                 let (json, checksum) = match decoded {
                     Ok(Ok(decoded)) => decoded,
-                    Ok(Err(e)) => return Err(fail("decode", format!("{path}: {e}"))),
+                    Ok(Err(e)) => {
+                        if matches!(&e, MemberDecodeError::Corrupt(_)) {
+                            evict_undecodable_member(proxy, member, path, &e.to_string()).await;
+                        }
+                        return Err(fail("decode", format!("{path}: {e}")));
+                    }
                     Err(e) => return Err(fail("decode", format!("decoder task failed: {e}"))),
                 };
+                if json.is_empty() {
+                    let reason = format!("{path}: decodes to an empty document");
+                    evict_undecodable_member(proxy, member, path, &reason).await;
+                    return Err(fail("decode", reason));
+                }
                 account.track(json.len());
                 // The entry must still be fresh and hold the bytes just read;
                 // otherwise the merge is served but not kept.
@@ -388,8 +467,10 @@ pub(super) async fn fetch_member_document(
                     ),
                 ));
             }
-            Err(response) if response.status() == StatusCode::NOT_FOUND => {
-                last_status = Some(response.status());
+            Err(response) if candidate_is_absent(&response, *codec) => {
+                last_status = Some(
+                    proxy_helpers::upstream_refusal_status(&response).unwrap_or(response.status()),
+                );
                 continue;
             }
             Err(response) => {
@@ -512,6 +593,9 @@ struct RepodataInfo<'a> {
 
 /// One hosted record, ready to merge.
 pub(super) struct HostedRecord {
+    /// Key of the hosted member the record comes from (the
+    /// `ak_conda_allowlist_dropped_total` `member` label).
+    pub member: String,
     pub filename: String,
     pub is_v2: bool,
     pub record: Box<RawValue>,
@@ -532,15 +616,42 @@ fn remote_record_is_owned(filename: &str, raw: &RawValue, owned: &HashSet<String
             .is_some_and(|n| owned.contains(&n.to_ascii_lowercase()))
 }
 
-/// Whether the allowlist admits a remote record: by the name and version its
+/// Whether the allowlist admits a record: by the name and version its
 /// filename carries (what the download seam checks) AND by the `name` and
 /// `version` the record itself claims, when it carries them. A record whose
 /// own identity disagrees with an admitted filename is dropped; the filename
 /// is checked first so the common case (not admitted) never parses the record.
-fn remote_record_is_admitted(
+fn record_is_admitted(
     subdir: &str,
     filename: &str,
     raw: &RawValue,
+    allowlist: &CompiledAllowlist,
+) -> bool {
+    if !allowlist.admits_filename(subdir, filename) {
+        return false;
+    }
+    let Ok(id) = serde_json::from_str::<RecordIdentity<'_>>(raw.get()) else {
+        return false;
+    };
+    identity_is_admitted(
+        subdir,
+        filename,
+        id.name.as_deref(),
+        id.version.as_deref(),
+        allowlist,
+    )
+}
+
+/// The identity half of [`record_is_admitted`], for a record whose filename
+/// the list admits: the `name`/`version` the record claims (absent: the
+/// filename's) must be the filename's or be admitted themselves. Shared with
+/// the hosted rows a virtual builds its shards and channeldata from, so every
+/// seam applies one rule.
+pub(super) fn identity_is_admitted(
+    subdir: &str,
+    filename: &str,
+    name: Option<&str>,
+    version: Option<&str>,
     allowlist: &CompiledAllowlist,
 ) -> bool {
     let Some((file_name, file_version)) =
@@ -551,20 +662,26 @@ fn remote_record_is_admitted(
     if !allowlist.admits(file_name, file_version, subdir) {
         return false;
     }
-    let Ok(id) = serde_json::from_str::<RecordIdentity<'_>>(raw.get()) else {
-        return false;
-    };
-    let name = id.name.as_deref().unwrap_or(file_name);
-    let version = id.version.as_deref().unwrap_or(file_version);
+    let name = name.unwrap_or(file_name);
+    let version = version.unwrap_or(file_version);
     (name == file_name && version == file_version) || allowlist.admits(name, version, subdir)
+}
+
+/// The allowlist as it applies to hosted members: `Some` only when one is
+/// enforced and its scope is every member (#5055).
+pub(super) fn hosted_allowlist(
+    allowlist: Option<&CompiledAllowlist>,
+) -> Option<&CompiledAllowlist> {
+    allowlist.filter(|a| a.applies_to_hosted())
 }
 
 /// Remote records a merge left out, by reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct MergeDrops {
-    /// Records under a name a hosted member owns.
+    /// Remote records under a name a hosted member owns.
     pub owned: usize,
-    /// Records the virtual's allowlist does not admit.
+    /// Records the virtual's allowlist does not admit, hosted (when the list
+    /// applies to every member) and remote.
     pub not_allowed: usize,
 }
 
@@ -576,8 +693,9 @@ type PackageMaps<'a> = (
 
 /// Merge hosted records and remote member package maps, first writer wins
 /// per filename: hosted records first, then each parsed remote document in
-/// member order, dropping remote records under a name a hosted member owns or
-/// that the allowlist does not admit. Shared by every per-package document a
+/// member order, dropping remote records under a name a hosted member owns,
+/// and records the allowlist does not admit (hosted ones too unless the list
+/// is scoped `remote_only`, #5055). Shared by every per-package document a
 /// virtual serves (`repodata.json`, `run_exports.json`, #4708), so the
 /// ownership and allowlist rules cannot drift between them. Allowlist drops
 /// are counted per member in `ak_conda_allowlist_dropped_total` under
@@ -593,13 +711,25 @@ fn merge_package_maps<'a>(
 ) -> PackageMaps<'a> {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
     let mut packages_conda: BTreeMap<&str, &RawValue> = BTreeMap::new();
+    let hosted_list = hosted_allowlist(allowlist);
+    let mut hosted_not_allowed: BTreeMap<&str, usize> = BTreeMap::new();
     for h in hosted {
+        if let Some(list) = hosted_list {
+            if !record_is_admitted(subdir, &h.filename, &h.record, list) {
+                *hosted_not_allowed.entry(h.member.as_str()).or_default() += 1;
+                continue;
+            }
+        }
         let target = if h.is_v2 {
             &mut packages_conda
         } else {
             &mut packages
         };
         target.entry(h.filename.as_str()).or_insert(&h.record);
+    }
+    for (member, count) in hosted_not_allowed {
+        dropped.not_allowed += count;
+        count_allowlist_drops(virtual_repo_key, member, count);
     }
     for (member, p) in parsed {
         let mut member_not_allowed = 0usize;
@@ -613,7 +743,7 @@ fn merge_package_maps<'a>(
                     continue;
                 }
                 if let Some(allowlist) = allowlist {
-                    if !remote_record_is_admitted(subdir, filename, raw, allowlist) {
+                    if !record_is_admitted(subdir, filename, raw, allowlist) {
                         member_not_allowed += 1;
                         continue;
                     }
@@ -781,12 +911,14 @@ struct MergedChanneldata<'a> {
 }
 
 /// Merge hosted channeldata entries (name -> entry, already first-writer-wins
-/// across hosted members) with remote member documents into a pretty-printed
-/// `channeldata.json`. Remote entries for owned names are dropped, and so are
-/// remote entries whose name the allowlist (when enabled) admits under no
-/// entry; channeldata is a per-name summary, so versions and subdirs do not
-/// enter into it. Returns the number of entries the allowlist dropped, which
-/// are also counted per member in `ak_conda_allowlist_dropped_total` (#4711).
+/// across hosted members, and already filtered by the allowlist when it
+/// applies to hosted members, #5055) with remote member documents into a
+/// pretty-printed `channeldata.json`. Remote entries for owned names are
+/// dropped, and so are remote entries whose name the allowlist (when enabled)
+/// admits under no entry; a remote channeldata entry is a per-name summary,
+/// so versions and subdirs do not enter into it. Returns the number of remote
+/// entries the allowlist dropped, which are also counted per member in
+/// `ak_conda_allowlist_dropped_total` (#4711).
 pub(super) fn merge_channeldata(
     virtual_repo_key: &str,
     hosted: &[(String, Box<RawValue>)],
