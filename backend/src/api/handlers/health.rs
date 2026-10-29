@@ -1085,11 +1085,16 @@ async fn probe_storage_health(
                     status: STATUS_HEALTHY.to_string(),
                     message: None,
                 },
+                // /health and /healthz are unauthenticated, so the message
+                // must never name the storage endpoint, bucket or key. Each
+                // backend keeps request URLs out of its errors; this strips
+                // any URL that still slips through.
                 Ok(Err(e)) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
                         "{} storage probe failed: {}",
-                        config.storage_backend, e
+                        config.storage_backend,
+                        crate::storage::s3::redact_urls_in_text(&e.to_string())
                     )),
                 },
                 Err(_) => CheckStatus {
@@ -1888,6 +1893,94 @@ mod tests {
         let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unhealthy");
         assert!(status.message.unwrap().contains("connection refused"));
+    }
+
+    /// A GCS backend pointed at a dead custom endpoint fails its probe in
+    /// transport. The unauthenticated health JSON must not name the endpoint
+    /// host, the bucket or the probe object key.
+    #[tokio::test]
+    async fn test_check_storage_health_gcs_transport_failure_omits_the_request_url() {
+        let bucket = "health-redaction-probe-bucket";
+        let config = crate::config::Config {
+            storage_backend: "gcs".to_string(),
+            gcs_bucket: Some(bucket.to_string()),
+            ..crate::config::Config::test_config()
+        };
+        let backend = crate::storage::gcs::GcsBackend::new(crate::storage::gcs::GcsConfig {
+            bucket: bucket.to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: false,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: crate::storage::path_format::StoragePathFormat::Native,
+            // Port 1 on loopback has no listener: a fast transport failure.
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+        })
+        .await
+        .expect("backend builds");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(backend);
+
+        let status = probe_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "unhealthy");
+        let body = serde_json::to_string(&status).expect("serializes");
+        for secret in ["127.0.0.1", bucket, ".health-probe", "http://"] {
+            assert!(
+                !body.contains(secret),
+                "health JSON must not carry the request URL ({secret}): {body}"
+            );
+        }
+    }
+
+    /// Whatever a backend's error says, the health message drops any URL.
+    #[tokio::test]
+    async fn test_check_storage_health_strips_a_url_from_the_backend_error() {
+        struct UrlEchoingBackend;
+        #[async_trait]
+        impl crate::storage::StorageBackend for UrlEchoingBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn health_check(&self) -> crate::error::Result<()> {
+                Err(crate::error::AppError::Storage(
+                    "request failed for url (https://storage.internal.example:9000/private-bucket/.health-probe)"
+                        .to_string(),
+                ))
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                crate::storage::buffered_put_stream_fallback(self, key, stream).await
+            }
+        }
+
+        for backend in ["s3", "gcs", "azure"] {
+            let config = test_config(backend);
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UrlEchoingBackend);
+            let message = probe_storage_health(&config, &storage)
+                .await
+                .message
+                .expect("unhealthy carries a message");
+            assert!(message.contains("request failed"), "{message}");
+            for secret in [
+                "storage.internal.example",
+                "private-bucket",
+                ".health-probe",
+            ] {
+                assert!(!message.contains(secret), "{backend}: {message}");
+            }
+        }
     }
 
     #[tokio::test]
