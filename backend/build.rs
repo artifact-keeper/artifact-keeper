@@ -1,6 +1,18 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
+    // Declaring any rerun-if-changed at all (the git SHA below does) turns off
+    // cargo's default of rerunning on every change in the package, so the
+    // schemas have to name themselves or an edited .proto regenerates nothing
+    // and the build fails against the previous generation -- or, worse, keeps
+    // compiling against it.
+    for entry in std::fs::read_dir("proto")? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "proto") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
     // Generate file descriptor set for gRPC reflection
     let descriptor_path = format!("{}/sbom_descriptor.bin", out_dir);
 

@@ -7,9 +7,10 @@ syntax = "proto3";
 // them, and the server enforces what it needs in Rust. Field numbers and
 // types are the originals' -- they are the wire format.
 //
-// NOTE: this package's DigestType numbers B5 = 1. The v1beta1 package, which
-// the CLI uses for upload and download, numbers B4 = 1 and B5 = 2. The two are
-// not interchangeable; see bsr_module_v1beta1.proto.
+// NOTE: this package's DigestType numbers B5 = 1, where the v1beta1 package
+// numbers B4 = 1 and B5 = 2. The two are not interchangeable: a reply built
+// with the wrong package's number names the wrong digest algorithm and the
+// CLI rejects the commit. See bsr_module_v1beta1.proto.
 package buf.registry.module.v1;
 
 import "google/protobuf/timestamp.proto";
@@ -246,4 +247,53 @@ message GetResourcesRequest {
 
 message GetResourcesResponse {
   repeated Resource resources = 1;
+}
+
+// A single-registry push and a b5 pull are served here, not on v1beta1: the
+// CLI chooses the package per call. `buf push` uses v1beta1's Upload only
+// when the module depends on a second registry (legacy federation), and
+// Download is chosen by digest type, so a repository answering b5 is asked
+// for its contents over v1.
+message ScopedLabelRef {
+  oneof value {
+    string id = 1;
+    string name = 2;
+  }
+}
+
+message UploadRequest {
+  message Content {
+    ModuleRef module_ref = 1;
+    repeated File files = 2;
+    repeated ScopedLabelRef scoped_label_refs = 3;
+    string source_control_url = 4;
+  }
+  repeated Content contents = 1;
+  // v1beta1 carries a registry alongside each dependency commit id; without
+  // federation there is only one registry, so this is the bare ids.
+  repeated string dep_commit_ids = 2;
+}
+
+message UploadResponse {
+  repeated Commit commits = 1;
+}
+
+message DownloadRequest {
+  message Value {
+    ResourceRef resource_ref = 1;
+    repeated FileType file_types = 2;
+    repeated string paths = 3;
+    bool paths_allow_not_exist = 4;
+  }
+  repeated Value values = 1;
+}
+
+message DownloadResponse {
+  // v1beta1's Content also carries the v1 buf.yaml and buf.lock of a module
+  // pushed before module v2; v1 has no such fields.
+  message Content {
+    Commit commit = 1;
+    repeated File files = 2;
+  }
+  repeated Content contents = 1;
 }
