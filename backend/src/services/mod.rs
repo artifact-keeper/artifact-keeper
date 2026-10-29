@@ -109,6 +109,7 @@ pub mod repository_service;
 pub mod routing_rules;
 pub mod rpm_layout;
 pub mod rpm_publish_service;
+pub mod rpm_repodata_builder;
 pub mod rpm_repodata_cache;
 pub mod rpm_version_retention;
 pub mod saml_service;

@@ -1219,6 +1219,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #4544: build the repodata of changed hosted RPM roots in the
+    // background and serve it from storage. Every replica ticks; a lease per
+    // root lets one of them build it. Detached deliberately: lifecycle is
+    // governed by the shutdown token.
+    artifact_keeper_backend::services::rpm_repodata_builder::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),
