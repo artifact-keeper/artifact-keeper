@@ -28,7 +28,7 @@ Bearer header. The one `/api/v1` route that shares this contract is the reposito
 accepts the API token as the Basic password and answers an anonymous request on a non-public repository \
 with `401` and a `WWW-Authenticate` challenge, like they do. Every other `/api/v1/*` route refuses the \
 Basic-with-token fallback.",
-        version = "1.11.9",
+        version = "1.11.10",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),

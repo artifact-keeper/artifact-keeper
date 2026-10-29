@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.11.10] - 2026-10-29
+
+### Fixed
+
+- **PyPI: the age gate's last-known-good substitute is served through the scan gate on a Remote that scans on proxy** (#5075, #5077, #5085). When the download age gate withholds a young version, a PyPI Remote answers with the newest older version it holds. That substitute was served through the plain proxy path (presigned redirect, cache stream or upstream fetch) while every other distribution download of the repository went through the scan-on-proxy gate. It now goes through the same gate as a requested distribution, on the direct route and for a Remote member of a Virtual repository (under the stricter-of-two policy): a stored blocking verdict refuses it with `403`, `fail_closed` withholds it with `423` until it is scanned, and `fail_open` serves it `pending`. Repositories that do not scan on proxy are unchanged.
+
+- **The repository `test-upstream` probe now reaches the upstream the way proxy fetches do** (#5079, #5080, #5086). `POST /api/v1/repositories/{key}/test-upstream` now applies the upstream URL validation before it sends anything (a URL that validation refuses answers `400`) and goes out on the repository's egress route (`direct` or `explicit` proxy), so its result reflects the path real fetches take. Its `502` message, and the curation sync failure messages built from HTTP client errors, no longer include the request URL.
+
+- **Curation sync now reaches each source Remote the way proxy fetches do** (#5089, #5090, #5091). The sweep built one HTTP client for every staging repository, so a Remote's `direct` or `explicit` egress proxy setting was not applied to its index fetches and attestation downloads, and the stored upstream URL was not checked by the upstream URL validation. Each Remote now gets a client built from its own egress configuration, and a Remote whose upstream URL the validation refuses is skipped with an info log, without a request, and is not marked as synced.
+
 ## [1.11.9] - 2026-10-28
 
 ### Fixed
