@@ -13320,7 +13320,11 @@ mod scan_on_proxy_tests {
                             FLAT,
                         )
                     };
-                    mount(&first, &route, 200, bytes.clone(), 1).await;
+                    // #4514: a package that is inconclusive under fail-closed
+                    // (no verdict, no scanner) is not cached, so each of the
+                    // two pulls fetches it; a verdict-decided one is cached.
+                    let package_fetches = if vulnerable.is_none() { 2 } else { 1 };
+                    mount(&first, &route, 200, bytes.clone(), package_fetches).await;
                     let second = v3_upstream().await;
                     mount_flat(&second, nupkg(ID, VERSION), 0).await;
                     let (first_id, first_dir) =

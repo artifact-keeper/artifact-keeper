@@ -96,6 +96,12 @@ async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
 /// refetches upstream), never to an unbounded stall.
 const TEE_PUBLISH_WAIT_MAX: Duration = Duration::from_secs(5);
 
+/// Upper bound on how long a cache read waits for a buffered body that the
+/// scan gate is still deciding on (#4514): the inline scan budget plus the
+/// publish itself. Past it the reader fetches the upstream again, as before.
+const DEFERRED_PUBLISH_WAIT_MAX: Duration =
+    Duration::from_secs(crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET.as_secs() + 5);
+
 /// One in-flight streaming cache publish (#3335), keyed by metadata sidecar
 /// key in [`tee_publish_registry`].
 struct TeePublishEntry {
@@ -108,6 +114,10 @@ struct TeePublishEntry {
     /// Completion signal: becomes `true` when the writer task finishes
     /// (commit, reject, or error alike).
     done_rx: tokio::sync::watch::Receiver<bool>,
+    /// How long a reader waits for this publish: [`TEE_PUBLISH_WAIT_MAX`] for
+    /// a streaming tee, [`DEFERRED_PUBLISH_WAIT_MAX`] for a buffered body
+    /// waiting on the scan gate (#4514).
+    wait_max: Duration,
 }
 
 /// Process-global registry of in-flight streaming cache publishes (#3335).
@@ -144,10 +154,23 @@ struct TeePublishGuard {
 
 impl TeePublishGuard {
     fn register(metadata_key: &str) -> Self {
+        Self::register_with(metadata_key, false, TEE_PUBLISH_WAIT_MAX)
+    }
+
+    /// Register a buffered body held back for the scan gate (#4514). It is
+    /// in hand already, so it is in its tail phase from the start: a reader
+    /// that misses the entry waits (up to [`DEFERRED_PUBLISH_WAIT_MAX`]) for
+    /// the gate to publish or discard it instead of fetching it again.
+    fn register_deferred(metadata_key: &str) -> Self {
+        Self::register_with(metadata_key, true, DEFERRED_PUBLISH_WAIT_MAX)
+    }
+
+    fn register_with(metadata_key: &str, tail: bool, wait_max: Duration) -> Self {
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let entry = Arc::new(TeePublishEntry {
-            tail: std::sync::atomic::AtomicBool::new(false),
+            tail: std::sync::atomic::AtomicBool::new(tail),
             done_rx,
+            wait_max,
         });
         lock_tee_publish_registry().insert(metadata_key.to_string(), Arc::clone(&entry));
         Self {
@@ -196,7 +219,7 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
         return false;
     }
     let mut done_rx = entry.done_rx.clone();
-    let _ = tokio::time::timeout(TEE_PUBLISH_WAIT_MAX, done_rx.wait_for(|done| *done)).await;
+    let _ = tokio::time::timeout(entry.wait_max, done_rx.wait_for(|done| *done)).await;
     true
 }
 
@@ -2299,6 +2322,68 @@ impl CachedBody {
 /// e.g. a conda CEP-16 shard, whose address is the hash of the decoded file.
 pub type CachedBodyCheck =
     dyn Fn(Bytes, Option<String>) -> futures::future::BoxFuture<'static, bool> + Send + Sync;
+
+/// A body the buffered fetch took from the upstream but has not committed to
+/// the proxy cache yet (#4514): the scan gate decides first.
+///
+/// [`ProxyService::publish_deferred`] writes it exactly as the buffered fetch
+/// would have; dropping it discards it. While it is held, a reader that
+/// misses the entry waits for that decision (up to
+/// [`DEFERRED_PUBLISH_WAIT_MAX`]) rather than fetching the upstream again.
+pub struct DeferredCacheCommit {
+    cache_key: String,
+    metadata_key: String,
+    content: Bytes,
+    content_type: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_encoding: Option<String>,
+    commit_sha: Option<String>,
+    ttl_secs: i64,
+    repository_id: Uuid,
+    cache_path: String,
+    quarantine_until: Option<DateTime<Utc>>,
+    /// Holds the entry's place in the publish registry until published or
+    /// dropped; dropping it wakes the readers waiting on it.
+    _pending: TeePublishGuard,
+}
+
+impl std::fmt::Debug for DeferredCacheCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredCacheCommit")
+            .field("cache_key", &self.cache_key)
+            .field("bytes", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where [`ProxyService::fetch_artifact_with_cache_path_capped_deferred`]
+/// leaves the [`DeferredCacheCommit`] of a fresh fill (#4514). Empty after a
+/// cache hit, and after a fill the cache would not have taken anyway (over
+/// the quota or the cap, or failing the path's own checksum).
+#[derive(Debug, Default)]
+pub struct DeferredCommitSlot(std::sync::Mutex<Option<DeferredCacheCommit>>);
+
+impl DeferredCommitSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The pending commit, if the fetch left one.
+    pub fn take(&self) -> Option<DeferredCacheCommit> {
+        match self.0.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    fn put(&self, commit: DeferredCacheCommit) {
+        match self.0.lock() {
+            Ok(mut guard) => *guard = Some(commit),
+            Err(poisoned) => *poisoned.into_inner() = Some(commit),
+        }
+    }
+}
 
 /// An uncached, straight-from-upstream buffered read — the result of
 /// [`ProxyService::fetch_upstream_direct_with_link`].
@@ -5868,7 +5953,7 @@ impl ProxyService {
         accept: Option<&'a str>,
         max: usize,
     ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
-        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, accept, max, None)
+        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, accept, max, None, None)
     }
 
     /// [`Self::fetch_artifact_with_cache_path_capped`] for a resource whose
@@ -5894,7 +5979,95 @@ impl ProxyService {
         max: usize,
         check: &'a CachedBodyCheck,
     ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
-        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, None, max, Some(check))
+        self.fetch_buffered_with_cache_path(
+            repo,
+            fetch_path,
+            cache_path,
+            None,
+            max,
+            Some(check),
+            None,
+        )
+    }
+
+    /// [`Self::fetch_artifact_with_cache_path_capped`] for the scan-on-proxy
+    /// gate (#4514): a fresh fill is NOT committed to the proxy cache yet.
+    /// Its commit is left in `deferred` for the caller to publish once the
+    /// gate has decided ([`Self::publish_deferred`]) or to drop, so a body the
+    /// gate could not vouch for (inconclusive under `fail_closed`) never lands
+    /// in the cache. A cache hit leaves `deferred` empty.
+    ///
+    /// A fill refused by a Package Age Policy hold (#1770) returns the `409`
+    /// as before and leaves its commit in `deferred` too: the caller
+    /// publishes it, so the hold is recorded and can be released.
+    ///
+    /// A plain `fn` like its siblings, for the same reason (the depth of the
+    /// handler futures that reach here).
+    pub fn fetch_artifact_with_cache_path_capped_deferred<'a>(
+        &'a self,
+        repo: &'a Repository,
+        fetch_path: &'a str,
+        cache_path: &'a str,
+        max: usize,
+        deferred: &'a DeferredCommitSlot,
+    ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
+        self.fetch_buffered_with_cache_path(
+            repo,
+            fetch_path,
+            cache_path,
+            None,
+            max,
+            None,
+            Some(deferred),
+        )
+    }
+
+    /// Commit a body [`Self::fetch_artifact_with_cache_path_capped_deferred`]
+    /// held back (#4514), exactly as the buffered fetch commits a fill, and
+    /// wake the readers waiting on it. Best-effort like that write: a storage
+    /// failure is logged and the cache heals on a later fetch.
+    pub async fn publish_deferred(&self, commit: DeferredCacheCommit) {
+        let content_len = commit.content.len() as i64;
+        match self
+            .cache_artifact(
+                &commit.cache_key,
+                &commit.metadata_key,
+                &commit.content,
+                commit.content_type.clone(),
+                commit.etag.clone(),
+                commit.last_modified.clone(),
+                commit.content_encoding.clone(),
+                commit.commit_sha.clone(),
+                commit.ttl_secs,
+                commit.repository_id,
+                &commit.cache_path,
+                commit.quarantine_until,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.warn_if_proxy_scan_unsupported(commit.repository_id, &commit.cache_path)
+                    .await;
+                let checksum = StorageService::calculate_hash(&commit.content);
+                self.index_cached_package(
+                    commit.repository_id,
+                    &commit.cache_path,
+                    content_len,
+                    Some(&checksum),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cache_key = %commit.cache_key,
+                    error = %e,
+                    "proxy cache write failed after the scan gate decided; \
+                     leaving the cache to self-heal on the next request"
+                );
+            }
+        }
+        // `commit` (and its registry entry) drops here, after the sidecar is
+        // written, so a woken reader finds the entry.
     }
 
     /// The buffered fetch behind
@@ -5906,6 +6079,7 @@ impl ProxyService {
         skip_all,
         fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "buffered")
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_buffered_with_cache_path(
         &self,
         repo: &Repository,
@@ -5914,6 +6088,7 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
         check: Option<&CachedBodyCheck>,
+        deferred: Option<&DeferredCommitSlot>,
     ) -> Result<CachedBody> {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
@@ -5991,9 +6166,24 @@ impl ProxyService {
         // #1631 layer 1: buffered single-flight via the injected coordinator
         // seam (was a direct `coordinate_proxy_hydration` call). The streaming
         // path below (`fetch_artifact_streaming`) is the layer-2 plug-in point.
+        // #4514: this request waits on another request's held fill at most
+        // once. A held fill the gate then drops (inconclusive under
+        // fail-closed) wakes every waiter at once; waiting again on the next
+        // leader's fill would queue them behind one scan after another and
+        // run them into the hydration deadline.
+        let waited_on_held_fill = std::sync::atomic::AtomicBool::new(false);
         self.coordinator.coordinate(
             &hydration_lease_key,
             || async {
+                // #4514: a fill another request holds back for the scan gate
+                // (or a streaming publish in its tail) is waited for, not
+                // fetched again; once it is published the sidecar is re-read.
+                if !waited_on_held_fill.load(std::sync::atomic::Ordering::Relaxed)
+                    && await_tee_publish(&metadata_key).await
+                {
+                    waited_on_held_fill.store(true, std::sync::atomic::Ordering::Relaxed);
+                    invalidate_proxy_metadata_lru(&metadata_key).await;
+                }
                 // Load the sidecar ONCE through the #2301 LRU and reuse it for
                 // the body read (#3951): this follower re-check used to pay
                 // two storage reads for the same `__cache_meta__.json` — a
@@ -6205,6 +6395,24 @@ impl ProxyService {
                             // Guard tripped above: skip the cache write entirely
                             // (do not index into the package catalog either --
                             // nothing was actually cached).
+                        } else if let Some(deferred) = deferred {
+                            // #4514: the scan gate decides first; the caller
+                            // publishes or drops this.
+                            deferred.put(DeferredCacheCommit {
+                                cache_key: cache_key.clone(),
+                                metadata_key: metadata_key.clone(),
+                                content: resp.content.clone(),
+                                content_type: resp.content_type.clone(),
+                                etag: resp.etag.clone(),
+                                last_modified: resp.last_modified.clone(),
+                                content_encoding: upstream_encoding.clone(),
+                                commit_sha: resp.commit_sha.clone(),
+                                ttl_secs: cache_ttl,
+                                repository_id: repo.id,
+                                cache_path: cache_path.to_string(),
+                                quarantine_until,
+                                _pending: TeePublishGuard::register_deferred(&metadata_key),
+                            });
                         } else if let Err(cache_err) = self
                             .cache_artifact(
                                 &cache_key,
@@ -26327,6 +26535,39 @@ mod tests {
     // #3335: the tee-publish window — a just-cached streaming entry must be
     // readable to a closely-following request instead of refetching upstream.
     // -----------------------------------------------------------------------
+
+    /// #4514: a buffered body held back for the scan gate is in its tail
+    /// phase from the start, so a reader waits for the gate's decision (up to
+    /// the longer deferred bound) and wakes when it is published or dropped.
+    #[tokio::test]
+    async fn test_await_tee_publish_waits_for_a_deferred_commit_4514() {
+        let key = format!(
+            "proxy-cache/deferred-4514-{}/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let guard = TeePublishGuard::register_deferred(&key);
+        assert!(DEFERRED_PUBLISH_WAIT_MAX > TEE_PUBLISH_WAIT_MAX);
+        let waiter = tokio::spawn({
+            let key = key.clone();
+            async move {
+                let started = std::time::Instant::now();
+                (await_tee_publish(&key).await, started.elapsed())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the reader waits for the decision");
+        drop(guard);
+        let (waited, elapsed) = waiter.await.unwrap();
+        assert!(waited);
+        assert!(
+            elapsed < TEE_PUBLISH_WAIT_MAX,
+            "woken by the drop: {elapsed:?}"
+        );
+        assert!(
+            !await_tee_publish(&key).await,
+            "nothing registered after the drop"
+        );
+    }
 
     /// Registry mechanics: a reader must NOT wait while the body is still
     /// streaming (the single-flight coordinator owns that phase), MUST wait

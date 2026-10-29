@@ -372,6 +372,29 @@ hit, a cached metadata hit.
   unscanned (a Maven POM, an index document), and that is served whatever
   any stored verdict says.
 
+## The proxy cache and the gate
+
+A format route that gates a file fetches it into memory first and commits it
+to the proxy cache only after the gate has decided (#4514; design note:
+[proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)):
+
+| Gate outcome | Proxy cache |
+| --- | --- |
+| Served (`clean`, `pending`, `recorded`) | The body is committed, then served. |
+| `403` `scan_blocked` | The body is committed, as before. Every read of it through a scanning Remote is refused from its stored verdict, and the cached copy keeps it in the cache listing, the blocked counts, the policy-blocks queue and the rescan endpoint. It is not evicted. |
+| `423` under `fail_closed` (inconclusive: no scanner, a failed or over-budget scan, an identity that cannot be established) | The body is not cached. |
+| Refused by the format's own check before the gate (a Cargo index `cksum`, a Maven `.sha1`, a verified index digest) | The body is not cached. |
+| `409` Package Age Policy hold | The body is committed with its hold, as before, so the hold can be released. |
+
+An inconclusive file is therefore fetched from the upstream again on its
+next pull, and it is not listed in the cache. Concurrent pulls of the same
+file on one replica wait for the first pull's decision (up to 35 seconds,
+at most once in the cache read and once in the single-flight re-check)
+instead of fetching it again. With the cross-replica single-flight locks
+(`PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`), a pull that loses the
+lock waits up to the 65-second hydration wait for a fill that is then
+dropped.
+
 ## Virtual repositories
 
 A Virtual repository walks its members in their configured priority order,
@@ -530,18 +553,14 @@ have no core proxy path to gate.
 
 ## Known gaps
 
-- **Cache commit before the verdict.** The buffered fetch commits upstream
-  bytes to the proxy cache before the gate decides (#4514; see the design
-  note [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)).
-  The format routes re-run the gate on every read, the generic download
-  route refuses before it reads the cache for a repository that scans on
-  proxy. A presigned redirect hands out a cached package without the gate;
-  the package-file redirect helpers consult the stored verdict (see
-  [Proxy-cache fast paths](#proxy-cache-fast-paths)). A non-scanning Remote
-  member of a scanning Virtual is still subject to this gap: bytes the
-  Virtual refused can be served warm by addressing the member directly, on
-  its format route or on the generic route, because the member's own
-  configuration does not scan.
+- **A non-scanning Remote member of a scanning Virtual, addressed
+  directly,** serves by its own configuration. It does not scan, so its
+  format route and the generic download route stream what its cache or its
+  upstream hold, including a package the Virtual refuses (a refused body
+  stays in the member's cache; see
+  [The proxy cache and the gate](#the-proxy-cache-and-the-gate)). To enforce
+  the Virtual's policy for every client, enable scan-on-proxy on the member
+  too, or do not grant clients read access to the member.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
