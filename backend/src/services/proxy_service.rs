@@ -3856,6 +3856,17 @@ pub(crate) struct UpstreamClient {
     test_loopback_ports: std::sync::Mutex<Option<Vec<u16>>>,
 }
 
+/// The error for an upstream destination the outbound address policy refuses
+/// (502 `UPSTREAM_DESTINATION_REFUSED`). The caller did nothing wrong, so this
+/// is the upstream's failure rather than a 400 for the request path, and the
+/// refused address is logged, not returned.
+fn destination_refused() -> AppError {
+    AppError::CodedBadGateway {
+        code: "UPSTREAM_DESTINATION_REFUSED",
+        message: "The upstream named a destination this server does not contact".to_string(),
+    }
+}
+
 /// A repository's own outbound client, plus whether it actually routes through
 /// a proxy (`Explicit`) as opposed to being pinned to direct egress (`Direct`).
 /// Only the proxied case needs the destination SSRF re-check in
@@ -3936,18 +3947,11 @@ impl UpstreamClient {
         #[cfg(not(test))]
         let _ = ip;
         crate::api::validation::validate_outbound_url(target_url, "Upstream URL").map_err(|e| {
-            // The policy logged the refused address; the caller did nothing
-            // wrong, so this is the upstream's failure (502), not a 400 for
-            // the request path, and the client is not told the address.
             tracing::warn!(
                 destination = %redact_url_for_diagnostics(target_url),
                 "upstream destination refused by the outbound address policy: {e}"
             );
-            AppError::CodedBadGateway {
-                code: "UPSTREAM_DESTINATION_REFUSED",
-                message: "The upstream named a destination this server does not contact"
-                    .to_string(),
-            }
+            destination_refused()
         })
     }
 
@@ -4039,7 +4043,14 @@ impl UpstreamClient {
         match entry {
             Some((client, proxied)) => {
                 if proxied {
-                    crate::services::egress_proxy::ensure_proxied_destination_allowed(target_url)?;
+                    crate::services::egress_proxy::ensure_proxied_destination_allowed(target_url)
+                        .map_err(|e| {
+                            tracing::warn!(
+                                destination = %redact_url_for_diagnostics(target_url),
+                                "proxied upstream destination refused by the outbound address policy: {e}"
+                            );
+                            destination_refused()
+                        })?;
                 }
                 Ok(client)
             }
@@ -26649,8 +26660,14 @@ mod tests {
             .await
             .expect_err("a proxied fetch to a blocked host name must be refused");
         assert!(
-            matches!(err, AppError::Validation(_)),
-            "expected the proxied-destination validation error, got {err:?}",
+            matches!(
+                err,
+                AppError::CodedBadGateway {
+                    code: "UPSTREAM_DESTINATION_REFUSED",
+                    ..
+                }
+            ),
+            "expected the same refusal for a host name, got {err:?}",
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")

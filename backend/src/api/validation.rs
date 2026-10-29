@@ -929,7 +929,6 @@ pub(crate) static OUTBOUND_POLICY_ENV_LOCK: tokio::sync::Mutex<()> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// See [`OUTBOUND_POLICY_ENV_LOCK`]. These tests are synchronous, so they
     /// take it with `blocking_lock`.
