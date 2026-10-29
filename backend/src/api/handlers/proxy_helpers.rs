@@ -17,6 +17,7 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
+use crate::services::proxy_scan_service::CacheScanGate;
 /// Re-exported so format handlers can pattern-match the buffered proxy result
 /// (named fields since #4581) without a second import path.
 pub(crate) use crate::services::proxy_service::CachedBody;
@@ -1916,8 +1917,49 @@ pub fn stream_fetch_result(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
+/// [`ProxyService::cache_scan_gate`] for a presigned-redirect fast path
+/// (#4514), with the live CVE-scanner version. `None` when the gate could not
+/// be evaluated (the scan config is unreadable): the redirect declines and
+/// the fall-through path answers. `record_block` as for the gate itself.
+pub(crate) async fn cache_scan_gate_for_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+    record_block: bool,
+) -> Option<CacheScanGate> {
+    proxy
+        .cache_scan_gate(
+            repo_key,
+            cache_path,
+            state.scanner_service.as_deref(),
+            record_block,
+        )
+        .await
+        .ok()
+}
+
+/// Whether the stored scan verdict lets a presigned redirect hand out the
+/// cached body at `cache_path` (#4514): only [`CacheScanGate::Serve`] does.
+/// A declined redirect leaves a refusal to the reader that serves the
+/// request instead, so it is not counted here.
+pub(crate) async fn cache_scan_allows_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+) -> bool {
+    matches!(
+        cache_scan_gate_for_redirect(state, proxy, repo_key, cache_path, false).await,
+        Some(CacheScanGate::Serve)
+    )
+}
+
 /// Presigned redirect to the fresh proxy-cache entry at `cache_path`, signed
-/// without reading the cached body (#1018). `Ok(None)` when presigned downloads
+/// without reading the cached body (#1018). For a Remote that scans on proxy
+/// the stored scan verdict of the body is consulted too (#4514), so callers
+/// pass only files the format's route gates (package archives), never a
+/// file the format serves unscanned. `Ok(None)` when presigned downloads
 /// are disabled, the request is a `HEAD` (#3209), the backend cannot presign or
 /// the entry is missing or stale: the caller then serves the request itself. A
 /// held (#2075) or origin-refused (#4506) entry is refused as on the fetch paths.
@@ -1946,6 +1988,18 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         .cache_origin_policy_gate(repo_key)
         .await
         .map_err(refused)?;
+    // #4514: the stored scan verdict of the cached body. A refusing verdict
+    // is the scan gate's 403; fail-closed without a reusable clean verdict
+    // is not for a redirect, and the caller serves the request itself.
+    match cache_scan_gate_for_redirect(state, proxy_service, repo_key, cache_path, true).await {
+        Some(CacheScanGate::Serve) => {}
+        Some(CacheScanGate::Block) => {
+            return Err(scan_blocked_response(
+                cache_path_filename(cache_path).unwrap_or(cache_path),
+            ))
+        }
+        Some(CacheScanGate::NotForFastPath) | None => return Ok(None),
+    }
     // Proxy-cache content is stored without the global key prefix, so it is
     // signed through that same no-prefix backend (#1555).
     let cache_key =
@@ -10089,10 +10143,11 @@ pub(crate) fn stored_clean_graded_nothing(
     stored_pin: Option<&str>,
     components_cataloged: Option<i32>,
 ) -> bool {
-    row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
-        && row.findings_count == 0
-        && components_cataloged.unwrap_or(0) <= 0
-        && stored_pin.is_none()
+    crate::services::proxy_scan_service::clean_verdict_graded_nothing(
+        row,
+        stored_pin,
+        components_cataloged,
+    )
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -14487,6 +14542,126 @@ mod tests {
                 .is_none()
         );
         assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
+    }
+
+    /// #4514: the package-file redirect fast paths of a Remote that scans on
+    /// proxy consult the verdict stored for the cached body's digest. A
+    /// refusing verdict is the scan gate's 403 (the PyPI helper declines);
+    /// under fail-closed, a body with no reusable clean verdict is not
+    /// redirected to. DB-backed.
+    #[tokio::test]
+    async fn package_redirects_consult_the_stored_scan_verdict_4514() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::StorageBackend;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool.clone(),
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let path = "simple/foo/foo-1.0-py3-none-any.whl";
+        let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let content_key = ProxyService::cache_storage_key(&scope, &repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+        let mut sidecar: crate::services::proxy_service::CacheMetadata =
+            serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+        sidecar.checksum_sha256 = digest.clone();
+        backend
+            .put(
+                &meta_key,
+                Bytes::from(serde_json::to_vec(&sidecar).unwrap()),
+            )
+            .await
+            .unwrap();
+        let ctx = get_ctx();
+        let redirect = || async {
+            proxy_cache_fresh_redirect(proxy.as_ref(), state.as_ref(), &repo_key, path, &ctx).await
+        };
+        let set_action = |action: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE scan_configs SET proxy_scan_action = $2 WHERE repository_id = $1",
+                )
+                .bind(repo_id)
+                .bind(action)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        // Scanning off: redirected as before.
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        // Fail-open with no verdict: the buffered gate would serve it pending.
+        tdh::enable_proxy_scan(&pool, repo_id, "fail_open").await;
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        // Fail-closed with no verdict: declined, so a gated route reads it.
+        set_action("fail_closed").await;
+        assert!(matches!(redirect().await, Ok(None)));
+
+        // A stored vulnerable verdict: the scan gate's own 403 on the shared
+        // redirect helper, a declined PyPI redirect, under either enforcing
+        // action.
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-test"),
+                Some(repo_id),
+            )
+            .await
+            .unwrap();
+        for action in ["fail_closed", "fail_open"] {
+            set_action(action).await;
+            let refused = redirect().await.expect_err("a blocked body is refused");
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{action}");
+            let body = axum::body::to_bytes(refused.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("scan_blocked"),
+                "{action}"
+            );
+
+            // The PyPI distribution redirect declines it.
+            assert!(
+                !cache_scan_allows_redirect(state.as_ref(), proxy.as_ref(), &repo_key, path).await,
+                "{action}"
+            );
+        }
+
+        // Record-only never refuses.
+        set_action("record_only").await;
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        for sql in [
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+            "DELETE FROM scan_configs WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
     }
 
     /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder

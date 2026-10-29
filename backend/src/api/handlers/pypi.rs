@@ -3810,6 +3810,11 @@ async fn pypi_proxy_cache_redirect(
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
         return None;
     }
+    // #4514: nor does a body its stored scan verdict refuses, or, under
+    // fail-closed, one with no reusable clean verdict.
+    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path).await {
+        return None;
+    }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
         proxy.cache_scope(),
         repo_key,

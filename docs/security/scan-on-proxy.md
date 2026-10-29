@@ -341,6 +341,37 @@ before. A rescan in a repository whose format does not scan on proxy (for
 example `generic`) in which the scanner catalogs nothing and finds nothing is
 inconclusive: it answers `503` and records no verdict.
 
+## Proxy-cache fast paths
+
+A format route that gates a file buffers it and runs the gate on every
+read, cache hits included. Some reads hand out a cached file without
+buffering it: a presigned redirect to the cached object, a streaming cache
+hit, a cached metadata hit.
+
+- The redirect helpers that serve only files the format gates (PyPI
+  distributions, and the shared `proxy_cache_fresh_redirect`) consult the
+  verdict stored for the cached body's SHA-256 (the `checksum_sha256` of its
+  `__cache_meta__.json`) under the Remote's own scan configuration, by the
+  reuse rules above (#4514):
+
+  | Stored verdict | `fail_closed` | `fail_open` | `record_only` |
+  | --- | --- | --- | --- |
+  | Reusable and blocking under the severity gate | `403` `scan_blocked` (or the redirect is declined) | same | redirected |
+  | Reusable `clean` that graded something, graded as a coordinate the bytes carry themselves | redirected | redirected | redirected |
+  | Anything else: none, stale, unprovable, `clean` graded on nothing, `clean` graded as a coordinate only the request names (Go, Composer, Conan, Debian, RPM, Alpine) or graded without one | redirect declined | redirected | redirected |
+
+  A declined redirect is not an error: the request is answered by the next
+  path, which reads the body itself. A `403` answered here is audited
+  (`PROXY_SCAN_BLOCKED`) and counted in `ak_proxy_scan_verdicts_total`.
+  Verdict reads on these paths are memoised per digest, so a new verdict
+  reaches them within 30 seconds.
+- The Virtual member redirect, the streaming cache hit and the cached
+  metadata hit are not changed. On a Remote that scans, a file the format
+  gates never reaches them: the Virtual walk and the direct route send it
+  through the gate. What they serve there is what the format serves
+  unscanned (a Maven POM, an index document), and that is served whatever
+  any stored verdict says.
+
 ## Virtual repositories
 
 A Virtual repository walks its members in their configured priority order,
@@ -500,13 +531,17 @@ have no core proxy path to gate.
 ## Known gaps
 
 - **Cache commit before the verdict.** The buffered fetch commits upstream
-  bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4514; see the design note
-  [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)). The generic download
+  bytes to the proxy cache before the gate decides (#4514; see the design
+  note [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)).
+  The format routes re-run the gate on every read, the generic download
   route refuses before it reads the cache for a repository that scans on
-  proxy. A non-scanning Remote member of a scanning Virtual is still subject
-  to this gap: bytes the Virtual refused can be served warm by addressing the
-  member directly, on its format route or on the generic route.
+  proxy. A presigned redirect hands out a cached package without the gate;
+  the package-file redirect helpers consult the stored verdict (see
+  [Proxy-cache fast paths](#proxy-cache-fast-paths)). A non-scanning Remote
+  member of a scanning Virtual is still subject to this gap: bytes the
+  Virtual refused can be served warm by addressing the member directly, on
+  its format route or on the generic route, because the member's own
+  configuration does not scan.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.

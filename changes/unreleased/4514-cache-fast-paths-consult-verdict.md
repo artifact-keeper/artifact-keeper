@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4514]
+---
+- **Presigned redirects to a cached package of a Remote that scans on proxy now consult the stored scan verdict** (#4514). The redirect fast path of PyPI distribution downloads, and the shared redirect helper for cached package archives, hand out the cached object without passing its bytes through the scan gate. For a Remote that scans on proxy, in a format that enforces it, they now look up the verdict stored for the cached body's SHA-256 under the Remote's own scan configuration: a blocking verdict is not redirected to, and under `fail_closed` neither is a body without a reusable `clean` verdict graded as a coordinate the bytes carry themselves, so the request is served by a path that reads the body itself. `record_only` repositories, Remotes that do not scan and formats that do not enforce scan-on-proxy are unaffected. Verdict reads on these paths are memoised per digest, so a new verdict reaches them within 30 seconds. See "Proxy-cache fast paths" in `docs/security/scan-on-proxy.md`.
