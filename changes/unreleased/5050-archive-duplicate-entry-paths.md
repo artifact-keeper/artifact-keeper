@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5050]
+---
+- **Proxied package archives with two entries at one path are refused before the scan-on-proxy identity check** (#5050). The check that ties a proxied package to the coordinate it is served as reads the first matching manifest in the archive (`package/package.json`, `Cargo.toml`, `*.nuspec`, `pom.properties`, `info/index.json`, `metadata.gz`, `go.mod`, `composer.json`, `pubspec.yaml`, `*.podspec.json`, `Package.swift`), while the extraction that unpacks the archive for the scanner keeps the last entry at a path, and a zip entry repeated as `./name` or `a//b` was read under one name and extracted under the other. An archive whose non-directory entries repeat a path, in the container or, for a conda `.conda`, across its payload tars, no longer establishes an identity: under `fail_closed` it is withheld (423) and under `fail_open` it is served `pending`, unscanned and unrecorded, as an unreadable archive is. A survey of 1,282 published packages across npm, PyPI, RubyGems, crates.io, NuGet, Maven Central and conda-forge found no outer archive with a repeated path.

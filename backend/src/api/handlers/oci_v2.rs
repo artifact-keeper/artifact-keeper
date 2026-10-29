@@ -34114,7 +34114,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -34126,6 +34126,11 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-1.0.0-test"),
                 Some(fx.repo_id),
+                // The image gate records what it cataloged with a clean image
+                // verdict; a clean row that cataloged nothing is not reused
+                // under fail-closed (part of #3396).
+                Some(1),
+                None,
             )
             .await
             .expect("seed clean verdict");
@@ -37307,7 +37312,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -37319,6 +37324,11 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-1.0.0-test"),
                 Some(fx.repo_id),
+                // The image gate records what it cataloged with a clean image
+                // verdict; a clean row that cataloged nothing is not reused
+                // under fail-closed (part of #3396).
+                Some(1),
+                None,
             )
             .await
             .expect("seed clean verdict");
@@ -38449,7 +38459,7 @@ mod proxy_scan_block_tests {
         let rows_after_refusal = package_rows(&fx.pool, fx.repo_id).await;
 
         // The verdict flips to clean; the image upstream is unchanged.
-        scan.record_verdict(
+        scan.record_verdict_with_catalog(
             &digest,
             "grype",
             "clean",
@@ -38461,6 +38471,11 @@ mod proxy_scan_block_tests {
             None,
             Some("grype-1.0.0-test"),
             Some(fx.repo_id),
+            // The image gate records what it cataloged with a clean image
+            // verdict; a clean row that cataloged nothing is not reused
+            // under fail-closed (part of #3396).
+            Some(1),
+            None,
         )
         .await
         .expect("flip verdict to clean");

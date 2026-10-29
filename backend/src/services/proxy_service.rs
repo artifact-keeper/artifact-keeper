@@ -1169,11 +1169,27 @@ pub(crate) fn oci_registry_auth_error(
 /// for an OPTIONAL derived resource that has a local recovery (extract METADATA
 /// from the wheel) the 403 means "not here", exactly like 404.
 pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
-    matches!(
-        err,
-        AppError::BadGateway(msg)
-            if msg.starts_with(&format!("Upstream returned error status {}", StatusCode::FORBIDDEN))
-    )
+    matches!(err, AppError::BadGateway(_))
+        && upstream_refusal_status(err) == Some(StatusCode::FORBIDDEN)
+}
+
+/// The upstream `401`/`403` behind a proxy fetch error, if it is one: the
+/// [`AppError::BadGateway`] [`validate_upstream_status`] produces, or the
+/// [`AppError::Storage`] a `401` without a Bearer challenge becomes in the
+/// upstream client (a plain or Basic-auth upstream, #4929).
+///
+/// The error carries no status field, so this reads the classification back out
+/// of the message exactly as [`is_upstream_forbidden`] does. Callers that only
+/// have the mapped [`Response`] can use
+/// [`crate::api::handlers::proxy_helpers::upstream_refusal_status`], which
+/// preserves this through the proxy-error mapping (#4929).
+pub(crate) fn upstream_refusal_status(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(message) | AppError::Storage(message)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| message.starts_with(&format!("Upstream returned error status {status}")))
 }
 
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG

@@ -476,25 +476,28 @@ impl ProxyScanService {
     }
 
     /// [`lookup_verdict`](Self::lookup_verdict) plus the coordinate the
-    /// verdict was graded as (`pin_identity`, #4952), in one read, for the
-    /// inline gate's reuse decision. Runtime query (no macro) so this adds no
-    /// offline sqlx data.
+    /// verdict was graded as (`pin_identity`, #4952) and the number of
+    /// components it was graded on (`components_cataloged`, `None` when not
+    /// recorded), in one read, for the inline gate's reuse decision (#3396).
+    /// Runtime query (no macro) so this adds no offline sqlx data.
     pub async fn lookup_verdict_with_pin(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
-    ) -> Result<Option<(ProxyScanRow, Option<String>)>> {
+    ) -> Result<Option<(ProxyScanRow, Option<String>, Option<i32>)>> {
         #[derive(sqlx::FromRow)]
         struct PinnedRow {
             #[sqlx(flatten)]
             row: ProxyScanRow,
             pin_identity: Option<String>,
+            components_cataloged: Option<i32>,
         }
         let row = sqlx::query_as::<_, PinnedRow>(
             r#"
             SELECT checksum_sha256, scan_type, verdict,
                    findings_count, critical_count, high_count, medium_count, low_count,
-                   max_severity, scanner_version, scanned_at, pin_identity
+                   max_severity, scanner_version, scanned_at, pin_identity,
+                   components_cataloged
             FROM proxy_scan_results
             WHERE checksum_sha256 = $1 AND scan_type = $2
             "#,
@@ -504,7 +507,7 @@ impl ProxyScanService {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(row.map(|r| (r.row, r.pin_identity)))
+        Ok(row.map(|r| (r.row, r.pin_identity, r.components_cataloged)))
     }
 
     /// The stored verdict for `(checksum_sha256, scan_type)` and the number of

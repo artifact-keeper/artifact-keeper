@@ -701,8 +701,8 @@ mod tests {
     /// (#4583): with an allowlist on `conda-virtual` that admits nothing from
     /// remotes, the consumer token can read neither the remote member's package
     /// through the virtual (the allowlist applies) nor `conda-forge` directly
-    /// (the token scope applies), so the allowlist cannot be bypassed. The hosted
-    /// member, which the allowlist does not filter, still downloads.
+    /// (the token scope applies), so the allowlist cannot be bypassed. The list
+    /// is scoped `remote_only` (#5055), so the hosted member still downloads.
     #[tokio::test]
     async fn virtual_scoped_token_cannot_bypass_the_conda_allowlist_4559() {
         let Some(pool) = tdh::try_pool().await else {
@@ -714,6 +714,7 @@ mod tests {
             rig.conda_virtual.id,
             &crate::services::conda_allowlist::CondaAllowlist {
                 enabled: true,
+                scope: Some(crate::services::conda_allowlist::AllowlistScope::RemoteOnly),
                 entries: vec![],
             },
         )
@@ -744,7 +745,7 @@ mod tests {
         assert_eq!(
             via_internal,
             StatusCode::OK,
-            "hosted members are not filtered"
+            "a remote_only list does not filter hosted members"
         );
         assert_eq!(
             direct_forge,

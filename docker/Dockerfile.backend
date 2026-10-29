@@ -381,10 +381,13 @@ ARG TARGETARCH
 ARG GRYPE_VERSION=0.120.1
 ARG GRYPE_COMMIT=6f8d854af29d3a3086b11a84afa51554a2a245fe
 ARG GO_MIN_PATCH=1.27.3
-# The one declared divergence from upstream grype at this tag. See the
-# override block below the clone for its justification and removal condition.
+# The two declared divergences from upstream grype at this tag (x/net and
+# go-jose). See the override blocks below the clone for their justification
+# and removal conditions.
 ARG XNET_FROM=v0.59.0
 ARG XNET_TO=v0.60.0
+ARG GOJOSE_FROM=v4.1.5
+ARG GOJOSE_TO=v4.1.6
 # Not an override: a floor asserted against the compiled binary's build info.
 # v0.120.1 ships x/crypto v0.57.0 on its own; this keeps a future tag or
 # override from silently dropping below the CVE-2026-56855 / CVE-2026-78662
@@ -503,8 +506,8 @@ RUN set -eu; \
 # this block still in place.
 #
 # The grype bump this paragraph used to defer (v0.118.0 -> v0.120.1) landed
-# at #3698 and retired the grpc override; this block is now the only
-# divergence from upstream.
+# at #3698 and retired the grpc override. Since #5041 the go-jose block
+# below is the second divergence from upstream.
 RUN set -eu; \
     xnet_pin() { sed -n 's|^[[:space:]]*golang\.org/x/net \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
     have="$(xnet_pin)"; \
@@ -534,6 +537,72 @@ RUN set -eu; \
     fi; \
     go mod verify; \
     echo "grype build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
+
+# ---- Dependency override: github.com/go-jose/go-jose/v4 ${GOJOSE_FROM} -> ${GOJOSE_TO} (2026-10-28, #5041)
+#
+# CVE-2026-116587 / GHSA-mgcc-cww5-fp2q (HIGH; denial of service when parsing
+# JWKs that contain RSA keys, vulnerable <= 4.1.5, fixed in 4.1.6) was
+# reported against `usr/local/bin/grype` at go-jose v4.1.5 and failed Docker
+# Publish's `Security Scan` on main from 79e52871 (run 40671050571). The same
+# run reported it against the scanner adapter's trivy, which is fixed in
+# artifact-keeper/trivy 0.76.0-r3 with the same override (see
+# Dockerfile.scanner-adapter).
+#
+# The three levers, in order:
+#   1. Bump GRYPE_VERSION. Checked 2026-10-28: the newest anchore/grype
+#      release is v0.121.0 (2026-10-19) and it pins go-jose v4.1.5, as does
+#      v0.120.1. No release reaches the fix.
+#   2. GO_MIN_PATCH. Does not apply: go-jose is a module, not the stdlib.
+#   3. Override. Only this one is left.
+#
+# Unlike the x/net block when it was written, this one meets the override
+# policy (#3465) outright: upstream HAS made the bump, anchore/grype#3854
+# (merged 2026-10-27) moves `main` to go-jose v4.1.6. go-jose v4.1.6's go.mod
+# has no requirements, so MVS moves exactly one module; the assertion below
+# declares that set, so a resolution that moves anything else fails the build.
+#
+# REACHABILITY: go-jose is linked into cmd/grype (Trivy found it in the
+# binary's Go build info, which only lists linked modules). We have not traced
+# an attack path through grype: the DoS needs a JWK with an RSA key to be
+# parsed, and grype parses no JWKs from the scan targets AK hands it. That
+# narrows the exposure; it does not remove the vulnerable code, and the gate is
+# not reachability-aware.
+#
+# REMOVAL CONDITION: delete this block, the GOJOSE_FROM/GOJOSE_TO ARGs and the
+# go-jose check in the build-info assertion when GRYPE_VERSION moves to a grype
+# release whose go.mod pins github.com/go-jose/go-jose/v4 >= v4.1.6:
+#   git show <tag>:go.mod | grep go-jose
+# The guard fails the build when the pinned source no longer requires
+# ${GOJOSE_FROM}, so the bump cannot ship with this block still in place.
+RUN set -eu; \
+    jose_pin() { sed -n 's|^[[:space:]]*github\.com/go-jose/go-jose/v4 \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(jose_pin)"; \
+    if [ "${have}" != "${GOJOSE_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} pins github.com/go-jose/go-jose/v4 ${have}, not ${GOJOSE_FROM}." >&2; \
+      echo "       This override was written against ${GOJOSE_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${GOJOSE_TO}, DELETE the go-jose override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    cp go.mod /tmp/go.mod.before-gojose; \
+    go get "github.com/go-jose/go-jose/v4@${GOJOSE_TO}"; \
+    got="$(jose_pin)"; \
+    if [ "${got}" != "${GOJOSE_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins github.com/go-jose/go-jose/v4 ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-gojose go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="github.com/go-jose/go-jose/v4 "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the go-jose override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    echo "grype build: override applied: github.com/go-jose/go-jose/v4 ${GOJOSE_FROM} -> ${GOJOSE_TO}"
 
 # ldflags mirror .goreleaser.yaml at this tag so the built binary reports the
 # same identity upstream's release does. buildDate is the commit timestamp
@@ -584,7 +653,15 @@ RUN set -eu; \
       echo "       That re-ships CVE-2026-56855 / CVE-2026-78662 (#3698)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — golang.org/x/net ${xnet}, golang.org/x/crypto ${xcrypto} across ${deps} deps"
+    jose="$(printf '%s\n' "${info}" \
+            | sed -n 's|^[[:space:]]*dep[[:space:]]*github\.com/go-jose/go-jose/v4[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+            | head -n1)"; \
+    if [ "${jose}" != "${GOJOSE_TO}" ]; then \
+      echo "ERROR: compiled grype records github.com/go-jose/go-jose/v4 '${jose}', want ${GOJOSE_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship (#5041)." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified: golang.org/x/net ${xnet}, golang.org/x/crypto ${xcrypto}, go-jose ${jose} across ${deps} deps"
 
 # ---------- Stage 5-bk: Build the buildctl client from source ----------
 # buildctl: the BuildKit client the image builder shells out to

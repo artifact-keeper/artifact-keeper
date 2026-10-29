@@ -13557,13 +13557,16 @@ pub struct CondaAllowlistResponse {
     /// stored list that can no longer be read is enforced as admit-nothing,
     /// so it reports `true` with `error` set and no entries.
     pub enabled: bool,
+    /// Which members the list applies to: `all_members` (the default) or
+    /// `remote_only` (#5055).
+    pub scope: conda_allowlist::AllowlistScope,
     /// The admitted packages.
     pub entries: Vec<conda_allowlist::AllowlistEntry>,
     /// `entries.len()`.
     pub entry_count: usize,
     /// Set when the stored list is unusable (only possible after a direct
-    /// database edit): nothing from remote members is admitted until a valid
-    /// list is saved or the list is deleted.
+    /// database edit): nothing is admitted from the members it applies to
+    /// until a valid list is saved or the list is deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -13571,14 +13574,16 @@ pub struct CondaAllowlistResponse {
 impl CondaAllowlistResponse {
     fn new(repository_key: String, stored: conda_allowlist::StoredAllowlist) -> Self {
         use conda_allowlist::StoredAllowlist as Stored;
+        let scope = stored.scope();
         let (enabled, entries, error) = match stored {
             Stored::None => (false, Vec::new(), None),
             Stored::Valid(list) => (list.enabled, list.entries, None),
-            Stored::Unusable(err) => (true, Vec::new(), Some(err)),
+            Stored::Unusable(err, _) => (true, Vec::new(), Some(err)),
         };
         Self {
             repository_key,
             enabled,
+            scope,
             entry_count: entries.len(),
             entries,
             error,
@@ -13635,13 +13640,15 @@ async fn audit_conda_allowlist_change(
         Stored::None => serde_json::Value::Null,
         Stored::Valid(list) => serde_json::json!({
             "enabled": list.enabled,
+            "scope": list.effective_scope(),
             "entry_count": list.entries.len(),
         }),
-        Stored::Unusable(_) => serde_json::json!({ "unusable": true }),
+        Stored::Unusable(_, _) => serde_json::json!({ "unusable": true }),
     };
     let current = current.map_or(serde_json::Value::Null, |list| {
         serde_json::json!({
             "enabled": list.enabled,
+            "scope": list.effective_scope(),
             "entry_count": list.entries.len(),
         })
     });
@@ -13694,12 +13701,16 @@ pub async fn get_conda_allowlist(
 
 /// Set the package allowlist of a virtual conda repository
 ///
-/// Restricts what the virtual's REMOTE members contribute. When `enabled`,
-/// a remote package record is listed in the virtual's `repodata.json` (every
-/// encoding) only if some entry admits it, `channeldata.json` keeps only
-/// admitted names, and a download through the virtual of a package the list
-/// does not admit is never served from a remote member (404, as the index
-/// implies). Hosted (local/staging) members are not filtered.
+/// Restricts what the virtual channel serves. When `enabled`, a package
+/// record is listed in the virtual's index (`repodata.json` in every
+/// encoding, the CEP-16 shard index, `current_repodata.json`,
+/// `run_exports.json`) only if some entry admits it, `channeldata.json` keeps
+/// only admitted names, and a download through the virtual of a package the
+/// list does not admit is a 404, as the index implies. `scope` selects the
+/// members filtered: `all_members` (the default: hosted and remote) or
+/// `remote_only` (hosted local/staging members pass through unfiltered, the
+/// behaviour before #5055). A request that omits `scope` keeps the scope
+/// already stored. Reads of a member repository itself are never filtered.
 ///
 /// An entry is `{"name": ..., "version": ..., "subdirs": [...]}`: `name` is an
 /// exact conda package name or a glob (`*`, `?`), case-insensitive; `version`
@@ -13708,8 +13719,9 @@ pub async fn get_conda_allowlist(
 /// not admitted by a constrained entry. `subdirs` optionally restricts the
 /// entry to platforms. A package is admitted when any entry admits it.
 ///
-/// `enabled` is required: an enabled empty list admits nothing from remotes;
-/// `enabled: false` keeps the entries but restores the unfiltered merge.
+/// `enabled` is required: an enabled empty list admits nothing from the
+/// members in scope; `enabled: false` keeps the entries but restores the
+/// unfiltered merge.
 /// Limits: 10,000 entries, names up to 128 bytes, version specs up to 256
 /// bytes, 32 subdirs per entry. Changes apply to the next request.
 #[utoipa::path(
@@ -13734,10 +13746,16 @@ pub async fn set_conda_allowlist(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<conda_allowlist::CondaAllowlist>,
+    Json(mut payload): Json<conda_allowlist::CondaAllowlist>,
 ) -> Result<Json<CondaAllowlistResponse>> {
     let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
     let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    // #5055: a request without `scope` (an older client) keeps the stored
+    // scope, so it cannot silently undo a `remote_only` opt-out. Stored
+    // explicitly once a list exists, so it no longer depends on the default.
+    if payload.scope.is_none() && !matches!(previous, conda_allowlist::StoredAllowlist::None) {
+        payload.scope = Some(previous.scope());
+    }
     conda_allowlist::save_allowlist(&state.db, repo.id, &payload).await?;
     audit_conda_allowlist_change(&state, &auth, &repo, &previous, Some(&payload)).await;
     Ok(Json(CondaAllowlistResponse::new(

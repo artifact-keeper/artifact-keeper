@@ -105,6 +105,8 @@ ARG GRYPE_COMMIT=6f8d854af29d3a3086b11a84afa51554a2a245fe
 ARG GO_MIN_PATCH=1.27.3
 ARG XNET_FROM=v0.59.0
 ARG XNET_TO=v0.60.0
+ARG GOJOSE_FROM=v4.1.5
+ARG GOJOSE_TO=v4.1.6
 ARG XCRYPTO_MIN=v0.56.0
 
 RUN apk add --no-cache git ca-certificates
@@ -162,6 +164,39 @@ RUN set -eu; \
     go mod verify; \
     echo "grype build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
 
+# Dependency override: github.com/go-jose/go-jose/v4, CVE-2026-116587 (#5041).
+# See Dockerfile.backend for the levers checked, the upstream bump it follows
+# (anchore/grype#3854), the reachability note and the removal condition.
+RUN set -eu; \
+    jose_pin() { sed -n 's|^[[:space:]]*github\.com/go-jose/go-jose/v4 \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(jose_pin)"; \
+    if [ "${have}" != "${GOJOSE_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} pins github.com/go-jose/go-jose/v4 ${have}, not ${GOJOSE_FROM}." >&2; \
+      echo "       This override was written against ${GOJOSE_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${GOJOSE_TO}, DELETE the go-jose override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    cp go.mod /tmp/go.mod.before-gojose; \
+    go get "github.com/go-jose/go-jose/v4@${GOJOSE_TO}"; \
+    got="$(jose_pin)"; \
+    if [ "${got}" != "${GOJOSE_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins github.com/go-jose/go-jose/v4 ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-gojose go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="github.com/go-jose/go-jose/v4 "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the go-jose override and update the declared set." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    echo "grype build: override applied: github.com/go-jose/go-jose/v4 ${GOJOSE_FROM} -> ${GOJOSE_TO}"
+
 RUN set -eu; \
     build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
@@ -202,7 +237,15 @@ RUN set -eu; \
       echo "       That re-ships CVE-2026-56855 / CVE-2026-78662 (#3698)." >&2; \
       exit 1; \
     fi; \
-    echo "grype build: build info verified — golang.org/x/net ${xnet}, golang.org/x/crypto ${xcrypto} across ${deps} deps"
+    jose="$(printf '%s\n' "${info}" \
+            | sed -n 's|^[[:space:]]*dep[[:space:]]*github\.com/go-jose/go-jose/v4[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+            | head -n1)"; \
+    if [ "${jose}" != "${GOJOSE_TO}" ]; then \
+      echo "ERROR: compiled grype records github.com/go-jose/go-jose/v4 '${jose}', want ${GOJOSE_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship (#5041)." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified: golang.org/x/net ${xnet}, golang.org/x/crypto ${xcrypto}, go-jose ${jose} across ${deps} deps"
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

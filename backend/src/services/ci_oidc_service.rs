@@ -63,7 +63,7 @@ use crate::services::auth_service::{
 macro_rules! provider_columns {
     () => {
         "id, name, provider_type, issuer_url, audience, is_enabled, created_at, updated_at, \
-         key_source, static_jwks"
+         key_source, static_jwks, token_ttl_secs"
     };
 }
 
@@ -85,6 +85,7 @@ macro_rules! provider_response_select {
         concat!(
             "SELECT p.id, p.name, p.provider_type, p.issuer_url, p.audience, ",
             "p.is_enabled, p.created_at, p.updated_at, p.key_source, p.static_jwks, ",
+            "p.token_ttl_secs, ",
             "COUNT(m.id) AS mapping_count ",
             "FROM ci_oidc_providers p ",
             "LEFT JOIN ci_oidc_identity_mappings m ON m.provider_id = p.id "
@@ -121,6 +122,50 @@ pub struct CiOidcProvider {
     pub key_source: String,
     /// The JWKS a `static` provider verifies against; `None` otherwise.
     pub static_jwks: Option<serde_json::Value>,
+    /// Lifetime in seconds of the access token a non-Kubernetes exchange
+    /// mints (migration 307, #5054). See [`CiOidcProvider::minted_token_ttl`].
+    pub token_ttl_secs: i32,
+}
+
+/// Default [`CiOidcProvider::token_ttl_secs`]: 15 minutes (#5054).
+pub const DEFAULT_TOKEN_TTL_SECS: i32 = 900;
+/// Shortest `token_ttl_secs` a provider may be given.
+pub const MIN_TOKEN_TTL_SECS: i32 = 60;
+/// Longest `token_ttl_secs` a provider may be given: one hour, the lifetime
+/// AWS STS, GCP Workload Identity Federation and Entra ID give their own
+/// CI-exchanged credentials. Also a CHECK constraint (migration 307).
+pub const MAX_TOKEN_TTL_SECS: i32 = 3600;
+
+impl CiOidcProvider {
+    /// Lifetime of the access token a non-Kubernetes exchange through this
+    /// provider mints (#5054): the stored `token_ttl_secs`, clamped to
+    /// [`MIN_TOKEN_TTL_SECS`]..=[`MAX_TOKEN_TTL_SECS`] again here so the hard
+    /// maximum holds even for a row written around the CHECK constraint.
+    ///
+    /// It does not depend on the presented assertion's own `exp`: the
+    /// assertion only has to be valid when it is exchanged, as with every
+    /// other relying party of CI OIDC tokens (AWS STS, GCP, Azure, PyPI,
+    /// Vault). A Kubernetes provider ignores it and keeps the assertion cap.
+    pub fn minted_token_ttl(&self) -> chrono::Duration {
+        chrono::Duration::seconds(i64::from(
+            self.token_ttl_secs
+                .clamp(MIN_TOKEN_TTL_SECS, MAX_TOKEN_TTL_SECS),
+        ))
+    }
+}
+
+/// Refuse a requested `token_ttl_secs` outside
+/// [`MIN_TOKEN_TTL_SECS`]..=[`MAX_TOKEN_TTL_SECS`] with a 400 naming the range.
+fn validate_token_ttl_secs(ttl: Option<i32>) -> Result<()> {
+    match ttl {
+        Some(t) if !(MIN_TOKEN_TTL_SECS..=MAX_TOKEN_TTL_SECS).contains(&t) => {
+            Err(AppError::Validation(format!(
+                "token_ttl_secs must be between {MIN_TOKEN_TTL_SECS} and {MAX_TOKEN_TTL_SECS} \
+                 seconds, got {t}"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Keys are found through `{issuer_url}/.well-known/openid-configuration`.
@@ -261,6 +306,11 @@ pub struct CreateCiOidcProviderRequest {
     /// only, with unique `kid`s.
     #[schema(value_type = Option<Object>)]
     pub static_jwks: Option<serde_json::Value>,
+    /// Lifetime in seconds of the access token an exchange through this
+    /// provider mints, 60 to 3600 (default 900). Independent of the CI
+    /// assertion's own `exp` (#5054). Ignored by `kubernetes` providers, whose
+    /// credential still expires with the presented ServiceAccount token.
+    pub token_ttl_secs: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -279,6 +329,8 @@ pub struct UpdateCiOidcProviderRequest {
     /// when the resulting key source is `static`.
     #[schema(value_type = Option<Object>)]
     pub static_jwks: Option<serde_json::Value>,
+    /// See [`CreateCiOidcProviderRequest::token_ttl_secs`]. Omit to keep it.
+    pub token_ttl_secs: Option<i32>,
 }
 
 /// A `ci_oidc_providers` row joined with its mapping count, as both
@@ -296,6 +348,7 @@ struct ProviderResponseRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     key_source: String,
     static_jwks: Option<serde_json::Value>,
+    token_ttl_secs: i32,
     mapping_count: i64,
 }
 
@@ -310,6 +363,7 @@ impl From<ProviderResponseRow> for CiOidcProviderResponse {
             is_enabled: r.is_enabled,
             key_source: r.key_source,
             static_jwks: r.static_jwks,
+            token_ttl_secs: r.token_ttl_secs,
             mapping_count: r.mapping_count,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -333,6 +387,9 @@ pub struct CiOidcProviderResponse {
     /// The stored JWKS of a `static` provider; `null` for `discovery`.
     #[schema(value_type = Option<Object>)]
     pub static_jwks: Option<serde_json::Value>,
+    /// Lifetime in seconds of the access token a non-Kubernetes exchange
+    /// mints (#5054).
+    pub token_ttl_secs: i32,
     pub mapping_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -920,14 +977,17 @@ impl CiOidcService {
         };
         let audience = req.audience.unwrap_or_else(|| "artifact-keeper".into());
         validate_provider_audience(&audience)?;
+        validate_token_ttl_secs(req.token_ttl_secs)?;
+        let token_ttl_secs = req.token_ttl_secs.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let (key_source, static_jwks) =
             resolve_key_material(req.key_source, req.static_jwks, None)?;
 
         let id = sqlx::query_scalar::<_, Uuid>(
             r#"INSERT INTO ci_oidc_providers
-                    (name, provider_type, issuer_url, audience, is_enabled, key_source, static_jwks)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (name, provider_type, issuer_url, audience, is_enabled, key_source, static_jwks,
+                     token_ttl_secs)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                RETURNING id"#,
         )
         .bind(&req.name)
@@ -937,6 +997,7 @@ impl CiOidcService {
         .bind(is_enabled)
         .bind(&key_source)
         .bind(&static_jwks)
+        .bind(token_ttl_secs)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -961,6 +1022,7 @@ impl CiOidcService {
         if let Some(audience) = req.audience.as_deref() {
             validate_provider_audience(audience)?;
         }
+        validate_token_ttl_secs(req.token_ttl_secs)?;
         let mut tx = self.db.begin().await.map_err(db_err)?;
         let existing = sqlx::query_as::<_, CiOidcProvider>(concat!(
             "SELECT ",
@@ -993,6 +1055,7 @@ impl CiOidcService {
                    is_enabled    = $6,
                    key_source    = $7,
                    static_jwks   = $8,
+                   token_ttl_secs = $9,
                    updated_at    = NOW()
                WHERE id = $1"#,
         )
@@ -1004,6 +1067,7 @@ impl CiOidcService {
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
         .bind(&key_source)
         .bind(&static_jwks)
+        .bind(req.token_ttl_secs.unwrap_or(existing.token_ttl_secs))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2321,6 +2385,7 @@ mod tests {
     fn sample_provider(provider_type: &str) -> CiOidcProvider {
         let now = Utc::now();
         CiOidcProvider {
+            token_ttl_secs: 900,
             id: Uuid::new_v4(),
             name: "CI Provider".to_string(),
             provider_type: provider_type.to_string(),
@@ -2846,6 +2911,7 @@ mod tests {
 
         let err = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: name.clone(),
                 provider_type: Some("kubernetes".to_string()),
                 issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
@@ -2894,6 +2960,7 @@ mod tests {
         );
 
         let update = |audience: &str| super::UpdateCiOidcProviderRequest {
+            token_ttl_secs: None,
             name: None,
             provider_type: None,
             issuer_url: None,
@@ -2935,6 +3002,7 @@ mod tests {
 
         let created = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: "test-provider-crud".to_string(),
                 provider_type: None,
                 issuer_url: "https://issuer.example.com".to_string(),
@@ -2965,6 +3033,7 @@ mod tests {
             .update(
                 created.id,
                 super::UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     name: Some("test-provider-crud-updated".to_string()),
                     provider_type: Some("github".to_string()),
                     issuer_url: Some("https://issuer2.example.com".to_string()),
@@ -3018,6 +3087,94 @@ mod tests {
         }
     }
 
+    /// #5054: `token_ttl_secs` defaults to 900, accepts 60..=3600, refuses
+    /// anything outside with 400 (create and update alike, leaving the row
+    /// unchanged), and an update that omits it keeps the stored value.
+    #[tokio::test]
+    async fn provider_token_ttl_is_validated_and_persisted_5054() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let create = |ttl: Option<i32>| super::CreateCiOidcProviderRequest {
+            token_ttl_secs: ttl,
+            name: format!("ttl-{}", uuid::Uuid::new_v4()),
+            provider_type: Some("github".to_string()),
+            issuer_url: format!("https://ttl-{}.example.com", uuid::Uuid::new_v4()),
+            audience: None,
+            is_enabled: Some(false),
+            key_source: None,
+            static_jwks: None,
+        };
+        let update = |ttl: Option<i32>| super::UpdateCiOidcProviderRequest {
+            token_ttl_secs: ttl,
+            name: None,
+            provider_type: None,
+            issuer_url: None,
+            audience: None,
+            is_enabled: None,
+            key_source: None,
+            static_jwks: None,
+        };
+
+        let created = svc.create(create(None)).await.expect("default TTL");
+        assert_eq!(created.token_ttl_secs, super::DEFAULT_TOKEN_TTL_SECS);
+        assert_eq!(svc.get(created.id).await.unwrap().token_ttl_secs, 900);
+
+        for bad in [0, 59, 3601, 86_400, -1] {
+            let err = svc.create(create(Some(bad))).await.expect_err("refused");
+            assert!(
+                matches!(err, crate::error::AppError::Validation(_)),
+                "{bad}"
+            );
+            let err = svc
+                .update(created.id, update(Some(bad)))
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(err, crate::error::AppError::Validation(_)),
+                "{bad}"
+            );
+        }
+        assert_eq!(svc.get(created.id).await.unwrap().token_ttl_secs, 900);
+
+        let updated = svc
+            .update(created.id, update(Some(3600)))
+            .await
+            .expect("the maximum is accepted");
+        assert_eq!(updated.provider.token_ttl_secs, 3600);
+        let kept = svc
+            .update(created.id, update(None))
+            .await
+            .expect("omitted keeps it");
+        assert_eq!(kept.provider.token_ttl_secs, 3600);
+        let listed = svc.list().await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|p| p.id == created.id)
+                .map(|p| p.token_ttl_secs),
+            Some(3600)
+        );
+
+        // The CHECK constraint backs the hard maximum below the API.
+        let raw = sqlx::query("UPDATE ci_oidc_providers SET token_ttl_secs = 7200 WHERE id = $1")
+            .bind(created.id)
+            .execute(&pool)
+            .await;
+        assert!(raw.is_err(), "the column must refuse a TTL above 3600");
+
+        let other = svc
+            .create(create(Some(60)))
+            .await
+            .expect("the minimum is accepted");
+        assert_eq!(other.token_ttl_secs, 60);
+        for id in [created.id, other.id] {
+            svc.delete(id).await.expect("cleanup");
+        }
+    }
+
     /// A provider stored while `provider_type` was free text keeps working
     /// with a client that re-sends the whole provider on edit (the web UI
     /// does), while a create or a change to an unknown type is still 400.
@@ -3028,6 +3185,7 @@ mod tests {
         };
         let svc = CiOidcService::new(pool.clone());
         let request = |provider_type: &str, name: &str| super::UpdateCiOidcProviderRequest {
+            token_ttl_secs: None,
             name: Some(name.to_string()),
             provider_type: Some(provider_type.to_string()),
             issuer_url: None,
@@ -3065,6 +3223,7 @@ mod tests {
 
         let err = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("legacy-create-{}", uuid::Uuid::new_v4()),
                 provider_type: Some("circleci".to_string()),
                 issuer_url: "https://oidc.circleci.example.com".to_string(),
@@ -3099,6 +3258,7 @@ mod tests {
         let svc = CiOidcService::new(pool.clone());
         let created = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("rmw-{}", uuid::Uuid::new_v4()),
                 provider_type: Some("kubernetes".to_string()),
                 issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
@@ -3127,6 +3287,7 @@ mod tests {
                 svc.update(
                     id,
                     super::UpdateCiOidcProviderRequest {
+                        token_ttl_secs: None,
                         name: None,
                         provider_type: None,
                         issuer_url: None,
@@ -3163,6 +3324,7 @@ mod tests {
         let svc = CiOidcService::new(pool.clone());
         let provider = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: "test-provider-mapping".to_string(),
                 provider_type: Some("gitlab".to_string()),
                 issuer_url: "https://issuer.example.com".to_string(),
@@ -3336,6 +3498,7 @@ mod tests {
 
     async fn gitlab_provider(svc: &CiOidcService) -> Uuid {
         svc.create(super::CreateCiOidcProviderRequest {
+            token_ttl_secs: None,
             name: format!("gitlab-{}", Uuid::new_v4()),
             provider_type: Some("gitlab".to_string()),
             issuer_url: "https://gitlab.example.com".to_string(),
@@ -4372,6 +4535,7 @@ mod tests {
 
     fn provider_at(issuer: &str, audience: &str, is_enabled: bool) -> CiOidcProvider {
         CiOidcProvider {
+            token_ttl_secs: 900,
             issuer_url: issuer.to_string(),
             audience: audience.to_string(),
             is_enabled,
@@ -4569,6 +4733,7 @@ mod tests {
 
         let wanted = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("resolve-by-issuer-{tag}"),
                 provider_type: None,
                 // Stored WITH a trailing slash; the assertion's iss has none.
@@ -4582,6 +4747,7 @@ mod tests {
             .expect("provider should be created");
         let other = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("resolve-other-{tag}"),
                 provider_type: None,
                 issuer_url: other_issuer.clone(),
@@ -4718,6 +4884,7 @@ mod tests {
 
     fn static_provider(keys: &[&TestKey]) -> CiOidcProvider {
         CiOidcProvider {
+            token_ttl_secs: 900,
             issuer_url: ONPREM_ISSUER.to_string(),
             key_source: super::KEY_SOURCE_STATIC.to_string(),
             static_jwks: Some(
@@ -4781,6 +4948,7 @@ mod tests {
 
         // The same provider on `discovery` does try the issuer, and fails.
         let discovering = CiOidcProvider {
+            token_ttl_secs: 900,
             key_source: super::KEY_SOURCE_DISCOVERY.to_string(),
             static_jwks: None,
             ..provider
@@ -5123,6 +5291,7 @@ mod tests {
 
         let err = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("k8s-static-{}", Uuid::new_v4()),
                 provider_type: Some("kubernetes".into()),
                 issuer_url: ONPREM_ISSUER.into(),
@@ -5140,6 +5309,7 @@ mod tests {
 
         let created = svc
             .create(super::CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("k8s-static-{}", Uuid::new_v4()),
                 provider_type: Some("kubernetes".into()),
                 issuer_url: ONPREM_ISSUER.into(),
@@ -5160,6 +5330,7 @@ mod tests {
         assert_eq!(from_list.key_source, "static");
 
         let empty_update = || super::UpdateCiOidcProviderRequest {
+            token_ttl_secs: None,
             name: None,
             provider_type: None,
             issuer_url: None,
@@ -5176,6 +5347,7 @@ mod tests {
             .update(
                 created.id,
                 super::UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     static_jwks: Some(json!({"keys": [private]})),
                     ..empty_update()
                 },
@@ -5193,6 +5365,7 @@ mod tests {
             .update(
                 created.id,
                 super::UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     static_jwks: Some(rotated.clone()),
                     ..empty_update()
                 },
@@ -5205,6 +5378,7 @@ mod tests {
             .update(
                 created.id,
                 super::UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     name: Some(format!("k8s-renamed-{}", Uuid::new_v4())),
                     ..empty_update()
                 },
@@ -5218,6 +5392,7 @@ mod tests {
             .update(
                 created.id,
                 super::UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     key_source: Some("discovery".into()),
                     ..empty_update()
                 },

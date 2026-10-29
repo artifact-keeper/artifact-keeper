@@ -252,6 +252,11 @@ tikv-jemalloc-sys = { version = "0.6", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 
+# setrlimit(2) on the `unsquashfs` child that unpacks an ISO's rootfs image
+# (#1966, services/iso_rootfs). Already in the tree transitively.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build.workspace = true
 prost-build.workspace = true
