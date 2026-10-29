@@ -1977,6 +1977,9 @@ mod tests {
         let (status, missing_body) = f.inspect(app, "missing").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{missing_body}");
         let missing = masked(&missing_body, &f.missing_config_digest);
+        let (status, body) = f.inspect(app, &f.missing_config).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(masked(&body, &f.missing_config_digest), missing);
         for reference in ["borrowed", f.borrowed_config.as_str()] {
             let (status, body) = f.inspect(app, reference).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{reference}: {body}");
