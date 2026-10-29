@@ -398,6 +398,17 @@ async fn compiled_filter(db: &PgPool, repo_id: Uuid) -> Result<CachedFilter> {
     Ok(compiled)
 }
 
+/// The compiled filter for the Remote `repo_id`, for callers that test many
+/// subjects in memory (#840: the curation sync filtering a parsed index) instead
+/// of one async lookup per subject. `Ok(None)` means "no filter configured"; a
+/// read error is returned, never treated as "no filter".
+pub async fn compiled_upstream_filter(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<Option<Arc<CompiledUpstreamFilter>>> {
+    compiled_filter(db, repo_id).await
+}
+
 /// Pure decision used by [`ensure_upstream_allowed`]: `Err(NotFound)` when the
 /// filter refuses the fetch.
 fn check_filter(
